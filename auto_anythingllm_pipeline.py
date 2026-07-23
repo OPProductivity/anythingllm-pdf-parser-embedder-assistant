@@ -446,7 +446,6 @@ AUTHOR_STOP_TERMS = {
     "proquest ebook central",
     "jstor",
     "terms conditions of use",
-    "american studies",
     "syllabus",
 }
 AUTHOR_BLOCK_STOP_HINTS = {
@@ -3709,7 +3708,7 @@ def has_complete_native_text_candidate(candidates, pdf_page_count, ocr_preflight
         # missing text page.  Require coverage of every material native page,
         # not the PDF's physical page count.  This retains the strict gate for
         # actual gaps while avoiding a redundant full-document OCR/layout pass
-        # for otherwise complete books such as Wray.
+        # for otherwise complete documents.
         empty_pages = max(0, int(quality.get("empty_pages") or 0))
         material_pages = max(1, page_count - empty_pages)
         if (
@@ -4289,14 +4288,6 @@ def evaluate_edge_cases(profile, selected, selected_dir: Path, native_payloads):
             )
     q = selected.get("quality") or {}
     add("low_text_or_scanned_detection", check_status(int(q.get("included_words") or 0) >= 8000, warn=True), f"included_words={q.get('included_words')}")
-
-    source_key = f"{profile.get('filename', '')} {profile.get('detected_title', '')}".casefold()
-    if "deneen" in source_key or "liberalism failed" in source_key:
-        add("deneen_expected_page_count", check_status(profile.get("pdf_page_count") == 167), f"pdf_page_count={profile.get('pdf_page_count')}")
-        add("deneen_expected_body_start", check_status(selected.get("start_page") == 25), f"start_page={selected.get('start_page')}")
-        add("deneen_expected_end_matter", check_status(selected.get("end_page") == 148), f"end_page={selected.get('end_page')}")
-        add("deneen_expected_backend", check_status(selected.get("backend") == "pymupdf"), f"backend={selected.get('backend')}")
-        add("deneen_expected_readiness", check_status(selected.get("readiness_status") == "ready"), f"readiness={selected.get('readiness_status')}")
 
     failed = sum(1 for row in rows if row["status"] == "fail")
     warnings = sum(1 for row in rows if row["status"] == "warning")

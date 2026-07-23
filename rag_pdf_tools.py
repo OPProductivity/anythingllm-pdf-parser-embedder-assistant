@@ -62,7 +62,7 @@ PHOTOGRAPHED_PAGE_OCR_DPI = 144
 # Keep a small outer-margin guard, but do not trim the final glyphs of warped
 # photographed pages whose printed text approaches the right edge of the PDF
 # CropBox.  The former .925 boundary visibly changed words such as ``between``
-# to ``betweer`` and dropped final letters throughout the Susman pilot.
+# to ``betweer`` and dropped final letters in an early photographed-PDF pilot.
 PHOTOGRAPHED_PAGE_CROP = (0.035, 0.055, 0.965, 0.95)
 LOGGER = logging.getLogger(__name__)
 
@@ -721,9 +721,9 @@ def get_pages_with_pymupdf4llm(pdf_path: Path):
     # PyMuPDF / Tesseract discovers trained data from TESSDATA_PREFIX. Do not
     # rely on an earlier Unstructured capability probe having happened to set
     # it: direct PyMuPDF4LLM calls otherwise degrade scan-only PDFs to image
-    # placeholders. The real Susman A/B recovered slightly more text at 200
-    # DPI than 300 DPI while taking about 11% less time, so make that measured
-    # setting explicit when OCR is available.
+    # placeholders. A photographed-PDF A/B recovered slightly more text at
+    # 200 DPI than 300 DPI while taking about 11% less time, so make that
+    # measured setting explicit when OCR is available.
     ocr_runtime = ensure_tesseract_runtime()
     markdown_options: dict[str, Any] = {"page_chunks": True}
     if ocr_runtime.get("available"):

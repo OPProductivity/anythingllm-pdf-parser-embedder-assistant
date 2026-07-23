@@ -1753,13 +1753,13 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertNotIn("Est: -", rendered)
 
     def test_workspace_name_is_sanitized_before_anythingllm_can_create_an_invalid_namespace(self):
-        unsafe_name = "PDF — Hillbilly Elegy: J. D. Vance’s Views / 2026"
+        unsafe_name = "PDF — Example Book: Example Author’s Views / 2026"
         safe_name = pipeline.lancedb_safe_workspace_name(unsafe_name)
 
-        self.assertEqual(safe_name, "PDF Hillbilly Elegy J. D. Vances Views 2026")
+        self.assertEqual(safe_name, "PDF Example Book Example Authors Views 2026")
         self.assertNotIn("'", safe_name)
-        self.assertTrue(pipeline.is_lancedb_safe_namespace("pdf-hillbilly-elegy-j-d-vances-views-2026"))
-        self.assertFalse(pipeline.is_lancedb_safe_namespace("pdf-vance's-views"))
+        self.assertTrue(pipeline.is_lancedb_safe_namespace("pdf-example-book-example-authors-views-2026"))
+        self.assertFalse(pipeline.is_lancedb_safe_namespace("pdf-example-author's-views"))
 
     def test_new_workspace_name_collision_uses_a_visible_numeric_suffix(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1769,17 +1769,17 @@ class PipelineCoreTests(unittest.TestCase):
                 con.execute("create table workspaces (name text, slug text)")
                 con.execute(
                     "insert into workspaces (name, slug) values (?, ?)",
-                    ("PDF Wray 2026-07-13", "pdf-wray-2026-07-13"),
+                    ("PDF Sample Author 2026-07-13", "pdf-sample-author-2026-07-13"),
                 )
                 con.commit()
             finally:
                 con.close()
 
             name, suffix = pipeline.unique_lancedb_workspace_name(
-                "PDF Wray 2026-07-13",
+                "PDF Sample Author 2026-07-13",
                 temp_dir,
             )
-        self.assertEqual(name, "PDF Wray 2026-07-13 2")
+        self.assertEqual(name, "PDF Sample Author 2026-07-13 2")
         self.assertEqual(suffix, 2)
 
     def test_native_boundary_policy_uses_zero_overlap_without_saving_global_settings(self):
@@ -1975,21 +1975,21 @@ class PipelineCoreTests(unittest.TestCase):
 
         generated, marker = app.update_new_workspace_name_control(
             app.NEW_DOCUMENT_WORKSPACE_VALUE,
-            "Wray's Boundary Study",
+            "Sample Author's Boundary Study",
             [],
             "",
             "",
         )
         self.assertTrue(generated["visible"])
-        self.assertTrue(generated["value"].startswith("PDF Wrays Boundary Study "))
+        self.assertTrue(generated["value"].startswith("PDF Sample Authors Boundary Study "))
         preserved, _marker = app.update_new_workspace_name_control(
             app.NEW_DOCUMENT_WORKSPACE_VALUE,
             "Changed detected title",
             [],
-            "My Wray comparison",
+            "My Sample Author comparison",
             marker,
         )
-        self.assertEqual(preserved["value"], "My Wray comparison")
+        self.assertEqual(preserved["value"], "My Sample Author comparison")
 
     def test_live_run_progress_is_whole_percent_rounded_and_capped_when_a_phase_is_slow(self):
         import rag_pdf_gradio_app as app
@@ -4264,18 +4264,18 @@ class PipelineCoreTests(unittest.TestCase):
     def test_relocate_uploaded_document_moves_out_of_custom_documents(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             storage = Path(tmpdir)
-            source = storage / "documents" / "custom-documents" / "wray-p15-s0001.txt"
+            source = storage / "documents" / "custom-documents" / "sample-author-p15-s0001.txt"
             source.parent.mkdir(parents=True, exist_ok=True)
             source.write_text("hello", encoding="utf-8")
 
             relocated, error = pipeline.relocate_uploaded_document(
                 storage,
-                "custom-documents/wray-p15-s0001.txt",
+                "custom-documents/sample-author-p15-s0001.txt",
                 "page-bounded-subchunking-test-A",
             )
 
             self.assertEqual(error, "")
-            self.assertEqual(relocated, "page-bounded-subchunking-test-A/wray-p15-s0001.txt")
+            self.assertEqual(relocated, "page-bounded-subchunking-test-A/sample-author-p15-s0001.txt")
             self.assertFalse(source.exists())
             self.assertTrue((storage / "documents" / relocated).exists())
 
@@ -4337,12 +4337,12 @@ class PipelineCoreTests(unittest.TestCase):
 
     def test_document_title_folder_name_uses_title_and_hash(self):
         folder_name = pipeline.document_title_folder_name(
-            "Wray Matt - Not quite white / white trash",
+            "Sample Author Matt - Not quite white / white trash",
             "189891f31edf2c536afd9971cec08af7c7c0e5a20181e06aecc616196e772d7a",  # pragma: allowlist secret -- fixed SHA-256 fixture
         )
         self.assertIn("189891f3", folder_name)
         self.assertNotIn("/", folder_name)
-        self.assertTrue(folder_name.startswith("Wray-Matt-Not-quite-white-white-trash"))
+        self.assertTrue(folder_name.startswith("Sample-Author-Matt-Not-quite-white-white-trash"))
 
     def test_managed_upload_folder_uses_custom_documents_when_document_folders_are_disabled(self):
         folder_name = pipeline.managed_anythingllm_upload_folder_name(
@@ -7685,12 +7685,12 @@ class PipelineCoreTests(unittest.TestCase):
     def test_page_segment_marker_detection_handles_filename_underscores(self):
         self.assertTrue(
             pipeline.text_contains_page_or_segment_metadata(
-                "Deneen__pdf_hash_p0025_s00001__Introduction.txt"
+                "Reference Work__pdf_hash_p0025_s00001__Introduction.txt"
             )
         )
         self.assertFalse(
             pipeline.text_contains_page_or_segment_metadata(
-                "Deneen Introduction and chapter context"
+                "Reference Work Introduction and chapter context"
             )
         )
 
@@ -7698,7 +7698,7 @@ class PipelineCoreTests(unittest.TestCase):
         payload = {
             "textContent": "Distinctive passage about rights-bearing individuals.",
             "metadata": {
-                "title": "Deneen | p25 | s00001",
+                "title": "Reference Work | p25 | s00001",
                 "chunkSource": "segment://pdf_hash_p0025_s00001",
             },
         }
@@ -7831,7 +7831,7 @@ class PipelineCoreTests(unittest.TestCase):
         payload = {
             "textContent": "Distinctive passage about rights-bearing individuals.",
             "metadata": {
-                "title": "Deneen | p25 | s00001",
+                "title": "Reference Work | p25 | s00001",
                 "chunkSource": "segment://pdf_hash_p0025_s00001",
             },
         }
@@ -7866,7 +7866,7 @@ class PipelineCoreTests(unittest.TestCase):
         payload = {
             "textContent": "Distinctive passage about rights-bearing individuals.",
             "metadata": {
-                "title": "Deneen | p25 | s00001",
+                "title": "Reference Work | p25 | s00001",
                 "chunkSource": "segment://pdf_hash_p0025_s00001",
             },
         }
@@ -7921,7 +7921,7 @@ class PipelineCoreTests(unittest.TestCase):
         payload = {
             "textContent": "Distinctive passage about rights-bearing individuals.",
             "metadata": {
-                "title": "Deneen | p25 | s00001",
+                "title": "Reference Work | p25 | s00001",
                 "chunkSource": "segment://pdf_hash_p0025_s00001",
             },
         }
@@ -7957,7 +7957,7 @@ class PipelineCoreTests(unittest.TestCase):
         payload = {
             "textContent": "Distinctive passage about rights-bearing individuals.",
             "metadata": {
-                "title": "Deneen | p25 | s00001",
+                "title": "Reference Work | p25 | s00001",
                 "chunkSource": "segment://pdf_hash_p0025_s00001",
             },
         }
@@ -7990,14 +7990,14 @@ class PipelineCoreTests(unittest.TestCase):
             {
                 "textContent": "Distinctive first passage about rights-bearing individuals.",
                 "metadata": {
-                    "title": "Deneen | p25 | s00001",
+                    "title": "Reference Work | p25 | s00001",
                     "chunkSource": "segment://pdf_hash_p0025_s00001",
                 },
             },
             {
                 "textContent": "Distinctive second passage about civic responsibility.",
                 "metadata": {
-                    "title": "Deneen | p26 | s00002",
+                    "title": "Reference Work | p26 | s00002",
                     "chunkSource": "segment://pdf_hash_p0026_s00002",
                 },
             },
@@ -8047,14 +8047,14 @@ class PipelineCoreTests(unittest.TestCase):
             {
                 "textContent": "Distinctive first passage about rights-bearing individuals.",
                 "metadata": {
-                    "title": "Deneen | p25 | s00001",
+                    "title": "Reference Work | p25 | s00001",
                     "chunkSource": "segment://pdf_hash_p0025_s00001",
                 },
             },
             {
                 "textContent": "Distinctive second passage about civic responsibility.",
                 "metadata": {
-                    "title": "Deneen | p26 | s00002",
+                    "title": "Reference Work | p26 | s00002",
                     "chunkSource": "segment://pdf_hash_p0026_s00002",
                 },
             },
@@ -8759,7 +8759,7 @@ class PipelineCoreTests(unittest.TestCase):
                 "segment_id": "final-notes",
                 "text": (
                     "College Diversity Push, The New York Times, https://example.test. "
-                    "94 Pruitt, Law Review. 95 James, University Press. "
+                    "94 Reviewer, Law Review. 95 James, University Press. "
                     "96 Martin, Journal Review. 97 Taylor, Times."
                 ),
             }
@@ -9349,12 +9349,12 @@ class PipelineCoreTests(unittest.TestCase):
             [
                 {
                     "page": 1,
-                    "text": "Not Quite White\n\nby Matt Wray\n\nDuke University Press",
+                    "text": "Not Quite White\n\nby Sample Author\n\nDuke University Press",
                 }
             ],
             title_hint="Not Quite White",
         )
-        self.assertEqual(report["author"], "Matt Wray")
+        self.assertEqual(report["author"], "Sample Author")
         self.assertIn(report["source"], {"text_byline", "text_role_followup"})
 
     def test_author_inference_prefers_affiliation_bylines_over_title_and_reviewed_book_names(self):
@@ -9377,11 +9377,11 @@ class PipelineCoreTests(unittest.TestCase):
         report = pipeline.infer_author_from_text_samples(
             [{
                 "page": 1,
-                "text": "Moving Beyond Appalachia: Social Mobility\nHatice Bay (Independent researcher)\nAbstract. This paper...",
+                "text": "Moving Beyond Appalachia: Social Mobility\nSample Researcher (Independent researcher)\nAbstract. This paper...",
             }],
             title_hint="Moving Beyond Appalachia: Social Mobility",
         )
-        self.assertEqual(report["author"], "Hatice Bay")
+        self.assertEqual(report["author"], "Sample Researcher")
         self.assertEqual(report["source"], "text_affiliated_byline")
 
     def test_author_inference_accepts_name_echoed_by_bibliographic_from_line(self):
@@ -9590,7 +9590,7 @@ class PipelineCoreTests(unittest.TestCase):
                         "Not Quite White\n"
                         "WHITE TRASH and the\n"
                         "BOUNDARIES of WHITENESS\n"
-                        "Matt Wray\n"
+                        "Sample Author\n"
                         "Duke University Press   Durham and London   2006\n"
                     ),
                 },
@@ -9607,7 +9607,7 @@ class PipelineCoreTests(unittest.TestCase):
             ],
             title_hint="Not Quite White: White Trash and the Boundaries of Whiteness",
         )
-        self.assertEqual(report["author"], "Matt Wray")
+        self.assertEqual(report["author"], "Sample Author")
         self.assertEqual(report["source"], "text_top_block_names")
 
     def test_organization_byline_is_not_treated_as_person_name(self):
@@ -9620,7 +9620,7 @@ class PipelineCoreTests(unittest.TestCase):
 
     def test_native_segment_title_uses_compact_identity_stem(self):
         row = {
-            "source_short_label": "Wray",
+            "source_short_label": "Sample Author",
             "source_title": "Not Quite White",
             "pdf_page": 99,
             "logical_page": "85",
@@ -9631,11 +9631,11 @@ class PipelineCoreTests(unittest.TestCase):
             "section": "",
         }
         title = pipeline.native_segment_title(row, include_heading=True)
-        self.assertEqual(title, "wray-p99-lp85-ln12-18-s00332-ch03")
+        self.assertEqual(title, "sample-author-p99-lp85-ln12-18-s00332-ch03")
 
     def test_native_page_parent_title_omits_child_segment_number(self):
         row = {
-            "source_short_label": "Wray",
+            "source_short_label": "Sample Author",
             "source_title": "Not Quite White",
             "pdf_page": 99,
             "logical_page": "85",
@@ -9645,11 +9645,11 @@ class PipelineCoreTests(unittest.TestCase):
             "section": "",
         }
         title = pipeline.native_page_parent_title(row, include_heading=True)
-        self.assertEqual(title, "wray-p99-lp85-page-parent-ch03")
+        self.assertEqual(title, "sample-author-p99-lp85-page-parent-ch03")
 
     def test_native_segment_title_uses_a_page_range_for_unsegmented_content(self):
         row = {
-            "source_short_label": "Wray",
+            "source_short_label": "Sample Author",
             "source_title": "Not Quite White",
             "pdf_page": 10,
             "pdf_page_end": 21,
@@ -9662,7 +9662,7 @@ class PipelineCoreTests(unittest.TestCase):
         }
         self.assertEqual(
             pipeline.native_segment_title(row, include_heading=True),
-            "wray-p10-21-lp1-s00001",
+            "sample-author-p10-21-lp1-s00001",
         )
 
     def test_make_segments_page_mode_keeps_one_segment_per_page(self):
@@ -10067,7 +10067,7 @@ class PipelineCoreTests(unittest.TestCase):
         payloads = [
             {
                 "metadata": {
-                    "title": "Wray -- pdf-p0099 -- logical-p85 -- page-parent",
+                    "title": "Sample Author -- pdf-p0099 -- logical-p85 -- page-parent",
                     "description": "PDF page: 99. Logical page: 85.",
                     "chunkSource": "page-parent://source-1::pdf-p0099",
                 }
@@ -10076,7 +10076,7 @@ class PipelineCoreTests(unittest.TestCase):
         needles = pipeline.expected_upload_needles(payloads, source_sha="abcdef1234567890")
         self.assertIn("abcdef1234567890", needles)  # pragma: allowlist secret -- fixed test needle
         self.assertIn("page-parent://source-1::pdf-p0099", needles)
-        self.assertTrue(any("Wray" in needle for needle in needles))
+        self.assertTrue(any("Sample Author" in needle for needle in needles))
 
     def test_upload_plan_rows_to_expected_payloads_preserves_native_metadata_fields(self):
         rows = [
@@ -10192,7 +10192,7 @@ class PipelineCoreTests(unittest.TestCase):
     def test_response_contains_page_segment_accepts_page_parent_page_only(self):
         payload = {
             "metadata": {
-                "title": "wray-p99-lp85-ln1-29-page-parent-ch03",
+                "title": "sample-author-p99-lp85-ln1-29-page-parent-ch03",
                 "description": "PDF page: 99. Logical page: 85.",
                 "chunkSource": "page-parent://source-1::pdf-p0099",
             }

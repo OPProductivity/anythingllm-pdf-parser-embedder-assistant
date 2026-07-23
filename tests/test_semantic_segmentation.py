@@ -68,12 +68,12 @@ def test_transition_detects_and_reconstructs_hyphenated_page_boundary():
         "nant at that time. Turner reasoned that the frontier mattered.",
         64,
         65,
-        "wray",
+        "sample-author",
     )
 
     assert row["continuation_detected"] is True
     assert "dominant at that time." in row["reconstructed_text"]
-    assert row["boundary_id"] == "wray-b064-065-tr01"
+    assert row["boundary_id"] == "sample-author-b064-065-tr01"
     assert row["upload_eligible"] is False
 
 
