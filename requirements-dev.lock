@@ -1,0 +1,18 @@
+# Development and verification tools. Install with:
+#   python -m pip install -r requirements-dev.lock
+-r requirements.lock
+
+pytest==9.0.3
+pytest-xdist==3.8.0
+pytest-timeout==2.4.0
+pytest-cov==7.1.0
+ruff==0.15.21
+pip-audit==2.10.1
+pyright==1.1.411
+pre-commit==4.6.0
+psutil==7.2.2
+bandit==1.9.4
+uv==0.11.28
+pytest-playwright==0.8.0
+playwright==1.61.0
+detect-secrets==1.5.0

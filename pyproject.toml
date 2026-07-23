@@ -1,0 +1,91 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "anythingllm-pdf-assistant"
+version = "0.5.0"
+description = "Local PDF preparation and AnythingLLM desktop upload assistant"
+readme = "README.md"
+requires-python = ">=3.11,<3.15"
+dependencies = [
+  "gradio==6.19.0",
+  "PyMuPDF==1.27.2.3",
+  "pymupdf4llm==1.27.2.3",
+  "unstructured[pdf]==0.18.32",
+  "unstructured-inference==1.2.0",
+  "lancedb==0.33.0",
+  "pyarrow==24.0.0",
+  "numpy==2.4.6",
+  "pandas==3.0.3",
+  "pillow==12.3.0",
+  "pi-heif==1.4.0",
+  "pydantic==2.13.4",
+  "requests==2.34.2",
+]
+
+[project.scripts]
+anythingllm-pdf-assistant = "anythingllm_pdf_assistant_cli:main"
+
+[tool.setuptools]
+py-modules = [
+  "anythingllm_compatibility",
+  "anythingllm_document_sync_findings",
+  "anythingllm_pdf_assistant_cli",
+  "anythingllm_persistence",
+  "anythingllm_state",
+  "auto_anythingllm_pipeline",
+  "cancellable_preparation_worker",
+  "embedder_capabilities",
+  "orchestration",
+  "portable_paths",
+  "post_upload_polling",
+  "preflight",
+  "rag_pdf_gradio_app",
+  "rag_pdf_tools",
+  "run_control",
+  "run_request",
+  "segmentation_policy",
+  "semantic_segmentation",
+  "structured_logging",
+  "validation_contract",
+]
+
+[tool.setuptools.data-files]
+"share/anythingllm-pdf-assistant" = ["Install-AnythingLLMDesktopRefreshBridge.ps1", "VERSION"]
+"share/anythingllm-pdf-assistant/assets" = ["assets/pdf-icon.svg"]
+
+[tool.ruff]
+target-version = "py314"
+extend-exclude = ["tmp", "tmp-output", ".venv", "build"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.coverage.run]
+branch = true
+source = [
+  "anythingllm_compatibility",
+  "anythingllm_persistence",
+  "anythingllm_state",
+  "auto_anythingllm_pipeline",
+  "benchmarks",
+  "orchestration",
+  "post_upload_polling",
+  "preflight",
+  "rag_pdf_gradio_app",
+  "rag_pdf_tools",
+  "run_control",
+  "run_request",
+  "segmentation_policy",
+  "semantic_segmentation",
+  "structured_logging",
+  "validation_contract",
+]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+fail_under = 63
+precision = 1
+skip_empty = true
+show_missing = true

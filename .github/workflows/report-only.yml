@@ -1,0 +1,30 @@
+name: Supplemental security report
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  report:
+    name: Non-blocking supplemental report
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: |
+            requirements.lock
+            requirements-dev.lock
+      - name: Install development dependencies
+        run: python -m pip install -r requirements-dev.lock
+      - name: Scoped security report
+        continue-on-error: true
+        run: python -m bandit -q -r . -x tests,tmp,tmp-output,build,.venv
+      - name: Report-only reminder
+        if: always()
+        run: echo "This is a manual supplemental report. The deterministic quality gate runs on every push and pull request; Desktop bridge, browser, dependency audit, and broader security checks remain opt-in." >> "$GITHUB_STEP_SUMMARY"

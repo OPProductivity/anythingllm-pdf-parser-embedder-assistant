@@ -1,0 +1,36 @@
+name: Deterministic quality gate
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deterministic-checks:
+    name: Offline regression gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: |
+            requirements.lock
+            requirements-dev.lock
+      - name: Install development dependencies
+        run: python -m pip install -r requirements-dev.lock
+      - name: Ruff
+        run: python -m ruff check --force-exclude .
+      - name: Core type checks
+        run: python -m pyright
+      - name: Offline deterministic tests
+        run: python -m pytest -m offline_deterministic -q
+      - name: Tracked-file secret scan
+        run: git ls-files -z | xargs -0 detect-secrets-hook --baseline .secrets.baseline
+
+# Live AnythingLLM/Desktop, browser, and paid-provider acceptance are intentionally
+# excluded: each needs local mutable state or explicit owner authorization.

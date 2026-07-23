@@ -1,0 +1,15 @@
+# Reproducible runtime dependencies for a pipx installation.
+# The package metadata in pyproject.toml is the canonical install contract.
+gradio==6.19.0
+PyMuPDF==1.27.2.3
+pymupdf4llm==1.27.2.3
+unstructured[pdf]==0.18.32
+unstructured-inference==1.2.0
+lancedb==0.33.0
+pyarrow==24.0.0
+numpy==2.4.6
+pandas==3.0.3
+pillow==12.3.0
+pi-heif==1.4.0
+pydantic==2.13.4
+requests==2.34.2

@@ -1,0 +1,14 @@
+# Keep source and repository configuration stable across Windows and CI.
+# Existing files are deliberately not mass-normalized in this policy commit.
+* text=auto
+.gitattributes text eol=lf
+
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+VERSION text eol=lf
+
+# PowerShell scripts remain idiomatic for their Windows-first execution host.
+*.ps1 text eol=crlf

@@ -1,0 +1,17 @@
+{
+  "include": [
+    "anythingllm_compatibility.py",
+    "anythingllm_persistence.py",
+    "anythingllm_state.py",
+    "auto_anythingllm_pipeline.py",
+    "post_upload_polling.py",
+    "rag_pdf_tools.py",
+    "run_control.py",
+    "segmentation_policy.py",
+    "semantic_segmentation.py"
+  ],
+  "exclude": [".venv", "tmp", "tmp-output", "build"],
+  "typeCheckingMode": "basic",
+  "reportMissingImports": "none",
+  "reportMissingTypeStubs": "none"
+}

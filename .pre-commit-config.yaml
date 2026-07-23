@@ -1,0 +1,31 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-json
+      - id: check-yaml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: detect-private-key
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: Ruff source checks
+        entry: ruff check --force-exclude
+        language: python
+        additional_dependencies: [ruff==0.15.21]
+        types: [python]
+      - id: typecheck-core
+        name: Core production type checks
+        entry: pyright
+        language: python
+        additional_dependencies: [pyright==1.1.411]
+        pass_filenames: false
+        types: [python]
+      - id: detect-secrets
+        name: Secret scan
+        entry: detect-secrets-hook
+        language: python
+        additional_dependencies: [detect-secrets==1.5.0]
+        types: [text]
+        args: [--baseline, .secrets.baseline]
