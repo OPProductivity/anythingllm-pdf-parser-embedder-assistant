@@ -7757,7 +7757,7 @@ class PipelineCoreTests(unittest.TestCase):
     def test_runtime_validation_selects_distinct_body_rich_pages_over_ocr_letterhead(self):
         payloads = [
             {
-                "textContent": "ANNA UNIVERSITY PHONE 22358488 22358654 600025 9840146642",
+                "textContent": "EXAMPLE UNIVERSITY CONTACT DETAILS 00000000 00000000 000000",
                 "metadata": {"title": "letter p1 s00001", "chunkSource": "segment://letter_p0001_s00001"},
             },
             {
@@ -8411,7 +8411,7 @@ class PipelineCoreTests(unittest.TestCase):
             document = pipeline.fitz.open()
             for page_number in range(1, 5):
                 page = document.new_page(width=612, height=792)
-                header = "Ricky Mullins & Brooke Mullins" if page_number % 2 else "Book Review: Everybody Lives Near Appalachia"
+                header = "Sample Reviewer One & Sample Reviewer Two" if page_number % 2 else "Book Review: Example Public Book"
                 page.insert_text((36, 110), header, fontsize=11)
                 page.insert_text((565, 110), str(page_number), fontsize=11)
                 for line_number in range(12):
@@ -8429,8 +8429,8 @@ class PipelineCoreTests(unittest.TestCase):
             transformed, evidence = pipeline.apply_region_aware_native_layout(pdf_path, pages)
 
             for page in transformed:
-                self.assertNotIn("Ricky Mullins & Brooke Mullins", page["text"])
-                self.assertNotIn("Book Review: Everybody Lives Near Appalachia", page["text"])
+                self.assertNotIn("Sample Reviewer One & Sample Reviewer Two", page["text"])
+                self.assertNotIn("Book Review: Example Public Book", page["text"])
             self.assertGreaterEqual(evidence["removed_marginalia_count"], 8)
 
     def test_region_aware_layout_excludes_verified_outer_margin_annotations(self):
@@ -9349,10 +9349,10 @@ class PipelineCoreTests(unittest.TestCase):
             [
                 {
                     "page": 1,
-                    "text": "Not Quite White\n\nby Sample Author\n\nDuke University Press",
+                    "text": "Example Book\n\nby Sample Author\n\nExample University Press",
                 }
             ],
-            title_hint="Not Quite White",
+            title_hint="Example Book",
         )
         self.assertEqual(report["author"], "Sample Author")
         self.assertIn(report["source"], {"text_byline", "text_role_followup"})
@@ -9362,24 +9362,24 @@ class PipelineCoreTests(unittest.TestCase):
             [{
                 "page": 1,
                 "text": (
-                    "Everybody Lives Near Appalachia: Examining Hillbilly Elegy's Impact\n"
-                    "Ricky Mullins, The University of Virginia's College at Wise\n"
-                    "Brooke Mullins, The University of Virginia's College at Wise\n"
-                    "Book Reviewed: Hillbilly Elegy, by J. D. Vance\n"
+                    "Example Review: Examining a Public Book's Impact\n"
+                    "Alex Harper, Example University\n"
+                    "Jordan Lee, Example University\n"
+                    "Book Reviewed: Example Public Book, by Example Writer\n"
                 ),
             }],
-            title_hint="Everybody Lives Near Appalachia",
+            title_hint="Example Review: Examining a Public Book's Impact",
         )
-        self.assertEqual(report["author"], "Ricky Mullins, Brooke Mullins")
+        self.assertEqual(report["author"], "Alex Harper, Jordan Lee")
         self.assertEqual(report["source"], "text_affiliated_byline")
 
     def test_author_inference_accepts_parenthetical_researcher_affiliation(self):
         report = pipeline.infer_author_from_text_samples(
             [{
                 "page": 1,
-                "text": "Moving Beyond Appalachia: Social Mobility\nSample Researcher (Independent researcher)\nAbstract. This paper...",
+                    "text": "Example Research Topic\nSample Researcher (Independent researcher)\nAbstract. This paper...",
             }],
-            title_hint="Moving Beyond Appalachia: Social Mobility",
+            title_hint="Example Research Topic",
         )
         self.assertEqual(report["author"], "Sample Researcher")
         self.assertEqual(report["source"], "text_affiliated_byline")
@@ -9518,13 +9518,12 @@ class PipelineCoreTests(unittest.TestCase):
                 {
                     "page": 1,
                     "text": (
-                        "Administrative Theory & Praxis\n"
-                        "ISSN: 1084-1806 (Print) 1949-0461 (Online) Journal homepage: www.tandfonline.com/journals/madt20\n"
-                        "Hillbilly Elegy: Deconstructing J. D. Vance's Views\n"
-                        "on Government Intervention, Merit, Outlaws, and\n"
-                        "Slackers\n"
-                        "Kenneth Oldfield\n"
-                        "To cite this article: Kenneth Oldfield (2018) Hillbilly Elegy...\n"
+                        "Example Journal\n"
+                        "ISSN: 0000-0000 (Print) 0000-0000 (Online) Journal homepage: www.example.test/journal\n"
+                        "Example Book: A Review of Public Ideas\n"
+                        "on Policy, Merit, and Community\n"
+                        "Sample Reviewer\n"
+                        "To cite this article: Sample Reviewer (2018) Example Book...\n"
                         "Published online: 07 Aug 2018.\n"
                         "Submit your article to this journal\n"
                         "Article views: 585\n"
@@ -9533,9 +9532,9 @@ class PipelineCoreTests(unittest.TestCase):
                     ),
                 }
             ],
-            title_hint="Hillbilly Elegy: Deconstructing J. D. Vance's Views on Government Intervention, Merit, Outlaws, and Slackers",
+            title_hint="Example Book: A Review of Public Ideas on Policy, Merit, and Community",
         )
-        self.assertEqual(report["author"], "Kenneth Oldfield")
+        self.assertEqual(report["author"], "Sample Reviewer")
         self.assertIn(report["source"], {"text_top_block_names", "text_role_followup"})
 
     def test_author_inference_reads_instructor_label(self):
@@ -9544,15 +9543,15 @@ class PipelineCoreTests(unittest.TestCase):
                 {
                     "page": 1,
                     "text": (
-                        "Capitalism and the Environment in Latin America\n"
+                        "Example Course Reading List\n"
                         "Annotated Bibliography Assignment\n"
-                        "Instructor: Dr. Ian Merkel (i.w.merkel@rug.nl)\n"
+                        "Instructor: Dr. Example Instructor (instructor@example.edu)\n"
                     ),
                 }
             ],
             title_hint="Annotated Bibliography Assignment",
         )
-        self.assertEqual(report["author"], "Dr. Ian Merkel")
+        self.assertEqual(report["author"], "Dr. Example Instructor")
         self.assertEqual(report["source"], "text_instructor_label")
 
     def test_author_inference_reads_author_s_label(self):
@@ -9561,24 +9560,24 @@ class PipelineCoreTests(unittest.TestCase):
                 {
                     "page": 1,
                     "text": (
-                        "The Amazon Rubber Boom\n"
-                        "Author(s): Oliver T. Coomes and Bradford L. Barham\n"
+                        "Example Research Article\n"
+                        "Author(s): Alex Harper and Jordan Lee\n"
                         "Source: Example Journal\n"
                     ),
                 }
             ],
-            title_hint="The Amazon Rubber Boom",
+            title_hint="Example Research Article",
         )
-        self.assertIn("Oliver T. Coomes", report["author"])
-        self.assertIn("Bradford L. Barham", report["author"])
+        self.assertIn("Alex Harper", report["author"])
+        self.assertIn("Jordan Lee", report["author"])
         self.assertEqual(report["source"], "text_author_label")
 
     def test_author_inference_can_fallback_to_filename(self):
         report = pipeline.infer_author_from_filename(
-            Path("The Devil and Commodity Fetishism - Michael T. Taussig.pdf"),
-            title_hint="The Devil and Commodity Fetishism",
+            Path("Example Document - Sample Author.pdf"),
+            title_hint="Example Document",
         )
-        self.assertEqual(report["author"], "Michael T. Taussig")
+        self.assertEqual(report["author"], "Sample Author")
         self.assertEqual(report["source"], "filename_author_fallback")
 
     def test_author_inference_uses_title_page_name_before_copyright_byline(self):
@@ -9587,25 +9586,25 @@ class PipelineCoreTests(unittest.TestCase):
                 {
                     "page": 3,
                     "text": (
-                        "Not Quite White\n"
-                        "WHITE TRASH and the\n"
-                        "BOUNDARIES of WHITENESS\n"
+                        "Example Book\n"
+                        "AN EXAMPLE TITLE AND\n"
+                        "ITS SAMPLE SUBTITLE\n"
                         "Sample Author\n"
-                        "Duke University Press   Durham and London   2006\n"
+                        "Example University Press   Example City   2006\n"
                     ),
                 },
                 {
                     "page": 4,
                     "text": (
-                        "© 2006 Duke University Press\n"
+                        "© 2006 Example University Press\n"
                         "All rights reserved\n"
-                        "Designed by C. H. Westmoreland\n"
-                        "Typeset in Minion with ITC Stone display\n"
-                        "by Tseng Information Systems, Inc.\n"
+                        "Designed by Example Designer\n"
+                        "Typeset in Example Typeface\n"
+                        "by Example Typesetting Service\n"
                     ),
                 },
             ],
-            title_hint="Not Quite White: White Trash and the Boundaries of Whiteness",
+            title_hint="Example Book: An Example Title and Its Sample Subtitle",
         )
         self.assertEqual(report["author"], "Sample Author")
         self.assertEqual(report["source"], "text_top_block_names")
@@ -12301,8 +12300,8 @@ class PipelineCoreTests(unittest.TestCase):
 
     def test_prepared_pdf_text_filename_is_source_named_and_windows_safe(self):
         self.assertEqual(
-            pipeline.parsed_pdf_text_filename(Path("Oldfield: Hillbilly Elegy? 2018.pdf")),
-            "Oldfield-Hillbilly-Elegy-2018-pdf-parsed.txt",
+            pipeline.parsed_pdf_text_filename(Path("Sample Review: Example Book? 2018.pdf")),
+            "Sample-Review-Example-Book-2018-pdf-parsed.txt",
         )
         self.assertEqual(
             pipeline.parsed_pdf_text_filename(Path("CON.pdf")),

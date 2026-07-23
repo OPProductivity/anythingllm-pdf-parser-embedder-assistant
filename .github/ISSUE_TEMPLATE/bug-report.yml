@@ -1,0 +1,39 @@
+name: Bug report
+description: Report a reproducible problem without sharing sensitive documents or credentials.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include API keys, tokens, private PDFs, workspace contents, personal paths, or AnythingLLM storage archives.
+  - type: input
+    id: version
+    attributes:
+      label: Assistant version
+      placeholder: "0.5.0"
+    validations:
+      required: true
+  - type: input
+    id: anythingllm
+    attributes:
+      label: AnythingLLM Desktop version
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Output mode
+      options:
+        - Create local files only
+        - Create local files without logs
+        - Create local files and upload to AnythingLLM
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction and observed result
+      description: Use a small non-sensitive PDF or describe its characteristics only.
+    validations:
+      required: true

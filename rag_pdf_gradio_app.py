@@ -10537,7 +10537,7 @@ def ocr_runtime_surcharge_seconds(estimate, history=None, observed_pages=0):
     segment_mode = str(features.get("segment_mode") or "")
     # A local-only OCR record measures extraction/packaging.  An upload record
     # also includes AnythingLLM's embedding queue.  Mixing them was the source
-    # of the 819s -> 4,161s local-run jump observed in the Downloads audit.
+    # of a large, misleading jump in a historical local timing sample.
     matching_per_page = [
         float(row.get("actual_seconds") or 0) / max(1, int(row.get("page_count") or 0))
         for row in (history or [])
@@ -10594,7 +10594,7 @@ def recalibrated_run_eta_seconds(
     # The first accepted native request commonly includes connection/setup
     # work that is not representative of the remaining hundreds of batches.
     # A three-sample 75th percentile made that cold request dominate the ETA
-    # and produced an immediate 116m -> 157m jump on a healthy Downloads run.
+    # and produced a large early jump on a healthy local run.
     # Use the robust middle cadence; after four observations, drop the cold
     # request entirely. Slow sustained service is still reflected because the
     # median rises only when multiple completed batches are actually slow.

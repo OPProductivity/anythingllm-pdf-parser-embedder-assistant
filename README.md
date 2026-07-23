@@ -1,52 +1,140 @@
 # AnythingLLM PDF Parser Embedder Assistant
 
-Local PDF preparation, page-aware segmentation, and optional upload to a
-locally running AnythingLLM Desktop instance.
+**Local PDF-to-text, OCR, page-aware chunking, and AnythingLLM Desktop upload
+automation for retrieval-augmented generation (RAG).**
 
-## Install
+This Windows-friendly assistant turns one PDF, a selected batch, or a folder of
+PDFs into clean text files and optionally sends the prepared records to a local
+AnythingLLM Desktop workspace. It is designed for people who want auditable,
+page-based PDF retrieval instead of losing the source page during document
+preparation.
 
-Install Python 3.11–3.14 and pipx, then install the application from a local
-checkout during development:
+It supports native-text PDFs, optional OCR and Unstructured extraction, whole
+documents, whole-page chunks, automatically page-preserved records, and shorter
+page-local passages. It can prepare files locally or complete the local
+AnythingLLM upload-and-embedding workflow.
+
+> **AI-assisted disclosure:** this project was completely vibe-coded through
+> iterative AI-assisted development. Treat it as beta software: review the
+> generated outputs and test it with your own AnythingLLM configuration before
+> using it for consequential work.
+
+> **Use at your own risk.** This software is provided under the MIT License,
+> without warranty of any kind. It is not affiliated with, endorsed by, or
+> supported by Mintplex Labs or AnythingLLM.
+
+## Why use it?
+
+- Preserve page provenance for PDF citations in RAG answers.
+- Convert PDFs into explicit, inspectable text records before embedding.
+- Choose a segmentation strategy that fits retrieval quality and speed.
+- Prepare and upload a single PDF, several selected PDFs, or a batch folder.
+- Keep local-only workflows available when you do not want to upload anything.
+- Detect extraction, OCR, embedding, workspace, and retrieval failures with
+  separate readiness messages.
+- Use the optional desktop refresh bridge to make AnythingLLM Desktop reflect
+  completed document changes more reliably.
+
+AnythingLLM supports multiple document types, including PDFs. This assistant
+intentionally prepares text records because controlling the text record and its
+page metadata gives page-aware retrieval a clear, inspectable boundary.
+
+## What it does
+
+```mermaid
+flowchart LR
+    PDF["PDF or PDF batch"] --> Inspect["Inspect text layer and metadata"]
+    Inspect --> Extract["Native extraction or OCR / Unstructured"]
+    Extract --> Segment["Choose whole file, page-aware, or page-local segments"]
+    Segment --> Local["Local text output"]
+    Segment --> Upload["AnythingLLM Desktop workspace"]
+    Upload --> Verify["Storage, vector, and retrieval checks"]
+```
+
+### Output modes
+
+| Mode | Result |
+| --- | --- |
+| **Create local files only** | Parsed transcript and selected segments with run evidence. |
+| **Create local files without logs** | A compact output folder containing only the parsed transcript and text segments. |
+| **Create local files and upload to AnythingLLM** | Local output plus workspace upload, embedding queue submission, and post-upload checks. |
+
+### Segmentation choices
+
+- **All in one file:** one text record for the entire PDF.
+- **Whole-page chunks:** one record for each extracted page.
+- **Page – preserve automatically:** page-addressable records, with page-local
+  splitting only where necessary to fit the effective upload boundary.
+- **Shorter page-local passages:** smaller page-addressable passages for more
+  granular retrieval.
+
+The app reports what it observed. It does not claim that an AnythingLLM document
+drawer view alone proves retrieval readiness; storage, vectors, and runtime
+retrieval are separate checks.
+
+## Quick start
+
+### Requirements
+
+- Windows 10/11
+- Python 3.11–3.14
+- [pipx](https://pipx.pypa.io/)
+- [AnythingLLM Desktop](https://anythingllm.com/desktop) running locally when
+  you use the upload mode
+- An embedding provider configured and working in AnythingLLM Desktop
+
+### Install from GitHub
 
 ```powershell
 py -m pip install --user pipx
 py -m pipx ensurepath
-pipx install .
+pipx install git+https://github.com/OPProductivity/anythingllm-pdf-parser-embedder-assistant.git
 ```
 
-For a published Git repository, the equivalent command is:
-
-```powershell
-pipx install git+https://github.com/USERNAME/anythingllm-pdf-assistant.git
-```
-
-Start the app and open its local URL:
+Close and reopen PowerShell if `pipx ensurepath` changed your PATH. Then start
+the local app:
 
 ```powershell
 anythingllm-pdf-assistant start --browser
 ```
 
-Use `anythingllm-pdf-assistant doctor` to check writable locations and port
-availability, or `anythingllm-pdf-assistant paths` to show the current user's
-data directory.
+The app opens at `http://127.0.0.1:7860`. Use these diagnostics if needed:
 
-## Local data and credentials
+```powershell
+anythingllm-pdf-assistant doctor
+anythingllm-pdf-assistant paths
+```
 
-The installed Python package is not used as a data folder. Generated output,
-logs, timing observations, and optional local configuration are created under:
+For a development checkout, clone the repository and run `pipx install .` in
+the repository root instead.
 
-`%LOCALAPPDATA%\AnythingLLM PDF Parser Embedder Assistant`
+## How to use the app
 
-Set `ANYTHINGLLM_PDF_ASSISTANT_HOME` before launching to use another writable
-location, for example a portable drive. API keys are intentionally not bundled
-or committed. Configure provider credentials in AnythingLLM Desktop itself.
+1. Start AnythingLLM Desktop and confirm that its embedding provider works.
+2. Start this assistant with `anythingllm-pdf-assistant start --browser`.
+3. Upload a PDF, choose several PDFs, or select a batch folder.
+4. Review the detected PDF metadata and set title/author information if needed.
+5. Select an output mode and a segmentation mode.
+6. For upload mode, choose an existing workspace or create a new one.
+7. Confirm the settings. The app creates local outputs before changing the
+   AnythingLLM workspace.
+8. Review the completion state and the generated output folder. For upload
+   runs, distinguish local preparation, document storage, vector observation,
+   and retrieval evidence in the run report.
 
-## Optional Desktop refresh bridge
+For a detailed walkthrough, see [docs/USAGE.md](docs/USAGE.md).
 
-The optional bridge modifies the installed AnythingLLM Desktop archive only
-after validating exact supported anchors and first makes a timestamped backup.
-Close AnythingLLM Desktop before installing, upgrading, or uninstalling it;
-validation is read-only and can be run while Desktop is open.
+## AnythingLLM integration
+
+The upload workflow uses AnythingLLM's local HTTP APIs and its documented
+workspace/document model where available. It deliberately keeps provider keys
+inside AnythingLLM Desktop: no provider API key is read from, stored in, or
+committed by this repository.
+
+The optional refresh bridge is a separate, opt-in desktop integration. It
+patches the installed desktop archive only after validating known anchors and
+creating a timestamped backup. Close AnythingLLM Desktop before changing the
+bridge.
 
 ```powershell
 anythingllm-pdf-assistant bridge validate
@@ -54,10 +142,41 @@ anythingllm-pdf-assistant bridge install
 anythingllm-pdf-assistant bridge uninstall
 ```
 
-The installer automatically locates the normal Desktop resources directory;
-use `--resources-path` only for a non-standard installation.
+See [docs/ANYTHINGLLM-INTEGRATION.md](docs/ANYTHINGLLM-INTEGRATION.md) before
+using the bridge or relying on a workspace for citations.
 
-## Before public release
+## Local data, privacy, and safety
 
-Choose and add a license appropriate for the intended release. Do not commit
-`.env` files, AnythingLLM Desktop storage, run outputs, logs, or provider keys.
+- Generated output, logs, and local configuration live under
+  `%LOCALAPPDATA%\AnythingLLM PDF Parser Embedder Assistant` by default.
+- Set `ANYTHINGLLM_PDF_ASSISTANT_HOME` before launching to use another writable
+  location, including a portable drive.
+- Your PDFs remain local unless you choose AnythingLLM upload. Your configured
+  AnythingLLM embedding provider may send text to the provider you selected;
+  check that provider's policy before uploading sensitive material.
+- Never commit `.env` files, AnythingLLM Desktop storage, run output, logs,
+  private PDFs, API keys, or desktop backups.
+- This project is not a security boundary, legal advice, a backup system, or a
+  guarantee that any answer produced by an LLM is correct.
+
+## Development
+
+```powershell
+py -m pip install -e .
+py -m pytest -q
+py -m pre_commit run --all-files
+```
+
+Contributions, bug reports, and reproducible test cases are welcome. Read
+[CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md) first.
+
+## Related projects and official references
+
+- [AnythingLLM](https://github.com/Mintplex-Labs/anything-llm)
+- [AnythingLLM documentation](https://docs.anythingllm.com/)
+- AnythingLLM's local developer API documentation at `http://127.0.0.1:3001/api/docs`
+- [pipx documentation](https://pipx.pypa.io/)
+
+## License
+
+MIT. See [LICENSE](LICENSE).
