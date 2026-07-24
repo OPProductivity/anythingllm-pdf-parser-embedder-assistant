@@ -79,8 +79,8 @@ py-modules = [
 ]
 
 [tool.setuptools.data-files]
-"share/anythingllm-pdf-assistant" = ["Install-AnythingLLMDesktopRefreshBridge.ps1", "VERSION"]
-"share/anythingllm-pdf-assistant/assets" = ["assets/pdf-icon.svg"]
+"share/anythingllm-pdf-assistant" = ["Install-AnythingLLMDesktopRefreshBridge.ps1", "Install-AnythingLLMPdfAssistant.ps1", "VERSION"]
+"share/anythingllm-pdf-assistant/assets" = ["assets/pdf-icon.svg", "assets/anythingllm-pdf-assistant-start.ico", "assets/anythingllm-pdf-assistant-stop.ico"]
 
 [tool.ruff]
 target-version = "py314"

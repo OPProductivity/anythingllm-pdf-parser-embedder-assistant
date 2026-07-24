@@ -271,7 +271,7 @@ ANYTHINGLLM_EMBEDDER_ENGINE_CHOICES = [
     "localai",
     "lemonade",
 ]
-APP_ICON = package_resource_path("assets/pdf-icon.svg")
+APP_ICON = package_resource_path("assets/anythingllm-pdf-assistant-start.ico")
 APP_THEME = gr.themes.Soft(primary_hue="blue", neutral_hue="slate")
 LAST_SIMULATION_DIAGNOSTICS = {}
 LAST_TIMING_ESTIMATE = {}
@@ -12386,7 +12386,7 @@ def parse_native_upload_custom_range(value, maximum=None):
     """
     text = str(value or "").strip()
     if not text:
-        raise ValueError("Enter at least one prepared-record number or range.")
+        raise ValueError("Enter at least one PDF page number or range.")
     selected = set()
     for part in text.split(","):
         token = part.strip()
@@ -12396,10 +12396,10 @@ def parse_native_upload_custom_range(value, maximum=None):
         start = int(match.group(1))
         end = int(match.group(2) or start)
         if start < 1 or end < start:
-            raise ValueError(f"Invalid range '{token}'. Record numbers start at 1.")
+            raise ValueError(f"Invalid range '{token}'. PDF page numbers start at 1.")
         if maximum is not None and end > int(maximum):
             raise ValueError(
-                f"Range '{token}' exceeds the {int(maximum)} prepared records available for this run."
+                f"Range '{token}' exceeds the {int(maximum)} PDF pages available for this run."
             )
         selected.update(range(start, end + 1))
     return tuple(sorted(selected))

@@ -9,11 +9,11 @@ uploading PDF files, and uses .TXT or .JSON. Optionally split files into one or 
 the prepared records in a subfolder to your local AnythingLLM Desktop workspace installed on the user's pc. It is designed for people who want
 to more easily work with PDFs inside AnythingLLM. You can also create local files only (only parse/perform OCR) to automatically convert PDFs to TXT and then upload to AnythingLLM manually. The advantage is that this software works with existing PDF metadata and bookmarks and can also recognize title pages, content index, bibliography and more (which can be excluded) and can also perform OCR on only a subset (5 out of 20 pages only need OCR).
 Doing this automatically or in batch mode is faster than manually creating  workspaces and uploading and embedding pdf files.
-Depending on whether you use local ollama embedders, or openrouter embedders via api key, this can be done under half a minute per pdf. 
+Depending on whether you use local ollama embedders, or openrouter embedders via api key, this can be done under half a minute per pdf.
 The app communicates with AnythingLLM settings and workspaces through the official AnythingLLM API key. Be sure to vet the codebase of this app (manually or using AI) to see if it complies with your own data processing protocols, as it will be able to make embedding decisions using local python scripts. The app operates via a localhost structure at port 7860 (http://127.0.0.1:7860/) and is a completely local app. But it uses the AnythingLLM app to send PDFs to local embedders (privacy-friendly) or cloud embedder providers (different data processing policies) using the provided (default) settings and the settings you have made personally in the AnythingLLM app. Start up AnythingLLM before using the app.
 
-AnythingLLM PDF Parser Embedder Assistant supports parsing native-text PDFs, PDFs that need OCR (using Tesseract) for all 
-pages or a subset of pages, and can also use the Unstructured library for text extraction 
+AnythingLLM PDF Parser Embedder Assistant supports parsing native-text PDFs, PDFs that need OCR (using Tesseract) for all
+pages or a subset of pages, and can also use the Unstructured library for text extraction
 from tables and documents with complex layout. It can do whole documents, whole-page chunks, automatically page-preserved records, and shorter
 page-local passages and can do a custom range of pages or all pages.
 
@@ -111,11 +111,42 @@ retrieval are separate checks.
 ### Installation
 
 ## Install the app directly from this Github Repository to your Windows PC:
+Run the repository's Windows installer. It installs the pipx package and
+creates **Start AnythingLLM PDF Assistant** and **Stop AnythingLLM PDF
+Assistant** shortcuts on the current user's Desktop.
+
+```powershell
+git clone https://github.com/OPProductivity/anythingllm-pdf-parser-embedder-assistant.git
+Set-Location anythingllm-pdf-parser-embedder-assistant
+.\Install-AnythingLLMPdfAssistant.ps1
+```
+
+The installer uses the packaged Start/Stop icons and points both shortcuts at
+the installed pipx environment. It installs all Python packages declared by
+this project through pipx. If Python 3.11–3.14 is missing, it asks before
+offering a per-user Python 3.14 installation through `winget`; it never
+installs Python without that confirmation. System applications such as
+AnythingLLM Desktop, Git, and optional OCR tools remain user-managed. When the
+installer cannot detect AnythingLLM Desktop or Tesseract, it explains why the
+component is needed and asks before opening its official installation page.
+To repair the shortcuts later, run:
+
+```powershell
+anythingllm-pdf-assistant shortcuts repair
+```
+
+Manual `pipx` installation remains supported for users who already manage
+Python and `pipx` themselves:
+
 ```powershell
 py -m pip install --user pipx
 py -m pipx ensurepath
 pipx install git+https://github.com/OPProductivity/anythingllm-pdf-parser-embedder-assistant.git
+anythingllm-pdf-assistant shortcuts repair
 ```
+
+The app also repairs the Start/Stop shortcuts automatically when it is first
+started on Windows.
 
 Close and reopen PowerShell if `pipx ensurepath` changed your PATH. Then start
 the local app:
@@ -131,8 +162,8 @@ anythingllm-pdf-assistant doctor
 anythingllm-pdf-assistant paths
 ```
 
-For a development checkout, clone the repository and run `pipx install .` in
-the repository root instead.
+For a development checkout, run `pipx install .` in the repository root and
+then `anythingllm-pdf-assistant shortcuts repair`.
 
 ## How to use the app
 
@@ -276,14 +307,3 @@ Start:
 <img width="1920" height="1072" alt="image" src="https://github.com/user-attachments/assets/33122e8a-283a-47ef-b4de-3dce923da9c2" />
 
 <img width="897" height="962" alt="image" src="https://github.com/user-attachments/assets/1f158773-c327-467a-b6db-350f44366bf7" />
-
-
-
-
-
-
-
-
-
-
-

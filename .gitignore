@@ -28,3 +28,4 @@ tests/test_benchmark_contract.py
 tests/test_benchmark_utilities.py
 *.ps1
 !Install-AnythingLLMDesktopRefreshBridge.ps1
+!Install-AnythingLLMPdfAssistant.ps1

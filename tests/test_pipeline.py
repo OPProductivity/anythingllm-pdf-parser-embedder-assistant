@@ -7744,6 +7744,7 @@ class PipelineCoreTests(unittest.TestCase):
                 [payload],
                 1,
                 Path("unused"),
+                include_chat_probe=True,
             )
         finally:
             pipeline.read_workspace_model_gate = original_gate
@@ -7753,6 +7754,44 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertTrue(
             result["chat_check"]["response_contains_expected_page_segment"]
         )
+
+    def test_runtime_native_validation_uses_vector_provenance_without_chat_by_default(self):
+        payload = {
+            "textContent": "Distinctive passage about page-aware retrieval.",
+            "metadata": {
+                "title": "Reference Work | p7 | s00001",
+                "chunkSource": "segment://pdf_hash_p0007_s00001",
+            },
+        }
+        original_gate = pipeline.read_workspace_model_gate
+        original_post = pipeline.post_json_captured
+        original_probe = pipeline.verify_anythingllm_runtime_embedder
+        try:
+            pipeline.read_workspace_model_gate = lambda *args, **kwargs: {
+                "status": "pass", "chat_provider": "generic-openai", "chat_model": "deepseek-v4-pro"
+            }
+            pipeline.verify_anythingllm_runtime_embedder = lambda *args, **kwargs: {"status": "pass"}
+
+            def fake_post(url, body, **_kwargs):
+                self.assertTrue(url.endswith("/vector-search"))
+                return {
+                    "http_status": 200,
+                    "data": {"results": [{"metadata": dict(payload["metadata"])}]},
+                    "error": "",
+                }
+
+            pipeline.post_json_captured = fake_post
+            result = pipeline.validate_anythingllm_native_runtime(
+                "http://127.0.0.1:3001", "provided-key", "test", [payload], 1, Path("unused")
+            )
+        finally:
+            pipeline.read_workspace_model_gate = original_gate
+            pipeline.post_json_captured = original_post
+            pipeline.verify_anythingllm_runtime_embedder = original_probe
+
+        self.assertEqual(result["status"], "pass")
+        self.assertFalse(result["chat_probe_requested"])
+        self.assertEqual(result["chat_check"]["status"], "skipped_not_required")
 
     def test_runtime_validation_selects_distinct_body_rich_pages_over_ocr_letterhead(self):
         payloads = [
@@ -7853,7 +7892,8 @@ class PipelineCoreTests(unittest.TestCase):
 
             pipeline.post_json_captured = fake_post
             result = pipeline.validate_anythingllm_native_runtime(
-                "http://127.0.0.1:3001", "provided-key", "test", [payload], 1, Path("unused")
+                "http://127.0.0.1:3001", "provided-key", "test", [payload], 1, Path("unused"),
+                include_chat_probe=True,
             )
         finally:
             pipeline.read_workspace_model_gate = original_gate

@@ -11376,6 +11376,7 @@ def validate_anythingllm_native_runtime(
     storage_dir,
     upload_indices=None,
     embedder_probe_override=None,
+    include_chat_probe=False,
 ):
     embedder_probe = (
         dict(embedder_probe_override)
@@ -11391,7 +11392,8 @@ def validate_anythingllm_native_runtime(
         "embedder_probe": embedder_probe,
         "vector_checks": [],
         "vector_recheck_status": "not_needed",
-        "chat_check": {},
+        "chat_check": {"status": "skipped_not_required"},
+        "chat_probe_requested": bool(include_chat_probe),
         "authentication_mode": "provided_api_key" if api_key else "none",
         "temporary_key_cleanup": {"status": "not_applicable", "error": ""},
     }
@@ -11488,7 +11490,7 @@ def validate_anythingllm_native_runtime(
                 probe_kind = "natural_language_anchor"
             result["vector_checks"].append(execute_vector_check(payload, probe_index, probe_kind))
 
-        if selected_payloads:
+        if include_chat_probe and selected_payloads:
             expected = expected_page_segment_tokens(selected_payloads[0])
             prompt = (
                 "Using only the indexed sources, identify the PDF page "
@@ -11548,11 +11550,9 @@ def validate_anythingllm_native_runtime(
 
         # A successful sibling vector query establishes that the workspace is
         # searchable, while a timed-out sibling can simply have hit a cold
-        # provider/cache window. Recheck only those timed-out records *after*
-        # the chat phase has provided a natural settle interval. This is
-        # intentionally one extra, exact query per unresolved source: it is
-        # evidence recovery, not an unbounded retry loop and never re-submits
-        # any document for embedding.
+        # provider/cache window. Recheck only those timed-out records once.
+        # This is evidence recovery, not an unbounded retry loop and never
+        # re-submits any document for embedding.
         initial_vector_checks = list(result["vector_checks"])
         transient_classes = {"timeout", "connection", "transient_http"}
         if any(check.get("expected_in_top_n") for check in initial_vector_checks):
@@ -11567,7 +11567,7 @@ def validate_anythingllm_native_runtime(
                     recheck = execute_vector_check(
                         payload,
                         probe_index,
-                        f"{original.get('probe_kind') or 'vector'}_post_chat_recheck",
+                        f"{original.get('probe_kind') or 'vector'}_recheck",
                         max_attempts=1,
                         recheck_of=original.get("expected_chunk_source") or "",
                     )
@@ -11629,6 +11629,8 @@ def validate_anythingllm_native_runtime(
         result["status"] = "vector_runtime_timeout"
     elif not vector_pass:
         result["status"] = "vector_retrieval_failed"
+    elif not include_chat_probe:
+        result["status"] = "pass"
     elif chat_pass:
         result["status"] = "pass"
     elif "401" in chat_error or "invalid api key" in chat_error:
