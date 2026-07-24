@@ -3349,97 +3349,6 @@ class PipelineCoreTests(unittest.TestCase):
                 self.assertFalse(app.terminate_automatic_run_worker(run_root))
             taskkill.assert_not_called()
 
-    def test_cancel_queue_cleanup_uses_only_the_run_embedding_ledger(self):
-        import rag_pdf_gradio_app as app
-
-        original_resolve = app.resolve_anythingllm_api_key
-        original_remove = app.remove_workspace_embedding_queue_entries
-        original_observe = app.observe_workspace_embedding_queue_activity
-        calls = []
-        try:
-            app.resolve_anythingllm_api_key = lambda _url, _key=None: ("managed-key", "managed_desktop_key")
-            app.observe_workspace_embedding_queue_activity = lambda *_args, **_kwargs: {
-                "status": "owned_activity_observed", "stream_connected": True
-            }
-
-            def fake_remove(api_url, api_key, workspace_slug, locations):
-                calls.append((api_url, api_key, workspace_slug, list(locations)))
-                return {
-                    "status": "complete",
-                    "attempted": 2,
-                    "removed": 1,
-                    "absent": 1,
-                    "timed_out": 0,
-                    "errors": [],
-                }
-
-            app.remove_workspace_embedding_queue_entries = fake_remove
-            with tempfile.TemporaryDirectory() as tmpdir:
-                root = Path(tmpdir) / "app-run-current"
-                inspection = root / "document" / "inspection"
-                inspection.mkdir(parents=True)
-                (root / "document" / ".automatic-worker-config.json").write_text(
-                    json.dumps({"args": {"anythingllm_api_url": "http://127.0.0.1:3001", "anythingllm_api_key": ""}}),
-                    encoding="utf-8",
-                )
-                (inspection / "embedding-batch-ledger.json").write_text(
-                    json.dumps(
-                        {
-                            "workspace_slug": "safe-workspace",
-                            "planned_locations": [
-                                "custom-documents/owned-a.json",
-                                "custom-documents/owned-b.json",
-                            ],
-                        }
-                    ),
-                    encoding="utf-8",
-                )
-                result = app.cleanup_app_owned_embedding_queue(root)
-                persisted = json.loads((root / app.AUTOMATIC_RUN_QUEUE_CLEANUP).read_text(encoding="utf-8"))
-        finally:
-            app.resolve_anythingllm_api_key = original_resolve
-            app.remove_workspace_embedding_queue_entries = original_remove
-            app.observe_workspace_embedding_queue_activity = original_observe
-
-        self.assertEqual(result["status"], "complete")
-        self.assertEqual(result["removed"], 1)
-        self.assertEqual(calls, [("http://127.0.0.1:3001", "managed-key", "safe-workspace", ["custom-documents/owned-a.json", "custom-documents/owned-b.json"])])
-        self.assertEqual(persisted["restart"], "not_attempted_queue_cleanup_does_not_restart_desktop")
-
-    def test_cancel_queue_cleanup_never_guesses_when_the_ledger_is_missing(self):
-        import rag_pdf_gradio_app as app
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir) / "app-run-current"
-            root.mkdir()
-            result = app.cleanup_app_owned_embedding_queue(root)
-
-        self.assertEqual(result["status"], "no_ledger_proven_locations")
-        self.assertEqual(result["attempted"], 0)
-        self.assertEqual(result["restart"], "not_attempted_queue_cleanup_does_not_restart_desktop")
-
-    def test_non_owned_queue_activity_blocks_automatic_restart_policy(self):
-        observation = pipeline.embedding_queue_activity_observation(
-            [
-                {"type": "doc_starting", "filename": "custom-documents/manual-file.json"},
-                {"type": "doc_starting", "filename": "custom-documents/owned-file.json"},
-            ],
-            connected=True,
-            owned_locations=["custom-documents/owned-file.json"],
-        )
-        self.assertEqual(observation["status"], "non_owned_activity_observed")
-        self.assertEqual(observation["non_owned_filenames"], ["custom-documents/manual-file.json"])
-        self.assertEqual(observation["restart_policy"], "never_auto_restart_when_non_owned_or_uncertain")
-
-    def test_quiet_queue_stream_is_uncertain_not_restart_permission(self):
-        observation = pipeline.embedding_queue_activity_observation(
-            [],
-            connected=True,
-            owned_locations=["custom-documents/owned-file.json"],
-        )
-        self.assertEqual(observation["status"], "quiet_stream_not_proof_of_empty_queue")
-        self.assertEqual(observation["restart_policy"], "never_auto_restart_when_non_owned_or_uncertain")
-
     def test_terminal_run_status_reconciles_the_full_ui_after_a_lost_stream(self):
         import rag_pdf_gradio_app as app
 
@@ -10947,10 +10856,6 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(recovery["recovery"]["remaining_locations"], [
             "custom-documents/segment-1.json", "custom-documents/segment-2.json",
         ])
-        self.assertEqual(recovery["planned_locations"], [
-            "custom-documents/segment-1.json", "custom-documents/segment-2.json",
-        ])
-
     def test_operator_cancellation_stops_before_the_next_embedding_batch(self):
         original_post = pipeline.post_json
         calls = []
@@ -10967,93 +10872,6 @@ class PipelineCoreTests(unittest.TestCase):
             pipeline.post_json = original_post
         self.assertEqual(calls, [])
         self.assertEqual(result["batches"][0]["submission_state"], "cancelled_before_submission")
-
-    def test_queue_removal_targets_only_ledger_proven_managed_locations(self):
-        original_delete = pipeline.delete_json
-        calls = []
-        try:
-            def fake_delete(url, body=None, api_key=None, timeout=30):
-                calls.append({"url": url, "body": body, "api_key": api_key, "timeout": timeout})
-                return 204, ""
-
-            pipeline.delete_json = fake_delete
-            result = pipeline.remove_workspace_embedding_queue_entries(
-                "http://127.0.0.1:3001",
-                "test-key",
-                "safe-workspace",
-                [
-                    "custom-documents/owned-a.json",
-                    "custom-documents/owned-a.json",
-                    "custom-documents/owned-b.json",
-                    "manual-queue.json",
-                    "custom-documents/../manual-queue.json",
-                ],
-            )
-        finally:
-            pipeline.delete_json = original_delete
-
-        self.assertEqual(result["status"], "complete")
-        self.assertEqual(result["requested"], 2)
-        self.assertEqual(result["removed"], 2)
-        self.assertEqual(
-            {call["body"]["filename"] for call in calls},
-            {"custom-documents/owned-a.json", "custom-documents/owned-b.json"},
-        )
-        self.assertEqual(len(result["untrusted_locations"]), 2)
-
-    def test_queue_removal_preserves_timeout_evidence_without_restart(self):
-        original_delete = pipeline.delete_json
-        try:
-            def timeout_delete(*_args, **_kwargs):
-                raise urllib.error.URLError("connection refused")
-
-            pipeline.delete_json = timeout_delete
-            result = pipeline.remove_workspace_embedding_queue_entries(
-                "http://localhost:3001",
-                "test-key",
-                "safe-workspace",
-                ["custom-documents/owned-a.json"],
-            )
-        finally:
-            pipeline.delete_json = original_delete
-
-        self.assertEqual(result["status"], "partial")
-        self.assertEqual(result["timed_out"], 1)
-        self.assertEqual(result["removed"], 0)
-        self.assertFalse(any("test-key" in str(item) for item in result.values()))
-
-    def test_queue_removal_treats_desktop_success_false_as_already_absent(self):
-        original_delete = pipeline.delete_json
-        try:
-            pipeline.delete_json = lambda *_args, **_kwargs: (200, json.dumps({"success": False}))
-            result = pipeline.remove_workspace_embedding_queue_entries(
-                "http://localhost:3001",
-                "test-key",
-                "safe-workspace",
-                ["custom-documents/owned-a.json"],
-            )
-        finally:
-            pipeline.delete_json = original_delete
-
-        self.assertEqual(result["status"], "complete")
-        self.assertEqual(result["removed"], 0)
-        self.assertEqual(result["absent"], 1)
-
-    def test_queue_removal_rejects_nonlocal_runtime_without_requests(self):
-        original_delete = pipeline.delete_json
-        try:
-            pipeline.delete_json = lambda *_args, **_kwargs: self.fail("nonlocal runtime must not be mutated")
-            result = pipeline.remove_workspace_embedding_queue_entries(
-                "https://example.invalid",
-                "test-key",
-                "safe-workspace",
-                ["custom-documents/owned-a.json"],
-            )
-        finally:
-            pipeline.delete_json = original_delete
-
-        self.assertEqual(result["status"], "rejected_nonlocal_runtime")
-        self.assertEqual(result["attempted"], 0)
 
     def test_embedding_scheduler_never_runs_more_than_one_request(self):
         original_post = pipeline.post_json

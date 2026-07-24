@@ -7530,7 +7530,6 @@ def listen_for_anythingllm_embed_progress(
     event_callback=None,
     error_callback=None,
     connected_event=None,
-    include_unmatched_events=False,
 ):
     """Read Desktop's SSE queue feed while a single update request is active.
 
@@ -7581,9 +7580,7 @@ def listen_for_anythingllm_embed_progress(
                         continue
                     event = parse_anythingllm_embed_progress_event("\n".join(payload_lines))
                     payload_lines = []
-                    if not event:
-                        continue
-                    if not include_unmatched_events and not _anythingllm_embed_event_matches_locations(
+                    if not event or not _anythingllm_embed_event_matches_locations(
                         event, expected, matched_locations
                     ):
                         continue
@@ -7629,8 +7626,6 @@ def start_anythingllm_embed_progress_listener(
     api_key,
     workspace_slug,
     expected_locations,
-    *,
-    include_unmatched_events=False,
 ):
     """Start a best-effort, path-correlated Desktop progress listener.
 
@@ -7658,7 +7653,6 @@ def start_anythingllm_embed_progress_listener(
             "event_callback": receive,
             "error_callback": receive_error,
             "connected_event": connected_event,
-            "include_unmatched_events": include_unmatched_events,
         },
         name="anythingllm-embed-progress",
         daemon=True,
@@ -7671,97 +7665,6 @@ def start_anythingllm_embed_progress_listener(
         "events": observed_events,
         "errors": observed_errors,
     }
-
-
-def embedding_queue_activity_observation(events, *, connected, owned_locations):
-    """Classify queue activity without mistaking silence for an empty queue.
-
-    The Desktop SSE feed is event-only and has no authoritative snapshot
-    endpoint. Consequently a connected but quiet feed is *uncertain*, while a
-    filename outside the ledger-proven owned set is positive evidence of
-    manual/non-owned activity. This classification is deliberately suitable
-    for restart gating, not for declaring queue completion.
-    """
-    owned = {
-        _normalized_anythingllm_document_location(location)
-        for location in (owned_locations or [])
-        if str(location or "").strip()
-    }
-    own_events = []
-    non_owned_events = []
-    for event in events or []:
-        filenames = [event.get("filename")]
-        filenames.extend(event.get("filenames") or [])
-        filenames.extend(event.get("embeddedFiles") or [])
-        filenames.extend(event.get("failedFiles") or [])
-        normalized = {
-            _normalized_anythingllm_document_location(item)
-            for item in filenames
-            if str(item or "").strip()
-        }
-        if normalized & owned:
-            own_events.append(dict(event))
-        if normalized - owned:
-            non_owned_events.append(dict(event))
-    if non_owned_events:
-        status = "non_owned_activity_observed"
-    elif own_events:
-        status = "owned_activity_observed"
-    elif connected:
-        status = "quiet_stream_not_proof_of_empty_queue"
-    else:
-        status = "stream_unavailable_or_unconfirmed"
-    return {
-        "status": status,
-        "stream_connected": bool(connected),
-        "owned_event_count": len(own_events),
-        "non_owned_event_count": len(non_owned_events),
-        "non_owned_filenames": sorted(
-            {
-                _normalized_anythingllm_document_location(item)
-                for event in non_owned_events
-                for item in ([event.get("filename")] + list(event.get("filenames") or []))
-                if str(item or "").strip()
-                and _normalized_anythingllm_document_location(item) not in owned
-            }
-        ),
-        "restart_policy": (
-            "never_auto_restart_when_non_owned_or_uncertain"
-            if status in {"non_owned_activity_observed", "quiet_stream_not_proof_of_empty_queue", "stream_unavailable_or_unconfirmed"}
-            else "owned_activity_requires_grace_period_and_runtime_health_check"
-        ),
-    }
-
-
-def observe_workspace_embedding_queue_activity(
-    api_url,
-    api_key,
-    workspace_slug,
-    owned_locations,
-    *,
-    observation_seconds=1.0,
-):
-    """Take one bounded, read-only SSE observation for restart safety."""
-    listener = start_anythingllm_embed_progress_listener(
-        api_url,
-        api_key,
-        workspace_slug,
-        owned_locations,
-        include_unmatched_events=True,
-    )
-    listener["connected_event"].wait(timeout=min(.75, max(.0, float(observation_seconds))))
-    remaining = max(0.0, float(observation_seconds))
-    if remaining:
-        listener["stop_event"].wait(timeout=remaining)
-    listener["stop_event"].set()
-    listener["thread"].join(timeout=1.0)
-    result = embedding_queue_activity_observation(
-        listener["events"],
-        connected=listener["connected_event"].is_set(),
-        owned_locations=owned_locations,
-    )
-    result["stream_errors"] = list(listener["errors"])
-    return result
 
 
 def post_multipart_form(url, fields, file_field_name, file_path, api_key=None, timeout=120):
@@ -7850,142 +7753,13 @@ def get_json_with_retry(url, api_key=None, timeout: float = 5.0, max_attempts=3,
     return {"http_status": None, "text": "", "attempts": attempts}
 
 
-def delete_json(url, body=None, api_key=None, timeout=30.0):
-    """Issue a DELETE request, optionally with the documented JSON body.
-
-    AnythingLLM Desktop's queue-removal route identifies an entry through a
-    JSON ``filename`` field.  Keep the body optional for existing read/delete
-    callers, and never place authorization material in the body or result.
-    """
-    data = None
+def delete_json(url, api_key=None, timeout=30):
     headers = {}
-    if body is not None:
-        data = json.dumps(body).encode("utf-8")
-        headers["Content-Type"] = "application/json"
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-    req = urllib.request.Request(url, data=data, headers=headers, method="DELETE")
+    req = urllib.request.Request(url, headers=headers, method="DELETE")
     with urllib.request.urlopen(req, timeout=timeout) as response:
         return response.status, response.read().decode("utf-8", errors="replace")
-
-
-def _safe_managed_queue_location(location):
-    """Return one normalized app-managed filename or an empty string.
-
-    The queue endpoint removes by filename.  Requiring the exact managed
-    ``custom-documents`` namespace and rejecting traversal makes this helper
-    unusable for a manually queued file, even if a corrupt recovery artifact
-    is presented to it.
-    """
-    normalized = str(location or "").replace("\\", "/").strip().lstrip("/")
-    parts = [part for part in normalized.split("/") if part not in {"", "."}]
-    if (
-        len(parts) < 2
-        or parts[0].casefold() != "custom-documents"
-        or any(part == ".." for part in parts)
-    ):
-        return ""
-    return "/".join(parts)
-
-
-def remove_workspace_embedding_queue_entries(
-    api_url,
-    api_key,
-    workspace_slug,
-    locations,
-    *,
-    timeout=12.0,
-    max_workers=2,
-):
-    """Remove only ledger-proven app queue entries from local AnythingLLM.
-
-    Desktop exposes ``DELETE /workspace/:slug/embed-queue`` with a JSON
-    ``filename`` body.  The route cannot prove that the active entry stopped,
-    so this helper reports precise per-entry outcomes and never initiates a
-    restart.  Callers must keep uncertainty as a stop condition.
-    """
-    result = {
-        "status": "not_attempted",
-        "workspace_slug": str(workspace_slug or ""),
-        "requested": 0,
-        "attempted": 0,
-        "removed": 0,
-        "absent": 0,
-        "timed_out": 0,
-        "errors": [],
-        "removed_locations": [],
-        "absent_locations": [],
-        "untrusted_locations": [],
-        "policy": "local_only_ledger_proven_managed_locations",
-    }
-    if not is_local_anythingllm_url(api_url):
-        result["status"] = "rejected_nonlocal_runtime"
-        return result
-    if not is_lancedb_safe_namespace(workspace_slug):
-        result["status"] = "rejected_workspace"
-        return result
-
-    trusted = []
-    seen = set()
-    for location in locations or []:
-        safe_location = _safe_managed_queue_location(location)
-        if not safe_location:
-            result["untrusted_locations"].append(str(location or ""))
-            continue
-        key = safe_location.casefold()
-        if key not in seen:
-            seen.add(key)
-            trusted.append(safe_location)
-    result["requested"] = len(trusted)
-    if not trusted:
-        result["status"] = "no_trusted_locations"
-        return result
-
-    endpoint = api_url.rstrip("/") + f"/api/v1/workspace/{workspace_slug}/embed-queue"
-    worker_count = max(1, min(2, int(max_workers or 1), len(trusted)))
-
-    def remove_one(location):
-        try:
-            status, text = delete_json(
-                endpoint,
-                body={"filename": location},
-                api_key=api_key,
-                timeout=float(timeout),
-            )
-            try:
-                response = json.loads(text) if str(text or "").strip() else {}
-            except (TypeError, ValueError, json.JSONDecodeError):
-                response = {}
-            if int(status) in {200, 201, 202} and isinstance(response, dict) and response.get("success") is False:
-                return location, 404, "already_absent"
-            return location, int(status), ""
-        except urllib.error.HTTPError as exc:
-            return location, int(exc.code), ""
-        except (TimeoutError, urllib.error.URLError) as exc:
-            return location, None, f"timeout_or_connection: {type(exc).__name__}"
-        except Exception as exc:
-            return location, None, f"{type(exc).__name__}: {str(exc)[:240]}"
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
-        futures = [executor.submit(remove_one, location) for location in trusted]
-        for future in concurrent.futures.as_completed(futures):
-            location, status, error = future.result()
-            result["attempted"] += 1
-            if status in {200, 201, 202, 204}:
-                result["removed"] += 1
-                result["removed_locations"].append(location)
-            elif status == 404:
-                result["absent"] += 1
-                result["absent_locations"].append(location)
-            elif error.startswith("timeout_or_connection:"):
-                result["timed_out"] += 1
-                result["errors"].append({"location": location, "error": error})
-            else:
-                result["errors"].append(
-                    {"location": location, "http_status": status, "error": error or "queue removal rejected"}
-                )
-    result["status"] = "complete" if not result["errors"] else "partial"
-    return result
 
 
 def is_local_anythingllm_url(api_url):
@@ -9748,11 +9522,6 @@ def _write_embedding_batch_ledger(ledger_path, workspace_slug, result):
         "verification_interval": result.get("verification_interval", 1),
         "deferred_verification_batches": result.get("deferred_verification_batches", []),
         "final_verification_required": bool(result.get("final_verification_required")),
-        # This is the ownership proof for cancellation/recovery.  Persist it
-        # on every ledger update, not only in the in-memory scheduler result:
-        # after a worker crash we must never infer queue ownership from a
-        # workspace-wide scan or a filename pattern.
-        "planned_locations": list(result.get("planned_locations") or []),
         "batches": result.get("batches", []),
         "inflight_batch": result.get("inflight_batch"),
         "runtime_events": result.get("runtime_events", []),
@@ -10827,10 +10596,7 @@ def update_workspace_embeddings_desktop_queue(
         )
     result["submission_strategy"] = ANYTHINGLLM_EMBEDDING_SUBMISSION_STRATEGY
     result["queue_records"] = requested
-    result["queue_cancellation_boundary"] = (
-        "ledger-proven queued entries may be removed by filename; an active "
-        "Desktop record remains ambiguous and is never assumed stopped"
-    )
+    result["queue_cancellation_boundary"] = "before_submission_only"
     event_counts = {}
     observed_locations = set()
     for event in progress_listener["events"]:

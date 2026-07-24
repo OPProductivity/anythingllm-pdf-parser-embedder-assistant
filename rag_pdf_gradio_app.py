@@ -82,7 +82,6 @@ from auto_anythingllm_pipeline import (
     is_lancedb_safe_namespace,
     lancedb_safe_workspace_name,
     native_identity_stem,
-    observe_workspace_embedding_queue_activity,
     page_stats_for,
     pdf_metadata,
     planned_embedding_batch_count,
@@ -92,7 +91,6 @@ from auto_anythingllm_pipeline import (
     persist_anythingllm_embedder_settings,
     provider_model_key_for_engine,
     project_local_env_path,
-    remove_workspace_embedding_queue_entries,
     resolve_anythingllm_api_key,
     resolve_embedder_capability,
     refresh_local_anythingllm_openrouter_runtime,
@@ -294,7 +292,6 @@ CANCELLED_AUTOMATIC_RUN_ROOTS = set()
 AUTOMATIC_RUN_CANCELLATION_MARKER = ".cancel-requested.json"
 AUTOMATIC_RUN_WORKER_MARKER = ".active-preparation-worker.json"
 AUTOMATIC_RUN_CANCELLATION_RECOVERY = "cancellation-recovery.json"
-AUTOMATIC_RUN_QUEUE_CLEANUP = "queue-cleanup.json"
 # A marker survives a server crash for recovery, but a Windows PID can later be
 # reused by an unrelated process. Keep the live Popen handle in this process as
 # the authority for a forced taskkill; the durable marker remains useful for
@@ -9044,114 +9041,8 @@ def active_automatic_run_root():
     return None
 
 
-def _read_automatic_run_json(path):
-    try:
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, TypeError):
-        return {}
-    return payload if isinstance(payload, dict) else {}
-
-
-def cleanup_app_owned_embedding_queue(run_root):
-    """Remove only this run's ledger-proven queued Desktop filenames.
-
-    This is intentionally narrower than cancellation as a whole.  It neither
-    scans the workspace queue nor restarts Desktop, because either action
-    could affect manual work.  A missing ledger, credential, or response is
-    recorded as uncertainty for later recovery—not interpreted as a clean
-    queue.
-    """
-    root = Path(str(run_root or ""))
-    result = {
-        "recorded_at": datetime.now().isoformat(timespec="seconds"),
-        "status": "not_available",
-        "ledgers_found": 0,
-        "groups_attempted": 0,
-        "attempted": 0,
-        "removed": 0,
-        "absent": 0,
-        "timed_out": 0,
-        "errors": [],
-        "restart": "not_attempted_queue_cleanup_does_not_restart_desktop",
-        "manual_activity": "not_observed",
-        "queue_activity": [],
-    }
-    if not root.is_dir():
-        result["status"] = "run_root_unavailable"
-        return result
-    config_records = [
-        _read_automatic_run_json(path)
-        for path in sorted(root.rglob(".automatic-worker-config.json"))
-    ]
-    by_workspace = {}
-    for ledger_path in sorted(root.rglob("embedding-batch-ledger.json")):
-        ledger = _read_automatic_run_json(ledger_path)
-        locations = [str(item) for item in ledger.get("planned_locations") or [] if str(item).strip()]
-        workspace_slug = str(ledger.get("workspace_slug") or "").strip()
-        if not locations or not workspace_slug:
-            continue
-        result["ledgers_found"] += 1
-        matching_config = next(
-            (
-                item.get("args") or {}
-                for item in config_records
-                if isinstance(item.get("args"), dict)
-            ),
-            {},
-        )
-        api_url = str(matching_config.get("anythingllm_api_url") or DEFAULT_ANYTHINGLLM_API_URL).strip()
-        supplied_key = str(matching_config.get("anythingllm_api_key") or "").strip()
-        key = (api_url, supplied_key, workspace_slug)
-        by_workspace.setdefault(key, []).extend(locations)
-    if not by_workspace:
-        result["status"] = "no_ledger_proven_locations"
-        _write_automatic_run_json(root / AUTOMATIC_RUN_QUEUE_CLEANUP, result)
-        return result
-
-    for (api_url, supplied_key, workspace_slug), locations in by_workspace.items():
-        secret, authentication_mode = resolve_anythingllm_api_key(api_url, supplied_key or None)
-        if not secret:
-            result["errors"].append(
-                {
-                    "workspace_slug": workspace_slug,
-                    "error": "no_existing_local_api_key_available",
-                    "authentication": authentication_mode,
-                }
-            )
-            continue
-        activity = observe_workspace_embedding_queue_activity(
-            api_url,
-            secret,
-            workspace_slug,
-            locations,
-        )
-        result["queue_activity"].append(activity)
-        if activity.get("status") == "non_owned_activity_observed":
-            result["manual_activity"] = "non_owned_activity_observed"
-        elif result["manual_activity"] == "not_observed":
-            result["manual_activity"] = str(activity.get("status") or "not_observed")
-        cleanup = remove_workspace_embedding_queue_entries(
-            api_url,
-            secret,
-            workspace_slug,
-            locations,
-        )
-        result["groups_attempted"] += 1
-        for field in ("attempted", "removed", "absent", "timed_out"):
-            result[field] += int(cleanup.get(field) or 0)
-        if cleanup.get("errors"):
-            result["errors"].extend(cleanup["errors"])
-        if cleanup.get("status") not in {"complete", "no_trusted_locations"}:
-            result["errors"].append(
-                {"workspace_slug": workspace_slug, "error": str(cleanup.get("status") or "queue_cleanup_unknown")}
-            )
-    result["status"] = "complete" if result["groups_attempted"] and not result["errors"] else "partial"
-    _write_automatic_run_json(root / AUTOMATIC_RUN_QUEUE_CLEANUP, result)
-    return result
-
-
 def request_automatic_run_cancellation(run_root):
-    """Stop the owned worker and clear only ledger-proven queued filenames."""
+    """Persist a stop request and terminate the run's owned worker if present."""
     raw_root = str(run_root or "").strip()
     if not raw_root:
         return False
@@ -9166,17 +9057,8 @@ def request_automatic_run_cancellation(run_root):
         APP_LOGGER.warning("could not persist automatic run cancellation request: %s", exc)
         return False
     CANCELLED_AUTOMATIC_RUN_ROOTS.add(str(root))
-    worker_stopped = terminate_automatic_run_worker(root)
-    queue_cleanup = cleanup_app_owned_embedding_queue(root)
-    APP_LOGGER.info(
-        "automatic run cancellation requested",
-        extra={
-            "run_root": str(root),
-            "worker_stopped": worker_stopped,
-            "queue_cleanup_status": queue_cleanup.get("status"),
-            "queue_cleanup_removed": queue_cleanup.get("removed", 0),
-        },
-    )
+    terminate_automatic_run_worker(root)
+    APP_LOGGER.info("automatic run cancellation requested", extra={"run_root": str(root)})
     return True
 
 
@@ -9258,17 +9140,6 @@ def terminate_automatic_run_worker(run_root):
 def write_automatic_cancellation_recovery(run_root, pdf_path=None, worker_record=None):
     """Record the only safe postcondition after a forced child termination."""
     root = Path(run_root)
-    queue_cleanup = _read_automatic_run_json(root / AUTOMATIC_RUN_QUEUE_CLEANUP)
-    queue_message = (
-        "No ledger-proven queued AnythingLLM entries were available for removal."
-        if not queue_cleanup
-        else (
-            f"Queue cleanup removed {int(queue_cleanup.get('removed') or 0)} owned entry/entries, "
-            f"found {int(queue_cleanup.get('absent') or 0)} already absent, and left "
-            f"{int(queue_cleanup.get('timed_out') or 0)} timed out request(s) unresolved. "
-            "Desktop was not restarted automatically."
-        )
-    )
     payload = {
         "schema_version": 1,
         "status": "cancelled",
@@ -9277,10 +9148,9 @@ def write_automatic_cancellation_recovery(run_root, pdf_path=None, worker_record
         "worker": dict(worker_record or {}),
         "local_result": "partial artifacts may remain and are intentionally not deleted automatically",
         "anythingllm_result": (
-            "An active embedding record may still finish; only ledger-proven queued filenames were considered. "
-            + queue_message
+            "unknown if an embedding request had already crossed into AnythingLLM; "
+            "no later documents or batches were submitted by this app run"
         ),
-        "queue_cleanup": queue_cleanup,
         "resume_guidance": "Inspect the workspace and this run folder before rerunning; a rerun may safely recreate prepared local artifacts.",
     }
     try:
@@ -9563,23 +9433,6 @@ def cancel_or_reset_automatic_run(
                 gr.update(value="", visible=False),
                 gr.update(visible=False, interactive=False),
             )
-        queue_cleanup = _read_automatic_run_json(run_root_path / AUTOMATIC_RUN_QUEUE_CLEANUP)
-        queue_activity = str(queue_cleanup.get("manual_activity") or "not_observed")
-        if queue_activity == "non_owned_activity_observed":
-            cancellation_details = (
-                "Non-owned AnythingLLM queue activity was observed. Only this run's ledger-proven queued records "
-                "were considered for removal; AnythingLLM was not restarted."
-            )
-        elif queue_activity in {"quiet_stream_not_proof_of_empty_queue", "stream_unavailable_or_unconfirmed"}:
-            cancellation_details = (
-                "Only this run's ledger-proven queued records were considered for removal. The queue observation was "
-                "not sufficient to prove no other embedding is active, so AnythingLLM was not restarted."
-            )
-        else:
-            cancellation_details = (
-                "The owned PDF worker was stopped and only ledger-proven queued records were considered for removal. "
-                "An already active AnythingLLM record may still finish; Desktop was not restarted automatically."
-            )
         progress_record = record
         if str(progress_record.get("run_root") or "") != run_root:
             try:
@@ -9589,9 +9442,9 @@ def cancel_or_reset_automatic_run(
         update_live_automatic_run_status(
             run_root,
             state="running",
-            phase="Stop requested — removing confirmed queued records",
+            phase="Stop requested — stopping the active document worker",
             expected_seconds=progress_record.get("expected_seconds", 0),
-            details=cancellation_details,
+            details="The active PDF worker is being terminated; no later PDF or AnythingLLM batch will be submitted.",
             confirmed_fraction=progress_record.get("confirmed_fraction"),
             cancel_available=False,
             cancel_requested=True,
