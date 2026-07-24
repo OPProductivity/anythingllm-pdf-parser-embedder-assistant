@@ -3,18 +3,18 @@
 **Local PDF-to-text, OCR, page-aware chunking, and AnythingLLM Desktop upload
 automation for retrieval-augmented generation (RAG).**
 
-This Windows-friendly assistant turns one PDF, a selected batch, or a folder of
-PDFs into clean text files split into one or more segments per page and sends the prepared records to the local
-AnythingLLM Desktop workspace installed on the user's pc. It is designed for people who want
-page-based PDF retrieval or want something that can automatically convert PDFs to TXT and upload directly to AnythingLLM.
+This AnythingLLM (Windows 11) assistant turns one PDF, a selected batch or folder of
+PDFs, into clean text files, and uploads them and embeds them to AnythingLLM. AnythingLLM itself does not support
+uploading PDF files, and uses .TXT or .JSON. Optionally split files into one or more segments per page and send
+the prepared records in a subfolder to your local AnythingLLM Desktop workspace installed on the user's pc. It is designed for people who want
+to more easily work with PDFs inside AnythingLLM. You can also create local files only (only parse/perform OCR) to automatically convert PDFs to TXT and then upload to AnythingLLM manually. The advantage is that this software works with existing PDF metadata and bookmarks and can also recognize title pages, content index, bibliography and more (which can be excluded) and can also perform OCR on only a subset (5 out of 20 pages only need OCR).
 Doing this automatically or in batch mode is faster than manually creating  workspaces and uploading and embedding pdf files.
-Depending on whether you use local ollama embedders, or openrouter embedders via api key, this can be done under half a minute for normal pdfs. 
+Depending on whether you use local ollama embedders, or openrouter embedders via api key, this can be done under half a minute per pdf. 
 
 It supports parsing native-text PDFs, PDFs that need OCR (using Tesseract) for all 
 pages or a subset of pages, and can also use the Unstructured library for text extraction 
-from tables and more diffidcult documents. whole documents, whole-page chunks, automatically page-preserved records, and shorter
-page-local passages. It can prepare files locally or complete the local
-AnythingLLM upload-and-embedding workflow.
+from tables and documents with complex layout. It can do whole documents, whole-page chunks, automatically page-preserved records, and shorter
+page-local passages and can do a custom range of pages or all pages.
 
 > **AI-assisted disclosure:** this project was completely vibe-coded through
 > iterative AI-assisted development. Treat it as beta software: review the
