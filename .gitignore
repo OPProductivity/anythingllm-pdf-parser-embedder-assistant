@@ -10,6 +10,7 @@ build/
 .pytest_cache/
 .coverage
 outputs/
+Test Outputs/
 logs/
 config/
 tmp-output/
