@@ -45,8 +45,10 @@ page-local passages and can do a custom range of pages or all pages.
 
 - Preserve PDF pages for citing or retrieving directly from page (higher LLM citation accuracy).
 - Convert PDFs into text records before embedding.
-- Parse PDF file batches
-- Upload PDF batches to AnythingLLM - fully automated
+- Parse PDF files in batches
+- Upload your pdf, and use the default settings by simply clicking "Confirm and start processing" at the bottom of the page,
+  and let the app create a new workspace for you with the title of the pdf file itself.
+- Parse & Upload PDFs in batches at the same time to AnythingLLM (new or existing workspace) without clicking through menus for each PDF
 - Choose a segmentation strategy that fits retrieval quality and speed (one file, multiple files)
 - Prepare and upload a single PDF, several selected PDFs, or a batch folder.
 - Keep parsing and OCR locally when you do not want to upload anything.
