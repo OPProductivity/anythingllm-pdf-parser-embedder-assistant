@@ -1097,6 +1097,20 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(pending_reconciliation["code"], "AUTO-EMBEDDING-RECONCILE-001")
         self.assertIn("Local preparation is complete", pending_reconciliation["message"])
 
+    def test_ocr_withheld_terminal_phase_never_claims_searchable_vectors(self):
+        import rag_pdf_gradio_app as app
+
+        completion = app.automatic_completion([{
+            "pdf": "mixed-text.pdf",
+            "api_upload_status": "skipped_needs_ocr_review",
+        }], True)
+
+        self.assertEqual(completion["state"], "warning")
+        self.assertEqual(completion["code"], "AUTO-OCR-REVIEW-001")
+        phase = app.automatic_completion_phase(completion, True)
+        self.assertIn("upload withheld", phase)
+        self.assertNotIn("vectors verified", phase.casefold())
+
     def test_automatic_completion_names_chat_retrieval_as_unverified(self):
         import rag_pdf_gradio_app as app
 
@@ -1157,6 +1171,46 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn("AnythingLLM is not available", unavailable_html)
         self.assertTrue(unavailable_module["visible"])
 
+    def test_app_open_initialization_uses_one_guarded_local_start_attempt(self):
+        import rag_pdf_gradio_app as app
+
+        original_workspaces = app.load_workspaces_on_open
+        original_readiness = app.native_upload_readiness_report
+        original_readiness_html = app.native_upload_readiness_html
+        captured = {}
+        try:
+            app.load_workspaces_on_open = lambda: ({"value": "new-document"}, "local workspaces")
+
+            def fake_readiness(api_url, api_key, workspace_slug, **kwargs):
+                captured.update(
+                    api_url=api_url,
+                    api_key=api_key,
+                    workspace_slug=workspace_slug,
+                    kwargs=kwargs,
+                )
+                return {
+                    "runtime_api_url": "http://127.0.0.1:3001",
+                    "runtime_api_reachable": True,
+                    "runtime_start_status": "started",
+                }
+
+            app.native_upload_readiness_report = fake_readiness
+            app.native_upload_readiness_html = lambda report: "readiness:started"
+            result = app.initialize_anythingllm_on_app_open(
+                "http://127.0.0.1:3001", "existing-key", ""
+            )
+        finally:
+            app.load_workspaces_on_open = original_workspaces
+            app.native_upload_readiness_report = original_readiness
+            app.native_upload_readiness_html = original_readiness_html
+
+        self.assertEqual(captured["workspace_slug"], "new-document")
+        self.assertTrue(captured["kwargs"]["autostart_runtime"])
+        self.assertFalse(captured["kwargs"]["verify_authentication"])
+        self.assertEqual(result[2], "readiness:started")
+        self.assertEqual(result[3], "")
+        self.assertFalse(result[4]["visible"])
+
     def test_startup_status_timer_is_passive_and_low_frequency(self):
         import rag_pdf_gradio_app as app
 
@@ -1165,6 +1219,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn("anythingllm_startup_status_timer = gr.Timer(", source)
         self.assertIn("anythingllm_startup_status_timer.tick(", source)
         self.assertIn("fn=anythingllm_startup_status_view", source)
+        self.assertIn("fn=initialize_anythingllm_on_app_open", source)
 
     def test_runtime_preflight_records_autostart_without_persisting_a_key(self):
         import rag_pdf_gradio_app as app

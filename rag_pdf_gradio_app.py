@@ -4079,6 +4079,43 @@ def load_workspaces_on_open():
     )
 
 
+def initialize_anythingllm_on_app_open(api_url="", api_key="", workspace_slug=""):
+    """Perform the one allowed Desktop start attempt while the app is opening.
+
+    The top-of-page status previously observed Desktop but did not invoke the
+    already-existing local-start helper.  That left an initially red warning in
+    place until a later workspace refresh or upload preflight happened to start
+    Desktop.  App open is a useful, explicit lifecycle boundary: make one
+    bounded attempt there for a local endpoint, then leave the recurring status
+    timer strictly observational.  This neither authenticates nor creates an
+    API key, and remote URLs remain excluded by ``ensure_anythingllm_runtime``.
+    """
+    workspace_update, workspace_status = load_workspaces_on_open()
+    selected_workspace = (
+        (workspace_slug or "").strip()
+        or str(workspace_update.get("value") or "").strip()
+    )
+    report = native_upload_readiness_report(
+        api_url,
+        api_key,
+        selected_workspace,
+        autostart_runtime=True,
+        verify_authentication=False,
+    )
+    reachable = bool(report.get("runtime_api_reachable"))
+    status_html = anythingllm_startup_status_html(
+        report.get("runtime_api_url") or api_url,
+        health={"reachable": reachable},
+    )
+    return (
+        workspace_update,
+        workspace_status,
+        native_upload_readiness_html(report),
+        status_html,
+        gr.update(visible=not reachable),
+    )
+
+
 def initial_native_upload_readiness_report():
     storage_dir = default_anythingllm_storage_dir()
     db_path = storage_dir / "anythingllm.db"
@@ -11886,6 +11923,7 @@ def automatic_completion(summaries, prepare_and_upload):
         suffix = "" if len(ocr_withheld) <= 3 else f" (+{len(ocr_withheld) - 3} more)"
         return {
             "state": "warning",
+            "code": "AUTO-OCR-REVIEW-001",
             "message": (
                 f"Local preparation completed, but AnythingLLM upload was withheld for {names}{suffix} "
                 "because reliable OCR is required and unavailable. Review the saved OCR/readiness report."
@@ -12057,6 +12095,31 @@ def automatic_completion(summaries, prepare_and_upload):
         "code": "AUTO-EMBEDDING-VERIFY-001",
         "message": "AnythingLLM accepted the submission, but no complete searchable-vector evidence was observed in the target workspace.",
     }
+
+
+def automatic_completion_phase(completion, prepare_and_upload):
+    """Choose a terminal phase that makes only evidence-backed claims.
+
+    A warning can mean successful searchable vectors with a document-list
+    caveat, but it can also mean that OCR withheld submission entirely. Those
+    outcomes must never share a "vectors verified" label.
+    """
+    completion = completion if isinstance(completion, dict) else {}
+    state = str(completion.get("state") or "")
+    code = str(completion.get("code") or "")
+    if state == "cancelled":
+        return "Processing stopped by operator"
+    if state == "successful" and prepare_and_upload:
+        return "Ready for retrieval"
+    if code == "AUTO-EMBEDDING-RECONCILE-001":
+        return "Preparation complete — AnythingLLM verification pending"
+    if code == "AUTO-OCR-REVIEW-001":
+        return "Local preparation complete — upload withheld for OCR review"
+    if state == "warning" and prepare_and_upload:
+        return "Searchable vectors verified; document-list observation needs review"
+    if state == "successful":
+        return "Local preparation complete"
+    return "Run needs attention"
 
 
 def automatic_batch_diagnostics_required(
@@ -15396,20 +15459,7 @@ def run_automatic(
     update_live_automatic_run_status(
         run_root,
         state=completion["state"],
-        phase=(
-            "Processing stopped by operator"
-            if completion["state"] == "cancelled"
-            else
-            "Ready for retrieval"
-            if completion["state"] == "successful" and prepare_and_upload
-            else "Preparation complete — AnythingLLM verification pending"
-            if completion.get("code") == "AUTO-EMBEDDING-RECONCILE-001"
-            else "Searchable vectors verified; document-list observation needs review"
-            if completion["state"] == "warning" and prepare_and_upload
-            else "Local preparation complete"
-            if completion["state"] == "successful"
-            else "Run needs attention"
-        ),
+        phase=automatic_completion_phase(completion, prepare_and_upload),
         expected_seconds=expected_seconds,
         details=(
             f"{completion.get('code')}: {completion['message']}"
@@ -16421,21 +16471,16 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 show_progress="hidden",
             )
             demo.load(
-                fn=load_workspaces_on_open,
-                inputs=None,
-                outputs=[workspace_slug, workspace_status],
-            )
-            demo.load(
-                fn=lambda: native_upload_readiness_html(initial_native_upload_readiness_report()),
-                inputs=None,
-                outputs=[native_upload_readiness],
-            )
-            demo.load(
-                fn=anythingllm_startup_status_view,
-                inputs=[api_url],
-                outputs=[anythingllm_startup_status, anythingllm_startup_status_module],
-                show_progress="hidden",
-                queue=False,
+                fn=initialize_anythingllm_on_app_open,
+                inputs=[api_url, api_key, workspace_slug],
+                outputs=[
+                    workspace_slug,
+                    workspace_status,
+                    native_upload_readiness,
+                    anythingllm_startup_status,
+                    anythingllm_startup_status_module,
+                ],
+                show_progress="minimal",
             )
             fresh_run_presentation_outputs = [
                 automatic_run_activity,
