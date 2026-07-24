@@ -1513,6 +1513,19 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertFalse(remote["needed"])
         self.assertEqual(remote["reason"], "not_submission_runtime_loss")
 
+    def test_embedder_network_failure_uses_the_same_local_runtime_recovery_gate(self):
+        import rag_pdf_gradio_app as app
+
+        recovery = app.submission_runtime_recovery_needed(
+            {"status": "network_error"},
+            "http://127.0.0.1:3001",
+            "",
+            probe=lambda *_args, **_kwargs: {"status": "unreachable", "error": "connection reset"},
+        )
+
+        self.assertTrue(recovery["needed"])
+        self.assertEqual(recovery["health"]["status"], "unreachable")
+
     def test_runtime_recovery_starts_a_missing_desktop_but_never_force_restarts_a_live_process(self):
         import rag_pdf_gradio_app as app
 
@@ -2388,6 +2401,22 @@ class PipelineCoreTests(unittest.TestCase):
         rendered = app.automatic_live_status_html(record)
         self.assertIn('role="progressbar"', rendered)
         self.assertIn("48%", rendered)
+
+    def test_failed_progress_freezes_at_its_terminal_checkpoint(self):
+        import rag_pdf_gradio_app as app
+
+        record = {
+            "state": "failed",
+            "confirmed_fraction": 0.095,
+            "phase_start_fraction": 0.095,
+            "phase_started_epoch": 100.0,
+            "phase_allowance": 0.08,
+            "phase_budget_seconds": 20.0,
+            "display_anchor_fraction": 0.123,
+        }
+
+        self.assertEqual(app.paced_progress_percent(record, now=101.0), 13)
+        self.assertEqual(app.paced_progress_percent(record, now=1_000.0), 13)
 
     def test_live_run_status_has_one_evidence_bar_with_elapsed_time_but_no_duplicate_estimate(self):
         import rag_pdf_gradio_app as app
@@ -3671,6 +3700,36 @@ class PipelineCoreTests(unittest.TestCase):
             app.LIVE_AUTOMATIC_RUN_STATUS = original_status
             app.CANCELLED_AUTOMATIC_RUN_ROOTS.clear()
             app.CANCELLED_AUTOMATIC_RUN_ROOTS.update(original_cancelled)
+
+    def test_cancel_requested_progress_never_advances_from_elapsed_time_or_late_events(self):
+        import rag_pdf_gradio_app as app
+
+        original_status = app.LIVE_AUTOMATIC_RUN_STATUS
+        try:
+            app.LIVE_AUTOMATIC_RUN_STATUS = {
+                "state": "running",
+                "run_root": "C:/temp/active-run",
+                "confirmed_fraction": 0.095,
+                "cancel_requested": True,
+                "phase_started_epoch": 100.0,
+                "display_anchor_fraction": 0.095,
+                "display_target_fraction": 0.095,
+                "display_anchor_epoch": 100.0,
+            }
+            updated = app.update_live_automatic_run_status(
+                "C:/temp/active-run",
+                state="running",
+                phase="Late worker callback",
+                expected_seconds=100,
+                confirmed_fraction=0.80,
+                cancel_requested=True,
+            )
+        finally:
+            app.LIVE_AUTOMATIC_RUN_STATUS = original_status
+
+        self.assertEqual(updated["confirmed_fraction"], 0.095)
+        self.assertEqual(updated["phase_allowance"], 0.0)
+        self.assertEqual(app.paced_progress_percent(updated, now=1_000.0), 10)
 
     def test_processing_label_stays_blue_while_force_stop_is_light_grey(self):
         import rag_pdf_gradio_app as app

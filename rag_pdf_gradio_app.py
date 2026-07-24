@@ -8659,6 +8659,11 @@ def raw_paced_progress_fraction(record, now=None):
     """Return the evidence-plus-time target before display smoothing."""
     now = time.time() if now is None else float(now)
     confirmed = min(1.0, max(0.0, float(record.get("confirmed_fraction") or 0.0)))
+    if record.get("cancel_requested"):
+        # Once the operator has requested a stop, neither elapsed time nor
+        # late worker events are progress evidence. Keep the bar exactly at
+        # the last confirmed checkpoint while the worker is terminated.
+        return confirmed
     phase_started = float(record.get("phase_started_epoch") or now)
     budget_value = record.get("phase_budget_seconds")
     allowance_value = record.get("phase_allowance")
@@ -8724,7 +8729,14 @@ def update_live_automatic_run_status(
         incoming_confirmed = float(confirmed_fraction)
     except (TypeError, ValueError):
         incoming_confirmed = previous_confirmed
-    confirmed = min(1.0, max(previous_confirmed, incoming_confirmed, 0.0))
+    cancellation_freezes_progress = bool(
+        previous.get("cancel_requested") or cancel_requested
+    )
+    confirmed = (
+        previous_confirmed
+        if cancellation_freezes_progress and previous
+        else min(1.0, max(previous_confirmed, incoming_confirmed, 0.0))
+    )
     phase_changed = str(phase or "Working") != str(previous.get("phase") or "")
     expected = max(0, int(expected_seconds or previous.get("expected_seconds") or 0))
     if cancel_available is None:
@@ -8740,7 +8752,11 @@ def update_live_automatic_run_status(
     # A phase earns at most a modest forecast allowance. If the phase exceeds
     # its budget, the bar waits at the cap for real evidence instead of racing
     # falsely towards completion.
-    phase_allowance = min(0.08, max(0.025, remaining_fraction * 0.18))
+    phase_allowance = (
+        0.0
+        if cancellation_freezes_progress
+        else min(0.08, max(0.025, remaining_fraction * 0.18))
+    )
     phase_budget = max(8.0, min(45.0, (expected * max(phase_allowance, 0.04)) if expected else 15.0))
     # Retain the visible clock's high-water mark when a batch-derived ETA
     # revision changes its denominator. This is display state only; the raw
@@ -8870,12 +8886,15 @@ def paced_progress_percent(record, now=None):
     state = str(record.get("state") or "")
     if state in {"successful", "warning"}:
         return 100
-    if state == "cancelled":
-        # A stop is terminal but is not evidence that all planned work
-        # completed. Preserve the last checkpoint rather than displaying 100%.
-        return min(99, math.ceil(raw_paced_progress_fraction(record, now) * 100.0 - 1e-9))
-    if state == "failed":
-        return min(99, math.ceil(raw_paced_progress_fraction(record, now) * 100.0 - 1e-9))
+    if state in {"cancelled", "failed"}:
+        # Terminal status must never continue to look alive because the page
+        # timer refreshed. Freeze it at the last displayed evidence checkpoint.
+        frozen = float(
+            record.get("display_anchor_fraction")
+            or record.get("confirmed_fraction")
+            or 0.0
+        )
+        return min(99, math.ceil(max(0.0, min(0.99, frozen)) * 100.0 - 1e-9))
     # Round up to whole percentages, but never show 100% before terminal
     # evidence has been received.
     return min(99, math.ceil(paced_progress_fraction(record, now) * 100.0 - 1e-9))
@@ -9730,7 +9749,7 @@ def poll_automatic_runtime_guard(guard, desktop_required, stage, api_url, api_ke
 
 
 def submission_runtime_recovery_needed(summary, api_url, api_key, *, probe=detect_anythingllm_api_url):
-    """Recognize a Desktop loss at the narrow upload-submission boundary.
+    """Recognize a Desktop loss at a narrow embedding boundary.
 
     The regular worker guard intentionally needs two low-frequency failed
     probes.  That protects a long upload from one transient request failure,
@@ -9744,8 +9763,14 @@ def submission_runtime_recovery_needed(summary, api_url, api_key, *, probe=detec
         "reason": "not_submission_runtime_loss",
         "health": {},
     }
-    status = str((summary or {}).get("api_upload_status") or "").casefold()
-    if status != "error_authentication_required" or not is_local_anythingllm_url(api_url):
+    source = dict(summary or {})
+    status = str(source.get("api_upload_status") or source.get("status") or "").casefold()
+    runtime_loss_statuses = {
+        "error_authentication_required",
+        "authentication_required",
+        "network_error",
+    }
+    if status not in runtime_loss_statuses or not is_local_anythingllm_url(api_url):
         return result
     try:
         health = probe(str(api_url), api_key=api_key or None, timeout=1.25)
@@ -14423,6 +14448,47 @@ def run_automatic(
             storage_dir=default_anythingllm_storage_dir(),
         )
         embedder_runtime_recovery = {}
+        preflight_runtime_loss = submission_runtime_recovery_needed(
+            anythingllm_embedder_preflight,
+            resolved_api_url,
+            (api_key or "").strip(),
+        )
+        if preflight_runtime_loss.get("needed"):
+            progress(0.097, desc="AnythingLLM stopped during its embedding check; starting Desktop once")
+            update_live_automatic_run_status(
+                run_root,
+                state="running",
+                phase="AnythingLLM stopped during its embedding check; starting Desktop once",
+                expected_seconds=expected_seconds,
+                details="The local runtime became unavailable after its health check. This app-owned run will retry the embedding check once if Desktop starts.",
+                confirmed_fraction=0.095,
+                cancel_available=False,
+            )
+            embedder_runtime_recovery = attempt_automatic_runtime_start(
+                run_root,
+                resolved_api_url,
+                (api_key or "").strip(),
+                stage="AnythingLLM embedding preflight",
+            )
+            embedder_runtime_recovery["trigger"] = preflight_runtime_loss
+            try:
+                append_automatic_runtime_event(
+                    run_root,
+                    {"phase": "AnythingLLM embedding preflight", **embedder_runtime_recovery},
+                )
+            except OSError:
+                pass
+            if embedder_runtime_recovery.get("status") == "ready":
+                progress(0.098, desc="AnythingLLM restarted; retrying its embedding check")
+                recovered_probe = verify_anythingllm_runtime_embedder(
+                    resolved_api_url,
+                    api_key=(api_key or "").strip() or None,
+                    storage_dir=default_anythingllm_storage_dir(),
+                )
+                embedder_runtime_recovery["verification"] = recovered_probe
+                if recovered_probe.get("status") == "pass":
+                    anythingllm_embedder_preflight = recovered_probe
+                    anythingllm_embedder_preflight["recovered_after_desktop_start"] = True
         if (
             anythingllm_embedder_preflight.get("status") in {"server_error", "server_error_empty_body"}
             and str(anythingllm_embedder_preflight.get("provider") or "").casefold() == "openrouter"
@@ -14451,40 +14517,55 @@ def run_automatic(
         )
         if anythingllm_embedder_preflight.get("status") != "pass":
             progress(None)
-            update_live_automatic_run_status(
-                run_root,
-                state="failed",
-                phase="Pre-processing needs attention",
-                expected_seconds=expected_seconds,
-                details="AUTO-EMBEDDER-001: OpenRouter embedding authentication failed (401).",
-                activity_observed=False,
-            )
             credential_reverification_required = (
                 anythingllm_embedder_preflight.get("warning_code")
                 == "AUTO-OPENROUTER-KEY-REVERIFY-001"
             )
+            runtime_unavailable = bool(preflight_runtime_loss.get("needed"))
+            failure_code = (
+                "AUTO-OPENROUTER-KEY-REVERIFY-001"
+                if credential_reverification_required
+                else "AUTO-ANYTHINGLLM-RUNTIME-001"
+                if runtime_unavailable
+                else "AUTO-EMBEDDER-001"
+            )
+            failure_title = (
+                "OpenRouter embedding key rejected"
+                if credential_reverification_required
+                else "AnythingLLM stopped during its embedding check"
+                if runtime_unavailable
+                else "AnythingLLM embedding runtime check failed"
+            )
+            failure_detail = (
+                "OpenRouter returned 401; PDF not uploaded."
+                if credential_reverification_required
+                else (
+                    anythingllm_embedder_preflight.get("message")
+                    or "AnythingLLM's embedding route did not complete; PDF not uploaded."
+                )
+            )
+            if anythingllm_embedder_preflight.get("error") and not credential_reverification_required:
+                failure_detail += f" Detail: {anythingllm_embedder_preflight['error']}"
+            update_live_automatic_run_status(
+                run_root,
+                state="failed",
+                phase="AnythingLLM embedding runtime needs attention",
+                expected_seconds=expected_seconds,
+                details=f"{failure_code}: {failure_title}.",
+                confirmed_fraction=0.095,
+                cancel_available=False,
+                activity_observed=False,
+            )
             return automatic_error_outputs(
-                (
-                    "AUTO-OPENROUTER-KEY-REVERIFY-001"
-                    if credential_reverification_required
-                    else "AUTO-EMBEDDER-001"
-                ),
-                (
-                    "OpenRouter embedding key rejected"
-                    if credential_reverification_required
-                    else "AnythingLLM cannot currently create embeddings"
-                ),
-                [
-                    (
-                        "OpenRouter returned 401; PDF not uploaded."
-                        if credential_reverification_required
-                        else "The live embedding route failed; PDF not uploaded."
-                    ),
-                ],
+                failure_code,
+                failure_title,
+                [failure_detail],
                 [
                     (
                         "Update the OpenRouter key in AnythingLLM Settings, save, then retry."
                         if credential_reverification_required
+                        else "AnythingLLM was started once for this app-owned run, but its embedding check still did not complete. Review the saved probe report before retrying."
+                        if runtime_unavailable
                         else "Open AnythingLLM Settings and save the active embedder configuration again, then retry."
                     ),
                 ],
