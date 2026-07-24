@@ -10,8 +10,9 @@ the prepared records in a subfolder to your local AnythingLLM Desktop workspace 
 to more easily work with PDFs inside AnythingLLM. You can also create local files only (only parse/perform OCR) to automatically convert PDFs to TXT and then upload to AnythingLLM manually. The advantage is that this software works with existing PDF metadata and bookmarks and can also recognize title pages, content index, bibliography and more (which can be excluded) and can also perform OCR on only a subset (5 out of 20 pages only need OCR).
 Doing this automatically or in batch mode is faster than manually creating  workspaces and uploading and embedding pdf files.
 Depending on whether you use local ollama embedders, or openrouter embedders via api key, this can be done under half a minute per pdf. 
+The app communicates with AnythingLLM settings and workspaces through the official AnythingLLM API key. Be sure to vet the codebase of this app (manually or using AI) to see if it complies with your own data processing protocols, as it will be able to make embedding decisions using local python scripts. The app operates via a localhost structure at port 7860 (http://127.0.0.1:7860/) and is a completely local app. But it uses the AnythingLLM app to send PDFs to local embedders (privacy-friendly) or cloud embedder providers (different data processing policies) using the provided (default) settings and the settings you have made personally in the AnythingLLM app. Start up AnythingLLM before using the app.
 
-It supports parsing native-text PDFs, PDFs that need OCR (using Tesseract) for all 
+AnythingLLM PDF Parser Embedder Assistant supports parsing native-text PDFs, PDFs that need OCR (using Tesseract) for all 
 pages or a subset of pages, and can also use the Unstructured library for text extraction 
 from tables and documents with complex layout. It can do whole documents, whole-page chunks, automatically page-preserved records, and shorter
 page-local passages and can do a custom range of pages or all pages.
@@ -32,6 +33,29 @@ page-local passages and can do a custom range of pages or all pages.
 <img width="873" height="940" alt="image" src="https://github.com/user-attachments/assets/2a92ddef-1db8-4809-b872-8304ff1bd47b" />
 
 <img width="873" height="943" alt="image" src="https://github.com/user-attachments/assets/5049178f-14e6-4921-b7c7-a9b1c7a8e63b" />
+
+<img width="876" height="943" alt="image" src="https://github.com/user-attachments/assets/40432234-a23f-446a-95c9-143482da19b3" />
+
+
+<img width="878" height="943" alt="image" src="https://github.com/user-attachments/assets/5cd601f9-0b8d-40ae-b357-be4f6a1145bf" />
+
+<img width="870" height="944" alt="image" src="https://github.com/user-attachments/assets/ed1ac2fa-b586-4689-b9dc-2d5eb6129d17" />
+
+<img width="875" height="943" alt="image" src="https://github.com/user-attachments/assets/de254721-137a-46fc-adce-ddd2a43a5c1a" />
+
+<img width="872" height="942" alt="image" src="https://github.com/user-attachments/assets/69efd3ec-7762-4ec8-966f-423bd4078457" />
+
+<img width="878" height="945" alt="image" src="https://github.com/user-attachments/assets/1b6876a6-59ae-4bd3-9828-85b947f3b414" />
+
+<img width="878" height="945" alt="image" src="https://github.com/user-attachments/assets/6900baed-1c86-4056-b512-e5dafa0ccdf1" />
+
+<img width="873" height="466" alt="image" src="https://github.com/user-attachments/assets/d0964653-485f-4b86-9657-3a7772e43466" />
+
+<img width="1639" height="980" alt="image" src="https://github.com/user-attachments/assets/ae143af4-2fe8-4c24-bcd9-3aa457bd61ee" />
+
+<img width="1620" height="985" alt="image" src="https://github.com/user-attachments/assets/a40a4640-7975-4a50-9caa-d52201b942bb" />
+
+<img width="1619" height="986" alt="image" src="https://github.com/user-attachments/assets/a3a39db0-ba33-41d5-8732-4c5f87c7a14d" />
 
 
 ## Why use it?
