@@ -27,6 +27,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -68,6 +69,7 @@ from auto_anythingllm_pipeline import (
     build_ollama_simulation_adapter,
     build_openrouter_simulation_adapter,
     create_validation_workspace,
+    confirmed_submission_locations_from_ledger,
     create_temporary_desktop_api_key,
     delete_temporary_desktop_api_key,
     detect_anythingllm_api_url,
@@ -82,6 +84,7 @@ from auto_anythingllm_pipeline import (
     is_lancedb_safe_namespace,
     lancedb_safe_workspace_name,
     native_identity_stem,
+    observe_workspace_embedding_queue_activity,
     page_stats_for,
     pdf_metadata,
     planned_embedding_batch_count,
@@ -91,6 +94,8 @@ from auto_anythingllm_pipeline import (
     persist_anythingllm_embedder_settings,
     provider_model_key_for_engine,
     project_local_env_path,
+    remove_confirmed_workspace_queue_entries,
+    restart_anythingllm_desktop,
     resolve_anythingllm_api_key,
     resolve_embedder_capability,
     refresh_local_anythingllm_openrouter_runtime,
@@ -138,6 +143,7 @@ BASE_OUTPUT_DIR = PORTABLE_APPLICATION_PATHS["interactive_outputs"]
 AUTO_OUTPUT_DIR = PORTABLE_APPLICATION_PATHS["automatic_outputs"]
 ADVANCED_DIAGNOSTICS_OUTPUT_DIR = BASE_OUTPUT_DIR / "advanced-diagnostics"
 INGESTION_HISTORY_PATH = AUTO_OUTPUT_DIR / "ingestion-history.jsonl"
+AUTOMATIC_RECOVERY_HISTORY_PATH = AUTO_OUTPUT_DIR / "automatic-recovery-history.jsonl"
 TIMING_MODEL_DIR = AUTO_OUTPUT_DIR / "timing-model"
 TIMING_MODEL_RUNS_PATH = TIMING_MODEL_DIR / "timing-runs.jsonl"
 TIMING_MODEL_EVENTS_PATH = TIMING_MODEL_DIR / "timing-events.jsonl"
@@ -292,12 +298,19 @@ CANCELLED_AUTOMATIC_RUN_ROOTS = set()
 AUTOMATIC_RUN_CANCELLATION_MARKER = ".cancel-requested.json"
 AUTOMATIC_RUN_WORKER_MARKER = ".active-preparation-worker.json"
 AUTOMATIC_RUN_CANCELLATION_RECOVERY = "cancellation-recovery.json"
+AUTOMATIC_RUN_RECOVERY_STATE = "automatic-recovery-state.json"
+# Recovery observes before doing anything remotely. These are intentionally
+# bounded so a Cancel action cannot become a long-running queue client.
+AUTOMATIC_RECOVERY_OBSERVATION_SECONDS = 20.0
+AUTOMATIC_RECOVERY_GRACE_SECONDS = 15.0
+AUTOMATIC_RECOVERY_CLEANUP_TIMEOUT_SECONDS = 20.0
 # A marker survives a server crash for recovery, but a Windows PID can later be
 # reused by an unrelated process. Keep the live Popen handle in this process as
 # the authority for a forced taskkill; the durable marker remains useful for
 # cooperative cancellation and recovery, never as a licence to kill a reused
 # PID after a restart.
 ACTIVE_AUTOMATIC_RUN_WORKER_PROCESSES = {}
+ACTIVE_AUTOMATIC_RECOVERY_THREADS = {}
 # A cross-process worker proves liveness by refreshing run-progress.json.
 # Older records remain recovery evidence, but must never turn a pre-start
 # Cancel click into a stop request against an unrelated historical run.
@@ -5605,11 +5618,25 @@ def reconcile_resume_manifest_late_vectors(manifest):
     return remaining, report
 
 
-def resume_latest_embedding_manifest(api_url, api_key, workspace_slug):
-    """Explicitly submit only the prepared batches left in the latest recovery manifest."""
-    path, manifest = latest_resume_manifest(workspace_slug)
-    if not path or not manifest:
-        return latest_resume_manifest_html(workspace_slug), gr.update(value="No recovery manifest", variant="secondary")
+def submit_embedding_resume_manifest(
+    path,
+    manifest,
+    api_url,
+    api_key,
+    workspace_slug,
+    *,
+    automatic=False,
+    expected_run_root=None,
+):
+    """Reconcile and submit only missing records from one durable manifest."""
+    result = {"status": "not_started", "accepted": 0, "reconciled_locations": 0, "message": ""}
+    path = Path(path)
+    if expected_run_root:
+        try:
+            path.resolve().relative_to(Path(expected_run_root).resolve())
+        except ValueError:
+            result.update(status="rejected_outside_run", message="Recovery manifest is outside the selected run.")
+            return result
     recovery = manifest.get("recovery") or {}
     locations, reconciliation = reconcile_resume_manifest_late_vectors(manifest)
     reconciled_count = int(reconciliation.get("reconciled_locations") or 0)
@@ -5621,15 +5648,14 @@ def resume_latest_embedding_manifest(api_url, api_key, workspace_slug):
             "observed_vectors": reconciliation.get("lancedb_matching_rows"),
             "recorded_at": datetime.now().isoformat(timespec="seconds"),
         }
-        path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        _write_automatic_run_json(path, manifest)
     slug = str(manifest.get("workspace_slug") or "").strip()
     if not slug or slug != str(workspace_slug or "").strip() or not is_lancedb_safe_namespace(slug):
-        return (
-            '<div class="artifact-placeholder"><strong>Recovery manifest rejected.</strong> It does not match the selected safe workspace.</div>',
-            gr.update(value="Recovery manifest rejected", variant="stop"),
-        )
+        result.update(status="rejected_workspace", message="Recovery manifest does not match the selected safe workspace.")
+        return result
     if not locations:
-        return '<div class="artifact-placeholder"><strong>Recovery manifest has no pending locations.</strong></div>', gr.update(value="Nothing to resume", variant="secondary")
+        result.update(status="nothing_to_resume", reconciled_locations=reconciled_count, message="No prepared locations remain after reconciliation.")
+        return result
     resolved_api = (api_url or DEFAULT_ANYTHINGLLM_API_URL).strip()
     secret = (api_key or "").strip()
     authentication_mode = "provided_api_key" if secret else "none"
@@ -5640,13 +5666,13 @@ def resume_latest_embedding_manifest(api_url, api_key, workspace_slug):
         secret, authentication_mode = resolve_anythingllm_api_key(resolved_api)
     temporary_key_id = None
     if not secret:
+        if automatic:
+            result.update(status="no_existing_local_api_key", message="Automatic recovery never creates a new Developer API key.")
+            return result
         temporary = create_temporary_desktop_api_key(resolved_api)
         if temporary.get("status") != "created":
-            return (
-                '<div class="artifact-placeholder"><strong>Could not authorize the explicit resume.</strong> '
-                f'{html.escape(str(temporary.get("error") or "AnythingLLM did not issue a managed or temporary local API key."))}</div>',
-                gr.update(value="Resume needs API authorization", variant="stop"),
-            )
+            result.update(status="authorization_failed", message=str(temporary.get("error") or "AnythingLLM did not issue a local API key."))
+            return result
         secret, temporary_key_id = temporary["secret"], temporary["id"]
         authentication_mode = "temporary_desktop_api_key"
     try:
@@ -5671,18 +5697,68 @@ def resume_latest_embedding_manifest(api_url, api_key, workspace_slug):
         if temporary_key_id:
             delete_temporary_desktop_api_key(resolved_api, temporary_key_id)
     if report.get("errors"):
-        return (
-            latest_resume_manifest_html(workspace_slug),
-            gr.update(value="Resume stopped — review recovery manifest", variant="stop"),
-        )
+        result.update(status="resume_failed", reconciled_locations=reconciled_count, message="Resume stopped; review the recovery manifest.")
+        return result
+    result.update(
+        status="submitted",
+        accepted=int(report.get("accepted") or 0),
+        reconciled_locations=reconciled_count,
+        authentication=authentication_mode,
+        message="Missing prepared locations were submitted; retrieval verification remains required.",
+    )
+    return result
+
+
+def resume_latest_embedding_manifest(api_url, api_key, workspace_slug):
+    """Explicitly submit only the prepared batches left in the latest recovery manifest."""
+    path, manifest = latest_resume_manifest(workspace_slug)
+    if not path or not manifest:
+        return latest_resume_manifest_html(workspace_slug), gr.update(value="No recovery manifest", variant="secondary")
+    result = submit_embedding_resume_manifest(path, manifest, api_url, api_key, workspace_slug)
+    if result.get("status") == "rejected_workspace":
+        return '<div class="artifact-placeholder"><strong>Recovery manifest rejected.</strong> It does not match the selected safe workspace.</div>', gr.update(value="Recovery manifest rejected", variant="stop")
+    if result.get("status") == "nothing_to_resume":
+        return '<div class="artifact-placeholder"><strong>Recovery manifest has no pending locations.</strong></div>', gr.update(value="Nothing to resume", variant="secondary")
+    if result.get("status") in {"authorization_failed", "no_existing_local_api_key"}:
+        return latest_resume_manifest_html(workspace_slug), gr.update(value="Resume needs API authorization", variant="stop")
+    if result.get("status") != "submitted":
+        return latest_resume_manifest_html(workspace_slug), gr.update(value="Resume stopped — review recovery manifest", variant="stop")
     return (
         '<div class="metadata-summary"><section class="metadata-file"><div class="metadata-file-name">Resume submitted</div>'
-        f'<div class="metadata-status">AnythingLLM accepted {html.escape(str(report.get("accepted", 0)))} prepared locations. '
-        f'{html.escape(str(reconciled_count))} late-completing location(s) were verified and omitted before resubmission. '
-        f'Authorization: {html.escape(authentication_mode)}. Use Verify current workspace after indexing settles; '
+        f'<div class="metadata-status">AnythingLLM accepted {html.escape(str(result.get("accepted", 0)))} prepared locations. '
+        f'{html.escape(str(result.get("reconciled_locations", 0)))} late-completing location(s) were verified and omitted before resubmission. '
+        f'Authorization: {html.escape(str(result.get("authentication") or ""))}. Use Verify current workspace after indexing settles; '
         'acceptance alone is not a retrieval-success claim.</div></section></div>',
         gr.update(value="Resume submitted — verify workspace", variant="secondary"),
     )
+
+
+RECOVERY_POLICY_LABELS = {
+    "Leave everything running": "leave_everything_running",
+    "Cancel only my confirmed queued records": "cancel_confirmed_queues",
+    "Restart AnythingLLM anyway": "restart_anythingllm_anyway",
+}
+
+
+def apply_latest_recovery_policy(api_url, api_key, workspace_slug, policy_label, restart_confirmed=False):
+    """Apply an explicitly chosen recovery action to the latest matching run."""
+    path, manifest = latest_resume_manifest(workspace_slug)
+    if not path or not manifest:
+        return latest_resume_manifest_html(workspace_slug), gr.update(value="No recovery manifest", variant="secondary")
+    policy = RECOVERY_POLICY_LABELS.get(str(policy_label or ""), "leave_everything_running")
+    run_root = path.parents[2]
+    result = recover_automatic_run(
+        run_root,
+        policy=policy,
+        explicit_restart_confirmation=bool(restart_confirmed),
+        observation_seconds=AUTOMATIC_RECOVERY_OBSERVATION_SECONDS,
+    )
+    message = str(result.get("message") or result.get("status") or "Recovery recorded.")
+    if result.get("status") in {"restart_confirmation_required", "review_required"}:
+        variant = "stop"
+    else:
+        variant = "secondary"
+    return latest_resume_manifest_html(workspace_slug), gr.update(value=message, variant=variant)
 
 
 def storage_audit_html(workspace_slug):
@@ -9039,6 +9115,205 @@ def active_automatic_run_root():
         if str(record.get("state") or "") in {"running", "preparing"}:
             return Path(str(record.get("run_root") or progress_path.parent))
     return None
+
+
+def _read_automatic_run_json(path):
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _append_automatic_recovery_history(record):
+    try:
+        AUTOMATIC_RECOVERY_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with AUTOMATIC_RECOVERY_HISTORY_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    except OSError as exc:
+        APP_LOGGER.warning("could not record automatic recovery history: %s", exc)
+
+
+def _recovery_ledger_groups(run_root):
+    """Yield each ledger with its nearest worker configuration, never a sibling's."""
+    root = Path(run_root)
+    for ledger_path in sorted(root.rglob("embedding-batch-ledger.json")):
+        ledger = _read_automatic_run_json(ledger_path)
+        workspace_slug = str(ledger.get("workspace_slug") or "").strip()
+        locations = confirmed_submission_locations_from_ledger(ledger)
+        if not workspace_slug or not locations:
+            continue
+        config = {}
+        parent = ledger_path.parent
+        while True:
+            candidate = parent / ".automatic-worker-config.json"
+            if candidate.is_file():
+                config = _read_automatic_run_json(candidate)
+                break
+            if parent == root or root not in parent.parents:
+                break
+            parent = parent.parent
+        args = config.get("args") if isinstance(config.get("args"), dict) else {}
+        yield {
+            "ledger_path": str(ledger_path),
+            "workspace_slug": workspace_slug,
+            "locations": locations,
+            "api_url": str(args.get("anythingllm_api_url") or DEFAULT_ANYTHINGLLM_API_URL).strip(),
+            "provided_api_key": str(args.get("anythingllm_api_key") or "").strip(),
+        }
+
+
+def _is_most_recent_recovery_run(run_root):
+    root = Path(run_root)
+    candidates = sorted(
+        AUTO_OUTPUT_DIR.glob("app-run-*/**/resume-embedding-manifest.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not candidates:
+        return True
+    return root == candidates[0].parents[2]
+
+
+def recover_automatic_run(
+    run_root,
+    *,
+    policy="leave_everything_running",
+    automatic=False,
+    explicit_restart_confirmation=False,
+    observation_seconds=AUTOMATIC_RECOVERY_OBSERVATION_SECONDS,
+    grace_seconds=AUTOMATIC_RECOVERY_GRACE_SECONDS,
+    sleeper=time.sleep,
+):
+    """Apply one bounded, durable recovery policy to one interrupted run.
+
+    ``leave_everything_running`` is the default. Automatic recovery is limited
+    to the latest interrupted run and only when live SSE evidence identifies
+    owned activity and no non-owned activity. Quiet or unavailable streams are
+    treated as uncertainty and never trigger queue mutation or a restart.
+    """
+    root = Path(run_root)
+    result = {
+        "schema_version": 1,
+        "recorded_at": datetime.now().isoformat(timespec="seconds"),
+        "run_root": str(root),
+        "policy": str(policy or "leave_everything_running"),
+        "automatic": bool(automatic),
+        "status": "not_started",
+        "groups": [],
+        "message": "",
+    }
+    if not root.is_dir():
+        result.update(status="run_root_unavailable", message="Recovery run folder is unavailable.")
+    elif automatic and not _is_most_recent_recovery_run(root):
+        result.update(status="blocked_not_most_recent", message="Only the most recent interrupted run may resume automatically.")
+    elif policy == "restart_anythingllm_anyway" and not explicit_restart_confirmation:
+        result.update(status="restart_confirmation_required", message="Restart AnythingLLM anyway requires explicit destructive confirmation.")
+    else:
+        groups = list(_recovery_ledger_groups(root))
+        if not groups:
+            result.update(status="no_confirmed_submissions", message="No confirmed submitted or pending records were found in this run.")
+        for group in groups:
+            api_url = group["api_url"]
+            secret, auth_mode = resolve_anythingllm_api_key(api_url, group["provided_api_key"] or None)
+            row = {**group, "authentication": auth_mode, "action": "none"}
+            if not secret:
+                row.update(status="no_existing_local_api_key", message="No existing local API key was available; no key was created.")
+                result["groups"].append(row)
+                continue
+            activity = observe_workspace_embedding_queue_activity(
+                api_url, secret, group["workspace_slug"], group["locations"],
+                observation_seconds=observation_seconds,
+            )
+            row["activity"] = activity
+            if policy == "leave_everything_running":
+                row.update(status="left_running", message="Default policy left AnythingLLM unchanged.")
+            elif policy == "restart_anythingllm_anyway":
+                row["restart"] = restart_anythingllm_desktop(api_url, secret)
+                row.update(action="restart", status=str(row["restart"].get("status") or "unknown"))
+            elif activity.get("status") != "owned_activity_observed":
+                row.update(status="blocked_by_manual_activity_or_uncertainty", message="AnythingLLM was not changed because manual activity or uncertainty was observed.")
+            else:
+                cleanup = remove_confirmed_workspace_queue_entries(
+                    api_url, secret, group["workspace_slug"], group["locations"], activity,
+                    total_timeout=AUTOMATIC_RECOVERY_CLEANUP_TIMEOUT_SECONDS,
+                )
+                row["cleanup"] = cleanup
+                row["action"] = "cancel_confirmed_queues"
+                if policy == "cancel_confirmed_queues":
+                    row["status"] = cleanup.get("status")
+                elif automatic:
+                    # A healthy slow queue is never restarted. Only a completed
+                    # removal proves a queued record was still present; a 404 or
+                    # quiet stream can also describe an active record, so neither
+                    # permits a duplicate automatic submission.
+                    if cleanup.get("status") == "complete" and int(cleanup.get("removed") or 0) > 0:
+                        sleeper(max(0.0, min(30.0, float(grace_seconds))))
+                        runtime = detect_anythingllm_api_url(api_url, api_key=secret, timeout=1.25)
+                        row["runtime_after_grace"] = runtime
+                        if runtime.get("status") not in {"reachable", "reachable_auth_required"}:
+                            row["restart"] = restart_anythingllm_desktop(api_url, secret)
+                            row["action"] = "restart_confirmed_stalled_queue"
+                            if row["restart"].get("status") != "ready":
+                                row["status"] = str(row["restart"].get("status") or "unknown")
+                                result["groups"].append(row)
+                                continue
+                        else:
+                            row["restart"] = {"status": "not_needed_runtime_healthy"}
+                        manifest_path = Path(group["ledger_path"]).with_name("resume-embedding-manifest.json")
+                        manifest = _read_automatic_run_json(manifest_path)
+                        if manifest:
+                            row["resume"] = submit_embedding_resume_manifest(
+                                manifest_path, manifest, api_url, secret, group["workspace_slug"],
+                                automatic=True, expected_run_root=root,
+                            )
+                            row["action"] = "reconcile_missing_and_resume"
+                            row["status"] = str(row["resume"].get("status") or "review_required")
+                        else:
+                            row["status"] = "resume_manifest_missing"
+                    else:
+                        row["status"] = "active_or_absent_records_not_resubmitted"
+                else:
+                    row["status"] = cleanup.get("status")
+            result["groups"].append(row)
+        if groups:
+            result["status"] = "complete" if all(str(row.get("status")) in {"complete", "ready", "left_running"} for row in result["groups"]) else "review_required"
+            if any(str((row.get("restart") or {}).get("status") or "") == "ready" for row in result["groups"]):
+                result["message"] = "AnythingLLM restarted to clear this run's confirmed stalled queue. Other workspace content was not modified."
+            else:
+                result["message"] = "AnythingLLM recovery recorded. Check run history before relying on an interrupted upload."
+    try:
+        _write_automatic_run_json(root / AUTOMATIC_RUN_RECOVERY_STATE, result)
+    except OSError:
+        pass
+    _append_automatic_recovery_history(result)
+    return result
+
+
+def schedule_automatic_recovery(run_root, *, reason="runtime_interrupted"):
+    """Start one non-blocking recovery attempt for the latest interrupted run."""
+    root = Path(run_root)
+    key = str(root)
+    existing = ACTIVE_AUTOMATIC_RECOVERY_THREADS.get(key)
+    if existing and existing.is_alive():
+        return False
+
+    def recover_in_background():
+        try:
+            recover_automatic_run(root, policy="automatic_recover", automatic=True)
+        except Exception as exc:
+            APP_LOGGER.warning("automatic recovery attempt failed: %s", exc)
+        finally:
+            ACTIVE_AUTOMATIC_RECOVERY_THREADS.pop(key, None)
+
+    thread = threading.Thread(
+        target=recover_in_background,
+        name=f"anythingllm-recovery-{root.name}",
+        daemon=True,
+    )
+    ACTIVE_AUTOMATIC_RECOVERY_THREADS[key] = thread
+    thread.start()
+    return True
 
 
 def request_automatic_run_cancellation(run_root):
@@ -14340,12 +14615,25 @@ def run_automatic(
                 "last_failure": str(exc),
             }
             classified_error = classify_pipeline_exception(exc)
+            # A local worker can fail after Desktop accepted an embedding
+            # request. Schedule only that run's bounded recovery path, and
+            # only for transport/runtime-shaped failures. The recovery worker
+            # itself still requires positive owned-queue evidence before it
+            # can mutate Desktop or resume anything.
+            recovery_scheduled = False
+            recovery_text = str(exc).casefold()
+            if (
+                (out_dir / "inspection" / "embedding-batch-ledger.json").is_file()
+                and any(token in recovery_text for token in ("anythingllm", "update-embeddings", "timeout", "connection", "urlopen"))
+            ):
+                recovery_scheduled = schedule_automatic_recovery(run_root, reason="runtime_or_transport_failure")
             try:
                 summary = write_failure_package(pdf_path, out_dir, exc, args)
                 summary["app_error_code"] = classified_error["code"]
                 summary["app_error_title"] = classified_error["title"]
                 summary["app_error_message"] = str(exc)
                 summary["app_error_next_steps"] = classified_error["next_steps"]
+                summary["automatic_recovery_scheduled"] = recovery_scheduled
             except Exception as failure_exc:
                 return automatic_error_outputs(
                     "AUTO-PIPELINE-002",
@@ -15291,6 +15579,17 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                         refresh_resume_manifest_button = gr.Button("Check interrupted embedding recovery")
                         resume_manifest_status = gr.HTML(value=latest_resume_manifest_html(INITIAL_WORKSPACE_VALUE))
                         resume_embedding_button = gr.Button("Resume pending embedding batches", variant="secondary")
+                        recovery_policy = gr.Radio(
+                            choices=list(RECOVERY_POLICY_LABELS),
+                            value="Leave everything running",
+                            label="Interrupted-run recovery action",
+                            info="Default is non-destructive. Queue cleanup runs only with positive evidence that the active queue belongs to this app run.",
+                        )
+                        recovery_restart_confirmation = gr.Checkbox(
+                            value=False,
+                            label="I understand that restarting AnythingLLM can interrupt other Desktop work",
+                        )
+                        apply_recovery_policy_button = gr.Button("Apply recovery action", variant="secondary")
                     with gr.Accordion("ETA model and timing diagnostics", open=False, elem_classes=["native-upload-subaccordion"]):
                         refresh_timing_model_button = gr.Button("Refresh ETA model")
                         timing_model_status = gr.HTML(value=timing_model_html())
@@ -15710,6 +16009,12 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 fn=resume_latest_embedding_manifest,
                 inputs=[api_url, api_key, workspace_slug],
                 outputs=[resume_manifest_status, resume_embedding_button],
+                show_progress="full",
+            )
+            apply_recovery_policy_button.click(
+                fn=apply_latest_recovery_policy,
+                inputs=[api_url, api_key, workspace_slug, recovery_policy, recovery_restart_confirmation],
+                outputs=[resume_manifest_status, apply_recovery_policy_button],
                 show_progress="full",
             )
             run_storage_audit_button.click(

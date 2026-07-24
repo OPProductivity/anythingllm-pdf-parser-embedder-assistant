@@ -7530,6 +7530,7 @@ def listen_for_anythingllm_embed_progress(
     event_callback=None,
     error_callback=None,
     connected_event=None,
+    include_unmatched_events=False,
 ):
     """Read Desktop's SSE queue feed while a single update request is active.
 
@@ -7580,7 +7581,9 @@ def listen_for_anythingllm_embed_progress(
                         continue
                     event = parse_anythingllm_embed_progress_event("\n".join(payload_lines))
                     payload_lines = []
-                    if not event or not _anythingllm_embed_event_matches_locations(
+                    if not event:
+                        continue
+                    if not include_unmatched_events and not _anythingllm_embed_event_matches_locations(
                         event, expected, matched_locations
                     ):
                         continue
@@ -7626,6 +7629,8 @@ def start_anythingllm_embed_progress_listener(
     api_key,
     workspace_slug,
     expected_locations,
+    *,
+    include_unmatched_events=False,
 ):
     """Start a best-effort, path-correlated Desktop progress listener.
 
@@ -7653,6 +7658,7 @@ def start_anythingllm_embed_progress_listener(
             "event_callback": receive,
             "error_callback": receive_error,
             "connected_event": connected_event,
+            "include_unmatched_events": include_unmatched_events,
         },
         name="anythingllm-embed-progress",
         daemon=True,
@@ -7665,6 +7671,100 @@ def start_anythingllm_embed_progress_listener(
         "events": observed_events,
         "errors": observed_errors,
     }
+
+
+def observe_workspace_embedding_queue_activity(
+    api_url,
+    api_key,
+    workspace_slug,
+    owned_locations,
+    *,
+    observation_seconds=3.0,
+):
+    """Take one bounded, read-only queue observation for recovery safety.
+
+    Desktop's event feed is not a queue snapshot.  Silence therefore remains
+    uncertainty, while an event whose filename is outside this run's durable
+    submission ledger is positive evidence that another workflow is active.
+    """
+    listener = start_anythingllm_embed_progress_listener(
+        api_url,
+        api_key,
+        workspace_slug,
+        owned_locations,
+        include_unmatched_events=True,
+    )
+    budget = max(0.0, min(10.0, float(observation_seconds or 0.0)))
+    listener["connected_event"].wait(timeout=min(1.0, budget))
+    if budget:
+        listener["stop_event"].wait(timeout=budget)
+    listener["stop_event"].set()
+    listener["thread"].join(timeout=1.0)
+    owned = {
+        _normalized_anythingllm_document_location(location)
+        for location in (owned_locations or [])
+        if str(location or "").strip()
+    }
+    owned_events, non_owned_events = [], []
+    for event in listener["events"]:
+        filenames = [event.get("filename")]
+        filenames.extend(event.get("filenames") or [])
+        filenames.extend(event.get("embeddedFiles") or [])
+        filenames.extend(event.get("failedFiles") or [])
+        names = {
+            _normalized_anythingllm_document_location(name)
+            for name in filenames
+            if str(name or "").strip()
+        }
+        if names & owned:
+            owned_events.append(dict(event))
+        if names - owned:
+            non_owned_events.append(dict(event))
+    if non_owned_events:
+        status = "non_owned_activity_observed"
+    elif owned_events:
+        status = "owned_activity_observed"
+    elif listener["connected_event"].is_set():
+        status = "quiet_stream_uncertain"
+    else:
+        status = "stream_unavailable_uncertain"
+    return {
+        "status": status,
+        "stream_connected": listener["connected_event"].is_set(),
+        "owned_event_count": len(owned_events),
+        "non_owned_event_count": len(non_owned_events),
+        "events": list(listener["events"]),
+        "stream_errors": list(listener["errors"]),
+        "automatic_mutation_allowed": status == "owned_activity_observed",
+        "automatic_restart_allowed": status == "owned_activity_observed",
+    }
+
+
+def confirmed_submission_locations_from_ledger(ledger):
+    """Return only locations whose submission crossed the app's request boundary.
+
+    Planned locations include records never sent because a cancellation can
+    stop before the next batch. They are not authority to mutate Desktop.
+    """
+    confirmed_states = {
+        "submitted", "accepted", "unresolved", "reconciliation_pending",
+        "verification_failed",
+    }
+    locations = []
+    seen = set()
+    batches = list((ledger or {}).get("batches") or [])
+    inflight = (ledger or {}).get("inflight_batch")
+    if isinstance(inflight, dict):
+        batches.append(inflight)
+    for batch in batches:
+        if str((batch or {}).get("submission_state") or "").strip() not in confirmed_states:
+            continue
+        for location in (batch or {}).get("locations") or []:
+            normalized = _normalized_anythingllm_document_location(location)
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                locations.append(normalized)
+    return locations
 
 
 def post_multipart_form(url, fields, file_field_name, file_path, api_key=None, timeout=120):
@@ -7753,11 +7853,15 @@ def get_json_with_retry(url, api_key=None, timeout: float = 5.0, max_attempts=3,
     return {"http_status": None, "text": "", "attempts": attempts}
 
 
-def delete_json(url, api_key=None, timeout=30):
+def delete_json(url, api_key=None, timeout=30, body=None):
     headers = {}
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-    req = urllib.request.Request(url, headers=headers, method="DELETE")
+    req = urllib.request.Request(url, data=data, headers=headers, method="DELETE")
     with urllib.request.urlopen(req, timeout=timeout) as response:
         return response.status, response.read().decode("utf-8", errors="replace")
 
@@ -7768,6 +7872,127 @@ def is_local_anythingllm_url(api_url):
     except Exception:
         return False
     return hostname in {"127.0.0.1", "localhost", "::1"}
+
+
+def _safe_app_owned_queue_location(location):
+    normalized = str(location or "").replace("\\", "/").strip().lstrip("/")
+    parts = [part for part in normalized.split("/") if part not in {"", "."}]
+    if len(parts) < 2 or parts[0].casefold() != "custom-documents" or any(part == ".." for part in parts):
+        return ""
+    return "/".join(parts)
+
+
+def remove_confirmed_workspace_queue_entries(
+    api_url,
+    api_key,
+    workspace_slug,
+    locations,
+    activity_observation,
+    *,
+    total_timeout=20.0,
+    request_timeout=4.0,
+    initial_workers=2,
+    max_workers=4,
+):
+    """Bounded cleanup for confirmed app submissions after positive ownership evidence.
+
+    This helper will not run from a quiet or unavailable stream: those states
+    cannot establish that a manual queue is absent.  It permits at most one
+    retry per record and returns at its total deadline even if Desktop has
+    stopped responding.
+    """
+    result = {
+        "status": "not_attempted", "attempted": 0, "removed": 0, "absent": 0,
+        "timed_out": 0, "retry_count": 0, "deadline_seconds": max(1.0, float(total_timeout)),
+        "errors": [], "unresolved_locations": [], "removed_locations": [],
+    }
+    if not is_local_anythingllm_url(api_url) or not is_lancedb_safe_namespace(workspace_slug):
+        result["status"] = "rejected_target"
+        return result
+    if str((activity_observation or {}).get("status") or "") != "owned_activity_observed":
+        result["status"] = "blocked_by_manual_activity_or_uncertainty"
+        return result
+    trusted, seen = [], set()
+    for location in locations or []:
+        safe_location = _safe_app_owned_queue_location(location)
+        if safe_location and safe_location.casefold() not in seen:
+            seen.add(safe_location.casefold())
+            trusted.append(safe_location)
+    if not trusted:
+        result["status"] = "no_confirmed_managed_locations"
+        return result
+    endpoint = api_url.rstrip("/") + f"/api/v1/workspace/{workspace_slug}/embed-queue"
+    deadline = time.monotonic() + result["deadline_seconds"]
+    attempts = {location: 0 for location in trusted}
+    pending = list(trusted)
+    workers = max(1, min(2, int(initial_workers or 1), len(pending)))
+    ceiling = max(workers, min(4, int(max_workers or 1)))
+
+    def remove_one(location, timeout):
+        started = time.monotonic()
+        try:
+            status, text = delete_json(endpoint, api_key=api_key, timeout=timeout, body={"filename": location})
+            try:
+                payload = json.loads(text) if str(text or "").strip() else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            if int(status) in {200, 201, 202} and isinstance(payload, dict) and payload.get("success") is False:
+                return location, "absent", time.monotonic() - started, ""
+            if int(status) in {200, 201, 202, 204}:
+                return location, "removed", time.monotonic() - started, ""
+            if int(status) == 404:
+                return location, "absent", time.monotonic() - started, ""
+            return location, "retryable", time.monotonic() - started, f"HTTP {int(status)}"
+        except urllib.error.HTTPError as exc:
+            return location, ("absent" if int(exc.code) == 404 else "retryable"), time.monotonic() - started, f"HTTP {int(exc.code)}"
+        except (TimeoutError, urllib.error.URLError) as exc:
+            return location, "retryable", time.monotonic() - started, type(exc).__name__
+        except Exception as exc:
+            return location, "retryable", time.monotonic() - started, type(exc).__name__
+
+    while pending and time.monotonic() < deadline:
+        wave = pending[:workers]
+        pending = pending[workers:]
+        timeout = max(0.25, min(float(request_timeout), deadline - time.monotonic()))
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(wave))
+        futures = {executor.submit(remove_one, location, timeout): location for location in wave}
+        done, unfinished = concurrent.futures.wait(futures, timeout=max(0.0, deadline - time.monotonic()))
+        executor.shutdown(wait=False, cancel_futures=True)
+        prompt_wave = bool(done) and not unfinished
+        for future in done:
+            location, state, elapsed, error = future.result()
+            attempts[location] += 1
+            result["attempted"] += 1
+            if state == "removed":
+                result["removed"] += 1
+                result["removed_locations"].append(location)
+            elif state == "absent":
+                result["absent"] += 1
+            elif attempts[location] <= 1 and time.monotonic() < deadline:
+                result["retry_count"] += 1
+                pending.append(location)
+            else:
+                result["timed_out"] += 1
+                result["errors"].append({"location": location, "error": error or "queue removal unresolved"})
+            prompt_wave = prompt_wave and elapsed <= 1.0
+        for future in unfinished:
+            location = futures[future]
+            future.cancel()
+            attempts[location] += 1
+            result["attempted"] += 1
+            if attempts[location] <= 1 and time.monotonic() < deadline:
+                result["retry_count"] += 1
+                pending.append(location)
+            else:
+                result["timed_out"] += 1
+                result["errors"].append({"location": location, "error": "total cleanup deadline reached"})
+        if prompt_wave and workers < ceiling:
+            workers = min(ceiling, workers + 1)
+    result["unresolved_locations"] = list(dict.fromkeys(pending))
+    if pending:
+        result["timed_out"] += len(pending)
+    result["status"] = "complete" if not result["errors"] and not pending else "partial"
+    return result
 
 
 def default_anythingllm_desktop_executable_candidates():
@@ -7987,6 +8212,56 @@ def start_anythingllm_desktop(executable_path=None):
         result["status"] = "start_failed"
         result["error"] = str(exc)
         return result
+
+
+def restart_anythingllm_desktop(
+    preferred_url="",
+    api_key=None,
+    *,
+    startup_timeout=45.0,
+):
+    """Restart local Desktop only after the caller has established safety.
+
+    This deliberately performs no queue inspection or policy decision itself.
+    Callers must record why a restart was allowed before invoking it.
+    """
+    result = {"status": "not_attempted", "stopped": False, "start": {}, "error": ""}
+    if preferred_url and not is_local_anythingllm_url(preferred_url):
+        result["status"] = "rejected_nonlocal_runtime"
+        return result
+    if anythingllm_desktop_process_running():
+        try:
+            completed = subprocess.run(
+                ["taskkill", "/IM", "AnythingLLM.exe", "/T", "/F"] if os.name == "nt" else ["pkill", "-f", "AnythingLLM"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            result["stopped"] = completed.returncode == 0
+        except (OSError, subprocess.SubprocessError) as exc:
+            result["status"] = "stop_failed"
+            result["error"] = str(exc)
+            return result
+        if not result["stopped"]:
+            result["status"] = "stop_failed"
+            return result
+    started = start_anythingllm_desktop()
+    result["start"] = started
+    if started.get("status") in {"missing_executable", "start_failed"}:
+        result["status"] = started.get("status")
+        result["error"] = str(started.get("error") or "")
+        return result
+    runtime = ensure_anythingllm_runtime(
+        preferred_url,
+        api_key=api_key,
+        timeout=1.25,
+        startup_timeout=max(5.0, float(startup_timeout)),
+        autostart_local=False,
+    )
+    result["runtime"] = runtime
+    result["status"] = "ready" if runtime.get("status") in {"reachable", "reachable_auth_required"} else "startup_timeout"
+    return result
 
 
 def ensure_anythingllm_runtime(
@@ -12418,7 +12693,28 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
                 "but this document is incomplete and needs review or explicit recovery."
             )
         elif not matching_docs and vector_namespace_evidence_exists:
-            if result["workspace_documents_globally_unused"]:
+            if normalized_observation_mode == "fast":
+                # Fast polling deliberately counts workspace rows without
+                # materializing their metadata, so ``matching_docs`` is empty
+                # by design. Do not turn that deferred observation into a
+                # false document-list warning when exact expected vectors and
+                # page/segment provenance are already present.
+                if result["lancedb_text_contains_page_or_segment"]:
+                    result["status"] = "pass"
+                    result["classification"] = "native_metadata_llm_visible_fast_document_observation_deferred"
+                    result["message"] = (
+                        "Exact expected vectors are embedded in the target workspace namespace and retain "
+                        "page/segment evidence. Workspace document metadata observation was deferred to a "
+                        "separate deep verification and does not block retrieval."
+                    )
+                else:
+                    result["status"] = "review"
+                    result["classification"] = "native_metadata_source_panel_only_fast_document_observation_deferred"
+                    result["message"] = (
+                        "Exact expected vectors are embedded, but page/segment evidence was not visible in the "
+                        "fast observation. Use Verify deeply before relying on page-cited retrieval."
+                    )
+            elif result["workspace_documents_globally_unused"]:
                 if result["lancedb_text_contains_page_or_segment"]:
                     result["status"] = "pass"
                     result["classification"] = "native_metadata_llm_visible_legacy_workspace_table_unused"

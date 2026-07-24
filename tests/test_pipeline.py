@@ -3349,6 +3349,138 @@ class PipelineCoreTests(unittest.TestCase):
                 self.assertFalse(app.terminate_automatic_run_worker(run_root))
             taskkill.assert_not_called()
 
+    def test_confirmed_submission_locations_exclude_unsubmitted_plans(self):
+        locations = pipeline.confirmed_submission_locations_from_ledger(
+            {
+                "batches": [
+                    {"submission_state": "accepted", "locations": ["custom-documents/accepted.json"]},
+                    {"submission_state": "cancelled_before_submission", "locations": ["custom-documents/not-sent.json"]},
+                    {"submission_state": "rejected", "locations": ["custom-documents/refused.json"]},
+                ],
+                "inflight_batch": {"submission_state": "unresolved", "locations": ["custom-documents/unknown.json"]},
+            }
+        )
+        self.assertEqual(locations, ["custom-documents/accepted.json", "custom-documents/unknown.json"])
+
+    def test_queue_cleanup_blocks_uncertain_or_manual_activity_without_requests(self):
+        original_delete = pipeline.delete_json
+        try:
+            pipeline.delete_json = lambda *_args, **_kwargs: self.fail("uncertain activity must not mutate Desktop")
+            result = pipeline.remove_confirmed_workspace_queue_entries(
+                "http://127.0.0.1:3001", "test-key", "safe-workspace",
+                ["custom-documents/owned.json"], {"status": "quiet_stream_uncertain"},
+            )
+        finally:
+            pipeline.delete_json = original_delete
+        self.assertEqual(result["status"], "blocked_by_manual_activity_or_uncertainty")
+        self.assertEqual(result["attempted"], 0)
+
+    def test_queue_cleanup_retries_once_with_a_total_bounded_contract(self):
+        original_delete = pipeline.delete_json
+        calls = []
+        try:
+            def fake_delete(*_args, **_kwargs):
+                calls.append(1)
+                return (503, "busy") if len(calls) == 1 else (204, "")
+
+            pipeline.delete_json = fake_delete
+            result = pipeline.remove_confirmed_workspace_queue_entries(
+                "http://localhost:3001", "test-key", "safe-workspace",
+                ["custom-documents/owned.json"], {"status": "owned_activity_observed"},
+                total_timeout=5, request_timeout=1,
+            )
+        finally:
+            pipeline.delete_json = original_delete
+        self.assertEqual(calls, [1, 1])
+        self.assertEqual(result["retry_count"], 1)
+        self.assertEqual(result["removed"], 1)
+        self.assertEqual(result["status"], "complete")
+
+    def test_recovery_uses_nearest_worker_configuration_and_blocks_manual_activity(self):
+        import rag_pdf_gradio_app as app
+
+        original_resolve = app.resolve_anythingllm_api_key
+        original_observe = app.observe_workspace_embedding_queue_activity
+        original_remove = app.remove_confirmed_workspace_queue_entries
+        try:
+            app.resolve_anythingllm_api_key = lambda *_args, **_kwargs: ("managed-key", "managed_desktop_key")
+            app.observe_workspace_embedding_queue_activity = lambda *_args, **_kwargs: {"status": "non_owned_activity_observed"}
+            app.remove_confirmed_workspace_queue_entries = lambda *_args, **_kwargs: self.fail("manual activity must block cleanup")
+            with tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir) / "app-run-current"
+                for name, api_url in (("first", "http://127.0.0.1:3001"), ("second", "http://127.0.0.1:3002")):
+                    document = root / name
+                    inspection = document / "inspection"
+                    inspection.mkdir(parents=True)
+                    (document / ".automatic-worker-config.json").write_text(
+                        json.dumps({"args": {"anythingllm_api_url": api_url}}), encoding="utf-8"
+                    )
+                    (inspection / "embedding-batch-ledger.json").write_text(
+                        json.dumps({"workspace_slug": f"workspace-{name}", "batches": [
+                            {"submission_state": "accepted", "locations": [f"custom-documents/{name}.json"]}
+                        ]}), encoding="utf-8"
+                    )
+                result = app.recover_automatic_run(root, policy="cancel_confirmed_queues", observation_seconds=0)
+        finally:
+            app.resolve_anythingllm_api_key = original_resolve
+            app.observe_workspace_embedding_queue_activity = original_observe
+            app.remove_confirmed_workspace_queue_entries = original_remove
+        self.assertEqual([row["api_url"] for row in result["groups"]], ["http://127.0.0.1:3001", "http://127.0.0.1:3002"])
+        self.assertTrue(all(row["status"] == "blocked_by_manual_activity_or_uncertainty" for row in result["groups"]))
+
+    def test_restart_anyway_requires_explicit_confirmation(self):
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = app.recover_automatic_run(
+                Path(tmpdir), policy="restart_anythingllm_anyway", explicit_restart_confirmation=False,
+            )
+        self.assertEqual(result["status"], "restart_confirmation_required")
+
+    def test_automatic_recovery_resumes_only_after_confirmed_owned_cleanup(self):
+        import rag_pdf_gradio_app as app
+
+        original_resolve = app.resolve_anythingllm_api_key
+        original_observe = app.observe_workspace_embedding_queue_activity
+        original_remove = app.remove_confirmed_workspace_queue_entries
+        original_detect = app.detect_anythingllm_api_url
+        original_submit = app.submit_embedding_resume_manifest
+        try:
+            app.resolve_anythingllm_api_key = lambda *_args, **_kwargs: ("managed-key", "managed_desktop_key")
+            app.observe_workspace_embedding_queue_activity = lambda *_args, **_kwargs: {"status": "owned_activity_observed"}
+            app.remove_confirmed_workspace_queue_entries = lambda *_args, **_kwargs: {"status": "complete", "removed": 1}
+            app.detect_anythingllm_api_url = lambda *_args, **_kwargs: {"status": "reachable"}
+            submissions = []
+            app.submit_embedding_resume_manifest = lambda *args, **kwargs: (submissions.append((args, kwargs)) or {"status": "submitted"})
+            with tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir) / "app-run-current"
+                inspection = root / "document" / "inspection"
+                inspection.mkdir(parents=True)
+                (root / "document" / ".automatic-worker-config.json").write_text(
+                    json.dumps({"args": {"anythingllm_api_url": "http://127.0.0.1:3001"}}), encoding="utf-8"
+                )
+                (inspection / "embedding-batch-ledger.json").write_text(
+                    json.dumps({"workspace_slug": "safe-workspace", "batches": [
+                        {"submission_state": "unresolved", "locations": ["custom-documents/owned.json"]}
+                    ]}), encoding="utf-8"
+                )
+                (inspection / "resume-embedding-manifest.json").write_text(
+                    json.dumps({"workspace_slug": "safe-workspace", "recovery": {"remaining_locations": ["custom-documents/owned.json"]}}),
+                    encoding="utf-8",
+                )
+                result = app.recover_automatic_run(
+                    root, policy="automatic_recover", automatic=True, observation_seconds=0, grace_seconds=0,
+                )
+        finally:
+            app.resolve_anythingllm_api_key = original_resolve
+            app.observe_workspace_embedding_queue_activity = original_observe
+            app.remove_confirmed_workspace_queue_entries = original_remove
+            app.detect_anythingllm_api_url = original_detect
+            app.submit_embedding_resume_manifest = original_submit
+        self.assertEqual(len(submissions), 1)
+        self.assertEqual(result["groups"][0]["action"], "reconcile_missing_and_resume")
+        self.assertEqual(result["groups"][0]["resume"]["status"], "submitted")
+
     def test_terminal_run_status_reconciles_the_full_ui_after_a_lost_stream(self):
         import rag_pdf_gradio_app as app
 
@@ -12083,6 +12215,45 @@ class PipelineCoreTests(unittest.TestCase):
         )
         self.assertEqual(result["lancedb_matching_rows"], 2)
         self.assertIn(result["status"], {"review", "pass_with_missing_workspace_document_records"})
+
+    def test_fast_post_upload_passes_when_exact_page_vectors_are_visible(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = Path(temp_dir)
+            con = sqlite3.connect(storage / "anythingllm.db")
+            con.executescript(
+                """
+                create table workspaces (id integer primary key, name text, slug text);
+                create table workspace_documents (docId text, filename text, docpath text, workspaceId integer, metadata text);
+                create table document_vectors (docId text, vectorId text);
+                insert into workspaces values (1, 'Test', 'test');
+                insert into workspace_documents values ('other', 'other.txt', 'other.txt', 1, '{}');
+                """
+            )
+            con.commit()
+            con.close()
+            original_count = pipeline.inspect_native_metadata_count
+            original_locations = pipeline.inspect_uploaded_location_files
+            try:
+                pipeline.inspect_native_metadata_count = lambda *args, **kwargs: {
+                    "status": "complete", "matching_rows": 1,
+                    "matching_table_names": ["test"], "text_contains_segment_or_page": True,
+                }
+                pipeline.inspect_uploaded_location_files = lambda *args, **kwargs: {
+                    "status": "complete", "existing_files": 1, "matching_files": 1,
+                    "metadata_visible": True, "sample_path": "dummy.json",
+                }
+                result = pipeline.verify_anythingllm_post_upload(
+                    storage, "test", "a" * 64,
+                    [{"metadata": {"chunkSource": "segment://0"}}], observation_mode="fast",
+                )
+            finally:
+                pipeline.inspect_native_metadata_count = original_count
+                pipeline.inspect_uploaded_location_files = original_locations
+        self.assertEqual(result["status"], "pass")
+        self.assertEqual(
+            result["classification"],
+            "native_metadata_llm_visible_fast_document_observation_deferred",
+        )
 
     def test_exact_vector_success_defers_full_post_upload_observation(self):
         report = {
