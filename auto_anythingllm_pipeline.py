@@ -2370,10 +2370,15 @@ def _layout_photographed_spread_columns(rows, width, height):
     inner edges overlap around the camera's fold.  Sorting such rows by y/x
     interleaves the two pages.  This is intentionally stricter than ordinary
     two-column detection: both long regions must cover much of the page and
-    their median inner edges must overlap at the physical centre.  A normal
-    journal layout has a real gutter, so it cannot take this path.
+    their median inner edges must overlap at the physical centre.  A true
+    two-facing-page spread is materially landscape; a portrait page can have
+    poetry, quotations, or indented prose that creates the same coordinate
+    overlap without a camera fold.  A normal journal layout has a real gutter,
+    so it cannot take this path either.
     """
     if not rows or width <= 0 or height <= 0:
+        return None
+    if float(width) / max(float(height), 1.0) < 1.22:
         return None
     prose = [
         row for row in rows

@@ -8889,15 +8889,15 @@ class PipelineCoreTests(unittest.TestCase):
                 {
                     "text": f"left spread prose line {line_number} contains enough ordinary words for geometry.",
                     "normalized": "",
-                    "x0": 55.0, "x1": 325.0, "y0": float(y), "y1": float(y + 12),
+                    "x0": 110.0, "x1": 650.0, "y0": float(y), "y1": float(y + 12),
                 },
                 {
                     "text": f"right spread prose line {line_number} contains enough ordinary words for geometry.",
                     "normalized": "",
-                    "x0": 285.0, "x1": 555.0, "y0": float(y), "y1": float(y + 12),
+                    "x0": 570.0, "x1": 1110.0, "y0": float(y), "y1": float(y + 12),
                 },
             ])
-        ordered, reading_order, regions = pipeline._layout_reading_order(rows, 612, 792)
+        ordered, reading_order, regions = pipeline._layout_reading_order(rows, 1224, 792)
         self.assertEqual(reading_order, "photographed_spread_column_first")
         self.assertEqual(len(regions), 2)
         self.assertEqual(regions[0]["source_column_index"], 1)
@@ -8906,6 +8906,25 @@ class PipelineCoreTests(unittest.TestCase):
             ordered.index(rows[24]),
             ordered.index(rows[1]),
         )
+
+    def test_photographed_spread_detector_rejects_portrait_overlap(self):
+        rows = []
+        for line_number in range(14):
+            y = 70 + line_number * 25
+            rows.extend([
+                {
+                    "text": f"left indented prose line {line_number} has enough ordinary words for geometry.",
+                    "normalized": "",
+                    "x0": 55.0, "x1": 325.0, "y0": float(y), "y1": float(y + 12),
+                },
+                {
+                    "text": f"right indented prose line {line_number} has enough ordinary words for geometry.",
+                    "normalized": "",
+                    "x0": 285.0, "x1": 555.0, "y0": float(y), "y1": float(y + 12),
+                },
+            ])
+
+        self.assertIsNone(pipeline._layout_photographed_spread_columns(rows, 612, 792))
 
     def test_photographed_spread_detector_does_not_claim_a_normal_gutter(self):
         rows = []
