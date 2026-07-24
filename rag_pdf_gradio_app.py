@@ -9565,16 +9565,29 @@ def terminate_automatic_run_worker(run_root):
 def write_automatic_cancellation_recovery(run_root, pdf_path=None, worker_record=None):
     """Record the only safe postcondition after a forced child termination."""
     root = Path(run_root)
+    live = dict(LIVE_AUTOMATIC_RUN_STATUS or {})
+    try:
+        confirmed_percent = round(
+            min(1.0, max(0.0, float(live.get("confirmed_fraction") or 0.0))) * 100.0,
+            1,
+        )
+    except (TypeError, ValueError):
+        confirmed_percent = 0.0
     payload = {
         "schema_version": 1,
         "status": "cancelled",
         "cancelled_at": datetime.now().isoformat(),
         "source_pdf": str(pdf_path or ""),
         "worker": dict(worker_record or {}),
+        "checkpoint": {
+            "phase": str(live.get("phase") or ""),
+            "confirmed_percent": confirmed_percent,
+            "meaning": "Progress was frozen at this evidence-backed checkpoint when cancellation was requested.",
+        },
         "local_result": "partial artifacts may remain and are intentionally not deleted automatically",
         "anythingllm_result": (
-            "unknown if an embedding request had already crossed into AnythingLLM; "
-            "no later documents or batches were submitted by this app run"
+            "No further request will be submitted by this app run. An embedding request already accepted by "
+            "AnythingLLM may still finish; its outcome is intentionally recorded as unknown rather than claimed stopped."
         ),
         "resume_guidance": "Inspect the workspace and this run folder before rerunning; a rerun may safely recreate prepared local artifacts.",
     }
@@ -9598,7 +9611,17 @@ def automatic_run_cancelled_outputs(
     """Return the stable terminal UI contract for a stop before any PDF ends."""
     recovery = write_automatic_cancellation_recovery(run_root)
     files = [recovery] if recovery and Path(recovery).is_file() else []
-    message = "Stopped by operator before another document was submitted."
+    live = dict(LIVE_AUTOMATIC_RUN_STATUS or {})
+    try:
+        checkpoint_percent = round(
+            min(1.0, max(0.0, float(live.get("confirmed_fraction") or 0.0))) * 100.0
+        )
+    except (TypeError, ValueError):
+        checkpoint_percent = 0
+    message = (
+        f"Cancelled at the {checkpoint_percent}% evidence checkpoint. Progress was frozen there; "
+        "no later PDF or new AnythingLLM request was submitted. An already accepted Desktop request may still finish."
+    )
     update_live_automatic_run_status(
         run_root,
         state="cancelled",
@@ -10087,9 +10110,12 @@ def cancel_or_reset_automatic_run(
         update_live_automatic_run_status(
             run_root,
             state="running",
-            phase="Stop requested — stopping the active document worker",
+            phase="Cancellation requested — stopping at the current safe checkpoint",
             expected_seconds=progress_record.get("expected_seconds", 0),
-            details="The active PDF worker is being terminated; no later PDF or AnythingLLM batch will be submitted.",
+            details=(
+                "Progress is frozen at its last confirmed checkpoint. The active PDF worker is stopping; "
+                "no later PDF or new AnythingLLM request will be submitted. An already accepted request may still finish."
+            ),
             confirmed_fraction=progress_record.get("confirmed_fraction"),
             cancel_available=False,
             cancel_requested=True,
@@ -14785,7 +14811,7 @@ def run_automatic(
             run_root, confirmed_fraction
         )
         if cancellation_active:
-            stage_text = "Stop requested — stopping the active document worker"
+            stage_text = "Cancellation requested — stopping at the current safe checkpoint"
         update_live_automatic_run_status(
             run_root,
             state="running",
@@ -15645,7 +15671,11 @@ def run_automatic(
     completion = (
         {
             "state": "cancelled",
-            "message": "Stop requested. The current safe checkpoint finished; later PDFs or AnythingLLM batches were not submitted. Review the recovery manifest before resuming.",
+            "message": (
+                "Cancellation completed at the current safe checkpoint. Progress remained frozen; no later PDF or "
+                "new AnythingLLM request was submitted. An already accepted Desktop request may still finish; review "
+                "the recovery manifest before resuming."
+            ),
         }
         if cancellation_requested
         else automatic_completion(summaries, prepare_and_upload)

@@ -7923,6 +7923,28 @@ class PipelineCoreTests(unittest.TestCase):
                 app.LIVE_AUTOMATIC_RUN_STATUS = original_live
                 app.CANCELLED_AUTOMATIC_RUN_ROOTS.discard(str(run_root))
 
+    def test_cancellation_recovery_records_a_frozen_checkpoint_without_claiming_remote_stop(self):
+        import rag_pdf_gradio_app as app
+
+        original_status = app.LIVE_AUTOMATIC_RUN_STATUS
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_root = Path(temp_dir) / "cancelled-run"
+            run_root.mkdir()
+            try:
+                app.LIVE_AUTOMATIC_RUN_STATUS = {
+                    "run_root": str(run_root),
+                    "phase": "Submitting AnythingLLM batch 2",
+                    "confirmed_fraction": 0.387,
+                }
+                recovery = app.write_automatic_cancellation_recovery(run_root, "example.pdf")
+                record = json.loads(Path(recovery).read_text(encoding="utf-8"))
+            finally:
+                app.LIVE_AUTOMATIC_RUN_STATUS = original_status
+
+        self.assertEqual(record["checkpoint"]["confirmed_percent"], 38.7)
+        self.assertEqual(record["checkpoint"]["phase"], "Submitting AnythingLLM batch 2")
+        self.assertIn("already accepted", record["anythingllm_result"])
+
     def test_target_passage_length_control_update_changes_by_segment_mode(self):
         import rag_pdf_gradio_app as app
 
