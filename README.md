@@ -27,8 +27,7 @@ page-local passages and can do a custom range of pages or all pages.
 > supported by Mintplex Labs or AnythingLLM.
 
 
-##Examples (more info with bullet points below these screenshots):
-<img width="870" height="993" alt="image" src="https://github.com/user-attachments/assets/91bc9842-375b-4321-ab47-2c1c8479b1df" />
+##Example Screenshots
 
 <img width="876" height="942" alt="image" src="https://github.com/user-attachments/assets/f84ed39b-164f-403f-ad95-170a302487cf" />
 
@@ -36,29 +35,8 @@ page-local passages and can do a custom range of pages or all pages.
 
 <img width="873" height="943" alt="image" src="https://github.com/user-attachments/assets/5049178f-14e6-4921-b7c7-a9b1c7a8e63b" />
 
-<img width="876" height="943" alt="image" src="https://github.com/user-attachments/assets/40432234-a23f-446a-95c9-143482da19b3" />
-
-
-<img width="878" height="943" alt="image" src="https://github.com/user-attachments/assets/5cd601f9-0b8d-40ae-b357-be4f6a1145bf" />
-
-<img width="870" height="944" alt="image" src="https://github.com/user-attachments/assets/ed1ac2fa-b586-4689-b9dc-2d5eb6129d17" />
-
-<img width="875" height="943" alt="image" src="https://github.com/user-attachments/assets/de254721-137a-46fc-adce-ddd2a43a5c1a" />
-
-<img width="872" height="942" alt="image" src="https://github.com/user-attachments/assets/69efd3ec-7762-4ec8-966f-423bd4078457" />
-
-<img width="878" height="945" alt="image" src="https://github.com/user-attachments/assets/1b6876a6-59ae-4bd3-9828-85b947f3b414" />
-
-<img width="873" height="466" alt="image" src="https://github.com/user-attachments/assets/d0964653-485f-4b86-9657-3a7772e43466" />
-
-
-<img width="1639" height="980" alt="image" src="https://github.com/user-attachments/assets/ae143af4-2fe8-4c24-bcd9-3aa457bd61ee" />
-
-
-<img width="1620" height="985" alt="image" src="https://github.com/user-attachments/assets/a40a4640-7975-4a50-9caa-d52201b942bb" />
-
-
 <img width="1619" height="986" alt="image" src="https://github.com/user-attachments/assets/a3a39db0-ba33-41d5-8732-4c5f87c7a14d" />
+
 
 
 ## Why use it?
@@ -73,6 +51,7 @@ page-local passages and can do a custom range of pages or all pages.
 - Detect extraction, OCR, embedding, workspace, and retrieval failures
 - Parse advanced PDFs using complex python scripts
 - Easy localhost user interface - no terminal required
+- Dark Theme and Light Theme (also follows System Theme if your windows dark mode only activates at night)
 - Adheres to common embedder context size limits
 - Use the optional desktop refresh bridge to make AnythingLLM Desktop reflect
   completed document changes more reliably.
@@ -123,10 +102,11 @@ retrieval are separate checks.
 - [pipx](https://pipx.pypa.io/)
 - [AnythingLLM Desktop](https://anythingllm.com/desktop) running locally when
   you use the upload mode
-- An embedding provider configured and working in AnythingLLM Desktop
+- An embedding provider configured and working in AnythingLLM Desktop (install Ollama on your PC or configure OpenRouter API key inside AnythingLLM)
 
-### Install from GitHub
+### Installation
 
+## Install the app directly from this Github Repository to your Windows PC:
 ```powershell
 py -m pip install --user pipx
 py -m pipx ensurepath
@@ -153,7 +133,7 @@ the repository root instead.
 ## How to use the app
 
 1. Start AnythingLLM Desktop and confirm that its embedding provider works.
-2. Start this assistant with `anythingllm-pdf-assistant start --browser`.
+2. Start this assistant with `anythingllm-pdf-assistant start --browser` (or use the desktop shortcut).
 3. Upload a PDF, choose several PDFs, or select a batch folder.
 4. Review the detected PDF metadata and set title/author information if needed.
 5. Select an output mode and a segmentation mode.
@@ -165,6 +145,31 @@ the repository root instead.
    and retrieval evidence in the run report.
 
 For a detailed walkthrough, see [docs/USAGE.md](docs/USAGE.md).
+
+## Screenshots
+
+<img width="876" height="943" alt="image" src="https://github.com/user-attachments/assets/40432234-a23f-446a-95c9-143482da19b3" />
+
+
+<img width="878" height="943" alt="image" src="https://github.com/user-attachments/assets/5cd601f9-0b8d-40ae-b357-be4f6a1145bf" />
+
+<img width="870" height="944" alt="image" src="https://github.com/user-attachments/assets/ed1ac2fa-b586-4689-b9dc-2d5eb6129d17" />
+
+<img width="875" height="943" alt="image" src="https://github.com/user-attachments/assets/de254721-137a-46fc-adce-ddd2a43a5c1a" />
+
+<img width="872" height="942" alt="image" src="https://github.com/user-attachments/assets/69efd3ec-7762-4ec8-966f-423bd4078457" />
+
+<img width="878" height="945" alt="image" src="https://github.com/user-attachments/assets/1b6876a6-59ae-4bd3-9828-85b947f3b414" />
+
+<img width="873" height="466" alt="image" src="https://github.com/user-attachments/assets/d0964653-485f-4b86-9657-3a7772e43466" />
+
+
+<img width="1639" height="980" alt="image" src="https://github.com/user-attachments/assets/ae143af4-2fe8-4c24-bcd9-3aa457bd61ee" />
+
+
+<img width="1620" height="985" alt="image" src="https://github.com/user-attachments/assets/a40a4640-7975-4a50-9caa-d52201b942bb" />
+
+
 
 ## AnythingLLM integration
 
