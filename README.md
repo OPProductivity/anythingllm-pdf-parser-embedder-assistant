@@ -61,13 +61,17 @@ page-local passages and can do a custom range of pages or all pages.
 
 ## Why use it?
 
-- Preserve page provenance for PDF citations in RAG answers.
-- Convert PDFs into explicit, inspectable text records before embedding.
-- Choose a segmentation strategy that fits retrieval quality and speed.
+- Preserve PDF pages for citing or retrieving directly from page (higher LLM citation accuracy).
+- Convert PDFs into text records before embedding.
+- Parse PDF file batches
+- Upload PDF batches to AnythingLLM - fully automated
+- Choose a segmentation strategy that fits retrieval quality and speed (one file, multiple files)
 - Prepare and upload a single PDF, several selected PDFs, or a batch folder.
-- Keep local-only workflows available when you do not want to upload anything.
-- Detect extraction, OCR, embedding, workspace, and retrieval failures with
-  separate readiness messages.
+- Keep parsing and OCR locally when you do not want to upload anything.
+- Detect extraction, OCR, embedding, workspace, and retrieval failures
+- Parse advanced PDFs using complex python scripts
+- Easy localhost user interface - no terminal required
+- Adheres to common embedder context size limits
 - Use the optional desktop refresh bridge to make AnythingLLM Desktop reflect
   completed document changes more reliably.
 
@@ -216,3 +220,59 @@ Contributions, bug reports, and reproducible test cases are welcome. Read
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Succesfully Parsing and embedding a PDF with 2 columns of text per page - 6 page pdf - 0 OCR pages - parsed - split into 6 - embedded into AnythingLLM
+
+Start:
+<img width="1639" height="980" alt="2026-07-24_12h54_10" src="https://github.com/user-attachments/assets/902ddcb5-4bac-4c03-b6d8-1544dfa9a969" />
+<img width="1639" height="980" alt="image" src="https://github.com/user-attachments/assets/03b2a41b-e9cd-4386-95cc-dca3b63c859f" />
+<img width="1639" height="980" alt="image" src="https://github.com/user-attachments/assets/901975d1-0085-4001-b109-60fe091ef510" />
+<img width="1639" height="980" alt="image" src="https://github.com/user-attachments/assets/54838066-aaa8-4037-b8d3-c9dc446e2f16" />
+<img width="1639" height="980" alt="image" src="https://github.com/user-attachments/assets/71268e08-3271-41ff-9269-75ea2da3f90f" />
+<img width="1639" height="980" alt="image" src="https://github.com/user-attachments/assets/525e6ab0-9ca2-43f2-b633-6f1baece1b4d" />
+<img width="1639" height="980" alt="image" src="https://github.com/user-attachments/assets/640ac739-e423-44a9-9627-6345383dcfcf" />
+<img width="1639" height="980" alt="image" src="https://github.com/user-attachments/assets/a740739c-3462-413a-ac7c-39702aeb3ed7" />
+<img width="1639" height="980" alt="image" src="https://github.com/user-attachments/assets/5e9024f2-38a6-4d54-b215-4bccce7bd317" />
+<img width="1920" height="1072" alt="image" src="https://github.com/user-attachments/assets/264add11-928e-42c3-aeae-030ff0cbbc90" />
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/b929dbb9-331f-417a-b108-15f17c63762a" />
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/41e244cb-761d-4240-b0cf-5ac2acbd2e48" />
+<img width="1920" height="1072" alt="image" src="https://github.com/user-attachments/assets/42a383b1-f7b1-425f-a672-6fe083c6039d" />
+<img width="1639" height="980" alt="image" src="https://github.com/user-attachments/assets/8f3812af-3015-478f-8ef5-8a92d1ebf70a" />
+<img width="1920" height="1072" alt="image" src="https://github.com/user-attachments/assets/38ecbee5-1e7f-41be-9121-4a05ca327374" />
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/d619eb09-6868-447e-a5be-e154aa142d30" />
+<img width="1920" height="1072" alt="image" src="https://github.com/user-attachments/assets/a89e9d29-0723-4fd1-bede-de948b5f53a8" />
+<img width="1639" height="980" alt="image" src="https://github.com/user-attachments/assets/2fd61c26-1c3c-4320-ae06-6d63b4f701ac" />
+<img width="1639" height="980" alt="image" src="https://github.com/user-attachments/assets/e77fd36e-8aaa-409c-a561-f9193b038e8e" />
+<img width="1639" height="980" alt="image" src="https://github.com/user-attachments/assets/464790de-5cfd-4141-9d1f-f33e7a3c2046" />
+<img width="1639" height="980" alt="image" src="https://github.com/user-attachments/assets/bd72f128-05d2-42f7-9436-fa98ddd89e5f" />
+<img width="1639" height="980" alt="image" src="https://github.com/user-attachments/assets/594daec1-a38d-4720-a928-5560e9cfcd1f" />
+<img width="1639" height="980" alt="image" src="https://github.com/user-attachments/assets/94a13c3a-be21-4178-8acf-14f0b111e460" />
+<img width="1920" height="1072" alt="image" src="https://github.com/user-attachments/assets/88ace4ed-d9d8-43bd-9179-0bb12f4d4c9a" />
+<img width="1639" height="980" alt="image" src="https://github.com/user-attachments/assets/388f0c6e-f4da-47bd-9547-2f02d8eca504" />
+<img width="1639" height="980" alt="image" src="https://github.com/user-attachments/assets/630f20a3-4f91-4d91-addb-d7e4d9c61374" />
+Completed succesfully.
+
+
+## Succesfully Parsing and embedding a normal PDF - 678 pages pdf - 0 OCR pages - parsed - split into 6 - embedded into AnythingLLM
+
+Start:
+<img width="1639" height="980" alt="image" src="https://github.com/user-attachments/assets/38fd80e9-621a-428a-a640-a8183e5159a9" />
+<img width="1639" height="980" alt="image" src="https://github.com/user-attachments/assets/ae4f7561-7b8c-4004-bdda-cbda9042ed8d" />
+<img width="1639" height="980" alt="image" src="https://github.com/user-attachments/assets/cd038291-1823-4068-b0aa-e76dcbe74d47" />
+<img width="794" height="962" alt="image" src="https://github.com/user-attachments/assets/871a04ac-c3da-4720-8c3d-020ae53c102b" />
+
+<img width="1920" height="1072" alt="image" src="https://github.com/user-attachments/assets/00037ece-2a25-4e44-837f-986ced685c43" />
+<img width="1920" height="1072" alt="image" src="https://github.com/user-attachments/assets/33122e8a-283a-47ef-b4de-3dce923da9c2" />
+
+<img width="897" height="962" alt="image" src="https://github.com/user-attachments/assets/1f158773-c327-467a-b6db-350f44366bf7" />
+
+
+
+
+
+
+
+
+
+
+
