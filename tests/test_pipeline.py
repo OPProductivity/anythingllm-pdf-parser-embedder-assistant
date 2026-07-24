@@ -1464,6 +1464,36 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(state["consecutive_failures"], 2)
         self.assertEqual(len(state["checks"]), 4)
 
+    def test_runtime_guard_confirms_a_failed_probe_promptly(self):
+        import rag_pdf_gradio_app as app
+
+        state = app.new_automatic_runtime_guard()
+        state, first = app.poll_automatic_runtime_guard(
+            state,
+            True,
+            "Extracting native PDF text",
+            "http://127.0.0.1:3001",
+            "key",
+            now=100,
+            probe=lambda *_args, **_kwargs: {"status": "connection_refused"},
+        )
+        self.assertEqual(first["status"], "transient_failure")
+        self.assertEqual(
+            state["next_check_epoch"],
+            100 + app.AUTOMATIC_RUNTIME_GUARD_RECHECK_SECONDS,
+        )
+
+        state, second = app.poll_automatic_runtime_guard(
+            state,
+            True,
+            "Extracting native PDF text",
+            "http://127.0.0.1:3001",
+            "key",
+            now=102,
+            probe=lambda *_args, **_kwargs: {"status": "connection_refused"},
+        )
+        self.assertEqual(second["status"], "unavailable")
+
     def test_runtime_guard_turns_probe_error_into_bounded_failure_evidence(self):
         import rag_pdf_gradio_app as app
 
@@ -3730,6 +3760,36 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(updated["confirmed_fraction"], 0.095)
         self.assertEqual(updated["phase_allowance"], 0.0)
         self.assertEqual(app.paced_progress_percent(updated, now=1_000.0), 10)
+
+    def test_runtime_retry_resets_visible_progress_before_replaying_preparation(self):
+        import rag_pdf_gradio_app as app
+
+        original_status = app.LIVE_AUTOMATIC_RUN_STATUS
+        with tempfile.TemporaryDirectory() as tmpdir:
+            try:
+                app.LIVE_AUTOMATIC_RUN_STATUS = {
+                    "state": "running",
+                    "run_root": tmpdir,
+                    "confirmed_fraction": 0.98,
+                    "display_anchor_fraction": 0.995,
+                    "display_target_fraction": 0.995,
+                    "display_anchor_epoch": 100.0,
+                    "started_epoch": 90.0,
+                    "phase": "Preparation complete",
+                }
+                updated = app.update_live_automatic_run_status(
+                    tmpdir,
+                    state="running",
+                    phase="AnythingLLM stopped; restarting before retry",
+                    expected_seconds=100,
+                    confirmed_fraction=0.10,
+                    reset_progress=True,
+                )
+            finally:
+                app.LIVE_AUTOMATIC_RUN_STATUS = original_status
+
+        self.assertEqual(updated["confirmed_fraction"], 0.10)
+        self.assertLess(app.paced_progress_percent(updated, now=101.0), 20)
 
     def test_processing_label_stays_blue_while_force_stop_is_light_grey(self):
         import rag_pdf_gradio_app as app

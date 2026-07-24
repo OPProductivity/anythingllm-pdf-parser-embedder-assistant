@@ -315,6 +315,10 @@ AUTOMATIC_RECOVERY_OBSERVATION_SECONDS = 20.0
 AUTOMATIC_RECOVERY_GRACE_SECONDS = 15.0
 AUTOMATIC_RECOVERY_CLEANUP_TIMEOUT_SECONDS = 20.0
 AUTOMATIC_RUNTIME_GUARD_INTERVAL_SECONDS = 12.0
+# A failed health probe is deliberately confirmed before recovery, but the
+# confirmation must not make a stopped Desktop invisible for another full
+# monitoring interval.
+AUTOMATIC_RUNTIME_GUARD_RECHECK_SECONDS = 2.0
 AUTOMATIC_RUNTIME_GUARD_FAILURE_THRESHOLD = 2
 # A marker survives a server crash for recovery, but a Windows PID can later be
 # reused by an unrelated process. Keep the live Popen handle in this process as
@@ -8709,6 +8713,7 @@ def update_live_automatic_run_status(
     confidence_label=None,
     comparable_runs=None,
     output_paths=None,
+    reset_progress=False,
 ):
     """Persist progress evidence plus a deliberately capped time-based estimate.
 
@@ -8723,6 +8728,22 @@ def update_live_automatic_run_status(
     # or its visible-progress floor.
     if requested_run_root and previous.get("run_root") and requested_run_root != previous.get("run_root"):
         previous = {}
+    # A bounded Desktop recovery currently replays local preparation before it
+    # can submit the document again.  That is a new attempt, not 99% completed
+    # work, so explicitly discard only its display high-water state.  Preserve
+    # the original run root and start time for durable recovery evidence.
+    if reset_progress and previous:
+        previous = {
+            **previous,
+            "confirmed_fraction": 0.0,
+            "display_anchor_fraction": 0.0,
+            "display_target_fraction": 0.0,
+            "elapsed_percent_floor": 0,
+            "phase_started_epoch": 0.0,
+            "phase_start_fraction": 0.0,
+            "phase_allowance": 0.0,
+            "phase_budget_seconds": 0.0,
+        }
     now = time.time()
     previous_confirmed = float(previous.get("confirmed_fraction") or 0.0)
     try:
@@ -9712,7 +9733,7 @@ def attempt_automatic_runtime_start(run_root, api_url, api_key, *, stage=""):
 
 
 def poll_automatic_runtime_guard(guard, desktop_required, stage, api_url, api_key, *, now=None, probe=detect_anythingllm_api_url):
-    """Perform one low-frequency health probe after Desktop-dependent work starts.
+    """Perform bounded passive health probes for an upload-mode run.
 
     A broken SSE connection is diagnostic only. Recovery is authorized only
     after two real API-health failures, and callers own the one-per-run
@@ -9730,8 +9751,12 @@ def poll_automatic_runtime_guard(guard, desktop_required, stage, api_url, api_ke
     except Exception as exc:  # A monitor must never bring down a live run.
         health = {"status": "probe_error", "error": str(exc)}
     healthy = str(health.get("status") or "") in {"reachable", "reachable_auth_required"}
-    state["next_check_epoch"] = moment + AUTOMATIC_RUNTIME_GUARD_INTERVAL_SECONDS
     state["consecutive_failures"] = 0 if healthy else int(state.get("consecutive_failures") or 0) + 1
+    state["next_check_epoch"] = moment + (
+        AUTOMATIC_RUNTIME_GUARD_INTERVAL_SECONDS
+        if healthy
+        else AUTOMATIC_RUNTIME_GUARD_RECHECK_SECONDS
+    )
     if healthy:
         state["last_healthy_at"] = datetime.now().isoformat(timespec="seconds")
     observation = {
@@ -9854,7 +9879,11 @@ def execute_automatic_preparation_in_worker(
     event_offset = 0
     latest_progress_value = 0.0
     latest_stage = ""
-    desktop_required = False
+    # Upload-mode runs need a passive runtime guard from the first local
+    # preparation event.  Waiting for a worker event to declare an embedding
+    # stage made a stopped Desktop invisible until the document was already
+    # locally complete, producing a misleading 99% recovery state.
+    desktop_required = bool(getattr(args, "prepare_and_upload", False))
     runtime_guard = new_automatic_runtime_guard()
     worker_record = active_automatic_run_worker(root)
     try:
@@ -14714,7 +14743,15 @@ def run_automatic(
     except OSError as exc:
         APP_LOGGER.warning("could not write automatic progress allocation: %s", exc)
 
-    def report_automatic_progress(value, stage, file_index=0, total=0, start=0.0, end=1.0):
+    def report_automatic_progress(
+        value,
+        stage,
+        file_index=0,
+        total=0,
+        start=0.0,
+        end=1.0,
+        reset_progress=False,
+    ):
         nonlocal expected_seconds, ocr_eta_applied_files
         stage_text = str(stage or "Working")
         stage_key = stage_text.casefold()
@@ -14760,6 +14797,7 @@ def run_automatic(
                 automatic_run_cancel_is_safe(stage_text) and not cancellation_active
             ),
             cancel_requested=cancellation_active,
+            reset_progress=reset_progress,
         )
         progress(
             confirmed_fraction,
@@ -15091,12 +15129,13 @@ def run_automatic(
             )
             if submission_recovery.get("needed"):
                 report_automatic_progress(
-                    0.98,
-                    "AnythingLLM stopped before submission; starting Desktop once and resuming this document",
+                    0.0,
+                    "AnythingLLM stopped before submission; restarting Desktop before retrying this document",
                     file_index=file_index,
                     total=total_files,
                     start=start_fraction,
                     end=end_fraction,
+                    reset_progress=True,
                 )
                 runtime_recovery = attempt_automatic_runtime_start(
                     run_root,
@@ -15115,8 +15154,8 @@ def run_automatic(
                 summary["runtime_recovery"] = runtime_recovery
                 if runtime_recovery.get("status") == "ready":
                     report_automatic_progress(
-                        0.98,
-                        "AnythingLLM restarted; resuming this app-owned document submission",
+                        0.0,
+                        "AnythingLLM restarted; retrying this document from local preparation",
                         file_index=file_index,
                         total=total_files,
                         start=start_fraction,
