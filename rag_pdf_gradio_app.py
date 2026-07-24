@@ -9729,6 +9729,36 @@ def poll_automatic_runtime_guard(guard, desktop_required, stage, api_url, api_ke
     }
 
 
+def submission_runtime_recovery_needed(summary, api_url, api_key, *, probe=detect_anythingllm_api_url):
+    """Recognize a Desktop loss at the narrow upload-submission boundary.
+
+    The regular worker guard intentionally needs two low-frequency failed
+    probes.  That protects a long upload from one transient request failure,
+    but a PDF can finish local preparation between those probes.  In that
+    short final window, a failed temporary-key request is ambiguous until a
+    fresh health probe says whether Desktop is actually gone.  Only then may
+    the caller make its one bounded *start-only* recovery attempt.
+    """
+    result = {
+        "needed": False,
+        "reason": "not_submission_runtime_loss",
+        "health": {},
+    }
+    status = str((summary or {}).get("api_upload_status") or "").casefold()
+    if status != "error_authentication_required" or not is_local_anythingllm_url(api_url):
+        return result
+    try:
+        health = probe(str(api_url), api_key=api_key or None, timeout=1.25)
+    except Exception as exc:
+        health = {"status": "probe_error", "error": str(exc)}
+    result["health"] = dict(health or {})
+    if str(result["health"].get("status") or "") in {"reachable", "reachable_auth_required"}:
+        result["reason"] = "runtime_still_reachable"
+        return result
+    result.update(needed=True, reason="local_runtime_unavailable_after_submission_auth_failure")
+    return result
+
+
 def execute_automatic_preparation_in_worker(
     pdf_path, out_dir, args, run_root, progress_callback, timing_event_callback=None
 ):
@@ -14973,6 +15003,79 @@ def run_automatic(
             if not summary:
                 raise RuntimeError("The preparation worker completed without a pipeline summary.")
             summary["run_control"] = dict(worker_result.get("run_control") or {})
+            submission_recovery = submission_runtime_recovery_needed(
+                summary,
+                getattr(args, "anythingllm_api_url", ""),
+                getattr(args, "anythingllm_api_key", ""),
+            )
+            if submission_recovery.get("needed"):
+                report_automatic_progress(
+                    0.98,
+                    "AnythingLLM stopped before submission; starting Desktop once and resuming this document",
+                    file_index=file_index,
+                    total=total_files,
+                    start=start_fraction,
+                    end=end_fraction,
+                )
+                runtime_recovery = attempt_automatic_runtime_start(
+                    run_root,
+                    getattr(args, "anythingllm_api_url", ""),
+                    getattr(args, "anythingllm_api_key", ""),
+                    stage="AnythingLLM submission authentication",
+                )
+                runtime_recovery["trigger"] = submission_recovery
+                try:
+                    append_automatic_runtime_event(
+                        run_root,
+                        {"phase": "AnythingLLM submission authentication", **runtime_recovery},
+                    )
+                except OSError:
+                    pass
+                summary["runtime_recovery"] = runtime_recovery
+                if runtime_recovery.get("status") == "ready":
+                    report_automatic_progress(
+                        0.98,
+                        "AnythingLLM restarted; resuming this app-owned document submission",
+                        file_index=file_index,
+                        total=total_files,
+                        start=start_fraction,
+                        end=end_fraction,
+                    )
+                    retry_result = execute_automatic_preparation_in_worker(
+                        pdf_path,
+                        out_dir,
+                        args,
+                        run_root,
+                        lambda value, stage: report_automatic_progress(
+                            value,
+                            stage,
+                            file_index=file_index,
+                            total=total_files,
+                            start=start_fraction,
+                            end=end_fraction,
+                        ),
+                        record_pipeline_timing,
+                    )
+                    if retry_result.get("status") == "cancelled":
+                        cancellation_requested = True
+                        recovery = retry_result.get("recovery")
+                        if recovery:
+                            downloadable.append(recovery)
+                        break
+                    if retry_result.get("status") != "completed":
+                        raise RuntimeError(
+                            retry_result.get("error")
+                            or "The automatic retry after Desktop startup did not complete."
+                        )
+                    summary = dict(retry_result.get("summary") or {})
+                    if not summary:
+                        raise RuntimeError(
+                            "The automatic retry after Desktop startup completed without a pipeline summary."
+                        )
+                    summary["run_control"] = dict(retry_result.get("run_control") or {})
+                    summary["runtime_recovery"] = runtime_recovery
+                    summary["runtime_retry_after_desktop_start"] = True
+                    worker_result = retry_result
             worker_context = worker_result.get("batch_inspection_context")
             if isinstance(worker_context, dict):
                 batch_inspection_context.update(worker_context)

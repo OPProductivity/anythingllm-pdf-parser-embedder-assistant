@@ -1480,6 +1480,39 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(result["status"], "transient_failure")
         self.assertEqual(state["checks"][-1]["health_status"], "probe_error")
 
+    def test_submission_auth_failure_recovers_only_when_local_desktop_is_down(self):
+        import rag_pdf_gradio_app as app
+
+        summary = {"api_upload_status": "error_authentication_required"}
+        unavailable = app.submission_runtime_recovery_needed(
+            summary,
+            "http://127.0.0.1:3001",
+            "",
+            probe=lambda *_args, **_kwargs: {"status": "unreachable", "error": "connection refused"},
+        )
+        still_reachable = app.submission_runtime_recovery_needed(
+            summary,
+            "http://127.0.0.1:3001",
+            "",
+            probe=lambda *_args, **_kwargs: {"status": "reachable"},
+        )
+        remote = app.submission_runtime_recovery_needed(
+            summary,
+            "https://anythingllm.example.test",
+            "",
+            probe=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not probe remote")),
+        )
+
+        self.assertTrue(unavailable["needed"])
+        self.assertEqual(
+            unavailable["reason"],
+            "local_runtime_unavailable_after_submission_auth_failure",
+        )
+        self.assertFalse(still_reachable["needed"])
+        self.assertEqual(still_reachable["reason"], "runtime_still_reachable")
+        self.assertFalse(remote["needed"])
+        self.assertEqual(remote["reason"], "not_submission_runtime_loss")
+
     def test_runtime_recovery_starts_a_missing_desktop_but_never_force_restarts_a_live_process(self):
         import rag_pdf_gradio_app as app
 
