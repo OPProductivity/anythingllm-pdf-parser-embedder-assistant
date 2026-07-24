@@ -27,7 +27,8 @@ page-local passages and can do a custom range of pages or all pages.
 > supported by Mintplex Labs or AnythingLLM.
 
 
-##Example Screenshots
+
+## Example Screenshots
 
 <img width="570" height="612" alt="image" src="https://github.com/user-attachments/assets/f84ed39b-164f-403f-ad95-170a302487cf" />
 
