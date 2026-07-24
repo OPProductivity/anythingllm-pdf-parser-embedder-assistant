@@ -26,6 +26,7 @@ page-local passages and can do a custom range of pages or all pages.
 > without warranty of any kind. It is not affiliated with, endorsed by, or
 > supported by Mintplex Labs or AnythingLLM.
 
+Example Gallery (more bullet points below these screenshots):
 <img width="870" height="993" alt="image" src="https://github.com/user-attachments/assets/91bc9842-375b-4321-ab47-2c1c8479b1df" />
 
 <img width="876" height="942" alt="image" src="https://github.com/user-attachments/assets/f84ed39b-164f-403f-ad95-170a302487cf" />
