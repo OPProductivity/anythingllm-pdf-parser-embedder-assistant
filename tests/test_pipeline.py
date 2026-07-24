@@ -1111,6 +1111,25 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn("upload withheld", phase)
         self.assertNotIn("vectors verified", phase.casefold())
 
+    def test_photographed_spread_hold_is_not_described_as_missing_ocr(self):
+        import rag_pdf_gradio_app as app
+
+        completion = app.automatic_completion([{
+            "pdf": "open-book-photo.pdf",
+            "api_upload_status": "skipped_needs_ocr_review",
+            "api_upload_warning": (
+                "AnythingLLM upload was withheld because photographed spreads require visual review."
+            ),
+        }], True)
+
+        self.assertEqual(completion["code"], "AUTO-LAYOUT-REVIEW-001")
+        self.assertIn("photographed spreads require visual review", completion["message"])
+        self.assertNotIn("reliable OCR is required", completion["message"])
+        self.assertEqual(
+            app.automatic_completion_phase(completion, True),
+            "Local preparation complete — upload withheld for layout review",
+        )
+
     def test_automatic_completion_names_chat_retrieval_as_unverified(self):
         import rag_pdf_gradio_app as app
 

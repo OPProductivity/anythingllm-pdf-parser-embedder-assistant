@@ -11921,12 +11921,27 @@ def automatic_completion(summaries, prepare_and_upload):
     if ocr_withheld:
         names = ", ".join(Path(str(summary.get("pdf") or "document")).name for summary in ocr_withheld[:3])
         suffix = "" if len(ocr_withheld) <= 3 else f" (+{len(ocr_withheld) - 3} more)"
+        first_warning = str(ocr_withheld[0].get("api_upload_warning") or "").strip()
+        photographed_spread_hold = "photographed spread" in first_warning.casefold()
+        warning_detail = first_warning.removeprefix(
+            "AnythingLLM upload was withheld because "
+        ).removeprefix("AnythingLLM upload was withheld ").strip()
         return {
             "state": "warning",
-            "code": "AUTO-OCR-REVIEW-001",
+            "code": (
+                "AUTO-LAYOUT-REVIEW-001"
+                if photographed_spread_hold
+                else "AUTO-OCR-REVIEW-001"
+            ),
             "message": (
                 f"Local preparation completed, but AnythingLLM upload was withheld for {names}{suffix} "
-                "because reliable OCR is required and unavailable. Review the saved OCR/readiness report."
+                + (
+                    f"because {warning_detail[0].lower() + warning_detail[1:]} "
+                    "Review the saved readiness report."
+                    if warning_detail
+                    else "because reliable OCR is required and unavailable. "
+                    "Review the saved OCR/readiness report."
+                )
             ),
         }
     credential_reverification = [
@@ -12115,6 +12130,8 @@ def automatic_completion_phase(completion, prepare_and_upload):
         return "Preparation complete — AnythingLLM verification pending"
     if code == "AUTO-OCR-REVIEW-001":
         return "Local preparation complete — upload withheld for OCR review"
+    if code == "AUTO-LAYOUT-REVIEW-001":
+        return "Local preparation complete — upload withheld for layout review"
     if state == "warning" and prepare_and_upload:
         return "Searchable vectors verified; document-list observation needs review"
     if state == "successful":
