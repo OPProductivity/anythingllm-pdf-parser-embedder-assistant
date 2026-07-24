@@ -60,6 +60,7 @@ from auto_anythingllm_pipeline import (
     ANYTHINGLLM_RAW_TEXT_METADATA_FIELDS,
     ANYTHINGLLM_SOURCE_CONTRACT,
     apply_recommended_anythingllm_settings,
+    anythingllm_desktop_process_running,
     anythingllm_storage_audit,
     anythingllm_stale_artifact_report,
     ensure_anythingllm_runtime,
@@ -307,12 +308,13 @@ AUTOMATIC_RUN_RECOVERY_ATTEMPT = "automatic-recovery-attempt.json"
 AUTOMATIC_RUN_RUNTIME_GUARD = "runtime-guard.json"
 AUTOMATIC_RUN_RUNTIME_RECOVERY = "runtime-recovery.json"
 AUTOMATIC_RUN_RUNTIME_PREFLIGHT = "anythingllm-runtime-preflight.json"
+AUTOMATIC_RUN_RUNTIME_EVENTS = "runtime-events.jsonl"
 # Recovery observes before doing anything remotely. These are intentionally
 # bounded so a Cancel action cannot become a long-running queue client.
 AUTOMATIC_RECOVERY_OBSERVATION_SECONDS = 20.0
 AUTOMATIC_RECOVERY_GRACE_SECONDS = 15.0
 AUTOMATIC_RECOVERY_CLEANUP_TIMEOUT_SECONDS = 20.0
-AUTOMATIC_RUNTIME_GUARD_INTERVAL_SECONDS = 6.0
+AUTOMATIC_RUNTIME_GUARD_INTERVAL_SECONDS = 12.0
 AUTOMATIC_RUNTIME_GUARD_FAILURE_THRESHOLD = 2
 # A marker survives a server crash for recovery, but a Windows PID can later be
 # reused by an unrelated process. Keep the live Popen handle in this process as
@@ -9581,22 +9583,23 @@ def cleanup_automatic_success_worker_artifacts(output_dir, summary):
     return removed
 
 
-def automatic_stage_requires_desktop_runtime(stage):
-    """Return whether a pipeline stage depends on the local Desktop service."""
-    text = str(stage or "").casefold()
-    return any(token in text for token in (
-        "anythingllm", "embedding", "embed queue", "vector verification",
-        "vector search", "retrieval verification", "workspace upload",
-    ))
-
-
 def new_automatic_runtime_guard():
     return {
-        "desktop_phase_seen": False,
+        "desktop_required": False,
         "consecutive_failures": 0,
         "next_check_epoch": 0.0,
+        "last_healthy_at": "",
         "checks": [],
     }
+
+
+def append_automatic_runtime_event(run_root, event):
+    """Append concise non-secret Desktop liveness evidence for one run."""
+    record = dict(event or {})
+    record.setdefault("recorded_at", datetime.now().isoformat(timespec="seconds"))
+    path = Path(run_root) / AUTOMATIC_RUN_RUNTIME_EVENTS
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
 
 
 def attempt_automatic_runtime_start(run_root, api_url, api_key, *, stage=""):
@@ -9618,20 +9621,32 @@ def attempt_automatic_runtime_start(run_root, api_url, api_key, *, stage=""):
         "status": "not_attempted",
         "error": "",
     }
-    try:
-        runtime = ensure_anythingllm_runtime(
-            preferred_url=str(api_url or ""),
-            api_key=api_key or None,
-            timeout=1.25,
-            startup_timeout=45.0,
-            autostart_local=True,
+    process_running = anythingllm_desktop_process_running()
+    record["desktop_process_running"] = process_running
+    if process_running:
+        # A live process with a dead API can be a hung Desktop instance, but it
+        # can also own a manual queue. Its ownership cannot be proven while the
+        # API is unavailable, so do not force-kill it here.
+        record.update(
+            action="restart_withheld_process_alive",
+            status="restart_withheld_manual_activity_uncertain",
+            error="AnythingLLM process exists but its API is unavailable; automatic force-restart was withheld.",
         )
-        record["runtime"] = runtime
-        status = str(runtime.get("status") or "unknown")
-        record["status"] = "ready" if status in {"reachable", "reachable_auth_required"} else status
-    except Exception as exc:
-        record["status"] = "failed"
-        record["error"] = str(exc)
+    else:
+        try:
+            runtime = ensure_anythingllm_runtime(
+                preferred_url=str(api_url or ""),
+                api_key=api_key or None,
+                timeout=1.25,
+                startup_timeout=45.0,
+                autostart_local=True,
+            )
+            record["runtime"] = runtime
+            status = str(runtime.get("status") or "unknown")
+            record["status"] = "ready" if status in {"reachable", "reachable_auth_required"} else status
+        except Exception as exc:
+            record["status"] = "failed"
+            record["error"] = str(exc)
     record["elapsed_seconds"] = round(time.perf_counter() - started, 3)
     try:
         _write_automatic_run_json(root / AUTOMATIC_RUN_RUNTIME_RECOVERY, record)
@@ -9640,7 +9655,7 @@ def attempt_automatic_runtime_start(run_root, api_url, api_key, *, stage=""):
     return record
 
 
-def poll_automatic_runtime_guard(guard, stage, api_url, api_key, *, now=None, probe=detect_anythingllm_api_url):
+def poll_automatic_runtime_guard(guard, desktop_required, stage, api_url, api_key, *, now=None, probe=detect_anythingllm_api_url):
     """Perform one low-frequency health probe after Desktop-dependent work starts.
 
     A broken SSE connection is diagnostic only. Recovery is authorized only
@@ -9648,9 +9663,8 @@ def poll_automatic_runtime_guard(guard, stage, api_url, api_key, *, now=None, pr
     recovery attempt plus durable reconciliation.
     """
     state = dict(guard or new_automatic_runtime_guard())
-    if automatic_stage_requires_desktop_runtime(stage):
-        state["desktop_phase_seen"] = True
-    if not state["desktop_phase_seen"] or not str(api_url or "").strip():
+    state["desktop_required"] = bool(state.get("desktop_required")) or bool(desktop_required)
+    if not state["desktop_required"] or not str(api_url or "").strip():
         return state, {"status": "not_required"}
     moment = time.time() if now is None else float(now)
     if moment < float(state.get("next_check_epoch") or 0.0):
@@ -9662,9 +9676,12 @@ def poll_automatic_runtime_guard(guard, stage, api_url, api_key, *, now=None, pr
     healthy = str(health.get("status") or "") in {"reachable", "reachable_auth_required"}
     state["next_check_epoch"] = moment + AUTOMATIC_RUNTIME_GUARD_INTERVAL_SECONDS
     state["consecutive_failures"] = 0 if healthy else int(state.get("consecutive_failures") or 0) + 1
+    if healthy:
+        state["last_healthy_at"] = datetime.now().isoformat(timespec="seconds")
     observation = {
         "checked_at": datetime.now().isoformat(timespec="seconds"),
         "stage": str(stage or ""),
+        "desktop_required": True,
         "health_status": str(health.get("status") or "unknown"),
         "consecutive_failures": state["consecutive_failures"],
     }
@@ -9745,6 +9762,7 @@ def execute_automatic_preparation_in_worker(
     event_offset = 0
     latest_progress_value = 0.0
     latest_stage = ""
+    desktop_required = False
     runtime_guard = new_automatic_runtime_guard()
     worker_record = active_automatic_run_worker(root)
     try:
@@ -9770,6 +9788,7 @@ def execute_automatic_preparation_in_worker(
                             else:
                                 latest_progress_value = event.get("value", 0.0)
                                 latest_stage = event.get("stage", "Working")
+                                desktop_required = bool(event.get("desktop_required")) or desktop_required
                                 progress_callback(latest_progress_value, latest_stage)
                         except (TypeError, ValueError, json.JSONDecodeError):
                             continue
@@ -9778,10 +9797,25 @@ def execute_automatic_preparation_in_worker(
                 pass
             runtime_guard, runtime_probe = poll_automatic_runtime_guard(
                 runtime_guard,
+                desktop_required,
                 latest_stage,
                 getattr(args, "anythingllm_api_url", ""),
                 getattr(args, "anythingllm_api_key", ""),
             )
+            if runtime_probe.get("status") not in {"not_required", "not_due"}:
+                try:
+                    append_automatic_runtime_event(
+                        root,
+                        {
+                            "phase": latest_stage,
+                            "desktop_required": bool(runtime_guard.get("desktop_required")),
+                            "status": runtime_probe.get("status"),
+                            "health_status": (runtime_probe.get("health") or {}).get("status", ""),
+                            "consecutive_failures": runtime_guard.get("consecutive_failures", 0),
+                        },
+                    )
+                except OSError:
+                    pass
             if runtime_probe.get("status") == "unavailable":
                 _write_automatic_run_json(root / AUTOMATIC_RUN_RUNTIME_GUARD, runtime_guard)
                 progress_callback(
@@ -9799,6 +9833,10 @@ def execute_automatic_preparation_in_worker(
                     getattr(args, "anythingllm_api_key", ""),
                     stage=latest_stage,
                 )
+                try:
+                    append_automatic_runtime_event(root, {"phase": latest_stage, **runtime_recovery})
+                except OSError:
+                    pass
                 return {
                     "status": "runtime_unavailable",
                     "error": (
@@ -9806,7 +9844,11 @@ def execute_automatic_preparation_in_worker(
                         + (
                             "Desktop was started again; this interrupted run was left for safe reconciliation."
                             if runtime_recovery.get("status") == "ready"
-                            else "Desktop could not be started automatically; inspect the saved recovery evidence."
+                            else (
+                                "Desktop process is still present but its API is unavailable; automatic force-restart was withheld because manual activity cannot be ruled out."
+                                if runtime_recovery.get("status") == "restart_withheld_manual_activity_uncertain"
+                                else "Desktop could not be started automatically; inspect the saved recovery evidence."
+                            )
                         )
                     ),
                     "runtime_guard": runtime_guard,

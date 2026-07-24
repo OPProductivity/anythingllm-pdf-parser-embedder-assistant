@@ -27,9 +27,19 @@ def _write_json(path: Path, payload: dict) -> None:
     temporary.replace(path)
 
 
-def _emit_event(path: Path, value: float, stage: str) -> None:
+def _emit_event(path: Path, value: float, stage: str, *, desktop_required: bool = False) -> None:
     with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps({"value": float(value), "stage": str(stage)}, ensure_ascii=False) + "\n")
+        handle.write(
+            json.dumps(
+                {
+                    "value": float(value),
+                    "stage": str(stage),
+                    "desktop_required": bool(desktop_required),
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
         handle.flush()
 
 
@@ -54,7 +64,9 @@ def main(config_path: str) -> int:
     events_path = Path(config["events_path"])
     cancel_marker = run_root / ".cancel-requested.json"
     args = SimpleNamespace(**dict(config.get("args") or {}))
-    args.progress_callback = lambda value, stage: _emit_event(events_path, value, stage)
+    args.progress_callback = lambda value, stage, desktop_required=False: _emit_event(
+        events_path, value, stage, desktop_required=desktop_required
+    )
     args.timing_event_callback = lambda stage, batch_report=None: _emit_timing_event(
         events_path, stage, batch_report
     )

@@ -13446,9 +13446,18 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
     total_started = time.perf_counter()
     progress_callback = getattr(args, "progress_callback", None)
 
-    def report_progress(value, stage):
+    def report_progress(value, stage, *, desktop_required=False):
         if callable(progress_callback):
             try:
+                progress_callback(
+                    float(value),
+                    str(stage),
+                    desktop_required=bool(desktop_required),
+                )
+            except TypeError:
+                # The Advanced diagnostics callback predates the structured
+                # Automatic-worker protocol. It remains a two-argument local
+                # callback and has no Desktop-dependent phases.
                 progress_callback(float(value), str(stage))
             except Exception:
                 # UI/status observers are informative only. A browser callback
@@ -14786,6 +14795,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
             + (embedding_end_progress - embedding_start_progress)
             * ((batch_number - 1 + within_batch) / total_batches),
             stage,
+            desktop_required=True,
         )
         timing_callback = getattr(args, "timing_event_callback", None)
         if callable(timing_callback):
@@ -15184,6 +15194,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
                     f"AnythingLLM indexing observation {evidence.get('attempt', 0)}: "
                     f"{format_vector_observation(observed_vectors, expected_records, operator_state)}"
                 ),
+                desktop_required=True,
             )
 
         if failed_embedding_checkpoint:

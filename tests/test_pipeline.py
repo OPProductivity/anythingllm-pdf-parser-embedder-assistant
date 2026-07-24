@@ -1351,6 +1351,7 @@ class PipelineCoreTests(unittest.TestCase):
         probe_calls = []
         state, result = app.poll_automatic_runtime_guard(
             app.new_automatic_runtime_guard(),
+            False,
             "Extracting native PDF text",
             "http://127.0.0.1:3001",
             "key",
@@ -1358,7 +1359,7 @@ class PipelineCoreTests(unittest.TestCase):
             probe=lambda *_args, **_kwargs: probe_calls.append(True),
         )
 
-        self.assertFalse(state["desktop_phase_seen"])
+        self.assertFalse(state["desktop_required"])
         self.assertEqual(result["status"], "not_required")
         self.assertEqual(probe_calls, [])
 
@@ -1376,6 +1377,7 @@ class PipelineCoreTests(unittest.TestCase):
         for moment in (100, 112, 124, 136):
             state, result = app.poll_automatic_runtime_guard(
                 state,
+                True,
                 "Vector verification",
                 "http://127.0.0.1:3001",
                 "key",
@@ -1393,6 +1395,7 @@ class PipelineCoreTests(unittest.TestCase):
 
         state, result = app.poll_automatic_runtime_guard(
             app.new_automatic_runtime_guard(),
+            True,
             "Submitting AnythingLLM queue",
             "http://127.0.0.1:3001",
             "key",
@@ -1402,6 +1405,29 @@ class PipelineCoreTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "transient_failure")
         self.assertEqual(state["checks"][-1]["health_status"], "probe_error")
+
+    def test_runtime_recovery_starts_a_missing_desktop_but_never_force_restarts_a_live_process(self):
+        import rag_pdf_gradio_app as app
+
+        original_process = app.anythingllm_desktop_process_running
+        original_ensure = app.ensure_anythingllm_runtime
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            try:
+                app.anythingllm_desktop_process_running = lambda: False
+                app.ensure_anythingllm_runtime = lambda **_kwargs: {"status": "reachable"}
+                started = app.attempt_automatic_runtime_start(root, "http://127.0.0.1:3001", "key")
+
+                app.anythingllm_desktop_process_running = lambda: True
+                app.ensure_anythingllm_runtime = lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not run"))
+                withheld = app.attempt_automatic_runtime_start(root, "http://127.0.0.1:3001", "key")
+            finally:
+                app.anythingllm_desktop_process_running = original_process
+                app.ensure_anythingllm_runtime = original_ensure
+
+        self.assertEqual(started["status"], "ready")
+        self.assertEqual(withheld["status"], "restart_withheld_manual_activity_uncertain")
+        self.assertEqual(withheld["action"], "restart_withheld_process_alive")
 
     def test_automatic_recovery_is_durably_limited_to_one_attempt_per_run(self):
         import rag_pdf_gradio_app as app
