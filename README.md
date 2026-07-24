@@ -4,13 +4,15 @@
 automation for retrieval-augmented generation (RAG).**
 
 This Windows-friendly assistant turns one PDF, a selected batch, or a folder of
-PDFs into clean text files and optionally sends the prepared records to a local
-AnythingLLM Desktop workspace. It is designed for people who want auditable,
-page-based PDF retrieval instead of losing the source page during document
-preparation.
+PDFs into clean text files split into one or more segments per page and sends the prepared records to the local
+AnythingLLM Desktop workspace installed on the user's pc. It is designed for people who want
+page-based PDF retrieval or want something that can automatically convert PDFs to TXT and upload directly to AnythingLLM.
+Doing this automatically or in batch mode is faster than manually creating  workspaces and uploading and embedding pdf files.
+Depending on whether you use local ollama embedders, or openrouter embedders via api key, this can be done under half a minute for normal pdfs. 
 
-It supports native-text PDFs, optional OCR and Unstructured extraction, whole
-documents, whole-page chunks, automatically page-preserved records, and shorter
+It supports parsing native-text PDFs, PDFs that need OCR (using Tesseract) for all 
+pages or a subset of pages, and can also use the Unstructured library for text extraction 
+from tables and more diffidcult documents. whole documents, whole-page chunks, automatically page-preserved records, and shorter
 page-local passages. It can prepare files locally or complete the local
 AnythingLLM upload-and-embedding workflow.
 
@@ -22,6 +24,15 @@ AnythingLLM upload-and-embedding workflow.
 > **Use at your own risk.** This software is provided under the MIT License,
 > without warranty of any kind. It is not affiliated with, endorsed by, or
 > supported by Mintplex Labs or AnythingLLM.
+
+<img width="870" height="993" alt="image" src="https://github.com/user-attachments/assets/91bc9842-375b-4321-ab47-2c1c8479b1df" />
+
+<img width="876" height="942" alt="image" src="https://github.com/user-attachments/assets/f84ed39b-164f-403f-ad95-170a302487cf" />
+
+<img width="873" height="940" alt="image" src="https://github.com/user-attachments/assets/2a92ddef-1db8-4809-b872-8304ff1bd47b" />
+
+<img width="873" height="943" alt="image" src="https://github.com/user-attachments/assets/5049178f-14e6-4921-b7c7-a9b1c7a8e63b" />
+
 
 ## Why use it?
 
