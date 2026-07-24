@@ -232,6 +232,10 @@ EMBEDDING_OBSERVER_QUIET_SECONDS = 60
 # This timer only reads local AnythingLLM state. It never starts the desktop app,
 # creates an API key, mutates a workspace, or retries an embedding job.
 BACKGROUND_RECONCILIATION_INTERVAL_SECONDS = 5
+# This is a passive page-level health signal, intentionally slower than the
+# run-status clock. It makes a stopped Desktop visible in an already-open
+# browser tab but never starts Desktop, creates a key, or changes a workspace.
+ANYTHINGLLM_STARTUP_STATUS_INTERVAL_SECONDS = 10
 # This descriptor exists only while the separately-installed guarded Desktop
 # bridge is running. The timer reads it for status but never calls the bridge.
 DESKTOP_REFRESH_BRIDGE_FILENAME = "anythingllm-pdf-prep-refresh-bridge.json"
@@ -299,11 +303,17 @@ AUTOMATIC_RUN_CANCELLATION_MARKER = ".cancel-requested.json"
 AUTOMATIC_RUN_WORKER_MARKER = ".active-preparation-worker.json"
 AUTOMATIC_RUN_CANCELLATION_RECOVERY = "cancellation-recovery.json"
 AUTOMATIC_RUN_RECOVERY_STATE = "automatic-recovery-state.json"
+AUTOMATIC_RUN_RECOVERY_ATTEMPT = "automatic-recovery-attempt.json"
+AUTOMATIC_RUN_RUNTIME_GUARD = "runtime-guard.json"
+AUTOMATIC_RUN_RUNTIME_RECOVERY = "runtime-recovery.json"
+AUTOMATIC_RUN_RUNTIME_PREFLIGHT = "anythingllm-runtime-preflight.json"
 # Recovery observes before doing anything remotely. These are intentionally
 # bounded so a Cancel action cannot become a long-running queue client.
 AUTOMATIC_RECOVERY_OBSERVATION_SECONDS = 20.0
 AUTOMATIC_RECOVERY_GRACE_SECONDS = 15.0
 AUTOMATIC_RECOVERY_CLEANUP_TIMEOUT_SECONDS = 20.0
+AUTOMATIC_RUNTIME_GUARD_INTERVAL_SECONDS = 6.0
+AUTOMATIC_RUNTIME_GUARD_FAILURE_THRESHOLD = 2
 # A marker survives a server crash for recovery, but a Windows PID can later be
 # reused by an unrelated process. Keep the live Popen handle in this process as
 # the authority for a forced taskkill; the durable marker remains useful for
@@ -5925,6 +5935,51 @@ def refresh_anythingllm_startup_status(api_url=""):
     )
 
 
+def automatic_runtime_start_notice(readiness_report):
+    """Describe a start performed by this run without treating it as a restart.
+
+    A normal upload preflight may start a closed local Desktop instance. The
+    operation is deliberately visible to the person running the job, while a
+    process that was already running remains quiet.
+    """
+    report = readiness_report if isinstance(readiness_report, dict) else {}
+    if str(report.get("runtime_start_status") or "") != "started":
+        return "", ""
+    message = str(report.get("runtime_start_message") or "").strip()
+    detail = "AnythingLLM Desktop was unavailable and has been started before PDF preparation."
+    if message:
+        detail += f" {message}"
+    return "AnythingLLM Desktop started automatically", detail
+
+
+def record_automatic_runtime_preflight(run_root, readiness_report):
+    """Persist non-secret runtime-start evidence beside its automatic run."""
+    report = readiness_report if isinstance(readiness_report, dict) else {}
+    fields = (
+        "runtime_api_url",
+        "runtime_api_status",
+        "runtime_api_reachable",
+        "runtime_api_message",
+        "runtime_start_status",
+        "runtime_start_message",
+        "authenticated",
+        "authentication_status",
+        "authentication_message",
+        "workspace_slug",
+        "workspace_slug_found",
+        "workspace_slug_message",
+        "workspace_api_found",
+        "workspace_api_message",
+    )
+    record = {
+        "recorded_at": datetime.now().isoformat(timespec="seconds"),
+        "readiness": {field: report.get(field) for field in fields if field in report},
+    }
+    path = Path(run_root) / AUTOMATIC_RUN_RUNTIME_PREFLIGHT
+    _write_automatic_run_json(path, record)
+    return path
+
+
 ANYTHINGLLM_STARTUP_STATUS_REFRESH_JS = r"""
 () => {
   const status = document.getElementById("anythingllm-startup-status");
@@ -9291,11 +9346,27 @@ def recover_automatic_run(
 
 
 def schedule_automatic_recovery(run_root, *, reason="runtime_interrupted"):
-    """Start one non-blocking recovery attempt for the latest interrupted run."""
+    """Schedule one guarded recovery attempt for an interrupted run.
+
+    The recovery policy still leaves Desktop untouched unless its bounded
+    observer proves that the most recent interrupted run owns active queue
+    work and no other activity is present. When that proof exists, it can
+    reconcile missing records after one bounded Desktop recovery attempt.
+    """
     root = Path(run_root)
     key = str(root)
+    attempt_path = root / AUTOMATIC_RUN_RECOVERY_ATTEMPT
+    if attempt_path.is_file():
+        return False
     existing = ACTIVE_AUTOMATIC_RECOVERY_THREADS.get(key)
     if existing and existing.is_alive():
+        return False
+    try:
+        _write_automatic_run_json(
+            attempt_path,
+            {"scheduled_at": datetime.now().isoformat(timespec="seconds"), "reason": str(reason or "runtime_interrupted")},
+        )
+    except OSError:
         return False
 
     def recover_in_background():
@@ -9510,6 +9581,100 @@ def cleanup_automatic_success_worker_artifacts(output_dir, summary):
     return removed
 
 
+def automatic_stage_requires_desktop_runtime(stage):
+    """Return whether a pipeline stage depends on the local Desktop service."""
+    text = str(stage or "").casefold()
+    return any(token in text for token in (
+        "anythingllm", "embedding", "embed queue", "vector verification",
+        "vector search", "retrieval verification", "workspace upload",
+    ))
+
+
+def new_automatic_runtime_guard():
+    return {
+        "desktop_phase_seen": False,
+        "consecutive_failures": 0,
+        "next_check_epoch": 0.0,
+        "checks": [],
+    }
+
+
+def attempt_automatic_runtime_start(run_root, api_url, api_key, *, stage=""):
+    """Make one bounded *start-only* Desktop recovery attempt and save evidence.
+
+    This does not restart a reachable Desktop process, remove queue entries, or
+    resubmit records.  It is safe to call after the health guard has established
+    that the configured local service is unavailable: if Desktop was closed,
+    its normal launcher is invoked once; if it returns, the interrupted run is
+    still left for reconciliation because the submission boundary is unknown.
+    """
+    root = Path(run_root)
+    started = time.perf_counter()
+    record = {
+        "recorded_at": datetime.now().isoformat(timespec="seconds"),
+        "stage": str(stage or ""),
+        "requested_url": str(api_url or ""),
+        "action": "start_only",
+        "status": "not_attempted",
+        "error": "",
+    }
+    try:
+        runtime = ensure_anythingllm_runtime(
+            preferred_url=str(api_url or ""),
+            api_key=api_key or None,
+            timeout=1.25,
+            startup_timeout=45.0,
+            autostart_local=True,
+        )
+        record["runtime"] = runtime
+        status = str(runtime.get("status") or "unknown")
+        record["status"] = "ready" if status in {"reachable", "reachable_auth_required"} else status
+    except Exception as exc:
+        record["status"] = "failed"
+        record["error"] = str(exc)
+    record["elapsed_seconds"] = round(time.perf_counter() - started, 3)
+    try:
+        _write_automatic_run_json(root / AUTOMATIC_RUN_RUNTIME_RECOVERY, record)
+    except OSError:
+        pass
+    return record
+
+
+def poll_automatic_runtime_guard(guard, stage, api_url, api_key, *, now=None, probe=detect_anythingllm_api_url):
+    """Perform one low-frequency health probe after Desktop-dependent work starts.
+
+    A broken SSE connection is diagnostic only. Recovery is authorized only
+    after two real API-health failures, and callers own the one-per-run
+    recovery attempt plus durable reconciliation.
+    """
+    state = dict(guard or new_automatic_runtime_guard())
+    if automatic_stage_requires_desktop_runtime(stage):
+        state["desktop_phase_seen"] = True
+    if not state["desktop_phase_seen"] or not str(api_url or "").strip():
+        return state, {"status": "not_required"}
+    moment = time.time() if now is None else float(now)
+    if moment < float(state.get("next_check_epoch") or 0.0):
+        return state, {"status": "not_due"}
+    try:
+        health = probe(str(api_url), api_key=api_key or None, timeout=1.25)
+    except Exception as exc:  # A monitor must never bring down a live run.
+        health = {"status": "probe_error", "error": str(exc)}
+    healthy = str(health.get("status") or "") in {"reachable", "reachable_auth_required"}
+    state["next_check_epoch"] = moment + AUTOMATIC_RUNTIME_GUARD_INTERVAL_SECONDS
+    state["consecutive_failures"] = 0 if healthy else int(state.get("consecutive_failures") or 0) + 1
+    observation = {
+        "checked_at": datetime.now().isoformat(timespec="seconds"),
+        "stage": str(stage or ""),
+        "health_status": str(health.get("status") or "unknown"),
+        "consecutive_failures": state["consecutive_failures"],
+    }
+    state["checks"] = (list(state.get("checks") or []) + [observation])[-12:]
+    return state, {
+        "status": "unavailable" if state["consecutive_failures"] >= AUTOMATIC_RUNTIME_GUARD_FAILURE_THRESHOLD else "healthy" if healthy else "transient_failure",
+        "health": health,
+    }
+
+
 def execute_automatic_preparation_in_worker(
     pdf_path, out_dir, args, run_root, progress_callback, timing_event_callback=None
 ):
@@ -9578,6 +9743,9 @@ def execute_automatic_preparation_in_worker(
     worker_key = str(root)
     ACTIVE_AUTOMATIC_RUN_WORKER_PROCESSES[worker_key] = process
     event_offset = 0
+    latest_progress_value = 0.0
+    latest_stage = ""
+    runtime_guard = new_automatic_runtime_guard()
     worker_record = active_automatic_run_worker(root)
     try:
         while process.poll() is None:
@@ -9596,15 +9764,54 @@ def execute_automatic_preparation_in_worker(
                         try:
                             event = json.loads(line)
                             if event.get("type") == "timing":
+                                latest_stage = event.get("stage", latest_stage)
                                 if callable(timing_event_callback):
                                     timing_event_callback(event.get("stage", ""), event.get("batch_report") or {})
                             else:
-                                progress_callback(event.get("value", 0.0), event.get("stage", "Working"))
+                                latest_progress_value = event.get("value", 0.0)
+                                latest_stage = event.get("stage", "Working")
+                                progress_callback(latest_progress_value, latest_stage)
                         except (TypeError, ValueError, json.JSONDecodeError):
                             continue
                     event_offset = handle.tell()
             except OSError:
                 pass
+            runtime_guard, runtime_probe = poll_automatic_runtime_guard(
+                runtime_guard,
+                latest_stage,
+                getattr(args, "anythingllm_api_url", ""),
+                getattr(args, "anythingllm_api_key", ""),
+            )
+            if runtime_probe.get("status") == "unavailable":
+                _write_automatic_run_json(root / AUTOMATIC_RUN_RUNTIME_GUARD, runtime_guard)
+                progress_callback(
+                    latest_progress_value,
+                    "AnythingLLM runtime unavailable; stopping this worker and starting Desktop once",
+                )
+                terminate_automatic_run_worker(root)
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    pass
+                runtime_recovery = attempt_automatic_runtime_start(
+                    root,
+                    getattr(args, "anythingllm_api_url", ""),
+                    getattr(args, "anythingllm_api_key", ""),
+                    stage=latest_stage,
+                )
+                return {
+                    "status": "runtime_unavailable",
+                    "error": (
+                        "AnythingLLM stopped during a Desktop-dependent stage. "
+                        + (
+                            "Desktop was started again; this interrupted run was left for safe reconciliation."
+                            if runtime_recovery.get("status") == "ready"
+                            else "Desktop could not be started automatically; inspect the saved recovery evidence."
+                        )
+                    ),
+                    "runtime_guard": runtime_guard,
+                    "runtime_recovery": runtime_recovery,
+                }
             time.sleep(0.12)
         # Drain the final progress callback before resolving the result.
         try:
@@ -11810,6 +12017,27 @@ def automatic_completion(summaries, prepare_and_upload):
     }
 
 
+def automatic_batch_diagnostics_required(
+    summaries,
+    prepare_and_upload,
+    *,
+    retain_detailed_evidence=False,
+    cancellation_requested=False,
+):
+    """Keep broad storage inspection out of the ordinary successful path.
+
+    Exact submitted-record, vector, and provenance-matched runtime evidence is
+    enough for normal completion. A broad storage inspection is valuable for a
+    mismatch or an explicit diagnostic request, but it must not extend every
+    successful upload with another potentially slow workspace scan.
+    """
+    if cancellation_requested or not summaries:
+        return False
+    return bool(retain_detailed_evidence) or (
+        automatic_completion(summaries, prepare_and_upload).get("state") != "successful"
+    )
+
+
 def automatic_completion_button_state(completion):
     """Render terminal state as evidence, never as an implicit retry action.
 
@@ -12252,6 +12480,28 @@ def prepare_automatic_confirmation(*values):
         )
 
 
+def dispatch_confirmed_automatic_run(settings, *, progress):
+    """Build one keyword-only launch request from the confirmed settings.
+
+    Keep estimate/recovery metadata outside ``AUTOMATIC_RUN_FIELDS`` and pass
+    every field by name. This prevents a UI ordering change from silently
+    binding an estimate as a positional argument and then passing the same
+    value again by keyword.
+    """
+    run_kwargs = {field: settings.get(field) for field in AUTOMATIC_RUN_FIELDS}
+    run_kwargs.update(
+        expected_seconds=settings.get("expected_seconds", 0),
+        ocr_preflight_manifest=settings.get("ocr_preflight_manifest"),
+        estimate_range=settings.get("estimate_range", ""),
+        estimate_confidence=settings.get("estimate_confidence", ""),
+        estimate_comparable_runs=settings.get("estimate_comparable_runs"),
+        run_root_override=str(settings.get("_reserved_run_root") or "") or None,
+        retain_detailed_evidence=bool(settings.get("retain_detailed_evidence")),
+        progress=progress,
+    )
+    return run_automatic(**run_kwargs)
+
+
 def run_automatic_from_confirmation(*values, progress=gr.Progress(track_tqdm=False)):
     """Run from explicit current UI values (or a dict in direct/test calls).
 
@@ -12301,17 +12551,7 @@ def run_automatic_from_confirmation(*values, progress=gr.Progress(track_tqdm=Fal
             )
         reserved_run_root = str(confirmed_settings.get("_reserved_run_root") or "")
         if reserved_run_root and automatic_run_cancellation_requested(reserved_run_root):
-            return run_automatic(
-                *(confirmed_settings.get(field) for field in AUTOMATIC_RUN_FIELDS),
-                progress=progress,
-                expected_seconds=confirmed_settings.get("expected_seconds", 0),
-                ocr_preflight_manifest=confirmed_settings.get("ocr_preflight_manifest"),
-                estimate_range=confirmed_settings.get("estimate_range", ""),
-                estimate_confidence=confirmed_settings.get("estimate_confidence", ""),
-                estimate_comparable_runs=confirmed_settings.get("estimate_comparable_runs"),
-                run_root_override=reserved_run_root,
-                retain_detailed_evidence=bool(confirmed_settings.get("retain_detailed_evidence")),
-            )
+            return dispatch_confirmed_automatic_run(confirmed_settings, progress=progress)
         if (
             confirmed_settings.get("mode") == MODE_NATIVE_UPLOAD_LABEL
             and is_new_document_workspace_choice(confirmed_settings.get("workspace_slug"))
@@ -12350,17 +12590,7 @@ def run_automatic_from_confirmation(*values, progress=gr.Progress(track_tqdm=Fal
             confirmed_settings.get("workspace_slug") or "not-selected",
             len(confirmed_settings.get("files") or []),
         )
-        run_outputs = run_automatic(
-            *(confirmed_settings.get(field) for field in AUTOMATIC_RUN_FIELDS),
-            progress=progress,
-            expected_seconds=confirmed_settings.get("expected_seconds", 0),
-            ocr_preflight_manifest=confirmed_settings.get("ocr_preflight_manifest"),
-            estimate_range=confirmed_settings.get("estimate_range", ""),
-            estimate_confidence=confirmed_settings.get("estimate_confidence", ""),
-            estimate_comparable_runs=confirmed_settings.get("estimate_comparable_runs"),
-            run_root_override=reserved_run_root or None,
-            retain_detailed_evidence=bool(confirmed_settings.get("retain_detailed_evidence")),
-        )
+        run_outputs = dispatch_confirmed_automatic_run(confirmed_settings, progress=progress)
         if not isinstance(run_outputs, (tuple, list)) or len(run_outputs) != 7:
             raise RuntimeError("Automatic run returned an invalid UI result contract.")
         failure_banner = automatic_run_result_failure_banner(run_outputs)
@@ -13933,6 +14163,22 @@ def run_automatic(
         )
         latest_readiness_html = native_upload_readiness_html(readiness_report)
         resolved_api_url = readiness_report.get("runtime_api_url") or resolved_api_url
+        try:
+            runtime_preflight_path = record_automatic_runtime_preflight(run_root, readiness_report)
+        except OSError as exc:
+            runtime_preflight_path = None
+            APP_LOGGER.warning("could not persist AnythingLLM runtime preflight: %s", exc)
+        startup_phase, startup_detail = automatic_runtime_start_notice(readiness_report)
+        if startup_phase:
+            progress(0.09, desc=startup_phase)
+            update_live_automatic_run_status(
+                run_root,
+                state="running",
+                phase=startup_phase,
+                expected_seconds=expected_seconds,
+                details=startup_detail,
+                confirmed_fraction=0.09,
+            )
     if prepare_and_upload:
         if not readiness_report.get("runtime_api_reachable"):
             progress(None)
@@ -13951,6 +14197,7 @@ def run_automatic(
                 {
                     "Detected API URL": readiness_report.get("runtime_api_url") or resolved_api_url,
                     "Runtime status": readiness_report.get("runtime_api_status"),
+                    "Runtime preflight report": str(runtime_preflight_path) if runtime_preflight_path else "Could not save report",
                 },
                 readiness_html=latest_readiness_html,
             )
@@ -14589,6 +14836,14 @@ def run_automatic(
                 recovery = worker_result.get("recovery")
                 if recovery:
                     downloadable.append(recovery)
+                # The Cancel handler has already returned after recording the
+                # stop request.  Any Desktop reconciliation must remain a
+                # separate bounded background action, and only starts when a
+                # ledger proves that this document crossed the submission
+                # boundary.  Its observer still blocks all mutation whenever
+                # manual activity or queue state is uncertain.
+                if (out_dir / "inspection" / "embedding-batch-ledger.json").is_file():
+                    schedule_automatic_recovery(run_root, reason="operator_cancellation")
                 break
             if worker_result.get("status") != "completed":
                 raise RuntimeError(worker_result.get("error") or "The preparation worker did not complete.")
@@ -14719,7 +14974,12 @@ def run_automatic(
             cancellation_requested = True
             break
 
-    if summaries:
+    if automatic_batch_diagnostics_required(
+        summaries,
+        prepare_and_upload,
+        retain_detailed_evidence=retain_detailed_evidence,
+        cancellation_requested=cancellation_requested,
+    ):
         try:
             batch_audit = finalize_batch_inspection_context(
                 batch_inspection_context,
@@ -15871,6 +16131,10 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     BACKGROUND_RECONCILIATION_INTERVAL_SECONDS,
                     active=True,
                 )
+                anythingllm_startup_status_timer = gr.Timer(
+                    ANYTHINGLLM_STARTUP_STATUS_INTERVAL_SECONDS,
+                    active=True,
+                )
                 # This ticker drives the visible ETA from durable server state.
                 # It is a clock, not a request-duration display, so one second
                 # is the smallest useful refresh interval.
@@ -16068,6 +16332,14 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     anythingllm_embedder_model,
                     anythingllm_reference_values,
                 ],
+                show_progress="hidden",
+                queue=False,
+                trigger_mode="always_last",
+            )
+            anythingllm_startup_status_timer.tick(
+                fn=anythingllm_startup_status_view,
+                inputs=[api_url],
+                outputs=[anythingllm_startup_status, anythingllm_startup_status_module],
                 show_progress="hidden",
                 queue=False,
                 trigger_mode="always_last",

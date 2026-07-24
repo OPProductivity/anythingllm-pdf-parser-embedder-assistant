@@ -3758,6 +3758,8 @@ def format_vector_observation(observed_vectors, expected_records, operator_state
     observed = max(0, int(observed_vectors or 0))
     expected = max(0, int(expected_records or 0))
     state = str(operator_state or "observing")
+    if not expected:
+        return f"{observed} vectors observed (expected count not yet confirmed; {state})"
     if expected and observed > expected:
         return f"{expected} records → {observed} vectors observed (re-chunked; {state})"
     return f"{observed}/{expected} vectors observed ({state})"
@@ -7437,7 +7439,7 @@ def default_short_label(title, author):
     return title_words[0] if title_words else "PDF"
 
 
-def post_json(url, body, api_key=None, timeout=ANYTHINGLLM_HTTP_RESPONSE_TIMEOUT_SECONDS):
+def post_json(url, body, api_key=None, timeout: float = ANYTHINGLLM_HTTP_RESPONSE_TIMEOUT_SECONDS):
     data = json.dumps(body).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     if api_key:
@@ -7478,18 +7480,24 @@ def anythingllm_embed_progress_message(event):
     event_type = str((event or {}).get("type") or "").strip()
     total = int((event or {}).get("totalDocs") or 0)
     index = int((event or {}).get("docIndex") or 0) + 1
+    record_position = f"{index}/{total}" if total else f"{index}; total not yet confirmed"
     if event_type == "batch_starting":
-        return f"AnythingLLM Desktop queue started ({total} records)"
+        return (
+            f"AnythingLLM Desktop queue started ({total} records)"
+            if total
+            else "AnythingLLM Desktop queue started; record total not yet confirmed"
+        )
     if event_type == "doc_starting":
-        return f"AnythingLLM Desktop queue: embedding record {index}/{total}"
+        return f"AnythingLLM Desktop queue: embedding record {record_position}"
     if event_type == "chunk_progress":
         done = int((event or {}).get("chunksProcessed") or 0)
         chunks = int((event or {}).get("totalChunks") or 0)
-        return f"AnythingLLM Desktop queue: record {index}/{total}, chunks {done}/{chunks}"
+        chunk_position = f"{done}/{chunks}" if chunks else f"{done}; total not yet confirmed"
+        return f"AnythingLLM Desktop queue: record {record_position}, chunks {chunk_position}"
     if event_type == "doc_complete":
-        return f"AnythingLLM Desktop queue: completed record {index}/{total}"
+        return f"AnythingLLM Desktop queue: completed record {record_position}"
     if event_type == "doc_failed":
-        return f"AnythingLLM Desktop queue: record {index}/{total} needs review"
+        return f"AnythingLLM Desktop queue: record {record_position} needs review"
     if event_type == "file_removed":
         return "AnythingLLM Desktop queue: a queued record was removed"
     if event_type == "all_complete":
@@ -10865,8 +10873,13 @@ def update_workspace_embeddings_desktop_queue(
         if str(event.get("type") or "") == "doc_complete"
     )
     if completed_events and callable(status_callback):
+        completion_count = (
+            f"{completed_events}/{requested}"
+            if requested
+            else f"{completed_events} completed records; queue total not yet confirmed"
+        )
         status_callback(
-            f"AnythingLLM Desktop event stream observed {completed_events}/{requested} completed records; verifying searchable vectors",
+            f"AnythingLLM Desktop event stream observed {completion_count}; verifying searchable vectors",
             {"desktop_events_observed": completed_events, "queue_records": requested},
         )
     result["submission_strategy"] = ANYTHINGLLM_EMBEDDING_SUBMISSION_STRATEGY
@@ -11399,7 +11412,7 @@ def apply_temporary_key_cleanup_review(selected, upload_report, prepare_and_uplo
     return True
 
 
-def post_json_captured(url, body, api_key=None, timeout_label="request", timeout_seconds=120):
+def post_json_captured(url, body, api_key=None, timeout_label="request", timeout_seconds: float = 120):
     started = time.perf_counter()
     try:
         status, response_text = post_json(url, body, api_key=api_key, timeout=timeout_seconds)
@@ -11459,7 +11472,7 @@ def post_json_captured_with_retry(
     body,
     api_key=None,
     timeout_label="request",
-    timeout_seconds=120,
+    timeout_seconds: float = 120,
     max_attempts=2,
 ):
     """Run a bounded runtime probe and retain every attempt for later review."""
@@ -11652,6 +11665,10 @@ def validate_anythingllm_native_runtime(
     upload_indices=None,
     embedder_probe_override=None,
     include_chat_probe=False,
+    runtime_probe_limit=2,
+    vector_timeout_seconds=45,
+    vector_max_attempts=2,
+    retry_timed_out_siblings=True,
 ):
     validation_started = time.perf_counter()
     embedder_probe = (
@@ -11693,8 +11710,11 @@ def validate_anythingllm_native_runtime(
         temporary_key_id = temporary_key["id"]
         result["authentication_mode"] = "temporary_desktop_api_key"
 
+    runtime_probe_limit = max(1, int(runtime_probe_limit or 1))
+    vector_timeout_seconds = max(1.0, float(vector_timeout_seconds or 1.0))
+    vector_max_attempts = max(1, int(vector_max_attempts or 1))
     selected_payloads = select_runtime_validation_payloads(
-        payloads, upload_limit, limit=2, upload_indices=upload_indices
+        payloads, upload_limit, limit=runtime_probe_limit, upload_indices=upload_indices
     )
     result["probe_selection"] = [
         {
@@ -11705,7 +11725,7 @@ def validate_anythingllm_native_runtime(
         for payload in selected_payloads
     ]
 
-    def execute_vector_check(payload, probe_index, probe_kind, max_attempts=2, recheck_of=""):
+    def execute_vector_check(payload, probe_index, probe_kind, max_attempts=None, recheck_of=""):
         """Run one provenance-gated vector query and retain its exact evidence."""
         expected = expected_page_segment_tokens(payload)
         normalized_text = runtime_validation_query_text(payload)
@@ -11723,8 +11743,8 @@ def validate_anythingllm_native_runtime(
             # and the configured embedder settle. The later, targeted
             # reconciliation below handles a remaining partial timeout rather
             # than silently treating storage proof as retrieval proof.
-            timeout_seconds=45,
-            max_attempts=max_attempts,
+            timeout_seconds=vector_timeout_seconds,
+            max_attempts=vector_max_attempts if max_attempts is None else max(1, int(max_attempts)),
         )
         rows = response["data"].get("results", []) if isinstance(response["data"], dict) else []
         top_metadata = rows[0].get("metadata", {}) if rows else {}
@@ -11834,7 +11854,7 @@ def validate_anythingllm_native_runtime(
         # re-submits any document for embedding.
         initial_vector_checks = list(result["vector_checks"])
         transient_classes = {"timeout", "connection", "transient_http"}
-        if any(check.get("expected_in_top_n") for check in initial_vector_checks):
+        if retry_timed_out_siblings and any(check.get("expected_in_top_n") for check in initial_vector_checks):
             timed_out_checks = [
                 (index, payload, check)
                 for index, (payload, check) in enumerate(zip(selected_payloads, initial_vector_checks))
@@ -15403,6 +15423,10 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
             0,
             storage_dir,
             embedder_probe_override=cached_embedder_probe,
+            runtime_probe_limit=1,
+            vector_timeout_seconds=12,
+            vector_max_attempts=1,
+            retry_timed_out_siblings=False,
         )
         embedder_probe = runtime_validation_report.get("embedder_probe")
         if (

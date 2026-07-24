@@ -541,7 +541,8 @@ class PipelineCoreTests(unittest.TestCase):
                 return {'status': 'created', 'workspace_slug': 'pdf-new-document'}
 
             def run_automatic(*args, **kwargs):
-                captured['workspace_slug'] = args[app.AUTOMATIC_RUN_FIELDS.index('workspace_slug')]
+                self.assertEqual(args, ())
+                captured['workspace_slug'] = kwargs['workspace_slug']
                 return ('summary', 'files', 'artifacts', 'download-state', 'button', 'readiness', 'timer')
 
             app.create_new_document_workspace = create_workspace
@@ -747,8 +748,9 @@ class PipelineCoreTests(unittest.TestCase):
 
         updates = app.reset_automatic_run_settings_to_defaults()
 
-        # The 15th automatic setting is the dedicated-folder checkbox.
-        self.assertFalse(updates[14]["value"])
+        # The dedicated-folder checkbox remains opt-in so root-level records
+        # stay visible in AnythingLLM Desktop's Documents drawer.
+        self.assertFalse(updates[15]["value"])
 
     def test_desktop_refresh_result_never_claims_that_the_documents_drawer_is_confirmed(self):
         import rag_pdf_gradio_app as app
@@ -1138,6 +1140,54 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn("Please start AnythingLLM Desktop", unavailable)
         self.assertIn("Refresh Status", unavailable)
 
+    def test_startup_status_view_detects_a_runtime_loss_after_page_load(self):
+        import rag_pdf_gradio_app as app
+
+        original_health = app.anythingllm_observer_api_health
+        try:
+            app.anythingllm_observer_api_health = lambda _url: {"reachable": True, "http_status": 200, "error": ""}
+            running_html, running_module = app.anythingllm_startup_status_view("http://127.0.0.1:3001")
+            app.anythingllm_observer_api_health = lambda _url: {"reachable": False, "http_status": None, "error": "refused"}
+            unavailable_html, unavailable_module = app.anythingllm_startup_status_view("http://127.0.0.1:3001")
+        finally:
+            app.anythingllm_observer_api_health = original_health
+
+        self.assertEqual(running_html, "")
+        self.assertFalse(running_module["visible"])
+        self.assertIn("AnythingLLM is not available", unavailable_html)
+        self.assertTrue(unavailable_module["visible"])
+
+    def test_startup_status_timer_is_passive_and_low_frequency(self):
+        import rag_pdf_gradio_app as app
+
+        source = Path(app.__file__).read_text(encoding="utf-8")
+        self.assertGreaterEqual(app.ANYTHINGLLM_STARTUP_STATUS_INTERVAL_SECONDS, 10)
+        self.assertIn("anythingllm_startup_status_timer = gr.Timer(", source)
+        self.assertIn("anythingllm_startup_status_timer.tick(", source)
+        self.assertIn("fn=anythingllm_startup_status_view", source)
+
+    def test_runtime_preflight_records_autostart_without_persisting_a_key(self):
+        import rag_pdf_gradio_app as app
+
+        report = {
+            "runtime_api_url": "http://127.0.0.1:3001",
+            "runtime_api_reachable": True,
+            "runtime_start_status": "started",
+            "runtime_start_message": "Started AnythingLLM Desktop from the installed executable.",
+            "authenticated": True,
+            "credential": "must-not-be-written",
+        }
+        phase, detail = app.automatic_runtime_start_notice(report)
+        self.assertEqual(phase, "AnythingLLM Desktop started automatically")
+        self.assertIn("started before PDF preparation", detail)
+        self.assertEqual(app.automatic_runtime_start_notice({"runtime_start_status": "already_running"}), ("", ""))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = app.record_automatic_runtime_preflight(Path(tmpdir), report)
+            saved = path.read_text(encoding="utf-8")
+        self.assertIn("runtime_start_status", saved)
+        self.assertNotIn("must-not-be-written", saved)
+
     def test_browser_watchdog_reports_a_lost_localhost_app_connection(self):
         import rag_pdf_gradio_app as app
         from fastapi import FastAPI
@@ -1268,6 +1318,202 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn("Est: 00m00s", idle)
         self.assertIn("Est: 01m23s", estimated)
         self.assertNotIn("Run timer", estimated)
+
+    def test_confirmed_dispatch_passes_expected_seconds_once_by_keyword(self):
+        import rag_pdf_gradio_app as app
+
+        original_run = app.run_automatic
+        captured = {}
+        try:
+            app.run_automatic = lambda *args, **kwargs: captured.update(args=args, kwargs=kwargs) or (None,) * 7
+            settings = {field: f"value-{index}" for index, field in enumerate(app.AUTOMATIC_RUN_FIELDS)}
+            settings.update({
+                "expected_seconds": 321,
+                "ocr_preflight_manifest": {"status": "ready"},
+                "estimate_range": "04m00s - 06m00s",
+                "estimate_confidence": "medium confidence",
+                "estimate_comparable_runs": 3,
+                "_reserved_run_root": "C:/tmp/app-run-confirmed",
+                "retain_detailed_evidence": True,
+            })
+            app.dispatch_confirmed_automatic_run(settings, progress="progress-token")
+        finally:
+            app.run_automatic = original_run
+        self.assertEqual(captured["args"], ())
+        self.assertEqual(captured["kwargs"]["expected_seconds"], 321)
+        self.assertEqual(captured["kwargs"]["progress"], "progress-token")
+        self.assertEqual(captured["kwargs"]["run_root_override"], "C:/tmp/app-run-confirmed")
+        self.assertEqual(captured["kwargs"]["download_segments_folder"], f"value-{len(app.AUTOMATIC_RUN_FIELDS) - 1}")
+
+    def test_runtime_guard_stays_idle_for_local_preparation(self):
+        import rag_pdf_gradio_app as app
+
+        probe_calls = []
+        state, result = app.poll_automatic_runtime_guard(
+            app.new_automatic_runtime_guard(),
+            "Extracting native PDF text",
+            "http://127.0.0.1:3001",
+            "key",
+            now=100,
+            probe=lambda *_args, **_kwargs: probe_calls.append(True),
+        )
+
+        self.assertFalse(state["desktop_phase_seen"])
+        self.assertEqual(result["status"], "not_required")
+        self.assertEqual(probe_calls, [])
+
+    def test_runtime_guard_requires_two_spaced_api_failures_and_resets_after_health(self):
+        import rag_pdf_gradio_app as app
+
+        observations = iter((
+            {"status": "connection_refused"},
+            {"status": "reachable"},
+            {"status": "connection_refused"},
+            {"status": "connection_refused"},
+        ))
+        state = app.new_automatic_runtime_guard()
+        outcomes = []
+        for moment in (100, 112, 124, 136):
+            state, result = app.poll_automatic_runtime_guard(
+                state,
+                "Vector verification",
+                "http://127.0.0.1:3001",
+                "key",
+                now=moment,
+                probe=lambda *_args, **_kwargs: next(observations),
+            )
+            outcomes.append(result["status"])
+
+        self.assertEqual(outcomes, ["transient_failure", "healthy", "transient_failure", "unavailable"])
+        self.assertEqual(state["consecutive_failures"], 2)
+        self.assertEqual(len(state["checks"]), 4)
+
+    def test_runtime_guard_turns_probe_error_into_bounded_failure_evidence(self):
+        import rag_pdf_gradio_app as app
+
+        state, result = app.poll_automatic_runtime_guard(
+            app.new_automatic_runtime_guard(),
+            "Submitting AnythingLLM queue",
+            "http://127.0.0.1:3001",
+            "key",
+            now=100,
+            probe=lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("socket closed")),
+        )
+
+        self.assertEqual(result["status"], "transient_failure")
+        self.assertEqual(state["checks"][-1]["health_status"], "probe_error")
+
+    def test_automatic_recovery_is_durably_limited_to_one_attempt_per_run(self):
+        import rag_pdf_gradio_app as app
+
+        class DeferredThread:
+            def __init__(self, *, target, name, daemon):
+                self.target = target
+                self.name = name
+                self.daemon = daemon
+
+            def is_alive(self):
+                return True
+
+            def start(self):
+                return None
+
+        original_thread = app.threading.Thread
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "app-run-interrupted"
+            root.mkdir()
+            key = str(root)
+            try:
+                app.threading.Thread = DeferredThread
+                self.assertTrue(app.schedule_automatic_recovery(root, reason="operator_cancellation"))
+                self.assertTrue((root / app.AUTOMATIC_RUN_RECOVERY_ATTEMPT).is_file())
+                self.assertFalse(app.schedule_automatic_recovery(root, reason="duplicate"))
+            finally:
+                app.threading.Thread = original_thread
+                app.ACTIVE_AUTOMATIC_RECOVERY_THREADS.pop(key, None)
+
+    def test_scheduled_recovery_uses_the_guarded_automatic_policy(self):
+        import rag_pdf_gradio_app as app
+
+        class InlineThread:
+            def __init__(self, *, target, name, daemon):
+                self.target = target
+
+            def is_alive(self):
+                return False
+
+            def start(self):
+                self.target()
+
+        original_thread = app.threading.Thread
+        original_recover = app.recover_automatic_run
+        captured = {}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "app-run-interrupted"
+            root.mkdir()
+            try:
+                app.threading.Thread = InlineThread
+                app.recover_automatic_run = lambda run_root, **kwargs: captured.update(
+                    run_root=str(run_root), **kwargs
+                )
+                self.assertTrue(app.schedule_automatic_recovery(root, reason="runtime_interrupted"))
+            finally:
+                app.threading.Thread = original_thread
+                app.recover_automatic_run = original_recover
+                app.ACTIVE_AUTOMATIC_RECOVERY_THREADS.pop(str(root), None)
+
+        self.assertEqual(captured["run_root"], str(root))
+        self.assertEqual(captured["policy"], "automatic_recover")
+        self.assertTrue(captured["automatic"])
+
+    def test_successful_fast_completion_skips_broad_batch_diagnostics(self):
+        import rag_pdf_gradio_app as app
+
+        successful_summary = {
+            "api_upload_status": "complete",
+            "post_upload_verification_status": "pass",
+            "anythingllm_runtime_validation_status": "pass",
+        }
+        self.assertFalse(
+            app.automatic_batch_diagnostics_required([successful_summary], prepare_and_upload=True)
+        )
+        self.assertTrue(
+            app.automatic_batch_diagnostics_required(
+                [successful_summary], prepare_and_upload=True, retain_detailed_evidence=True
+            )
+        )
+        self.assertTrue(
+            app.automatic_batch_diagnostics_required(
+                [{**successful_summary, "post_upload_verification_status": "review"}],
+                prepare_and_upload=True,
+            )
+        )
+        self.assertFalse(
+            app.automatic_batch_diagnostics_required(
+                [successful_summary], prepare_and_upload=True, cancellation_requested=True
+            )
+        )
+
+    def test_queue_progress_never_displays_a_false_zero_denominator(self):
+        message = pipeline.anythingllm_embed_progress_message(
+            {"type": "chunk_progress", "docIndex": 0, "totalDocs": 0, "chunksProcessed": 1, "totalChunks": 0}
+        )
+        observation = pipeline.format_vector_observation(1, 0, "observing")
+
+        self.assertIn("total not yet confirmed", message)
+        self.assertIn("expected count not yet confirmed", observation)
+        self.assertNotIn("1/0", message)
+        self.assertNotIn("1/0", observation)
+
+    def test_large_queue_progress_keeps_the_confirmed_denominator(self):
+        message = pipeline.anythingllm_embed_progress_message(
+            {"type": "doc_complete", "docIndex": 326, "totalDocs": 663}
+        )
+        observation = pipeline.format_vector_observation(327, 663, "queue active")
+
+        self.assertIn("327/663", message)
+        self.assertIn("327/663", observation)
+        self.assertIn("queue active", observation)
 
     def test_automatic_timing_html_exposes_range_and_evidence_without_overstating_it(self):
         import rag_pdf_gradio_app as app
@@ -2876,16 +3122,16 @@ class PipelineCoreTests(unittest.TestCase):
 
         app.LIVE_AUTOMATIC_RUN_STATUS = {"state": "successful", "phase": "Complete"}
         updates = app.reset_automatic_run_settings_to_defaults()
-        self.assertEqual(len(updates), 39)
+        self.assertEqual(len(updates), 41)
         self.assertEqual(updates[0]["value"], "")  # document label
         self.assertEqual(updates[5]["value"], str(app.AUTO_OUTPUT_DIR))
         self.assertEqual(updates[7]["value"], "")  # visible API-key field
         self.assertEqual(updates[8]["value"], app.INITIAL_WORKSPACE_VALUE)
         self.assertEqual(updates[9]["value"], "")  # new workspace name
         self.assertEqual(updates[10], "")  # generated-name auto state
-        self.assertEqual(updates[24]["value"], "Automatic")
-        self.assertEqual(updates[32]["value"], False)  # do not retain apply-before-run
-        self.assertEqual(updates[36]["value"], "")  # validation phrases
+        self.assertEqual(updates[25]["value"], "Automatic")
+        self.assertEqual(updates[34]["value"], False)  # do not retain apply-before-run
+        self.assertEqual(updates[38]["value"], "")  # validation phrases
 
     def test_active_run_blocks_next_selection_presentation_callbacks(self):
         """Late selection events must not redraw an in-flight run as a new one."""
@@ -3057,31 +3303,33 @@ class PipelineCoreTests(unittest.TestCase):
             "api_key": 7,
             "workspace_slug": 8,
             "native_upload_scope": 11,
-            "native_metadata_mode": 13,
-            "anythingllm_create_document_folders": 14,
-            "anythingllm_document_folder_name": 15,
-            "local_check_mode": 16,
-            "custom_ollama_model": 17,
-            "ollama_url": 18,
-            "vector_audit_scope": 19,
-            "deep_extraction": 20,
-            "include_front_matter": 21,
-            "include_back_matter": 22,
-            "segment_mode": 23,
-            "backend_mode": 24,
-            "first_page_override": 25,
-            "end_page_override": 26,
-            "target_passage_length": 28,
-            "inherit_anythingllm_settings": 29,
-            "anythingllm_chunk_size": 30,
-            "anythingllm_chunk_overlap": 31,
-            "auto_apply_recommended_settings": 32,
-            "download_full_folder": 33,
-            "download_segments_folder": 34,
-            "advanced_end_section_names": 35,
-            "automatic_validation_phrases": 36,
-            "unstructured_strategy": 37,
-            "generate_inline_fallback": 38,
+            "native_upload_custom_range": 12,
+            "native_metadata_mode": 14,
+            "anythingllm_create_document_folders": 15,
+            "anythingllm_document_folder_name": 16,
+            "local_check_mode": 17,
+            "custom_ollama_model": 18,
+            "ollama_url": 19,
+            "vector_audit_scope": 20,
+            "deep_extraction": 21,
+            "include_front_matter": 22,
+            "include_back_matter": 23,
+            "segment_mode": 24,
+            "backend_mode": 25,
+            "first_page_override": 26,
+            "end_page_override": 27,
+            "target_passage_length": 29,
+            "page_preserve_ceiling": 30,
+            "inherit_anythingllm_settings": 31,
+            "anythingllm_chunk_size": 32,
+            "anythingllm_chunk_overlap": 33,
+            "auto_apply_recommended_settings": 34,
+            "download_full_folder": 35,
+            "download_segments_folder": 36,
+            "advanced_end_section_names": 37,
+            "automatic_validation_phrases": 38,
+            "unstructured_strategy": 39,
+            "generate_inline_fallback": 40,
         }
         for field, index in field_to_update.items():
             self.assertEqual(updates[index]["value"], defaults[field], field)
@@ -3965,7 +4213,7 @@ class PipelineCoreTests(unittest.TestCase):
 
         self.assertRegex(app.APP_VERSION, r"^\d+\.\d+\.\d+$")
         self.assertEqual(app.APP_VERSION, "0.5.0")
-        self.assertEqual(app.APP_BASE_COMMIT, "c32f226")
+        self.assertEqual(app.APP_BASE_COMMIT, "portable-package")
         self.assertIn('window.matchMedia("(prefers-color-scheme: dark)")', app.APP_JS)
         self.assertIn('systemThemeQuery.addEventListener("change", applySystemTheme)', app.APP_JS)
         self.assertIn('localStorage.setItem(themeFollowSystemKey, followSystem ? "true" : "false")', app.APP_JS)
@@ -5468,6 +5716,7 @@ class PipelineCoreTests(unittest.TestCase):
                 "",
                 "",
                 app.NATIVE_UPLOAD_SCOPE_ALL_LABEL,
+                "",
                 "Strict metadata only",
                 True,
                 "",
@@ -5482,6 +5731,7 @@ class PipelineCoreTests(unittest.TestCase):
                 0,
                 0,
                 750,
+                0,
                 app.SEGMENT_PASSAGES_LABEL,
                 "",
                 "",
@@ -5522,6 +5772,7 @@ class PipelineCoreTests(unittest.TestCase):
                 "",
                 "",
                 app.NATIVE_UPLOAD_SCOPE_ALL_LABEL,
+                "",
                 "Strict metadata only",
                 True,
                 "",
@@ -5536,6 +5787,7 @@ class PipelineCoreTests(unittest.TestCase):
                 0,
                 0,
                 750,
+                0,
                 app.SEGMENT_PASSAGES_LABEL,
                 "",
                 "",
@@ -5643,6 +5895,7 @@ class PipelineCoreTests(unittest.TestCase):
                 "",
                 "",
                 app.NATIVE_UPLOAD_SCOPE_ALL_LABEL,
+                "",
                 "Strict metadata only",
                 False,
                 "",
@@ -5657,6 +5910,7 @@ class PipelineCoreTests(unittest.TestCase):
                 0,
                 0,
                 750,
+                0,
                 app.SEGMENT_PAGE_LIMIT_LABEL,
                 "",
                 "",
@@ -5682,6 +5936,7 @@ class PipelineCoreTests(unittest.TestCase):
                 "",
                 "workspace-a",
                 app.NATIVE_UPLOAD_SCOPE_ALL_LABEL,
+                "",
                 "Strict metadata only",
                 False,
                 "",
@@ -5696,6 +5951,7 @@ class PipelineCoreTests(unittest.TestCase):
                 0,
                 0,
                 750,
+                0,
                 app.SEGMENT_PAGE_LIMIT_LABEL,
                 "",
                 "",
@@ -5723,7 +5979,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn("Retrieval simulation warning", native_result[0]["value"])
         self.assertIn("Needs attention", native_result[0]["value"])
 
-    def test_run_automatic_native_compatibility_probe_passes_upload_limit_two(self):
+    def test_run_automatic_legacy_probe_scope_keeps_the_full_ledger_limit(self):
         import rag_pdf_gradio_app as app
 
         original_validate = app.validate_pdf_inputs
@@ -5805,6 +6061,7 @@ class PipelineCoreTests(unittest.TestCase):
                 "",
                 "workspace-a",
                 app.NATIVE_UPLOAD_SCOPE_PROBE_LABEL,
+                "",
                 "Strict metadata only",
                 True,
                 "",
@@ -5819,6 +6076,7 @@ class PipelineCoreTests(unittest.TestCase):
                 0,
                 0,
                 750,
+                0,
                 app.SEGMENT_PAGE_LIMIT_LABEL,
                 "",
                 "",
@@ -5839,7 +6097,7 @@ class PipelineCoreTests(unittest.TestCase):
             app.verify_anythingllm_runtime_embedder = original_embedder_probe
 
         self.assertTrue(captured["prepare_and_upload"])
-        self.assertEqual(captured["upload_limit"], 2)
+        self.assertEqual(captured["upload_limit"], 0)
         self.assertEqual(captured["native_upload_transport"], "file_upload")
         self.assertEqual(captured["native_upload_representation"], "page_parents")
         self.assertEqual(captured["workspace_slug"], "workspace-a")
@@ -5892,6 +6150,7 @@ class PipelineCoreTests(unittest.TestCase):
                 "",
                 "workspace-a",
                 app.NATIVE_UPLOAD_SCOPE_ALL_LABEL,
+                "",
                 "Strict metadata only",
                 True,
                 "",
@@ -5906,6 +6165,7 @@ class PipelineCoreTests(unittest.TestCase):
                 0,
                 0,
                 750,
+                0,
                 app.SEGMENT_PAGE_LIMIT_LABEL,
                 "",
                 "",
@@ -6142,6 +6402,7 @@ class PipelineCoreTests(unittest.TestCase):
                 "",
                 "workspace-a",
                 app.NATIVE_UPLOAD_SCOPE_PROBE_LABEL,
+                "",
                 "Native title header (priority)",
                 True,
                 "",
@@ -6156,6 +6417,7 @@ class PipelineCoreTests(unittest.TestCase):
                 0,
                 0,
                 750,
+                0,
                 app.SEGMENT_PASSAGES_LABEL,
                 "",
                 "",
@@ -6663,6 +6925,7 @@ class PipelineCoreTests(unittest.TestCase):
                 "",
                 "",
                 app.NATIVE_UPLOAD_SCOPE_ALL_LABEL,
+                "",
                 "Native title header (priority)",
                 True,
                 "",
@@ -6677,6 +6940,7 @@ class PipelineCoreTests(unittest.TestCase):
                 0,
                 0,
                 750,
+                0,
                 app.SEGMENT_PASSAGES_LABEL,
                 "",
                 "",
@@ -6889,6 +7153,7 @@ class PipelineCoreTests(unittest.TestCase):
                 "",
                 "",
                 app.NATIVE_UPLOAD_SCOPE_ALL_LABEL,
+                "",
                 "Native title header (priority)",
                 True,
                 "",
@@ -6903,6 +7168,7 @@ class PipelineCoreTests(unittest.TestCase):
                 0,
                 0,
                 750,
+                0,
                 app.SEGMENT_PASSAGES_LABEL,
                 "",
                 "",
@@ -11323,7 +11589,7 @@ class PipelineCoreTests(unittest.TestCase):
             app.anythingllm_resolved_state = original_resolved_state
 
         self.assertIn("historical retrieval comparison preset", reference)
-        self.assertIn("page-bounded subchunking with a 750-character target", reference)
+        self.assertIn("page-preserving automatic", reference)
         self.assertNotIn("best tested", reference)
 
     def test_blank_key_uses_managed_local_service_key(self):
