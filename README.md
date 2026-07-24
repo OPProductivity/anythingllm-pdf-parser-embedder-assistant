@@ -32,8 +32,8 @@ page-local passages and can do a custom range of pages or all pages.
 <img width="570" height="612" alt="image" src="https://github.com/user-attachments/assets/f84ed39b-164f-403f-ad95-170a302487cf" />
 
 
-<img width="436" height="470" alt="image" src="https://github.com/user-attachments/assets/2a92ddef-1db8-4809-b872-8304ff1bd47b" />
-<img width="436" height="471" alt="image" src="https://github.com/user-attachments/assets/5049178f-14e6-4921-b7c7-a9b1c7a8e63b" />
+<img width="567" height="611" alt="image" src="https://github.com/user-attachments/assets/2a92ddef-1db8-4809-b872-8304ff1bd47b" />
+<img width="567" height="611" alt="image" src="https://github.com/user-attachments/assets/5049178f-14e6-4921-b7c7-a9b1c7a8e63b" />
 
 
 <img width="810" height="493" alt="image" src="https://github.com/user-attachments/assets/a3a39db0-ba33-41d5-8732-4c5f87c7a14d" />
