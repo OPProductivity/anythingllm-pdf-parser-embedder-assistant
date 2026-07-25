@@ -5533,12 +5533,17 @@ def append_ingestion_history(
     }
     try:
         Path(run_root).mkdir(parents=True, exist_ok=True)
-        (Path(run_root) / "ingestion-terminal-record.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
+        # A terminal audit record must not turn a completed cancellation into a
+        # UI failure if a future setting gains a Path-like value. Preserve it
+        # as its literal local path instead.
+        (Path(run_root) / "ingestion-terminal-record.json").write_text(
+            json.dumps(record, indent=2, default=str), encoding="utf-8"
+        )
         AUTO_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         prune_background_jsonl(INGESTION_HISTORY_PATH)
         with INGESTION_HISTORY_PATH.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-    except OSError as exc:
+            handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    except (OSError, TypeError, ValueError) as exc:
         APP_LOGGER.warning("could not append ingestion history: %s", exc)
     return record
 
@@ -8686,6 +8691,15 @@ def paced_progress_fraction(record, now=None):
     state = str(record.get("state") or "")
     if state in {"successful", "warning"}:
         return 1.0
+    if record.get("cancel_requested"):
+        # The cancel request is durable before the owned worker necessarily
+        # observes it. A final progress event can therefore arrive while the
+        # status is still technically ``running``. It is not new completed
+        # work and must not make the visible checkpoint creep forward.
+        return min(
+            0.995,
+            max(0.0, float(record.get("display_anchor_fraction") or record.get("confirmed_fraction") or 0.0)),
+        )
     raw = raw_paced_progress_fraction(record, now)
     anchor = min(0.995, max(0.0, float(record.get("display_anchor_fraction") or raw)))
     anchor_epoch = float(record.get("display_anchor_epoch") or now)
@@ -9521,7 +9535,10 @@ def active_automatic_run_worker(run_root):
         or str(record.get("run_root") or "") != str(root)
     ):
         return None
-    return {"pid": pid, "marker": marker, **record}
+    # This record is copied into durable cancellation evidence. Keep the
+    # marker's filesystem value serializable at that boundary; callers only
+    # need it for audit display, not Path methods.
+    return {"pid": pid, "marker": str(marker), **record}
 
 
 def terminate_automatic_run_worker(run_root):
@@ -9594,7 +9611,7 @@ def write_automatic_cancellation_recovery(run_root, pdf_path=None, worker_record
     try:
         _write_automatic_run_json(root / AUTOMATIC_RUN_CANCELLATION_RECOVERY, payload)
         return str(root / AUTOMATIC_RUN_CANCELLATION_RECOVERY)
-    except OSError as exc:
+    except (OSError, TypeError, ValueError) as exc:
         APP_LOGGER.warning("could not write automatic cancellation recovery record: %s", exc)
         return ""
 
@@ -14849,6 +14866,11 @@ def run_automatic(
         changes the pipeline's completion decision.
         """
         nonlocal expected_seconds, last_eta_recalibration_batch, completed_batches_across_run
+        # The worker can flush an event after the browser has already received
+        # a durable cancel acknowledgement. Do not let that late observation
+        # revise the ETA, status, or progress checkpoint.
+        if automatic_run_cancellation_requested(run_root):
+            return
         record_timing_model_event(run_root, stage, batch_report)
         report = batch_report or {}
         live = dict(LIVE_AUTOMATIC_RUN_STATUS or {})
@@ -15144,6 +15166,20 @@ def run_automatic(
                 break
             if worker_result.get("status") != "completed":
                 raise RuntimeError(worker_result.get("error") or "The preparation worker did not complete.")
+            # Cancellation can race a normally exiting child process. Once the
+            # marker exists, its result is intentionally not incorporated into
+            # this run: no follow-on callback, retry decision, or later PDF
+            # may be allowed to move the checkpoint or touch AnythingLLM.
+            if automatic_run_cancellation_requested(run_root):
+                cancellation_requested = True
+                recovery = write_automatic_cancellation_recovery(
+                    run_root,
+                    pdf_path,
+                    active_automatic_run_worker(run_root),
+                )
+                if recovery:
+                    downloadable.append(recovery)
+                break
             summary = dict(worker_result.get("summary") or {})
             if not summary:
                 raise RuntimeError("The preparation worker completed without a pipeline summary.")
@@ -15213,6 +15249,16 @@ def run_automatic(
                             retry_result.get("error")
                             or "The automatic retry after Desktop startup did not complete."
                         )
+                    if automatic_run_cancellation_requested(run_root):
+                        cancellation_requested = True
+                        recovery = write_automatic_cancellation_recovery(
+                            run_root,
+                            pdf_path,
+                            active_automatic_run_worker(run_root),
+                        )
+                        if recovery:
+                            downloadable.append(recovery)
+                        break
                     summary = dict(retry_result.get("summary") or {})
                     if not summary:
                         raise RuntimeError(

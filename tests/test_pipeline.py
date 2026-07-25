@@ -3761,6 +3761,25 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(updated["phase_allowance"], 0.0)
         self.assertEqual(app.paced_progress_percent(updated, now=1_000.0), 10)
 
+    def test_cancel_requested_progress_freezes_at_the_visible_checkpoint_not_the_elapsed_estimate(self):
+        import rag_pdf_gradio_app as app
+
+        status = {
+            "state": "running",
+            "cancel_requested": True,
+            "confirmed_fraction": 0.452,
+            # The small paced allowance was already visible when the operator
+            # clicked Cancel. That visible checkpoint, rather than a later
+            # elapsed-time estimate or worker event, is what must remain.
+            "display_anchor_fraction": 0.52,
+            "display_target_fraction": 0.52,
+            "display_anchor_epoch": 100.0,
+            "expected_seconds": 60,
+            "started_epoch": 0.0,
+        }
+
+        self.assertEqual(app.paced_progress_percent(status, now=10_000.0), 52)
+
     def test_runtime_retry_resets_visible_progress_before_replaying_preparation(self):
         import rag_pdf_gradio_app as app
 
@@ -7944,6 +7963,37 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(record["checkpoint"]["confirmed_percent"], 38.7)
         self.assertEqual(record["checkpoint"]["phase"], "Submitting AnythingLLM batch 2")
         self.assertIn("already accepted", record["anythingllm_result"])
+
+    def test_cancellation_recovery_serializes_the_owned_worker_marker(self):
+        import rag_pdf_gradio_app as app
+
+        original_status = app.LIVE_AUTOMATIC_RUN_STATUS
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_root = Path(temp_dir) / "cancelled-run"
+            run_root.mkdir()
+            marker = run_root / app.AUTOMATIC_RUN_WORKER_MARKER
+            marker.write_text(
+                json.dumps({
+                    "kind": "automatic-preparation-worker",
+                    "pid": 24680,
+                    "run_root": str(run_root),
+                }),
+                encoding="utf-8",
+            )
+            try:
+                app.LIVE_AUTOMATIC_RUN_STATUS = {
+                    "run_root": str(run_root),
+                    "confirmed_fraction": 0.2,
+                }
+                worker = app.active_automatic_run_worker(run_root)
+                recovery = app.write_automatic_cancellation_recovery(
+                    run_root, "example.pdf", worker
+                )
+                record = json.loads(Path(recovery).read_text(encoding="utf-8"))
+            finally:
+                app.LIVE_AUTOMATIC_RUN_STATUS = original_status
+
+        self.assertEqual(record["worker"]["marker"], str(marker))
 
     def test_target_passage_length_control_update_changes_by_segment_mode(self):
         import rag_pdf_gradio_app as app
