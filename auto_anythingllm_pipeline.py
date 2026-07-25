@@ -6903,12 +6903,13 @@ def anythingllm_resolved_state(storage_dir: Path, simulation_adapter=None, runti
 def should_verify_anythingllm_runtime_during_preparation(args):
     """Whether this preparation still needs a live embedder round trip.
 
-    Local-only preparation does not consume the embedder, and the desktop UI
-    already performs its live readiness preflight before constructing a run
-    with ``external_preflight_managed``.  Repeating that network-backed probe
-    inside the first PDF added tens of seconds without adding evidence.  CLI
-    uploads and vector evaluations without an external preflight remain
-    verified here.
+    Local-only preparation does not consume the embedder. The desktop UI
+    confirms local availability and upload authentication before constructing a
+    run with ``external_preflight_managed``; its continuous runtime guard and
+    exact post-upload vector checks remain the live evidence path. Repeating a
+    paid network-backed embedding probe inside the first PDF added tens of
+    seconds without adding reliable completion evidence. CLI uploads and
+    vector evaluations without an external preflight remain verified here.
     """
     if bool(getattr(args, "external_preflight_managed", False)):
         return False

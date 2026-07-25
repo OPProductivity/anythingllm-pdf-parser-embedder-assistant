@@ -99,13 +99,11 @@ from auto_anythingllm_pipeline import (
     restart_anythingllm_desktop,
     resolve_anythingllm_api_key,
     resolve_embedder_capability,
-    refresh_local_anythingllm_openrouter_runtime,
     resolve_default_simulation_adapter,
     safe_stem,
     sha256_file,
     simulation_app_config,
     simulation_preflight,
-    verify_anythingllm_runtime_embedder,
     verify_anythingllm_upload_auth,
     update_workspace_embeddings_batched,
     verify_anythingllm_post_upload,
@@ -314,7 +312,7 @@ AUTOMATIC_RUN_RUNTIME_EVENTS = "runtime-events.jsonl"
 AUTOMATIC_RECOVERY_OBSERVATION_SECONDS = 20.0
 AUTOMATIC_RECOVERY_GRACE_SECONDS = 15.0
 AUTOMATIC_RECOVERY_CLEANUP_TIMEOUT_SECONDS = 20.0
-AUTOMATIC_RUNTIME_GUARD_INTERVAL_SECONDS = 12.0
+AUTOMATIC_RUNTIME_GUARD_INTERVAL_SECONDS = 5.0
 # A failed health probe is deliberately confirmed before recovery, but the
 # confirmation must not make a stopped Desktop invisible for another full
 # monitoring interval.
@@ -3759,6 +3757,7 @@ def native_upload_readiness_report(
     upload_result=None,
     autostart_runtime=False,
     verify_authentication=False,
+    status_callback=None,
 ):
     storage_dir = default_anythingllm_storage_dir()
     db_path = storage_dir / "anythingllm.db"
@@ -3801,6 +3800,7 @@ def native_upload_readiness_report(
         api_key=(api_key or "").strip(),
         timeout=1.25 if autostart_runtime else 0.5,
         autostart_local=bool(autostart_runtime),
+        status_callback=status_callback,
     )
     report["runtime_api_url"] = runtime.get("api_url") or report["runtime_api_url"]
     report["runtime_api_status"] = runtime.get("status") or "not_checked"
@@ -9719,11 +9719,6 @@ def append_automatic_runtime_event(run_root, event):
         handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
 
 
-def detached_runtime_evidence(value):
-    """Return JSON-safe evidence that cannot retain references into live state."""
-    return json.loads(json.dumps(value, ensure_ascii=False, default=str))
-
-
 def attempt_automatic_runtime_start(run_root, api_url, api_key, *, stage="", status_callback=None):
     """Make one bounded *start-only* Desktop recovery attempt and save evidence.
 
@@ -9855,8 +9850,25 @@ def submission_runtime_recovery_needed(summary, api_url, api_key, *, probe=detec
     return result
 
 
+def can_resume_local_preparation_after_runtime_start(output_dir, runtime_recovery):
+    """Allow one automatic resume only before an AnythingLLM submission exists."""
+    ledger_path = Path(output_dir) / "inspection" / "embedding-batch-ledger.json"
+    return bool(
+        isinstance(runtime_recovery, dict)
+        and runtime_recovery.get("status") == "ready"
+        and not ledger_path.is_file()
+    )
+
+
 def execute_automatic_preparation_in_worker(
-    pdf_path, out_dir, args, run_root, progress_callback, timing_event_callback=None
+    pdf_path,
+    out_dir,
+    args,
+    run_root,
+    progress_callback,
+    timing_event_callback=None,
+    *,
+    allow_runtime_restart_resume=True,
 ):
     """Run one document outside Gradio so the Cancel button can stop it now.
 
@@ -9994,16 +10006,60 @@ def execute_automatic_preparation_in_worker(
                     process.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     pass
+                if not allow_runtime_restart_resume:
+                    return {
+                        "status": "runtime_unavailable",
+                        "error": (
+                            "AnythingLLM became unavailable again after this run's one automatic "
+                            "Desktop recovery attempt. The interrupted work was left for safe reconciliation."
+                        ),
+                        "runtime_guard": runtime_guard,
+                    }
+
+                def report_runtime_recovery(lifecycle_phase, _runtime):
+                    phase = str(lifecycle_phase or "")
+                    if phase == "starting_desktop":
+                        message = "AnythingLLM stopped; starting Desktop once"
+                    elif phase == "waiting_for_runtime":
+                        message = "Waiting for AnythingLLM Desktop to become ready"
+                    elif phase in {"ready_after_start", "ready"}:
+                        message = "AnythingLLM restarted; resuming local preparation"
+                    elif phase == "start_failed":
+                        message = "AnythingLLM Desktop could not be started automatically"
+                    else:
+                        return
+                    progress_callback(latest_progress_value, message)
+
                 runtime_recovery = attempt_automatic_runtime_start(
                     root,
                     getattr(args, "anythingllm_api_url", ""),
                     getattr(args, "anythingllm_api_key", ""),
                     stage=latest_stage,
+                    status_callback=report_runtime_recovery,
                 )
                 try:
                     append_automatic_runtime_event(root, {"phase": latest_stage, **runtime_recovery})
                 except OSError:
                     pass
+                if can_resume_local_preparation_after_runtime_start(output, runtime_recovery):
+                    # No owned submission ledger exists, so Desktop stopped
+                    # during local-only preparation. Starting the worker once
+                    # more is safe: no AnythingLLM queue record could have
+                    # been created, and the resumed worker keeps the same run
+                    # folder and cancellation authority.
+                    progress_callback(
+                        latest_progress_value,
+                        "AnythingLLM restarted; resuming local preparation",
+                    )
+                    return execute_automatic_preparation_in_worker(
+                        pdf_path,
+                        out_dir,
+                        args,
+                        root,
+                        progress_callback,
+                        timing_event_callback,
+                        allow_runtime_restart_resume=False,
+                    )
                 return {
                     "status": "runtime_unavailable",
                     "error": (
@@ -14408,13 +14464,45 @@ def run_automatic(
     should_manage_local_runtime = prepare_and_upload
     anythingllm_embedder_preflight = {}
     if should_manage_local_runtime:
-        progress(0.085, desc="Checking AnythingLLM runtime")
+        # The confirmation view already owns the normal availability check.
+        # Re-check it here only as a fast, non-progress-bearing race guard: a
+        # user can close Desktop in the interval between confirmation and the
+        # first worker.  The worker's continuous health guard handles later
+        # transitions, so a healthy run does not advertise routine polling as
+        # a distinct parsing stage.
+        def report_launch_runtime_status(lifecycle_phase, _runtime):
+            phase = str(lifecycle_phase or "")
+            if phase == "starting_desktop":
+                live_phase = "Starting AnythingLLM Desktop"
+                details = "AnythingLLM was unavailable immediately after confirmation; launching Desktop once before local preparation."
+            elif phase == "waiting_for_runtime":
+                live_phase = "Waiting for AnythingLLM Desktop to become ready"
+                details = "Desktop was launched; local preparation will begin as soon as its API responds."
+            elif phase in {"ready_after_start", "ready"}:
+                live_phase = "AnythingLLM Desktop is ready; starting local preparation"
+                details = "Desktop is responding again. Continuing this confirmed run."
+            elif phase == "start_failed":
+                live_phase = "AnythingLLM Desktop could not be started"
+                details = "The automatic Desktop launch did not succeed; review the runtime status before retrying."
+            else:
+                return
+            update_live_automatic_run_status(
+                run_root,
+                state="running",
+                phase=live_phase,
+                expected_seconds=expected_seconds,
+                details=details,
+                confirmed_fraction=0.04,
+                cancel_available=False,
+            )
+
         readiness_report = native_upload_readiness_report(
             resolved_api_url,
             api_key,
             workspace_slug,
             autostart_runtime=True,
             verify_authentication=prepare_and_upload,
+            status_callback=report_launch_runtime_status,
         )
         latest_readiness_html = native_upload_readiness_html(readiness_report)
         resolved_api_url = readiness_report.get("runtime_api_url") or resolved_api_url
@@ -14425,14 +14513,13 @@ def run_automatic(
             APP_LOGGER.warning("could not persist AnythingLLM runtime preflight: %s", exc)
         startup_phase, startup_detail = automatic_runtime_start_notice(readiness_report)
         if startup_phase:
-            progress(0.09, desc=startup_phase)
             update_live_automatic_run_status(
                 run_root,
                 state="running",
                 phase=startup_phase,
                 expected_seconds=expected_seconds,
                 details=startup_detail,
-                confirmed_fraction=0.09,
+                confirmed_fraction=0.04,
             )
     if prepare_and_upload:
         if not readiness_report.get("runtime_api_reachable"):
@@ -14503,197 +14590,6 @@ def run_automatic(
                     f"Use {MODE_LOCAL_ONLY_LABEL} if you only want the generated files and reports.",
                 ],
                 {"Workspace slug": workspace_slug},
-                readiness_html=latest_readiness_html,
-            )
-
-        # Reachability, authentication, and workspace existence do not prove
-        # that AnythingLLM can call its configured embedding provider. Probe
-        # that exact runtime route before spending minutes preparing and
-        # submitting a document. This is post-confirmation work and therefore
-        # remains visible in the run timer/progress description.
-        progress(0.095, desc="Verifying AnythingLLM embedding runtime")
-        update_live_automatic_run_status(
-            run_root,
-            state="running",
-            phase="Verifying AnythingLLM embedding runtime",
-            expected_seconds=expected_seconds,
-            details="Testing the embedding route used by workspace indexing before PDF preparation begins.",
-            confirmed_fraction=0.095,
-        )
-        anythingllm_embedder_preflight = verify_anythingllm_runtime_embedder(
-            resolved_api_url,
-            api_key=(api_key or "").strip() or None,
-            storage_dir=default_anythingllm_storage_dir(),
-        )
-        embedder_runtime_recovery = {}
-        preflight_runtime_loss = submission_runtime_recovery_needed(
-            anythingllm_embedder_preflight,
-            resolved_api_url,
-            (api_key or "").strip(),
-        )
-        if preflight_runtime_loss.get("needed"):
-            progress(0.097, desc="AnythingLLM stopped during its embedding check; starting Desktop once")
-            update_live_automatic_run_status(
-                run_root,
-                state="running",
-                phase="AnythingLLM stopped during its embedding check; starting Desktop once",
-                expected_seconds=expected_seconds,
-                details="The local runtime became unavailable after its health check. This app-owned run will retry the embedding check once if Desktop starts.",
-                confirmed_fraction=0.095,
-                cancel_available=False,
-            )
-            def report_embedder_recovery_status(lifecycle_phase, _runtime):
-                phase = str(lifecycle_phase or "")
-                if phase == "starting_desktop":
-                    live_phase = "Starting AnythingLLM Desktop"
-                    details = "The local runtime is unavailable. Launching Desktop once for this app-owned run."
-                elif phase == "waiting_for_runtime":
-                    live_phase = "Waiting for AnythingLLM Desktop to become ready"
-                    details = "Desktop was launched; checking its local runtime again before retrying the embedding check."
-                elif phase in {"ready_after_start", "ready"}:
-                    live_phase = "AnythingLLM restarted; retrying its embedding check"
-                    details = "Desktop is responding again. Retrying the app-owned embedding check once."
-                elif phase == "start_failed":
-                    live_phase = "AnythingLLM Desktop could not be started"
-                    details = "The automatic Desktop launch did not succeed; the saved recovery report has details."
-                else:
-                    return
-                update_live_automatic_run_status(
-                    run_root,
-                    state="running",
-                    phase=live_phase,
-                    expected_seconds=expected_seconds,
-                    details=details,
-                    confirmed_fraction=0.095,
-                    cancel_available=False,
-                )
-
-            embedder_runtime_recovery = attempt_automatic_runtime_start(
-                run_root,
-                resolved_api_url,
-                (api_key or "").strip(),
-                stage="AnythingLLM embedding preflight",
-                status_callback=report_embedder_recovery_status,
-            )
-            embedder_runtime_recovery["trigger"] = preflight_runtime_loss
-            try:
-                append_automatic_runtime_event(
-                    run_root,
-                    {"phase": "AnythingLLM embedding preflight", **embedder_runtime_recovery},
-                )
-            except OSError:
-                pass
-            if embedder_runtime_recovery.get("status") == "ready":
-                progress(0.098, desc="AnythingLLM restarted; retrying its embedding check")
-                update_live_automatic_run_status(
-                    run_root,
-                    state="running",
-                    phase="AnythingLLM restarted; retrying its embedding check",
-                    expected_seconds=expected_seconds,
-                    details="Desktop is responding again. Retrying the app-owned embedding check once.",
-                    confirmed_fraction=0.098,
-                    cancel_available=False,
-                )
-                recovered_probe = verify_anythingllm_runtime_embedder(
-                    resolved_api_url,
-                    api_key=(api_key or "").strip() or None,
-                    storage_dir=default_anythingllm_storage_dir(),
-                )
-                # The recovered probe becomes the current preflight result on
-                # success. Keep a detached evidence copy in the recovery
-                # record; otherwise assigning ``runtime_recovery`` below would
-                # make ``verification`` point back to the same object and turn
-                # the report into a circular JSON structure.
-                embedder_runtime_recovery["verification"] = detached_runtime_evidence(recovered_probe)
-                if recovered_probe.get("status") == "pass":
-                    anythingllm_embedder_preflight = recovered_probe
-                    anythingllm_embedder_preflight["recovered_after_desktop_start"] = True
-        if (
-            anythingllm_embedder_preflight.get("status") in {"server_error", "server_error_empty_body"}
-            and str(anythingllm_embedder_preflight.get("provider") or "").casefold() == "openrouter"
-            and is_local_anythingllm_url(resolved_api_url)
-        ):
-            progress(0.097, desc="Refreshing stale AnythingLLM embedding runtime")
-            embedder_runtime_recovery = refresh_local_anythingllm_openrouter_runtime(
-                resolved_api_url,
-                api_key=(api_key or "").strip() or None,
-                storage_dir=default_anythingllm_storage_dir(),
-            )
-            if embedder_runtime_recovery.get("status") == "refreshed":
-                recovered_probe = verify_anythingllm_runtime_embedder(
-                    resolved_api_url,
-                    api_key=(api_key or "").strip() or None,
-                    storage_dir=default_anythingllm_storage_dir(),
-                )
-                # Keep the recovery report detached from the preflight result
-                # for the same reason as Desktop-start recovery above.
-                embedder_runtime_recovery["verification"] = detached_runtime_evidence(recovered_probe)
-                if recovered_probe.get("status") == "pass":
-                    anythingllm_embedder_preflight = recovered_probe
-                    anythingllm_embedder_preflight["recovered_stale_runtime"] = True
-        anythingllm_embedder_preflight["runtime_recovery"] = embedder_runtime_recovery
-        (run_root / "anythingllm-embedder-preflight.json").write_text(
-            json.dumps(anythingllm_embedder_preflight, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        if anythingllm_embedder_preflight.get("status") != "pass":
-            progress(None)
-            credential_reverification_required = (
-                anythingllm_embedder_preflight.get("warning_code")
-                == "AUTO-OPENROUTER-KEY-REVERIFY-001"
-            )
-            runtime_unavailable = bool(preflight_runtime_loss.get("needed"))
-            failure_code = (
-                "AUTO-OPENROUTER-KEY-REVERIFY-001"
-                if credential_reverification_required
-                else "AUTO-ANYTHINGLLM-RUNTIME-001"
-                if runtime_unavailable
-                else "AUTO-EMBEDDER-001"
-            )
-            failure_title = (
-                "OpenRouter embedding key rejected"
-                if credential_reverification_required
-                else "AnythingLLM stopped during its embedding check"
-                if runtime_unavailable
-                else "AnythingLLM embedding runtime check failed"
-            )
-            failure_detail = (
-                "OpenRouter returned 401; PDF not uploaded."
-                if credential_reverification_required
-                else (
-                    anythingllm_embedder_preflight.get("message")
-                    or "AnythingLLM's embedding route did not complete; PDF not uploaded."
-                )
-            )
-            if anythingllm_embedder_preflight.get("error") and not credential_reverification_required:
-                failure_detail += f" Detail: {anythingllm_embedder_preflight['error']}"
-            update_live_automatic_run_status(
-                run_root,
-                state="failed",
-                phase="AnythingLLM embedding runtime needs attention",
-                expected_seconds=expected_seconds,
-                details=f"{failure_code}: {failure_title}.",
-                confirmed_fraction=0.095,
-                cancel_available=False,
-                activity_observed=False,
-            )
-            return automatic_error_outputs(
-                failure_code,
-                failure_title,
-                [failure_detail],
-                [
-                    (
-                        "Update the OpenRouter key in AnythingLLM Settings, save, then retry."
-                        if credential_reverification_required
-                        else "AnythingLLM was started once for this app-owned run, but its embedding check still did not complete. Review the saved probe report before retrying."
-                        if runtime_unavailable
-                        else "Open AnythingLLM Settings and save the active embedder configuration again, then retry."
-                    ),
-                ],
-                {
-                    "Probe report": str(run_root / "anythingllm-embedder-preflight.json"),
-                    "Runtime API": resolved_api_url,
-                },
                 readiness_html=latest_readiness_html,
             )
 

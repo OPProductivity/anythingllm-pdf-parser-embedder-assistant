@@ -1565,8 +1565,20 @@ class PipelineCoreTests(unittest.TestCase):
             root = Path(tmpdir)
             try:
                 app.anythingllm_desktop_process_running = lambda: False
-                app.ensure_anythingllm_runtime = lambda **_kwargs: {"status": "reachable"}
-                started = app.attempt_automatic_runtime_start(root, "http://127.0.0.1:3001", "key")
+                callback_events = []
+
+                def fake_ensure(**kwargs):
+                    kwargs["status_callback"]("waiting_for_runtime", {"status": "unreachable"})
+                    kwargs["status_callback"]("ready_after_start", {"status": "reachable"})
+                    return {"status": "reachable"}
+
+                app.ensure_anythingllm_runtime = fake_ensure
+                started = app.attempt_automatic_runtime_start(
+                    root,
+                    "http://127.0.0.1:3001",
+                    "key",
+                    status_callback=lambda phase, _snapshot: callback_events.append(phase),
+                )
 
                 app.anythingllm_desktop_process_running = lambda: True
                 app.ensure_anythingllm_runtime = lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not run"))
@@ -1576,25 +1588,34 @@ class PipelineCoreTests(unittest.TestCase):
                 app.ensure_anythingllm_runtime = original_ensure
 
         self.assertEqual(started["status"], "ready")
+        self.assertEqual(callback_events, ["waiting_for_runtime", "ready_after_start"])
         self.assertEqual(withheld["status"], "restart_withheld_manual_activity_uncertain")
         self.assertEqual(withheld["action"], "restart_withheld_process_alive")
 
-    def test_recovered_embedder_evidence_does_not_create_a_circular_preflight_report(self):
+    def test_runtime_recovery_resumes_only_before_anythingllm_submission(self):
         import rag_pdf_gradio_app as app
 
-        recovered_probe = {
-            "status": "pass",
-            "temporary_key_cleanup": {"status": "deleted"},
-        }
-        recovery = {"status": "ready"}
-        recovery["verification"] = app.detached_runtime_evidence(recovered_probe)
-        recovered_probe["runtime_recovery"] = recovery
-
-        serialized = json.dumps(recovered_probe)
-
-        self.assertIn('"verification"', serialized)
-        self.assertEqual(recovered_probe["runtime_recovery"]["verification"]["status"], "pass")
-        self.assertIsNot(recovered_probe, recovered_probe["runtime_recovery"]["verification"])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output"
+            output.mkdir()
+            self.assertTrue(
+                app.can_resume_local_preparation_after_runtime_start(
+                    output, {"status": "ready"}
+                )
+            )
+            ledger = output / "inspection" / "embedding-batch-ledger.json"
+            ledger.parent.mkdir()
+            ledger.write_text("{}", encoding="utf-8")
+            self.assertFalse(
+                app.can_resume_local_preparation_after_runtime_start(
+                    output, {"status": "ready"}
+                )
+            )
+            self.assertFalse(
+                app.can_resume_local_preparation_after_runtime_start(
+                    output, {"status": "startup_timeout"}
+                )
+            )
 
     def test_automatic_recovery_is_durably_limited_to_one_attempt_per_run(self):
         import rag_pdf_gradio_app as app
