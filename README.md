@@ -124,7 +124,9 @@ or install Git first.
 4. When installation finishes, use the new **Start AnythingLLM PDF Assistant**
    shortcut on your Desktop. It starts the local app and opens it in your web
    browser. The matching **Stop AnythingLLM PDF Assistant** shortcut stops it.
-5. Done. You can now use the app.
+5. Done. You can now use the app. For your first run, simply choose a PDF and
+   an output mode, then scroll down to the blue **Confirm and start
+   processing** button. You can leave the remaining options at their defaults.
 
 ## How it works:
 

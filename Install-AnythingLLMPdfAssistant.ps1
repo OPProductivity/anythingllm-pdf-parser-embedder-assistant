@@ -144,6 +144,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "Installation complete. Start and Stop shortcuts were created on your Desktop."
+Write-Host "First-use tip: if the app's options feel overwhelming, choose your PDF and output mode first, then scroll down to the blue Confirm and start processing button. The remaining options can stay at their defaults for your first run."
 
 if (-not (Test-AnythingLLMDesktopInstalled)) {
     Offer-OfficialSetupPage -Name "AnythingLLM Desktop" -Purpose "It is required to upload prepared records and create embeddings; local PDF extraction can still be used without it." -Url "https://anythingllm.com/desktop"
