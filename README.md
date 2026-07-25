@@ -42,20 +42,24 @@ page-local passages and can do a custom range of pages or all pages.
 
 ## Why use it?
 
-- Preserve PDF pages for citing or retrieving directly from page (higher LLM citation accuracy).
-- Convert PDFs into text records before embedding.
-- Parse PDF files in batches
-- Upload your pdf, and use the default settings by simply clicking "Confirm and start processing" at the bottom of the page,
+- Preserve PDF pages as separate files (higher LLM citation accuracy) or all in one file
+- Select PDF page ranges you want to upload (optional)
+- Talk to PDFs in AnythingLLM workspace chats and use cheap embedder models like Qwen3-embedding-8B to save costs on retrieval while keeping your   budget for the actual chat.
+- Convert PDFs into text files that can be directly and automatically embedded.
+- - Upload your pdf, and use the default settings by simply clicking "Confirm and start processing" at the bottom of the page,
   and let the app create a new workspace for you with the title of the pdf file itself.
-- Parse & Upload PDFs in batches at the same time to AnythingLLM (new or existing workspace) without clicking through menus for each PDF
-- Choose a segmentation strategy that fits retrieval quality and speed (one file, multiple files)
-- Prepare and upload a single PDF, several selected PDFs, or a batch folder.
-- Keep parsing and OCR locally when you do not want to upload anything.
+- Parse & Upload PDFs in batches at the same time to AnythingLLM (new or existing workspace) without clicking through menus.
+- 3 Output modes (parsing only, parsing only with logs, parsing & directly embedding into a new workspace)
+- Parse PDF files in batches instead of one at a time. You can later select which files you want to upload and embed them manually
+- Choose a segmentation strategy that fits retrieval quality and speed (one file per pdf, multiple smaller files per pdf, adheres to max token size limits)
+- Prepare and upload a single PDF, several selected PDFs, or a folder.
+- Keep parsing and OCR local and then choose local embedding or cloud embedding via your selected provider
 - Automatically upload pdf files to AnythingLLM Desktop
-- Detect extraction, OCR, embedding, workspace, and retrieval failures
+- Detect and extract, perform quick OCR, embedding, workspace, and retrieval failures
 - Parse advanced PDFs using complex python scripts
-- Easy localhost user interface - no terminal required
-- Dark Theme and Light Theme (also follows System Theme if your windows dark mode only activates at night)
+- Connected chain of events: Parsing, OCR, splitting, chunking, uploading, embedding all done after clicking the blue confirm button.
+- Easy web page user interface - no terminal interface required except during installation
+- Use Dark Theme or Light Theme (also follows System Theme if your windows dark mode only activates at night)
 - Adheres to common embedder context size limits
 - Use the optional desktop refresh bridge to make AnythingLLM Desktop reflect
   completed document changes more reliably.
@@ -86,12 +90,10 @@ flowchart LR
 
 ### Segmentation choices
 
-- **All in one file:** one text record for the entire PDF.
+- **All in one file:** one text record for the entire PDF. (However 1 input file will get split up into smaller files embedding files by AnythingLLM itself. A single PDF file often exceeds the max context size of embedder models. For example, Qwen-3-Embedding-8B allows a maximum size of 32,000 tokens, and openai text-embedding-3-large has a maximum size of 8,000 tokens, after which both start splitting the text).
 - **Whole-page chunks:** one record for each extracted page.
-- **Page – preserve automatically:** page-addressable records, with page-local
-  splitting only where necessary to fit the effective upload boundary.
-- **Shorter page-local passages:** smaller page-addressable passages for more
-  granular retrieval.
+- **Page – preserve automatically:** split your pdf file into smaller chunks the size of pages. If a page is too big for the embedder, the page will be split locally to fit the effective upload boundary, but will still be recognizable as that page.
+- **Shorter page-local passages:** split large pdf files up into smaller page-addressable passages that are accepted by embedders but aware of which page they belong to.
 
 The app reports what it observed. It does not claim that an AnythingLLM document
 drawer view alone proves retrieval readiness; storage, vectors, and runtime
@@ -101,7 +103,7 @@ retrieval are separate checks.
 
 ### Requirements
 
-- Windows 10/11
+- Windows 10 or 11
 - Python 3.11–3.14
 - [pipx](https://pipx.pypa.io/)
 - [AnythingLLM Desktop](https://anythingllm.com/desktop) running locally when
