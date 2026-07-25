@@ -1579,6 +1579,23 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(withheld["status"], "restart_withheld_manual_activity_uncertain")
         self.assertEqual(withheld["action"], "restart_withheld_process_alive")
 
+    def test_recovered_embedder_evidence_does_not_create_a_circular_preflight_report(self):
+        import rag_pdf_gradio_app as app
+
+        recovered_probe = {
+            "status": "pass",
+            "temporary_key_cleanup": {"status": "deleted"},
+        }
+        recovery = {"status": "ready"}
+        recovery["verification"] = app.detached_runtime_evidence(recovered_probe)
+        recovered_probe["runtime_recovery"] = recovery
+
+        serialized = json.dumps(recovered_probe)
+
+        self.assertIn('"verification"', serialized)
+        self.assertEqual(recovered_probe["runtime_recovery"]["verification"]["status"], "pass")
+        self.assertIsNot(recovered_probe, recovered_probe["runtime_recovery"]["verification"])
+
     def test_automatic_recovery_is_durably_limited_to_one_attempt_per_run(self):
         import rag_pdf_gradio_app as app
 
@@ -4255,6 +4272,45 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(result["start"]["status"], "started")
         self.assertTrue(result["waited_for_runtime"])
         self.assertEqual(result["lifecycle"][-1], {"phase": "ready_after_start", "status": "reachable"})
+
+    def test_ensure_anythingllm_runtime_reports_startup_lifecycle_without_changing_recovery(self):
+        original_detect = pipeline.detect_anythingllm_api_url
+        original_start = pipeline.start_anythingllm_desktop
+        original_sleep = pipeline.time.sleep
+        try:
+            calls = {"detect": 0}
+            events = []
+
+            def fake_detect(preferred_url="", api_key=None, timeout=2.0):
+                calls["detect"] += 1
+                return {
+                    "status": "reachable" if calls["detect"] >= 2 else "unreachable",
+                    "api_url": "http://127.0.0.1:3001",
+                    "attempts": [],
+                    "message": "up" if calls["detect"] >= 2 else "down",
+                }
+
+            pipeline.detect_anythingllm_api_url = fake_detect
+            pipeline.start_anythingllm_desktop = lambda executable_path=None: {
+                "status": "started", "started": True, "already_running": False,
+                "executable": "C:/AnythingLLM.exe", "error": "",
+            }
+            pipeline.time.sleep = lambda seconds: None
+            result = pipeline.ensure_anythingllm_runtime(
+                "http://127.0.0.1:3001",
+                autostart_local=True,
+                startup_timeout=5,
+                status_callback=lambda phase, snapshot: events.append((phase, snapshot.get("status"))),
+            )
+        finally:
+            pipeline.detect_anythingllm_api_url = original_detect
+            pipeline.start_anythingllm_desktop = original_start
+            pipeline.time.sleep = original_sleep
+
+        self.assertEqual(result["status"], "reachable")
+        self.assertIn(("starting_desktop", "unreachable"), events)
+        self.assertIn(("waiting_for_runtime", "unreachable"), events)
+        self.assertEqual(events[-1], ("ready_after_start", "reachable"))
 
     def test_stale_artifact_report_groups_audit_findings_into_candidate_buckets(self):
         original_audit = pipeline.anythingllm_storage_audit

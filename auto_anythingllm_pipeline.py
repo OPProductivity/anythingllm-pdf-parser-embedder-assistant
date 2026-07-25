@@ -8283,7 +8283,23 @@ def ensure_anythingllm_runtime(
     timeout=2.0,
     startup_timeout=DEFAULT_ANYTHINGLLM_STARTUP_TIMEOUT_SECONDS,
     autostart_local=False,
+    status_callback=None,
 ):
+    """Ensure the local Desktop API can be reached, reporting bounded lifecycle updates.
+
+    ``status_callback`` is deliberately observational: callers such as the
+    Gradio run status can show that Desktop is launching or has become ready,
+    but a callback failure can never change the recovery outcome.
+    """
+    def report_status(phase, snapshot):
+        if not callable(status_callback):
+            return
+        try:
+            status_callback(str(phase), dict(snapshot or {}))
+        except Exception:
+            # A presentation observer must not break runtime recovery.
+            pass
+
     detection = detect_anythingllm_api_url(preferred_url, api_key=api_key, timeout=timeout)
     result = {
         **detection,
@@ -8297,34 +8313,44 @@ def ensure_anythingllm_runtime(
         "waited_for_runtime": False,
         "lifecycle": [{"phase": "initial_detection", "status": detection.get("status", "not_checked")}],
     }
+    report_status("initial_detection", result)
     if detection.get("status") in {"reachable", "reachable_auth_required"}:
         result["lifecycle"].append({"phase": "ready", "status": detection.get("status")})
+        report_status("ready", result)
         return result
     if not autostart_local:
         result["lifecycle"].append({"phase": "autostart_skipped", "status": "not_requested"})
+        report_status("autostart_skipped", result)
         return result
     if preferred_url and not is_local_anythingllm_url(preferred_url):
         result["lifecycle"].append({"phase": "autostart_skipped", "status": "non_local_target"})
+        report_status("autostart_skipped", result)
         return result
     result["lifecycle"].append({"phase": "starting_desktop", "status": "pending"})
+    report_status("starting_desktop", result)
     start_result = start_anythingllm_desktop()
     result["start"] = start_result
     if start_result.get("status") in {"missing_executable", "start_failed"}:
         result["lifecycle"].append({"phase": "start_failed", "status": start_result.get("status")})
+        report_status("start_failed", result)
         return result
     deadline = time.time() + max(5.0, float(startup_timeout or DEFAULT_ANYTHINGLLM_STARTUP_TIMEOUT_SECONDS))
     result["waited_for_runtime"] = True
     result["lifecycle"].append({"phase": "waiting_for_runtime", "status": start_result.get("status", "started")})
+    report_status("waiting_for_runtime", result)
     latest = detection
     while time.time() < deadline:
         latest = detect_anythingllm_api_url(preferred_url, api_key=api_key, timeout=min(float(timeout or 2.0), 1.25))
         result.update(latest)
         if latest.get("status") in {"reachable", "reachable_auth_required"}:
             result["lifecycle"].append({"phase": "ready_after_start", "status": latest.get("status")})
+            report_status("ready_after_start", result)
             return result
+        report_status("waiting_for_runtime", result)
         time.sleep(1.5)
     result.update(latest)
     result["lifecycle"].append({"phase": "startup_timeout", "status": latest.get("status", "unreachable")})
+    report_status("startup_timeout", result)
     return result
 
 

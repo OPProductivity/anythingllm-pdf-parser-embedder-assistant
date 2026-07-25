@@ -9719,7 +9719,12 @@ def append_automatic_runtime_event(run_root, event):
         handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
 
 
-def attempt_automatic_runtime_start(run_root, api_url, api_key, *, stage=""):
+def detached_runtime_evidence(value):
+    """Return JSON-safe evidence that cannot retain references into live state."""
+    return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+
+
+def attempt_automatic_runtime_start(run_root, api_url, api_key, *, stage="", status_callback=None):
     """Make one bounded *start-only* Desktop recovery attempt and save evidence.
 
     This does not restart a reachable Desktop process, remove queue entries, or
@@ -9757,6 +9762,7 @@ def attempt_automatic_runtime_start(run_root, api_url, api_key, *, stage=""):
                 timeout=1.25,
                 startup_timeout=45.0,
                 autostart_local=True,
+                status_callback=status_callback,
             )
             record["runtime"] = runtime
             status = str(runtime.get("status") or "unknown")
@@ -14536,11 +14542,38 @@ def run_automatic(
                 confirmed_fraction=0.095,
                 cancel_available=False,
             )
+            def report_embedder_recovery_status(lifecycle_phase, _runtime):
+                phase = str(lifecycle_phase or "")
+                if phase == "starting_desktop":
+                    live_phase = "Starting AnythingLLM Desktop"
+                    details = "The local runtime is unavailable. Launching Desktop once for this app-owned run."
+                elif phase == "waiting_for_runtime":
+                    live_phase = "Waiting for AnythingLLM Desktop to become ready"
+                    details = "Desktop was launched; checking its local runtime again before retrying the embedding check."
+                elif phase in {"ready_after_start", "ready"}:
+                    live_phase = "AnythingLLM restarted; retrying its embedding check"
+                    details = "Desktop is responding again. Retrying the app-owned embedding check once."
+                elif phase == "start_failed":
+                    live_phase = "AnythingLLM Desktop could not be started"
+                    details = "The automatic Desktop launch did not succeed; the saved recovery report has details."
+                else:
+                    return
+                update_live_automatic_run_status(
+                    run_root,
+                    state="running",
+                    phase=live_phase,
+                    expected_seconds=expected_seconds,
+                    details=details,
+                    confirmed_fraction=0.095,
+                    cancel_available=False,
+                )
+
             embedder_runtime_recovery = attempt_automatic_runtime_start(
                 run_root,
                 resolved_api_url,
                 (api_key or "").strip(),
                 stage="AnythingLLM embedding preflight",
+                status_callback=report_embedder_recovery_status,
             )
             embedder_runtime_recovery["trigger"] = preflight_runtime_loss
             try:
@@ -14552,12 +14585,26 @@ def run_automatic(
                 pass
             if embedder_runtime_recovery.get("status") == "ready":
                 progress(0.098, desc="AnythingLLM restarted; retrying its embedding check")
+                update_live_automatic_run_status(
+                    run_root,
+                    state="running",
+                    phase="AnythingLLM restarted; retrying its embedding check",
+                    expected_seconds=expected_seconds,
+                    details="Desktop is responding again. Retrying the app-owned embedding check once.",
+                    confirmed_fraction=0.098,
+                    cancel_available=False,
+                )
                 recovered_probe = verify_anythingllm_runtime_embedder(
                     resolved_api_url,
                     api_key=(api_key or "").strip() or None,
                     storage_dir=default_anythingllm_storage_dir(),
                 )
-                embedder_runtime_recovery["verification"] = recovered_probe
+                # The recovered probe becomes the current preflight result on
+                # success. Keep a detached evidence copy in the recovery
+                # record; otherwise assigning ``runtime_recovery`` below would
+                # make ``verification`` point back to the same object and turn
+                # the report into a circular JSON structure.
+                embedder_runtime_recovery["verification"] = detached_runtime_evidence(recovered_probe)
                 if recovered_probe.get("status") == "pass":
                     anythingllm_embedder_preflight = recovered_probe
                     anythingllm_embedder_preflight["recovered_after_desktop_start"] = True
@@ -14578,7 +14625,9 @@ def run_automatic(
                     api_key=(api_key or "").strip() or None,
                     storage_dir=default_anythingllm_storage_dir(),
                 )
-                embedder_runtime_recovery["verification"] = recovered_probe
+                # Keep the recovery report detached from the preflight result
+                # for the same reason as Desktop-start recovery above.
+                embedder_runtime_recovery["verification"] = detached_runtime_evidence(recovered_probe)
                 if recovered_probe.get("status") == "pass":
                     anythingllm_embedder_preflight = recovered_probe
                     anythingllm_embedder_preflight["recovered_stale_runtime"] = True
