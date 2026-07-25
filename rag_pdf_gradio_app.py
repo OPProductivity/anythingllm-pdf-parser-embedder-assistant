@@ -9754,7 +9754,10 @@ def attempt_automatic_runtime_start(run_root, api_url, api_key, *, stage="", sta
             runtime = ensure_anythingllm_runtime(
                 preferred_url=str(api_url or ""),
                 api_key=api_key or None,
-                timeout=1.25,
+                # The guard has already confirmed two failed local probes.
+                # Keep this final pre-start sweep short so a closed Desktop is
+                # launched promptly instead of waiting on four dead aliases.
+                timeout=0.4,
                 startup_timeout=45.0,
                 autostart_local=True,
                 status_callback=status_callback,
@@ -9788,7 +9791,9 @@ def poll_automatic_runtime_guard(guard, desktop_required, stage, api_url, api_ke
     if moment < float(state.get("next_check_epoch") or 0.0):
         return state, {"status": "not_due"}
     try:
-        health = probe(str(api_url), api_key=api_key or None, timeout=1.25)
+        # This is a frequent liveness signal, not an embedding request. A
+        # short bounded probe preserves fast recovery without delaying parsing.
+        health = probe(str(api_url), api_key=api_key or None, timeout=0.4)
     except Exception as exc:  # A monitor must never bring down a live run.
         health = {"status": "probe_error", "error": str(exc)}
     healthy = str(health.get("status") or "") in {"reachable", "reachable_auth_required"}
