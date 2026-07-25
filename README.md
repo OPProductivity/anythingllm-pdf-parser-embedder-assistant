@@ -77,16 +77,16 @@ flowchart LR
     Extract --> Segment["Choose whole file, page-aware, or page-local segments"]
     Segment --> Local["Local text output"]
     Segment --> Upload["AnythingLLM Desktop workspace"]
-    Upload --> Verify["Storage, vector, and retrieval checks"]
+    Upload --> Verify["Storage, vector, and retrieval checks         "]
 ```
 
 ### Output modes
 
 | Mode | Result |
 | --- | --- |
-| **Create local files only** | Parsed transcript and selected segments with run evidence. |
-| **Create local files without logs** | A compact output folder containing only the parsed transcript and text segments. |
-| **Create local files and upload to AnythingLLM** | Local output plus workspace upload, embedding queue submission, and post-upload checks. |
+| **Create local files only** | Convert and parse and OCR the text from you pdf to local .txt transcript with added creation logs. Does not upload your file to your AnythingLLM Desktop instance |
+| **Create local files without logs** | Convert and parse and OCR the text from you pdf to local .txt transcript. A compact output folder which only contains the parsed transcript (in 1 or more segments). |
+| **Create local files and upload to AnythingLLM** | The above plus uploads transcript directly to a new AnythingLLM workspace, where it uploads, and embeds your converted PDF file(s) which are now TXT files, automatically |
 
 ### Segmentation choices
 
@@ -95,9 +95,7 @@ flowchart LR
 - **Page – preserve automatically:** split your pdf file into smaller chunks the size of pages. If a page is too big for the embedder, the page will be split locally to fit the effective upload boundary, but will still be recognizable as that page.
 - **Shorter page-local passages:** split large pdf files up into smaller page-addressable passages that are accepted by embedders but aware of which page they belong to.
 
-The app reports what it observed. It does not claim that an AnythingLLM document
-drawer view alone proves retrieval readiness; storage, vectors, and runtime
-retrieval are separate checks.
+The app never overwrites or deletes existing AnythingLLM workspaces and only uses newly created workspaces which you can name inside the web interface (optional). Otherwise it uses the filename of the pdf as the name of the workspace. The workspace name can later be changed inside AnythingLLM. The app detects if embeddings in a new workspace get stuck and reports what it observes, and performs checks during processing to make sure everything works reliably.
 
 ## Quick start
 
