@@ -318,6 +318,11 @@ AUTOMATIC_RUNTIME_GUARD_INTERVAL_SECONDS = 5.0
 # monitoring interval.
 AUTOMATIC_RUNTIME_GUARD_RECHECK_SECONDS = 2.0
 AUTOMATIC_RUNTIME_GUARD_FAILURE_THRESHOLD = 2
+# Desktop's splash can reach 100% before the local API and worker processes are
+# usable. Recovery waits for the API itself rather than treating the window as
+# ready; cold starts observed on this machine can exceed the general 45-second
+# startup default, so give this one bounded app-owned attempt two minutes.
+AUTOMATIC_RUNTIME_RECOVERY_STARTUP_TIMEOUT_SECONDS = 120.0
 # A marker survives a server crash for recovery, but a Windows PID can later be
 # reused by an unrelated process. Keep the live Popen handle in this process as
 # the authority for a forced taskkill; the durable marker remains useful for
@@ -9758,7 +9763,7 @@ def attempt_automatic_runtime_start(run_root, api_url, api_key, *, stage="", sta
                 # Keep this final pre-start sweep short so a closed Desktop is
                 # launched promptly instead of waiting on four dead aliases.
                 timeout=0.4,
-                startup_timeout=45.0,
+                startup_timeout=AUTOMATIC_RUNTIME_RECOVERY_STARTUP_TIMEOUT_SECONDS,
                 autostart_local=True,
                 status_callback=status_callback,
             )

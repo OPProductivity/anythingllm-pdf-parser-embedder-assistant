@@ -1568,6 +1568,10 @@ class PipelineCoreTests(unittest.TestCase):
                 callback_events = []
 
                 def fake_ensure(**kwargs):
+                    self.assertEqual(
+                        kwargs["startup_timeout"],
+                        app.AUTOMATIC_RUNTIME_RECOVERY_STARTUP_TIMEOUT_SECONDS,
+                    )
                     kwargs["status_callback"]("waiting_for_runtime", {"status": "unreachable"})
                     kwargs["status_callback"]("ready_after_start", {"status": "reachable"})
                     return {"status": "reachable"}
