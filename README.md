@@ -124,6 +124,9 @@ or install Git first.
 4. When installation finishes, use the new **Start AnythingLLM PDF Assistant**
    shortcut on your Desktop. It starts the local app and opens it in your web
    browser. The matching **Stop AnythingLLM PDF Assistant** shortcut stops it.
+5. Done. You can now use the app.
+
+## How it works:
 
 The installer downloads the current public `main.zip` source archive from
 GitHub over HTTPS, installs `pipx`, and installs the application's required
@@ -132,7 +135,15 @@ a new installation gets the current public `main` version and needs an internet
 connection while it installs. If a supported Python version is not available,
 the installer asks before offering a per-user Python 3.14 installation through
 `winget`; it never installs Python without your confirmation. It does not
-require Git or a manually cloned repository.
+require Git or a manually cloned repository, but feel free to clone the
+repository, ask AI (Codex or Claude Cowork) to help you install it, or download
+it with Git like this:
+
+```powershell
+git clone https://github.com/OPProductivity/anythingllm-pdf-parser-embedder-assistant.git
+Set-Location anythingllm-pdf-parser-embedder-assistant
+.\Install-AnythingLLMPdfAssistant.ps1
+```
 
 For PDF upload and embedding, you still need AnythingLLM Desktop and a working
 embedding provider inside it. If the installer cannot find AnythingLLM Desktop
@@ -163,7 +174,9 @@ To repair the shortcuts later, run:
 anythingllm-pdf-assistant shortcuts repair
 ```
 
-### Advanced: manual pipx installation
+---
+
+### **Advanced: manual pipx installation**
 
 For users who already manage Python and `pipx` themselves:
 
