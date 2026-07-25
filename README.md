@@ -1,7 +1,7 @@
 # AnythingLLM PDF Parser And Embedder
-**Single PDF files are often too big to chat with inside AnythingLLM, this Assistant is a localhost app that parses and splits your pdf file to the require max text chunk size of AnythingLLM, in custom chunk sizes, or per page, so that you can more eaily chat with your PDF files in AnythingLLM**
+**Single PDF files are often too big to chat with inside AnythingLLM. This app parses and splits your pdf file into the required maximum text chunk size set in AnythingLLM, or into custom chunk sizes (per segment, per page), so that you can interact with the full PDF file inside AnythingLLM**
 
-**The app uses a web page (localhost) that allows you to pick and select your PDF files, convert them into AnythingLLM format and upload and embed the files automatically into a new AnythingLLM Desktop workspace.**
+**The app uses a web page (localhost app) that allows you to pick and select your PDF files, convert them into AnythingLLM format, and upload and embed the files automatically into a new AnythingLLM Desktop workspace.**
 
 This AnythingLLM (Windows 11) assistant turns one PDF, a selected batch or folder of
 PDFs, into clean text files, and uploads them and embeds them to AnythingLLM. AnythingLLM itself does not support
