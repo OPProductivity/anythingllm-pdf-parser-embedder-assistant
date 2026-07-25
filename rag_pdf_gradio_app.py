@@ -322,7 +322,8 @@ AUTOMATIC_RUNTIME_GUARD_FAILURE_THRESHOLD = 2
 # usable. Recovery waits for the API itself rather than treating the window as
 # ready; cold starts observed on this machine can exceed the general 45-second
 # startup default, so give this one bounded app-owned attempt two minutes.
-AUTOMATIC_RUNTIME_RECOVERY_STARTUP_TIMEOUT_SECONDS = 120.0
+AUTOMATIC_RUNTIME_RECOVERY_STARTUP_TIMEOUT_SECONDS = 180.0
+AUTOMATIC_RUNTIME_RECOVERY_STARTUP_POLL_INTERVAL_SECONDS = 10.0
 # A marker survives a server crash for recovery, but a Windows PID can later be
 # reused by an unrelated process. Keep the live Popen handle in this process as
 # the authority for a forced taskkill; the durable marker remains useful for
@@ -9766,6 +9767,7 @@ def attempt_automatic_runtime_start(run_root, api_url, api_key, *, stage="", sta
                 startup_timeout=AUTOMATIC_RUNTIME_RECOVERY_STARTUP_TIMEOUT_SECONDS,
                 autostart_local=True,
                 status_callback=status_callback,
+                startup_poll_interval=AUTOMATIC_RUNTIME_RECOVERY_STARTUP_POLL_INTERVAL_SECONDS,
             )
             record["runtime"] = runtime
             status = str(runtime.get("status") or "unknown")
@@ -10031,7 +10033,11 @@ def execute_automatic_preparation_in_worker(
                     if phase == "starting_desktop":
                         message = "AnythingLLM stopped; starting Desktop once"
                     elif phase == "waiting_for_runtime":
-                        message = "Waiting for AnythingLLM Desktop to become ready"
+                        probe_count = int((_runtime or {}).get("startup_probe_count") or 0)
+                        message = (
+                            "Waiting for AnythingLLM Desktop API "
+                            f"(check {probe_count}; retrying every 10 seconds for up to 3 minutes)"
+                        )
                     elif phase in {"ready_after_start", "ready"}:
                         message = "AnythingLLM restarted; resuming local preparation"
                     elif phase == "start_failed":
@@ -15119,6 +15125,55 @@ def run_automatic(
                 if (out_dir / "inspection" / "embedding-batch-ledger.json").is_file():
                     schedule_automatic_recovery(run_root, reason="operator_cancellation")
                 break
+            if worker_result.get("status") == "runtime_unavailable":
+                runtime_recovery = dict(worker_result.get("runtime_recovery") or {})
+                runtime_ready = runtime_recovery.get("status") == "ready"
+                failure_code = (
+                    "AUTO-EMBEDDING-RECONCILE-001"
+                    if runtime_ready
+                    else "AUTO-ANYTHINGLLM-STARTUP-001"
+                )
+                failure_title = (
+                    "AnythingLLM restarted after an embedding submission boundary"
+                    if runtime_ready
+                    else "AnythingLLM did not become ready after automatic startup"
+                )
+                failure_detail = (
+                    "AnythingLLM became ready, but this run had already crossed a submission boundary. "
+                    "The app stopped rather than risk a duplicate embedding submission."
+                    if runtime_ready
+                    else worker_result.get("error")
+                    or "Desktop's local API did not respond before the recovery deadline."
+                )
+                update_live_automatic_run_status(
+                    run_root,
+                    state="failed",
+                    phase=failure_title,
+                    expected_seconds=expected_seconds,
+                    details=f"{failure_code}: {failure_title}.",
+                    confirmed_fraction=start_fraction,
+                    cancel_available=False,
+                    activity_observed=False,
+                )
+                progress(None)
+                return automatic_error_outputs(
+                    failure_code,
+                    failure_title,
+                    [failure_detail],
+                    [
+                        (
+                            "Open the saved recovery report and resume only the ledger-proven missing records."
+                            if runtime_ready
+                            else "The app stopped this run before any unproven retry could submit duplicate embeddings."
+                        ),
+                        "Wait for AnythingLLM Desktop's local API to respond, then confirm a new run.",
+                    ],
+                    {
+                        "Runtime recovery report": str(run_root / AUTOMATIC_RUN_RUNTIME_RECOVERY),
+                        "Recovery status": runtime_recovery.get("status") or "unknown",
+                    },
+                    readiness_html=latest_readiness_html,
+                )
             if worker_result.get("status") != "completed":
                 raise RuntimeError(worker_result.get("error") or "The preparation worker did not complete.")
             # Cancellation can race a normally exiting child process. Once the

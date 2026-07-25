@@ -8285,6 +8285,7 @@ def ensure_anythingllm_runtime(
     startup_timeout=DEFAULT_ANYTHINGLLM_STARTUP_TIMEOUT_SECONDS,
     autostart_local=False,
     status_callback=None,
+    startup_poll_interval=1.5,
 ):
     """Ensure the local Desktop API can be reached, reporting bounded lifecycle updates.
 
@@ -8336,19 +8337,28 @@ def ensure_anythingllm_runtime(
         report_status("start_failed", result)
         return result
     deadline = time.time() + max(5.0, float(startup_timeout or DEFAULT_ANYTHINGLLM_STARTUP_TIMEOUT_SECONDS))
+    poll_interval = max(0.1, float(startup_poll_interval or 1.5))
     result["waited_for_runtime"] = True
+    result["startup_timeout_seconds"] = max(5.0, float(startup_timeout or DEFAULT_ANYTHINGLLM_STARTUP_TIMEOUT_SECONDS))
+    result["startup_poll_interval_seconds"] = poll_interval
+    result["startup_probe_count"] = 0
     result["lifecycle"].append({"phase": "waiting_for_runtime", "status": start_result.get("status", "started")})
     report_status("waiting_for_runtime", result)
     latest = detection
     while time.time() < deadline:
         latest = detect_anythingllm_api_url(preferred_url, api_key=api_key, timeout=min(float(timeout or 2.0), 1.25))
         result.update(latest)
+        result["startup_probe_count"] += 1
+        result["startup_wait_elapsed_seconds"] = round(
+            max(0.0, result["startup_timeout_seconds"] - max(0.0, deadline - time.time())), 3
+        )
+        result["startup_wait_remaining_seconds"] = round(max(0.0, deadline - time.time()), 3)
         if latest.get("status") in {"reachable", "reachable_auth_required"}:
             result["lifecycle"].append({"phase": "ready_after_start", "status": latest.get("status")})
             report_status("ready_after_start", result)
             return result
         report_status("waiting_for_runtime", result)
-        time.sleep(1.5)
+        time.sleep(min(poll_interval, max(0.0, deadline - time.time())))
     result.update(latest)
     result["lifecycle"].append({"phase": "startup_timeout", "status": latest.get("status", "unreachable")})
     report_status("startup_timeout", result)

@@ -1572,6 +1572,10 @@ class PipelineCoreTests(unittest.TestCase):
                         kwargs["startup_timeout"],
                         app.AUTOMATIC_RUNTIME_RECOVERY_STARTUP_TIMEOUT_SECONDS,
                     )
+                    self.assertEqual(
+                        kwargs["startup_poll_interval"],
+                        app.AUTOMATIC_RUNTIME_RECOVERY_STARTUP_POLL_INTERVAL_SECONDS,
+                    )
                     kwargs["status_callback"]("waiting_for_runtime", {"status": "unreachable"})
                     kwargs["status_callback"]("ready_after_start", {"status": "reachable"})
                     return {"status": "reachable"}
@@ -4336,6 +4340,44 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn(("starting_desktop", "unreachable"), events)
         self.assertIn(("waiting_for_runtime", "unreachable"), events)
         self.assertEqual(events[-1], ("ready_after_start", "reachable"))
+
+    def test_ensure_anythingllm_runtime_uses_the_requested_startup_poll_interval(self):
+        original_detect = pipeline.detect_anythingllm_api_url
+        original_start = pipeline.start_anythingllm_desktop
+        original_sleep = pipeline.time.sleep
+        try:
+            calls = {"detect": 0}
+            sleeps = []
+
+            def fake_detect(preferred_url="", api_key=None, timeout=2.0):
+                calls["detect"] += 1
+                return {
+                    "status": "reachable" if calls["detect"] >= 3 else "unreachable",
+                    "api_url": "http://127.0.0.1:3001",
+                    "attempts": [],
+                    "message": "up" if calls["detect"] >= 3 else "down",
+                }
+
+            pipeline.detect_anythingllm_api_url = fake_detect
+            pipeline.start_anythingllm_desktop = lambda executable_path=None: {
+                "status": "started", "started": True, "already_running": False,
+                "executable": "C:/AnythingLLM.exe", "error": "",
+            }
+            pipeline.time.sleep = lambda seconds: sleeps.append(seconds)
+            result = pipeline.ensure_anythingllm_runtime(
+                "http://127.0.0.1:3001",
+                autostart_local=True,
+                startup_timeout=30,
+                startup_poll_interval=10,
+            )
+        finally:
+            pipeline.detect_anythingllm_api_url = original_detect
+            pipeline.start_anythingllm_desktop = original_start
+            pipeline.time.sleep = original_sleep
+
+        self.assertEqual(result["status"], "reachable")
+        self.assertEqual(result["startup_probe_count"], 2)
+        self.assertEqual(sleeps, [10])
 
     def test_stale_artifact_report_groups_audit_findings_into_candidate_buckets(self):
         original_audit = pipeline.anythingllm_storage_audit
