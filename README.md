@@ -109,16 +109,15 @@ The app never overwrites or deletes existing AnythingLLM workspaces and only use
 
 You do **not** need Git, a cloned copy of this repository, Python, or `pipx`
 before starting the recommended installation. The installer handles the Python
-application requirements and asks before it makes a system-level change.
-
-### Installation
+application requirements and asks before offering to install Python through
+`winget`.
 
 ## Install directly like this:
 The easiest installation uses one Windows PowerShell file. You only need to
 download that file; you do **not** need to download the rest of this repository
 or install Git first.
 
-1. Download [Install-AnythingLLMPdfAssistant.ps1](https://github.com/OPProductivity/anythingllm-pdf-parser-embedder-assistant/raw/refs/heads/main/Install-AnythingLLMPdfAssistant.ps1) to your **Downloads** folder.
+1. Download [Install-AnythingLLMPdfAssistant.ps1](https://github.com/OPProductivity/anythingllm-pdf-parser-embedder-assistant/releases/download/v0.5.1/Install-AnythingLLMPdfAssistant.ps1) to your **Downloads** folder.
 2. In File Explorer, right-click the downloaded file and select **Run with PowerShell**.
 3. Keep the PowerShell window open and follow its prompts. It tells you what it
    finds and what it needs before doing anything optional.
@@ -126,17 +125,25 @@ or install Git first.
    shortcut on your Desktop. It starts the local app and opens it in your web
    browser. The matching **Stop AnythingLLM PDF Assistant** shortcut stops it.
 
-The installer downloads the current public package from GitHub over HTTPS,
-installs `pipx`, and installs the application's required Python packages. If a
-supported Python version is not available, it asks before offering a per-user
-Python 3.14 installation through `winget`; it never installs Python without
-your confirmation. It does not require Git or a manually cloned repository.
+The installer downloads the current public `main.zip` source archive from
+GitHub over HTTPS, installs `pipx`, and installs the application's required
+Python packages. It is deliberately not a version-pinned GitHub Release asset:
+a new installation gets the current public `main` version and needs an internet
+connection while it installs. If a supported Python version is not available,
+the installer asks before offering a per-user Python 3.14 installation through
+`winget`; it never installs Python without your confirmation. It does not
+require Git or a manually cloned repository.
 
 For PDF upload and embedding, you still need AnythingLLM Desktop and a working
 embedding provider inside it. If the installer cannot find AnythingLLM Desktop
 or Tesseract OCR, it explains what the missing component is for and asks before
 opening the official download page. It does not silently install either
 application or change your embedding provider settings.
+
+The app automatically assesses each PDF during preparation. It can recognize
+fully text-based PDFs, scanned or image-only PDFs, and pages containing images
+whose text may benefit from OCR. Tesseract OCR is therefore only needed when
+the document's OCR/readiness assessment indicates that reliable OCR is needed.
 
 Only run the installer after reviewing the linked public source. If Windows
 blocks a downloaded PowerShell script, right-click the file, choose
