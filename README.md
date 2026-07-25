@@ -111,7 +111,7 @@ retrieval are separate checks.
 
 ### Installation
 
-## Install the app directly from this Github Repository to your Windows PC:
+## Install directly like this:
 Run the repository's Windows installer. It installs the pipx package and
 creates **Start AnythingLLM PDF Assistant** and **Stop AnythingLLM PDF
 Assistant** shortcuts on the current user's Desktop.
