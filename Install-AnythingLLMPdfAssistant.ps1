@@ -1,6 +1,9 @@
 [CmdletBinding()]
 param(
-    [string]$RepositoryUrl = "https://github.com/OPProductivity/anythingllm-pdf-parser-embedder-assistant.git"
+    # A GitHub source archive can be installed by pip/pipx directly. This keeps
+    # the public one-file installer independent of Git for Windows and of a
+    # manually cloned repository.
+    [string]$PackageUrl = "https://github.com/OPProductivity/anythingllm-pdf-parser-embedder-assistant/archive/refs/heads/main.zip"
 )
 
 $ErrorActionPreference = "Stop"
@@ -120,13 +123,10 @@ function Invoke-Python {
     }
 }
 
-if (-not (Get-Command git.exe -ErrorAction SilentlyContinue) -and -not (Get-Command git -ErrorAction SilentlyContinue)) {
-    throw "Git is required to install directly from the repository. Install Git for Windows, then run this installer again."
-}
-
 Invoke-Python -Arguments @("-m", "pip", "install", "--user", "pipx")
 Invoke-Python -Arguments @("-m", "pipx", "ensurepath")
-Invoke-Python -Arguments @("-m", "pipx", "install", "--force", ("git+" + $RepositoryUrl))
+Write-Host "Downloading the current public application package from GitHub..."
+Invoke-Python -Arguments @("-m", "pipx", "install", "--force", $PackageUrl)
 
 $pipxEnvironmentArguments = @($pythonSelector) + @("-m", "pipx", "environment", "--value", "PIPX_HOME")
 $pipxHome = (& $pythonLauncherPath @pipxEnvironmentArguments).Trim()

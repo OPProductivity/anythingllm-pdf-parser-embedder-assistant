@@ -101,47 +101,68 @@ The app never overwrites or deletes existing AnythingLLM workspaces and only use
 
 ### Requirements
 
-- Windows 10 or 11
-- Python 3.11–3.14
-- [pipx](https://pipx.pypa.io/)
+- Windows 10/11
 - [AnythingLLM Desktop](https://anythingllm.com/desktop) running locally when
   you use the upload mode
 - An embedding provider configured and working in AnythingLLM Desktop (install Ollama on your PC or configure OpenRouter API key inside AnythingLLM)
 
+You do **not** need Git, a cloned copy of this repository, Python, or `pipx`
+before starting the recommended installation. The installer handles the Python
+application requirements and asks before it makes a system-level change.
+
 ### Installation
 
 ## Install directly like this:
-Run the repository's Windows installer. It installs the pipx package and
-creates **Start AnythingLLM PDF Assistant** and **Stop AnythingLLM PDF
-Assistant** shortcuts on the current user's Desktop.
+The easiest installation uses one Windows PowerShell file. You only need to
+download that file; you do **not** need to download the rest of this repository
+or install Git first.
+
+1. Download [Install-AnythingLLMPdfAssistant.ps1](https://github.com/OPProductivity/anythingllm-pdf-parser-embedder-assistant/raw/refs/heads/main/Install-AnythingLLMPdfAssistant.ps1) to your **Downloads** folder.
+2. In File Explorer, right-click the downloaded file and select **Run with PowerShell**.
+3. Keep the PowerShell window open and follow its prompts. It tells you what it
+   finds and what it needs before doing anything optional.
+4. When installation finishes, use the new **Start AnythingLLM PDF Assistant**
+   shortcut on your Desktop. It starts the local app and opens it in your web
+   browser. The matching **Stop AnythingLLM PDF Assistant** shortcut stops it.
+
+The installer downloads the current public package from GitHub over HTTPS,
+installs `pipx`, and installs the application's required Python packages. If a
+supported Python version is not available, it asks before offering a per-user
+Python 3.14 installation through `winget`; it never installs Python without
+your confirmation. It does not require Git or a manually cloned repository.
+
+For PDF upload and embedding, you still need AnythingLLM Desktop and a working
+embedding provider inside it. If the installer cannot find AnythingLLM Desktop
+or Tesseract OCR, it explains what the missing component is for and asks before
+opening the official download page. It does not silently install either
+application or change your embedding provider settings.
+
+Only run the installer after reviewing the linked public source. If Windows
+blocks a downloaded PowerShell script, right-click the file, choose
+**Properties**, select **Unblock** if that option appears, click **Apply**, and
+then choose **Run with PowerShell** again. If the right-click option is not
+available, open PowerShell in the Downloads folder and run:
 
 ```powershell
-git clone https://github.com/OPProductivity/anythingllm-pdf-parser-embedder-assistant.git
-Set-Location anythingllm-pdf-parser-embedder-assistant
 .\Install-AnythingLLMPdfAssistant.ps1
 ```
 
 The installer uses the packaged Start/Stop icons and points both shortcuts at
-the installed pipx environment. It installs all Python packages declared by
-this project through pipx. If Python 3.11–3.14 is missing, it asks before
-offering a per-user Python 3.14 installation through `winget`; it never
-installs Python without that confirmation. System applications such as
-AnythingLLM Desktop, Git, and optional OCR tools remain user-managed. When the
-installer cannot detect AnythingLLM Desktop or Tesseract, it explains why the
-component is needed and asks before opening its official installation page.
+the installed pipx environment.
 To repair the shortcuts later, run:
 
 ```powershell
 anythingllm-pdf-assistant shortcuts repair
 ```
 
-Manual `pipx` installation remains supported for users who already manage
-Python and `pipx` themselves:
+### Advanced: manual pipx installation
+
+For users who already manage Python and `pipx` themselves:
 
 ```powershell
 py -m pip install --user pipx
 py -m pipx ensurepath
-pipx install git+https://github.com/OPProductivity/anythingllm-pdf-parser-embedder-assistant.git
+pipx install --force https://github.com/OPProductivity/anythingllm-pdf-parser-embedder-assistant/archive/refs/heads/main.zip
 anythingllm-pdf-assistant shortcuts repair
 ```
 
