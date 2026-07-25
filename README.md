@@ -39,6 +39,10 @@ page-local passages and can do a custom range of pages or all pages.
 
 <img width="810" height="493" alt="image" src="https://github.com/user-attachments/assets/a3a39db0-ba33-41d5-8732-4c5f87c7a14d" />
 
+No more this:
+
+<img width="1091" height="612" alt="image" src="https://github.com/user-attachments/assets/25b6d878-ff43-44a7-a888-4c19e230163d" />
+<img width="1091" height="612" alt="image" src="https://github.com/user-attachments/assets/da471587-5b57-4cc7-bcf4-ae359a839fca" />
 
 
 ## Why use it?
