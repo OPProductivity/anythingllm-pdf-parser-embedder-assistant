@@ -1,6 +1,6 @@
 # AnythingLLM PDF Parser Embedder Assistant
 
-**Localhost app that converts normal and scanned PDF files into AnythingLLM format and automatically uploads and embeds files into new AnythingLLM Desktop workspaces.
+**Localhost app that converts normal and scanned PDF files into AnythingLLM format and automatically uploads and embeds files into new AnythingLLM Desktop workspaces via easy graphical user interface**
 
 This AnythingLLM (Windows 11) assistant turns one PDF, a selected batch or folder of
 PDFs, into clean text files, and uploads them and embeds them to AnythingLLM. AnythingLLM itself does not support
