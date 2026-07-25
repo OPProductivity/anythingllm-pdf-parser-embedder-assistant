@@ -52,6 +52,7 @@ page-local passages and can do a custom range of pages or all pages.
 - Choose a segmentation strategy that fits retrieval quality and speed (one file, multiple files)
 - Prepare and upload a single PDF, several selected PDFs, or a batch folder.
 - Keep parsing and OCR locally when you do not want to upload anything.
+- Automatically upload pdf files to AnythingLLM Desktop
 - Detect extraction, OCR, embedding, workspace, and retrieval failures
 - Parse advanced PDFs using complex python scripts
 - Easy localhost user interface - no terminal required
