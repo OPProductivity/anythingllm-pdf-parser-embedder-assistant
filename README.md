@@ -1,6 +1,7 @@
-# AnythingLLM PDF Parser Embedder Assistant
+# AnythingLLM PDF Parser And Embedder
+**Single PDF files are often too big to chat with inside AnythingLLM, this Assistant is a localhost app that parses and splits your pdf file to the require max text chunk size of AnythingLLM, in custom chunk sizes, or per page, so that you can more eaily chat with your PDF files in AnythingLLM**
 
-**Localhost app that converts normal and scanned PDF files into AnythingLLM format and automatically uploads and embeds files into new AnythingLLM Desktop workspaces via easy graphical user interface**
+**The app uses a web page (localhost) that allows you to pick and select your PDF files, convert them into AnythingLLM format and upload and embed the files automatically into a new AnythingLLM Desktop workspace.**
 
 This AnythingLLM (Windows 11) assistant turns one PDF, a selected batch or folder of
 PDFs, into clean text files, and uploads them and embeds them to AnythingLLM. AnythingLLM itself does not support
@@ -95,7 +96,7 @@ flowchart LR
 - **Page – preserve automatically:** split your pdf file into smaller chunks the size of pages. If a page is too big for the embedder, the page will be split locally to fit the effective upload boundary, but will still be recognizable as that page.
 - **Shorter page-local passages:** split large pdf files up into smaller page-addressable passages that are accepted by embedders but aware of which page they belong to.
 
-The app never overwrites or deletes existing AnythingLLM workspaces and only uses newly created workspaces which you can name inside the web interface (optional). Otherwise it uses the filename of the pdf as the name of the workspace. The workspace name can later be changed inside AnythingLLM. The app detects if embeddings in a new workspace get stuck and reports what it observes, and performs checks during processing to make sure everything works reliably.
+The app never overwrites or deletes existing AnythingLLM workspaces and only uses newly created workspaces which you can name inside the web interface itself (optional). If not set, it uses the filename of the pdf as the name for the workspace. The workspace name can also later be changed inside AnythingLLM. The app detects if embeddings in a new workspace get stuck and reports what it observes, and performs checks during processing to make sure everything works reliably.
 
 ## Quick start
 
