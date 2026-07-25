@@ -1,7 +1,6 @@
 # AnythingLLM PDF Parser Embedder Assistant
 
-**Local PDF-to-text, OCR, page-aware chunking, and AnythingLLM Desktop upload
-automation for retrieval-augmented generation (RAG).**
+**Localhost app that converts normal and scanned PDF files into AnythingLLM format and automatically uploads and embeds files into new AnythingLLM Desktop workspaces.
 
 This AnythingLLM (Windows 11) assistant turns one PDF, a selected batch or folder of
 PDFs, into clean text files, and uploads them and embeds them to AnythingLLM. AnythingLLM itself does not support
