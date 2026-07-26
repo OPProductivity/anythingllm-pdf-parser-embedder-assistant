@@ -189,6 +189,29 @@ def test_private_fingerprint_is_computed_locally_not_needed_by_public_manifest(t
     assert runner.sha256_file(source) not in runner.PUBLIC_MANIFEST.read_text(encoding="utf-8")
 
 
+def test_warm_up_is_private_and_does_not_create_a_public_trial(tmp_path: Path, monkeypatch):
+    document = runner.BenchmarkDocument("B01", 1, 0.1, "low")
+    private_root = tmp_path / "private"
+    status_path = tmp_path / "results" / "benchmark-status.json"
+    monkeypatch.setattr(runner, "load_manifest", lambda: {"B01": document})
+    monkeypatch.setattr(runner, "load_private_source_map", lambda _path: {"B01": {"path": "private.pdf"}})
+    monkeypatch.setattr(runner, "queue_guard", lambda _url: {"status": "idle"})
+    monkeypatch.setattr(
+        runner,
+        "run_one",
+        lambda *_args, **_kwargs: ({"document_id": "B01"}, {"source_path": "private.pdf"}),
+    )
+
+    assert runner.main([
+        "--private-map", str(tmp_path / "map.json"), "--document-id", "B01", "--warm-up",
+        "--private-root", str(private_root), "--status-path", str(status_path),
+    ]) == 0
+
+    assert len(list((private_root / "warm-ups").glob("B01-*.json"))) == 1
+    assert not status_path.exists()
+    assert not (status_path.parent / "runs" / "B01-trial-1.json").exists()
+
+
 def test_queue_guard_blocks_non_owned_activity_without_attempting_queue_cleanup(monkeypatch):
     monkeypatch.setattr(runner.app, "anythingllm_observer_api_health", lambda _url: {"reachable": True})
     monkeypatch.setattr(runner.app, "local_workspace_choices", lambda: ([("one", "one"), ("two", "two")], ""))

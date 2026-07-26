@@ -745,6 +745,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--private-map", type=Path, required=True, help="Ignored map from B01..B08 to local sources.")
     parser.add_argument("--document-id", choices=[f"B{index:02d}" for index in range(1, 9)])
     parser.add_argument("--trial", type=int, choices=(1, 2), default=1)
+    parser.add_argument(
+        "--warm-up",
+        action="store_true",
+        help="Run one excluded readiness check; retain private evidence only and do not alter the 16-trial cohort.",
+    )
     parser.add_argument("--private-root", type=Path, default=PRIVATE_ROOT)
     parser.add_argument("--status-path", type=Path, default=Path("benchmarks/results/benchmark-status.json"))
     parser.add_argument("--rerun", action="store_true", help="Replace an existing result for the same document/trial.")
@@ -754,9 +759,30 @@ def main(argv: list[str] | None = None) -> int:
         help="Reuse for both trials so configuration drift can make the pair incomparable.",
     )
     args = parser.parse_args(argv)
+    if args.warm_up and not args.document_id:
+        parser.error("--warm-up requires exactly one --document-id")
     manifest = load_manifest()
     source_map = load_private_source_map(args.private_map)
     selected = [args.document_id] if args.document_id else sorted(manifest)
+    if args.warm_up:
+        # A provider/Desktop readiness check is operationally valuable, but it
+        # is deliberately not a benchmark trial: it may include cold-start
+        # work and must never occupy or replace one of the 16 public slots.
+        document_id = selected[0]
+        guard = queue_guard(app.DEFAULT_ANYTHINGLLM_API_URL)
+        if guard["status"] != "idle":
+            raise RuntimeError(f"Warm-up blocked: {guard['reason']}")
+        _public_result, private_result = run_one(
+            manifest[document_id], source_map[document_id], trial=args.trial,
+            private_root=args.private_root,
+        )
+        warmup_path = args.private_root / "warm-ups" / f"{document_id}-{uuid.uuid4().hex[:8]}.json"
+        write_json(warmup_path, {
+            "purpose": "excluded_desktop_provider_warm_up",
+            "document_id": document_id,
+            "private_result": private_result,
+        })
+        return 0
     public_results_dir = args.status_path.parent / "runs"
     public_results_dir.mkdir(parents=True, exist_ok=True)
     session_root = args.private_root / "sessions" / re.sub(r"[^a-zA-Z0-9_-]+", "-", args.session_id).strip("-")

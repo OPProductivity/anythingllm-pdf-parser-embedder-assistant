@@ -36,8 +36,7 @@ observation window with read-only checks. A later document-level observer uses
 the remaining portion of that window rather than starting a second full
 timeout. Queue cleanup or restart is allowed only for ledger-proven app-owned
 work; ambiguous ownership or manual activity is preserved rather than changed
-automatically. See [Current engineering state](CURRENT-ENGINEERING-STATE.md)
-for the maintained operating contract.
+automatically.
 
 ## Desktop refresh bridge
 

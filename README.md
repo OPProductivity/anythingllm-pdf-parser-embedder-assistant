@@ -227,9 +227,7 @@ then `anythingllm-pdf-assistant shortcuts repair`.
    runs, distinguish local preparation, document storage, vector observation,
    and retrieval evidence in the run report.
 
-For a detailed walkthrough, see [docs/USAGE.md](docs/USAGE.md). For the
-current engineering behavior, evidence model, recovery boundaries, and known
-limits, see [docs/CURRENT-ENGINEERING-STATE.md](docs/CURRENT-ENGINEERING-STATE.md).
+For a detailed walkthrough, see [docs/USAGE.md](docs/USAGE.md).
 
 ## Screenshots
 
