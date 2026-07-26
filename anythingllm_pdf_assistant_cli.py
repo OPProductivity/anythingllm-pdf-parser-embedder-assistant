@@ -112,6 +112,12 @@ def _shortcut_arguments(action: str) -> str:
     executable = Path(sys.executable).resolve()
     escaped_executable = str(executable).replace("'", "''")
     command = "start --browser" if action == "start" else "stop"
+    # A Stop shortcut otherwise appears to do nothing: it closes its tiny
+    # PowerShell host at exactly the moment the user needs confirmation. Keep
+    # that host minimized, but alive briefly so it is visible on the taskbar
+    # and can be restored to read the success/failure line if desired.
+    if action == "stop":
+        command = "stop; $assistantExitCode = $LASTEXITCODE; Start-Sleep -Seconds 4; exit $assistantExitCode"
     return (
         "-NoProfile -ExecutionPolicy Bypass -WindowStyle Minimized -Command "
         f"& '{escaped_executable}' -m anythingllm_pdf_assistant_cli {command}"

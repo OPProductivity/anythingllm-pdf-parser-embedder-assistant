@@ -14133,18 +14133,26 @@ class TimingAndInspectionSafetyTests(unittest.TestCase):
         self.assertEqual(record["evidence_kind"], "exact_vector_observation")
         self.assertLessEqual(record["phase_allowance"], .04)
 
-    def test_upload_protocol_gives_queue_and_vector_evidence_the_observed_time_weight(self):
+    def test_upload_protocol_uses_one_shared_ingestion_range_for_queue_and_vectors(self):
         ranges = pipeline.AUTOMATIC_UPLOAD_PHASE_RANGES
-        self.assertAlmostEqual(ranges["attachments"][1], .0985)
-        self.assertAlmostEqual(ranges["queue_receipt"][0], .0985)
-        self.assertAlmostEqual(ranges["desktop_queue"][0], .1192)
-        self.assertAlmostEqual(ranges["desktop_queue"][1], .5855)
-        self.assertAlmostEqual(ranges["identity_set"][0], .5855)
-        self.assertAlmostEqual(ranges["identity_set"][1], .8549)
-        self.assertAlmostEqual(ranges["retrieval_sample"][0], .8549)
-        self.assertAlmostEqual(ranges["validation"][0], .9275)
-        self.assertAlmostEqual(ranges["reporting"][0], .9793)
+        self.assertAlmostEqual(ranges["queue_receipt"][1], .05)
+        self.assertEqual(ranges["desktop_queue"], (.05, .95))
+        self.assertEqual(ranges["identity_set"], (.05, .95))
+        self.assertAlmostEqual(ranges["retrieval_sample"][0], .95)
+        self.assertAlmostEqual(ranges["validation"][0], .98)
+        self.assertAlmostEqual(ranges["reporting"][0], .99)
         self.assertEqual(ranges["reporting"][1], 1.0)
+
+    def test_shared_upload_progress_evidence_never_adds_overlapping_streams(self):
+        evidence = pipeline.UploadProgressEvidence(
+            queue_current=9,
+            queue_completed=8,
+            queue_total=15,
+            vectors_confirmed=8,
+            vector_total=15,
+        )
+        self.assertEqual(evidence.completed, 9)
+        self.assertEqual(evidence.total, 15)
 
     def test_polling_deadline_extension_requires_explicit_evidence_policy(self):
         from post_upload_polling import poll_post_upload

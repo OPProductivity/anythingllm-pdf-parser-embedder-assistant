@@ -88,25 +88,27 @@ PIPELINE_PROGRESS_REPORTING = 0.97
 ANYTHINGLLM_HTTP_RESPONSE_TIMEOUT_SECONDS = 180
 
 # Upload-mode progress is a user-facing evidence scale, not the old generic
-# pipeline's anonymous 0..1 values.  The eight-PDF medium-file benchmark put
-# setup plus local preparation below ten percent of elapsed time; the
-# Desktop-owned queue and exact page-parent confirmation dominated it.  Keep
-# the detailed units visible so a user can see *what* is progressing rather
-# than collapsing that evidence into one "upload" stage. The queue and vector
-# observer can overlap in wall-clock time; the allocation is a useful,
-# monotonic explanation of owned evidence, not a claim that they are serial.
+# pipeline's anonymous 0..1 values.  The medium-PDF timing runs showed that
+# local preparation takes only a few percent of wall time.  More importantly,
+# Desktop's queue and the targeted page-parent observer overlap: treating them
+# as two *consecutive* ranges double-counts the longest part of the run.  They
+# therefore share the same 5--95% ingestion range.  Their labels remain
+# distinct, but either stream can advance the one bar only by its proven x/y.
+# The Gradio owner additionally constrains this active range by its live ETA,
+# so the percentage and the displayed elapsed/remaining time cannot diverge
+# dramatically when one observer gets ahead of the other.
 AUTOMATIC_UPLOAD_PHASE_RANGES = {
-    "metadata": (0.0000, 0.0130),
-    "extraction": (0.0130, 0.0415),
-    "candidate_evaluation": (0.0415, 0.0518),
-    "payloads": (0.0518, 0.0674),
-    "attachments": (0.0674, 0.0985),
-    "queue_receipt": (0.0985, 0.1192),
-    "desktop_queue": (0.1192, 0.5855),
-    "identity_set": (0.5855, 0.8549),
-    "retrieval_sample": (0.8549, 0.9275),
-    "validation": (0.9275, 0.9793),
-    "reporting": (0.9793, 1.0000),
+    "metadata": (0.0000, 0.0060),
+    "extraction": (0.0060, 0.0270),
+    "candidate_evaluation": (0.0270, 0.0340),
+    "payloads": (0.0340, 0.0420),
+    "attachments": (0.0420, 0.0470),
+    "queue_receipt": (0.0470, 0.0500),
+    "desktop_queue": (0.0500, 0.9500),
+    "identity_set": (0.0500, 0.9500),
+    "retrieval_sample": (0.9500, 0.9800),
+    "validation": (0.9800, 0.9900),
+    "reporting": (0.9900, 1.0000),
 }
 
 
@@ -151,6 +153,39 @@ class UploadPhaseReporter:
             total_units=total_units,
             evidence_kind=evidence_kind,
         )
+
+
+@dataclass(frozen=True)
+class UploadProgressEvidence:
+    """One run-owned ingestion measurement shared by SSE and storage reads.
+
+    A page-parent file completed by Desktop and a page-parent vector observed
+    in LanceDB describe the same in-flight ingestion interval.  This compact
+    value object makes the progress policy explicit: display the furthest
+    *confirmed* completion count, never the sum of two overlapping streams.
+    """
+
+    queue_current: int = 0
+    queue_completed: int = 0
+    queue_total: int = 0
+    vectors_confirmed: int = 0
+    vector_total: int = 0
+
+    @property
+    def total(self) -> int:
+        return max(0, int(self.queue_total or 0), int(self.vector_total or 0))
+
+    @property
+    def completed(self) -> int:
+        return min(
+            self.total,
+            max(
+                0,
+                int(self.queue_current or 0),
+                int(self.queue_completed or 0),
+                int(self.vectors_confirmed or 0),
+            ),
+        ) if self.total else 0
 
 
 def emit_pipeline_timing_event(args, stage, *, event="phase_completed", elapsed_seconds=0.0, **details):
@@ -11190,6 +11225,10 @@ def update_workspace_embeddings_desktop_queue(
         "observer_last_state_monotonic": time.monotonic(),
         "observer_failures": 0,
         "observer_reason": "",
+        "first_progress_monotonic": 0.0,
+        "first_progress_position": 0,
+        "last_progress_monotonic": 0.0,
+        "last_progress_position": 0,
     }
 
     def queue_snapshot():
@@ -11197,6 +11236,20 @@ def update_workspace_embeddings_desktop_queue(
             completed = min(requested, max(0, int(queue_state["completed"])))
             current = min(requested, max(0, int(queue_state["current"])))
             last_event = float(queue_state["last_event_monotonic"] or 0.0)
+            first_progress_at = float(queue_state["first_progress_monotonic"] or 0.0)
+            last_progress_at = float(queue_state["last_progress_monotonic"] or 0.0)
+            first_progress_position = int(queue_state["first_progress_position"] or 0)
+            last_progress_position = int(queue_state["last_progress_position"] or 0)
+            records_per_second = 0.0
+            if last_progress_at > first_progress_at and last_progress_position > first_progress_position:
+                records_per_second = (last_progress_position - first_progress_position) / (
+                    last_progress_at - first_progress_at
+                )
+            queue_position = max(completed, current)
+            remaining_seconds = (
+                round(max(0, requested - queue_position) / records_per_second, 3)
+                if records_per_second > 0.0 and queue_position < requested else None
+            )
             return {
                 "desktop_queue_completed": completed,
                 "desktop_queue_current": current,
@@ -11214,6 +11267,8 @@ def update_workspace_embeddings_desktop_queue(
                 ),
                 "desktop_queue_observer_failures": max(0, int(queue_state["observer_failures"] or 0)),
                 "desktop_queue_observer_reason": str(queue_state["observer_reason"] or ""),
+                "desktop_queue_records_per_minute": round(records_per_second * 60.0, 3) if records_per_second else None,
+                "desktop_queue_estimated_remaining_seconds": remaining_seconds,
             }
 
     def queue_activity_summary():
@@ -11221,7 +11276,13 @@ def update_workspace_embeddings_desktop_queue(
         completed = int(snapshot["desktop_queue_completed"])
         current = int(snapshot["desktop_queue_current"])
         if completed:
-            return f"Desktop completed {completed}/{requested} {normalized_record_label}"
+            rate = snapshot.get("desktop_queue_records_per_minute")
+            remaining = snapshot.get("desktop_queue_estimated_remaining_seconds")
+            forecast = (
+                f" (~{float(rate):.1f}/min; ~{int(round(float(remaining)))}s queue remaining)"
+                if rate and remaining is not None else ""
+            )
+            return f"Desktop completed {completed}/{requested} {normalized_record_label}{forecast}"
         if current:
             return f"Desktop is embedding {current}/{requested} {normalized_record_label}"
         observer_state = str(snapshot.get("desktop_queue_observer_state") or "unknown")
@@ -11260,6 +11321,14 @@ def update_workspace_embeddings_desktop_queue(
             queue_state["last_event_monotonic"] = time.monotonic()
             completed = min(total, max(0, int(queue_state["completed"])))
             current = min(total, max(0, int(queue_state["current"])))
+            progress_position = max(completed, current)
+            if progress_position > int(queue_state["last_progress_position"] or 0):
+                now = time.monotonic()
+                if not queue_state["first_progress_monotonic"]:
+                    queue_state["first_progress_monotonic"] = now
+                    queue_state["first_progress_position"] = progress_position
+                queue_state["last_progress_monotonic"] = now
+                queue_state["last_progress_position"] = progress_position
         snapshot = queue_snapshot()
         if not callable(status_callback):
             return
@@ -15625,7 +15694,10 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
             total = int(batch_report.get("attachments_total") or 0)
         elif timing_event in {"queue_progress", "desktop_queue_completed"}:
             phase = "desktop_queue"
-            completed = int(batch_report.get("desktop_events_observed") or 0)
+            completed = max(
+                int(batch_report.get("desktop_queue_completed") or 0),
+                int(batch_report.get("desktop_queue_current") or batch_report.get("desktop_current_record") or 0),
+            )
             total = int(batch_report.get("queue_records") or 0)
         elif timing_event in {"submission_started", "submission_completed", "verification_started"}:
             # Receipt/acceptance is deliberately distinct from the long
@@ -15894,11 +15966,28 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
             )
             if not (owned_queue_active or recent_vector_progress):
                 return None
+            # Use the owned SSE cadence when it is available.  A fixed grace
+            # period repeatedly rewards a slow queue with arbitrary waits;
+            # this forecast says how long the remaining queue itself needs,
+            # plus a bounded settling margin for the last vectors.  The hard
+            # cap still protects a stream that keeps reconnecting forever.
+            queue_remaining_seconds = evidence.get("desktop_queue_estimated_remaining_seconds")
+            try:
+                queue_remaining_seconds = max(0.0, float(queue_remaining_seconds))
+            except (TypeError, ValueError):
+                queue_remaining_seconds = None
+            forecast_deadline = (
+                elapsed
+                + queue_remaining_seconds
+                + max(30.0, min(180.0, queue_remaining_seconds * 0.25))
+                if queue_remaining_seconds is not None else
+                elapsed + ANYTHINGLLM_EMBEDDING_RECONCILIATION_PROGRESS_GRACE_SECONDS
+            )
             extended = min(
                 ANYTHINGLLM_EMBEDDING_RECONCILIATION_ACTIVE_CAP_SECONDS,
                 max(
                     float(current_deadline),
-                    elapsed + ANYTHINGLLM_EMBEDDING_RECONCILIATION_PROGRESS_GRACE_SECONDS,
+                    forecast_deadline,
                 ),
             )
             if extended > float(current_deadline):
@@ -15906,15 +15995,25 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
                 reconciliation_tracker["effective_deadline_seconds"] = extended
                 evidence["reconciliation_deadline_extensions"] = int(reconciliation_tracker["deadline_extensions"])
                 evidence["reconciliation_effective_deadline_seconds"] = round(extended, 3)
+                evidence["reconciliation_deadline_forecast_from_queue_seconds"] = (
+                    round(float(queue_remaining_seconds), 3)
+                    if queue_remaining_seconds is not None else None
+                )
                 return extended
             return None
 
         def report_batch_observation(evidence, operator_state):
             observed = int(evidence.get("matching_vector_rows") or evidence.get("lancedb_matching_rows") or 0)
-            batch_coverage = min(1.0, observed / len(expected_batch)) if expected_batch else 0.0
             queue_current = int(evidence.get("desktop_queue_current") or 0)
             queue_completed = int(evidence.get("desktop_queue_completed") or 0)
             queue_total = int(evidence.get("queue_records") or len(expected_batch))
+            ingestion_evidence = UploadProgressEvidence(
+                queue_current=queue_current,
+                queue_completed=queue_completed,
+                queue_total=queue_total,
+                vectors_confirmed=observed,
+                vector_total=len(expected_batch),
+            )
             reconciliation_elapsed = float(evidence.get("reconciliation_elapsed_seconds") or 0.0)
             reconciliation_deadline_seconds = float(
                 evidence.get("reconciliation_effective_deadline_seconds")
@@ -15942,9 +16041,12 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
                     f"{format_vector_observation(observed, len(expected_batch), operator_state, record_label=vector_record_label)}"
                     f"{checkpoint_detail}"
                 ),
-                completed_units=observed,
-                total_units=len(expected_batch),
-                fallback_fraction=batch_coverage,
+                completed_units=ingestion_evidence.completed,
+                total_units=ingestion_evidence.total,
+                fallback_fraction=(
+                    ingestion_evidence.completed / ingestion_evidence.total
+                    if ingestion_evidence.total else 0.0
+                ),
                 desktop_required=True,
                 evidence_kind=(
                     "exact_vector_observation_completed"

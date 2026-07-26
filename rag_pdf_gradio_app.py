@@ -12228,7 +12228,7 @@ def record_timing_model_run(
 
 
 def record_timing_model_event(run_root, stage, batch_report=None):
-    """Persist batch and pipeline-stage evidence for future ETA calibration."""
+    """Persist batch evidence for ETA learning and this run's own timeline."""
     batch = batch_report or {}
     event = {
         "recorded_at": datetime.now().isoformat(timespec="seconds"),
@@ -12244,11 +12244,29 @@ def record_timing_model_event(run_root, stage, batch_report=None):
         "verification_seconds": round(float(batch.get("verification_seconds") or 0), 3),
         "batch_elapsed_seconds": round(float(batch.get("batch_elapsed_seconds") or 0), 3),
         "phase_elapsed_seconds": round(float(batch.get("phase_elapsed_seconds") or 0), 3),
+        "desktop_queue_current": int(batch.get("desktop_queue_current") or batch.get("desktop_current_record") or 0),
+        "desktop_queue_completed": int(batch.get("desktop_queue_completed") or 0),
+        "desktop_queue_total": int(batch.get("queue_records") or 0),
+        "desktop_queue_records_per_minute": batch.get("desktop_queue_records_per_minute"),
+        "desktop_queue_estimated_remaining_seconds": batch.get("desktop_queue_estimated_remaining_seconds"),
+        "desktop_queue_observer_state": str(batch.get("desktop_queue_observer_state") or ""),
         "submission_state": str(batch.get("submission_state") or ""),
         "backend": str(batch.get("backend") or ""),
         "candidate_success": bool(batch.get("candidate_success")),
     }
     _append_timing_jsonl(TIMING_MODEL_EVENTS_PATH, event)
+    # The aggregate model is useful for future estimates, but it forces an
+    # operator investigating one slow PDF to sift through unrelated runs.
+    # Keep a parallel, privacy-minimal timeline beside that run's artifacts.
+    # It contains counters and timings only—never PDF text, API keys, or SSE
+    # payload content—and a write failure must never affect the run itself.
+    try:
+        timeline_path = Path(run_root) / "timing-evidence-timeline.jsonl"
+        timeline_path.parent.mkdir(parents=True, exist_ok=True)
+        with timeline_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+    except (OSError, TypeError, ValueError) as exc:
+        APP_LOGGER.warning("could not persist run timing timeline: %s", exc)
 
 
 def refresh_automatic_run_estimate(
@@ -15075,6 +15093,21 @@ def run_automatic(
             else source_fraction
         )
         confirmed_fraction = start + (end - start) * display_fraction
+        # Desktop queue events and exact page-parent observations can arrive
+        # far ahead of the elapsed-time forecast.  They are valuable evidence,
+        # but showing (for example) 70% while the live elapsed/remaining pair
+        # says 49% makes the one overall bar misleading.  During their shared
+        # ingestion interval, constrain the display to the same total-time
+        # fraction used by the visible ETA.  This is a ceiling, not invented
+        # progress: the bar still needs an actual queue/vector event to move,
+        # and the status continues to show its exact x/y evidence.
+        if phase_name in {"desktop_queue", "identity_set"} and expected_seconds:
+            live = dict(LIVE_AUTOMATIC_RUN_STATUS or {})
+            started_epoch = float(live.get("started_epoch") or 0.0)
+            if started_epoch > 0.0:
+                elapsed_seconds = max(0.0, time.time() - started_epoch)
+                eta_calibrated_fraction = min(1.0, elapsed_seconds / max(1.0, float(expected_seconds)))
+                confirmed_fraction = min(confirmed_fraction, eta_calibrated_fraction)
         confirmed_fraction, cancellation_active = cancellation_safe_display_progress(
             run_root, confirmed_fraction
         )

@@ -9,7 +9,9 @@ import anythingllm_pdf_assistant_cli as cli
 
 def test_shortcut_arguments_start_the_packaged_module():
     assert "anythingllm_pdf_assistant_cli start --browser" in cli._shortcut_arguments("start")
-    assert "anythingllm_pdf_assistant_cli stop" in cli._shortcut_arguments("stop")
+    stop_arguments = cli._shortcut_arguments("stop")
+    assert "anythingllm_pdf_assistant_cli stop" in stop_arguments
+    assert "Start-Sleep -Seconds 4" in stop_arguments
     assert "-WindowStyle Minimized" in cli._shortcut_arguments("start")
 
 
