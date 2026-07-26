@@ -55,6 +55,7 @@ Source = "https://github.com/OPProductivity/anythingllm-pdf-parser-embedder-assi
 Issues = "https://github.com/OPProductivity/anythingllm-pdf-parser-embedder-assistant/issues"
 
 [tool.setuptools]
+packages = ["benchmarks"]
 py-modules = [
   "anythingllm_compatibility",
   "anythingllm_document_sync_findings",
@@ -77,6 +78,9 @@ py-modules = [
   "structured_logging",
   "validation_contract",
 ]
+
+[tool.setuptools.package-data]
+benchmarks = ["*.json"]
 
 [tool.setuptools.data-files]
 "share/anythingllm-pdf-assistant" = ["Install-AnythingLLMDesktopRefreshBridge.ps1", "Install-AnythingLLMPdfAssistant.ps1", "VERSION"]

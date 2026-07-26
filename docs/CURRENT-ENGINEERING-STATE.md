@@ -51,19 +51,43 @@ AnythingLLM.
 
 | Display interval | Evidence represented |
 | --- | --- |
-| 0–5% | Startup, local preparation, and submission receipt. |
-| 5–95% | Overlapping Desktop queue and exact page-parent-vector observation; use the furthest proven `x/y`, never their sum. |
-| 95–99% | Retrieval and storage validation. |
-| 99–100% | Report and output handoff. |
+| 0–0.5% | Run setup and readiness preflight (`AUTOMATIC_RUN_PREFLIGHT_DISPLAY_END`). |
+| 0.5–about 16% | Local metadata, extraction, candidate/payload/attachment preparation, then submission receipt. |
+| about 16–78% | Overlapping Desktop queue and exact page-parent-vector observation; use the furthest proven `x/y`, never their sum. |
+| about 78–98% | Retrieval, storage validation, and worker-side reporting. |
+| 97–100% | Durable run report, downloads, and terminal handoff (`AUTOMATIC_RUN_TERMINAL_DISPLAY_START`). |
+
+The decimal boundaries are the current provisional evidence allocation.
+`AUTOMATIC_UPLOAD_PHASE_RANGES` in `auto_anythingllm_pipeline.py` is the source
+of truth; the rounded descriptions above are explanatory rather than a second
+set of ranges. Do not treat timings from an earlier presentation-controller
+version as calibration evidence: a complete current-version cohort is required
+before changing these ranges.
 
 During ingestion, display progress is constrained by the same elapsed/remaining
 forecast shown in the UI. The stage line's `x/y` values are direct evidence;
 the ETA is still a forecast.
 
+The visible numeric bar is monotonic for one run: a new queue, vector, or ETA
+observation can improve the forecast but cannot move a shown checkpoint
+backwards. Queue-rate ETA repricing waits for mature owned evidence, occurs at
+most once per 30 seconds, and moves by no more than 25% per reprice. Early SSE
+events remain useful stage evidence but are not a reliable countdown rate.
+
 Each run writes a privacy-minimal `timing-evidence-timeline.jsonl` beside its
 artifacts. It contains counters, durations, rate, and observer state—never PDF
-text, keys, or absolute source paths. The central timing model records document
-filenames, page counts, and phase timings for future benchmark analysis.
+text, keys, or absolute source paths. The central timing model may record local
+document filenames, page counts, and phase timings for future benchmark
+analysis, but filename-bearing rows, source paths, fingerprints, workspace
+names, and raw timelines are private ignored application data. They are never
+approved for Git; committed benchmark material uses random document IDs and
+safe aggregates only.
+
+The benchmark invokes the real Automatic handler and privately samples the
+same one-second paced-progress value rendered by the localhost status panel.
+That sample is calibration evidence only; raw UI timelines remain ignored local
+data. A controller-version change makes prior benchmark trials stale until all
+16 serial trials have been rerun.
 
 ## Current limits and maintenance
 

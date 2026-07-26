@@ -51,6 +51,11 @@ def _emit_event(
                 json.dumps(
                     {
                         "recorded_at": time.time(),
+                        # ``time.monotonic`` is comparable across local
+                        # Windows processes for one boot.  Keep it beside the
+                        # audit-friendly wall clock so benchmark attribution
+                        # never depends on a clock adjustment.
+                        "recorded_monotonic": time.monotonic(),
                         "value": float(value),
                         "stage": str(stage),
                         "desktop_required": bool(desktop_required),
@@ -66,16 +71,27 @@ def _emit_event(
             handle.flush()
 
 
-def _emit_timing_event(path: Path, stage: str, batch_report=None) -> None:
+def _emit_timing_event(path: Path, stage: str, event=None, **details) -> None:
+    """Persist the pipeline timing payload without narrowing its schema.
+
+    The canonical pipeline emits detailed ``timing_event`` payloads.  The
+    former worker adapter accepted only a positional ``batch_report`` and
+    silently discarded keyword-rich phase evidence, leaving live runs with
+    less timing data than the Gradio production path.  Preserve every
+    JSON-safe detail so the benchmark observes the same orchestration route.
+    """
+    payload = dict(event) if isinstance(event, dict) else {}
+    payload.update(details)
     with _EVENT_WRITE_LOCK:
         with path.open("a", encoding="utf-8") as handle:
             handle.write(
                 json.dumps(
                     {
                         "recorded_at": time.time(),
+                        "recorded_monotonic": time.monotonic(),
                         "type": "timing",
                         "stage": str(stage),
-                        "batch_report": batch_report or {},
+                        "batch_report": payload,
                     },
                     ensure_ascii=False,
                     default=str,
@@ -96,8 +112,8 @@ def main(config_path: str) -> int:
     args.progress_callback = lambda value, stage, desktop_required=False, **metadata: _emit_event(
         events_path, value, stage, desktop_required=desktop_required, **metadata
     )
-    args.timing_event_callback = lambda stage, batch_report=None: _emit_timing_event(
-        events_path, stage, batch_report
+    args.timing_event_callback = lambda stage, event=None, **details: _emit_timing_event(
+        events_path, stage, event, **details
     )
     args.cancel_callback = lambda: cancel_marker.is_file()
     if cancel_marker.is_file():

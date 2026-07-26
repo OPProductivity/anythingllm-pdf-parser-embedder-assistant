@@ -111,6 +111,8 @@ def _desktop_directory() -> Path:
 def _shortcut_arguments(action: str) -> str:
     executable = Path(sys.executable).resolve()
     escaped_executable = str(executable).replace("'", "''")
+    working_directory = Path(__file__).resolve().parent
+    escaped_working_directory = str(working_directory).replace("'", "''")
     command = "start --browser" if action == "start" else "stop"
     # A Stop shortcut otherwise appears to do nothing: it closes its tiny
     # PowerShell host at exactly the moment the user needs confirmation. Keep
@@ -118,9 +120,24 @@ def _shortcut_arguments(action: str) -> str:
     # and can be restored to read the success/failure line if desired.
     if action == "stop":
         command = "stop; $assistantExitCode = $LASTEXITCODE; Start-Sleep -Seconds 4; exit $assistantExitCode"
+        command_text = f"& '{escaped_executable}' -m anythingllm_pdf_assistant_cli {command}"
+    else:
+        # Launch the long-running Python server in its own hidden process.
+        # Hiding only the short PowerShell host leaves the child python.exe
+        # console visible, which makes a desktop shortcut look stuck even
+        # though the browser app is already serving.
+        command_text = (
+            f"Start-Process -FilePath '{escaped_executable}' "
+            "-ArgumentList @('-m', 'anythingllm_pdf_assistant_cli', 'start', '--browser') "
+            f"-WorkingDirectory '{escaped_working_directory}' "
+            "-WindowStyle Hidden"
+        )
+    # ``-Command`` accepts one command string. Without these quotes, the
+    # leading invocation operator becomes the complete argument and a Python
+    # path containing spaces is split at ``C:\\Program`` by PowerShell.
     return (
-        "-NoProfile -ExecutionPolicy Bypass -WindowStyle Minimized -Command "
-        f"& '{escaped_executable}' -m anythingllm_pdf_assistant_cli {command}"
+        "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "
+        f'"{command_text}"'
     )
 
 
@@ -134,7 +151,11 @@ def _write_windows_shortcut(path: Path, arguments: str, icon_path: Path, descrip
             "ANYTHINGLLM_SHORTCUT_PATH": str(path),
             "ANYTHINGLLM_SHORTCUT_TARGET": powershell,
             "ANYTHINGLLM_SHORTCUT_ARGUMENTS": arguments,
-            "ANYTHINGLLM_SHORTCUT_WORKING_DIRECTORY": str(ensure_application_directories()["root"]),
+            # ``python -m anythingllm_pdf_assistant_cli`` must resolve the
+            # local source/package. The application data directory contains
+            # only settings and output, so using it as a shortcut working
+            # directory makes Start/Stop fail silently in a source checkout.
+            "ANYTHINGLLM_SHORTCUT_WORKING_DIRECTORY": str(Path(__file__).resolve().parent),
             "ANYTHINGLLM_SHORTCUT_DESCRIPTION": description,
             "ANYTHINGLLM_SHORTCUT_ICON": str(icon_path),
         }
@@ -213,8 +234,18 @@ def _stop() -> int:
         return 1
     environment = os.environ.copy()
     environment["ANYTHINGLLM_SERVER_PID"] = str(pid)
+    # Parenthesise the complete WMI filter expression.  Without it PowerShell
+    # can pass the string literal and ``+ $env:...`` as separate arguments,
+    # making the owned-server check falsely reject the very CLI process that
+    # wrote the marker.
     observed = subprocess.run(
-        [powershell, "-NoProfile", "-NonInteractive", "-Command", "(Get-CimInstance Win32_Process -Filter 'ProcessId = ' + $env:ANYTHINGLLM_SERVER_PID).CommandLine"],
+        [
+            powershell,
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "(Get-CimInstance Win32_Process -Filter ('ProcessId = ' + $env:ANYTHINGLLM_SERVER_PID)).CommandLine",
+        ],
         env=environment,
         capture_output=True,
         text=True,

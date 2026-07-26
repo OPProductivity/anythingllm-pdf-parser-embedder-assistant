@@ -20,12 +20,14 @@ tmp-pipx-home/
 tmp-pipx-bin/
 *.log
 
-# Historical local experiments and machine-bound helpers are retained only in
-# the private migration copy. They must never enter the portable public repo.
-benchmarks/
+# Benchmark code, schemas, and anonymised aggregate results are public.  The
+# runner's real-source map, raw event timelines, and workspace receipts are
+# machine-bound evidence and must remain local.
+benchmarks/private/
+benchmarks/results/private/
+benchmarks/results/*.jsonl
+benchmarks/results/*.private.json
 evaluate_author_inference_samples.py
-tests/test_benchmark_contract.py
-tests/test_benchmark_utilities.py
 *.ps1
 !Install-AnythingLLMDesktopRefreshBridge.ps1
 !Install-AnythingLLMPdfAssistant.ps1

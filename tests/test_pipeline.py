@@ -2980,6 +2980,38 @@ class PipelineCoreTests(unittest.TestCase):
             120,
         )
 
+    def test_owned_queue_forecast_uses_one_ingestion_interval_and_a_bounded_handoff(self):
+        import rag_pdf_gradio_app as app
+
+        # The exact-vector observer is concurrent evidence for this same
+        # queue interval, so it is not a second serial duration in the ETA.
+        self.assertEqual(app.queue_evidence_eta_seconds(20, 20), 50)
+        self.assertEqual(app.queue_evidence_eta_seconds(20, 2), 28)
+
+    def test_mature_queue_reprice_moves_the_eta_in_bounded_readable_steps(self):
+        import rag_pdf_gradio_app as app
+
+        # A first trustworthy queue rate may reveal that an optimistic opening
+        # prior was much too low. It must not replace 2 minutes with 44 in a
+        # single UI repaint.
+        self.assertEqual(app.bounded_queue_eta_reprice(120, 2_640), 150)
+        self.assertEqual(app.bounded_queue_eta_reprice(120, 20), 90)
+
+    def test_concurrent_ingestion_progress_uses_eta_floor_and_evidence_ceiling(self):
+        import rag_pdf_gradio_app as app
+
+        # An owned callback can catch a lagging display up to the live ETA,
+        # but its x/y evidence cannot become a second additive queue phase.
+        self.assertAlmostEqual(
+            app.concurrent_ingestion_progress_fraction(.20, 20, 40),
+            .20,
+        )
+        self.assertAlmostEqual(
+            app.concurrent_ingestion_progress_fraction(.90, 20, 40),
+            20 / (40 * app.PRESENTATION_ETA_CONSERVATISM) + .05,
+        )
+        self.assertEqual(app.concurrent_ingestion_progress_fraction(.90, 20, 0), .9)
+
     def test_in_run_eta_recalibration_does_not_treat_one_cold_batch_as_steady_cadence(self):
         import rag_pdf_gradio_app as app
 
@@ -3671,8 +3703,8 @@ class PipelineCoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             first = app.create_fresh_automatic_run_root(temp_dir)
             second = app.create_fresh_automatic_run_root(temp_dir)
-        self.assertTrue(first.name.startswith("app-run-"))
-        self.assertTrue(second.name.startswith("app-run-"))
+        self.assertTrue(first.name.startswith("r-"))
+        self.assertTrue(second.name.startswith("r-"))
         self.assertNotEqual(first, second)
 
     def test_fresh_selection_eta_uses_defaults_not_prior_controls(self):
@@ -13722,6 +13754,23 @@ class PipelineCoreTests(unittest.TestCase):
             "CON-pdf-parsed.txt",
         )
 
+    def test_localhost_output_paths_stay_within_windows_compatible_limit(self):
+        root = Path("C:/Users/example/AppData/Local/AnythingLLM PDF Parser Embedder Assistant/outputs/automatic-runs")
+        pdf = Path("C:/fixtures/" + "very-long-source-title-" * 16 + ".pdf")
+        document = pipeline.compatible_output_document_directory(root / "r-20260726-220947", pdf)
+        selected = document / "selected"
+        parsed = selected / pipeline.parsed_pdf_text_filename(pdf, selected)
+        segment_directory = document / "segments"
+        segment = segment_directory / pipeline.compatible_output_filename(
+            segment_directory,
+            pdf.stem,
+            "-p001-s01.txt",
+        )
+
+        self.assertLessEqual(len(str(document)), pipeline.WINDOWS_COMPATIBLE_OUTPUT_PATH_LIMIT)
+        self.assertLessEqual(len(str(parsed)), pipeline.WINDOWS_COMPATIBLE_OUTPUT_PATH_LIMIT)
+        self.assertLessEqual(len(str(segment)), pipeline.WINDOWS_COMPATIBLE_OUTPUT_PATH_LIMIT)
+
     def test_notes_and_index_endmatter_are_detected_after_body(self):
         pages = []
         for page in range(1, 21):
@@ -14097,15 +14146,15 @@ class TimingAndInspectionSafetyTests(unittest.TestCase):
     def test_upload_progress_gives_vector_indexing_half_of_document_allocation(self):
         import rag_pdf_gradio_app as app
 
-        # Compatibility callbacks use the old generic source scale, while the
-        # normal structured events use the explicit displayed phase ranges.
+        # Compatibility callbacks use the explicit approved source mapping;
+        # normal structured events already carry those phase ranges directly.
         self.assertEqual(app.reweight_automatic_upload_progress(0), 0)
-        self.assertAlmostEqual(app.reweight_automatic_upload_progress(.80), .0556)
-        self.assertAlmostEqual(app.reweight_automatic_upload_progress(.94), .5556)
-        self.assertEqual(app.reweight_automatic_upload_progress(.97), 1)
-        self.assertEqual(app.reweight_automatic_upload_progress(1), 1)
+        self.assertAlmostEqual(app.reweight_automatic_upload_progress(.80), .16)
+        self.assertAlmostEqual(app.reweight_automatic_upload_progress(.94), .78)
+        self.assertAlmostEqual(app.reweight_automatic_upload_progress(.97), .98)
+        self.assertAlmostEqual(app.reweight_automatic_upload_progress(1), .98)
         self.assertEqual(app.reweight_automatic_upload_progress(-1), 0)
-        self.assertEqual(app.reweight_automatic_upload_progress(2), 1)
+        self.assertAlmostEqual(app.reweight_automatic_upload_progress(2), .98)
 
     def test_structured_progress_keeps_x_of_y_evidence_and_uses_small_gap_estimate(self):
         import rag_pdf_gradio_app as app
@@ -14133,14 +14182,87 @@ class TimingAndInspectionSafetyTests(unittest.TestCase):
         self.assertEqual(record["evidence_kind"], "exact_vector_observation")
         self.assertLessEqual(record["phase_allowance"], .04)
 
+    def test_confirmed_retrieval_boundary_is_not_hidden_by_visual_smoothing(self):
+        import rag_pdf_gradio_app as app
+
+        original = app.LIVE_AUTOMATIC_RUN_STATUS
+        with tempfile.TemporaryDirectory() as tmpdir:
+            try:
+                app.update_live_automatic_run_status(
+                    tmpdir,
+                    state="running",
+                    phase="AnythingLLM indexing: 10/25 records confirmed",
+                    progress_phase="desktop_queue",
+                    completed_units=10,
+                    total_units=25,
+                    confirmed_fraction=.40,
+                    expected_seconds=60,
+                )
+                record = app.update_live_automatic_run_status(
+                    tmpdir,
+                    state="running",
+                    phase="Retrieval validation started",
+                    progress_phase="retrieval_sample",
+                    completed_units=0,
+                    total_units=5,
+                    confirmed_fraction=.78,
+                    expected_seconds=60,
+                )
+            finally:
+                app.LIVE_AUTOMATIC_RUN_STATUS = original
+
+        self.assertAlmostEqual(record["display_anchor_fraction"], .78)
+        self.assertAlmostEqual(record["display_target_fraction"], .78)
+
+    def test_queue_evidence_never_moves_the_visible_bar_backwards(self):
+        import rag_pdf_gradio_app as app
+
+        original = app.LIVE_AUTOMATIC_RUN_STATUS
+        try:
+            # The previous paced allowance had already reached 21%, while the
+            # next queue x/y checkpoint proved only 16.1%. Queue evidence is
+            # still valuable, but cannot render as the 21 -> 17% regression
+            # that users previously saw on large uploads.
+            app.LIVE_AUTOMATIC_RUN_STATUS = {
+                "state": "running",
+                "run_root": "C:/temp/active-run",
+                "phase": "Attaching page-parent files",
+                "progress_phase": "attachments",
+                "confirmed_fraction": .161,
+                "display_anchor_fraction": .21,
+                "display_target_fraction": .21,
+                "display_anchor_epoch": time.time(),
+                "phase_started_epoch": time.time(),
+                "phase_start_fraction": .161,
+                "phase_allowance": .04,
+                "phase_budget_seconds": 15,
+                "expected_seconds": 240,
+            }
+            record = app.update_live_automatic_run_status(
+                "C:/temp/active-run",
+                state="running",
+                phase="AnythingLLM Desktop queue: embedding 4/663 page-parent files",
+                progress_phase="desktop_queue",
+                completed_units=4,
+                total_units=663,
+                evidence_kind="doc_starting",
+                expected_seconds=2_640,
+                confirmed_fraction=.161,
+            )
+        finally:
+            app.LIVE_AUTOMATIC_RUN_STATUS = original
+
+        self.assertGreaterEqual(record["display_anchor_fraction"], .21)
+        self.assertGreaterEqual(record["display_target_fraction"], .21)
+
     def test_upload_protocol_uses_one_shared_ingestion_range_for_queue_and_vectors(self):
         ranges = pipeline.AUTOMATIC_UPLOAD_PHASE_RANGES
-        self.assertAlmostEqual(ranges["queue_receipt"][1], .05)
-        self.assertEqual(ranges["desktop_queue"], (.05, .95))
-        self.assertEqual(ranges["identity_set"], (.05, .95))
-        self.assertAlmostEqual(ranges["retrieval_sample"][0], .95)
-        self.assertAlmostEqual(ranges["validation"][0], .98)
-        self.assertAlmostEqual(ranges["reporting"][0], .99)
+        self.assertAlmostEqual(ranges["queue_receipt"][1], .16)
+        self.assertEqual(ranges["desktop_queue"], (.16, .78))
+        self.assertEqual(ranges["identity_set"], (.16, .78))
+        self.assertAlmostEqual(ranges["retrieval_sample"][0], .78)
+        self.assertAlmostEqual(ranges["validation"][0], .94)
+        self.assertAlmostEqual(ranges["reporting"][0], .98)
         self.assertEqual(ranges["reporting"][1], 1.0)
 
     def test_shared_upload_progress_evidence_never_adds_overlapping_streams(self):

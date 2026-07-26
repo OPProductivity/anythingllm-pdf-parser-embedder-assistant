@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "benchmark_set_id": "medium-low-ocr-v1",
+  "profile": "ordinary-page-preserving-upload",
+  "documents": [
+    {"document_id": "B01", "page_count": 25, "size_mib": 0.41, "ocr_risk": "low"},
+    {"document_id": "B02", "page_count": 17, "size_mib": 0.13, "ocr_risk": "low"},
+    {"document_id": "B03", "page_count": 17, "size_mib": 1.31, "ocr_risk": "low"},
+    {"document_id": "B04", "page_count": 31, "size_mib": 0.32, "ocr_risk": "low"},
+    {"document_id": "B05", "page_count": 25, "size_mib": 0.20, "ocr_risk": "low"},
+    {"document_id": "B06", "page_count": 16, "size_mib": 1.68, "ocr_risk": "low"},
+    {"document_id": "B07", "page_count": 15, "size_mib": 0.34, "ocr_risk": "low"},
+    {"document_id": "B08", "page_count": 16, "size_mib": 0.12, "ocr_risk": "low"}
+  ]
+}

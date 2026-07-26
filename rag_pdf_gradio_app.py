@@ -69,6 +69,7 @@ from auto_anythingllm_pipeline import (
     anythingllm_resolved_state,
     build_ollama_simulation_adapter,
     build_openrouter_simulation_adapter,
+    compatible_output_document_directory,
     create_validation_workspace,
     confirmed_submission_locations_from_ledger,
     create_temporary_desktop_api_key,
@@ -333,11 +334,11 @@ AUTOMATIC_RUN_DOCUMENT_DISPLAY_SPAN = (
 # allocation. Structured events carry the authoritative phase mapping; this
 # legacy route exists only so old callbacks cannot jump ahead of it.
 AUTOMATIC_UPLOAD_PREPARATION_SOURCE_END = 0.80
-AUTOMATIC_UPLOAD_PREPARATION_DISPLAY_END = 0.0985
+AUTOMATIC_UPLOAD_PREPARATION_DISPLAY_END = 0.1600
 AUTOMATIC_UPLOAD_VECTOR_SOURCE_END = 0.94
-AUTOMATIC_UPLOAD_VECTOR_DISPLAY_END = 0.8549
+AUTOMATIC_UPLOAD_VECTOR_DISPLAY_END = 0.7800
 AUTOMATIC_UPLOAD_VALIDATION_SOURCE_END = 0.97
-AUTOMATIC_UPLOAD_VALIDATION_DISPLAY_END = 0.9793
+AUTOMATIC_UPLOAD_VALIDATION_DISPLAY_END = 0.9800
 
 
 def reweight_automatic_upload_progress(value):
@@ -5507,13 +5508,30 @@ def refresh_automatic_run_estimate_for_fresh_selection(pdf_files=None, folder_pd
     )
 
 
+AUTOMATIC_RUN_FOLDER_PATTERNS = ("r-*", "app-run-*")
+
+
+def automatic_run_artifact_paths(root, relative_pattern):
+    """Find current short run folders and pre-limit historical run folders."""
+    base = Path(root)
+    return [
+        path
+        for folder_pattern in AUTOMATIC_RUN_FOLDER_PATTERNS
+        for path in base.glob(f"{folder_pattern}/{relative_pattern}")
+    ]
+
+
 def create_fresh_automatic_run_root(output_root_base):
     """Atomically reserve a new output folder, even for same-second retries."""
     base = Path(output_root_base)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     for suffix in range(1, 1000):
-        label = f"app-run-{stamp}" if suffix == 1 else f"app-run-{stamp}-{suffix}"
+        label = f"r-{stamp}" if suffix == 1 else f"r-{stamp}-{suffix}"
         candidate = base / label
+        if len(str(candidate)) > 250:
+            raise OSError(
+                "Output root is too long for Windows-compatible app-run artifacts; choose a shorter folder."
+            )
         try:
             candidate.mkdir(parents=True, exist_ok=False)
             return candidate
@@ -5522,14 +5540,26 @@ def create_fresh_automatic_run_root(output_root_base):
     raise OSError("Could not reserve a fresh automatic run folder after 999 attempts.")
 
 
-def flat_no_logs_output_folder_name(pdf_path, source_sha=""):
+def flat_no_logs_output_folder_name(pdf_path, source_sha="", parent=None):
     """Name one user-visible flat export without a date/time run container."""
     pdf = Path(pdf_path)
     stem = safe_stem(pdf.stem) or "document"
     digest = str(source_sha or "").strip().lower()
     if not digest:
         digest = sha256_file(pdf)
-    return f"parsed-pdf-{stem[:72].rstrip('-._ ')}-{digest[:12]}"
+    preferred = f"parsed-pdf-{stem}-{digest[:12]}"
+    if parent is None:
+        return preferred[:72].rstrip("-._ ")
+    available = 250 - len(str(Path(parent))) - 1
+    if available < 16:
+        raise OSError("Output root is too long for a Windows-compatible flat export folder.")
+    if len(preferred) <= available:
+        return preferred
+    # Keep a visible source prefix and the source-content suffix so reruns
+    # remain distinguishable without relying on long Windows paths.
+    suffix = f"-{digest[:12]}"
+    prefix_length = max(1, min(48, available - len("parsed-pdf-") - len(suffix)))
+    return f"parsed-pdf-{stem[:prefix_length].rstrip('-._ ')}{suffix}"
 
 
 def promote_flat_no_logs_output(output_root, temporary_output_dir, pdf_path, summary):
@@ -5543,7 +5573,11 @@ def promote_flat_no_logs_output(output_root, temporary_output_dir, pdf_path, sum
     source = Path(temporary_output_dir)
     if not source.is_dir():
         raise FileNotFoundError(f"No-logs export directory is missing: {source}")
-    name = flat_no_logs_output_folder_name(pdf_path, (summary or {}).get("source_sha256"))
+    name = flat_no_logs_output_folder_name(
+        pdf_path,
+        (summary or {}).get("source_sha256"),
+        parent=base,
+    )
     target = base / name
     for suffix in range(2, 1000):
         if not target.exists():
@@ -5647,7 +5681,7 @@ def ingestion_history_html(workspace_slug="", limit=12):
 
 def latest_resume_manifest(workspace_slug):
     slug = (workspace_slug or "").strip()
-    candidates = sorted(AUTO_OUTPUT_DIR.glob("app-run-*/**/resume-embedding-manifest.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+    candidates = sorted(automatic_run_artifact_paths(AUTO_OUTPUT_DIR, "**/resume-embedding-manifest.json"), key=lambda path: path.stat().st_mtime, reverse=True)
     for path in candidates:
         try:
             manifest = json.loads(path.read_text(encoding="utf-8"))
@@ -7093,7 +7127,7 @@ def retained_run_diagnostics_update(run_directory):
 def latest_automatic_pdf_output_directory():
     """Find the newest completed per-PDF output below the default Automatic root."""
     candidates = sorted(
-        AUTO_OUTPUT_DIR.glob("app-run-*/*/run-summary.json"),
+        automatic_run_artifact_paths(AUTO_OUTPUT_DIR, "*/run-summary.json"),
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
@@ -7106,7 +7140,7 @@ def latest_advanced_diagnostics_output_directory(output_root_override=""):
         str(output_root_override or "").strip() or str(ADVANCED_DIAGNOSTICS_OUTPUT_DIR)
     )
     candidates = sorted(
-        root.glob("app-run-*/*/run-summary.json"),
+        automatic_run_artifact_paths(root, "*/run-summary.json"),
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
@@ -8286,7 +8320,7 @@ def run_advanced_diagnostics(
             str(output_root_override or "").strip() or str(ADVANCED_DIAGNOSTICS_OUTPUT_DIR)
         )
         run_root = create_fresh_automatic_run_root(output_root)
-        output_dir = run_root / safe_stem(pdf_path.stem)
+        output_dir = compatible_output_document_directory(run_root, pdf_path)
     except OSError as exc:
         raise gr.Error(f"Could not create the Advanced diagnostic output folder: {exc}") from exc
 
@@ -8731,10 +8765,42 @@ def format_estimate_clock(seconds, *, signed=False):
 # The status worker can receive several real stage callbacks in rapid
 # succession. Presenting each raw jump makes the bar look like a stopwatch
 # rather than an estimate. Limit displayed catch-up to four whole percentage
-# points per second, while retaining a larger (12-point) escape hatch for a
-# genuinely bad prior extrapolation.
+# points per second.  A later observation may make an ETA less certain, but it
+# can never revoke work the interface has already shown as complete.
 VISIBLE_PROGRESS_SPEED_PER_SECOND = 0.04
-VISIBLE_PROGRESS_SIGNIFICANT_CORRECTION = 0.12
+# A queue-rate reprice is based on the observed queue interval and does not
+# yet include the confirmation and handoff tail.  Keep this measured safety
+# margin before using that optimistic forecast to pull a real x/y checkpoint
+# forward.  It changes only bar presentation; the visible ETA is unchanged.
+PRESENTATION_ETA_CONSERVATISM = 1.20
+# A few early Desktop queue events are dominated by worker start-up and SSE
+# delivery timing.  They are evidence of activity, not yet a dependable rate.
+# Do not turn them into a multi-minute visible ETA revision.
+QUEUE_ETA_MIN_COMPLETED_RECORDS = 12
+QUEUE_ETA_MIN_EVENT_SAMPLES = 12
+QUEUE_ETA_REPRICE_INTERVAL_SECONDS = 30.0
+QUEUE_ETA_MAX_CHANGE_RATIO = 0.25
+
+
+def concurrent_ingestion_progress_fraction(evidence_fraction, elapsed_seconds, expected_seconds):
+    """Combine owned queue/vector evidence with the current elapsed/ETA pair.
+
+    This is used only when a real ingestion callback arrives.  The ETA caps
+    evidence that would otherwise outrun its forecast, but never supplies
+    progress by itself: a stalled queue must hold at its last owned x/y
+    checkpoint. Queue and exact-vector observations therefore remain one
+    concurrent interval rather than two additive phases.
+    """
+    evidence = min(.95, max(0.0, float(evidence_fraction or 0.0)))
+    expected = max(0.0, float(expected_seconds or 0.0))
+    if expected <= 0.0:
+        return evidence
+    presentation_expected = expected * PRESENTATION_ETA_CONSERVATISM
+    elapsed_share = min(
+        .95,
+        max(0.0, float(elapsed_seconds or 0.0) / presentation_expected),
+    )
+    return min(.95, min(evidence, elapsed_share + .05))
 def raw_paced_progress_fraction(record, now=None):
     """Return the evidence-plus-time target before display smoothing."""
     now = time.time() if now is None else float(now)
@@ -8803,6 +8869,7 @@ def update_live_automatic_run_status(
     completed_units=None,
     total_units=None,
     evidence_kind=None,
+    eta_reprice_reason=None,
 ):
     """Persist progress evidence plus a deliberately capped time-based estimate.
 
@@ -8905,6 +8972,10 @@ def update_live_automatic_run_status(
         "completed_units": completed_units if completed_units is not None else previous.get("completed_units"),
         "total_units": total_units if total_units is not None else previous.get("total_units"),
         "evidence_kind": str(evidence_kind or previous.get("evidence_kind") or ""),
+        # A calibration exception is allowed only immediately after this
+        # explicit, evidence-backed ETA reprice.  Persist the reason so a
+        # later benchmark can distinguish it from an ordinary status repaint.
+        "eta_reprice_reason": str(eta_reprice_reason or ""),
         "details": str(details or ""),
         "cancel_available": bool(cancel_available),
         "cancel_requested": bool(cancel_requested),
@@ -8949,17 +9020,41 @@ def update_live_automatic_run_status(
     # model is adjusted only from completed, measured runs and batch timings.
     record["eta_acceleration_seconds"] = 0.0
     raw_target = raw_paced_progress_fraction(record, now)
-    if previous:
-        previous_visible = paced_progress_fraction(previous, now)
-        # Do not walk backwards for routine noise (for example, a batch phase
-        # reporting 76.5% immediately after a 79% estimate). A correction is
-        # reserved for a materially wrong forecast, not small re-estimation.
-        if raw_target + VISIBLE_PROGRESS_SIGNIFICANT_CORRECTION < previous_visible:
-            display_anchor = raw_target
-            display_target = raw_target
-        else:
-            display_anchor = previous_visible
-            display_target = max(previous_visible, raw_target)
+    evidence_checkpoint = (
+        incoming_progress_phase in {
+            "desktop_queue",
+            "identity_set",
+            # Retrieval/validation are discrete, confirmed stage boundaries.
+            # Holding them behind interpolation can make a real 78--94%
+            # transition invisible until terminal completion, which both
+            # understates the run and leaves no observable 80% checkpoint.
+            "retrieval_sample",
+            "validation",
+        }
+        and completed_units is not None
+        and total_units is not None
+        and not cancellation_freezes_progress
+    )
+    previous_visible = paced_progress_fraction(previous, now) if previous else 0.0
+    visible_floor = max(
+        0.0,
+        float(previous.get("display_anchor_fraction") or 0.0) if previous else 0.0,
+        previous_visible,
+    )
+    if evidence_checkpoint:
+        # A queue/vector x/y callback or a confirmed retrieval/validation
+        # boundary has already been reconciled by ``report_automatic_progress``.
+        # Do not make that proven checkpoint wait behind visual smoothing, but
+        # never move the visible bar backwards when a prior paced checkpoint
+        # was ahead of the next x/y observation.
+        display_anchor = max(visible_floor, raw_target)
+        display_target = display_anchor
+    elif previous:
+        # A new ETA can slow or speed the future clock, never turn a completed
+        # UI checkpoint into negative progress.  The underlying trace retains
+        # the raw ETA/evidence relationship for calibration analysis.
+        display_anchor = visible_floor
+        display_target = max(visible_floor, raw_target)
     else:
         display_anchor = raw_target
         display_target = raw_target
@@ -8992,6 +9087,7 @@ def update_live_automatic_run_status(
                 "completed_units": record.get("completed_units"),
                 "total_units": record.get("total_units"),
                 "evidence_kind": record.get("evidence_kind", ""),
+                "eta_reprice_reason": record.get("eta_reprice_reason", ""),
                 "details": record["details"],
                 "confirmed_percent": round(float(record["confirmed_fraction"]) * 100.0, 3),
                 "visible_progress_percent": paced_progress_percent(record, now),
@@ -9346,7 +9442,7 @@ def active_automatic_run_root():
     if live_root:
         return Path(live_root)
     candidates = sorted(
-        AUTO_OUTPUT_DIR.glob("app-run-*/run-progress.json"),
+        automatic_run_artifact_paths(AUTO_OUTPUT_DIR, "run-progress.json"),
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
@@ -9411,7 +9507,7 @@ def _recovery_ledger_groups(run_root):
 def _is_most_recent_recovery_run(run_root):
     root = Path(run_root)
     candidates = sorted(
-        AUTO_OUTPUT_DIR.glob("app-run-*/**/resume-embedding-manifest.json"),
+        automatic_run_artifact_paths(AUTO_OUTPUT_DIR, "**/resume-embedding-manifest.json"),
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
@@ -11614,6 +11710,38 @@ def evidence_paced_eta_seconds(current_expected, elapsed_seconds, confirmed_frac
     return int(math.ceil(candidate))
 
 
+def queue_evidence_eta_seconds(elapsed_seconds, queue_remaining_seconds):
+    """Forecast completion from the owned Desktop queue without double-counting vectors.
+
+    The queue observer and exact-vector observer describe one concurrent
+    ingestion interval.  A live owned queue rate is therefore stronger than a
+    preflight prior once it has an estimated remaining duration.  Reserve only
+    a bounded tail for exact-vector/retrieval handoff; it is not added as a
+    second queue phase.
+    """
+    elapsed = max(0.0, float(elapsed_seconds or 0.0))
+    remaining = max(0.0, float(queue_remaining_seconds or 0.0))
+    handoff_tail = min(20.0, max(5.0, remaining * 0.5))
+    return int(math.ceil(max(elapsed + 8.0, elapsed + remaining + handoff_tail)))
+
+
+def bounded_queue_eta_reprice(current_expected, queue_forecast):
+    """Take one readable ETA step toward mature owned-queue evidence.
+
+    The forecast can be much more accurate than the opening prior, but a
+    single update must not replace (say) two minutes with forty-four.  The
+    next mature observation may take another bounded step.  This makes the
+    countdown stable while preserving the full raw rate in timing evidence.
+    """
+    current = max(0.0, float(current_expected or 0.0))
+    forecast = max(0.0, float(queue_forecast or 0.0))
+    if current <= 0.0:
+        return int(math.ceil(forecast))
+    lower = current * (1.0 - QUEUE_ETA_MAX_CHANGE_RATIO)
+    upper = current * (1.0 + QUEUE_ETA_MAX_CHANGE_RATIO)
+    return int(math.ceil(min(upper, max(lower, forecast))))
+
+
 def timing_model_similarity(features, historical):
     score = 0.0
     for key, weight in (("timing_formula_lane", 7), ("mode", 5), ("segment_mode", 4), ("page_preserve_text_lane", 3), ("native_upload_scope", 3), ("native_upload_transport", 2), ("native_upload_representation", 3), ("chunk_size", 3), ("chunk_overlap", 2), ("effective_segment_target", 3), ("target_passage_length", 1), ("backend_mode", 1), ("unstructured_strategy", 2), ("embedding_engine", 3), ("embedding_model", 4), ("text_density_bucket", 2), ("layout_bucket", 2), ("ocr_risk_bucket", 2), ("line_density_bucket", 1), ("page_variability_bucket", 1), ("file_size_bucket", 1)):
@@ -11706,7 +11834,7 @@ def ensure_timing_model_backfill():
     """Seed the central model from existing app run summaries exactly once."""
     existing = {str(row.get("run_key") or "") for row in _read_timing_jsonl(TIMING_MODEL_RUNS_PATH, limit=1000)}
     seeded = 0
-    for summary_path in sorted(AUTO_OUTPUT_DIR.glob("app-run-*/*/run-summary.json"), key=lambda path: path.stat().st_mtime)[-100:]:
+    for summary_path in sorted(automatic_run_artifact_paths(AUTO_OUTPUT_DIR, "*/run-summary.json"), key=lambda path: path.stat().st_mtime)[-100:]:
         run_key = str(summary_path.parent.parent)
         if run_key in existing:
             continue
@@ -14665,7 +14793,10 @@ def run_automatic(
                 run_timing_estimate.get("comparable_runs")
                 if estimate_comparable_runs is None else estimate_comparable_runs
             ),
-            confirmed_fraction=0.04,
+            # Creating the local run folder is only readiness work.  Reserve
+            # the first 0.5% for it; actual PDF evidence owns the rest of the
+            # early preparation range.
+            confirmed_fraction=AUTOMATIC_RUN_PREFLIGHT_DISPLAY_END,
         )
         if ocr_preflight_manifest:
             (run_root / "ocr-preflight-manifest.json").write_text(
@@ -14792,7 +14923,7 @@ def run_automatic(
                 phase=live_phase,
                 expected_seconds=expected_seconds,
                 details=details,
-                confirmed_fraction=0.04,
+                confirmed_fraction=AUTOMATIC_RUN_PREFLIGHT_DISPLAY_END,
                 cancel_available=False,
             )
 
@@ -14819,7 +14950,7 @@ def run_automatic(
                 phase=startup_phase,
                 expected_seconds=expected_seconds,
                 details=startup_detail,
-                confirmed_fraction=0.04,
+                confirmed_fraction=AUTOMATIC_RUN_PREFLIGHT_DISPLAY_END,
             )
     if prepare_and_upload:
         if not readiness_report.get("runtime_api_reachable"):
@@ -15109,21 +15240,20 @@ def run_automatic(
             else source_fraction
         )
         confirmed_fraction = start + (end - start) * display_fraction
-        # Desktop queue events and exact page-parent observations can arrive
-        # far ahead of the elapsed-time forecast.  They are valuable evidence,
-        # but showing (for example) 70% while the live elapsed/remaining pair
-        # says 49% makes the one overall bar misleading.  During their shared
-        # ingestion interval, constrain the display to the same total-time
-        # fraction used by the visible ETA.  This is a ceiling, not invented
-        # progress: the bar still needs an actual queue/vector event to move,
-        # and the status continues to show its exact x/y evidence.
+        # Desktop queue and exact page-parent observations are concurrent
+        # evidence for the same ingestion interval. A callback may therefore
+        # bring a lagging bar up to the current elapsed/remaining share, but
+        # it cannot take x/y evidence more than five points above that share.
+        # This happens only on a real owned callback, never as an unattended
+        # timer fill during a stalled queue.
         if phase_name in {"desktop_queue", "identity_set"} and expected_seconds:
             live = dict(LIVE_AUTOMATIC_RUN_STATUS or {})
             started_epoch = float(live.get("started_epoch") or 0.0)
             if started_epoch > 0.0:
                 elapsed_seconds = max(0.0, time.time() - started_epoch)
-                eta_calibrated_fraction = min(1.0, elapsed_seconds / max(1.0, float(expected_seconds)))
-                confirmed_fraction = min(confirmed_fraction, eta_calibrated_fraction)
+                confirmed_fraction = concurrent_ingestion_progress_fraction(
+                    confirmed_fraction, elapsed_seconds, expected_seconds
+                )
         confirmed_fraction, cancellation_active = cancellation_safe_display_progress(
             run_root, confirmed_fraction
         )
@@ -15154,6 +15284,7 @@ def run_automatic(
     completed_batch_seconds = []
     last_eta_recalibration_batch = 0
     completed_batches_across_run = 0
+    last_queue_eta_recalibration_elapsed = -float("inf")
     active_file_index = 0
     planned_batch_adjustments = {}
     initial_expected_seconds = expected_seconds
@@ -15169,7 +15300,7 @@ def run_automatic(
         The callback is observational: it neither retries AnythingLLM nor
         changes the pipeline's completion decision.
         """
-        nonlocal expected_seconds, last_eta_recalibration_batch, completed_batches_across_run
+        nonlocal expected_seconds, last_eta_recalibration_batch, completed_batches_across_run, last_queue_eta_recalibration_elapsed
         # The worker can flush an event after the browser has already received
         # a durable cancel acknowledgement. Do not let that late observation
         # revise the ETA, status, or progress checkpoint.
@@ -15178,6 +15309,85 @@ def run_automatic(
         record_timing_model_event(run_root, stage, batch_report)
         report = batch_report or {}
         live = dict(LIVE_AUTOMATIC_RUN_STATUS or {})
+        try:
+            queue_rate = float(report.get("desktop_queue_records_per_minute") or 0.0)
+        except (TypeError, ValueError):
+            queue_rate = 0.0
+        queue_remaining = report.get("desktop_queue_estimated_remaining_seconds")
+        try:
+            queue_completed = max(
+                0,
+                int(report.get("desktop_queue_completed") or 0),
+                int(report.get("desktop_queue_current") or report.get("desktop_current_record") or 0) - 1,
+            )
+        except (TypeError, ValueError):
+            queue_completed = 0
+        try:
+            queue_total = max(0, int(report.get("queue_records") or 0))
+        except (TypeError, ValueError):
+            queue_total = 0
+        try:
+            queue_event_samples = max(0, int(report.get("desktop_queue_events_observed") or 0))
+        except (TypeError, ValueError):
+            queue_event_samples = 0
+        # Require a material part of a long queue, while still allowing a
+        # small document to learn after at least three completed records.
+        required_queue_samples = min(
+            QUEUE_ETA_MIN_COMPLETED_RECORDS,
+            max(3, int(math.ceil(queue_total * .02))) if queue_total else QUEUE_ETA_MIN_COMPLETED_RECORDS,
+        )
+        queue_rate_is_mature = (
+            queue_completed >= required_queue_samples
+            and queue_event_samples >= min(QUEUE_ETA_MIN_EVENT_SAMPLES, required_queue_samples)
+        )
+        if (
+            live.get("run_root") == str(run_root)
+            and queue_rate > 0.0
+            and queue_remaining is not None
+            and queue_rate_is_mature
+        ):
+            try:
+                remaining_seconds = max(0.0, float(queue_remaining))
+            except (TypeError, ValueError):
+                remaining_seconds = None
+            elapsed = time.time() - float(live.get("started_epoch") or time.time())
+            # Reprice from owned queue evidence at a bounded cadence.  The
+            # raw observer may emit several records for one queue position;
+            # a mature sample is still repriced only every 30 seconds so the
+            # visible countdown cannot bounce between noisy rate estimates.
+            if (
+                remaining_seconds is not None
+                and elapsed - last_queue_eta_recalibration_elapsed >= QUEUE_ETA_REPRICE_INTERVAL_SECONDS
+            ):
+                raw_queue_forecast = queue_evidence_eta_seconds(elapsed, remaining_seconds)
+                queue_forecast = bounded_queue_eta_reprice(
+                    expected_seconds, raw_queue_forecast,
+                )
+                if abs(queue_forecast - expected_seconds) >= 5:
+                    expected_seconds = queue_forecast
+                    run_timing_estimate["expected_seconds"] = expected_seconds
+                    run_timing_estimate.setdefault("queue_rate_recalibrations", []).append({
+                        "elapsed_seconds": round(elapsed, 3),
+                        "queue_completed": queue_completed,
+                        "queue_total": queue_total,
+                        "queue_event_samples": queue_event_samples,
+                        "queue_records_per_minute": round(queue_rate, 3),
+                        "queue_remaining_seconds": round(remaining_seconds, 3),
+                        "raw_forecast_seconds": raw_queue_forecast,
+                        "expected_seconds": expected_seconds,
+                    })
+                    update_live_automatic_run_status(
+                        run_root,
+                        state="running",
+                        phase=live.get("phase") or str(stage or "Working"),
+                        expected_seconds=expected_seconds,
+                        details=live.get("details") or "",
+                        confirmed_fraction=live.get("confirmed_fraction"),
+                        cancel_available=live.get("cancel_available", True),
+                        cancel_requested=live.get("cancel_requested", False),
+                        eta_reprice_reason="owned_queue_rate",
+                    )
+                last_queue_eta_recalibration_elapsed = elapsed
         if str(report.get("timing_event") or "") == "exact_segment_plan_ready":
             exact_records = max(0, int(report.get("exact_records") or 0))
             exact_batches = max(0, int(report.get("exact_batches") or 0))
@@ -15229,6 +15439,7 @@ def run_automatic(
                     confirmed_fraction=live.get("confirmed_fraction"),
                     cancel_available=live.get("cancel_available", True),
                     cancel_requested=live.get("cancel_requested", False),
+                    eta_reprice_reason="exact_segment_count",
                 )
         if str(report.get("timing_event") or "") == "phase_completed":
             phase_elapsed = float(report.get("phase_elapsed_seconds") or 0.0)
@@ -15259,6 +15470,7 @@ def run_automatic(
                         confirmed_fraction=live.get("confirmed_fraction"),
                         cancel_available=live.get("cancel_available", True),
                         cancel_requested=live.get("cancel_requested", False),
+                        eta_reprice_reason="completed_phase_timing",
                     )
         if str(report.get("timing_event") or "") != "batch_completed":
             return
@@ -15326,6 +15538,7 @@ def run_automatic(
             confirmed_fraction=live.get("confirmed_fraction"),
             cancel_available=live.get("cancel_available", True),
             cancel_requested=live.get("cancel_requested", False),
+            eta_reprice_reason="batch_cadence",
         )
 
     preflight_by_path = {
@@ -15439,7 +15652,7 @@ def run_automatic(
             temporary_validation_cleanup_policy="cleanup_always",
             cancel_callback=lambda root=run_root: automatic_run_cancellation_requested(root),
         )
-        out_dir = run_root / safe_stem(pdf_path.stem)
+        out_dir = compatible_output_document_directory(run_root, pdf_path)
         try:
             worker_result = execute_automatic_preparation_in_worker(
                 pdf_path,
@@ -16335,7 +16548,7 @@ def run_edge_case_tests(
             anythingllm_storage_dir="",
             external_preflight_managed=True,
         )
-        out_dir = run_root / safe_stem(pdf_path.stem)
+        out_dir = compatible_output_document_directory(run_root, pdf_path)
         try:
             controlled_run = execute_preparation(pdf_path, out_dir, args, prepare_pdf)
             if controlled_run.status != "pass":

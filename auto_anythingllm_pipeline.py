@@ -86,29 +86,93 @@ PIPELINE_PROGRESS_EMBEDDING_END = 0.94
 PIPELINE_PROGRESS_POST_UPLOAD_OBSERVATION = 0.95
 PIPELINE_PROGRESS_REPORTING = 0.97
 ANYTHINGLLM_HTTP_RESPONSE_TIMEOUT_SECONDS = 180
+# Keep app-created output paths below the legacy Windows/MAX_PATH boundary.
+# Windows itself may support longer paths, but common local tools (including
+# Notepad++) still fail to open a 348-character generated transcript.
+WINDOWS_COMPATIBLE_OUTPUT_PATH_LIMIT = 250
+LOCAL_OUTPUT_DOCUMENT_NAME_LIMIT = 48
+
+
+def _bounded_output_component(value, maximum, *, fallback="document", identity=""):
+    """Return a readable Windows-safe name with a stable collision suffix."""
+    clean = safe_stem(str(value or "")).rstrip("-._ ") or fallback
+    maximum = max(len(fallback), int(maximum or 0))
+    if len(clean) <= maximum:
+        return clean
+    digest = hashlib.sha256(str(identity or clean).encode("utf-8")).hexdigest()[:10]
+    prefix_length = max(1, maximum - len(digest) - 1)
+    return f"{clean[:prefix_length].rstrip('-._ ') or fallback[:prefix_length]}-{digest}"
+
+
+def compatible_output_document_directory(output_root, pdf_path, *, reserve_relative_characters=82):
+    """Choose an app/CLI document folder that leaves room for every artifact."""
+    root = Path(output_root)
+    available = WINDOWS_COMPATIBLE_OUTPUT_PATH_LIMIT - len(str(root)) - 1 - int(reserve_relative_characters)
+    if available < 16:
+        raise OSError(
+            f"Output root is too long for Windows-compatible artifacts ({len(str(root))} characters; "
+            f"limit {WINDOWS_COMPATIBLE_OUTPUT_PATH_LIMIT}). Choose a shorter output folder."
+        )
+    pdf = Path(pdf_path)
+    identity = str(pdf)
+    try:
+        identity = sha256_file(pdf)
+    except OSError:
+        # The caller will report the original I/O problem later; retain a
+        # deterministic name in the meantime rather than hiding it here.
+        pass
+    component = _bounded_output_component(
+        pdf.stem,
+        min(LOCAL_OUTPUT_DOCUMENT_NAME_LIMIT, available),
+        identity=identity,
+    )
+    candidate = root / component
+    if len(str(candidate)) + int(reserve_relative_characters) > WINDOWS_COMPATIBLE_OUTPUT_PATH_LIMIT:
+        raise OSError("Could not allocate a Windows-compatible document output folder.")
+    return candidate
+
+
+def compatible_output_filename(parent, preferred_stem, suffix, *, fallback="artifact"):
+    """Bound one generated filename so its absolute path stays <= 250 chars."""
+    directory = Path(parent)
+    suffix = str(suffix or "")
+    available = WINDOWS_COMPATIBLE_OUTPUT_PATH_LIMIT - len(str(directory)) - 1 - len(suffix)
+    if available < 1:
+        raise OSError(f"Output directory is too long for Windows-compatible files: {directory}")
+    stem = _bounded_output_component(
+        preferred_stem,
+        available,
+        fallback=fallback,
+        identity=f"{directory}|{preferred_stem}|{suffix}",
+    )
+    filename = f"{stem}{suffix}"
+    if len(str(directory / filename)) > WINDOWS_COMPATIBLE_OUTPUT_PATH_LIMIT:
+        raise OSError(f"Could not allocate a Windows-compatible output filename in {directory}")
+    return filename
 
 # Upload-mode progress is a user-facing evidence scale, not the old generic
-# pipeline's anonymous 0..1 values.  The medium-PDF timing runs showed that
-# local preparation takes only a few percent of wall time.  More importantly,
+# pipeline's anonymous 0..1 values. The two-trial medium-PDF cohort measured
+# local preparation at a 15.9% median, shared ingestion at 62.2%, and
+# retrieval/validation at 16.1%. More importantly,
 # Desktop's queue and the targeted page-parent observer overlap: treating them
 # as two *consecutive* ranges double-counts the longest part of the run.  They
-# therefore share the same 5--95% ingestion range.  Their labels remain
+# therefore share the same 16--78% ingestion range. Their labels remain
 # distinct, but either stream can advance the one bar only by its proven x/y.
 # The Gradio owner additionally constrains this active range by its live ETA,
 # so the percentage and the displayed elapsed/remaining time cannot diverge
 # dramatically when one observer gets ahead of the other.
 AUTOMATIC_UPLOAD_PHASE_RANGES = {
-    "metadata": (0.0000, 0.0060),
-    "extraction": (0.0060, 0.0270),
-    "candidate_evaluation": (0.0270, 0.0340),
-    "payloads": (0.0340, 0.0420),
-    "attachments": (0.0420, 0.0470),
-    "queue_receipt": (0.0470, 0.0500),
-    "desktop_queue": (0.0500, 0.9500),
-    "identity_set": (0.0500, 0.9500),
-    "retrieval_sample": (0.9500, 0.9800),
-    "validation": (0.9800, 0.9900),
-    "reporting": (0.9900, 1.0000),
+    "metadata": (0.0000, 0.0190),
+    "extraction": (0.0190, 0.0860),
+    "candidate_evaluation": (0.0860, 0.1080),
+    "payloads": (0.1080, 0.1340),
+    "attachments": (0.1340, 0.1500),
+    "queue_receipt": (0.1500, 0.1600),
+    "desktop_queue": (0.1600, 0.7800),
+    "identity_set": (0.1600, 0.7800),
+    "retrieval_sample": (0.7800, 0.9400),
+    "validation": (0.9400, 0.9800),
+    "reporting": (0.9800, 1.0000),
 }
 
 
@@ -1492,7 +1556,7 @@ def usable_outline_from_validation(outline, validation):
     return [row for row in outline if row.get("title") not in mismatched_titles]
 
 
-def parsed_pdf_text_filename(pdf_path: Path) -> str:
+def parsed_pdf_text_filename(pdf_path: Path, parent=None) -> str:
     """Return the portable, user-facing name for a prepared PDF transcript.
 
     The internal candidate artifact remains deliberately generic because it is
@@ -1501,8 +1565,11 @@ def parsed_pdf_text_filename(pdf_path: Path) -> str:
     ``safe_stem`` removes Windows-invalid punctuation and the suffix ensures
     even a reserved bare stem such as ``CON`` is safe as a filename.
     """
-    stem = safe_stem(Path(pdf_path).stem)[:140].rstrip("-._ ") or "parsed-document"
-    return f"{stem}-pdf-parsed.txt"
+    stem = safe_stem(Path(pdf_path).stem) or "parsed-document"
+    suffix = "-pdf-parsed.txt"
+    if parent is None:
+        return _bounded_output_component(stem, 140, fallback="parsed-document") + suffix
+    return compatible_output_filename(parent, stem, suffix, fallback="parsed-document")
 
 
 LEAN_SUCCESS_ARTIFACT_DIRECTORIES = (
@@ -1577,7 +1644,12 @@ def materialize_retained_segments(prepared_text_path: Path, segments_dir: Path, 
             pdf_page = 1
         page_counts[pdf_page] += 1
         within_page = page_counts[pdf_page]
-        filename = f"{base_name}-p{pdf_page:03d}-s{within_page:02d}.txt"
+        filename = compatible_output_filename(
+            segments_dir,
+            base_name,
+            f"-p{pdf_page:03d}-s{within_page:02d}.txt",
+            fallback="segment",
+        )
         target = segments_dir / filename
         target.write_text(str(segment.get("text") or ""), encoding="utf-8")
         retained.append(target)
@@ -1775,9 +1847,13 @@ def retain_successful_run_without_logs(out_root: Path, summary, profile, prepare
     source_name = safe_stem(Path(str(profile.get("filename") or "document")).stem) or "document"
     source_hash = str(profile.get("source_sha256") or "").strip().lower()
     unique_suffix = source_hash[:12] or "local"
-    prefix = f"{source_name}-{unique_suffix}"
+    prefix = _bounded_output_component(
+        f"{source_name}-{unique_suffix}",
+        48,
+        identity=source_hash,
+    )
     current_text = Path(str(retained.get("prepared_text") or ""))
-    flat_text = root / f"{prefix}-complete-pdf-parsed.txt"
+    flat_text = root / compatible_output_filename(root, prefix, "-complete-pdf-parsed.txt")
     if not current_text.is_file():
         return {"applied": False, "reason": "prepared_text_missing_after_lean_cleanup"}
     segment_root = Path(str(retained.get("segments_directory") or root / "segments"))
@@ -1786,7 +1862,11 @@ def retain_successful_run_without_logs(out_root: Path, summary, profile, prepare
         match = re.search(r"-p(\d+)-s(\d+)\.txt$", segment_path.name, re.IGNORECASE)
         if not match:
             continue
-        flat_segment = root / f"{prefix}-p{int(match.group(1)):03d}-s{int(match.group(2)):02d}.txt"
+        flat_segment = root / compatible_output_filename(
+            root,
+            prefix,
+            f"-p{int(match.group(1)):03d}-s{int(match.group(2)):02d}.txt",
+        )
         planned_segments.append((segment_path, flat_segment))
 
     # Validate every destination before moving anything. A late collision used
@@ -14226,7 +14306,7 @@ code{{background:#eee;padding:1px 4px}}</style></head>
 </body></html>"""
 
 
-def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
+def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright: ignore[reportGeneralTypeIssues]
     """Characterized legacy engine.
 
     New callers must use ``prepare_pdf`` or the common orchestration façade.
@@ -15286,7 +15366,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
     selected_dir.mkdir(parents=True, exist_ok=True)
     src_candidate_dir = Path(selected["candidate_dir"])
     shutil.copy2(src_candidate_dir / "anythingllm-upload.txt", selected_dir / "anythingllm-upload.txt")
-    prepared_text_path = selected_dir / parsed_pdf_text_filename(pdf_path)
+    prepared_text_path = selected_dir / parsed_pdf_text_filename(pdf_path, selected_dir)
     shutil.copy2(selected_dir / "anythingllm-upload.txt", prepared_text_path)
     candidate_fallback = src_candidate_dir / "anythingllm-upload-inline-metadata-fallback.txt"
     if candidate_fallback.exists():
@@ -17958,7 +18038,7 @@ def main():
 
     summaries = []
     for pdf in discover_pdfs(input_path):
-        pdf_out = run_root / safe_stem(pdf.stem)
+        pdf_out = compatible_output_document_directory(run_root, pdf)
         run_result = execute_preparation(pdf, pdf_out, args, prepare_pdf)
         reporting_stage = run_result.stages.get("reporting")
         legacy_summary = (
