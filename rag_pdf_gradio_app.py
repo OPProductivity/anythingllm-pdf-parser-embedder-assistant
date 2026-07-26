@@ -12156,6 +12156,21 @@ def record_timing_model_run(
             # own run summaries, but must never distort a user's future ETA.
             return {}
         latest_summary = (summaries or [{}])[-1]
+        configured_documents = list((settings or {}).get("source_documents") or [])
+        document_timing = []
+        for index, document_summary in enumerate(summaries or []):
+            configured = configured_documents[index] if index < len(configured_documents) else {}
+            document_timing.append({
+                # Keep only the filename in the central local timing model;
+                # absolute source paths are not useful for calibration and can
+                # expose a user's folder structure. The run artifact retains
+                # the full provenance separately when requested.
+                "filename": Path(str(configured.get("path") or "")).name,
+                "pages": int(document_summary.get("pdf_page_count") or configured.get("pages") or 0),
+                "records": int(document_summary.get("api_embedding_update_requested") or document_summary.get("segments") or 0),
+                "phase_timing": dict(document_summary.get("phase_timing") or {}),
+                "total_pipeline_seconds": round(float(document_summary.get("total_pipeline_seconds") or 0.0), 3),
+            })
         if str(features.get("mode") or "") == MODE_NATIVE_UPLOAD_LABEL:
             features["embedding_engine"] = str(latest_summary.get("anythingllm_embedding_engine") or features.get("embedding_engine") or "unknown")
             features["embedding_model"] = str(latest_summary.get("anythingllm_embedding_model") or features.get("embedding_model") or "unknown")
@@ -12207,6 +12222,7 @@ def record_timing_model_run(
             "batch_submission_seconds": [row["submission_seconds"] for row in batches if row["submission_seconds"] > 0],
             "batch_verification_seconds": [row["verification_seconds"] for row in batches if row["verification_seconds"] > 0],
             "batch_measurements": batches,
+            "document_timing": document_timing,
             "profile": profile,
             **features,
         }
@@ -16211,7 +16227,13 @@ def run_automatic(
             run_root,
             summaries,
             completion,
-            {"timing_estimate": run_timing_estimate},
+            {
+                "timing_estimate": run_timing_estimate,
+                "source_documents": [
+                    {"path": str(path), "pages": int((progress_allocations[index] or {}).get("pages") or 0)}
+                    for index, path in enumerate(files)
+                ],
+            },
             actual_seconds,
             wall_clock_seconds=wall_clock_seconds,
         )

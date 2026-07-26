@@ -16033,13 +16033,24 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
                     f" Read-only inspection at {int(latest_checkpoint.get('scheduled_seconds') or 0)}s: "
                     f"{int(latest_checkpoint.get('observed_vectors') or 0)}/{len(expected_batch)} observed."
                 )
+            observer_state = str(evidence.get("desktop_queue_observer_state") or "unknown")
+            event_age = evidence.get("desktop_queue_last_event_age_seconds")
+            try:
+                event_age = max(0.0, float(event_age))
+            except (TypeError, ValueError):
+                event_age = None
+            observer_detail = (
+                f" SSE observer {observer_state}; last owned queue event {event_age:.0f}s ago."
+                if event_age is not None else
+                f" SSE observer {observer_state}; no owned queue event observed yet."
+            )
             report_upload_phase(
                 "identity_set",
                 (
                     f"AnythingLLM reconciliation {reconciliation_elapsed:.0f}/{reconciliation_deadline_seconds:.0f}s: "
                     f"{queue_detail}"
                     f"{format_vector_observation(observed, len(expected_batch), operator_state, record_label=vector_record_label)}"
-                    f"{checkpoint_detail}"
+                    f"{checkpoint_detail}{observer_detail}"
                 ),
                 completed_units=ingestion_evidence.completed,
                 total_units=ingestion_evidence.total,

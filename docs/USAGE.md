@@ -11,6 +11,11 @@ prepared text records to a workspace.
 Every upload run pauses at a confirmation screen before it changes local output
 or an AnythingLLM workspace.
 
+The app checks whether AnythingLLM Desktop is reachable when a confirmed upload
+run begins. If Desktop is unavailable, it can make one bounded local startup
+attempt and waits for the API rather than assuming the window is ready as soon
+as its icon appears.
+
 ## Choose segmentation for the question you want to answer
 
 | Need | Recommended mode |
@@ -35,6 +40,12 @@ you need rather than assuming that more segments are always better.
 5. Confirm the run.
 6. Read the final status literally: local preparation, document storage,
    vector observation, and runtime retrieval are different stages.
+
+The overall progress percentage is aligned with the active run's
+elapsed/remaining forecast. The stage line contains direct evidence, such as
+`Desktop completed 8/15 page-parent files` or `8/15 page-parent vectors
+confirmed`. A runtime retrieval diagnostic that times out does not block use
+when exact searchable-vector evidence is already verified.
 
 Custom range applies after the selected segmentation strategy is calculated. It
 is intentionally unavailable for batch upload because a single position range

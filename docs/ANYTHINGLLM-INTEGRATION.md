@@ -23,6 +23,22 @@ retrieval evidence it can observe afterwards.
 Do not treat a single status, including the Documents drawer, as proof of all
 four stages.
 
+## Current queue and recovery behavior
+
+The upload path submits one app-owned Desktop FIFO queue request for planned
+managed relative locations. The assistant observes only queue events that
+match those locations. It records the SSE observer health and uses exact
+expected page-parent identities to confirm storage; Desktop queue and vector
+observer percentages are not added because those activities overlap.
+
+If a request outcome is ambiguous, reconciliation uses one bounded shared
+observation window with read-only checks. A later document-level observer uses
+the remaining portion of that window rather than starting a second full
+timeout. Queue cleanup or restart is allowed only for ledger-proven app-owned
+work; ambiguous ownership or manual activity is preserved rather than changed
+automatically. See [Current engineering state](CURRENT-ENGINEERING-STATE.md)
+for the maintained operating contract.
+
 ## Desktop refresh bridge
 
 The bridge is optional. It patches an installed AnythingLLM Desktop archive only

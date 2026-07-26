@@ -4,13 +4,13 @@
 **The app uses a web page (localhost app) that allows you to pick and select your PDF files, convert them into AnythingLLM format, and upload and embed the files automatically into a new AnythingLLM Desktop workspace.**
 
 This AnythingLLM (Windows 11) assistant turns one PDF, a selected batch or folder of
-PDFs, into clean text files, and uploads them and embeds them to AnythingLLM. AnythingLLM itself does not support
-uploading PDF files, and uses .TXT or .JSON. Optionally split files into one or more segments per page and send
+PDFs, into clean text files, and uploads them and embeds them to AnythingLLM. AnythingLLM can upload PDFs itself;
+this assistant intentionally prepares controllable text records with page-aware provenance. Optionally split files into one or more segments per page and send
 the prepared records in a subfolder to your local AnythingLLM Desktop workspace installed on the user's pc. It is designed for people who want
 to more easily work with PDFs inside AnythingLLM. You can also create local files only (only parse/perform OCR) to automatically convert PDFs to TXT and then upload to AnythingLLM manually. The advantage is that this software works with existing PDF metadata and bookmarks and can also recognize title pages, content index, bibliography and more (which can be excluded) and can also perform OCR on only a subset (5 out of 20 pages only need OCR).
-Doing this automatically or in batch mode is faster than manually creating  workspaces and uploading and embedding pdf files.
+This reduces manual preparation work; eventual embedding time still depends on AnythingLLM Desktop and the selected provider.
 Depending on whether you use local ollama embedders, or openrouter embedders via api key, this can be done under half a minute per pdf.
-The app communicates with AnythingLLM settings and workspaces through the official AnythingLLM API key. Be sure to vet the codebase of this app (manually or using AI) to see if it complies with your own data processing protocols, as it will be able to make embedding decisions using local python scripts. The app operates via a localhost structure at port 7860 (http://127.0.0.1:7860/) and is a completely local app. But it uses the AnythingLLM app to send PDFs to local embedders (privacy-friendly) or cloud embedder providers (different data processing policies) using the provided (default) settings and the settings you have made personally in the AnythingLLM app. Start up AnythingLLM before using the app.
+The app communicates with AnythingLLM settings and workspaces through the official AnythingLLM API key. Be sure to vet the codebase of this app (manually or using AI) to see if it complies with your own data processing protocols, as it will be able to make embedding decisions using local python scripts. The app operates via a localhost structure at port 7860 (http://127.0.0.1:7860/) and is a completely local app. But it uses the AnythingLLM app to send PDFs to local embedders (privacy-friendly) or cloud embedder providers (different data processing policies) using the provided (default) settings and the settings you have made personally in the AnythingLLM app. The app checks Desktop at startup and can make one bounded local startup attempt when it is unavailable; keep AnythingLLM Desktop installed and configured before using upload mode.
 
 AnythingLLM PDF Parser Embedder Assistant supports parsing native-text PDFs, PDFs that need OCR (using Tesseract) for all
 pages or a subset of pages, and can also use the Unstructured library for text extraction
@@ -227,7 +227,9 @@ then `anythingllm-pdf-assistant shortcuts repair`.
    runs, distinguish local preparation, document storage, vector observation,
    and retrieval evidence in the run report.
 
-For a detailed walkthrough, see [docs/USAGE.md](docs/USAGE.md).
+For a detailed walkthrough, see [docs/USAGE.md](docs/USAGE.md). For the
+current engineering behavior, evidence model, recovery boundaries, and known
+limits, see [docs/CURRENT-ENGINEERING-STATE.md](docs/CURRENT-ENGINEERING-STATE.md).
 
 ## Screenshots
 
