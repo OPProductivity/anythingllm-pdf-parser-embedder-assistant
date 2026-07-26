@@ -74,6 +74,26 @@ def write_json(path: Path, payload: Any) -> None:
     temporary.replace(path)
 
 
+def archive_invalid_public_result(result_path: Path) -> Path | None:
+    """Preserve a safe invalid trial before its numbered slot is rerun."""
+    try:
+        prior = read_json(result_path)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(prior, dict) or not bool(prior.get("invalid_for_calibration")):
+        return None
+    # The archive is public only if it satisfies the same privacy boundary as
+    # an ordinary result. It stays outside the aggregate report's trial glob.
+    assert_public_payload_safe(prior)
+    archive_directory = result_path.parent.parent / "invalid"
+    for attempt in range(1, 1_000):
+        archive_path = archive_directory / f"{result_path.stem}-attempt-{attempt}.json"
+        if not archive_path.exists():
+            write_json(archive_path, prior)
+            return archive_path
+    raise OSError(f"Could not archive invalid benchmark result for {result_path.name}")
+
+
 def load_manifest(path: Path = PUBLIC_MANIFEST) -> dict[str, BenchmarkDocument]:
     payload = read_json(path)
     if payload.get("schema_version") != 1 or payload.get("profile") != "ordinary-page-preserving-upload":
@@ -833,6 +853,8 @@ def main(argv: list[str] | None = None) -> int:
         public_result["cleanup_state"] = "preserved_pending_thread_safe_gate"
         write_json(args.private_root / f"{document_id}-trial-{args.trial}.json", private_result)
         assert_public_payload_safe(public_result)
+        if args.rerun:
+            archive_invalid_public_result(prior_result_path)
         write_json(public_results_dir / f"{document_id}-trial-{args.trial}.json", public_result)
         completed.append(public_result)
     published_runs = []

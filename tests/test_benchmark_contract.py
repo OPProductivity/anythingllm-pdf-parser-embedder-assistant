@@ -212,6 +212,19 @@ def test_warm_up_is_private_and_does_not_create_a_public_trial(tmp_path: Path, m
     assert not (status_path.parent / "runs" / "B01-trial-1.json").exists()
 
 
+def test_rerun_archives_an_invalid_public_trial_without_exposing_private_data(tmp_path: Path):
+    result_path = tmp_path / "results" / "runs" / "B01-trial-1.json"
+    runner.write_json(result_path, {
+        "document_id": "B01", "trial": 1, "invalid_for_calibration": True,
+        "invalid_reasons": ["observer_uncertainty"], "page_count": 25,
+    })
+
+    archived = runner.archive_invalid_public_result(result_path)
+
+    assert archived == tmp_path / "results" / "invalid" / "B01-trial-1-attempt-1.json"
+    assert runner.read_json(archived)["invalid_reasons"] == ["observer_uncertainty"]
+
+
 def test_queue_guard_blocks_non_owned_activity_without_attempting_queue_cleanup(monkeypatch):
     monkeypatch.setattr(runner.app, "anythingllm_observer_api_health", lambda _url: {"reachable": True})
     monkeypatch.setattr(runner.app, "local_workspace_choices", lambda: ([("one", "one"), ("two", "two")], ""))
