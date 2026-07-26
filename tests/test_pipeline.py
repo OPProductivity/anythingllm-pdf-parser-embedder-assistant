@@ -153,6 +153,68 @@ class PipelineCoreTests(unittest.TestCase):
             else:
                 os.environ["RAG_PDF_UNSTRUCTURED_OCR_PAGE_TIMEOUT_SECONDS"] = original
 
+    def test_unstructured_parallel_lane_does_not_start_deadlines_for_queued_pages(self):
+        """Large OCR runs must keep only active worker pages under a deadline."""
+        import rag_pdf_tools
+
+        class FakeFuture:
+            def __init__(self, result):
+                self._result = result
+
+            def result(self):
+                return self._result
+
+        class FakeExecutor:
+            max_pending = 0
+            submitted_pages = []
+            active_count = 0
+
+            def __init__(self, *args, **kwargs):
+                return None
+
+            def submit(self, _function, _path, page_index, *_args):
+                future = FakeFuture({
+                    "page": page_index + 1,
+                    "page_row": {"page": page_index + 1, "text": f"page {page_index + 1}"},
+                    "element_rows": [],
+                })
+                type(self).submitted_pages.append(page_index + 1)
+                type(self).active_count += 1
+                type(self).max_pending = max(type(self).max_pending, type(self).active_count)
+                return future
+
+            def shutdown(self, **_kwargs):
+                return None
+
+        original_executor = rag_pdf_tools.ProcessPoolExecutor
+        original_wait = rag_pdf_tools.wait
+        try:
+            rag_pdf_tools.ProcessPoolExecutor = FakeExecutor
+
+            def complete_pending(pending, **_kwargs):
+                FakeExecutor.active_count -= len(pending)
+                return set(pending), set()
+
+            rag_pdf_tools.wait = complete_pending
+            progress = []
+            pages, count, _elements = rag_pdf_tools._parallel_unstructured_ocr_pages(
+                Path("fixture.pdf"),
+                5,
+                "hi_res",
+                2,
+                {"tesseract_available": True},
+                progress_callback=lambda completed, total: progress.append((completed, total)),
+            )
+        finally:
+            rag_pdf_tools.ProcessPoolExecutor = original_executor
+            rag_pdf_tools.wait = original_wait
+
+        self.assertEqual(count, 5)
+        self.assertEqual([row["page"] for row in pages], [1, 2, 3, 4, 5])
+        self.assertEqual(FakeExecutor.submitted_pages, [1, 2, 3, 4, 5])
+        self.assertLessEqual(FakeExecutor.max_pending, 2)
+        self.assertEqual(progress[-1], (5, 5))
+
     def test_unstructured_ocr_cache_requires_the_exact_source_identity(self):
         import rag_pdf_tools
 
@@ -203,7 +265,7 @@ class PipelineCoreTests(unittest.TestCase):
                 captured = {}
                 rag_pdf_tools.unstructured_ocr_page_workers = lambda: 2
                 rag_pdf_tools._parallel_unstructured_ocr_pages = (
-                    lambda path, pages, strategy, workers, runtime: (
+                    lambda path, pages, strategy, workers, runtime, **_kwargs: (
                         captured.update({
                             "path": path, "pages": pages, "strategy": strategy,
                             "workers": workers, "runtime": runtime,
@@ -330,7 +392,7 @@ class PipelineCoreTests(unittest.TestCase):
             rag_pdf_tools.ensure_tesseract_runtime = lambda: {"available": True}
             rag_pdf_tools.pymupdf4llm_ocr_page_workers = lambda: 4
             rag_pdf_tools.fitz.open = lambda _path: FakeDocument()
-            rag_pdf_tools._parallel_pymupdf4llm_pages = lambda path, count, dpi, workers: [
+            rag_pdf_tools._parallel_pymupdf4llm_pages = lambda path, count, dpi, workers, **_kwargs: [
                 {"page": 1, "text": "First", "kind": "markdown_page"},
                 {"page": 2, "text": "Second", "kind": "markdown_page"},
             ]
@@ -383,7 +445,7 @@ class PipelineCoreTests(unittest.TestCase):
             rag_pdf_tools.ensure_tesseract_runtime = lambda: {"available": True}
             rag_pdf_tools.pymupdf4llm_ocr_page_workers = lambda: 4
             rag_pdf_tools.fitz.open = lambda _path: FakeDocument()
-            rag_pdf_tools._parallel_pymupdf4llm_pages = lambda *_args: (_ for _ in ()).throw(RuntimeError("worker failure"))
+            rag_pdf_tools._parallel_pymupdf4llm_pages = lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("worker failure"))
             pages, count = rag_pdf_tools.get_pages_with_pymupdf4llm(Path("scanned.pdf"))
         finally:
             rag_pdf_tools.import_optional_backend = original_import
@@ -1065,12 +1127,12 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertNotIn("Storage verified", runtime_completion["message"])
         chat_timeout = dict(successful_upload, anythingllm_runtime_validation_status="pass_with_chat_timeout")
         timeout_completion = app.automatic_completion([chat_timeout], True)
-        self.assertEqual(timeout_completion["state"], "warning")
-        self.assertIn("Stored, but retrieval is unverified", timeout_completion["message"])
+        self.assertEqual(timeout_completion["state"], "successful")
+        self.assertIn("does not block use", timeout_completion["message"])
         vector_timeout = dict(successful_upload, anythingllm_runtime_validation_status="vector_runtime_timeout")
         vector_timeout_completion = app.automatic_completion([vector_timeout], True)
-        self.assertEqual(vector_timeout_completion["state"], "warning")
-        self.assertIn("Stored, but retrieval is unverified", vector_timeout_completion["message"])
+        self.assertEqual(vector_timeout_completion["state"], "successful")
+        self.assertIn("Searchable page-parent vectors verified", vector_timeout_completion["message"])
         provider_auth = dict(successful_upload, anythingllm_runtime_validation_status="blocked_provider_authentication")
         provider_auth_completion = app.automatic_completion([provider_auth], True)
         self.assertEqual(provider_auth_completion["code"], "AUTO-RETRIEVAL-AUTH-001")
@@ -1556,7 +1618,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertTrue(recovery["needed"])
         self.assertEqual(recovery["health"]["status"], "unreachable")
 
-    def test_runtime_recovery_starts_a_missing_desktop_but_never_force_restarts_a_live_process(self):
+    def test_runtime_recovery_waits_for_a_live_desktop_api_without_force_restarting_it(self):
         import rag_pdf_gradio_app as app
 
         original_process = app.anythingllm_desktop_process_running
@@ -1576,6 +1638,14 @@ class PipelineCoreTests(unittest.TestCase):
                         kwargs["startup_poll_interval"],
                         app.AUTOMATIC_RUNTIME_RECOVERY_STARTUP_POLL_INTERVAL_SECONDS,
                     )
+                    self.assertEqual(
+                        kwargs["startup_fast_poll_interval"],
+                        app.AUTOMATIC_RUNTIME_RECOVERY_STARTUP_FAST_POLL_INTERVAL_SECONDS,
+                    )
+                    self.assertEqual(
+                        kwargs["startup_fast_poll_window"],
+                        app.AUTOMATIC_RUNTIME_RECOVERY_STARTUP_FAST_POLL_WINDOW_SECONDS,
+                    )
                     kwargs["status_callback"]("waiting_for_runtime", {"status": "unreachable"})
                     kwargs["status_callback"]("ready_after_start", {"status": "reachable"})
                     return {"status": "reachable"}
@@ -1589,16 +1659,40 @@ class PipelineCoreTests(unittest.TestCase):
                 )
 
                 app.anythingllm_desktop_process_running = lambda: True
-                app.ensure_anythingllm_runtime = lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not run"))
-                withheld = app.attempt_automatic_runtime_start(root, "http://127.0.0.1:3001", "key")
+
+                def fake_wait_for_live_process(**kwargs):
+                    self.assertTrue(kwargs["autostart_local"])
+                    kwargs["status_callback"](
+                        "waiting_for_runtime",
+                        {"status": "unreachable", "start": {"status": "already_running"}},
+                    )
+                    kwargs["status_callback"](
+                        "ready_after_start",
+                        {"status": "reachable", "start": {"status": "already_running"}},
+                    )
+                    return {"status": "reachable", "start": {"status": "already_running"}}
+
+                app.ensure_anythingllm_runtime = fake_wait_for_live_process
+                waited = app.attempt_automatic_runtime_start(
+                    root,
+                    "http://127.0.0.1:3001",
+                    "key",
+                    status_callback=lambda phase, _snapshot: callback_events.append(phase),
+                )
+
+                app.ensure_anythingllm_runtime = lambda **_kwargs: {"status": "unreachable"}
+                timed_out = app.attempt_automatic_runtime_start(root, "http://127.0.0.1:3001", "key")
             finally:
                 app.anythingllm_desktop_process_running = original_process
                 app.ensure_anythingllm_runtime = original_ensure
 
         self.assertEqual(started["status"], "ready")
-        self.assertEqual(callback_events, ["waiting_for_runtime", "ready_after_start"])
-        self.assertEqual(withheld["status"], "restart_withheld_manual_activity_uncertain")
-        self.assertEqual(withheld["action"], "restart_withheld_process_alive")
+        self.assertEqual(callback_events, ["waiting_for_runtime", "ready_after_start", "waiting_for_runtime", "ready_after_start"])
+        self.assertEqual(waited["status"], "ready")
+        self.assertEqual(waited["action"], "wait_for_running_process_api")
+        self.assertEqual(waited["runtime"]["start"]["status"], "already_running")
+        self.assertEqual(timed_out["status"], "running_process_api_timeout")
+        self.assertEqual(timed_out["action"], "wait_for_running_process_api")
 
     def test_runtime_recovery_resumes_only_before_anythingllm_submission(self):
         import rag_pdf_gradio_app as app
@@ -1624,6 +1718,42 @@ class PipelineCoreTests(unittest.TestCase):
                     output, {"status": "startup_timeout"}
                 )
             )
+
+    def test_runtime_recovery_resumes_only_the_current_manifest_missing_locations(self):
+        import rag_pdf_gradio_app as app
+
+        original_latest = app._is_most_recent_recovery_run
+        original_submit = app.submit_embedding_resume_manifest
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "app-run-current"
+            output = root / "document"
+            inspection = output / "inspection"
+            inspection.mkdir(parents=True)
+            manifest_path = inspection / "resume-embedding-manifest.json"
+            manifest_path.write_text(json.dumps({
+                "workspace_slug": "safe-workspace",
+                "recovery": {
+                    "state": "resume_available",
+                    "remaining_locations": ["custom-documents/owned.json"],
+                },
+            }), encoding="utf-8")
+            calls = []
+            try:
+                app._is_most_recent_recovery_run = lambda candidate: Path(candidate) == root
+                app.submit_embedding_resume_manifest = lambda *args, **kwargs: (
+                    calls.append((args, kwargs)) or {"status": "submitted", "accepted": 1}
+                )
+                result = app.resume_owned_embedding_manifest_after_runtime_start(
+                    root, output, "http://127.0.0.1:3001", "managed-key",
+                )
+            finally:
+                app._is_most_recent_recovery_run = original_latest
+                app.submit_embedding_resume_manifest = original_submit
+
+        self.assertEqual(result["status"], "submitted")
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0][1]["automatic"])
+        self.assertEqual(calls[0][1]["expected_run_root"], root)
 
     def test_automatic_recovery_is_durably_limited_to_one_attempt_per_run(self):
         import rag_pdf_gradio_app as app
@@ -1736,6 +1866,67 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn("327/663", message)
         self.assertIn("327/663", observation)
         self.assertIn("queue active", observation)
+
+    def test_sse_observer_survives_idle_disconnects_until_owner_stops_it(self):
+        """A restarted Desktop must not lose its queue observer after two idle reads."""
+        class FakeStopEvent:
+            def __init__(self):
+                self.stopped = False
+                self.waits = []
+
+            def is_set(self):
+                return self.stopped
+
+            def set(self):
+                self.stopped = True
+
+            def wait(self, seconds=None):
+                self.waits.append(seconds)
+                return self.stopped
+
+        class FakeResponse:
+            def __init__(self, *, timeout=False):
+                self.timeout = timeout
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                if self.timeout:
+                    raise TimeoutError("idle stream boundary")
+                raise StopIteration
+
+        original_urlopen = pipeline.urllib.request.urlopen
+        stop = FakeStopEvent()
+        calls = []
+        try:
+            def urlopen(_request, timeout):
+                calls.append(timeout)
+                if len(calls) < 3:
+                    return FakeResponse(timeout=True)
+                stop.set()
+                return FakeResponse()
+
+            pipeline.urllib.request.urlopen = urlopen
+            pipeline.listen_for_anythingllm_embed_progress(
+                "http://127.0.0.1:3001",
+                "",
+                "workspace",
+                [],
+                stop,
+            )
+        finally:
+            pipeline.urllib.request.urlopen = original_urlopen
+
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(stop.stopped)
+        self.assertEqual(stop.waits, [0.75, 0.75])
 
     def test_automatic_timing_html_exposes_range_and_evidence_without_overstating_it(self):
         import rag_pdf_gradio_app as app
@@ -2504,7 +2695,7 @@ class PipelineCoreTests(unittest.TestCase):
             "started_epoch": time.time() - 25,
             "confirmed_fraction": .65,
         })
-        self.assertIn("Total progress:", rendered)
+        self.assertIn("Overall progress:", rendered)
         self.assertEqual(rendered.count('role="progressbar"'), 1)
         self.assertIn('aria-label="Overall run progress"', rendered)
         self.assertIn("Elapsed", rendered)
@@ -2956,6 +3147,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(completion["code"], "AUTO-EMBEDDING-PARTIAL-001")
         self.assertIn("8 of 28", completion["message"])
         self.assertIn("20", completion["message"])
+        self.assertIn("segment vectors", completion["message"])
 
     def test_ambiguous_timeout_is_never_reported_as_submission_rejection(self):
         import rag_pdf_gradio_app as app
@@ -4010,11 +4202,13 @@ class PipelineCoreTests(unittest.TestCase):
         original_remove = app.remove_confirmed_workspace_queue_entries
         original_detect = app.detect_anythingllm_api_url
         original_submit = app.submit_embedding_resume_manifest
+        original_latest = app._is_most_recent_recovery_run
         try:
             app.resolve_anythingllm_api_key = lambda *_args, **_kwargs: ("managed-key", "managed_desktop_key")
             app.observe_workspace_embedding_queue_activity = lambda *_args, **_kwargs: {"status": "owned_activity_observed"}
             app.remove_confirmed_workspace_queue_entries = lambda *_args, **_kwargs: {"status": "complete", "removed": 1}
             app.detect_anythingllm_api_url = lambda *_args, **_kwargs: {"status": "reachable"}
+            app._is_most_recent_recovery_run = lambda _root: True
             submissions = []
             app.submit_embedding_resume_manifest = lambda *args, **kwargs: (submissions.append((args, kwargs)) or {"status": "submitted"})
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -4042,6 +4236,7 @@ class PipelineCoreTests(unittest.TestCase):
             app.remove_confirmed_workspace_queue_entries = original_remove
             app.detect_anythingllm_api_url = original_detect
             app.submit_embedding_resume_manifest = original_submit
+            app._is_most_recent_recovery_run = original_latest
         self.assertEqual(len(submissions), 1)
         self.assertEqual(result["groups"][0]["action"], "reconcile_missing_and_resume")
         self.assertEqual(result["groups"][0]["resume"]["status"], "submitted")
@@ -4084,7 +4279,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn(">warning<", updates[8]["value"])
         self.assertTrue(updates[9]["visible"])
         self.assertTrue(updates[9]["interactive"])
-        self.assertIn("Total progress: 100%", second_updates[0]["value"])
+        self.assertIn("Overall progress: 100%", second_updates[0]["value"])
         self.assertIn("Compl: 01m10s", second_updates[1])
 
     def test_cancelled_run_never_claims_upload_verification_or_full_completion(self):
@@ -4109,7 +4304,7 @@ class PipelineCoreTests(unittest.TestCase):
             app.LIVE_AUTOMATIC_RUN_STATUS = original
 
         self.assertIn('data-run-state="cancelled"', updates[0]["value"])
-        self.assertIn("Total progress: 99%", updates[0]["value"])
+        self.assertIn("Overall progress: 99%", updates[0]["value"])
         self.assertNotIn("Searchable vectors verified", updates[0]["value"])
         self.assertIn("Stopped: 01m10s", updates[1])
         self.assertEqual(updates[3]["value"], "Processing stopped")
@@ -7850,11 +8045,19 @@ class PipelineCoreTests(unittest.TestCase):
     def test_vector_observation_marks_expansion_as_rechunked(self):
         self.assertEqual(
             pipeline.format_vector_observation(99, 98, "pass"),
-            "98 records → 99 vectors observed (re-chunked; pass)",
+            "98 planned records → 99 vectors confirmed (re-chunked; pass)",
         )
         self.assertEqual(
             pipeline.format_vector_observation(5, 5, "pass"),
-            "5/5 vectors observed (pass)",
+            "5/5 vectors confirmed (pass)",
+        )
+        self.assertEqual(
+            pipeline.format_vector_observation(5, 10, "incomplete", record_label="page-parent vectors"),
+            "5/10 page-parent vectors confirmed (incomplete)",
+        )
+        self.assertAlmostEqual(
+            pipeline.embedding_observation_progress(.25, .94, 93, 663),
+            .25 + .69 * (93 / 663),
         )
 
     def test_resolve_unstructured_strategy_accepts_a_run_scoped_runtime_probe(self):
@@ -8675,6 +8878,27 @@ class PipelineCoreTests(unittest.TestCase):
             "applicant attended" in pipeline.runtime_validation_query_text(payload)
             for payload in selected
         ))
+
+    def test_runtime_validation_sample_is_stratified_and_bounded(self):
+        payloads = [
+            {
+                "textContent": f"This is the substantive discussion on page {page}, with enough distinctive academic language for retrieval validation.",
+                "metadata": {
+                    "title": f"Sample p{page}",
+                    "chunkSource": f"page-parent://sample::pdf-p{page:04d}",
+                },
+            }
+            for page in range(1, 26)
+        ]
+
+        selected = pipeline.select_runtime_validation_payloads(payloads, limit=5)
+        pages = [pipeline.expected_page_segment_tokens(payload)["page_number"] for payload in selected]
+
+        self.assertEqual(pipeline.runtime_validation_sample_size(payloads), 5)
+        self.assertEqual(len(selected), 5)
+        self.assertEqual(len(set(pages)), 5)
+        self.assertLessEqual(pages[0], 5)
+        self.assertGreaterEqual(pages[-1], 21)
 
     def test_runtime_validation_query_prefers_body_before_references(self):
         payload = {
@@ -11268,6 +11492,60 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(result["batches"][0]["verification"]["status"], "pass")
         self.assertTrue(any("sequential queue" in message for message in statuses))
 
+    def test_desktop_queue_relays_per_file_progress_without_late_generic_overwrite(self):
+        original_post = pipeline.post_json
+        original_listener = pipeline.start_anythingllm_embed_progress_listener
+        statuses = []
+        locations = [f"custom-documents/page-parent-{index}.txt" for index in range(5)]
+
+        class FakeThread:
+            def join(self, timeout=None):
+                return None
+
+        try:
+            def fake_listener(*_args, **kwargs):
+                observed = []
+                connected = threading.Event()
+                connected.set()
+                observer = kwargs.get("observer_callback")
+                for event in (
+                    {"type": "doc_starting", "docIndex": 2, "totalDocs": 5},
+                    {"type": "doc_complete", "docIndex": 2, "totalDocs": 5},
+                    {"type": "all_complete", "totalDocs": 5},
+                ):
+                    observed.append(event)
+                    observer(dict(event))
+                return {
+                    "stop_event": threading.Event(),
+                    "thread": FakeThread(),
+                    "connected_event": connected,
+                    "events": observed,
+                    "errors": [],
+                }
+
+            pipeline.start_anythingllm_embed_progress_listener = fake_listener
+            pipeline.post_json = lambda *_args, **_kwargs: (200, json.dumps({"success": True}))
+            pipeline.update_workspace_embeddings_desktop_queue(
+                "http://anythingllm",
+                "key",
+                "queue-workspace",
+                locations,
+                record_label="page-parent files",
+                status_callback=lambda message, _report: statuses.append(message),
+                batch_verifier=lambda report: {
+                    "status": "pass",
+                    "matching_vector_rows": len(report["locations"]),
+                },
+            )
+        finally:
+            pipeline.post_json = original_post
+            pipeline.start_anythingllm_embed_progress_listener = original_listener
+
+        self.assertTrue(any("embedding 3/5 page-parent files" in message for message in statuses))
+        self.assertTrue(any("3/5 page-parent files completed" in message for message in statuses))
+        self.assertTrue(any("Desktop completed 3/5 page-parent files" in message for message in statuses))
+        self.assertFalse(any("Desktop event stream observed" in message for message in statuses))
+
     def test_desktop_queue_does_not_replay_an_uncertain_full_list_submission(self):
         original_post = pipeline.post_json
         calls = []
@@ -11295,6 +11573,36 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(result["accepted"], len(locations))
         self.assertEqual(result["batches"][0]["acceptance_basis"], "vector_observed_after_client_timeout")
         self.assertEqual(result["errors"], [])
+
+    def test_timeout_review_observation_without_exact_vectors_remains_resumable(self):
+        """A locked/read-only review result cannot recover a timed-out queue."""
+        original_post = pipeline.post_json
+        locations = ["custom-documents/a.json", "custom-documents/b.json"]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ledger = Path(tmpdir) / "embedding-batch-ledger.json"
+            try:
+                pipeline.post_json = lambda *_args, **_kwargs: (_ for _ in ()).throw(TimeoutError("timed out"))
+                result = pipeline.update_workspace_embeddings_desktop_queue(
+                    "http://anythingllm",
+                    "key",
+                    "queue-workspace",
+                    locations,
+                    ledger_path=ledger,
+                    batch_verifier=lambda _report: {
+                        "status": "pass_with_review",
+                        "matching_vector_rows": 0,
+                        "message": "database is locked",
+                    },
+                )
+            finally:
+                pipeline.post_json = original_post
+            manifest = json.loads((ledger.with_name("resume-embedding-manifest.json")).read_text(encoding="utf-8"))
+
+        self.assertEqual(result["accepted"], 0)
+        self.assertFalse(result["batches"][0]["searchability_proven"])
+        self.assertEqual(result["batches"][0]["submission_state"], "unresolved")
+        self.assertEqual(manifest["recovery"]["state"], "resume_available")
+        self.assertEqual(manifest["recovery"]["remaining_locations"], locations)
 
     def test_embedding_update_skips_exact_vectors_that_already_exist(self):
         original_post = pipeline.post_json
@@ -11355,6 +11663,39 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(pipeline.embedding_submission_timeout_seconds(1, 30), 180.0)
         self.assertEqual(pipeline.embedding_submission_timeout_seconds(2, 90), 345.0)
         self.assertEqual(pipeline.embedding_submission_timeout_seconds(2, 600), 480.0)
+
+    def test_embedding_submission_receipt_deadline_override_starts_reconciliation_early(self):
+        original_post = pipeline.post_json
+        observed_timeouts = []
+        try:
+            def fake_post(_url, _body, api_key=None, timeout=None):
+                observed_timeouts.append(timeout)
+                raise TimeoutError("timed out")
+
+            pipeline.post_json = fake_post
+            result = pipeline.update_workspace_embeddings_batched(
+                "http://anythingllm",
+                "key",
+                "safe-workspace",
+                ["custom-documents/page-parent-1.txt"],
+                submission_timeout_override=20.0,
+                batch_verifier=lambda _batch: {
+                    "status": "pass",
+                    "matching_vector_rows": 1,
+                    "lancedb_matching_rows": 1,
+                },
+            )
+        finally:
+            pipeline.post_json = original_post
+
+        self.assertEqual(observed_timeouts, [20])
+        self.assertEqual(result["batches"][0]["submission_timeout_basis"], "receipt_deadline_override")
+        self.assertTrue(result["batches"][0]["receipt_deadline_elapsed"])
+        self.assertEqual(
+            result["batches"][0]["reconciliation_deadline_seconds"],
+            pipeline.ANYTHINGLLM_EMBEDDING_RECONCILIATION_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(result["batches"][0]["submission_state"], "accepted")
 
     def test_embedding_updates_record_a_dynamic_timeout_after_warmup(self):
         original_post = pipeline.post_json
@@ -12987,6 +13328,46 @@ class PipelineCoreTests(unittest.TestCase):
             "native_metadata_llm_visible_fast_document_observation_deferred",
         )
 
+    def test_fast_post_upload_rejects_equal_count_with_duplicate_identity(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = Path(temp_dir)
+            con = sqlite3.connect(storage / "anythingllm.db")
+            con.executescript(
+                """
+                create table workspaces (id integer primary key, name text, slug text);
+                create table workspace_documents (docId text, filename text, docpath text, workspaceId integer, metadata text);
+                create table document_vectors (docId text, vectorId text);
+                insert into workspaces values (1, 'Test', 'test');
+                """
+            )
+            con.commit()
+            con.close()
+            original_count = pipeline.inspect_native_metadata_count
+            original_locations = pipeline.inspect_uploaded_location_files
+            try:
+                pipeline.inspect_native_metadata_count = lambda *args, **kwargs: {
+                    "status": "complete", "matching_rows": 2,
+                    "matching_table_names": ["test"], "text_contains_segment_or_page": True,
+                    "identity_set_checked": True, "identity_set_complete": False,
+                    "expected_chunk_source_count": 2, "observed_chunk_source_count": 1,
+                    "duplicate_chunk_source_count": 1, "missing_chunk_sources": ["segment://missing"],
+                }
+                pipeline.inspect_uploaded_location_files = lambda *args, **kwargs: {
+                    "status": "complete", "existing_files": 2, "matching_files": 2,
+                    "metadata_visible": True, "sample_path": "dummy.json",
+                }
+                result = pipeline.verify_anythingllm_post_upload(
+                    storage, "test", "a" * 64,
+                    [{"metadata": {"chunkSource": "segment://one"}}, {"metadata": {"chunkSource": "segment://two"}}],
+                    observation_mode="fast",
+                )
+            finally:
+                pipeline.inspect_native_metadata_count = original_count
+                pipeline.inspect_uploaded_location_files = original_locations
+
+        self.assertEqual(result["status"], "partial_vector_coverage")
+        self.assertEqual(result["classification"], "page_parent_identity_set_mismatch")
+
     def test_exact_vector_success_defers_full_post_upload_observation(self):
         report = {
             "status": "pass",
@@ -13659,6 +14040,56 @@ class TimingAndInspectionSafetyTests(unittest.TestCase):
         revised = app.evidence_paced_eta_seconds(3_200, 380, .25)
         self.assertLess(revised, 3_200)
         self.assertGreater(revised, 380)
+
+    def test_upload_progress_gives_vector_indexing_half_of_document_allocation(self):
+        import rag_pdf_gradio_app as app
+
+        # Compatibility callbacks use the old generic source scale, while the
+        # normal structured events use the explicit displayed phase ranges.
+        self.assertEqual(app.reweight_automatic_upload_progress(0), 0)
+        self.assertAlmostEqual(app.reweight_automatic_upload_progress(.80), .0556)
+        self.assertAlmostEqual(app.reweight_automatic_upload_progress(.94), .5556)
+        self.assertEqual(app.reweight_automatic_upload_progress(.97), 1)
+        self.assertEqual(app.reweight_automatic_upload_progress(1), 1)
+        self.assertEqual(app.reweight_automatic_upload_progress(-1), 0)
+        self.assertEqual(app.reweight_automatic_upload_progress(2), 1)
+
+    def test_structured_progress_keeps_x_of_y_evidence_and_uses_small_gap_estimate(self):
+        import rag_pdf_gradio_app as app
+
+        original = app.LIVE_AUTOMATIC_RUN_STATUS
+        with tempfile.TemporaryDirectory() as tmpdir:
+            try:
+                record = app.update_live_automatic_run_status(
+                    tmpdir,
+                    state="running",
+                    phase="AnythingLLM indexing: 93/663 page-parent vectors confirmed",
+                    progress_phase="searchable_vectors",
+                    completed_units=93,
+                    total_units=663,
+                    evidence_kind="exact_vector_observation",
+                    expected_seconds=600,
+                    confirmed_fraction=.58,
+                )
+            finally:
+                app.LIVE_AUTOMATIC_RUN_STATUS = original
+
+        self.assertEqual(record["progress_phase"], "searchable_vectors")
+        self.assertEqual(record["completed_units"], 93)
+        self.assertEqual(record["total_units"], 663)
+        self.assertEqual(record["evidence_kind"], "exact_vector_observation")
+        self.assertLessEqual(record["phase_allowance"], .04)
+
+    def test_upload_protocol_gives_queue_and_vector_evidence_the_observed_time_weight(self):
+        ranges = pipeline.AUTOMATIC_UPLOAD_PHASE_RANGES
+        self.assertAlmostEqual(ranges["attachments"][1], .0556)
+        self.assertAlmostEqual(ranges["desktop_queue"][0], .0556)
+        self.assertAlmostEqual(ranges["desktop_queue"][1], .5556)
+        self.assertAlmostEqual(ranges["searchable_vectors"][0], .5556)
+        self.assertAlmostEqual(ranges["searchable_vectors"][1], .8889)
+        self.assertAlmostEqual(ranges["validation"][0], .8889)
+        self.assertEqual(ranges["validation"][1], 1.0)
+        self.assertEqual(ranges["reporting"], (1.0, 1.0))
 
     def test_visible_eta_forwards_inherited_anythingllm_settings(self):
         import rag_pdf_gradio_app as app

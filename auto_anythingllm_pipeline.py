@@ -87,6 +87,28 @@ PIPELINE_PROGRESS_POST_UPLOAD_OBSERVATION = 0.95
 PIPELINE_PROGRESS_REPORTING = 0.97
 ANYTHINGLLM_HTTP_RESPONSE_TIMEOUT_SECONDS = 180
 
+# Upload-mode progress is a user-facing evidence scale, not the old generic
+# pipeline's anonymous 0..1 values.  The app applies each document's source
+# scale inside its visible 5--95% allocation (the outer 0--5% is
+# startup/preflight and terminal completion owns 95--100%).  These boundaries
+# therefore display: local preparation 5--10%, Desktop's sequential queue
+# 10--55%, exact page-parent vector confirmation 55--85%, validation 85--95%.
+# The queue and vector observer can overlap in wall-clock time; the allocation
+# is a stable explanation of evidence, not a claim that those operations are
+# serial.
+AUTOMATIC_UPLOAD_PHASE_RANGES = {
+    "metadata": (0.0000, 0.0056),
+    "extraction": (0.0056, 0.0333),
+    "candidate_evaluation": (0.0333, 0.0389),
+    "payloads": (0.0389, 0.0500),
+    "attachments": (0.0500, 0.0556),
+    "desktop_queue": (0.0556, 0.5556),
+    "searchable_vectors": (0.5556, 0.8889),
+    "validation": (0.8889, 1.0000),
+    # Terminal completion owns the outer 95--100% handoff.
+    "reporting": (1.0000, 1.0000),
+}
+
 
 def emit_pipeline_timing_event(args, stage, *, event="phase_completed", elapsed_seconds=0.0, **details):
     """Best-effort timing telemetry that can never fail a preparation run.
@@ -556,11 +578,16 @@ class PageStat:
     preview: str
 
 
-def sha256_file(path: Path) -> str:
+def sha256_file(path: Path, progress_callback=None) -> str:
     h = hashlib.sha256()
+    total_bytes = max(0, int(Path(path).stat().st_size))
+    completed_bytes = 0
     with path.open("rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             h.update(block)
+            completed_bytes += len(block)
+            if callable(progress_callback):
+                progress_callback(completed_bytes, total_bytes)
     return h.hexdigest()
 
 
@@ -652,7 +679,7 @@ def write_csv(path: Path, rows, fieldnames=None):
     atomic_write_text(path, buffer.getvalue())
 
 
-def pdf_metadata(path: Path, include_page_geometry=False, include_author_samples=False):
+def pdf_metadata(path: Path, include_page_geometry=False, include_author_samples=False, progress_callback=None):
     """Read PDF metadata and, optionally, author-inference samples in one open.
 
     Automatic preparation already opens every source to read its metadata and
@@ -685,6 +712,8 @@ def pdf_metadata(path: Path, include_page_geometry=False, include_author_samples
                         "image_count": len(page.get_images(full=True)),
                     }
                 )
+                if callable(progress_callback):
+                    progress_callback("page_geometry", page_number, len(doc))
         author_text_samples = []
         author_sample_error = ""
         if include_author_samples:
@@ -697,6 +726,8 @@ def pdf_metadata(path: Path, include_page_geometry=False, include_author_samples
                     text = doc.load_page(page_number - 1).get_text("text")
                     if text:
                         author_text_samples.append({"page": page_number, "text": text})
+                    if callable(progress_callback):
+                        progress_callback("author_sample", page_numbers.index(page_number) + 1, len(page_numbers))
             except Exception as exc:
                 # Preserve the legacy failure meaning: a broken sampled-page
                 # read means author inference abstains instead of using a
@@ -3758,16 +3789,38 @@ def is_reliable_structure_reference(quality, pdf_page_count):
     )
 
 
-def format_vector_observation(observed_vectors, expected_records, operator_state):
-    """Describe vector evidence without treating controlled re-chunking as loss."""
+def format_vector_observation(observed_vectors, expected_records, operator_state, *, record_label="vectors"):
+    """Describe vector evidence without treating controlled re-chunking as loss.
+
+    Page-parent uploads normally have one planned record per non-empty PDF
+    page, while segment uploads can have several records per page.  The UI
+    must name that representation instead of presenting vector evidence as a
+    completed PDF-page count.
+    """
     observed = max(0, int(observed_vectors or 0))
     expected = max(0, int(expected_records or 0))
     state = str(operator_state or "observing")
+    label = str(record_label or "vectors").strip() or "vectors"
     if not expected:
-        return f"{observed} vectors observed (expected count not yet confirmed; {state})"
+        return f"{observed} {label} confirmed (expected count not yet confirmed; {state})"
     if expected and observed > expected:
-        return f"{expected} records → {observed} vectors observed (re-chunked; {state})"
-    return f"{observed}/{expected} vectors observed ({state})"
+        return f"{expected} planned records → {observed} {label} confirmed (re-chunked; {state})"
+    return f"{observed}/{expected} {label} confirmed ({state})"
+
+
+def embedding_observation_progress(start_fraction, end_fraction, observed_vectors, expected_records):
+    """Map exact vector coverage into the upload portion of workflow progress.
+
+    Request acceptance is not indexing completion.  This prevents a fixed
+    post-upload stage value from showing 95% when only a small fraction of the
+    planned records is searchable.
+    """
+    start = min(1.0, max(0.0, float(start_fraction or 0.0)))
+    end = min(1.0, max(start, float(end_fraction or start)))
+    expected = max(0, int(expected_records or 0))
+    observed = max(0, int(observed_vectors or 0))
+    coverage = min(1.0, observed / expected) if expected else 0.0
+    return start + (end - start) * coverage
 
 
 def has_document_wide_ocr_evidence(candidates):
@@ -7572,7 +7625,7 @@ def listen_for_anythingllm_embed_progress(
     seen_events = set()
     failures = 0
     connected_once = False
-    while not stop_event.is_set() and failures < 2:
+    while not stop_event.is_set():
         headers = {"Accept": "text/event-stream", "Cache-Control": "no-cache"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
@@ -7609,10 +7662,14 @@ def listen_for_anythingllm_embed_progress(
                         event_callback(event)
             # A healthy Desktop stream stays open until the client closes it.
             # Treat a clean EOF as a transient disconnect, rather than a
-            # zero-delay reconnect loop when Desktop is restarting.
+            # zero-delay reconnect loop when Desktop is restarting. Do not
+            # retire the observer after two disconnects: a Desktop restart
+            # can occur while the app-owned queue remains active, and later
+            # SSE events are valuable progress evidence after it recovers.
             if not stop_event.is_set():
-                failures += 1
-                stop_event.wait(0.25)
+                if not connected_once:
+                    failures += 1
+                stop_event.wait(0.75 if connected_once else min(5.0, 0.25 * (2 ** min(failures, 4))))
         except urllib.error.HTTPError as exc:
             if exc.code == 404 and endpoint_index + 1 < len(endpoint_candidates):
                 endpoint_index += 1
@@ -7620,9 +7677,12 @@ def listen_for_anythingllm_embed_progress(
             if stop_event.is_set():
                 return
             failures += 1
-            if callable(error_callback):
+            # Keep the durable report useful during a long restart: record
+            # the first error and exponentially spaced repeats, not one row
+            # for every reconnect attempt.
+            if callable(error_callback) and (failures == 1 or failures & (failures - 1) == 0):
                 error_callback(f"HTTP {exc.code}", failures)
-            stop_event.wait(0.25)
+            stop_event.wait(min(5.0, 0.25 * (2 ** min(failures, 4))))
         except Exception as exc:
             if stop_event.is_set():
                 return
@@ -7631,11 +7691,22 @@ def listen_for_anythingllm_embed_progress(
             # a successful connection therefore means only that no new queue
             # event arrived in this five-second observation window. Recording
             # it as an outage produced a noisy and misleading run receipt.
-            if not connected_once and callable(error_callback):
+            if not connected_once:
+                failures += 1
+            if (
+                not connected_once
+                and callable(error_callback)
+                and (failures == 1 or failures & (failures - 1) == 0)
+            ):
                 error_callback(str(exc), failures)
-            # Do not hammer a failed local server.  A single retry also covers
-            # the harmless timeout used to make cancellation responsive.
-            stop_event.wait(0.25)
+            # After a successful connection, a socket timeout is merely an
+            # idle SSE boundary. Reconnect indefinitely (until the owning
+            # request ends) so a Desktop restart cannot silently remove the
+            # only live queue observer. Before the first connection use a
+            # small bounded exponential backoff instead of hammering a down
+            # local server.
+            delay = 0.75 if connected_once else min(5.0, 0.25 * (2 ** min(failures, 4)))
+            stop_event.wait(delay)
 
 
 def start_anythingllm_embed_progress_listener(
@@ -7645,12 +7716,16 @@ def start_anythingllm_embed_progress_listener(
     expected_locations,
     *,
     include_unmatched_events=False,
+    observer_callback=None,
 ):
     """Start a best-effort, path-correlated Desktop progress listener.
 
-    The listener does not call a Gradio progress callback from its background
-    thread.  It records native events for the main pipeline thread to publish
-    safely after the synchronous request returns.
+    The listener never calls Gradio directly.  It records native events and,
+    when supplied, invokes ``observer_callback`` for a caller-owned durable
+    relay (the cancellable worker appends those updates to its event file).
+    This makes Desktop's own per-record queue activity visible while the
+    synchronous update request is still open without letting a background
+    listener mutate browser components.
     """
     observed_events = []
     observed_errors = []
@@ -7661,6 +7736,13 @@ def start_anythingllm_embed_progress_listener(
         event_copy = dict(event)
         event_copy["observed_at_utc"] = datetime.now(timezone.utc).isoformat()
         observed_events.append(event_copy)
+        if callable(observer_callback):
+            try:
+                observer_callback(dict(event_copy))
+            except Exception:
+                # Progress observation is informative.  A relay failure must
+                # never affect the Desktop submission that it is observing.
+                pass
 
     def receive_error(error, attempt):
         observed_errors.append({"event": "desktop_embed_progress_unavailable", "attempt": attempt, "error": error})
@@ -8286,6 +8368,8 @@ def ensure_anythingllm_runtime(
     autostart_local=False,
     status_callback=None,
     startup_poll_interval=1.5,
+    startup_fast_poll_interval=None,
+    startup_fast_poll_window=0.0,
 ):
     """Ensure the local Desktop API can be reached, reporting bounded lifecycle updates.
 
@@ -8338,9 +8422,20 @@ def ensure_anythingllm_runtime(
         return result
     deadline = time.time() + max(5.0, float(startup_timeout or DEFAULT_ANYTHINGLLM_STARTUP_TIMEOUT_SECONDS))
     poll_interval = max(0.1, float(startup_poll_interval or 1.5))
+    try:
+        fast_poll_interval = max(0.1, float(startup_fast_poll_interval or poll_interval))
+    except (TypeError, ValueError):
+        fast_poll_interval = poll_interval
+    try:
+        fast_poll_window = max(0.0, float(startup_fast_poll_window or 0.0))
+    except (TypeError, ValueError):
+        fast_poll_window = 0.0
+    started_waiting_at = time.time()
     result["waited_for_runtime"] = True
     result["startup_timeout_seconds"] = max(5.0, float(startup_timeout or DEFAULT_ANYTHINGLLM_STARTUP_TIMEOUT_SECONDS))
     result["startup_poll_interval_seconds"] = poll_interval
+    result["startup_fast_poll_interval_seconds"] = fast_poll_interval
+    result["startup_fast_poll_window_seconds"] = fast_poll_window
     result["startup_probe_count"] = 0
     result["lifecycle"].append({"phase": "waiting_for_runtime", "status": start_result.get("status", "started")})
     report_status("waiting_for_runtime", result)
@@ -8358,7 +8453,17 @@ def ensure_anythingllm_runtime(
             report_status("ready_after_start", result)
             return result
         report_status("waiting_for_runtime", result)
-        time.sleep(min(poll_interval, max(0.0, deadline - time.time())))
+        # A newly launched Electron window is commonly visible before its
+        # local API listener has finished binding.  Probe quickly during that
+        # short startup window, then revert to the caller's quieter interval.
+        # This is a responsiveness rule, not a second timeout.
+        elapsed_waiting = max(0.0, time.time() - started_waiting_at)
+        next_interval = (
+            fast_poll_interval
+            if fast_poll_window and elapsed_waiting < fast_poll_window
+            else poll_interval
+        )
+        time.sleep(min(next_interval, max(0.0, deadline - time.time())))
     result.update(latest)
     result["lifecycle"].append({"phase": "startup_timeout", "status": latest.get("status", "unreachable")})
     report_status("startup_timeout", result)
@@ -9065,6 +9170,19 @@ def run_temporary_workspace_validation(
         expected_batch = selected_expected_payloads[start_index:end_index]
         if not expected_batch:
             return {"status": "error", "message": "No expected batch identities were available."}
+        def report_validation_batch_observation(evidence, operator_state):
+            if callable(status_callback):
+                status_callback(
+                    "Temporary validation: checking exact vectors",
+                    {
+                        "stage": "validation_batch_reconciliation",
+                        "attempt": evidence.get("attempt"),
+                        "observed": evidence.get("matching_vector_rows") or evidence.get("lancedb_matching_rows") or 0,
+                        "expected": len(expected_batch),
+                        "operator_status": operator_state,
+                    },
+                )
+
         polling = poll_post_upload(
             lambda: verify_anythingllm_post_upload(
                 storage_dir,
@@ -9077,6 +9195,7 @@ def run_temporary_workspace_validation(
             interval_seconds=2.0,
             timeout_seconds=45.0,
             hard_cap_seconds=45.0,
+            observation_callback=report_validation_batch_observation,
             retryable_evidence_codes={"partial_vector_coverage"},
         )
         evidence = dict(polling.final_evidence)
@@ -9124,6 +9243,19 @@ def run_temporary_workspace_validation(
         # bounded, auditable poll before querying retrieval.  Without it, a
         # large but healthy queue can be misclassified as a retrieval defect
         # while it is still actively indexing.
+        def report_validation_document_observation(evidence, operator_state):
+            if callable(status_callback):
+                status_callback(
+                    "Temporary validation: checking document-wide exact vectors",
+                    {
+                        "stage": "validation_document_reconciliation",
+                        "attempt": evidence.get("attempt"),
+                        "observed": evidence.get("matching_vector_rows") or evidence.get("lancedb_matching_rows") or 0,
+                        "expected": len(selected_expected_payloads),
+                        "operator_status": operator_state,
+                    },
+                )
+
         post_upload_poll = poll_post_upload(
             lambda: verify_anythingllm_post_upload(
                 storage_dir,
@@ -9135,6 +9267,7 @@ def run_temporary_workspace_validation(
             interval_seconds=3.0,
             timeout_seconds=180.0,
             hard_cap_seconds=180.0,
+            observation_callback=report_validation_document_observation,
             retryable_evidence_codes={"partial_vector_coverage"},
         )
         post_upload_report = dict(post_upload_poll.final_evidence)
@@ -9685,6 +9818,13 @@ ANYTHINGLLM_EMBEDDING_SUBMISSION_TIMEOUT_FLOOR_SECONDS = 180.0
 ANYTHINGLLM_EMBEDDING_SUBMISSION_TIMEOUT_CAP_SECONDS = 480.0
 ANYTHINGLLM_EMBEDDING_SUBMISSION_TIMEOUT_SAFETY_FACTOR = 1.75
 ANYTHINGLLM_EMBEDDING_SUBMISSION_TIMEOUT_SETUP_SECONDS = 30.0
+# ``update-embeddings`` is synchronous in Desktop even though its work is an
+# asynchronous queue.  Waiting for the HTTP response for a whole document
+# therefore made the normal path blind for the first four minutes of a long
+# queue.  This is only a receipt deadline: after it expires we reconcile the
+# already-submitted queue through SSE and exact local vector evidence, without
+# issuing a duplicate request.
+ANYTHINGLLM_DESKTOP_QUEUE_RECEIPT_TIMEOUT_SECONDS = 20.0
 # A timed-out HTTP response is not an embedding verdict. Give the exact-vector
 # reconciler enough time to observe slow sequential provider work, while still
 # retaining a finite circuit-breaker boundary.
@@ -9930,6 +10070,7 @@ def _update_workspace_embeddings_batched_serial(
     verification_mode="checkpoint",
     verification_interval=ANYTHINGLLM_EMBEDDING_VERIFICATION_CHECKPOINT_INTERVAL,
     adaptive_single_record_threshold_seconds=60.0,
+    submission_timeout_override=None,
 ):
     """Submit a bounded sequence of embedding updates and retain partial progress.
 
@@ -10001,9 +10142,16 @@ def _update_workspace_embeddings_batched_serial(
         start, end = batch_plan[batch_index]
         batch_number = batch_index + 1
         batch = unique_locations[start:end]
-        submission_timeout_seconds = embedding_submission_timeout_seconds(
-            len(batch), observed_seconds_per_record
-        )
+        if submission_timeout_override is None:
+            submission_timeout_seconds = embedding_submission_timeout_seconds(
+                len(batch), observed_seconds_per_record
+            )
+            submission_timeout_basis = (
+                "bootstrap" if observed_seconds_per_record is None else "accepted_warmup_throughput"
+            )
+        else:
+            submission_timeout_seconds = max(1.0, float(submission_timeout_override))
+            submission_timeout_basis = "receipt_deadline_override"
         batch_report = {
             "operation_id": f"embedding-{uuid.uuid4().hex}",
             "batch": batch_number,
@@ -10016,9 +10164,7 @@ def _update_workspace_embeddings_batched_serial(
             "submission_state": "submitting",
             "timing_event": "submission_started",
             "submission_timeout_seconds": submission_timeout_seconds,
-            "submission_timeout_basis": (
-                "bootstrap" if observed_seconds_per_record is None else "accepted_warmup_throughput"
-            ),
+            "submission_timeout_basis": submission_timeout_basis,
             "observed_seconds_per_record": observed_seconds_per_record,
         }
         set_embedding_batch_lifecycle(batch_report, "pending_submission")
@@ -10176,6 +10322,15 @@ def _update_workspace_embeddings_batched_serial(
             # A client timeout does not prove that Desktop rejected the work.
             # Preserve that uncertainty and do not automatically retry it.
             batch_report["submission_state"] = "unresolved"
+            # The short receipt deadline is deliberately not a second
+            # embedding deadline.  It starts one shared, durable observation
+            # budget which later document-wide checks must honour rather than
+            # beginning another full 480-second wait.
+            batch_report["receipt_deadline_elapsed"] = bool(timeout_like)
+            batch_report["reconciliation_started_at_epoch"] = time.time()
+            batch_report["reconciliation_deadline_seconds"] = (
+                ANYTHINGLLM_EMBEDDING_RECONCILIATION_TIMEOUT_SECONDS
+            )
             result["errors"].append(error)
             set_embedding_batch_lifecycle(
                 batch_report,
@@ -10241,21 +10396,37 @@ def _update_workspace_embeddings_batched_serial(
             batch_report["verification_seconds"] = round(time.perf_counter() - verification_started, 4)
             batch_report["verification"] = verification
             verification_status = str(verification.get("status") or "incomplete")
-            batch_report["searchability_proven"] = verification_status in {"pass", "pass_with_review"}
-            if not was_unresolved and verification_status in {"pass", "pass_with_review"}:
+            verification_observed = int(
+                verification.get("matching_vector_rows")
+                or verification.get("lancedb_matching_rows")
+                or 0
+            )
+            exact_vector_coverage = verification_observed >= len(batch)
+            # ``pass_with_review`` means an inspection layer could not make a
+            # clean storage assertion (for example, SQLite was locked while
+            # Desktop was writing). It is never proof that this batch's exact
+            # vectors exist. A timeout must be recovered only by the full
+            # batch's provenance-matched vector count, not a reviewable
+            # observer outcome with zero or partial rows.
+            batch_report["searchability_proven"] = bool(
+                verification_status in {"pass", "pass_with_review"}
+                and exact_vector_coverage
+            )
+            if not was_unresolved and batch_report["searchability_proven"]:
                 set_embedding_batch_lifecycle(
                     batch_report,
                     "vector_observed",
                     "Exact vector evidence was observed after the accepted submission.",
                 )
-            if was_unresolved and verification_status in {
-                "pass", "pass_with_review", "workspace_attached_pending_vectors"
-            }:
+            if was_unresolved and (
+                batch_report["searchability_proven"]
+                or verification_status == "workspace_attached_pending_vectors"
+            ):
                 batch_report["submission_state"] = "accepted"
                 batch_report["accepted"] = len(batch)
                 batch_report["acceptance_basis"] = (
                     "vector_observed_after_client_timeout"
-                    if verification_status in {"pass", "pass_with_review"}
+                    if batch_report["searchability_proven"]
                     else "workspace_attached_after_client_timeout"
                 )
                 result["accepted"] += len(batch)
@@ -10263,7 +10434,7 @@ def _update_workspace_embeddings_batched_serial(
                     result["errors"].remove(unresolved_error)
                 set_embedding_batch_lifecycle(
                     batch_report,
-                    "vector_observed" if verification_status in {"pass", "pass_with_review"} else "workspace_attached",
+                    "vector_observed" if batch_report["searchability_proven"] else "workspace_attached",
                     "Recovered after a client timeout using local AnythingLLM observation.",
                 )
                 result["runtime_events"].append(
@@ -10271,7 +10442,7 @@ def _update_workspace_embeddings_batched_serial(
                         **dict(unresolved_error or {}),
                         "classification": (
                             "client_timeout_recovered_by_vector_observation"
-                            if verification_status in {"pass", "pass_with_review"}
+                            if batch_report["searchability_proven"]
                             else "client_timeout_recovered_by_workspace_attachment"
                         ),
                         "verification_status": verification_status,
@@ -10379,8 +10550,13 @@ def _update_workspace_embeddings_batched_serial(
                         f"AnythingLLM batch {batch_number} accepted; per-batch storage verification deferred "
                         "to the next checkpoint and final document verification"
                     )
-                elif verification_status == "pass_with_review":
+                elif batch_report.get("searchability_proven"):
                     message = f"AnythingLLM batch {batch_number} is searchable; document-list evidence will be finalized after upload"
+                elif verification_status == "pass_with_review":
+                    message = (
+                        f"AnythingLLM batch {batch_number} could not be fully observed while Desktop was writing; "
+                        "exact vector reconciliation remains required"
+                    )
                 else:
                     message = f"AnythingLLM batch {batch_number} is searchable; proceeding to the next batch"
                 status_callback(message, dict(batch_report))
@@ -10438,6 +10614,7 @@ def update_workspace_embeddings_batched(
     adaptive_single_record_threshold_seconds=60.0,
     concurrent_batch_limit=1,
     initial_concurrent_batches=ANYTHINGLLM_EMBEDDING_INITIAL_CONCURRENT_BATCHES,
+    submission_timeout_override=None,
 ):
     """Submit bounded embedding requests.
 
@@ -10463,6 +10640,7 @@ def update_workspace_embeddings_batched(
             verification_mode=verification_mode,
             verification_interval=verification_interval,
             adaptive_single_record_threshold_seconds=adaptive_single_record_threshold_seconds,
+            submission_timeout_override=submission_timeout_override,
         )
 
     unique_locations = list(dict.fromkeys(str(location) for location in locations if location))
@@ -10822,6 +11000,7 @@ def update_workspace_embeddings_desktop_queue(
     batch_verifier=None,
     batch_inspector=None,
     cancel_callback=None,
+    record_label="uploaded files",
 ):
     """Mirror AnythingLLM Desktop's one-submit, sequential queue contract.
 
@@ -10852,18 +11031,141 @@ def update_workspace_embeddings_desktop_queue(
             "errors": [],
         }
 
+    normalized_record_label = str(record_label or "uploaded files").strip() or "uploaded files"
+    queue_state_lock = threading.Lock()
+    queue_state = {
+        "completed": 0,
+        "current": 0,
+        "last_event_type": "",
+        "events_observed": 0,
+        "last_event_monotonic": 0.0,
+        "queue_records": requested,
+    }
+
+    def queue_snapshot():
+        with queue_state_lock:
+            completed = min(requested, max(0, int(queue_state["completed"])))
+            current = min(requested, max(0, int(queue_state["current"])))
+            last_event = float(queue_state["last_event_monotonic"] or 0.0)
+            return {
+                "desktop_queue_completed": completed,
+                "desktop_queue_current": current,
+                "desktop_queue_events_observed": max(0, int(queue_state["events_observed"])),
+                "desktop_queue_last_event_type": str(queue_state["last_event_type"] or ""),
+                "desktop_queue_last_event_age_seconds": (
+                    round(max(0.0, time.monotonic() - last_event), 3)
+                    if last_event else None
+                ),
+                "queue_records": requested,
+            }
+
+    def queue_activity_summary():
+        snapshot = queue_snapshot()
+        completed = int(snapshot["desktop_queue_completed"])
+        current = int(snapshot["desktop_queue_current"])
+        if completed:
+            return f"Desktop completed {completed}/{requested} {normalized_record_label}"
+        if current:
+            return f"Desktop is embedding {current}/{requested} {normalized_record_label}"
+        return f"0/{requested} {normalized_record_label} completed"
+
+    def publish_desktop_queue_event(event):
+        """Relay a matching Desktop queue update through the worker event file.
+
+        ``doc_complete`` means Desktop completed a queued file, not that its
+        vector is already searchable.  That distinction stays explicit until
+        the targeted vector observer has confirmed the page-parent record.
+        """
+        event_type = str((event or {}).get("type") or "").strip()
+        try:
+            position = int((event or {}).get("docIndex") or 0) + 1
+        except (TypeError, ValueError):
+            position = 0
+        try:
+            event_total = int((event or {}).get("totalDocs") or 0)
+        except (TypeError, ValueError):
+            event_total = 0
+        total = requested or event_total
+        if total <= 0:
+            return
+        with queue_state_lock:
+            if event_type == "doc_complete":
+                queue_state["completed"] = max(queue_state["completed"], position)
+            elif event_type in {"doc_starting", "chunk_progress"}:
+                queue_state["current"] = max(queue_state["current"], position)
+            queue_state["last_event_type"] = event_type
+            queue_state["events_observed"] += 1
+            queue_state["last_event_monotonic"] = time.monotonic()
+            completed = min(total, max(0, int(queue_state["completed"])))
+            current = min(total, max(0, int(queue_state["current"])))
+        snapshot = queue_snapshot()
+        if not callable(status_callback):
+            return
+        if event_type == "doc_complete":
+            message = (
+                f"AnythingLLM Desktop queue: {completed}/{total} {normalized_record_label} completed; "
+                "searchable-vector confirmation is still in progress"
+            )
+        elif event_type in {"doc_starting", "chunk_progress"}:
+            message = (
+                f"AnythingLLM Desktop queue: embedding {current}/{total} {normalized_record_label}; "
+                f"{completed}/{total} completed; searchable-vector confirmation follows"
+            )
+        elif event_type == "all_complete":
+            message = (
+                f"AnythingLLM Desktop queue finished {completed}/{total} {normalized_record_label}; "
+                "verifying searchable vectors"
+            )
+        else:
+            return
+        status_callback(
+            message,
+            {
+                "timing_event": (
+                    "desktop_queue_completed"
+                    if event_type == "all_complete"
+                    else "queue_progress"
+                ),
+                "desktop_queue_event_type": event_type,
+                "desktop_events_observed": completed,
+                "desktop_current_record": current,
+                **snapshot,
+                "queue_completion_fraction": completed / total,
+            },
+        )
+
     def desktop_queue_status(message, report):
         if not callable(status_callback):
             return
         normalized = str(message or "")
+        report = {**dict(report or {}), **queue_snapshot()}
+        queue_summary = queue_activity_summary()
         if normalized.startswith("Submitting AnythingLLM batch"):
-            normalized = f"Submitting AnythingLLM sequential queue ({requested} records)"
+            normalized = (
+                f"Submitting AnythingLLM sequential queue ({requested} {normalized_record_label}); "
+                f"{queue_summary}; searchable-vector confirmation follows"
+            )
         elif normalized.startswith("AnythingLLM batch") and "submission accepted" in normalized:
-            normalized = "AnythingLLM queue accepted; final searchable-vector verification is next"
+            normalized = (
+                f"AnythingLLM accepted the sequential queue; {queue_summary}; "
+                "verifying searchable vectors next"
+            )
         elif normalized.startswith("Verifying AnythingLLM batch"):
-            normalized = "Verifying the completed AnythingLLM queue"
+            normalized = (
+                f"Verifying AnythingLLM indexing; {queue_summary}; "
+                "checking exact searchable vectors"
+            )
         elif normalized.startswith("AnythingLLM batch") and "is searchable" in normalized:
-            normalized = "AnythingLLM queue is searchable; continuing final workspace checks"
+            if bool(report.get("searchability_proven")):
+                normalized = (
+                    f"AnythingLLM queue is searchable; {queue_summary}; "
+                    "continuing final workspace checks"
+                )
+            else:
+                normalized = (
+                    f"AnythingLLM queue request finished; {queue_summary}; "
+                    "exact searchable-vector confirmation is still pending"
+                )
         status_callback(normalized, report)
 
     # The Desktop UI opens this exact SSE endpoint alongside its one update
@@ -10876,12 +11178,26 @@ def update_workspace_embeddings_desktop_queue(
         api_key,
         workspace_slug,
         unique_locations,
+        observer_callback=publish_desktop_queue_event,
     )
     # Do not make the write depend on the optional observer, but give the SSE
     # request a small head start. This lets the receipt capture Desktop's
     # initial ``batch_starting`` event when the local server is responsive,
     # without changing the one-request FIFO submission boundary.
     progress_listener["connected_event"].wait(timeout=0.75)
+    def queue_aware_batch_verifier(batch_report):
+        if not callable(batch_verifier):
+            return {}
+        # A mutable, JSON-safe snapshot lets the vector observer report live
+        # SSE queue evidence in its own status line.  It does not make SSE a
+        # success signal and does not alter queue ownership.
+        contextual_report = dict(batch_report)
+        contextual_report["desktop_queue_observer"] = queue_state
+        verification = batch_verifier(contextual_report)
+        if isinstance(verification, dict):
+            return {**verification, "desktop_queue_observer": queue_snapshot()}
+        return verification
+
     try:
         result = update_workspace_embeddings_batched(
             api_url,
@@ -10895,11 +11211,12 @@ def update_workspace_embeddings_desktop_queue(
             warmup_batch_count=0,
             ledger_path=ledger_path,
             status_callback=desktop_queue_status,
-            batch_verifier=batch_verifier,
+            batch_verifier=queue_aware_batch_verifier if callable(batch_verifier) else None,
             batch_inspector=batch_inspector,
             cancel_callback=cancel_callback,
             verification_mode="checkpoint",
             concurrent_batch_limit=1,
+            submission_timeout_override=ANYTHINGLLM_DESKTOP_QUEUE_RECEIPT_TIMEOUT_SECONDS,
         )
     finally:
         progress_listener["stop_event"].set()
@@ -10909,21 +11226,6 @@ def update_workspace_embeddings_desktop_queue(
         # Keep this diagnostic in the ledger rather than making a valid queue
         # submission fail merely because the optional stream was unavailable.
         result["runtime_events"].extend(progress_listener["errors"])
-    completed_events = sum(
-        1
-        for event in progress_listener["events"]
-        if str(event.get("type") or "") == "doc_complete"
-    )
-    if completed_events and callable(status_callback):
-        completion_count = (
-            f"{completed_events}/{requested}"
-            if requested
-            else f"{completed_events} completed records; queue total not yet confirmed"
-        )
-        status_callback(
-            f"AnythingLLM Desktop event stream observed {completion_count}; verifying searchable vectors",
-            {"desktop_events_observed": completed_events, "queue_records": requested},
-        )
     result["submission_strategy"] = ANYTHINGLLM_EMBEDDING_SUBMISSION_STRATEGY
     result["queue_records"] = requested
     result["queue_cancellation_boundary"] = "before_submission_only"
@@ -10945,6 +11247,7 @@ def update_workspace_embeddings_desktop_queue(
             "Desktop queue events are observational only; exact vector and retrieval "
             "verification determine run success."
         ),
+        "final_queue_snapshot": queue_snapshot(),
     }
     return result
 
@@ -10966,6 +11269,7 @@ def maybe_upload_payloads(
     cancel_callback=None,
     submission_receipt_path=None,
     run_id="",
+    record_label="uploaded files",
 ):
     if not api_url:
         return {"status": "error_missing_api_url", "uploaded": 0, "embedded": 0, "errors": [{"error": "Missing AnythingLLM API URL."}]}
@@ -11030,6 +11334,15 @@ def maybe_upload_payloads(
                     )
                     if location:
                         locations.append(location)
+                    if callable(status_callback):
+                        status_callback(
+                            f"Attaching prepared records to AnythingLLM: {uploaded}/{len(upload_rows)} accepted",
+                            {
+                                "timing_event": "attachment_progress",
+                                "attachments_completed": uploaded,
+                                "attachments_total": len(upload_rows),
+                            },
+                        )
                 else:
                     errors.append({"status": status, "segment": payload.get("metadata", {}).get("chunkSource", "")})
                     record_submission_receipt(
@@ -11060,6 +11373,7 @@ def maybe_upload_payloads(
                 batch_verifier=batch_verifier,
                 batch_inspector=batch_inspector,
                 cancel_callback=cancel_callback,
+                record_label=record_label,
             )
             embedded = embedding_update["accepted"]
             errors.extend(embedding_update["errors"])
@@ -11139,6 +11453,7 @@ def maybe_upload_segment_files(
     cancel_callback=None,
     submission_receipt_path=None,
     run_id="",
+    record_label="uploaded files",
 ):
     if not api_url:
         return {"status": "error_missing_api_url", "uploaded": 0, "embedded": 0, "errors": [{"error": "Missing AnythingLLM API URL."}]}
@@ -11245,6 +11560,15 @@ def maybe_upload_segment_files(
                                 )
                                 break
                         locations.append(location)
+                    if callable(status_callback):
+                        status_callback(
+                            f"Attaching page-parent files to AnythingLLM: {uploaded}/{len(selected_rows)} accepted",
+                            {
+                                "timing_event": "attachment_progress",
+                                "attachments_completed": uploaded,
+                                "attachments_total": len(selected_rows),
+                            },
+                        )
                 else:
                     errors.append({"status": status, "segment": row.get("chunkSource", ""), "filename": row.get("filename", "")})
                     record_submission_receipt(
@@ -11277,6 +11601,7 @@ def maybe_upload_segment_files(
                 batch_verifier=batch_verifier,
                 batch_inspector=batch_inspector,
                 cancel_callback=cancel_callback,
+                record_label=record_label,
             )
             embedded = embedding_update["accepted"]
             errors.extend(embedding_update["errors"])
@@ -11360,6 +11685,7 @@ def maybe_upload_to_anythingllm(
     cancel_callback=None,
     submission_receipt_path=None,
     run_id="",
+    record_label="uploaded files",
 ):
     transport = str(upload_transport or "raw_text").strip().casefold()
     if transport == "file_upload":
@@ -11397,6 +11723,7 @@ def maybe_upload_to_anythingllm(
             cancel_callback=cancel_callback,
             submission_receipt_path=submission_receipt_path,
             run_id=run_id,
+            record_label=record_label,
         )
     return maybe_upload_payloads(
         api_url,
@@ -11415,6 +11742,7 @@ def maybe_upload_to_anythingllm(
         cancel_callback=cancel_callback,
         submission_receipt_path=submission_receipt_path,
         run_id=run_id,
+        record_label=record_label,
     )
 
 
@@ -11625,17 +11953,18 @@ def runtime_validation_query_text(payload, limit=240):
 
 
 def select_runtime_validation_payloads(payloads, upload_limit=0, limit=2, upload_indices=None):
-    """Pick representative, body-rich uploaded fragments for live probes.
+    """Pick deterministic, stratified, body-rich fragments for live probes.
 
     The selected records remain exact upload payloads and are spread across
-    pages when page metadata is available. Source identity is checked within
-    the returned result set; ranking remains diagnostic because shared
-    workspaces can legitimately contain a more similar sibling chunk.
+    the document rather than repeatedly favouring the strongest early pages.
+    Within each stratum, a stable content-quality score chooses the probe. The
+    determinism makes a failed sample reproducible for later diagnosis.
     """
     candidates = list(select_upload_payloads(payloads, upload_limit, upload_indices))
     if len(candidates) <= 1:
         return candidates
 
+    requested = max(1, min(int(limit or 1), len(candidates)))
     scored = []
     for index, payload in enumerate(candidates):
         query = runtime_validation_query_text(payload)
@@ -11646,29 +11975,75 @@ def select_runtime_validation_payloads(payloads, upload_limit=0, limit=2, upload
         expected = expected_page_segment_tokens(payload)
         score = alpha + (len({word.casefold() for word in words}) * 5) + (punctuation * 8) - (digits * 3)
         scored.append((score, index, expected.get("page_number"), payload))
-    scored.sort(key=lambda row: (-row[0], row[1]))
+    if requested == 1:
+        return [max(scored, key=lambda row: (row[0], -row[1]))[3]]
+
     chosen = []
     pages = set()
-    for _score, _index, page_number, payload in scored:
-        if page_number is not None and page_number in pages:
+    # Do not let a page made entirely of a letterhead, a page number, or OCR
+    # noise consume one of the few live probes merely because it happens to
+    # be in the first document stratum.
+    strongest_score = max(row[0] for row in scored)
+    substantive = [row for row in scored if row[0] >= max(120, strongest_score * 0.45)]
+    if not substantive:
+        substantive = list(scored)
+    for stratum in range(requested):
+        start = (stratum * len(scored)) // requested
+        end = max(start + 1, ((stratum + 1) * len(scored)) // requested)
+        # Prefer a substantive probe in each contiguous document region, but
+        # do not collapse a multi-page sample onto the same page.
+        region = sorted(
+            [row for row in scored[start:end] if row in substantive],
+            key=lambda row: (-row[0], row[1]),
+        )
+        selected = next(
+            (row for row in region if row[2] is None or row[2] not in pages),
+            None,
+        )
+        if selected is None:
+            midpoint = (start + end - 1) / 2.0
+            selected = next(
+                (
+                    row
+                    for row in sorted(
+                        substantive,
+                        key=lambda row: (abs(row[1] - midpoint), -row[0], row[1]),
+                    )
+                    if row[3] not in chosen and (row[2] is None or row[2] not in pages)
+                ),
+                None,
+            )
+        if selected is None:
+            continue
+        _score, _index, page_number, payload = selected
+        if payload in chosen:
             continue
         chosen.append(payload)
         if page_number is not None:
             pages.add(page_number)
-        if len(chosen) >= limit:
-            return chosen
     # Multiple fragments from the same PDF page exercise the same provenance
     # and workspace lane. One strong probe for that page is sufficient; do
     # not refill the quota with a duplicate-page request merely because the
     # document has only one page (or the upload scope was a two-fragment pilot).
     if pages:
         return chosen
-    for _score, _index, _page_number, payload in scored:
+    for _score, _index, _page_number, payload in sorted(scored, key=lambda row: (-row[0], row[1])):
         if payload not in chosen:
             chosen.append(payload)
-        if len(chosen) >= limit:
+        if len(chosen) >= requested:
             break
     return chosen
+
+
+def runtime_validation_sample_size(payloads, upload_limit=0, upload_indices=None):
+    """Return a small, bounded retrieval sample for one confirmed upload."""
+    count = len(select_upload_payloads(payloads, upload_limit, upload_indices))
+    if count <= 1:
+        return count
+    # Four samples cover the usual medium PDF in early/middle/late regions;
+    # five is the cap for large files so retrieval diagnostics never become a
+    # second sequential queue.
+    return min(5, max(2, int(math.ceil(math.sqrt(count)))))
 
 
 def response_contains_page_segment(response_text, expected):
@@ -11711,6 +12086,7 @@ def validate_anythingllm_native_runtime(
     vector_timeout_seconds=45,
     vector_max_attempts=2,
     retry_timed_out_siblings=True,
+    status_callback=None,
 ):
     validation_started = time.perf_counter()
     embedder_probe = (
@@ -11766,6 +12142,15 @@ def validate_anythingllm_native_runtime(
         }
         for payload in selected_payloads
     ]
+
+    def report_validation_progress(stage, **details):
+        if not callable(status_callback):
+            return
+        try:
+            status_callback(str(stage), dict(details))
+        except Exception:
+            # Runtime validation evidence must not depend on a UI observer.
+            pass
 
     def execute_vector_check(payload, probe_index, probe_kind, max_attempts=None, recheck_of=""):
         """Run one provenance-gated vector query and retain its exact evidence."""
@@ -11829,9 +12214,23 @@ def validate_anythingllm_native_runtime(
                 probe_kind = "distinctive_exact_anchor"
             else:
                 probe_kind = "natural_language_anchor"
+            report_validation_progress(
+                "vector_probe_started",
+                completed=probe_index,
+                total=len(selected_payloads),
+                probe_kind=probe_kind,
+            )
             result["vector_checks"].append(execute_vector_check(payload, probe_index, probe_kind))
+            report_validation_progress(
+                "vector_probe_completed",
+                completed=probe_index + 1,
+                total=len(selected_payloads),
+                probe_kind=probe_kind,
+                result_status=("pass" if result["vector_checks"][-1].get("expected_in_top_n") else "review"),
+            )
 
         if include_chat_probe and selected_payloads:
+            report_validation_progress("chat_probe_started", completed=0, total=1)
             expected = expected_page_segment_tokens(selected_payloads[0])
             prompt = (
                 "Using only the indexed sources, identify the PDF page "
@@ -11888,6 +12287,12 @@ def validate_anythingllm_native_runtime(
                 "retry_count": chat_response.get("retry_count", 0),
                 "attempts": chat_response.get("attempts", []),
             }
+            report_validation_progress(
+                "chat_probe_completed",
+                completed=1,
+                total=1,
+                result_status=("pass" if result["chat_check"].get("response_contains_expected_page_segment") else "review"),
+            )
 
         # A successful sibling vector query establishes that the workspace is
         # searchable, while a timed-out sibling can simply have hit a cold
@@ -11904,7 +12309,12 @@ def validate_anythingllm_native_runtime(
             ]
             if timed_out_checks:
                 result["vector_recheck_status"] = "attempted"
-                for probe_index, payload, original in timed_out_checks:
+                for recheck_index, (probe_index, payload, original) in enumerate(timed_out_checks, start=1):
+                    report_validation_progress(
+                        "vector_recheck_started",
+                        completed=recheck_index - 1,
+                        total=len(timed_out_checks),
+                    )
                     recheck = execute_vector_check(
                         payload,
                         probe_index,
@@ -11913,6 +12323,12 @@ def validate_anythingllm_native_runtime(
                         recheck_of=original.get("expected_chunk_source") or "",
                     )
                     result["vector_checks"].append(recheck)
+                    report_validation_progress(
+                        "vector_recheck_completed",
+                        completed=recheck_index,
+                        total=len(timed_out_checks),
+                        result_status=("pass" if recheck.get("expected_in_top_n") else "review"),
+                    )
                 rechecks = result["vector_checks"][len(initial_vector_checks):]
                 result["vector_recheck_status"] = (
                     "recovered" if all(check.get("expected_in_top_n") for check in rechecks) else "still_unresolved"
@@ -12156,10 +12572,16 @@ def inspect_native_metadata_count(
     """
     result = {
         "status": "not_inspected",
-        "observation_mode": "bounded_count_and_one_row_sample",
+        "observation_mode": "bounded_count_and_identity_set_on_completion",
         "sample_limit": 1,
         "matching_rows": 0,
         "chunk_source_filter_count": 0,
+        "identity_set_checked": False,
+        "identity_set_complete": None,
+        "expected_chunk_source_count": 0,
+        "observed_chunk_source_count": 0,
+        "duplicate_chunk_source_count": 0,
+        "missing_chunk_sources": [],
         "matching_table_names": [],
         "metadata_fields_seen": [],
         "text_contains_segment_or_page": False,
@@ -12190,6 +12612,7 @@ def inspect_native_metadata_count(
             }
         )
         result["chunk_source_filter_count"] = len(normalized_chunk_sources)
+        result["expected_chunk_source_count"] = len(normalized_chunk_sources)
         # Per-batch polling must observe the precise submitted identities, not
         # every segment previously indexed for the same PDF. A final full
         # diagnostic observation still checks all metadata and text fields.
@@ -12215,6 +12638,41 @@ def inspect_native_metadata_count(
                 text = str(sample.iloc[0].get("text") or "")
                 result["text_contains_source_document"] = "sourceDocument" in text
                 result["text_contains_segment_or_page"] = text_contains_page_or_segment_metadata(text)
+        # A count proves that *some* matching rows exist, but equal counts can
+        # still conceal a duplicated page-parent plus a missing sibling. Once
+        # the bounded count reaches the planned total, fetch only the scalar
+        # identity column and compare its complete set. This avoids reading
+        # dense vectors and full text in the ordinary healthy path while
+        # retaining complete coverage proof for every planned page-parent.
+        if (
+            normalized_chunk_sources
+            and "chunkSource" in columns
+            and result["matching_rows"] >= len(normalized_chunk_sources)
+        ):
+            identities = (
+                table.search()
+                .where(row_filter, prefilter=True)
+                .select(["chunkSource"])
+                .limit(result["matching_rows"] + 1)
+                .to_pandas()
+            )
+            observed_sources = [
+                str(value).strip()
+                for value in identities.get("chunkSource", []).tolist()
+                if str(value).strip()
+            ]
+            observed_set = set(observed_sources)
+            expected_set = set(normalized_chunk_sources)
+            missing_sources = sorted(expected_set - observed_set)
+            result["identity_set_checked"] = True
+            result["observed_chunk_source_count"] = len(observed_set)
+            result["duplicate_chunk_source_count"] = max(0, len(observed_sources) - len(observed_set))
+            result["missing_chunk_sources"] = missing_sources[:25]
+            result["identity_set_complete"] = bool(
+                not missing_sources
+                and not result["duplicate_chunk_source_count"]
+                and len(observed_sources) == len(expected_set)
+            )
         result["status"] = "complete"
     except Exception as exc:
         result["status"] = "database_busy" if "lock" in str(exc).casefold() or "busy" in str(exc).casefold() else "error"
@@ -12529,6 +12987,12 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
         "upload_chain_lancedb_matching_count": 0,
         "chunk_survival_ratio": 0.0,
         "chunk_survival_flag": "unknown",
+        "identity_set_checked": False,
+        "identity_set_complete": None,
+        "expected_chunk_source_count": 0,
+        "observed_chunk_source_count": 0,
+        "duplicate_chunk_source_count": 0,
+        "missing_chunk_sources": [],
         "page_provenance_risk": "unknown",
         "classification": "not_checked",
         "message": "",
@@ -12711,6 +13175,12 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
             native_rows.get("matching_rows", 0),
             vector_rows.get("matching_rows", 0),
         )
+        result["identity_set_checked"] = bool(native_rows.get("identity_set_checked", False))
+        result["identity_set_complete"] = native_rows.get("identity_set_complete")
+        result["expected_chunk_source_count"] = int(native_rows.get("expected_chunk_source_count") or 0)
+        result["observed_chunk_source_count"] = int(native_rows.get("observed_chunk_source_count") or 0)
+        result["duplicate_chunk_source_count"] = int(native_rows.get("duplicate_chunk_source_count") or 0)
+        result["missing_chunk_sources"] = list(native_rows.get("missing_chunk_sources") or [])
         result["upload_chain_lancedb_matching_count"] = result["lancedb_matching_rows"]
         result["lancedb_matching_tables"] = native_rows.get("matching_table_names", [])
         result["lancedb_text_contains_page_or_segment"] = bool(
@@ -12731,7 +13201,10 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
                 result["chunk_survival_flag"] = "partial_or_missing"
         elif result["uploaded_payload_count"] > 0:
             result["chunk_survival_flag"] = "missing_after_upload"
-        if result["lancedb_text_contains_page_or_segment"]:
+        identity_provenance_evidence = bool(
+            result["identity_set_checked"] and result["identity_set_complete"]
+        )
+        if result["lancedb_text_contains_page_or_segment"] or identity_provenance_evidence:
             result["page_provenance_risk"] = "low"
         elif result["lancedb_matching_rows"] > 0:
             result["page_provenance_risk"] = "medium"
@@ -12746,7 +13219,15 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
         # cancelled/failed embedding batch can leave genuinely retrievable
         # vectors behind.  Report that honestly instead of letting the later
         # document/vector branches call the upload a pass.
-        if result["chunk_survival_flag"] == "partial_or_missing":
+        if result["identity_set_checked"] and not result["identity_set_complete"]:
+            result["status"] = "partial_vector_coverage"
+            result["classification"] = "page_parent_identity_set_mismatch"
+            result["message"] = (
+                "The target workspace did not expose one exact identity for every planned page-parent "
+                f"({result['observed_chunk_source_count']}/{result['expected_chunk_source_count']} unique; "
+                f"{result['duplicate_chunk_source_count']} duplicate row(s)). Reconciliation or deep verification is required."
+            )
+        elif result["chunk_survival_flag"] == "partial_or_missing":
             result["status"] = "partial_vector_coverage"
             result["classification"] = "planned_payloads_not_fully_observed"
             result["message"] = (
@@ -12761,7 +13242,7 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
                 # by design. Do not turn that deferred observation into a
                 # false document-list warning when exact expected vectors and
                 # page/segment provenance are already present.
-                if result["lancedb_text_contains_page_or_segment"]:
+                if result["lancedb_text_contains_page_or_segment"] or identity_provenance_evidence:
                     result["status"] = "pass"
                     result["classification"] = "native_metadata_llm_visible_fast_document_observation_deferred"
                     result["message"] = (
@@ -12777,7 +13258,7 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
                         "fast observation. Use Verify deeply before relying on page-cited retrieval."
                     )
             elif result["workspace_documents_globally_unused"]:
-                if result["lancedb_text_contains_page_or_segment"]:
+                if result["lancedb_text_contains_page_or_segment"] or identity_provenance_evidence:
                     result["status"] = "pass"
                     result["classification"] = "native_metadata_llm_visible_legacy_workspace_table_unused"
                     result["message"] = (
@@ -12820,7 +13301,7 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
             result["status"] = "docs_without_vectors"
             result["classification"] = "uploaded_not_embedded"
             result["message"] = "Matching workspace documents exist, but no vector rows were found."
-        elif result["lancedb_text_contains_page_or_segment"]:
+        elif result["lancedb_text_contains_page_or_segment"] or identity_provenance_evidence:
             result["status"] = "pass"
             result["classification"] = "native_metadata_llm_visible"
             result["message"] = "Matching documents and vectors exist, and LanceDB text appears to include page/segment metadata."
@@ -13488,13 +13969,26 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
     total_started = time.perf_counter()
     progress_callback = getattr(args, "progress_callback", None)
 
-    def report_progress(value, stage, *, desktop_required=False):
+    def report_progress(
+        value,
+        stage,
+        *,
+        desktop_required=False,
+        phase="",
+        completed_units=None,
+        total_units=None,
+        evidence_kind="",
+    ):
         if callable(progress_callback):
             try:
                 progress_callback(
                     float(value),
                     str(stage),
                     desktop_required=bool(desktop_required),
+                    phase=str(phase or ""),
+                    completed_units=completed_units,
+                    total_units=total_units,
+                    evidence_kind=str(evidence_kind or ""),
                 )
             except TypeError:
                 # The Advanced diagnostics callback predates the structured
@@ -13508,24 +14002,102 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
                 return False
         return True
 
+    progress_prepare_and_upload = bool(getattr(args, "prepare_and_upload", False))
+
+    def report_upload_phase(
+        phase,
+        stage,
+        *,
+        completed_units=None,
+        total_units=None,
+        fallback_fraction=0.0,
+        desktop_required=False,
+        evidence_kind="measured",
+    ):
+        """Emit one named upload phase with count-first progress evidence.
+
+        Automatic upload uses this instead of the historical source values
+        (which mixed local extraction and Desktop indexing).  Other callers
+        keep their existing progress callback contract through the supplied
+        fallback fraction.
+        """
+        if progress_prepare_and_upload:
+            start, end = AUTOMATIC_UPLOAD_PHASE_RANGES[str(phase)]
+            try:
+                completed = max(0.0, float(completed_units))
+                total = max(0.0, float(total_units))
+                fraction = min(1.0, completed / total) if total else max(0.0, min(1.0, fallback_fraction))
+            except (TypeError, ValueError):
+                fraction = max(0.0, min(1.0, fallback_fraction))
+            report_progress(
+                start + (end - start) * fraction,
+                stage,
+                desktop_required=desktop_required,
+                phase=phase,
+                completed_units=completed_units,
+                total_units=total_units,
+                evidence_kind=evidence_kind,
+            )
+        else:
+            report_progress(fallback_fraction, stage, desktop_required=desktop_required)
+
     pdf_path = Path(pdf_path)
     # Native ingestion is normally the slowest user-visible phase.  Give it a
     # proportionate evidence range rather than making a three-of-twenty batch
     # upload appear ~82% complete.  Local-only preparation retains the older
     # packaging-oriented range because it has no embedding phase.
-    progress_prepare_and_upload = bool(getattr(args, "prepare_and_upload", False))
     selection_progress = 0.15 if progress_prepare_and_upload else 0.60
     metadata_progress = 0.20 if progress_prepare_and_upload else 0.72
     storage_progress = 0.23 if progress_prepare_and_upload else PIPELINE_PROGRESS_STORAGE_INSPECTION
-    embedding_start_progress = 0.25 if progress_prepare_and_upload else PIPELINE_PROGRESS_EMBEDDING_START
-    embedding_end_progress = PIPELINE_PROGRESS_EMBEDDING_END
-    report_progress(0.01, "Reading PDF metadata")
+    report_upload_phase(
+        "metadata",
+        "Reading PDF metadata",
+        completed_units=0,
+        total_units=1,
+        fallback_fraction=0.01,
+        evidence_kind="phase_started",
+    )
     metadata_started = time.perf_counter()
-    source_sha = sha256_file(pdf_path)
+    def report_hash_progress(completed, total):
+        mib = 1024 * 1024
+        report_upload_phase(
+            "metadata",
+            f"Hashing source PDF: {float(completed) / mib:.1f}/{max(1.0, float(total) / mib):.1f} MiB",
+            completed_units=completed,
+            total_units=total,
+            fallback_fraction=0.0,
+            evidence_kind="source_hash_progress",
+        )
+
+    source_sha = sha256_file(pdf_path, progress_callback=report_hash_progress)
+    def report_metadata_progress(step, completed, total):
+        detail = (
+            "Profiling PDF page geometry"
+            if str(step) == "page_geometry"
+            else "Sampling PDF metadata for author detection"
+        )
+        report_upload_phase(
+            "metadata",
+            f"{detail}: {int(completed)}/{max(1, int(total))}",
+            completed_units=completed,
+            total_units=total,
+            fallback_fraction=0.0,
+            evidence_kind="metadata_progress",
+        )
+
     pdf_meta = pdf_metadata(
         pdf_path,
         include_page_geometry=True,
         include_author_samples=True,
+        progress_callback=report_metadata_progress,
+    )
+    report_upload_phase(
+        "metadata",
+        "PDF metadata and page profile ready",
+        completed_units=1,
+        total_units=1,
+        fallback_fraction=0.05,
+        evidence_kind="phase_completed",
     )
     author_text_samples = pdf_meta.pop("_author_text_samples", [])
     author_sample_error = str(pdf_meta.pop("_author_sample_error", "") or "")
@@ -13785,16 +14357,23 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
             "resolved_strategy": active_unstructured["resolved"],
             "selection_reason": active_unstructured["reason"],
         }
-        report_progress(
-            0.08 + (backend_index / max(len(backend_names), 1)) * 0.48,
-            (
-                f"Extracting and evaluating with {backend}"
-                + (
-                    f" ({active_unstructured['resolved']})"
-                    if backend == "unstructured"
-                    else ""
-                )
-            ),
+        extraction_label = (
+            f"Extracting and evaluating with {backend}"
+            + (
+                f" ({active_unstructured['resolved']})"
+                if backend == "unstructured"
+                else ""
+            )
+        )
+        known_pages = max(1, int(pdf_meta.get("pdf_page_count") or 0))
+        extraction_total = max(1, known_pages * max(1, len(backend_names)))
+        report_upload_phase(
+            "extraction",
+            extraction_label,
+            completed_units=backend_index * known_pages,
+            total_units=extraction_total,
+            fallback_fraction=backend_index / max(1, len(backend_names)),
+            evidence_kind="phase_started",
         )
         candidate_dir = out_root / "candidates" / backend
         candidate_dir.mkdir(parents=True, exist_ok=True)
@@ -13819,6 +14398,19 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
             continue
         backend_started = time.perf_counter()
         try:
+            def report_backend_page_progress(completed, total):
+                page_total = max(1, int(total or known_pages))
+                aggregate_total = max(1, page_total * max(1, len(backend_names)))
+                aggregate_completed = backend_index * page_total + min(page_total, max(0, int(completed or 0)))
+                report_upload_phase(
+                    "extraction",
+                    f"{extraction_label}: {min(page_total, max(0, int(completed or 0)))}/{page_total} pages processed",
+                    completed_units=aggregate_completed,
+                    total_units=aggregate_total,
+                    fallback_fraction=aggregate_completed / aggregate_total,
+                    evidence_kind="page_completed",
+                )
+
             pages, page_count, element_rows = get_backend_pages(
                 pdf_path,
                 backend,
@@ -13829,6 +14421,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
                     if backend == "unstructured"
                     else None
                 ),
+                progress_callback=report_backend_page_progress,
             )
             layout_evidence = {
                 "status": "not_applied",
@@ -14207,9 +14800,13 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
                     probes[: args.max_vector_probes],
                     simulation_adapter,
                     max_segments=len(vector_eval_rows),
-                    progress_callback=lambda done, total, stage, backend_index=backend_index, backend_count=len(backend_names): report_progress(
-                        0.42 + (backend_index / max(backend_count, 1)) * 0.16 + (0.16 / max(backend_count, 1)) * (done / max(total, 1)),
+                    progress_callback=lambda done, total, stage: report_upload_phase(
+                        "candidate_evaluation",
                         stage,
+                        completed_units=done,
+                        total_units=total,
+                        fallback_fraction=done / max(total, 1),
+                        evidence_kind="evaluation_unit_completed",
                     ),
                 )
                 candidate["vector_results"] = vector_results
@@ -14325,7 +14922,14 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
     selection_stage = f"Selected {selected['backend']} and writing output variants"
     if ocr_evidence["used"]:
         selection_stage += " — OCR-assisted extraction observed"
-    report_progress(selection_progress, selection_stage)
+    report_upload_phase(
+        "candidate_evaluation",
+        selection_stage,
+        completed_units=1,
+        total_units=1,
+        fallback_fraction=selection_progress,
+        evidence_kind="selection_completed",
+    )
     readiness_reasons = []
     exact_vector_fail = any(
         row.get("kind") in {"exact_phrase", "user_exact_phrase"} and row.get("status") == "fail"
@@ -14608,9 +15212,13 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
     lean_retention = bool(getattr(args, "lean_retention", False))
     requested_upload_transport = getattr(args, "native_upload_transport", "raw_text")
     materialize_metadata_artifacts = not lean_retention or requested_upload_transport == "file_upload"
-    report_progress(
-        metadata_progress,
+    report_upload_phase(
+        "payloads",
         "Preparing native upload payloads" if lean_retention else "Generating native metadata payloads and test kit",
+        completed_units=0,
+        total_units=1,
+        fallback_fraction=metadata_progress,
+        evidence_kind="phase_started",
     )
     strict_payloads = generate_api_payloads(selected["segments"], "strict")
     native_payloads = generate_api_payloads(selected["segments"], "native_header")
@@ -14685,13 +15293,17 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
     )
     inspection_context.setdefault("inspection_dirs", []).append(str(inspection_dir))
     global_reads = inspection_context.setdefault("global_read_only", {})
-    report_progress(
-        storage_progress,
+    report_upload_phase(
+        "payloads",
         (
             "Reusing batch-global AnythingLLM configuration inspection"
             if inspection_reused else
             "Inspecting AnythingLLM configuration and storage read-only"
         ),
+        completed_units=1,
+        total_units=1,
+        fallback_fraction=storage_progress,
+        evidence_kind="payloads_ready",
     )
     if not inspection_reused:
         # These reads are batch-global: author regression samples, Desktop
@@ -14722,15 +15334,35 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
                 "passed": 0,
                 "failed": 0,
             }
-        with measured_pipeline_phase(args, "anythingllm_batch_read_only_inspection"):
-            global_reads["storage_report"] = inspect_anythingllm_storage(storage_dir)
-            global_reads["workspace_gate"] = read_workspace_model_gate(storage_dir, target_workspace_slug)
-            global_reads["metadata_schema_report"] = get_anythingllm_metadata_schema(
+        inspection_steps = [
+            ("Reading local AnythingLLM storage baseline", "storage_report", lambda: inspect_anythingllm_storage(storage_dir)),
+            ("Reading workspace model configuration", "workspace_gate", lambda: read_workspace_model_gate(storage_dir, target_workspace_slug)),
+            ("Reading AnythingLLM metadata schema", "metadata_schema_report", lambda: get_anythingllm_metadata_schema(
                 (args.anythingllm_api_url or "").strip(), args.anythingllm_api_key,
-            )
-            global_reads["workspace_layer_report"] = workspace_storage_inspector(
+            )),
+            ("Reading workspace storage layout", "workspace_layer_report", lambda: workspace_storage_inspector(
                 storage_dir, target_workspace_slug
-            )
+            )),
+        ]
+        with measured_pipeline_phase(args, "anythingllm_batch_read_only_inspection"):
+            for step_index, (label, key, inspector) in enumerate(inspection_steps, start=1):
+                report_upload_phase(
+                    "payloads",
+                    f"{label} ({step_index}/{len(inspection_steps)})",
+                    completed_units=step_index - 1,
+                    total_units=len(inspection_steps),
+                    fallback_fraction=0.0,
+                    evidence_kind="read_only_inspection_started",
+                )
+                global_reads[key] = inspector()
+                report_upload_phase(
+                    "payloads",
+                    f"{label} complete ({step_index}/{len(inspection_steps)})",
+                    completed_units=step_index,
+                    total_units=len(inspection_steps),
+                    fallback_fraction=0.0,
+                    evidence_kind="read_only_inspection_completed",
+                )
     author_eval = dict(global_reads.get("author_eval") or {})
     storage_report = dict(global_reads.get("storage_report") or {"status": "not_available"})
     workspace_gate = dict(global_reads.get("workspace_gate") or {"status": "not_available"})
@@ -14818,26 +15450,30 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
         # This reaches the Gradio progress channel through the existing typed
         # preparation callback. It is stage evidence, never a completion claim.
         batch_report = batch_report or {}
-        total_batches = max(1, int(batch_report.get("total_batches") or 1))
-        batch_number = max(1, int(batch_report.get("batch") or 1))
         timing_event = str(batch_report.get("timing_event") or "status")
-        if timing_event == "batch_completed":
-            within_batch = 1.0
-        elif timing_event in {"submission_completed", "verification_started"}:
-            within_batch = .55
+        if timing_event == "attachment_progress":
+            phase = "attachments"
+            completed = int(batch_report.get("attachments_completed") or 0)
+            total = int(batch_report.get("attachments_total") or 0)
+        elif timing_event in {"queue_progress", "desktop_queue_completed"}:
+            phase = "desktop_queue"
+            completed = int(batch_report.get("desktop_events_observed") or 0)
+            total = int(batch_report.get("queue_records") or 0)
         else:
-            within_batch = 0.0
-        # Embedding is a substantial, observable portion of a native run.
-        # Its range begins after the storage inspection and grows only as a
-        # batch is submitted/verified.  The ordering must stay monotonic: a
-        # prior 0.82 inspection callback followed by a 0.60 batch callback
-        # caused the UI to hold progress artificially, then leap near the end.
-        report_progress(
-            embedding_start_progress
-            + (embedding_end_progress - embedding_start_progress)
-            * ((batch_number - 1 + within_batch) / total_batches),
+            # Request acceptance is useful state, but it is not vector
+            # evidence. Keep it at the current queue checkpoint until either
+            # Desktop emits per-file events or the exact observer sees rows.
+            phase = "desktop_queue"
+            completed = int(batch_report.get("desktop_events_observed") or 0)
+            total = int(batch_report.get("queue_records") or batch_report.get("requested") or 0)
+        report_upload_phase(
+            phase,
             stage,
+            completed_units=completed,
+            total_units=total,
+            fallback_fraction=0.0,
             desktop_required=True,
+            evidence_kind=str(batch_report.get("desktop_queue_event_type") or timing_event),
         )
         timing_callback = getattr(args, "timing_event_callback", None)
         if callable(timing_callback):
@@ -14904,6 +15540,11 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
         if upload_transport == "file_upload" and upload_plan_rows
         else select_upload_payloads(payloads_to_upload, args.upload_limit, upload_indices)
     )
+    vector_record_label = (
+        "page-parent vectors"
+        if upload_representation == "page_parents"
+        else "segment vectors"
+    )
 
     def verify_embedding_batch(batch_report):
         """Reconcile a batch through attachment first, then vector evidence.
@@ -14917,42 +15558,258 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
         end_index = int(batch_report.get("end_index") or start_index)
         expected_batch = expected_upload_payloads[start_index:end_index]
         batch_number = int(batch_report.get("batch") or 0)
-        total_batches = max(1, int(batch_report.get("total_batches") or 1))
         if not expected_batch:
             return {
                 "status": "error",
                 "message": f"No expected payload identity was available for batch {batch_number}.",
             }
 
+        unresolved_submission = str(batch_report.get("submission_state") or "") == "unresolved"
+        reconciliation_started_at = float(
+            batch_report.get("reconciliation_started_at_epoch") or time.time()
+        )
+        reconciliation_deadline = max(
+            0.0,
+            float(
+                batch_report.get("reconciliation_deadline_seconds")
+                or ANYTHINGLLM_EMBEDDING_RECONCILIATION_TIMEOUT_SECONDS
+            ),
+        )
+        reconciliation_tracker = {
+            "highest_observed": 0,
+            "last_vector_progress_elapsed_seconds": None,
+            "storage_busy_observed": False,
+            # Fast observations are deliberately cheap enough to run on the
+            # normal two-second cadence.  The two scheduled diagnostics below
+            # are a *read-only* deeper look at the workspace/document state;
+            # they never enqueue, restart Desktop, retry an upload, or alter
+            # the recovery decision by themselves.
+            "completed_read_only_checkpoints": set(),
+            "read_only_checkpoints": [],
+        }
+
+        def live_desktop_queue_snapshot():
+            # ``update_workspace_embeddings_desktop_queue`` supplies a
+            # JSON-safe mutable SSE snapshot.  Non-Desktop callers simply
+            # receive an empty context.
+            raw = batch_report.get("desktop_queue_observer")
+            if not isinstance(raw, dict):
+                return {}
+            last_event = float(raw.get("last_event_monotonic") or 0.0)
+            return {
+                "desktop_queue_completed": max(0, int(raw.get("completed") or 0)),
+                "desktop_queue_current": max(0, int(raw.get("current") or 0)),
+                "desktop_queue_events_observed": max(0, int(raw.get("events_observed") or 0)),
+                "desktop_queue_last_event_type": str(raw.get("last_event_type") or ""),
+                "desktop_queue_last_event_age_seconds": (
+                    round(max(0.0, time.monotonic() - last_event), 3)
+                    if last_event else None
+                ),
+                "queue_records": max(0, int(raw.get("queue_records") or len(expected_batch))),
+            }
+
+        def reconcile_evidence(evidence):
+            evidence = dict(evidence or {})
+            observed = int(
+                evidence.get("matching_vector_rows")
+                or evidence.get("lancedb_matching_rows")
+                or 0
+            )
+            elapsed = max(0.0, time.time() - reconciliation_started_at)
+            if observed > int(reconciliation_tracker["highest_observed"]):
+                reconciliation_tracker["highest_observed"] = observed
+                reconciliation_tracker["last_vector_progress_elapsed_seconds"] = round(elapsed, 3)
+            error_text = " ".join(
+                str(evidence.get(key) or "") for key in ("error", "message", "classification", "status")
+            ).casefold()
+            if any(token in error_text for token in ("database is locked", "sqlite", "lock", "busy")):
+                reconciliation_tracker["storage_busy_observed"] = True
+            queue = live_desktop_queue_snapshot()
+            heartbeat_age = queue.get("desktop_queue_last_event_age_seconds")
+            heartbeat_live = (
+                heartbeat_age is not None
+                and float(heartbeat_age) <= max(15.0, float(getattr(args, "post_upload_poll_interval", 2.0)) * 3.0)
+            )
+            if observed >= len(expected_batch):
+                classification = "reconciliation_exact_vectors_confirmed"
+            elif observed > 0 and reconciliation_tracker["last_vector_progress_elapsed_seconds"] == round(elapsed, 3):
+                classification = "reconciliation_vector_progressing"
+            elif heartbeat_live:
+                classification = "reconciliation_desktop_queue_heartbeating"
+            elif reconciliation_tracker["storage_busy_observed"]:
+                classification = "reconciliation_storage_busy"
+            elif elapsed >= 60.0:
+                classification = "reconciliation_no_new_evidence"
+            else:
+                classification = "reconciliation_waiting_for_evidence"
+            evidence.update(queue)
+            evidence.update({
+                "reconciliation_classification": classification,
+                "reconciliation_elapsed_seconds": round(elapsed, 3),
+                "reconciliation_deadline_seconds": reconciliation_deadline,
+                "reconciliation_remaining_seconds": round(max(0.0, reconciliation_deadline - elapsed), 3),
+                "reconciliation_vector_progress_count": int(reconciliation_tracker["highest_observed"]),
+                "reconciliation_storage_busy_observed": bool(reconciliation_tracker["storage_busy_observed"]),
+                "reconciliation_read_only_checkpoints": list(
+                    reconciliation_tracker["read_only_checkpoints"]
+                ),
+            })
+            return evidence
+
         def report_batch_observation(evidence, operator_state):
             observed = int(evidence.get("matching_vector_rows") or evidence.get("lancedb_matching_rows") or 0)
-            report_progress(
-                embedding_start_progress
-                + (embedding_end_progress - embedding_start_progress)
-                * ((batch_number - 1 + .55) / total_batches),
+            batch_coverage = min(1.0, observed / len(expected_batch)) if expected_batch else 0.0
+            queue_current = int(evidence.get("desktop_queue_current") or 0)
+            queue_completed = int(evidence.get("desktop_queue_completed") or 0)
+            queue_total = int(evidence.get("queue_records") or len(expected_batch))
+            reconciliation_elapsed = float(evidence.get("reconciliation_elapsed_seconds") or 0.0)
+            reconciliation_deadline_seconds = float(evidence.get("reconciliation_deadline_seconds") or 0.0)
+            queue_detail = (
+                f"Desktop queue: embedding {queue_current}/{queue_total} page-parent files; "
+                f"{queue_completed}/{queue_total} completed. "
+                if queue_total and (queue_current or queue_completed) else ""
+            )
+            checkpoint_detail = ""
+            checkpoints = evidence.get("reconciliation_read_only_checkpoints") or []
+            if checkpoints:
+                latest_checkpoint = checkpoints[-1]
+                checkpoint_detail = (
+                    f" Read-only inspection at {int(latest_checkpoint.get('scheduled_seconds') or 0)}s: "
+                    f"{int(latest_checkpoint.get('observed_vectors') or 0)}/{len(expected_batch)} observed."
+                )
+            report_upload_phase(
+                "searchable_vectors",
                 (
-                    f"Verifying AnythingLLM batch {batch_number} of {total_batches}: "
-                    f"{format_vector_observation(observed, len(expected_batch), operator_state)}"
+                    f"AnythingLLM reconciliation {reconciliation_elapsed:.0f}/{reconciliation_deadline_seconds:.0f}s: "
+                    f"{queue_detail}"
+                    f"{format_vector_observation(observed, len(expected_batch), operator_state, record_label=vector_record_label)}"
+                    f"{checkpoint_detail}"
+                ),
+                completed_units=observed,
+                total_units=len(expected_batch),
+                fallback_fraction=batch_coverage,
+                desktop_required=True,
+                evidence_kind=(
+                    "exact_vector_observation_completed"
+                    if observed >= len(expected_batch)
+                    else "exact_vector_observation"
                 ),
             )
 
-        unresolved_submission = str(batch_report.get("submission_state") or "") == "unresolved"
         # A 2xx response only proves that Desktop accepted the request.  The
         # live serialized probe showed valid vectors materializing after the
         # former 180-second window, so both accepted and interrupted requests
         # use the same bounded observation budget.  This preserves one active
         # request while slow provider work completes instead of converting it
         # into a needless resume requirement.
-        observation_timeout = ANYTHINGLLM_EMBEDDING_RECONCILIATION_TIMEOUT_SECONDS
-        polling = poll_post_upload(
-            lambda: verify_anythingllm_post_upload(
+        observation_timeout = (
+            max(0.0, reconciliation_deadline - max(0.0, time.time() - reconciliation_started_at))
+            if unresolved_submission else ANYTHINGLLM_EMBEDDING_RECONCILIATION_TIMEOUT_SECONDS
+        )
+
+        def inspect_batch_vectors():
+            # The frequent observer is intentionally fast even when the
+            # request receipt was ambiguous.  Performing a full workspace and
+            # frontend materialization every two seconds both slows Desktop
+            # while it is writing and makes the poller itself a source of
+            # contention.  The 60/120-second checkpoints below provide the
+            # deeper, still read-only inspection requested for an unresolved
+            # receipt.
+            evidence = verify_anythingllm_post_upload(
                 storage_dir,
                 target_workspace_slug,
                 source_sha,
                 expected_batch,
                 upload_locations=(batch_report.get("locations") or []),
-                observation_mode="full" if unresolved_submission else "fast",
-            ),
+                observation_mode="fast",
+            )
+            if unresolved_submission:
+                elapsed = max(0.0, time.time() - reconciliation_started_at)
+                for checkpoint_seconds in (60.0, 120.0):
+                    if (
+                        elapsed < checkpoint_seconds
+                        or checkpoint_seconds in reconciliation_tracker["completed_read_only_checkpoints"]
+                    ):
+                        continue
+                    # ``verify_anythingllm_post_upload`` only opens local
+                    # SQLite/LanceDB/filesystem views in this path.  Do not
+                    # pass a frontend endpoint here: inspecting at a recovery
+                    # checkpoint must not trigger any application-side work.
+                    checkpoint_evidence = verify_anythingllm_post_upload(
+                        storage_dir,
+                        target_workspace_slug,
+                        source_sha,
+                        expected_batch,
+                        upload_locations=(batch_report.get("locations") or []),
+                        observation_mode="full",
+                    )
+                    checkpoint_observed = int(
+                        checkpoint_evidence.get("matching_vector_rows")
+                        or checkpoint_evidence.get("lancedb_matching_rows")
+                        or 0
+                    )
+                    checkpoint = {
+                        "scheduled_seconds": int(checkpoint_seconds),
+                        "observed_at_elapsed_seconds": round(elapsed, 3),
+                        "observed_vectors": checkpoint_observed,
+                        "status": str(checkpoint_evidence.get("status") or "not_checked"),
+                        "classification": str(checkpoint_evidence.get("classification") or ""),
+                        "workspace_documents": int(checkpoint_evidence.get("matching_workspace_documents") or 0),
+                        "identity_set_complete": checkpoint_evidence.get("identity_set_complete"),
+                        "storage_changed_during_observation": bool(
+                            checkpoint_evidence.get("storage_changed_during_observation")
+                        ),
+                    }
+                    reconciliation_tracker["completed_read_only_checkpoints"].add(checkpoint_seconds)
+                    reconciliation_tracker["read_only_checkpoints"].append(checkpoint)
+                    # A deep inspection can see identities which became
+                    # visible between the fast poll and this checkpoint.  It
+                    # may improve positive evidence only; a review-only
+                    # document-list result must never turn a fast exact-vector
+                    # result into a failure.
+                    fast_observed = int(
+                        evidence.get("matching_vector_rows")
+                        or evidence.get("lancedb_matching_rows")
+                        or 0
+                    )
+                    if checkpoint_observed > fast_observed:
+                        for key in (
+                            "matching_vector_rows",
+                            "lancedb_matching_rows",
+                            "identity_set_checked",
+                            "identity_set_complete",
+                            "expected_chunk_source_count",
+                            "observed_chunk_source_count",
+                            "duplicate_chunk_source_count",
+                            "missing_chunk_sources",
+                            "lancedb_matching_tables",
+                            "lancedb_text_contains_page_or_segment",
+                        ):
+                            evidence[key] = checkpoint_evidence.get(key)
+            observed = int(
+                evidence.get("matching_vector_rows")
+                or evidence.get("lancedb_matching_rows")
+                or 0
+            )
+            # A reviewable storage read (for example a transient SQLite lock)
+            # never proves this batch searchable. Keep polling the explicit
+            # retryable partial state until every exact vector is observable
+            # or the bounded reconciliation deadline is reached.
+            if (
+                observed < len(expected_batch)
+                and str(evidence.get("status") or "") in REVIEWABLE_POST_UPLOAD_STATUSES
+            ):
+                evidence = dict(evidence)
+                evidence["status"] = "partial_vector_coverage"
+                evidence["classification"] = "exact_batch_vectors_not_fully_observed"
+                evidence["message"] = (
+                    f"Only {observed}/{len(expected_batch)} exact vectors are observable; "
+                    "AnythingLLM may still be indexing, so reconciliation continues."
+                )
+            return reconcile_evidence(evidence)
+
+        polling = poll_post_upload(
+            inspect_batch_vectors,
             interval_seconds=float(getattr(args, "post_upload_poll_interval", 2.0)),
             # A 120-second client timeout can leave Desktop still embedding a
             # four-record batch. The old 45-second observer window then
@@ -14974,6 +15831,27 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
             }
         )
         if polling.status == "timeout":
+            cap_classification = (
+                "reconciliation_cap_partial_vector_progress"
+                if int(reconciliation_tracker["highest_observed"]) > 0
+                else "reconciliation_cap_queue_heartbeat"
+                if int(evidence.get("desktop_queue_events_observed") or 0) > 0
+                and float(evidence.get("desktop_queue_last_event_age_seconds") or 10**9) <= 30.0
+                else "reconciliation_cap_storage_busy"
+                if reconciliation_tracker["storage_busy_observed"]
+                else "reconciliation_cap_no_new_evidence"
+            )
+            evidence["reconciliation_cap_classification"] = cap_classification
+            evidence["reconciliation_outcome"] = "bounded_window_exhausted"
+            evidence["message"] = (
+                f"AnythingLLM reconciliation reached its {reconciliation_deadline:.0f}-second shared cap: "
+                f"{int(evidence.get('matching_vector_rows') or evidence.get('lancedb_matching_rows') or 0)}/"
+                f"{len(expected_batch)} exact page-parent vectors were observed ({cap_classification})."
+            )
+            # The final cap classification is itself meaningful UI evidence;
+            # do not make the user infer a 480-second timeout from a stale
+            # earlier count.
+            report_batch_observation(evidence, "incomplete")
             confirmed_chunk_sources = []
             unresolved_chunk_sources = []
             batch_locations = list(batch_report.get("locations") or [])
@@ -15118,6 +15996,11 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
                 cancel_callback=getattr(args, "cancel_callback", None),
                 submission_receipt_path=submission_receipt_path,
                 run_id=str(getattr(args, "run_id", "") or source_sha or out_root.name),
+                record_label=(
+                    "page-parent files"
+                    if upload_representation == "page_parents"
+                    else "segment files"
+                ),
             )
         upload_report["representation"] = upload_representation
         upload_report["transport"] = upload_transport
@@ -15230,15 +16113,34 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
         def report_post_upload_observation(evidence, operator_state):
             observed_vectors = int(evidence.get("matching_vector_rows") or evidence.get("lancedb_matching_rows") or 0)
             expected_records = len(selected_expected_upload_payloads or payloads_to_upload)
-            report_progress(
-                PIPELINE_PROGRESS_POST_UPLOAD_OBSERVATION,
+            report_upload_phase(
+                "searchable_vectors",
                 (
                     f"AnythingLLM indexing observation {evidence.get('attempt', 0)}: "
-                    f"{format_vector_observation(observed_vectors, expected_records, operator_state)}"
+                    f"{format_vector_observation(observed_vectors, expected_records, operator_state, record_label=vector_record_label)}"
                 ),
+                completed_units=observed_vectors,
+                total_units=expected_records,
+                fallback_fraction=(observed_vectors / expected_records if expected_records else 0.0),
                 desktop_required=True,
+                evidence_kind="exact_vector_observation",
             )
 
+        shared_reconciliation_elapsed = 0.0
+        shared_reconciliation_remaining = None
+        if ambiguous_embedding_submission:
+            reconciliation_starts = [
+                float(batch.get("reconciliation_started_at_epoch") or 0.0)
+                for batch in ((upload_report.get("embedding_update") or {}).get("batches") or [])
+                if float(batch.get("reconciliation_started_at_epoch") or 0.0) > 0.0
+            ]
+            if reconciliation_starts:
+                shared_reconciliation_elapsed = max(0.0, time.time() - min(reconciliation_starts))
+                shared_reconciliation_remaining = max(
+                    0.0,
+                    ANYTHINGLLM_EMBEDDING_RECONCILIATION_TIMEOUT_SECONDS
+                    - shared_reconciliation_elapsed,
+                )
         if failed_embedding_checkpoint:
             fast_post_upload_report = verify_anythingllm_post_upload(
                 storage_dir,
@@ -15254,9 +16156,13 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
             polling_observations = [dict(fast_post_upload_report)]
             polling_observer_failures = []
         else:
+            # An unresolved receipt already spent this run's shared
+            # reconciliation budget in the batch observer.  Do one final
+            # immediate document-wide read when it is exhausted; never begin
+            # a second hidden 480-second poll after the first one.
             final_observation_timeout = (
-                ANYTHINGLLM_EMBEDDING_RECONCILIATION_TIMEOUT_SECONDS
-                if ambiguous_embedding_submission
+                float(shared_reconciliation_remaining)
+                if shared_reconciliation_remaining is not None
                 else float(getattr(args, "post_upload_poll_timeout", 60.0))
             )
             polling_result = poll_post_upload(
@@ -15324,10 +16230,18 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
                 "the pipeline took one final full observation instead of repeating the wait."
             )
         elif ambiguous_embedding_submission:
-            post_upload_report["reconciliation_window_seconds"] = final_observation_timeout
+            post_upload_report["reconciliation_window_seconds"] = (
+                ANYTHINGLLM_EMBEDDING_RECONCILIATION_TIMEOUT_SECONDS
+            )
+            post_upload_report["reconciliation_elapsed_before_document_check_seconds"] = round(
+                shared_reconciliation_elapsed, 3
+            )
+            post_upload_report["reconciliation_remaining_for_document_check_seconds"] = round(
+                float(shared_reconciliation_remaining or 0.0), 3
+            )
             post_upload_report["reconciliation_reason"] = (
                 "At least one embedding submission had an ambiguous client outcome. "
-                "The original run remained active while local workspace/vector state was reconciled."
+                "The original run remained active under one shared 480-second local workspace/vector observation budget."
             )
     else:
         post_upload_report = {
@@ -15347,6 +16261,21 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
             "polling_observer_failures": [],
         }
     embedding_checkpoint_evidence = dict(upload_report.get("embedding_update") or {})
+    reconciliation_cap_evidence = [
+        dict((batch.get("verification") or {}))
+        for batch in (embedding_checkpoint_evidence.get("batches") or [])
+        if isinstance(batch, dict)
+        and str((batch.get("verification") or {}).get("reconciliation_cap_classification") or "")
+    ]
+    if reconciliation_cap_evidence:
+        latest_cap = reconciliation_cap_evidence[-1]
+        post_upload_report["reconciliation_cap_classification"] = latest_cap.get(
+            "reconciliation_cap_classification"
+        )
+        post_upload_report["reconciliation_cap_message"] = latest_cap.get("message")
+        post_upload_report["reconciliation_cap_vector_progress_count"] = latest_cap.get(
+            "reconciliation_vector_progress_count"
+        )
     post_upload_report["embedding_verification_policy"] = {
         "mode": embedding_checkpoint_evidence.get("verification_mode", "not_applicable"),
         "interval": embedding_checkpoint_evidence.get("verification_interval", 0),
@@ -15431,6 +16360,64 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
                 "post_upload_status": "partial_vector_coverage",
             }
         )
+        # A timed-out Desktop request remains unresolved, but the final
+        # document-wide observation may already show a subset of its exact
+        # vectors. Record that subset per planned location before writing the
+        # durable resume manifest. The recovery action can then resubmit only
+        # the genuinely missing records, never the eight (or any other) late
+        # vectors that did complete after the client lost its response.
+        embedding_update = upload_report.get("embedding_update") or {}
+        unresolved_batches = [
+            batch for batch in (embedding_update.get("batches") or [])
+            if str(batch.get("submission_state") or "") == "unresolved"
+            or str(batch.get("lifecycle_state") or "") == "reconciliation_pending"
+        ]
+        if unresolved_batches and embedding_batch_ledger_path:
+            locations = list(upload_report.get("locations") or [])
+            confirmed_locations = set()
+            for index, payload in enumerate(selected_expected_upload_payloads or payloads_to_upload):
+                location = locations[index:index + 1]
+                if not location:
+                    continue
+                try:
+                    record_evidence = verify_anythingllm_post_upload(
+                        storage_dir,
+                        target_workspace_slug,
+                        source_sha,
+                        [payload],
+                        upload_locations=location,
+                        observation_mode="fast",
+                    )
+                except Exception:
+                    continue
+                observed = int(
+                    record_evidence.get("matching_vector_rows")
+                    or record_evidence.get("lancedb_matching_rows")
+                    or 0
+                )
+                if (
+                    str(record_evidence.get("status") or "") in REVIEWABLE_POST_UPLOAD_STATUSES
+                    and observed >= 1
+                ):
+                    confirmed_locations.add(str(location[0]))
+            for batch in unresolved_batches:
+                batch_locations = [str(item) for item in (batch.get("locations") or [])]
+                verification = dict(batch.get("verification") or {})
+                verification["confirmed_locations"] = [
+                    location for location in batch_locations if location in confirmed_locations
+                ]
+                verification["unresolved_locations"] = [
+                    location for location in batch_locations if location not in confirmed_locations
+                ]
+                verification["confirmed_record_count"] = len(verification["confirmed_locations"])
+                verification["unresolved_record_count"] = len(verification["unresolved_locations"])
+                verification["status"] = "partial_vector_coverage"
+                batch["verification"] = verification
+            _write_embedding_batch_ledger(
+                embedding_batch_ledger_path,
+                target_workspace_slug,
+                embedding_update,
+            )
     write_json(inspection_dir / "post-upload-verification.json", post_upload_report)
     write_csv(
         inspection_dir / "post-upload-verification.csv",
@@ -15463,11 +16450,40 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
         and upload_report.get("uploaded", 0) > 0
         and post_upload_report.get("status") in REVIEWABLE_POST_UPLOAD_STATUSES
     ):
+        report_upload_phase(
+            "validation",
+            "Checking runtime retrieval after exact vector confirmation",
+            completed_units=0,
+            total_units=1,
+            fallback_fraction=0.0,
+            evidence_kind="validation_started",
+        )
         cached_embedder_probe = None
         if isinstance(inspection_context, dict):
             candidate_probe = inspection_context.get("anythingllm_runtime_embedder_probe")
             if isinstance(candidate_probe, dict) and candidate_probe.get("status") == "pass":
                 cached_embedder_probe = candidate_probe
+        def report_runtime_validation_progress(stage, details):
+            completed = int((details or {}).get("completed") or 0)
+            total = max(1, int((details or {}).get("total") or 1))
+            action = {
+                "vector_probe_started": "Running retrieval sample",
+                "vector_probe_completed": "Retrieval sample completed",
+                "vector_recheck_started": "Rechecking a timed-out retrieval sample",
+                "vector_recheck_completed": "Timed-out retrieval sample rechecked",
+                "chat_probe_started": "Running chat retrieval diagnostic",
+                "chat_probe_completed": "Chat retrieval diagnostic completed",
+            }.get(str(stage), "Running runtime retrieval validation")
+            report_upload_phase(
+                "validation",
+                f"{action}: {completed}/{total}",
+                completed_units=completed,
+                total_units=total,
+                fallback_fraction=0.0,
+                desktop_required=True,
+                evidence_kind=str(stage),
+            )
+
         runtime_validation_report = validate_anythingllm_native_runtime(
             args.anythingllm_api_url,
             args.anythingllm_api_key,
@@ -15476,11 +16492,43 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
             0,
             storage_dir,
             embedder_probe_override=cached_embedder_probe,
-            runtime_probe_limit=1,
-            vector_timeout_seconds=12,
+            runtime_probe_limit=runtime_validation_sample_size(
+                selected_expected_upload_payloads or payloads_to_upload,
+            ),
+            vector_timeout_seconds=8,
+            # A freshly completed Desktop queue can leave a live search cold
+            # even though local exact-vector evidence is already complete.
+            # Keep each sampled probe short and single-shot: a timeout stays
+            # diagnostic rather than converting validation into a long hidden
+            # retry loop.
             vector_max_attempts=1,
             retry_timed_out_siblings=False,
+            status_callback=report_runtime_validation_progress,
         )
+        # Normal completion uses the exact identity set plus a small
+        # stratified retrieval sample. If that sample exposes a miss or a
+        # runtime timeout, preserve the fast result but immediately perform
+        # the existing all-page-parent diagnostic audit. This is the explicit
+        # escalation path, not a cost paid by every healthy large PDF.
+        if runtime_validation_report.get("status") in {
+            "vector_retrieval_failed",
+            "vector_runtime_timeout",
+            "blocked_provider_authentication",
+        }:
+            try:
+                post_upload_report["sample_failure_full_identity_audit"] = verify_anythingllm_post_upload(
+                    storage_dir,
+                    target_workspace_slug,
+                    source_sha,
+                    selected_expected_upload_payloads or payloads_to_upload,
+                    upload_locations=(upload_report.get("locations") or []),
+                    observation_mode="full",
+                )
+            except Exception as exc:
+                post_upload_report["sample_failure_full_identity_audit"] = {
+                    "status": "audit_error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
         embedder_probe = runtime_validation_report.get("embedder_probe")
         if (
             isinstance(inspection_context, dict)
@@ -15678,7 +16726,40 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
     (out_root / "diagnostics.html").write_text(build_diagnostics_html(diagnostics), encoding="utf-8")
 
     retrieval_dir = out_root / "retrieval-eval"
-    report_progress(PIPELINE_PROGRESS_REPORTING, "Writing retrieval and readiness reports")
+    partial_vector_coverage = (
+        str(post_upload_report.get("status") or "") == "partial_vector_coverage"
+    )
+    if not partial_vector_coverage:
+        report_upload_phase(
+            "validation",
+            "Exact storage and retrieval validation complete",
+            completed_units=1,
+            total_units=1,
+            fallback_fraction=PIPELINE_PROGRESS_REPORTING,
+            evidence_kind="validation_completed",
+        )
+        report_upload_phase(
+            "reporting",
+            "Writing retrieval and readiness reports",
+            completed_units=0,
+            total_units=1,
+            fallback_fraction=PIPELINE_PROGRESS_REPORTING,
+            evidence_kind="phase_started",
+        )
+    else:
+        # Reports are still written for investigation, but they are not
+        # workflow completion evidence. Keep the single progress bar at the
+        # last exact vector checkpoint rather than advancing into validation
+        # or final reporting after a partial Desktop queue.
+        report_upload_phase(
+            "searchable_vectors",
+            "AnythingLLM indexing remains incomplete; preserving the exact vector checkpoint",
+            completed_units=int(post_upload_report.get("matching_vector_rows") or 0),
+            total_units=len(selected_expected_upload_payloads or payloads_to_upload),
+            fallback_fraction=0.0,
+            desktop_required=True,
+            evidence_kind="partial_vector_coverage",
+        )
     retrieval_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src_candidate_dir / "probes.jsonl", retrieval_dir / "probes.jsonl")
     shutil.copy2(src_candidate_dir / "literal-results.csv", retrieval_dir / "literal-results.csv")
@@ -16074,6 +17155,12 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
             int(post_upload_report.get("lancedb_matching_rows") or 0),
         ),
         "post_upload_expected_payloads": int(post_upload_report.get("expected_payload_count") or 0),
+        "post_upload_reconciliation_cap_classification": post_upload_report.get(
+            "reconciliation_cap_classification", ""
+        ),
+        "post_upload_reconciliation_cap_message": post_upload_report.get(
+            "reconciliation_cap_message", ""
+        ),
         "anythingllm_runtime_validation_status": runtime_validation_report.get("status"),
         "anythingllm_runtime_embedder_probe_status": runtime_validation_report.get(
             "embedder_probe",
@@ -16181,7 +17268,15 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
             prepared_text_path,
             segments=selected.get("segments") or (),
         )
-    report_progress(1.0, "Preparation complete")
+    if not partial_vector_coverage:
+        report_upload_phase(
+            "reporting",
+            "Preparation complete",
+            completed_units=1,
+            total_units=1,
+            fallback_fraction=1.0,
+            evidence_kind="phase_completed",
+        )
     return summary
 
 

@@ -97,7 +97,7 @@ def one_page_pdf(tmp_path: Path) -> Path:
 def test_fresh_file_selection_never_displays_prior_success(page, local_app_url, one_page_pdf):
     page.goto(local_app_url)
     expect(page.get_by_text("Processing successful", exact=False)).to_have_count(0)
-    expect(page.get_by_text("Total progress: 100%", exact=False)).to_have_count(0)
+    expect(page.get_by_text("Overall progress: 100%", exact=False)).to_have_count(0)
     expect(page.locator("#cancel-automatic-run-button")).to_be_hidden()
 
 
@@ -184,7 +184,7 @@ def test_selected_pdf_exposes_one_confirm_action_and_safe_prestart_cancel(page, 
     assert confirm_box["y"] == pytest.approx(cancel_box["y"], abs=1)
     expect(page.get_by_text("Ready — Confirm to begin processing.")).to_be_visible()
     expect(page.get_by_text("Processing successful", exact=False)).to_have_count(0)
-    expect(page.get_by_text("Total progress: 100%", exact=False)).to_have_count(0)
+    expect(page.get_by_text("Overall progress: 100%", exact=False)).to_have_count(0)
 
 
 def test_file_selection_opens_identity_fields_but_keeps_technical_metadata_collapsed(

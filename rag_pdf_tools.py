@@ -463,17 +463,24 @@ def write_validation_report(full_text: str, phrases, report_path: Path):
         writer.writerows(rows)
 
 
-def get_pages_with_pymupdf(pdf_path: Path):
-    doc = fitz.open(pdf_path)
+def get_pages_with_pymupdf(pdf_path: Path, progress_callback=None):
     pages = []
     # PyMuPDF's ``Document`` supports indexed page access, but its type stub
     # does not promise the iterator protocol. Indexed access is also explicit
     # about the stable page number we put into provenance.
-    for page_index in range(len(doc)):
-        page_num = page_index + 1
-        page = doc[page_index]
-        pages.append({"page": page_num, "text": page.get_text("text"), "kind": "page"})
-    return pages, len(doc)
+    # Close the native document before returning. On Windows an open PyMuPDF
+    # handle can keep the source PDF locked while later preparation stages or
+    # the user try to move/delete it; all returned page text is already plain
+    # Python data and does not need the document to stay alive.
+    with fitz.open(pdf_path) as doc:
+        page_count = len(doc)
+        for page_index in range(page_count):
+            page_num = page_index + 1
+            page = doc[page_index]
+            pages.append({"page": page_num, "text": page.get_text("text"), "kind": "page"})
+            if callable(progress_callback):
+                progress_callback(page_num, page_count)
+    return pages, page_count
 
 
 def pymupdf4llm_ocr_page_workers() -> int:
@@ -659,7 +666,13 @@ def _pymupdf4llm_one_page(pdf_path_text: str, page_index: int, ocr_dpi: int | No
     return {"page": page_index + 1, "text": text, "kind": "markdown_page"}
 
 
-def _parallel_pymupdf4llm_pages(pdf_path: Path, page_count: int, ocr_dpi: int | None, worker_count: int):
+def _parallel_pymupdf4llm_pages(
+    pdf_path: Path,
+    page_count: int,
+    ocr_dpi: int | None,
+    worker_count: int,
+    progress_callback=None,
+):
     """Extract ordered page text with isolated OCR processes, never threads."""
     pages = []
     with ProcessPoolExecutor(max_workers=min(worker_count, page_count)) as executor:
@@ -667,8 +680,10 @@ def _parallel_pymupdf4llm_pages(pdf_path: Path, page_count: int, ocr_dpi: int | 
             executor.submit(_pymupdf4llm_one_page, str(pdf_path), page_index, ocr_dpi): page_index
             for page_index in range(page_count)
         }
-        for future in as_completed(futures):
+        for completed_count, future in enumerate(as_completed(futures), start=1):
             pages.append(future.result())
+            if callable(progress_callback):
+                progress_callback(completed_count, page_count)
     pages.sort(key=lambda row: int(row["page"]))
     expected_pages = list(range(1, page_count + 1))
     observed_pages = [int(row["page"]) for row in pages]
@@ -710,7 +725,7 @@ def pymupdf4llm_execution_evidence(pages):
     }
 
 
-def get_pages_with_pymupdf4llm(pdf_path: Path):
+def get_pages_with_pymupdf4llm(pdf_path: Path, progress_callback=None):
     try:
         pymupdf4llm = import_optional_backend("pymupdf4llm")
     except ImportError as exc:
@@ -739,6 +754,7 @@ def get_pages_with_pymupdf4llm(pdf_path: Path):
                     source_page_count,
                     markdown_options.get("ocr_dpi"),
                     worker_count,
+                    progress_callback=progress_callback,
                 )
                 LOGGER.info(
                     "Completed PyMuPDF4LLM OCR with %s isolated page workers across %s pages.",
@@ -777,6 +793,10 @@ def get_pages_with_pymupdf4llm(pdf_path: Path):
         pages.append({"page": page_num, "text": text, "kind": "markdown_page"})
 
     page_count = max((p["page"] for p in pages), default=0)
+    if callable(progress_callback) and page_count:
+        # The single-call backend exposes no intermediate per-page callbacks;
+        # report its measurable completion rather than fabricating a page rate.
+        progress_callback(page_count, page_count)
     if not ocr_runtime.get("available"):
         return (
             _annotate_pymupdf4llm_execution(
@@ -1288,6 +1308,7 @@ def _parallel_unstructured_ocr_pages(
     worker_count: int,
     runtime_probe,
     page_timeout_seconds=None,
+    progress_callback=None,
 ):
     """Extract OCR pages in isolated processes and reassemble source order.
 
@@ -1302,29 +1323,69 @@ def _parallel_unstructured_ocr_pages(
         # Explicit ``spawn`` avoids inheriting a partially initialized ONNX or
         # Tesseract runtime. It is Windows' default and is safer cross-platform
         # for optional native OCR dependencies.
+        active_worker_count = min(worker_count, page_count)
         executor = ProcessPoolExecutor(
-            max_workers=min(worker_count, page_count),
+            max_workers=active_worker_count,
             mp_context=get_context("spawn"),
         )
         terminated = False
         try:
-            futures = {
-                executor.submit(
-                    _unstructured_one_page, str(pdf_path), page_index, strategy, scratch_dir, dict(runtime_probe)
-                ): page_index
-                for page_index in range(page_count)
-            }
-            submitted_at = {future: time.monotonic() for future in futures}
-            pending = set(futures)
+            # Do not queue every page at once.  With a 663-page document and
+            # two workers, the old code started the 90-second per-page clock
+            # for hundreds of pages that had not even been handed to an OCR
+            # worker yet.  Healthy queued pages could therefore be falsely
+            # reported as timed out.  Keeping at most one active future per
+            # worker makes the deadline describe actual OCR work, bounds
+            # memory/IPC pressure, and provides a truthful completed-page
+            # heartbeat for the parent process.
+            pending = {}
+            submitted_at = {}
+            next_page_index = 0
+
+            def submit_next_page():
+                nonlocal next_page_index
+                future = executor.submit(
+                    _unstructured_one_page,
+                    str(pdf_path),
+                    next_page_index,
+                    strategy,
+                    scratch_dir,
+                    dict(runtime_probe),
+                )
+                pending[future] = next_page_index
+                submitted_at[future] = time.monotonic()
+                next_page_index += 1
+
+            while len(pending) < active_worker_count and next_page_index < page_count:
+                submit_next_page()
             while pending:
-                done, _ = wait(pending, timeout=0.25, return_when=FIRST_COMPLETED)
+                done, _ = wait(set(pending), timeout=0.25, return_when=FIRST_COMPLETED)
                 for future in done:
-                    pending.remove(future)
-                    result = future.result()
+                    page_index = pending.pop(future)
+                    submitted_at.pop(future, None)
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        # A native OCR worker failure should not leave its
+                        # siblings running invisibly while the caller waits
+                        # for the executor's normal shutdown.  Preserve the
+                        # failing page in the error and stop the isolated
+                        # worker pool immediately; the higher-level fallback
+                        # policy can then make its own bounded decision.
+                        _terminate_unstructured_executor(executor)
+                        terminated = True
+                        raise RuntimeError(
+                            f"Unstructured OCR failed for PDF page {page_index + 1}: "
+                            f"{type(exc).__name__}: {exc}"
+                        ) from exc
                     pages.append(result["page_row"])
                     element_rows.extend(result["element_rows"])
+                    if callable(progress_callback):
+                        progress_callback(len(pages), page_count)
+                    while len(pending) < active_worker_count and next_page_index < page_count:
+                        submit_next_page()
                 timed_out = [
-                    futures[future] + 1
+                    pending[future] + 1
                     for future in pending
                     if time.monotonic() - submitted_at[future] > timeout_seconds
                 ]
@@ -1372,7 +1433,7 @@ def unstructured_execution_evidence(pages):
     }
 
 
-def get_pages_with_unstructured(pdf_path: Path, strategy: str, runtime_probe=None, cache_dir=None):
+def get_pages_with_unstructured(pdf_path: Path, strategy: str, runtime_probe=None, cache_dir=None, progress_callback=None):
     requested_strategy = (strategy or "auto").strip().casefold()
     resolved_strategy = "fast" if requested_strategy == "auto" else requested_strategy
     runtime = dict(
@@ -1386,6 +1447,8 @@ def get_pages_with_unstructured(pdf_path: Path, strategy: str, runtime_probe=Non
     if resolved_strategy in {"hi_res", "ocr_only"} and pdf_path.exists():
         cached = load_unstructured_ocr_cache(pdf_path, resolved_strategy, runtime, cache_dir)
         if cached is not None:
+            if callable(progress_callback):
+                progress_callback(int(cached[1]), int(cached[1]))
             return cached
         with fitz.open(pdf_path) as document:
             source_page_count = len(document)
@@ -1410,6 +1473,8 @@ def get_pages_with_unstructured(pdf_path: Path, strategy: str, runtime_probe=Non
             )
             if cache_path:
                 pages[0]["unstructured_execution"]["cache_path"] = cache_path
+            if callable(progress_callback):
+                progress_callback(1, 1)
             return pages, page_count, element_rows
         workers = unstructured_ocr_page_workers()
         if source_page_count > 1:
@@ -1419,6 +1484,7 @@ def get_pages_with_unstructured(pdf_path: Path, strategy: str, runtime_probe=Non
                 resolved_strategy,
                 workers,
                 runtime,
+                progress_callback=progress_callback,
             )
             cache_path = save_unstructured_ocr_cache(
                 pdf_path, resolved_strategy, runtime, cache_dir, pages, page_count, element_rows
@@ -1438,6 +1504,11 @@ def get_pages_with_unstructured(pdf_path: Path, strategy: str, runtime_probe=Non
             "actual_workers": 1,
             "strategy": resolved_strategy,
         }
+    if callable(progress_callback) and page_count:
+        # The third-party whole-document call has no per-page callback. This
+        # is an honest terminal checkpoint; OCR-capable multi-page work uses
+        # the isolated page lane above and reports every finished page.
+        progress_callback(page_count, page_count)
     if resolved_strategy in {"hi_res", "ocr_only"}:
         cache_path = save_unstructured_ocr_cache(
             pdf_path, resolved_strategy, runtime, cache_dir, pages, page_count, element_rows
@@ -1454,21 +1525,24 @@ def get_backend_pages(
     unstructured_strategy: str,
     unstructured_runtime_probe=None,
     unstructured_cache_dir=None,
+    progress_callback=None,
 ):
     backend_key = backend.lower()
     if backend_key == "pymupdf":
-        pages, page_count = get_pages_with_pymupdf(pdf_path)
+        pages, page_count = get_pages_with_pymupdf(pdf_path, progress_callback=progress_callback)
         return pages, page_count, []
     if backend_key == "pymupdf4llm":
-        pages, page_count = get_pages_with_pymupdf4llm(pdf_path)
+        pages, page_count = get_pages_with_pymupdf4llm(pdf_path, progress_callback=progress_callback)
         return pages, page_count, []
     if backend_key == "unstructured":
-        return get_pages_with_unstructured(
+        result = get_pages_with_unstructured(
             pdf_path,
             unstructured_strategy,
             runtime_probe=unstructured_runtime_probe,
             cache_dir=unstructured_cache_dir,
+            progress_callback=progress_callback,
         )
+        return result
     raise ValueError(f"Unsupported backend: {backend}")
 
 

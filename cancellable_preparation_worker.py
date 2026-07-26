@@ -10,12 +10,16 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
 
 from auto_anythingllm_pipeline import prepare_pdf
 from orchestration import execute_preparation, legacy_summary_from_run
+
+
+_EVENT_WRITE_LOCK = threading.Lock()
 
 
 def _write_json(path: Path, payload: dict) -> None:
@@ -27,33 +31,58 @@ def _write_json(path: Path, payload: dict) -> None:
     temporary.replace(path)
 
 
-def _emit_event(path: Path, value: float, stage: str, *, desktop_required: bool = False) -> None:
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(
-            json.dumps(
-                {
-                    "value": float(value),
-                    "stage": str(stage),
-                    "desktop_required": bool(desktop_required),
-                },
-                ensure_ascii=False,
+def _emit_event(
+    path: Path,
+    value: float,
+    stage: str,
+    *,
+    desktop_required: bool = False,
+    phase: str = "",
+    completed_units=None,
+    total_units=None,
+    evidence_kind: str = "",
+) -> None:
+    # The main pipeline and the read-only Desktop SSE observer can both relay
+    # status into this file.  Serialise writes so the Gradio owner never sees
+    # a torn JSON line while it polls the worker event stream.
+    with _EVENT_WRITE_LOCK:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "recorded_at": time.time(),
+                        "value": float(value),
+                        "stage": str(stage),
+                        "desktop_required": bool(desktop_required),
+                        "phase": str(phase or ""),
+                        "completed_units": completed_units,
+                        "total_units": total_units,
+                        "evidence_kind": str(evidence_kind or ""),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
             )
-            + "\n"
-        )
-        handle.flush()
+            handle.flush()
 
 
 def _emit_timing_event(path: Path, stage: str, batch_report=None) -> None:
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(
-            json.dumps(
-                {"type": "timing", "stage": str(stage), "batch_report": batch_report or {}},
-                ensure_ascii=False,
-                default=str,
+    with _EVENT_WRITE_LOCK:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "recorded_at": time.time(),
+                        "type": "timing",
+                        "stage": str(stage),
+                        "batch_report": batch_report or {},
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                )
+                + "\n"
             )
-            + "\n"
-        )
-        handle.flush()
+            handle.flush()
 
 
 def main(config_path: str) -> int:
@@ -64,8 +93,8 @@ def main(config_path: str) -> int:
     events_path = Path(config["events_path"])
     cancel_marker = run_root / ".cancel-requested.json"
     args = SimpleNamespace(**dict(config.get("args") or {}))
-    args.progress_callback = lambda value, stage, desktop_required=False: _emit_event(
-        events_path, value, stage, desktop_required=desktop_required
+    args.progress_callback = lambda value, stage, desktop_required=False, **metadata: _emit_event(
+        events_path, value, stage, desktop_required=desktop_required, **metadata
     )
     args.timing_event_callback = lambda stage, batch_report=None: _emit_timing_event(
         events_path, stage, batch_report
@@ -75,6 +104,13 @@ def main(config_path: str) -> int:
         _write_json(result_path, {"status": "cancelled", "message": "Stop requested before worker start."})
         return 0
     started = time.time()
+    _emit_event(
+        events_path,
+        0.0,
+        "Worker started",
+        phase="worker_lifecycle",
+        evidence_kind="worker_started",
+    )
     try:
         controlled = execute_preparation(
             Path(config["pdf_path"]),
@@ -95,6 +131,15 @@ def main(config_path: str) -> int:
                 "elapsed_seconds": round(time.time() - started, 3),
             },
         )
+        _emit_event(
+            events_path,
+            1.0,
+            "Worker finished",
+            phase="worker_lifecycle",
+            completed_units=1,
+            total_units=1,
+            evidence_kind="worker_finished",
+        )
         return 0
     except BaseException as exc:
         _write_json(
@@ -104,6 +149,15 @@ def main(config_path: str) -> int:
                 "error": f"{type(exc).__name__}: {exc}",
                 "elapsed_seconds": round(time.time() - started, 3),
             },
+        )
+        _emit_event(
+            events_path,
+            0.0,
+            "Worker failed",
+            phase="worker_lifecycle",
+            completed_units=0,
+            total_units=1,
+            evidence_kind="worker_failed",
         )
         return 1
 

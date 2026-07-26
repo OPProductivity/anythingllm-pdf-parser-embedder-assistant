@@ -318,12 +318,65 @@ AUTOMATIC_RUNTIME_GUARD_INTERVAL_SECONDS = 5.0
 # monitoring interval.
 AUTOMATIC_RUNTIME_GUARD_RECHECK_SECONDS = 2.0
 AUTOMATIC_RUNTIME_GUARD_FAILURE_THRESHOLD = 2
+# Legacy, unstructured callbacks still use the former generic pipeline
+# fractions. Structured callbacks use ``AUTOMATIC_UPLOAD_PHASE_RANGES``
+# directly, so this compatibility mapper cannot alter normal upload progress.
+# Values returned here are source values inside the app's 5--95% document
+# allocation: they display as 5--10% local work, 10--55% Desktop queue,
+# 55--85% exact vectors, and 85--95% validation.
+AUTOMATIC_UPLOAD_PREPARATION_SOURCE_END = 0.80
+AUTOMATIC_UPLOAD_PREPARATION_DISPLAY_END = 0.0556
+AUTOMATIC_UPLOAD_VECTOR_SOURCE_END = 0.94
+AUTOMATIC_UPLOAD_VECTOR_DISPLAY_END = 0.5556
+AUTOMATIC_UPLOAD_VALIDATION_SOURCE_END = 0.97
+AUTOMATIC_UPLOAD_VALIDATION_DISPLAY_END = 1.0
+
+
+def reweight_automatic_upload_progress(value):
+    """Map only a legacy unstructured progress value to the current slots."""
+    try:
+        source = float(value)
+    except (TypeError, ValueError):
+        source = 0.0
+    source = max(0.0, min(1.0, source))
+    if source <= AUTOMATIC_UPLOAD_PREPARATION_SOURCE_END:
+        return (
+            source
+            / AUTOMATIC_UPLOAD_PREPARATION_SOURCE_END
+            * AUTOMATIC_UPLOAD_PREPARATION_DISPLAY_END
+        )
+    if source <= AUTOMATIC_UPLOAD_VECTOR_SOURCE_END:
+        vector_source_span = (
+            AUTOMATIC_UPLOAD_VECTOR_SOURCE_END
+            - AUTOMATIC_UPLOAD_PREPARATION_SOURCE_END
+        )
+        vector_display_span = (
+            AUTOMATIC_UPLOAD_VECTOR_DISPLAY_END
+            - AUTOMATIC_UPLOAD_PREPARATION_DISPLAY_END
+        )
+        return AUTOMATIC_UPLOAD_PREPARATION_DISPLAY_END + (
+            (source - AUTOMATIC_UPLOAD_PREPARATION_SOURCE_END)
+            / vector_source_span
+            * vector_display_span
+        )
+    if source <= AUTOMATIC_UPLOAD_VALIDATION_SOURCE_END:
+        return AUTOMATIC_UPLOAD_VECTOR_DISPLAY_END + (
+            (source - AUTOMATIC_UPLOAD_VECTOR_SOURCE_END)
+            / (AUTOMATIC_UPLOAD_VALIDATION_SOURCE_END - AUTOMATIC_UPLOAD_VECTOR_SOURCE_END)
+            * (AUTOMATIC_UPLOAD_VALIDATION_DISPLAY_END - AUTOMATIC_UPLOAD_VECTOR_DISPLAY_END)
+        )
+    return AUTOMATIC_UPLOAD_VALIDATION_DISPLAY_END
 # Desktop's splash can reach 100% before the local API and worker processes are
 # usable. Recovery waits for the API itself rather than treating the window as
 # ready; cold starts observed on this machine can exceed the general 45-second
-# startup default, so give this one bounded app-owned attempt two minutes.
+# startup default, so retain one bounded three-minute app-owned attempt.
 AUTOMATIC_RUNTIME_RECOVERY_STARTUP_TIMEOUT_SECONDS = 180.0
 AUTOMATIC_RUNTIME_RECOVERY_STARTUP_POLL_INTERVAL_SECONDS = 10.0
+# The long interval is for a genuinely slow startup. Immediately after a
+# launch, probe rapidly so a ready Desktop is not left idle until the next
+# ten-second tick.
+AUTOMATIC_RUNTIME_RECOVERY_STARTUP_FAST_POLL_INTERVAL_SECONDS = 1.0
+AUTOMATIC_RUNTIME_RECOVERY_STARTUP_FAST_POLL_WINDOW_SECONDS = 45.0
 # A marker survives a server crash for recovery, but a Windows PID can later be
 # reused by an unrelated process. Keep the live Popen handle in this process as
 # the authority for a forced taskkill; the durable marker remains useful for
@@ -5691,6 +5744,7 @@ def submit_embedding_resume_manifest(
     *,
     automatic=False,
     expected_run_root=None,
+    status_callback=None,
 ):
     """Reconcile and submit only missing records from one durable manifest."""
     result = {"status": "not_started", "accepted": 0, "reconciled_locations": 0, "message": ""}
@@ -5753,9 +5807,12 @@ def submit_embedding_resume_manifest(
             slug,
             locations,
             batch_size=manifest.get("batch_size") or ANYTHINGLLM_EMBEDDING_UPDATE_BATCH_SIZE,
-            ledger_path=path,
+            # The recovery manifest is the durable proof of what may be
+            # resumed.  Do not let a new transport attempt overwrite it.
+            ledger_path=path.with_name("resume-embedding-attempt-ledger.json"),
             concurrent_batch_limit=resume_parallelism,
             initial_concurrent_batches=resume_parallelism,
+            status_callback=status_callback,
         )
     finally:
         if temporary_key_id:
@@ -8734,6 +8791,10 @@ def update_live_automatic_run_status(
     comparable_runs=None,
     output_paths=None,
     reset_progress=False,
+    progress_phase=None,
+    completed_units=None,
+    total_units=None,
+    evidence_kind=None,
 ):
     """Persist progress evidence plus a deliberately capped time-based estimate.
 
@@ -8778,7 +8839,15 @@ def update_live_automatic_run_status(
         if cancellation_freezes_progress and previous
         else min(1.0, max(previous_confirmed, incoming_confirmed, 0.0))
     )
-    phase_changed = str(phase or "Working") != str(previous.get("phase") or "")
+    # A phase name is the durable protocol boundary. Its human-readable text
+    # may change every second (for example 93/663 then 94/663 vectors), which
+    # must not reset the small, bounded estimate allowance each time.
+    incoming_progress_phase = str(progress_phase or "").strip()
+    previous_progress_phase = str(previous.get("progress_phase") or "").strip()
+    phase_changed = (
+        incoming_progress_phase != previous_progress_phase
+        if incoming_progress_phase else str(phase or "Working") != str(previous.get("phase") or "")
+    )
     expected = max(0, int(expected_seconds or previous.get("expected_seconds") or 0))
     if cancel_available is None:
         cancel_available = previous.get("cancel_available", str(state or "") == "running")
@@ -8793,9 +8862,15 @@ def update_live_automatic_run_status(
     # A phase earns at most a modest forecast allowance. If the phase exceeds
     # its budget, the bar waits at the cap for real evidence instead of racing
     # falsely towards completion.
+    has_count_evidence = completed_units is not None and total_units is not None
     phase_allowance = (
         0.0
         if cancellation_freezes_progress
+        # Measured x/y phases already supply real movement. Retain only a
+        # very small, explicitly bounded interpolation during a quiet poll
+        # interval, instead of applying the old generic 2.5--8% timer jump.
+        else min(0.04, max(0.01, remaining_fraction * 0.06))
+        if has_count_evidence
         else min(0.08, max(0.025, remaining_fraction * 0.18))
     )
     phase_budget = max(8.0, min(45.0, (expected * max(phase_allowance, 0.04)) if expected else 15.0))
@@ -8818,6 +8893,10 @@ def update_live_automatic_run_status(
     record = {
         "state": str(state or "running"),
         "phase": str(phase or "Working"),
+        "progress_phase": incoming_progress_phase or previous_progress_phase,
+        "completed_units": completed_units if completed_units is not None else previous.get("completed_units"),
+        "total_units": total_units if total_units is not None else previous.get("total_units"),
+        "evidence_kind": str(evidence_kind or previous.get("evidence_kind") or ""),
         "details": str(details or ""),
         "cancel_available": bool(cancel_available),
         "cancel_requested": bool(cancel_requested),
@@ -8901,6 +8980,10 @@ def update_live_automatic_run_status(
                 "recorded_at": datetime.now().isoformat(timespec="milliseconds"),
                 "state": record["state"],
                 "phase": record["phase"],
+                "progress_phase": record.get("progress_phase", ""),
+                "completed_units": record.get("completed_units"),
+                "total_units": record.get("total_units"),
+                "evidence_kind": record.get("evidence_kind", ""),
                 "details": record["details"],
                 "confirmed_percent": round(float(record["confirmed_fraction"]) * 100.0, 3),
                 "visible_progress_percent": paced_progress_percent(record, now),
@@ -9042,7 +9125,7 @@ def automatic_live_status_html(status=None):
         f'<div class="automatic-run-progress" role="progressbar" aria-label="Overall run progress" '
         f'aria-valuemin="0" aria-valuemax="100" aria-valuenow="{percent:d}">'
         f'<div class="automatic-run-progress-fill" style="width: {percent:d}%"></div></div>'
-        f'<div class="automatic-run-progress-label"><strong>Total progress: {percent_text}</strong> '
+        f'<div class="automatic-run-progress-label"><strong>Overall progress: {percent_text}</strong> '
         f'<span>{phase}</span>{suffix}{timing_text}</div></div>'
     )
 
@@ -9746,35 +9829,44 @@ def attempt_automatic_runtime_start(run_root, api_url, api_key, *, stage="", sta
     }
     process_running = anythingllm_desktop_process_running()
     record["desktop_process_running"] = process_running
-    if process_running:
-        # A live process with a dead API can be a hung Desktop instance, but it
-        # can also own a manual queue. Its ownership cannot be proven while the
-        # API is unavailable, so do not force-kill it here.
-        record.update(
-            action="restart_withheld_process_alive",
-            status="restart_withheld_manual_activity_uncertain",
-            error="AnythingLLM process exists but its API is unavailable; automatic force-restart was withheld.",
+    # A live process with a dead API can be a hung Desktop instance, but it can
+    # also be in its ordinary startup window or own manual queue work. Never
+    # force-kill it here. ``ensure_anythingllm_runtime(..., autostart_local=True)``
+    # is still safe: its launcher merely returns ``already_running`` and then
+    # polls the local API. Previously this branch failed immediately, so a
+    # Desktop instance that became ready seconds later was reported as a failed
+    # automatic startup.
+    record["action"] = "wait_for_running_process_api" if process_running else "start_only"
+    try:
+        runtime = ensure_anythingllm_runtime(
+            preferred_url=str(api_url or ""),
+            api_key=api_key or None,
+            # The guard has already confirmed two failed local probes. Keep the
+            # initial sweep short; the bounded startup loop below performs the
+            # patient, observable readiness wait.
+            timeout=0.4,
+            startup_timeout=AUTOMATIC_RUNTIME_RECOVERY_STARTUP_TIMEOUT_SECONDS,
+            autostart_local=True,
+            status_callback=status_callback,
+            startup_poll_interval=AUTOMATIC_RUNTIME_RECOVERY_STARTUP_POLL_INTERVAL_SECONDS,
+            startup_fast_poll_interval=AUTOMATIC_RUNTIME_RECOVERY_STARTUP_FAST_POLL_INTERVAL_SECONDS,
+            startup_fast_poll_window=AUTOMATIC_RUNTIME_RECOVERY_STARTUP_FAST_POLL_WINDOW_SECONDS,
         )
-    else:
-        try:
-            runtime = ensure_anythingllm_runtime(
-                preferred_url=str(api_url or ""),
-                api_key=api_key or None,
-                # The guard has already confirmed two failed local probes.
-                # Keep this final pre-start sweep short so a closed Desktop is
-                # launched promptly instead of waiting on four dead aliases.
-                timeout=0.4,
-                startup_timeout=AUTOMATIC_RUNTIME_RECOVERY_STARTUP_TIMEOUT_SECONDS,
-                autostart_local=True,
-                status_callback=status_callback,
-                startup_poll_interval=AUTOMATIC_RUNTIME_RECOVERY_STARTUP_POLL_INTERVAL_SECONDS,
+        record["runtime"] = runtime
+        status = str(runtime.get("status") or "unknown")
+        if status in {"reachable", "reachable_auth_required"}:
+            record["status"] = "ready"
+        elif process_running:
+            record["status"] = "running_process_api_timeout"
+            record["error"] = (
+                "AnythingLLM Desktop remained running, but its local API did not respond "
+                "before the recovery deadline. Automatic force-restart was withheld."
             )
-            record["runtime"] = runtime
-            status = str(runtime.get("status") or "unknown")
-            record["status"] = "ready" if status in {"reachable", "reachable_auth_required"} else status
-        except Exception as exc:
-            record["status"] = "failed"
-            record["error"] = str(exc)
+        else:
+            record["status"] = status
+    except Exception as exc:
+        record["status"] = "failed"
+        record["error"] = str(exc)
     record["elapsed_seconds"] = round(time.perf_counter() - started, 3)
     try:
         _write_automatic_run_json(root / AUTOMATIC_RUN_RUNTIME_RECOVERY, record)
@@ -9872,6 +9964,57 @@ def can_resume_local_preparation_after_runtime_start(output_dir, runtime_recover
     )
 
 
+def resume_owned_embedding_manifest_after_runtime_start(
+    run_root,
+    output_dir,
+    api_url,
+    api_key,
+    *,
+    status_callback=None,
+):
+    """Resume one current run's ledger-proven missing locations after Desktop returns.
+
+    This deliberately does not rerun PDF preparation and never uses a broad
+    workspace scan.  The manifest first removes locations with exact late
+    vector evidence, then resubmits only the remainder using an existing
+    Desktop key.  The most-recent-run restriction prevents an old manifest
+    from reviving beside a newer operator run.
+    """
+    root = Path(run_root)
+    manifest_path = Path(output_dir) / "inspection" / "resume-embedding-manifest.json"
+    manifest = _read_automatic_run_json(manifest_path)
+    recovery = manifest.get("recovery") if isinstance(manifest, dict) else {}
+    if not manifest_path.is_file() or not isinstance(recovery, dict):
+        return {"status": "manifest_unavailable", "message": "No durable embedding recovery manifest was found."}
+    if str(recovery.get("state") or "") != "resume_available":
+        return {"status": "manifest_not_resumable", "message": "The embedding recovery manifest is not resumable."}
+    if not _is_most_recent_recovery_run(root):
+        return {"status": "blocked_not_most_recent", "message": "Only the most recent interrupted run may resume automatically."}
+    if callable(status_callback):
+        try:
+            status_callback("Reconciling exact vectors before resuming this run's missing embedding records")
+        except Exception:
+            pass
+    result = submit_embedding_resume_manifest(
+        manifest_path,
+        manifest,
+        api_url,
+        api_key,
+        str(manifest.get("workspace_slug") or ""),
+        automatic=True,
+        expected_run_root=root,
+        status_callback=(
+            lambda stage, _report: status_callback(
+                f"AnythingLLM recovered; resuming only this run's missing records — {stage}"
+            )
+            if callable(status_callback)
+            else None
+        ),
+    )
+    result["manifest_path"] = str(manifest_path)
+    return result
+
+
 def execute_automatic_preparation_in_worker(
     pdf_path,
     out_dir,
@@ -9949,11 +10092,13 @@ def execute_automatic_preparation_in_worker(
     event_offset = 0
     latest_progress_value = 0.0
     latest_stage = ""
-    # Upload-mode runs need a passive runtime guard from the first local
-    # preparation event.  Waiting for a worker event to declare an embedding
-    # stage made a stopped Desktop invisible until the document was already
-    # locally complete, producing a misleading 99% recovery state.
+    # Observe upload-mode runs continuously, but keep the event-specific flag
+    # separate. A Desktop loss during local parsing can be repaired in the
+    # background while extraction continues; only an actual Desktop operation
+    # is allowed to stop the worker.
     desktop_required = bool(getattr(args, "prepare_and_upload", False))
+    stage_requires_desktop = False
+    background_runtime_recovery_attempted = False
     runtime_guard = new_automatic_runtime_guard()
     worker_record = active_automatic_run_worker(root)
     try:
@@ -9979,8 +10124,8 @@ def execute_automatic_preparation_in_worker(
                             else:
                                 latest_progress_value = event.get("value", 0.0)
                                 latest_stage = event.get("stage", "Working")
-                                desktop_required = bool(event.get("desktop_required")) or desktop_required
-                                progress_callback(latest_progress_value, latest_stage)
+                                stage_requires_desktop = bool(event.get("desktop_required"))
+                                progress_callback(latest_progress_value, latest_stage, progress_event=event)
                         except (TypeError, ValueError, json.JSONDecodeError):
                             continue
                     event_offset = handle.tell()
@@ -10009,6 +10154,60 @@ def execute_automatic_preparation_in_worker(
                     pass
             if runtime_probe.get("status") == "unavailable":
                 _write_automatic_run_json(root / AUTOMATIC_RUN_RUNTIME_GUARD, runtime_guard)
+                if not stage_requires_desktop:
+                    # PDF extraction is local work. Restart Desktop in the
+                    # parent while the child keeps parsing, rather than
+                    # killing the worker and making the operator wait for the
+                    # same PDF to be extracted a second time.
+                    if not background_runtime_recovery_attempted:
+                        background_runtime_recovery_attempted = True
+                        progress_callback(
+                            latest_progress_value,
+                            "AnythingLLM is unavailable; restarting Desktop while local PDF preparation continues",
+                        )
+
+                        def report_background_runtime_recovery(lifecycle_phase, _runtime):
+                            phase = str(lifecycle_phase or "")
+                            if phase == "starting_desktop":
+                                message = "Starting AnythingLLM Desktop while local PDF preparation continues"
+                            elif phase == "waiting_for_runtime":
+                                probe_count = int((_runtime or {}).get("startup_probe_count") or 0)
+                                message = (
+                                    "Waiting for AnythingLLM Desktop API while local PDF preparation continues "
+                                    f"(check {probe_count})"
+                                )
+                            elif phase in {"ready_after_start", "ready"}:
+                                message = "AnythingLLM is ready; local PDF preparation continued without restarting"
+                            elif phase == "start_failed":
+                                message = "AnythingLLM could not be started, but local PDF preparation is continuing"
+                            else:
+                                return
+                            progress_callback(latest_progress_value, message)
+
+                        runtime_recovery = attempt_automatic_runtime_start(
+                            root,
+                            getattr(args, "anythingllm_api_url", ""),
+                            getattr(args, "anythingllm_api_key", ""),
+                            stage=latest_stage,
+                            status_callback=report_background_runtime_recovery,
+                        )
+                        try:
+                            append_automatic_runtime_event(
+                                root,
+                                {
+                                    "phase": latest_stage,
+                                    "background_local_preparation": True,
+                                    **runtime_recovery,
+                                },
+                            )
+                        except OSError:
+                            pass
+                        # The recovery's final API result supersedes the two
+                        # stale failures that triggered it. The next passive
+                        # check starts from a clean evidence window.
+                        runtime_guard = new_automatic_runtime_guard()
+                    time.sleep(0.12)
+                    continue
                 progress_callback(
                     latest_progress_value,
                     "AnythingLLM runtime unavailable; stopping this worker and starting Desktop once",
@@ -10031,15 +10230,20 @@ def execute_automatic_preparation_in_worker(
                 def report_runtime_recovery(lifecycle_phase, _runtime):
                     phase = str(lifecycle_phase or "")
                     if phase == "starting_desktop":
-                        message = "AnythingLLM stopped; starting Desktop once"
+                        message = "Checking AnythingLLM Desktop runtime"
                     elif phase == "waiting_for_runtime":
                         probe_count = int((_runtime or {}).get("startup_probe_count") or 0)
+                        already_running = str(((_runtime or {}).get("start") or {}).get("status") or "") == "already_running"
                         message = (
-                            "Waiting for AnythingLLM Desktop API "
-                            f"(check {probe_count}; retrying every 10 seconds for up to 3 minutes)"
+                            "AnythingLLM is already open; waiting for its local API "
+                            if already_running
+                            else "Waiting for AnythingLLM Desktop API "
+                        ) + (
+                            f"(check {probe_count}; checking about once a second for the first 45 seconds, "
+                            "then every 10 seconds for up to 3 minutes)"
                         )
                     elif phase in {"ready_after_start", "ready"}:
-                        message = "AnythingLLM restarted; resuming local preparation"
+                        message = "AnythingLLM is ready; resuming local preparation"
                     elif phase == "start_failed":
                         message = "AnythingLLM Desktop could not be started automatically"
                     else:
@@ -10104,7 +10308,11 @@ def execute_automatic_preparation_in_worker(
                         if callable(timing_event_callback):
                             timing_event_callback(event.get("stage", ""), event.get("batch_report") or {})
                     else:
-                        progress_callback(event.get("value", 0.0), event.get("stage", "Working"))
+                        progress_callback(
+                            event.get("value", 0.0),
+                            event.get("stage", "Working"),
+                            progress_event=event,
+                        )
         except (OSError, ValueError, json.JSONDecodeError):
             pass
         if automatic_run_cancellation_requested(root):
@@ -12163,9 +12371,10 @@ def automatic_completion(summaries, prepare_and_upload):
     post_ok = all(status == "pass" for status in post_statuses)
     post_searchable_with_caveat = all(status in REVIEWABLE_POST_UPLOAD_STATUSES for status in post_statuses)
     runtime_statuses = [str(summary.get("anythingllm_runtime_validation_status") or "") for summary in summaries]
-    # Stored vectors and a usable retrieval path are separate claims. A
-    # timeout may be operationally transient, but it cannot receive the same
-    # green completion state as a confirmed live retrieval.
+    # Stored vectors and a live runtime probe are separate claims. Exact
+    # page-parent vector evidence is sufficient to complete an upload. A
+    # timed-out optional probe is retained for diagnostics, but must never
+    # make already-searchable documents unusable or block the run.
     runtime_ok = all(status == "pass" for status in runtime_statuses)
     runtime_transient_timeout = all(
         status in {
@@ -12213,9 +12422,9 @@ def automatic_completion(summaries, prepare_and_upload):
         }
     if upload_ok and post_searchable_with_caveat and runtime_transient_timeout:
         return {
-            "state": "warning",
+            "state": "successful",
             "code": "AUTO-RETRIEVAL-RUNTIME-001",
-            "message": "Stored, but retrieval is unverified: a runtime check timed out. Retry validation before using this workspace.",
+            "message": "Searchable page-parent vectors verified. An optional live retrieval probe timed out and was saved for diagnostics; it does not block use of this workspace.",
         }
     if upload_ok and post_searchable_with_caveat and any(
         status == "blocked_provider_authentication" for status in runtime_statuses
@@ -12251,12 +12460,25 @@ def automatic_completion(summaries, prepare_and_upload):
         observed = int(first.get("post_upload_matching_vectors") or 0)
         expected = int(first.get("post_upload_expected_payloads") or 0)
         remaining = max(0, expected - observed)
-        counts = f"{observed} of {expected} planned records were indexed" if expected else "Only part of the prepared document was indexed"
-        recovery = f"; {remaining} still require reconciliation or submission" if expected else ""
+        representation = str(first.get("native_upload_representation") or "").casefold()
+        record_label = "page-parent vectors" if representation == "page_parents" else "segment vectors"
+        coverage = f" ({observed / expected:.0%} confirmed)" if expected else ""
+        counts = (
+            f"{observed} of {expected} planned {record_label} were confirmed searchable{coverage}"
+            if expected else "Only part of the prepared document was indexed"
+        )
+        recovery = f"; {remaining} remain unconfirmed and require reconciliation before any resubmission" if expected else ""
+        cap_classification = str(first.get("post_upload_reconciliation_cap_classification") or "")
+        cap_detail = {
+            "reconciliation_cap_partial_vector_progress": " Exact-vector progress was still arriving during the shared 480-second observation window.",
+            "reconciliation_cap_queue_heartbeat": " Desktop was still emitting queue activity near the shared 480-second observation cap.",
+            "reconciliation_cap_storage_busy": " Local storage was busy during the shared 480-second observation window.",
+            "reconciliation_cap_no_new_evidence": " No new Desktop or exact-vector evidence arrived before the shared 480-second observation cap.",
+        }.get(cap_classification, "")
         return {
             "state": "failed",
             "code": "AUTO-EMBEDDING-PARTIAL-001",
-            "message": f"AnythingLLM partial indexing: {counts}{recovery}. Use the saved recovery manifest to reconcile late vectors and resume only missing records.",
+            "message": f"AnythingLLM indexing stalled: {counts}{recovery}.{cap_detail} The original Desktop queue was not replayed automatically because its remaining outcome is ambiguous; the saved recovery manifest limits any later resume to this run's exact missing records.",
         }
     reconciliation_pending = [
         summary for summary in summaries
@@ -13862,7 +14084,17 @@ def aggregate_upload_result(summaries):
     }
 
 
-def automatic_error_outputs(code, title, details, next_steps=None, context=None, readiness_html=None, timing_html=None):
+def automatic_error_outputs(
+    code,
+    title,
+    details,
+    next_steps=None,
+    context=None,
+    readiness_html=None,
+    timing_html=None,
+    *,
+    terminal_state="failed",
+):
     record = dict(LIVE_AUTOMATIC_RUN_STATUS or {})
     run_root = str(record.get("run_root") or "")
     if run_root and automatic_run_cancellation_requested(run_root):
@@ -13885,7 +14117,7 @@ def automatic_error_outputs(code, title, details, next_steps=None, context=None,
         # panel, otherwise the next poll can repaint the UI as still running.
         update_live_automatic_run_status(
             record["run_root"],
-            state="failed",
+            state=terminal_state,
             phase="Run needs attention",
             expected_seconds=record.get("expected_seconds", 0),
             details=f"{code}: {title}",
@@ -13900,7 +14132,14 @@ def automatic_error_outputs(code, title, details, next_steps=None, context=None,
         [],
         gr.update(visible=False, interactive=False),
         readiness_html or native_upload_readiness_html(initial_native_upload_readiness_report()),
-        timing_html or automatic_run_timing_html(state="failed", message="Run did not start or did not complete."),
+        timing_html or automatic_run_timing_html(
+            state=terminal_state,
+            message=(
+                "Automatic recovery completed its bounded resume step; final indexing verification remains pending."
+                if terminal_state == "warning"
+                else "Run did not start or did not complete."
+            ),
+        ),
     )
 
 
@@ -14362,7 +14601,7 @@ def run_automatic(
     expected_seconds = int(run_timing_estimate["expected_seconds"])
 
     try:
-        progress(0.04, desc="Creating output folder")
+        progress(0.025, desc="Creating output folder")
         output_root_base = Path((output_root_override or "").strip() or str(AUTO_OUTPUT_DIR))
         run_root = Path(run_root_override) if run_root_override else create_fresh_automatic_run_root(output_root_base)
         run_root.mkdir(parents=True, exist_ok=True)
@@ -14448,7 +14687,7 @@ def run_automatic(
     run_timing_estimate["features"]["timing_formula_lane"] = timing_formula_lane(
         run_timing_estimate["features"]
     )
-    progress(0.07, desc="Checking mode and workspace settings")
+    progress(0.035, desc="Checking mode and workspace settings")
     if prepare_and_upload and not workspace_slug:
         progress(None)
         return automatic_error_outputs(
@@ -14610,7 +14849,7 @@ def run_automatic(
             )
 
     local_choice = normalize_simulation_choice(local_check_mode)
-    progress(0.10, desc="Checking retrieval simulation settings")
+    progress(0.04, desc="Checking retrieval simulation settings")
     simulation_plan = resolve_simulation_run(local_choice, custom_ollama_model, ollama_url)
     simulation_warning = ""
     if simulation_plan.get("error_report"):
@@ -14655,7 +14894,7 @@ def run_automatic(
         "write_result": None,
     }
     if prepare_and_upload and bool(auto_apply_recommended_settings):
-        progress(0.11, desc="Applying recommended AnythingLLM settings")
+        progress(0.045, desc="Applying recommended AnythingLLM settings")
         auto_correction = apply_recommended_anythingllm_settings(default_anythingllm_storage_dir())
     if run_vector_eval and simulation_adapter:
         current_state = anythingllm_resolved_state(default_anythingllm_storage_dir(), simulation_adapter)
@@ -14665,7 +14904,7 @@ def run_automatic(
             or embed_policy.get("recommended_limit")
             or 4096
         )
-        progress(0.115, desc="Running embedder preflight")
+        progress(0.05, desc="Running embedder preflight")
         preflight = simulation_preflight(
             simulation_adapter,
             effective_limit=effective_limit,
@@ -14708,6 +14947,10 @@ def run_automatic(
     total_files = max(len(files), 1)
     cancellation_requested = False
     ocr_eta_applied_files = set()
+    # The worker supplies this same ordering on every structured event.  Keep
+    # it run-local so stale callbacks from an earlier phase cannot repaint the
+    # single visible progress bar after the workflow has advanced.
+    automatic_phase_rank = 0
     progress_allocations = automatic_progress_file_allocations(
         files,
         segment_mode=segment_mode,
@@ -14755,8 +14998,9 @@ def run_automatic(
         start=0.0,
         end=1.0,
         reset_progress=False,
+        progress_event=None,
     ):
-        nonlocal expected_seconds, ocr_eta_applied_files
+        nonlocal expected_seconds, ocr_eta_applied_files, automatic_phase_rank
         stage_text = str(stage or "Working")
         stage_key = stage_text.casefold()
         if (
@@ -14784,7 +15028,40 @@ def run_automatic(
                     {"file": pdf_path.name, "pages": observed_pages, "seconds": surcharge}
                 )
             ocr_eta_applied_files.add(str(pdf_path))
-        confirmed_fraction = start + (end - start) * float(value)
+        source_fraction = max(0.0, min(1.0, float(value)))
+        # Structured worker events already carry the canonical automatic
+        # phase allocation. Do not run them through the old source-scale
+        # mapper: that would reclassify local extraction as Desktop indexing.
+        # Untagged callbacks remain diagnostic-only legacy fallbacks while the
+        # remaining non-automatic callers keep their established values.
+        phase_name = str((progress_event or {}).get("phase") or "").strip()
+        # A worker can flush a buffered extraction or queue callback after a
+        # later observer has already supplied exact vector evidence.  Numeric
+        # high-water protection alone is insufficient: without this guard the
+        # bar can keep its correct percentage while its text regresses to an
+        # earlier, less informative phase.  Structured phases are ordered by
+        # actual ownership and completed work, not by the text of a message.
+        phase_rank = {
+            "metadata": 1,
+            "extraction": 2,
+            "candidate_evaluation": 3,
+            "payloads": 4,
+            "attachments": 5,
+            "desktop_queue": 6,
+            "searchable_vectors": 7,
+            "validation": 8,
+            "reporting": 9,
+        }.get(phase_name, 0)
+        if phase_rank and phase_rank < automatic_phase_rank:
+            return
+        if phase_rank:
+            automatic_phase_rank = phase_rank
+        display_fraction = source_fraction if phase_name else (
+            reweight_automatic_upload_progress(source_fraction)
+            if prepare_and_upload
+            else source_fraction
+        )
+        confirmed_fraction = start + (end - start) * display_fraction
         confirmed_fraction, cancellation_active = cancellation_safe_display_progress(
             run_root, confirmed_fraction
         )
@@ -14802,6 +15079,10 @@ def run_automatic(
             ),
             cancel_requested=cancellation_active,
             reset_progress=reset_progress,
+            progress_phase=phase_name or None,
+            completed_units=(progress_event or {}).get("completed_units") if phase_name else None,
+            total_units=(progress_event or {}).get("total_units") if phase_name else None,
+            evidence_kind=(progress_event or {}).get("evidence_kind") if phase_name else None,
         )
         progress(
             confirmed_fraction,
@@ -15000,12 +15281,14 @@ def run_automatic(
             break
         pdf_path = Path(file_path)
         active_file_index = file_index
+        automatic_phase_rank = 0
         progress_allocation = progress_allocations[file_index - 1]
-        # Reserve only the final two percentage points for the terminal
-        # verification response. The former 12%-88% mapping made a real
-        # 95%-complete pipeline look stuck near 84%, then jump to 100%.
-        start_fraction = 0.10 + float(progress_allocation["start_share"]) * 0.88
-        end_fraction = 0.10 + float(progress_allocation["end_share"]) * 0.88
+        # The first 5% covers run setup and the final 5% covers durable
+        # reports/downloads. The document protocol therefore receives the
+        # evidence-bearing 5--95% range, weighted across PDFs by the bounded
+        # preflight difficulty profile rather than an equal-file split.
+        start_fraction = 0.05 + float(progress_allocation["start_share"]) * 0.90
+        end_fraction = 0.05 + float(progress_allocation["end_share"]) * 0.90
         progress(start_fraction, desc=format_progress_desc(f"Preparing {pdf_path.name}", file_index, total_files))
         resolved_segment_mode = pipeline_segment_mode(segment_mode)
         args = SimpleNamespace(
@@ -15073,8 +15356,8 @@ def run_automatic(
             anythingllm_create_document_folders=bool(anythingllm_create_document_folders),
             anythingllm_document_folder_name=(anythingllm_document_folder_name or "").strip(),
             anythingllm_storage_dir="",
-            progress_callback=lambda value, stage, start=start_fraction, end=end_fraction: report_automatic_progress(
-                value, stage, file_index=file_index, total=total_files, start=start, end=end
+            progress_callback=lambda value, stage, start=start_fraction, end=end_fraction, progress_event=None: report_automatic_progress(
+                value, stage, file_index=file_index, total=total_files, start=start, end=end, progress_event=progress_event
             ),
             timing_event_callback=record_pipeline_timing,
             batch_inspection_context=batch_inspection_context,
@@ -15101,13 +15384,14 @@ def run_automatic(
                 out_dir,
                 args,
                 run_root,
-                lambda value, stage: report_automatic_progress(
+                lambda value, stage, progress_event=None: report_automatic_progress(
                     value,
                     stage,
                     file_index=file_index,
                     total=total_files,
                     start=start_fraction,
                     end=end_fraction,
+                    progress_event=progress_event,
                 ),
                 record_pipeline_timing,
             )
@@ -15128,22 +15412,100 @@ def run_automatic(
             if worker_result.get("status") == "runtime_unavailable":
                 runtime_recovery = dict(worker_result.get("runtime_recovery") or {})
                 runtime_ready = runtime_recovery.get("status") == "ready"
-                failure_code = (
-                    "AUTO-EMBEDDING-RECONCILE-001"
-                    if runtime_ready
-                    else "AUTO-ANYTHINGLLM-STARTUP-001"
+                running_process_timeout = runtime_recovery.get("status") == "running_process_api_timeout"
+                if runtime_ready:
+                    # The worker stopped at a submission boundary because the
+                    # client could not know whether Desktop accepted that one
+                    # request.  Desktop is now back. Reconcile the exact
+                    # app-owned identities and submit only those still missing;
+                    # do not rerun PDF parsing or replay the original batch.
+                    def report_manifest_resume(stage):
+                        report_automatic_progress(
+                            0.0,
+                            stage,
+                            file_index=file_index,
+                            total=total_files,
+                            start=start_fraction,
+                            end=end_fraction,
+                        )
+
+                    resume_result = resume_owned_embedding_manifest_after_runtime_start(
+                        run_root,
+                        out_dir,
+                        getattr(args, "anythingllm_api_url", ""),
+                        getattr(args, "anythingllm_api_key", ""),
+                        status_callback=report_manifest_resume,
+                    )
+                    resume_status = str(resume_result.get("status") or "unknown")
+                    if resume_status in {"submitted", "nothing_to_resume"}:
+                        # The bridge is guarded against unsent drafts. Ask it
+                        # once only after the recovered Desktop has accepted
+                        # this run's resume step, so the visible workspace can
+                        # catch up without making UI reload a readiness test.
+                        desktop_refresh_note = refresh_desktop_after_anythingllm_mutation()
+                        resumed = int(resume_result.get("accepted") or 0)
+                        reconciled = int(resume_result.get("reconciled_locations") or 0)
+                        phase = (
+                            "AnythingLLM recovered — all interrupted records already became searchable"
+                            if resume_status == "nothing_to_resume"
+                            else "AnythingLLM recovered — missing embedding records were resubmitted"
+                        )
+                        detail = (
+                            "Exact vector reconciliation found no missing records after Desktop restarted. "
+                            "Final retrieval verification remains pending."
+                            if resume_status == "nothing_to_resume"
+                            else (
+                                f"Desktop restarted and the app resubmitted {resumed} ledger-proven missing record(s). "
+                                f"{reconciled} late-completing record(s) were excluded; final retrieval verification remains pending."
+                            )
+                        ) + f" {desktop_refresh_note}"
+                        update_live_automatic_run_status(
+                            run_root,
+                            state="warning",
+                            phase=phase,
+                            expected_seconds=expected_seconds,
+                            details=detail,
+                            confirmed_fraction=start_fraction,
+                            cancel_available=False,
+                            activity_observed=False,
+                        )
+                        progress(None)
+                        return automatic_error_outputs(
+                            "AUTO-EMBEDDING-RECOVERY-001",
+                            phase,
+                            [detail],
+                            [
+                                "AnythingLLM was restarted and this run resumed only its durable, app-owned missing records.",
+                                "Use the saved recovery manifest to inspect the exact reconciliation evidence while AnythingLLM finishes indexing.",
+                            ],
+                            {
+                                "Runtime recovery report": str(run_root / AUTOMATIC_RUN_RUNTIME_RECOVERY),
+                                "Embedding recovery manifest": resume_result.get("manifest_path") or "",
+                            },
+                            readiness_html=latest_readiness_html,
+                            terminal_state="warning",
+                        )
+                failure_code = "AUTO-EMBEDDING-RECONCILE-001" if runtime_ready else (
+                    "AUTO-ANYTHINGLLM-RUNTIME-001" if running_process_timeout else "AUTO-ANYTHINGLLM-STARTUP-001"
                 )
                 failure_title = (
                     "AnythingLLM restarted after an embedding submission boundary"
                     if runtime_ready
-                    else "AnythingLLM did not become ready after automatic startup"
+                    else (
+                        "AnythingLLM is running but its local API did not become ready"
+                        if running_process_timeout
+                        else "AnythingLLM did not become ready after automatic startup"
+                    )
                 )
                 failure_detail = (
                     "AnythingLLM became ready, but this run had already crossed a submission boundary. "
                     "The app stopped rather than risk a duplicate embedding submission."
                     if runtime_ready
-                    else worker_result.get("error")
-                    or "Desktop's local API did not respond before the recovery deadline."
+                    else (
+                        runtime_recovery.get("error")
+                        if running_process_timeout
+                        else worker_result.get("error") or "Desktop's local API did not respond before the recovery deadline."
+                    )
                 )
                 update_live_automatic_run_status(
                     run_root,
@@ -15238,13 +15600,14 @@ def run_automatic(
                         out_dir,
                         args,
                         run_root,
-                        lambda value, stage: report_automatic_progress(
+                        lambda value, stage, progress_event=None: report_automatic_progress(
                             value,
                             stage,
                             file_index=file_index,
                             total=total_files,
                             start=start_fraction,
                             end=end_fraction,
+                            progress_event=progress_event,
                         ),
                         record_pipeline_timing,
                     )
@@ -15332,7 +15695,18 @@ def run_automatic(
                     {"PDF": pdf_path, "Output folder": out_dir},
                     readiness_html=latest_readiness_html,
                 )
-        progress(end_fraction, desc=format_progress_desc(f"Collected output files for {pdf_path.name}", file_index, total_files))
+        indexing_incomplete = str(summary.get("post_upload_verification_status") or "") == "partial_vector_coverage"
+        if indexing_incomplete:
+            # Local text is prepared, but it is false to credit the workflow
+            # with this document's full allocation while exact searchable
+            # page/segment-vector coverage remains incomplete.
+            live = dict(LIVE_AUTOMATIC_RUN_STATUS or {})
+            progress(
+                float(live.get("confirmed_fraction") or start_fraction),
+                desc=format_progress_desc("AnythingLLM indexing incomplete; preserving the exact recovery checkpoint", file_index, total_files),
+            )
+        else:
+            progress(end_fraction, desc=format_progress_desc(f"Collected output files for {pdf_path.name}", file_index, total_files))
         summaries.append(summary)
         # Prepared text is the operator's usable result even if upload,
         # indexing, or a later verification layer needs review.  Keep it in
@@ -15475,7 +15849,12 @@ def run_automatic(
         for path in downloadable
         if path and Path(path).exists()
     ]
-    progress(0.985, desc="Deduplicating generated files")
+    incomplete_indexing = any(
+        str(summary.get("post_upload_verification_status") or "") == "partial_vector_coverage"
+        for summary in summaries
+    )
+    if not incomplete_indexing:
+        progress(0.95, desc="Writing the run report and preparing downloads")
     seen_downloads = set()
     downloadable = [
         path
@@ -15723,6 +16102,8 @@ def run_automatic(
                 verify_authentication=True,
             )
         )
+    if not incomplete_indexing:
+        progress(0.98, desc="Finalizing run output and completion checks")
 
     completion = (
         {
@@ -15777,7 +16158,7 @@ def run_automatic(
     lines.insert(0, f"Status: {display_status}")
     lines.insert(1, f"Completion assessment: {completion['message']}")
 
-    if completion["state"] == "cancelled":
+    if completion["state"] in {"cancelled", "failed"}:
         progress(None)
     else:
         progress(1.0, desc="Preparation complete")
