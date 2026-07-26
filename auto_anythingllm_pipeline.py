@@ -88,25 +88,25 @@ PIPELINE_PROGRESS_REPORTING = 0.97
 ANYTHINGLLM_HTTP_RESPONSE_TIMEOUT_SECONDS = 180
 
 # Upload-mode progress is a user-facing evidence scale, not the old generic
-# pipeline's anonymous 0..1 values.  The app applies each document's source
-# scale inside the app's visible document allocation (currently 1--95%; the
-# outer 0--1% is run setup and terminal completion owns 95--100%). These
-# boundaries deliberately give Desktop queue and exact-vector evidence most
-# of that document scale. The benchmark may refine their shares further.
-# The queue and vector observer can overlap in wall-clock time; the allocation
-# is a stable explanation of evidence, not a claim that those operations are
-# serial.
+# pipeline's anonymous 0..1 values.  The eight-PDF medium-file benchmark put
+# setup plus local preparation below ten percent of elapsed time; the
+# Desktop-owned queue and exact page-parent confirmation dominated it.  Keep
+# the detailed units visible so a user can see *what* is progressing rather
+# than collapsing that evidence into one "upload" stage. The queue and vector
+# observer can overlap in wall-clock time; the allocation is a useful,
+# monotonic explanation of owned evidence, not a claim that they are serial.
 AUTOMATIC_UPLOAD_PHASE_RANGES = {
-    "metadata": (0.0000, 0.0056),
-    "extraction": (0.0056, 0.0333),
-    "candidate_evaluation": (0.0333, 0.0389),
-    "payloads": (0.0389, 0.0500),
-    "attachments": (0.0500, 0.0556),
-    "desktop_queue": (0.0556, 0.5556),
-    "searchable_vectors": (0.5556, 0.8889),
-    "validation": (0.8889, 1.0000),
-    # Terminal completion owns the outer 95--100% handoff.
-    "reporting": (1.0000, 1.0000),
+    "metadata": (0.0000, 0.0130),
+    "extraction": (0.0130, 0.0415),
+    "candidate_evaluation": (0.0415, 0.0518),
+    "payloads": (0.0518, 0.0674),
+    "attachments": (0.0674, 0.0985),
+    "queue_receipt": (0.0985, 0.1192),
+    "desktop_queue": (0.1192, 0.5855),
+    "identity_set": (0.5855, 0.8549),
+    "retrieval_sample": (0.8549, 0.9275),
+    "validation": (0.9275, 0.9793),
+    "reporting": (0.9793, 1.0000),
 }
 
 
@@ -137,8 +137,8 @@ class UploadPhaseReporter:
             return self._report_progress(fallback_fraction, stage, desktop_required=desktop_required)
         start, end = AUTOMATIC_UPLOAD_PHASE_RANGES[str(phase)]
         try:
-            completed = max(0.0, float(completed_units))
-            total = max(0.0, float(total_units))
+            completed = max(0.0, float(completed_units or 0.0))
+            total = max(0.0, float(total_units or 0.0))
             fraction = min(1.0, completed / total) if total else max(0.0, min(1.0, fallback_fraction))
         except (TypeError, ValueError):
             fraction = max(0.0, min(1.0, fallback_fraction))
@@ -9953,6 +9953,13 @@ ANYTHINGLLM_DESKTOP_QUEUE_RECEIPT_TIMEOUT_SECONDS = 20.0
 # reconciler enough time to observe slow sequential provider work, while still
 # retaining a finite circuit-breaker boundary.
 ANYTHINGLLM_EMBEDDING_RECONCILIATION_TIMEOUT_SECONDS = 480.0
+# The first reconciliation window is finite, but a locally owned Desktop queue
+# that is still proving forward progress must not be declared failed merely
+# because its provider is slower than the original observation estimate. Every
+# extension is evidence-backed and the whole run stays bounded by this cap.
+ANYTHINGLLM_EMBEDDING_RECONCILIATION_ACTIVE_CAP_SECONDS = 3600.0
+ANYTHINGLLM_EMBEDDING_RECONCILIATION_PROGRESS_GRACE_SECONDS = 90.0
+ANYTHINGLLM_EMBEDDING_RECONCILIATION_STALL_SECONDS = 90.0
 # Temporary validation uses one shorter, shared observation budget. Its
 # per-batch checkpoint and final document check observe the same Desktop work;
 # they must not add independent 45- and 180-second waits.
@@ -10523,6 +10530,17 @@ def _update_workspace_embeddings_batched_serial(
                 verification = {"status": "error", "error": str(exc)}
             batch_report["verification_seconds"] = round(time.perf_counter() - verification_started, 4)
             batch_report["verification"] = verification
+            if verification.get("reconciliation_effective_deadline_seconds") is not None:
+                # Preserve the active, evidence-backed deadline in the
+                # durable ledger so the document-level final read does not
+                # mistakenly believe that the original 480-second window has
+                # already exhausted a still-moving Desktop queue.
+                batch_report["reconciliation_effective_deadline_seconds"] = float(
+                    verification["reconciliation_effective_deadline_seconds"]
+                )
+                batch_report["reconciliation_deadline_extensions"] = int(
+                    verification.get("reconciliation_deadline_extensions") or 0
+                )
             verification_status = str(verification.get("status") or "incomplete")
             verification_observed = int(
                 verification.get("matching_vector_rows")
@@ -12724,6 +12742,7 @@ def inspect_native_metadata_count(
     source_sha: str,
     workspace_namespace="",
     expected_chunk_sources=None,
+    identity_set_mode="on_completion",
 ):
     """Read a bounded vector-count observation for active polling.
 
@@ -12744,6 +12763,7 @@ def inspect_native_metadata_count(
         "observed_chunk_source_count": 0,
         "duplicate_chunk_source_count": 0,
         "missing_chunk_sources": [],
+        "observed_chunk_sources": [],
         "matching_table_names": [],
         "metadata_fields_seen": [],
         "text_contains_segment_or_page": False,
@@ -12806,10 +12826,15 @@ def inspect_native_metadata_count(
         # identity column and compare its complete set. This avoids reading
         # dense vectors and full text in the ordinary healthy path while
         # retaining complete coverage proof for every planned page-parent.
+        identity_mode = str(identity_set_mode or "on_completion").casefold()
+        result["identity_set_mode"] = identity_mode
         if (
             normalized_chunk_sources
             and "chunkSource" in columns
-            and result["matching_rows"] >= len(normalized_chunk_sources)
+            and (
+                identity_mode == "always"
+                or result["matching_rows"] >= len(normalized_chunk_sources)
+            )
         ):
             identities = (
                 table.search()
@@ -12818,9 +12843,11 @@ def inspect_native_metadata_count(
                 .limit(result["matching_rows"] + 1)
                 .to_pandas()
             )
+            identity_column = identities.get("chunkSource")
+            identity_values = identity_column.tolist() if identity_column is not None else []
             observed_sources = [
                 str(value).strip()
-                for value in identities.get("chunkSource", []).tolist()
+                for value in identity_values
                 if str(value).strip()
             ]
             observed_set = set(observed_sources)
@@ -12828,6 +12855,10 @@ def inspect_native_metadata_count(
             missing_sources = sorted(expected_set - observed_set)
             result["identity_set_checked"] = True
             result["observed_chunk_source_count"] = len(observed_set)
+            # Keep the exact scalar identities available to a bounded recovery
+            # manifest. This avoids reopening LanceDB once per planned page at
+            # a deadline while never reading text or dense vectors.
+            result["observed_chunk_sources"] = sorted(observed_set)
             result["duplicate_chunk_source_count"] = max(0, len(observed_sources) - len(observed_set))
             result["missing_chunk_sources"] = missing_sources[:25]
             result["identity_set_complete"] = bool(
@@ -13093,9 +13124,9 @@ def full_post_upload_observation_is_required(
     """Keep broad storage/frontend inspection off a healthy success path.
 
     Exact, provenance-matched vector coverage is the ordinary completion
-    evidence.  A broad scan remains mandatory when there is an incomplete,
-    ambiguous, or contradicted result, but should not add minutes after all
-    expected vectors are already observable.
+    evidence. A broad scan remains mandatory when there is an incomplete,
+    contradicted, or failed-checkpoint result. An ambiguous HTTP receipt alone
+    is no longer enough once its complete exact identity set is observed.
     """
     expected = max(0, int(expected_records or 0))
     observed = max(
@@ -13103,12 +13134,13 @@ def full_post_upload_observation_is_required(
         int((fast_report or {}).get("lancedb_matching_rows") or 0),
     )
     status = str((fast_report or {}).get("status") or "")
+    diagnostic_error = "busy" in status.casefold() or "error" in status.casefold()
     return not (
         expected > 0
         and observed >= expected
         and status in REVIEWABLE_POST_UPLOAD_STATUSES
         and not failed_checkpoint
-        and not ambiguous_submission
+        and not diagnostic_error
     )
 
 
@@ -13179,7 +13211,7 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
         result["workspace_found"] = True
         workspace_id = workspace["id"]
         normalized_observation_mode = str(observation_mode or "full").casefold()
-        if normalized_observation_mode == "fast":
+        if normalized_observation_mode in {"fast", "identity"}:
             # The five-second observer needs only a bounded health signal.
             # Pulling every workspace-document JSON blob on every poll caused
             # a batch-global cost once per PDF, and it could race Desktop
@@ -13301,8 +13333,11 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
                 source_sha,
                 workspace_namespace=workspace_slug,
                 expected_chunk_sources=expected_chunk_sources,
+                identity_set_mode=(
+                    "always" if normalized_observation_mode == "identity" else "on_completion"
+                ),
             )
-            if normalized_observation_mode == "fast"
+            if normalized_observation_mode in {"fast", "identity"}
             else inspect_native_metadata_rows(
                 storage_dir,
                 source_sha,
@@ -13323,10 +13358,10 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
             )
         vector_rows = (
             {"matching_rows": 0, "text_contains_page_or_segment": False}
-            if normalized_observation_mode == "fast"
+            if normalized_observation_mode in {"fast", "identity"}
             else inspect_lancedb_vector_ids(storage_dir, vector_ids)
         )
-        if normalized_observation_mode == "fast":
+        if normalized_observation_mode in {"fast", "identity"}:
             # A Lance table row is itself vector evidence.  The count is a
             # bounded readiness signal, not a replacement for the later full
             # metadata audit.
@@ -13343,6 +13378,7 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
         result["observed_chunk_source_count"] = int(native_rows.get("observed_chunk_source_count") or 0)
         result["duplicate_chunk_source_count"] = int(native_rows.get("duplicate_chunk_source_count") or 0)
         result["missing_chunk_sources"] = list(native_rows.get("missing_chunk_sources") or [])
+        result["observed_chunk_sources"] = list(native_rows.get("observed_chunk_sources") or [])
         result["upload_chain_lancedb_matching_count"] = result["lancedb_matching_rows"]
         result["lancedb_matching_tables"] = native_rows.get("matching_table_names", [])
         result["lancedb_text_contains_page_or_segment"] = bool(
@@ -13398,7 +13434,7 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
                 "but this document is incomplete and needs review or explicit recovery."
             )
         elif not matching_docs and vector_namespace_evidence_exists:
-            if normalized_observation_mode == "fast":
+            if normalized_observation_mode in {"fast", "identity"}:
                 # Fast polling deliberately counts workspace rows without
                 # materializing their metadata, so ``matching_docs`` is empty
                 # by design. Do not turn that deferred observation into a
@@ -15591,13 +15627,21 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
             phase = "desktop_queue"
             completed = int(batch_report.get("desktop_events_observed") or 0)
             total = int(batch_report.get("queue_records") or 0)
+        elif timing_event in {"submission_started", "submission_completed", "verification_started"}:
+            # Receipt/acceptance is deliberately distinct from the long
+            # Desktop-owned queue. It reaches its end only when the HTTP
+            # receipt is known; an unresolved receipt remains visible without
+            # falsely implying that the queued page parents are complete.
+            phase = "queue_receipt"
+            completed = 1 if timing_event == "submission_completed" else 0
+            total = 1
         else:
             # Request acceptance is useful state, but it is not vector
             # evidence. Keep it at the current queue checkpoint until either
             # Desktop emits per-file events or the exact observer sees rows.
-            phase = "desktop_queue"
+            phase = "queue_receipt"
             completed = int(batch_report.get("desktop_events_observed") or 0)
-            total = int(batch_report.get("queue_records") or batch_report.get("requested") or 0)
+            total = max(1, int(batch_report.get("queue_records") or batch_report.get("requested") or 0))
         report_upload_phase(
             phase,
             stage,
@@ -15710,6 +15754,10 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
         reconciliation_tracker = {
             "highest_observed": 0,
             "last_vector_progress_elapsed_seconds": None,
+            "highest_queue_position": 0,
+            "last_queue_progress_elapsed_seconds": None,
+            "deadline_extensions": 0,
+            "effective_deadline_seconds": reconciliation_deadline,
             "storage_busy_observed": False,
             # Fast observations are deliberately cheap enough to run on the
             # normal two-second cadence.  The two scheduled diagnostics below
@@ -15738,6 +15786,9 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
                     if last_event else None
                 ),
                 "queue_records": max(0, int(raw.get("queue_records") or len(expected_batch))),
+                "desktop_queue_observer_state": str(raw.get("observer_state") or "unknown"),
+                "desktop_queue_observer_failures": max(0, int(raw.get("observer_failures") or 0)),
+                "desktop_queue_observer_reason": str(raw.get("observer_reason") or ""),
             }
 
         def reconcile_evidence(evidence):
@@ -15757,8 +15808,17 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
             if any(token in error_text for token in ("database is locked", "sqlite", "lock", "busy")):
                 reconciliation_tracker["storage_busy_observed"] = True
             queue = live_desktop_queue_snapshot()
+            queue_position = max(
+                int(queue.get("desktop_queue_completed") or 0),
+                int(queue.get("desktop_queue_current") or 0),
+            )
+            if queue_position > int(reconciliation_tracker["highest_queue_position"]):
+                reconciliation_tracker["highest_queue_position"] = queue_position
+                reconciliation_tracker["last_queue_progress_elapsed_seconds"] = round(elapsed, 3)
             heartbeat_age = queue.get("desktop_queue_last_event_age_seconds")
             heartbeat_live = (
+                str(queue.get("desktop_queue_observer_state") or "") == "connected"
+                and
                 heartbeat_age is not None
                 and float(heartbeat_age) <= max(15.0, float(getattr(args, "post_upload_poll_interval", 2.0)) * 3.0)
             )
@@ -15779,14 +15839,75 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
                 "reconciliation_classification": classification,
                 "reconciliation_elapsed_seconds": round(elapsed, 3),
                 "reconciliation_deadline_seconds": reconciliation_deadline,
-                "reconciliation_remaining_seconds": round(max(0.0, reconciliation_deadline - elapsed), 3),
+                "reconciliation_effective_deadline_seconds": round(
+                    float(reconciliation_tracker["effective_deadline_seconds"]), 3
+                ),
+                "reconciliation_remaining_seconds": round(
+                    max(0.0, float(reconciliation_tracker["effective_deadline_seconds"]) - elapsed), 3
+                ),
                 "reconciliation_vector_progress_count": int(reconciliation_tracker["highest_observed"]),
+                "reconciliation_queue_progress_count": int(reconciliation_tracker["highest_queue_position"]),
+                "reconciliation_last_queue_progress_elapsed_seconds": reconciliation_tracker[
+                    "last_queue_progress_elapsed_seconds"
+                ],
+                "reconciliation_deadline_extensions": int(reconciliation_tracker["deadline_extensions"]),
                 "reconciliation_storage_busy_observed": bool(reconciliation_tracker["storage_busy_observed"]),
                 "reconciliation_read_only_checkpoints": list(
                     reconciliation_tracker["read_only_checkpoints"]
                 ),
             })
             return evidence
+
+        def extend_reconciliation_deadline(evidence, poll_elapsed, current_deadline):
+            """Extend only while this run's owned Desktop queue proves movement.
+
+            The receipt POST is intentionally never replayed.  Once it has
+            timed out, fresh SSE queue progress or exact-vector progress is
+            the only basis for continued observation.  A quiet/reconnecting
+            stream cannot prolong the run, and a hard cap prevents an endless
+            wait if Desktop stops reporting entirely.
+            """
+            evidence = dict(evidence or {})
+            elapsed = float(evidence.get("reconciliation_elapsed_seconds") or poll_elapsed or 0.0)
+            if elapsed < reconciliation_deadline:
+                return None
+            queue_total = int(evidence.get("queue_records") or len(expected_batch))
+            queue_position = max(
+                int(evidence.get("desktop_queue_completed") or 0),
+                int(evidence.get("desktop_queue_current") or 0),
+            )
+            last_queue_progress = reconciliation_tracker["last_queue_progress_elapsed_seconds"]
+            last_vector_progress = reconciliation_tracker["last_vector_progress_elapsed_seconds"]
+            recent_queue_progress = (
+                last_queue_progress is not None
+                and elapsed - float(last_queue_progress) <= ANYTHINGLLM_EMBEDDING_RECONCILIATION_STALL_SECONDS
+            )
+            recent_vector_progress = (
+                last_vector_progress is not None
+                and elapsed - float(last_vector_progress) <= ANYTHINGLLM_EMBEDDING_RECONCILIATION_STALL_SECONDS
+            )
+            owned_queue_active = (
+                queue_total > 0
+                and queue_position < queue_total
+                and str(evidence.get("desktop_queue_observer_state") or "") == "connected"
+                and recent_queue_progress
+            )
+            if not (owned_queue_active or recent_vector_progress):
+                return None
+            extended = min(
+                ANYTHINGLLM_EMBEDDING_RECONCILIATION_ACTIVE_CAP_SECONDS,
+                max(
+                    float(current_deadline),
+                    elapsed + ANYTHINGLLM_EMBEDDING_RECONCILIATION_PROGRESS_GRACE_SECONDS,
+                ),
+            )
+            if extended > float(current_deadline):
+                reconciliation_tracker["deadline_extensions"] += 1
+                reconciliation_tracker["effective_deadline_seconds"] = extended
+                evidence["reconciliation_deadline_extensions"] = int(reconciliation_tracker["deadline_extensions"])
+                evidence["reconciliation_effective_deadline_seconds"] = round(extended, 3)
+                return extended
+            return None
 
         def report_batch_observation(evidence, operator_state):
             observed = int(evidence.get("matching_vector_rows") or evidence.get("lancedb_matching_rows") or 0)
@@ -15795,7 +15916,11 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
             queue_completed = int(evidence.get("desktop_queue_completed") or 0)
             queue_total = int(evidence.get("queue_records") or len(expected_batch))
             reconciliation_elapsed = float(evidence.get("reconciliation_elapsed_seconds") or 0.0)
-            reconciliation_deadline_seconds = float(evidence.get("reconciliation_deadline_seconds") or 0.0)
+            reconciliation_deadline_seconds = float(
+                evidence.get("reconciliation_effective_deadline_seconds")
+                or evidence.get("reconciliation_deadline_seconds")
+                or 0.0
+            )
             queue_detail = (
                 f"Desktop queue: embedding {queue_current}/{queue_total} page-parent files; "
                 f"{queue_completed}/{queue_total} completed. "
@@ -15810,7 +15935,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
                     f"{int(latest_checkpoint.get('observed_vectors') or 0)}/{len(expected_batch)} observed."
                 )
             report_upload_phase(
-                "searchable_vectors",
+                "identity_set",
                 (
                     f"AnythingLLM reconciliation {reconciliation_elapsed:.0f}/{reconciliation_deadline_seconds:.0f}s: "
                     f"{queue_detail}"
@@ -15873,7 +15998,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
                         source_sha,
                         expected_batch,
                         upload_locations=(batch_report.get("locations") or []),
-                        observation_mode="full",
+                        observation_mode="identity",
                     )
                     checkpoint_observed = int(
                         checkpoint_evidence.get("matching_vector_rows")
@@ -15914,6 +16039,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
                             "observed_chunk_source_count",
                             "duplicate_chunk_source_count",
                             "missing_chunk_sources",
+                            "observed_chunk_sources",
                             "lancedb_matching_tables",
                             "lancedb_text_contains_page_or_segment",
                         ):
@@ -15949,9 +16075,10 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
             # batches. Successful observations still return immediately; the
             # longer cap is paid only by the exceptional timeout path.
             timeout_seconds=observation_timeout,
-            hard_cap_seconds=observation_timeout,
+            hard_cap_seconds=ANYTHINGLLM_EMBEDDING_RECONCILIATION_ACTIVE_CAP_SECONDS,
             observation_callback=report_batch_observation,
             retryable_evidence_codes={"partial_vector_coverage"},
+            deadline_extension=extend_reconciliation_deadline,
         )
         evidence = dict(polling.final_evidence)
         evidence.update(
@@ -15976,7 +16103,8 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
             evidence["reconciliation_cap_classification"] = cap_classification
             evidence["reconciliation_outcome"] = "bounded_window_exhausted"
             evidence["message"] = (
-                f"AnythingLLM reconciliation reached its {reconciliation_deadline:.0f}-second shared cap: "
+                f"AnythingLLM reconciliation reached its {float(evidence.get('reconciliation_effective_deadline_seconds') or reconciliation_deadline):.0f}-second "
+                "evidence-backed observation cap: "
                 f"{int(evidence.get('matching_vector_rows') or evidence.get('lancedb_matching_rows') or 0)}/"
                 f"{len(expected_batch)} exact page-parent vectors were observed ({cap_classification})."
             )
@@ -15984,33 +16112,44 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
             # do not make the user infer a 480-second timeout from a stale
             # earlier count.
             report_batch_observation(evidence, "incomplete")
-            confirmed_chunk_sources = []
-            unresolved_chunk_sources = []
+            # One exact scalar identity-set observation maps every confirmed
+            # page-parent at once.  The former loop opened LanceDB once per
+            # record at the worst possible moment: while Desktop was already
+            # late and potentially still writing.  This preserves complete
+            # provenance evidence without N repeated storage reads.
+            identity_evidence = verify_anythingllm_post_upload(
+                storage_dir,
+                target_workspace_slug,
+                source_sha,
+                expected_batch,
+                upload_locations=(batch_report.get("locations") or []),
+                observation_mode="identity",
+            )
+            identity_observed = {
+                str(value).strip()
+                for value in (identity_evidence.get("observed_chunk_sources") or [])
+                if str(value).strip()
+            }
+            expected_sources = [
+                str((payload.get("metadata", {}) or {}).get("chunkSource") or f"batch-{batch_number}-record-{offset + 1}")
+                for offset, payload in enumerate(expected_batch)
+            ]
+            confirmed_chunk_sources = [source for source in expected_sources if source in identity_observed]
+            unresolved_chunk_sources = [source for source in expected_sources if source not in identity_observed]
+            evidence["final_identity_set_observation"] = {
+                key: identity_evidence.get(key)
+                for key in (
+                    "status",
+                    "classification",
+                    "identity_set_checked",
+                    "identity_set_complete",
+                    "expected_chunk_source_count",
+                    "observed_chunk_source_count",
+                    "duplicate_chunk_source_count",
+                    "missing_chunk_sources",
+                )
+            }
             batch_locations = list(batch_report.get("locations") or [])
-            for offset, payload in enumerate(expected_batch):
-                metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
-                chunk_source = str(metadata.get("chunkSource") or f"batch-{batch_number}-record-{offset + 1}")
-                location = batch_locations[offset:offset + 1]
-                record_evidence = verify_anythingllm_post_upload(
-                    storage_dir,
-                    target_workspace_slug,
-                    source_sha,
-                    [payload],
-                    upload_locations=location,
-                    observation_mode="fast",
-                )
-                record_observed = int(
-                    record_evidence.get("matching_vector_rows")
-                    or record_evidence.get("lancedb_matching_rows")
-                    or 0
-                )
-                if (
-                    str(record_evidence.get("status") or "") in REVIEWABLE_POST_UPLOAD_STATUSES
-                    and record_observed >= 1
-                ):
-                    confirmed_chunk_sources.append(chunk_source)
-                else:
-                    unresolved_chunk_sources.append(chunk_source)
             evidence["confirmed_chunk_sources"] = confirmed_chunk_sources
             evidence["unresolved_chunk_sources"] = unresolved_chunk_sources
             evidence["confirmed_locations"] = [
@@ -16246,7 +16385,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
             observed_vectors = int(evidence.get("matching_vector_rows") or evidence.get("lancedb_matching_rows") or 0)
             expected_records = len(selected_expected_upload_payloads or payloads_to_upload)
             report_upload_phase(
-                "searchable_vectors",
+                "identity_set",
                 (
                     f"AnythingLLM indexing observation {evidence.get('attempt', 0)}: "
                     f"{format_vector_observation(observed_vectors, expected_records, operator_state, record_label=vector_record_label)}"
@@ -16268,9 +16407,18 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
             ]
             if reconciliation_starts:
                 shared_reconciliation_elapsed = max(0.0, time.time() - min(reconciliation_starts))
+                effective_deadlines = [
+                    float(
+                        batch.get("reconciliation_effective_deadline_seconds")
+                        or batch.get("reconciliation_deadline_seconds")
+                        or ANYTHINGLLM_EMBEDDING_RECONCILIATION_TIMEOUT_SECONDS
+                    )
+                    for batch in ((upload_report.get("embedding_update") or {}).get("batches") or [])
+                    if float(batch.get("reconciliation_started_at_epoch") or 0.0) > 0.0
+                ]
                 shared_reconciliation_remaining = max(
                     0.0,
-                    ANYTHINGLLM_EMBEDDING_RECONCILIATION_TIMEOUT_SECONDS
+                    max(effective_deadlines or [ANYTHINGLLM_EMBEDDING_RECONCILIATION_TIMEOUT_SECONDS])
                     - shared_reconciliation_elapsed,
                 )
         if failed_embedding_checkpoint:
@@ -16506,32 +16654,29 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
         ]
         if unresolved_batches and embedding_batch_ledger_path:
             locations = list(upload_report.get("locations") or [])
-            confirmed_locations = set()
-            for index, payload in enumerate(selected_expected_upload_payloads or payloads_to_upload):
-                location = locations[index:index + 1]
-                if not location:
-                    continue
-                try:
-                    record_evidence = verify_anythingllm_post_upload(
-                        storage_dir,
-                        target_workspace_slug,
-                        source_sha,
-                        [payload],
-                        upload_locations=location,
-                        observation_mode="fast",
-                    )
-                except Exception:
-                    continue
-                observed = int(
-                    record_evidence.get("matching_vector_rows")
-                    or record_evidence.get("lancedb_matching_rows")
-                    or 0
-                )
-                if (
-                    str(record_evidence.get("status") or "") in REVIEWABLE_POST_UPLOAD_STATUSES
-                    and observed >= 1
-                ):
-                    confirmed_locations.add(str(location[0]))
+            # Recover the exact missing locations from one scalar
+            # identity-set observation.  Do not open the workspace table once
+            # per page-parent while Desktop may still be writing it.
+            identity_evidence = verify_anythingllm_post_upload(
+                storage_dir,
+                target_workspace_slug,
+                source_sha,
+                selected_expected_upload_payloads or payloads_to_upload,
+                upload_locations=locations,
+                observation_mode="identity",
+            )
+            observed_sources = {
+                str(value).strip()
+                for value in (identity_evidence.get("observed_chunk_sources") or [])
+                if str(value).strip()
+            }
+            confirmed_locations = {
+                str(locations[index])
+                for index, payload in enumerate(selected_expected_upload_payloads or payloads_to_upload)
+                if index < len(locations)
+                and str((payload.get("metadata", {}) or {}).get("chunkSource") or "").strip()
+                in observed_sources
+            }
             for batch in unresolved_batches:
                 batch_locations = [str(item) for item in (batch.get("locations") or [])]
                 verification = dict(batch.get("verification") or {})
@@ -16583,7 +16728,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
         and post_upload_report.get("status") in REVIEWABLE_POST_UPLOAD_STATUSES
     ):
         report_upload_phase(
-            "validation",
+            "retrieval_sample",
             "Checking runtime retrieval after exact vector confirmation",
             completed_units=0,
             total_units=1,
@@ -16607,7 +16752,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
                 "chat_probe_completed": "Chat retrieval diagnostic completed",
             }.get(str(stage), "Running runtime retrieval validation")
             report_upload_phase(
-                "validation",
+                "retrieval_sample",
                 f"{action}: {completed}/{total}",
                 completed_units=completed,
                 total_units=total,
@@ -16884,7 +17029,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
         # last exact vector checkpoint rather than advancing into validation
         # or final reporting after a partial Desktop queue.
         report_upload_phase(
-            "searchable_vectors",
+            "identity_set",
             "AnythingLLM indexing remains incomplete; preserving the exact vector checkpoint",
             completed_units=int(post_upload_report.get("matching_vector_rows") or 0),
             total_units=len(selected_expected_upload_payloads or payloads_to_upload),

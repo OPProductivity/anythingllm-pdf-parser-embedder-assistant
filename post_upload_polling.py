@@ -28,6 +28,11 @@ class ObservationCallback(Protocol):
         """Observe progress without changing the polling verdict."""
 
 
+class DeadlineExtension(Protocol):
+    def __call__(self, evidence: Evidence, elapsed_seconds: float, current_deadline_seconds: float, /) -> float | None:
+        """Return a later evidence-backed deadline, or ``None`` to retain it."""
+
+
 class ObserverFailure(TypedDict):
     attempt: int
     operator_status: OperatorStatus
@@ -86,6 +91,7 @@ def poll_post_upload(
     sleeper: Callable[[float], None] = time.sleep,
     observation_callback: ObservationCallback | None = None,
     retryable_evidence_codes: Collection[str] = (),
+    deadline_extension: DeadlineExtension | None = None,
 ) -> PollingResult:
     policy = PollingPolicy.from_values(
         interval_seconds=interval_seconds,
@@ -143,6 +149,21 @@ def poll_post_upload(
                 observer_failures=observer_failures,
             )
         elapsed = monotonic() - started
+        if callable(deadline_extension):
+            # A slow asynchronous queue can provide real ownership/progress
+            # evidence after its HTTP receipt expires.  Let a caller extend
+            # the active deadline, but never beyond this poller's declared
+            # hard cap.  This keeps the general poller bounded and avoids a
+            # hidden second wait window in higher-level recovery code.
+            try:
+                requested_deadline = deadline_extension(dict(evidence), elapsed, timeout)
+                if requested_deadline is not None:
+                    timeout = min(
+                        policy.hard_cap_seconds,
+                        max(timeout, float(requested_deadline)),
+                    )
+            except Exception as exc:  # deadline policy is observational only
+                LOGGER.exception("Post-upload deadline extension failed; retaining existing deadline: %s", exc)
         if elapsed >= timeout:
             return PollingResult(
                 status="timeout",

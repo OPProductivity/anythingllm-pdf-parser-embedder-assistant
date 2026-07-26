@@ -318,27 +318,26 @@ AUTOMATIC_RUNTIME_GUARD_INTERVAL_SECONDS = 5.0
 # monitoring interval.
 AUTOMATIC_RUNTIME_GUARD_RECHECK_SECONDS = 2.0
 AUTOMATIC_RUNTIME_GUARD_FAILURE_THRESHOLD = 2
-# Run-wide readiness is normally measured in fractions of a second for the
-# medium-PDF benchmark cohort.  Reserve a visible but deliberately small 1%
-# for it; local document preparation owns the next allocation instead of
-# making a quick startup look like five percent of a long ingestion.
-AUTOMATIC_RUN_PREFLIGHT_DISPLAY_END = 0.01
-AUTOMATIC_RUN_TERMINAL_DISPLAY_START = 0.95
+# The benchmark measured run-wide readiness at roughly 0.2--0.4% for the
+# medium-PDF cohort. Reserve only 0.5% for it. Pipeline evidence then owns
+# 0.5--97%; the final 3% is durable report/download handoff.
+AUTOMATIC_RUN_PREFLIGHT_DISPLAY_END = 0.005
+AUTOMATIC_RUN_TERMINAL_DISPLAY_START = 0.97
 AUTOMATIC_RUN_DOCUMENT_DISPLAY_SPAN = (
     AUTOMATIC_RUN_TERMINAL_DISPLAY_START - AUTOMATIC_RUN_PREFLIGHT_DISPLAY_END
 )
 # Legacy, unstructured callbacks still use the former generic pipeline
 # fractions. Structured callbacks use ``AUTOMATIC_UPLOAD_PHASE_RANGES``
 # directly, so this compatibility mapper cannot alter normal upload progress.
-# Values returned here are source values inside the app's 1--95% document
+# Values returned here are source values inside the app's 0.5--97% document
 # allocation. Structured events carry the authoritative phase mapping; this
 # legacy route exists only so old callbacks cannot jump ahead of it.
 AUTOMATIC_UPLOAD_PREPARATION_SOURCE_END = 0.80
-AUTOMATIC_UPLOAD_PREPARATION_DISPLAY_END = 0.0556
+AUTOMATIC_UPLOAD_PREPARATION_DISPLAY_END = 0.0985
 AUTOMATIC_UPLOAD_VECTOR_SOURCE_END = 0.94
-AUTOMATIC_UPLOAD_VECTOR_DISPLAY_END = 0.5556
+AUTOMATIC_UPLOAD_VECTOR_DISPLAY_END = 0.8549
 AUTOMATIC_UPLOAD_VALIDATION_SOURCE_END = 0.97
-AUTOMATIC_UPLOAD_VALIDATION_DISPLAY_END = 1.0
+AUTOMATIC_UPLOAD_VALIDATION_DISPLAY_END = 0.9793
 
 
 def reweight_automatic_upload_progress(value):
@@ -15059,10 +15058,12 @@ def run_automatic(
             "candidate_evaluation": 3,
             "payloads": 4,
             "attachments": 5,
-            "desktop_queue": 6,
-            "searchable_vectors": 7,
-            "validation": 8,
-            "reporting": 9,
+            "queue_receipt": 6,
+            "desktop_queue": 7,
+            "identity_set": 8,
+            "retrieval_sample": 9,
+            "validation": 10,
+            "reporting": 11,
         }.get(phase_name, 0)
         if phase_rank and phase_rank < automatic_phase_rank:
             return

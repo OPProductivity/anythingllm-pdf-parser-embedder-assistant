@@ -13431,7 +13431,7 @@ class PipelineCoreTests(unittest.TestCase):
             pipeline.full_post_upload_observation_is_required(report, 6)
         )
 
-    def test_post_upload_mismatch_or_recovery_requires_full_observation(self):
+    def test_post_upload_mismatch_or_failed_checkpoint_requires_full_observation(self):
         complete_report = {
             "status": "pass",
             "matching_vector_rows": 6,
@@ -13445,7 +13445,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertTrue(
             pipeline.full_post_upload_observation_is_required(missing_report, 6)
         )
-        self.assertTrue(
+        self.assertFalse(
             pipeline.full_post_upload_observation_is_required(
                 complete_report, 6, ambiguous_submission=True
             )
@@ -14135,14 +14135,40 @@ class TimingAndInspectionSafetyTests(unittest.TestCase):
 
     def test_upload_protocol_gives_queue_and_vector_evidence_the_observed_time_weight(self):
         ranges = pipeline.AUTOMATIC_UPLOAD_PHASE_RANGES
-        self.assertAlmostEqual(ranges["attachments"][1], .0556)
-        self.assertAlmostEqual(ranges["desktop_queue"][0], .0556)
-        self.assertAlmostEqual(ranges["desktop_queue"][1], .5556)
-        self.assertAlmostEqual(ranges["searchable_vectors"][0], .5556)
-        self.assertAlmostEqual(ranges["searchable_vectors"][1], .8889)
-        self.assertAlmostEqual(ranges["validation"][0], .8889)
-        self.assertEqual(ranges["validation"][1], 1.0)
-        self.assertEqual(ranges["reporting"], (1.0, 1.0))
+        self.assertAlmostEqual(ranges["attachments"][1], .0985)
+        self.assertAlmostEqual(ranges["queue_receipt"][0], .0985)
+        self.assertAlmostEqual(ranges["desktop_queue"][0], .1192)
+        self.assertAlmostEqual(ranges["desktop_queue"][1], .5855)
+        self.assertAlmostEqual(ranges["identity_set"][0], .5855)
+        self.assertAlmostEqual(ranges["identity_set"][1], .8549)
+        self.assertAlmostEqual(ranges["retrieval_sample"][0], .8549)
+        self.assertAlmostEqual(ranges["validation"][0], .9275)
+        self.assertAlmostEqual(ranges["reporting"][0], .9793)
+        self.assertEqual(ranges["reporting"][1], 1.0)
+
+    def test_polling_deadline_extension_requires_explicit_evidence_policy(self):
+        from post_upload_polling import poll_post_upload
+
+        clock = [0.0]
+        attempts = [0]
+
+        def inspect():
+            attempts[0] += 1
+            return {"status": "pass" if attempts[0] >= 4 else "partial_vector_coverage"}
+
+        result = poll_post_upload(
+            inspect,
+            interval_seconds=1.0,
+            timeout_seconds=2.0,
+            hard_cap_seconds=4.0,
+            monotonic=lambda: clock[0],
+            sleeper=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+            retryable_evidence_codes={"partial_vector_coverage"},
+            deadline_extension=lambda _evidence, _elapsed, _deadline: 4.0,
+        )
+
+        self.assertEqual(result.status, "pass")
+        self.assertEqual(result.attempts, 4)
 
     def test_visible_eta_forwards_inherited_anythingllm_settings(self):
         import rag_pdf_gradio_app as app
