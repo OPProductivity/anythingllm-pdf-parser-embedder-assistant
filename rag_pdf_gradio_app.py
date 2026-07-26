@@ -318,12 +318,21 @@ AUTOMATIC_RUNTIME_GUARD_INTERVAL_SECONDS = 5.0
 # monitoring interval.
 AUTOMATIC_RUNTIME_GUARD_RECHECK_SECONDS = 2.0
 AUTOMATIC_RUNTIME_GUARD_FAILURE_THRESHOLD = 2
+# Run-wide readiness is normally measured in fractions of a second for the
+# medium-PDF benchmark cohort.  Reserve a visible but deliberately small 1%
+# for it; local document preparation owns the next allocation instead of
+# making a quick startup look like five percent of a long ingestion.
+AUTOMATIC_RUN_PREFLIGHT_DISPLAY_END = 0.01
+AUTOMATIC_RUN_TERMINAL_DISPLAY_START = 0.95
+AUTOMATIC_RUN_DOCUMENT_DISPLAY_SPAN = (
+    AUTOMATIC_RUN_TERMINAL_DISPLAY_START - AUTOMATIC_RUN_PREFLIGHT_DISPLAY_END
+)
 # Legacy, unstructured callbacks still use the former generic pipeline
 # fractions. Structured callbacks use ``AUTOMATIC_UPLOAD_PHASE_RANGES``
 # directly, so this compatibility mapper cannot alter normal upload progress.
-# Values returned here are source values inside the app's 5--95% document
-# allocation: they display as 5--10% local work, 10--55% Desktop queue,
-# 55--85% exact vectors, and 85--95% validation.
+# Values returned here are source values inside the app's 1--95% document
+# allocation. Structured events carry the authoritative phase mapping; this
+# legacy route exists only so old callbacks cannot jump ahead of it.
 AUTOMATIC_UPLOAD_PREPARATION_SOURCE_END = 0.80
 AUTOMATIC_UPLOAD_PREPARATION_DISPLAY_END = 0.0556
 AUTOMATIC_UPLOAD_VECTOR_SOURCE_END = 0.94
@@ -12582,9 +12591,12 @@ def automatic_batch_diagnostics_required(
     """
     if cancellation_requested or not summaries:
         return False
-    return bool(retain_detailed_evidence) or (
-        automatic_completion(summaries, prepare_and_upload).get("state") != "successful"
-    )
+    # Detailed per-run artifacts are retained independently.  A global scan of
+    # every LanceDB table is a diagnostic for an evidence mismatch, not another
+    # completion requirement for a document whose exact page-parent and
+    # retrieval checks already succeeded.  Explicit deep audit remains a
+    # separate Workspace-maintenance action.
+    return automatic_completion(summaries, prepare_and_upload).get("state") != "successful"
 
 
 def automatic_completion_button_state(completion):
@@ -14849,7 +14861,7 @@ def run_automatic(
             )
 
     local_choice = normalize_simulation_choice(local_check_mode)
-    progress(0.04, desc="Checking retrieval simulation settings")
+    progress(0.004, desc="Checking retrieval simulation settings")
     simulation_plan = resolve_simulation_run(local_choice, custom_ollama_model, ollama_url)
     simulation_warning = ""
     if simulation_plan.get("error_report"):
@@ -14894,7 +14906,7 @@ def run_automatic(
         "write_result": None,
     }
     if prepare_and_upload and bool(auto_apply_recommended_settings):
-        progress(0.045, desc="Applying recommended AnythingLLM settings")
+        progress(0.006, desc="Applying recommended AnythingLLM settings")
         auto_correction = apply_recommended_anythingllm_settings(default_anythingllm_storage_dir())
     if run_vector_eval and simulation_adapter:
         current_state = anythingllm_resolved_state(default_anythingllm_storage_dir(), simulation_adapter)
@@ -14904,7 +14916,7 @@ def run_automatic(
             or embed_policy.get("recommended_limit")
             or 4096
         )
-        progress(0.05, desc="Running embedder preflight")
+        progress(0.008, desc="Running embedder preflight")
         preflight = simulation_preflight(
             simulation_adapter,
             effective_limit=effective_limit,
@@ -15283,12 +15295,12 @@ def run_automatic(
         active_file_index = file_index
         automatic_phase_rank = 0
         progress_allocation = progress_allocations[file_index - 1]
-        # The first 5% covers run setup and the final 5% covers durable
+        # The first 1% covers run setup and the final 5% covers durable
         # reports/downloads. The document protocol therefore receives the
-        # evidence-bearing 5--95% range, weighted across PDFs by the bounded
+        # evidence-bearing 1--95% range, weighted across PDFs by the bounded
         # preflight difficulty profile rather than an equal-file split.
-        start_fraction = 0.05 + float(progress_allocation["start_share"]) * 0.90
-        end_fraction = 0.05 + float(progress_allocation["end_share"]) * 0.90
+        start_fraction = AUTOMATIC_RUN_PREFLIGHT_DISPLAY_END + float(progress_allocation["start_share"]) * AUTOMATIC_RUN_DOCUMENT_DISPLAY_SPAN
+        end_fraction = AUTOMATIC_RUN_PREFLIGHT_DISPLAY_END + float(progress_allocation["end_share"]) * AUTOMATIC_RUN_DOCUMENT_DISPLAY_SPAN
         progress(start_fraction, desc=format_progress_desc(f"Preparing {pdf_path.name}", file_index, total_files))
         resolved_segment_mode = pipeline_segment_mode(segment_mode)
         args = SimpleNamespace(
@@ -15782,10 +15794,34 @@ def run_automatic(
         cancellation_requested=cancellation_requested,
     ):
         try:
+            def report_batch_audit_progress(completed_tables, total_tables, table_name, state):
+                total = max(0, int(total_tables or 0))
+                completed = min(total, max(0, int(completed_tables or 0))) if total else 0
+                table_label = Path(str(table_name or "")).name or "storage table"
+                update_live_automatic_run_status(
+                    run_root,
+                    state="running",
+                    phase=(
+                        f"Post-completion diagnostic: inspecting AnythingLLM storage table "
+                        f"{completed}/{total} ({table_label})"
+                    ),
+                    expected_seconds=expected_seconds,
+                    details="A broad storage audit is collecting diagnostic evidence after an upload warning; it does not change verified document evidence.",
+                    confirmed_fraction=None,
+                    cancel_available=False,
+                    cancel_requested=False,
+                    activity_observed=True,
+                    progress_phase="post_completion_storage_diagnostic",
+                    completed_units=completed,
+                    total_units=total,
+                    evidence_kind="diagnostic",
+                )
+
             batch_audit = finalize_batch_inspection_context(
                 batch_inspection_context,
                 default_anythingllm_storage_dir(),
                 run_root / "batch-inspection",
+                progress_callback=report_batch_audit_progress,
             )
             if batch_audit.get("output"):
                 downloadable.append(batch_audit["output"])
@@ -15854,7 +15890,7 @@ def run_automatic(
         for summary in summaries
     )
     if not incomplete_indexing:
-        progress(0.95, desc="Writing the run report and preparing downloads")
+        progress(AUTOMATIC_RUN_TERMINAL_DISPLAY_START, desc="Writing the run report and preparing downloads")
     seen_downloads = set()
     downloadable = [
         path

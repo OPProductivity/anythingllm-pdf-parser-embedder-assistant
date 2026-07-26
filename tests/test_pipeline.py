@@ -1829,7 +1829,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertFalse(
             app.automatic_batch_diagnostics_required([successful_summary], prepare_and_upload=True)
         )
-        self.assertTrue(
+        self.assertFalse(
             app.automatic_batch_diagnostics_required(
                 [successful_summary], prepare_and_upload=True, retain_detailed_evidence=True
             )
@@ -5122,6 +5122,59 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(result["post_upload_report"]["polling_attempts"], 3)
         self.assertEqual(result["runtime_validation_status"], "not_run_post_upload_incomplete")
         self.assertEqual(runtime_calls, [])
+
+    def test_temporary_validation_uses_one_shared_reconciliation_deadline(self):
+        """Two batch checks must consume the document-wide validation budget."""
+        original_create = pipeline.create_validation_workspace
+        original_upload = pipeline.maybe_upload_to_anythingllm
+        original_poll = pipeline.poll_post_upload
+        original_runtime = pipeline.validate_anythingllm_native_runtime
+        original_delete = pipeline.delete_validation_workspace
+        original_time = pipeline.time.time
+        timeouts = []
+        clock = [1000.0]
+        try:
+            pipeline.create_validation_workspace = lambda *args, **kwargs: {
+                "status": "created", "workspace_slug": "shared-deadline", "workspace_name": "Shared deadline"
+            }
+
+            def fake_upload(*_args, **kwargs):
+                verifier = kwargs["batch_verifier"]
+                verifier({"start_index": 0, "end_index": 1, "locations": []})
+                verifier({"start_index": 1, "end_index": 2, "locations": []})
+                return {"status": "complete", "uploaded": 2, "embedded": 2, "locations": []}
+
+            def fake_poll(*_args, **kwargs):
+                timeouts.append(float(kwargs["timeout_seconds"]))
+                clock[0] += 60.0
+                return SimpleNamespace(
+                    status="pass", final_evidence={"status": "pass"}, attempts=1,
+                    elapsed_seconds=0.0, observer_failures=[]
+                )
+
+            pipeline.maybe_upload_to_anythingllm = fake_upload
+            pipeline.poll_post_upload = fake_poll
+            pipeline.time.time = lambda: clock[0]
+            pipeline.validate_anythingllm_native_runtime = lambda *args, **kwargs: {"status": "pass"}
+            pipeline.delete_validation_workspace = lambda *args, **kwargs: {"status": "deleted", "error": ""}
+            result = pipeline.run_temporary_workspace_validation(
+                "http://127.0.0.1:3001", "key", PROJECT_ROOT, "abc123",
+                [
+                    {"textContent": "one", "metadata": {"chunkSource": "segment://1"}},
+                    {"textContent": "two", "metadata": {"chunkSource": "segment://2"}},
+                ],
+            )
+        finally:
+            pipeline.create_validation_workspace = original_create
+            pipeline.maybe_upload_to_anythingllm = original_upload
+            pipeline.poll_post_upload = original_poll
+            pipeline.validate_anythingllm_native_runtime = original_runtime
+            pipeline.delete_validation_workspace = original_delete
+            pipeline.time.time = original_time
+
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(timeouts[:2], [45.0, 45.0])
+        self.assertAlmostEqual(timeouts[2], 60.0)
 
     def test_temporary_workspace_validation_forwards_cached_embedder_probe(self):
         original_create = pipeline.create_validation_workspace

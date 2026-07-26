@@ -244,6 +244,11 @@ def main() -> int:
         type=Path,
         help="Existing benchmark directory to resume without rerunning completed samples.",
     )
+    parser.add_argument(
+        "--sample-summary",
+        type=Path,
+        help="Reuse the exact selected PDF paths from an earlier benchmark summary.",
+    )
     args = parser.parse_args()
 
     if args.resume:
@@ -266,7 +271,17 @@ def main() -> int:
         for entry in entries
         if entry.get("file_sha256")
     }
-    for source_index, pdf_path in enumerate(sorted(args.source_dir.glob("*.pdf")), 1):
+    source_paths = sorted(args.source_dir.glob("*.pdf"))
+    if args.sample_summary:
+        source_payload = json.loads(args.sample_summary.read_text(encoding="utf-8"))
+        source_paths = [
+            Path(entry["file"])
+            for entry in (source_payload.get("entries") or [])
+            if entry.get("selected") and entry.get("file") and Path(entry["file"]).is_file()
+        ]
+        if not source_paths:
+            raise ValueError("The supplied benchmark summary has no selected PDF files that still exist.")
+    for source_index, pdf_path in enumerate(source_paths, 1):
         if len([entry for entry in entries if entry.get("selected")]) >= max(1, args.limit):
             break
         if str(pdf_path) in completed_files:

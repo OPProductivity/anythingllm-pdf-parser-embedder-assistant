@@ -89,10 +89,10 @@ ANYTHINGLLM_HTTP_RESPONSE_TIMEOUT_SECONDS = 180
 
 # Upload-mode progress is a user-facing evidence scale, not the old generic
 # pipeline's anonymous 0..1 values.  The app applies each document's source
-# scale inside its visible 5--95% allocation (the outer 0--5% is
-# startup/preflight and terminal completion owns 95--100%).  These boundaries
-# therefore display: local preparation 5--10%, Desktop's sequential queue
-# 10--55%, exact page-parent vector confirmation 55--85%, validation 85--95%.
+# scale inside the app's visible document allocation (currently 1--95%; the
+# outer 0--1% is run setup and terminal completion owns 95--100%). These
+# boundaries deliberately give Desktop queue and exact-vector evidence most
+# of that document scale. The benchmark may refine their shares further.
 # The queue and vector observer can overlap in wall-clock time; the allocation
 # is a stable explanation of evidence, not a claim that those operations are
 # serial.
@@ -108,6 +108,49 @@ AUTOMATIC_UPLOAD_PHASE_RANGES = {
     # Terminal completion owns the outer 95--100% handoff.
     "reporting": (1.0000, 1.0000),
 }
+
+
+class UploadPhaseReporter:
+    """Translate phase evidence into the single Automatic-run progress scale.
+
+    This isolates presentation/evidence mapping from the legacy preparation
+    engine. Local preparation, upload, and final reporting can now share the
+    same monotonic contract without the engine knowing UI range arithmetic.
+    """
+
+    def __init__(self, report_progress, prepare_and_upload):
+        self._report_progress = report_progress
+        self._prepare_and_upload = bool(prepare_and_upload)
+
+    def emit(
+        self,
+        phase,
+        stage,
+        *,
+        completed_units=None,
+        total_units=None,
+        fallback_fraction=0.0,
+        desktop_required=False,
+        evidence_kind="measured",
+    ):
+        if not self._prepare_and_upload:
+            return self._report_progress(fallback_fraction, stage, desktop_required=desktop_required)
+        start, end = AUTOMATIC_UPLOAD_PHASE_RANGES[str(phase)]
+        try:
+            completed = max(0.0, float(completed_units))
+            total = max(0.0, float(total_units))
+            fraction = min(1.0, completed / total) if total else max(0.0, min(1.0, fallback_fraction))
+        except (TypeError, ValueError):
+            fraction = max(0.0, min(1.0, fallback_fraction))
+        return self._report_progress(
+            start + (end - start) * fraction,
+            stage,
+            desktop_required=desktop_required,
+            phase=phase,
+            completed_units=completed_units,
+            total_units=total_units,
+            evidence_kind=evidence_kind,
+        )
 
 
 def emit_pipeline_timing_event(args, stage, *, event="phase_completed", elapsed_seconds=0.0, **details):
@@ -6509,7 +6552,7 @@ def score_candidate(candidate):
     return score, reasons
 
 
-def inspect_anythingllm_storage(storage_dir: Path):
+def inspect_anythingllm_storage(storage_dir: Path, progress_callback=None):
     result = {
         "storage_dir": str(storage_dir),
         "exists": storage_dir.exists(),
@@ -6533,7 +6576,10 @@ def inspect_anythingllm_storage(storage_dir: Path):
         db = lancedb.connect(str(storage_dir / "lancedb"))
         tables = []
         table_names = lancedb_table_names(db)
-        for table_name in table_names:
+        total_tables = len(table_names)
+        for table_index, table_name in enumerate(table_names, start=1):
+            if callable(progress_callback):
+                progress_callback(table_index - 1, total_tables, table_name, "started")
             entry = {"name": table_name}
             try:
                 table = db.open_table(table_name)
@@ -6558,6 +6604,8 @@ def inspect_anythingllm_storage(storage_dir: Path):
             except Exception as exc:
                 entry["error"] = str(exc)
             tables.append(entry)
+            if callable(progress_callback):
+                progress_callback(table_index, total_tables, table_name, "completed")
         result["tables"] = tables
         result["status"] = "complete"
     except Exception as exc:
@@ -6593,7 +6641,7 @@ def compare_storage_snapshots(before, after):
     }
 
 
-def finalize_batch_inspection_context(context, storage_dir: Path, output_dir: Path):
+def finalize_batch_inspection_context(context, storage_dir: Path, output_dir: Path, progress_callback=None):
     """Perform the one mutable storage audit deferred by a shared PDF batch.
 
     This deliberately runs once after the last document. Per-document upload
@@ -6606,7 +6654,7 @@ def finalize_batch_inspection_context(context, storage_dir: Path, output_dir: Pa
     output_dir.mkdir(parents=True, exist_ok=True)
     started = time.perf_counter()
     before = dict((context.get("global_read_only") or {}).get("storage_report") or {})
-    after = inspect_anythingllm_storage(Path(storage_dir))
+    after = inspect_anythingllm_storage(Path(storage_dir), progress_callback=progress_callback)
     comparison = compare_storage_snapshots(before, after)
     report = {
         "status": "complete",
@@ -6852,9 +6900,13 @@ def anythingllm_runtime_verification_status(storage_dir: Path, api_url=DEFAULT_A
     }
 
 
-def anythingllm_embedder_policy(storage_dir: Path, provider="", model=""):
+def anythingllm_embedder_policy(storage_dir: Path, provider="", model="", authoritative_state=None):
     storage = Path(storage_dir)
-    authoritative = resolve_authoritative_anythingllm_state(storage, runtime_verification={"status": "not_run"})
+    authoritative = (
+        dict(authoritative_state)
+        if isinstance(authoritative_state, dict)
+        else resolve_authoritative_anythingllm_state(storage, runtime_verification={"status": "not_run"})
+    )
     embedder_state = authoritative.get("embedder", {})
     chunking_state = authoritative.get("chunking", {})
     engine_field = embedder_state.get("engine") or {}
@@ -6912,12 +6964,18 @@ def anythingllm_embedder_policy(storage_dir: Path, provider="", model=""):
     }
 
 
-def anythingllm_resolved_state(storage_dir: Path, simulation_adapter=None, runtime_verify=True):
+def anythingllm_preflight_snapshot(storage_dir: Path, simulation_adapter=None, runtime_verify=True):
+    """Read immutable AnythingLLM preflight evidence once for one run.
+
+    Configuration, policy, and runtime presentation used to independently
+    reopen the same SQLite/.env state and resolve authoritative settings. A
+    run-scoped snapshot keeps those values internally consistent while
+    deliberately excluding mutable workspace/vector evidence.
+    """
     storage = Path(storage_dir)
     llm = anythingllm_llm_config(storage)
     embed = anythingllm_embedding_config(storage)
     chunk = anythingllm_chunk_settings(storage)
-    policy = anythingllm_embedder_policy(storage)
     simulation = normalize_simulation_adapter(simulation_adapter) if simulation_adapter else {}
     runtime = (
         anythingllm_runtime_verification_status(storage)
@@ -6931,6 +6989,7 @@ def anythingllm_resolved_state(storage_dir: Path, simulation_adapter=None, runti
         storage,
         runtime_verification=runtime if runtime.get("status") not in {"", "runtime_verification_unavailable"} else None,
     )
+    policy = anythingllm_embedder_policy(storage, authoritative_state=authoritative)
     anomalies = list(embed.get("anomalies") or [])
     if policy.get("status") in {"too_low", "too_high"}:
         anomalies.append("embedder_limit_mismatch")
@@ -6951,6 +7010,11 @@ def anythingllm_resolved_state(storage_dir: Path, simulation_adapter=None, runti
         "anomalies": sorted(set(anomalies)),
         "evidence_state": authoritative,
     }
+
+
+def anythingllm_resolved_state(storage_dir: Path, simulation_adapter=None, runtime_verify=True):
+    """Compatibility name for the run-scoped immutable preflight snapshot."""
+    return anythingllm_preflight_snapshot(storage_dir, simulation_adapter, runtime_verify)
 
 
 def should_verify_anythingllm_runtime_during_preparation(args):
@@ -7596,6 +7660,7 @@ def listen_for_anythingllm_embed_progress(
     stop_event,
     event_callback=None,
     error_callback=None,
+    state_callback=None,
     connected_event=None,
     include_unmatched_events=False,
 ):
@@ -7635,6 +7700,8 @@ def listen_for_anythingllm_embed_progress(
             with urllib.request.urlopen(request, timeout=5) as response:
                 failures = 0
                 connected_once = True
+                if callable(state_callback):
+                    state_callback("connected", {"at_monotonic": time.monotonic(), "failures": 0})
                 if isinstance(connected_event, threading.Event):
                     connected_event.set()
                 for raw_line in response:
@@ -7667,6 +7734,8 @@ def listen_for_anythingllm_embed_progress(
             # can occur while the app-owned queue remains active, and later
             # SSE events are valuable progress evidence after it recovers.
             if not stop_event.is_set():
+                if callable(state_callback):
+                    state_callback("reconnecting", {"at_monotonic": time.monotonic(), "reason": "stream_eof", "failures": failures})
                 if not connected_once:
                     failures += 1
                 stop_event.wait(0.75 if connected_once else min(5.0, 0.25 * (2 ** min(failures, 4))))
@@ -7677,6 +7746,8 @@ def listen_for_anythingllm_embed_progress(
             if stop_event.is_set():
                 return
             failures += 1
+            if callable(state_callback):
+                state_callback("reconnecting", {"at_monotonic": time.monotonic(), "reason": f"HTTP {exc.code}", "failures": failures})
             # Keep the durable report useful during a long restart: record
             # the first error and exponentially spaced repeats, not one row
             # for every reconnect attempt.
@@ -7693,6 +7764,11 @@ def listen_for_anythingllm_embed_progress(
             # it as an outage produced a noisy and misleading run receipt.
             if not connected_once:
                 failures += 1
+            if callable(state_callback):
+                state_callback(
+                    "reconnecting" if connected_once else "connecting",
+                    {"at_monotonic": time.monotonic(), "reason": type(exc).__name__, "failures": failures},
+                )
             if (
                 not connected_once
                 and callable(error_callback)
@@ -7717,6 +7793,7 @@ def start_anythingllm_embed_progress_listener(
     *,
     include_unmatched_events=False,
     observer_callback=None,
+    observer_state_callback=None,
 ):
     """Start a best-effort, path-correlated Desktop progress listener.
 
@@ -7729,6 +7806,8 @@ def start_anythingllm_embed_progress_listener(
     """
     observed_events = []
     observed_errors = []
+    observer_health = {"state": "connecting", "last_state_monotonic": time.monotonic(), "failures": 0, "reason": ""}
+    health_lock = threading.Lock()
     stop_event = threading.Event()
     connected_event = threading.Event()
 
@@ -7747,12 +7826,33 @@ def start_anythingllm_embed_progress_listener(
     def receive_error(error, attempt):
         observed_errors.append({"event": "desktop_embed_progress_unavailable", "attempt": attempt, "error": error})
 
+    def receive_state(state, details):
+        snapshot = None
+        with health_lock:
+            observer_health.update(
+                {
+                    "state": str(state or "unknown"),
+                    "last_state_monotonic": float((details or {}).get("at_monotonic") or time.monotonic()),
+                    "failures": int((details or {}).get("failures") or 0),
+                    "reason": str((details or {}).get("reason") or ""),
+                }
+            )
+            snapshot = dict(observer_health)
+        if callable(observer_state_callback):
+            try:
+                observer_state_callback(snapshot)
+            except Exception:
+                # The state relay is UI/diagnostic evidence only. Never let a
+                # consumer-side failure affect Desktop's submission request.
+                pass
+
     thread = threading.Thread(
         target=listen_for_anythingllm_embed_progress,
         args=(api_url, api_key, workspace_slug, list(expected_locations or []), stop_event),
         kwargs={
             "event_callback": receive,
             "error_callback": receive_error,
+            "state_callback": receive_state,
             "connected_event": connected_event,
             "include_unmatched_events": include_unmatched_events,
         },
@@ -7766,6 +7866,7 @@ def start_anythingllm_embed_progress_listener(
         "connected_event": connected_event,
         "events": observed_events,
         "errors": observed_errors,
+        "health": observer_health,
     }
 
 
@@ -9162,6 +9263,21 @@ def run_temporary_workspace_validation(
         else payloads
     )
     selected_expected_payloads = select_upload_payloads(expected_payloads, upload_limit)
+    validation_reconciliation = {
+        "started_at": None,
+        "deadline_seconds": ANYTHINGLLM_VALIDATION_RECONCILIATION_TIMEOUT_SECONDS,
+    }
+
+    def validation_remaining_seconds():
+        started_at = validation_reconciliation.get("started_at")
+        if not started_at:
+            return float(validation_reconciliation["deadline_seconds"])
+        return max(0.0, float(validation_reconciliation["deadline_seconds"]) - (time.time() - float(started_at)))
+
+    def begin_validation_reconciliation():
+        if not validation_reconciliation.get("started_at"):
+            validation_reconciliation["started_at"] = time.time()
+        return validation_remaining_seconds()
 
     def verify_validation_embedding_batch(batch_report):
         """Resolve an accepted or timed-out batch from exact persisted vectors."""
@@ -9170,6 +9286,7 @@ def run_temporary_workspace_validation(
         expected_batch = selected_expected_payloads[start_index:end_index]
         if not expected_batch:
             return {"status": "error", "message": "No expected batch identities were available."}
+        remaining = begin_validation_reconciliation()
         def report_validation_batch_observation(evidence, operator_state):
             if callable(status_callback):
                 status_callback(
@@ -9180,6 +9297,7 @@ def run_temporary_workspace_validation(
                         "observed": evidence.get("matching_vector_rows") or evidence.get("lancedb_matching_rows") or 0,
                         "expected": len(expected_batch),
                         "operator_status": operator_state,
+                        "shared_reconciliation_remaining_seconds": round(validation_remaining_seconds(), 3),
                     },
                 )
 
@@ -9193,8 +9311,8 @@ def run_temporary_workspace_validation(
                 observation_mode="fast",
             ),
             interval_seconds=2.0,
-            timeout_seconds=45.0,
-            hard_cap_seconds=45.0,
+            timeout_seconds=min(45.0, remaining),
+            hard_cap_seconds=min(45.0, remaining),
             observation_callback=report_validation_batch_observation,
             retryable_evidence_codes={"partial_vector_coverage"},
         )
@@ -9205,6 +9323,8 @@ def run_temporary_workspace_validation(
                 "polling_attempts": polling.attempts,
                 "polling_elapsed_seconds": polling.elapsed_seconds,
                 "polling_observer_failures": polling.observer_failures,
+                "shared_reconciliation_started_at_epoch": validation_reconciliation["started_at"],
+                "shared_reconciliation_deadline_seconds": validation_reconciliation["deadline_seconds"],
             }
         )
         return evidence
@@ -9256,6 +9376,7 @@ def run_temporary_workspace_validation(
                     },
                 )
 
+        remaining = begin_validation_reconciliation()
         post_upload_poll = poll_post_upload(
             lambda: verify_anythingllm_post_upload(
                 storage_dir,
@@ -9265,8 +9386,8 @@ def run_temporary_workspace_validation(
                 upload_locations=(upload_report.get("locations") or []),
             ),
             interval_seconds=3.0,
-            timeout_seconds=180.0,
-            hard_cap_seconds=180.0,
+            timeout_seconds=remaining,
+            hard_cap_seconds=remaining,
             observation_callback=report_validation_document_observation,
             retryable_evidence_codes={"partial_vector_coverage"},
         )
@@ -9276,6 +9397,9 @@ def run_temporary_workspace_validation(
                 "polling_attempts": post_upload_poll.attempts,
                 "polling_elapsed_seconds": post_upload_poll.elapsed_seconds,
                 "polling_observer_failures": post_upload_poll.observer_failures,
+                "shared_reconciliation_started_at_epoch": validation_reconciliation["started_at"],
+                "shared_reconciliation_deadline_seconds": validation_reconciliation["deadline_seconds"],
+                "shared_reconciliation_remaining_seconds": round(validation_remaining_seconds(), 3),
             }
         )
         if post_upload_report.get("status") in SUCCESSFUL_POST_UPLOAD_STATUSES:
@@ -9829,6 +9953,10 @@ ANYTHINGLLM_DESKTOP_QUEUE_RECEIPT_TIMEOUT_SECONDS = 20.0
 # reconciler enough time to observe slow sequential provider work, while still
 # retaining a finite circuit-breaker boundary.
 ANYTHINGLLM_EMBEDDING_RECONCILIATION_TIMEOUT_SECONDS = 480.0
+# Temporary validation uses one shorter, shared observation budget. Its
+# per-batch checkpoint and final document check observe the same Desktop work;
+# they must not add independent 45- and 180-second waits.
+ANYTHINGLLM_VALIDATION_RECONCILIATION_TIMEOUT_SECONDS = 180.0
 # HTTP 429 is an explicit refusal to start a request, unlike an interrupted
 # response where Desktop may already have accepted the write. Only this narrow
 # case may retry in the same run at reduced concurrency.
@@ -11040,6 +11168,10 @@ def update_workspace_embeddings_desktop_queue(
         "events_observed": 0,
         "last_event_monotonic": 0.0,
         "queue_records": requested,
+        "observer_state": "connecting",
+        "observer_last_state_monotonic": time.monotonic(),
+        "observer_failures": 0,
+        "observer_reason": "",
     }
 
     def queue_snapshot():
@@ -11057,6 +11189,13 @@ def update_workspace_embeddings_desktop_queue(
                     if last_event else None
                 ),
                 "queue_records": requested,
+                "desktop_queue_observer_state": str(queue_state["observer_state"] or "unknown"),
+                "desktop_queue_observer_last_state_age_seconds": (
+                    round(max(0.0, time.monotonic() - float(queue_state["observer_last_state_monotonic"] or 0.0)), 3)
+                    if queue_state["observer_last_state_monotonic"] else None
+                ),
+                "desktop_queue_observer_failures": max(0, int(queue_state["observer_failures"] or 0)),
+                "desktop_queue_observer_reason": str(queue_state["observer_reason"] or ""),
             }
 
     def queue_activity_summary():
@@ -11067,6 +11206,11 @@ def update_workspace_embeddings_desktop_queue(
             return f"Desktop completed {completed}/{requested} {normalized_record_label}"
         if current:
             return f"Desktop is embedding {current}/{requested} {normalized_record_label}"
+        observer_state = str(snapshot.get("desktop_queue_observer_state") or "unknown")
+        if observer_state == "reconnecting":
+            return "Desktop queue observer is reconnecting; queue completion is not yet observable"
+        if observer_state == "connected":
+            return "Desktop queue observer is connected; waiting for the next queue event"
         return f"0/{requested} {normalized_record_label} completed"
 
     def publish_desktop_queue_event(event):
@@ -11134,6 +11278,23 @@ def update_workspace_embeddings_desktop_queue(
             },
         )
 
+    def publish_observer_state(health):
+        """Make the observer's transport state available to queue evidence.
+
+        A quiet Desktop queue and a reconnecting SSE observer are different
+        facts.  They share the same worker-side state object so a later batch
+        verifier can report the distinction without treating either one as a
+        vector-completion signal.
+        """
+        health = health if isinstance(health, dict) else {}
+        with queue_state_lock:
+            queue_state["observer_state"] = str(health.get("state") or "unknown")
+            queue_state["observer_last_state_monotonic"] = float(
+                health.get("last_state_monotonic") or time.monotonic()
+            )
+            queue_state["observer_failures"] = int(health.get("failures") or 0)
+            queue_state["observer_reason"] = str(health.get("reason") or "")
+
     def desktop_queue_status(message, report):
         if not callable(status_callback):
             return
@@ -11179,6 +11340,7 @@ def update_workspace_embeddings_desktop_queue(
         workspace_slug,
         unique_locations,
         observer_callback=publish_desktop_queue_event,
+        observer_state_callback=publish_observer_state,
     )
     # Do not make the write depend on the optional observer, but give the SSE
     # request a small head start. This lets the receipt capture Desktop's
@@ -14003,43 +14165,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
         return True
 
     progress_prepare_and_upload = bool(getattr(args, "prepare_and_upload", False))
-
-    def report_upload_phase(
-        phase,
-        stage,
-        *,
-        completed_units=None,
-        total_units=None,
-        fallback_fraction=0.0,
-        desktop_required=False,
-        evidence_kind="measured",
-    ):
-        """Emit one named upload phase with count-first progress evidence.
-
-        Automatic upload uses this instead of the historical source values
-        (which mixed local extraction and Desktop indexing).  Other callers
-        keep their existing progress callback contract through the supplied
-        fallback fraction.
-        """
-        if progress_prepare_and_upload:
-            start, end = AUTOMATIC_UPLOAD_PHASE_RANGES[str(phase)]
-            try:
-                completed = max(0.0, float(completed_units))
-                total = max(0.0, float(total_units))
-                fraction = min(1.0, completed / total) if total else max(0.0, min(1.0, fallback_fraction))
-            except (TypeError, ValueError):
-                fraction = max(0.0, min(1.0, fallback_fraction))
-            report_progress(
-                start + (end - start) * fraction,
-                stage,
-                desktop_required=desktop_required,
-                phase=phase,
-                completed_units=completed_units,
-                total_units=total_units,
-                evidence_kind=evidence_kind,
-            )
-        else:
-            report_progress(fallback_fraction, stage, desktop_required=desktop_required)
+    report_upload_phase = UploadPhaseReporter(report_progress, progress_prepare_and_upload).emit
 
     pdf_path = Path(pdf_path)
     # Native ingestion is normally the slowest user-visible phase.  Give it a
@@ -14208,15 +14334,21 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):
         embedder_policy = dict(cached_config["embedder_policy"])
     else:
         with measured_pipeline_phase(args, "anythingllm_configuration_resolution"):
-            detected_chunk_settings = anythingllm_chunk_settings(storage_dir)
-            embedding_config = anythingllm_embedding_config(storage_dir)
-            embedder_policy = anythingllm_embedder_policy(storage_dir)
+            preflight_snapshot = anythingllm_preflight_snapshot(
+                storage_dir,
+                getattr(args, "simulation_adapter", None),
+                runtime_verify=should_verify_anythingllm_runtime_during_preparation(args),
+            )
+            detected_chunk_settings = dict(preflight_snapshot["chunking"])
+            embedding_config = dict(preflight_snapshot["embedder"])
+            embedder_policy = dict(embedding_config.get("policy") or {})
         if isinstance(shared_runtime_context, dict):
             shared_runtime_context["anythingllm_preparation_config"] = {
                 "chunk_settings": dict(detected_chunk_settings),
                 "embedding_config": dict(embedding_config),
                 "embedder_policy": dict(embedder_policy),
             }
+            shared_runtime_context["resolved_anythingllm_runtime_state"] = dict(preflight_snapshot)
     auto_correction_report = {
         "status": "not_applied",
         "auto_corrected": False,
