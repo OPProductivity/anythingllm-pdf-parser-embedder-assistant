@@ -1,0 +1,692 @@
+{
+  "checkpoint_accuracy": {
+    "20": {
+      "eta_error_mean_seconds": 24.643,
+      "eta_error_median_seconds": 36.427,
+      "progress_error_mean_points": -11.274,
+      "progress_error_median_points": -10.61
+    },
+    "40": {
+      "eta_error_mean_seconds": 17.58,
+      "eta_error_median_seconds": 19.465,
+      "progress_error_mean_points": -16.779,
+      "progress_error_median_points": -19.202
+    },
+    "60": {
+      "eta_error_mean_seconds": 20.58,
+      "eta_error_median_seconds": 25.557,
+      "progress_error_mean_points": -10.181,
+      "progress_error_median_points": -14.158
+    },
+    "80": {
+      "eta_error_mean_seconds": 19.143,
+      "eta_error_median_seconds": 25.557,
+      "progress_error_mean_points": -10.369,
+      "progress_error_median_points": -12.088
+    }
+  },
+  "data_quality": {
+    "calibration_acceptance": "failed",
+    "calibration_failed_count": 11,
+    "calibration_passed_count": 0,
+    "note": "Timing validity and progress-calibration acceptance are separate: a timing-valid run may fail calibration.",
+    "timing_invalid_run_count": 5,
+    "timing_valid_run_count": 11
+  },
+  "outlier_bounds_seconds": {
+    "lower": -7.153,
+    "upper": 137.994
+  },
+  "outliers": [],
+  "page_count_quartiles": {
+    "groups": {
+      "lower": {
+        "run_count": 6,
+        "stage_share": {
+          "preparation": {
+            "mean_percent": 22.284,
+            "mean_seconds": 9.146,
+            "median_percent": 18.929,
+            "median_seconds": 9.351
+          },
+          "reporting": {
+            "mean_percent": 2.361,
+            "mean_seconds": 1.03,
+            "median_percent": 2.125,
+            "median_seconds": 1.053
+          },
+          "shared_ingestion": {
+            "mean_percent": 60.87,
+            "mean_seconds": 29.32,
+            "median_percent": 61.992,
+            "median_seconds": 30.331
+          },
+          "submission": {
+            "mean_percent": 0.458,
+            "mean_seconds": 0.186,
+            "median_percent": 0.371,
+            "median_seconds": 0.185
+          },
+          "unattributed": {
+            "mean_percent": 3.302,
+            "mean_seconds": 1.333,
+            "median_percent": 2.667,
+            "median_seconds": 1.341
+          },
+          "validation": {
+            "mean_percent": 10.725,
+            "mean_seconds": 5.676,
+            "median_percent": 5.592,
+            "median_seconds": 3.208
+          }
+        },
+        "total_duration": {
+          "mean_seconds": 46.691,
+          "median_seconds": 49.537
+        }
+      },
+      "median": {
+        "run_count": 4,
+        "stage_share": {
+          "preparation": {
+            "mean_percent": 19.082,
+            "mean_seconds": 13.936,
+            "median_percent": 13.475,
+            "median_seconds": 13.875
+          },
+          "reporting": {
+            "mean_percent": 1.377,
+            "mean_seconds": 1.05,
+            "median_percent": 1.097,
+            "median_seconds": 1.048
+          },
+          "shared_ingestion": {
+            "mean_percent": 57.77,
+            "mean_seconds": 53.761,
+            "median_percent": 63.478,
+            "median_seconds": 64.347
+          },
+          "submission": {
+            "mean_percent": 0.224,
+            "mean_seconds": 0.172,
+            "median_percent": 0.194,
+            "median_seconds": 0.172
+          },
+          "unattributed": {
+            "mean_percent": 1.758,
+            "mean_seconds": 1.336,
+            "median_percent": 1.47,
+            "median_seconds": 1.321
+          },
+          "validation": {
+            "mean_percent": 19.788,
+            "mean_seconds": 15.518,
+            "median_percent": 21.323,
+            "median_seconds": 16.929
+          }
+        },
+        "total_duration": {
+          "mean_seconds": 85.772,
+          "median_seconds": 90.019
+        }
+      },
+      "upper": {
+        "run_count": 6,
+        "stage_share": {
+          "preparation": {
+            "mean_percent": 21.68,
+            "mean_seconds": 12.05,
+            "median_percent": 21.293,
+            "median_seconds": 11.952
+          },
+          "reporting": {
+            "mean_percent": 3.226,
+            "mean_seconds": 1.583,
+            "median_percent": 2.071,
+            "median_seconds": 1.232
+          },
+          "shared_ingestion": {
+            "mean_percent": 63.03,
+            "mean_seconds": 41.578,
+            "median_percent": 65.132,
+            "median_seconds": 37.748
+          },
+          "submission": {
+            "mean_percent": 0.311,
+            "mean_seconds": 0.176,
+            "median_percent": 0.309,
+            "median_seconds": 0.172
+          },
+          "unattributed": {
+            "mean_percent": 2.663,
+            "mean_seconds": 1.476,
+            "median_percent": 2.739,
+            "median_seconds": 1.404
+          },
+          "validation": {
+            "mean_percent": 9.09,
+            "mean_seconds": 7.365,
+            "median_percent": 7.307,
+            "median_seconds": 3.574
+          }
+        },
+        "total_duration": {
+          "mean_seconds": 64.229,
+          "median_seconds": 54.456
+        }
+      }
+    },
+    "lower_threshold": 16.0,
+    "upper_threshold": 25.0
+  },
+  "queue_rate_records_per_minute": {
+    "mean": 71.968,
+    "median": 46.176
+  },
+  "run_count": 16,
+  "schema_version": 1,
+  "stage_summary": {
+    "preparation": {
+      "mean_percent": 21.257,
+      "mean_seconds": 11.433,
+      "median_percent": 18.929,
+      "median_seconds": 10.38
+    },
+    "reporting": {
+      "mean_percent": 2.44,
+      "mean_seconds": 1.243,
+      "median_percent": 2.069,
+      "median_seconds": 1.123
+    },
+    "shared_ingestion": {
+      "mean_percent": 60.905,
+      "mean_seconds": 40.027,
+      "median_percent": 64.561,
+      "median_seconds": 36.59
+    },
+    "submission": {
+      "mean_percent": 0.345,
+      "mean_seconds": 0.179,
+      "median_percent": 0.328,
+      "median_seconds": 0.175
+    },
+    "unattributed": {
+      "mean_percent": 2.676,
+      "mean_seconds": 1.387,
+      "median_percent": 2.599,
+      "median_seconds": 1.353
+    },
+    "validation": {
+      "mean_percent": 12.378,
+      "mean_seconds": 8.77,
+      "median_percent": 8.575,
+      "median_seconds": 4.524
+    }
+  },
+  "table": [
+    {
+      "document_id": "B01",
+      "outlier": false,
+      "page_count": 25,
+      "progress_calibration_passed": false,
+      "stage_percent": {
+        "preparation": 25.77,
+        "reporting": 2.431,
+        "shared_ingestion": 58.084,
+        "submission": 0.364,
+        "unattributed": 3.549,
+        "validation": 9.802
+      },
+      "stage_seconds": {
+        "preparation": 12.118,
+        "reporting": 1.143,
+        "shared_ingestion": 27.313,
+        "submission": 0.171,
+        "unattributed": 1.669,
+        "validation": 4.609
+      },
+      "total_wall_seconds": 47.023,
+      "trial": 1
+    },
+    {
+      "document_id": "B01",
+      "outlier": false,
+      "page_count": 25,
+      "progress_calibration_passed": false,
+      "stage_percent": {
+        "preparation": 20.251,
+        "reporting": 1.733,
+        "shared_ingestion": 71.01,
+        "submission": 0.29,
+        "unattributed": 2.878,
+        "validation": 3.837
+      },
+      "stage_seconds": {
+        "preparation": 11.37,
+        "reporting": 0.973,
+        "shared_ingestion": 39.868,
+        "submission": 0.163,
+        "unattributed": 1.616,
+        "validation": 2.154
+      },
+      "total_wall_seconds": 56.144,
+      "trial": 2
+    },
+    {
+      "document_id": "B02",
+      "outlier": false,
+      "page_count": 17,
+      "progress_calibration_passed": false,
+      "stage_percent": {
+        "preparation": 9.467,
+        "reporting": 1.022,
+        "shared_ingestion": 60.582,
+        "submission": 0.183,
+        "unattributed": 1.354,
+        "validation": 27.392
+      },
+      "stage_seconds": {
+        "preparation": 9.089,
+        "reporting": 0.981,
+        "shared_ingestion": 58.162,
+        "submission": 0.176,
+        "unattributed": 1.3,
+        "validation": 26.298
+      },
+      "total_wall_seconds": 96.006,
+      "trial": 1
+    },
+    {
+      "document_id": "B02",
+      "outlier": false,
+      "page_count": 17,
+      "progress_calibration_passed": false,
+      "stage_percent": {
+        "preparation": 10.827,
+        "reporting": 1.172,
+        "shared_ingestion": 83.933,
+        "submission": 0.205,
+        "unattributed": 1.585,
+        "validation": 2.279
+      },
+      "stage_seconds": {
+        "preparation": 9.098,
+        "reporting": 0.985,
+        "shared_ingestion": 70.531,
+        "submission": 0.172,
+        "unattributed": 1.332,
+        "validation": 1.915
+      },
+      "total_wall_seconds": 84.033,
+      "trial": 2
+    },
+    {
+      "document_id": "B03",
+      "outlier": false,
+      "page_count": 17,
+      "progress_calibration_passed": false,
+      "stage_percent": {
+        "preparation": 39.912,
+        "reporting": 2.344,
+        "shared_ingestion": 20.193,
+        "submission": 0.363,
+        "unattributed": 2.96,
+        "validation": 34.228
+      },
+      "stage_seconds": {
+        "preparation": 18.903,
+        "reporting": 1.11,
+        "shared_ingestion": 9.564,
+        "submission": 0.172,
+        "unattributed": 1.402,
+        "validation": 16.211
+      },
+      "total_wall_seconds": 47.362,
+      "trial": 1
+    },
+    {
+      "document_id": "B03",
+      "outlier": false,
+      "page_count": 17,
+      "progress_calibration_passed": false,
+      "stage_percent": {
+        "preparation": 16.123,
+        "reporting": 0.972,
+        "shared_ingestion": 66.373,
+        "submission": 0.145,
+        "unattributed": 1.133,
+        "validation": 15.254
+      },
+      "stage_seconds": {
+        "preparation": 18.652,
+        "reporting": 1.124,
+        "shared_ingestion": 76.786,
+        "submission": 0.168,
+        "unattributed": 1.311,
+        "validation": 17.647
+      },
+      "total_wall_seconds": 115.688,
+      "trial": 2
+    },
+    {
+      "document_id": "B04",
+      "outlier": false,
+      "page_count": 31,
+      "progress_calibration_passed": false,
+      "stage_percent": {
+        "preparation": 15.505,
+        "reporting": 1.43,
+        "shared_ingestion": 62.748,
+        "submission": 0.209,
+        "unattributed": 1.668,
+        "validation": 18.441
+      },
+      "stage_seconds": {
+        "preparation": 12.932,
+        "reporting": 1.193,
+        "shared_ingestion": 52.337,
+        "submission": 0.174,
+        "unattributed": 1.391,
+        "validation": 15.381
+      },
+      "total_wall_seconds": 83.408,
+      "trial": 1
+    },
+    {
+      "document_id": "B04",
+      "outlier": false,
+      "page_count": 31,
+      "progress_calibration_passed": false,
+      "stage_percent": {
+        "preparation": 35.765,
+        "reporting": 10.095,
+        "shared_ingestion": 49.493,
+        "submission": 0.493,
+        "unattributed": 4.014,
+        "validation": 0.14
+      },
+      "stage_seconds": {
+        "preparation": 12.474,
+        "reporting": 3.521,
+        "shared_ingestion": 17.262,
+        "submission": 0.172,
+        "unattributed": 1.4,
+        "validation": 0.049
+      },
+      "total_wall_seconds": 34.878,
+      "trial": 2
+    },
+    {
+      "document_id": "B05",
+      "outlier": false,
+      "page_count": 25,
+      "progress_calibration_passed": false,
+      "stage_percent": {
+        "preparation": 22.335,
+        "reporting": 2.409,
+        "shared_ingestion": 67.517,
+        "submission": 0.328,
+        "unattributed": 2.6,
+        "validation": 4.812
+      },
+      "stage_seconds": {
+        "preparation": 11.786,
+        "reporting": 1.271,
+        "shared_ingestion": 35.628,
+        "submission": 0.173,
+        "unattributed": 1.372,
+        "validation": 2.539
+      },
+      "total_wall_seconds": 52.769,
+      "trial": 1
+    },
+    {
+      "document_id": "B05",
+      "outlier": false,
+      "page_count": 25,
+      "progress_calibration_passed": false,
+      "stage_percent": {
+        "preparation": 10.456,
+        "reporting": 1.259,
+        "shared_ingestion": 69.326,
+        "submission": 0.184,
+        "unattributed": 1.267,
+        "validation": 17.508
+      },
+      "stage_seconds": {
+        "preparation": 11.622,
+        "reporting": 1.399,
+        "shared_ingestion": 77.059,
+        "submission": 0.205,
+        "unattributed": 1.408,
+        "validation": 19.461
+      },
+      "total_wall_seconds": 111.154,
+      "trial": 2
+    },
+    {
+      "document_id": "B06",
+      "outlier": false,
+      "page_count": 16,
+      "progress_calibration_passed": false,
+      "stage_percent": {
+        "preparation": 16.463,
+        "reporting": 1.975,
+        "shared_ingestion": 51.574,
+        "submission": 0.327,
+        "unattributed": 2.373,
+        "validation": 27.287
+      },
+      "stage_seconds": {
+        "preparation": 9.359,
+        "reporting": 1.123,
+        "shared_ingestion": 29.319,
+        "submission": 0.186,
+        "unattributed": 1.349,
+        "validation": 15.512
+      },
+      "total_wall_seconds": 56.848,
+      "trial": 1
+    },
+    {
+      "document_id": "B06",
+      "outlier": false,
+      "page_count": 16,
+      "progress_calibration_passed": false,
+      "stage_percent": {
+        "preparation": 18.195,
+        "reporting": 2.182,
+        "shared_ingestion": 72.836,
+        "submission": 0.353,
+        "unattributed": 2.597,
+        "validation": 3.836
+      },
+      "stage_seconds": {
+        "preparation": 9.381,
+        "reporting": 1.125,
+        "shared_ingestion": 37.553,
+        "submission": 0.182,
+        "unattributed": 1.339,
+        "validation": 1.978
+      },
+      "total_wall_seconds": 51.558,
+      "trial": 2
+    },
+    {
+      "document_id": "B07",
+      "outlier": false,
+      "page_count": 15,
+      "progress_calibration_passed": false,
+      "stage_percent": {
+        "preparation": 19.782,
+        "reporting": 2.226,
+        "shared_ingestion": 71.045,
+        "submission": 0.426,
+        "unattributed": 3.042,
+        "validation": 3.479
+      },
+      "stage_seconds": {
+        "preparation": 8.727,
+        "reporting": 0.982,
+        "shared_ingestion": 31.342,
+        "submission": 0.188,
+        "unattributed": 1.342,
+        "validation": 1.535
+      },
+      "total_wall_seconds": 44.116,
+      "trial": 1
+    },
+    {
+      "document_id": "B07",
+      "outlier": false,
+      "page_count": 15,
+      "progress_calibration_passed": false,
+      "stage_percent": {
+        "preparation": 44.055,
+        "reporting": 3.645,
+        "shared_ingestion": 44.268,
+        "submission": 0.939,
+        "unattributed": 6.894,
+        "validation": 0.198
+      },
+      "stage_seconds": {
+        "preparation": 8.678,
+        "reporting": 0.718,
+        "shared_ingestion": 8.72,
+        "submission": 0.185,
+        "unattributed": 1.358,
+        "validation": 0.039
+      },
+      "total_wall_seconds": 19.698,
+      "trial": 2
+    },
+    {
+      "document_id": "B08",
+      "outlier": false,
+      "page_count": 16,
+      "progress_calibration_passed": false,
+      "stage_percent": {
+        "preparation": 15.543,
+        "reporting": 2.069,
+        "shared_ingestion": 72.557,
+        "submission": 0.315,
+        "unattributed": 2.169,
+        "validation": 7.348
+      },
+      "stage_seconds": {
+        "preparation": 9.389,
+        "reporting": 1.25,
+        "shared_ingestion": 43.83,
+        "submission": 0.19,
+        "unattributed": 1.31,
+        "validation": 4.439
+      },
+      "total_wall_seconds": 60.408,
+      "trial": 1
+    },
+    {
+      "document_id": "B08",
+      "outlier": false,
+      "page_count": 16,
+      "progress_calibration_passed": false,
+      "stage_percent": {
+        "preparation": 19.663,
+        "reporting": 2.069,
+        "shared_ingestion": 52.94,
+        "submission": 0.389,
+        "unattributed": 2.736,
+        "validation": 22.203
+      },
+      "stage_seconds": {
+        "preparation": 9.343,
+        "reporting": 0.983,
+        "shared_ingestion": 25.155,
+        "submission": 0.185,
+        "unattributed": 1.3,
+        "validation": 10.55
+      },
+      "total_wall_seconds": 47.516,
+      "trial": 2
+    }
+  ],
+  "total_duration": {
+    "max_seconds": 115.688,
+    "mean_seconds": 63.038,
+    "median_seconds": 54.456,
+    "min_seconds": 19.698
+  },
+  "trial_to_trial_variance": [
+    {
+      "absolute_trial_delta_seconds": 9.121,
+      "document_id": "B01",
+      "max_seconds": 56.144,
+      "mean_seconds": 51.584,
+      "min_seconds": 47.023,
+      "sample_variance_seconds_squared": 41.596,
+      "trial_count": 2
+    },
+    {
+      "absolute_trial_delta_seconds": 11.973,
+      "document_id": "B02",
+      "max_seconds": 96.006,
+      "mean_seconds": 90.019,
+      "min_seconds": 84.033,
+      "sample_variance_seconds_squared": 71.676,
+      "trial_count": 2
+    },
+    {
+      "absolute_trial_delta_seconds": 68.326,
+      "document_id": "B03",
+      "max_seconds": 115.688,
+      "mean_seconds": 81.525,
+      "min_seconds": 47.362,
+      "sample_variance_seconds_squared": 2334.221,
+      "trial_count": 2
+    },
+    {
+      "absolute_trial_delta_seconds": 48.53,
+      "document_id": "B04",
+      "max_seconds": 83.408,
+      "mean_seconds": 59.143,
+      "min_seconds": 34.878,
+      "sample_variance_seconds_squared": 1177.58,
+      "trial_count": 2
+    },
+    {
+      "absolute_trial_delta_seconds": 58.385,
+      "document_id": "B05",
+      "max_seconds": 111.154,
+      "mean_seconds": 81.962,
+      "min_seconds": 52.769,
+      "sample_variance_seconds_squared": 1704.404,
+      "trial_count": 2
+    },
+    {
+      "absolute_trial_delta_seconds": 5.29,
+      "document_id": "B06",
+      "max_seconds": 56.848,
+      "mean_seconds": 54.203,
+      "min_seconds": 51.558,
+      "sample_variance_seconds_squared": 13.992,
+      "trial_count": 2
+    },
+    {
+      "absolute_trial_delta_seconds": 24.418,
+      "document_id": "B07",
+      "max_seconds": 44.116,
+      "mean_seconds": 31.907,
+      "min_seconds": 19.698,
+      "sample_variance_seconds_squared": 298.119,
+      "trial_count": 2
+    },
+    {
+      "absolute_trial_delta_seconds": 12.892,
+      "document_id": "B08",
+      "max_seconds": 60.408,
+      "mean_seconds": 53.962,
+      "min_seconds": 47.516,
+      "sample_variance_seconds_squared": 83.102,
+      "trial_count": 2
+    }
+  ]
+}

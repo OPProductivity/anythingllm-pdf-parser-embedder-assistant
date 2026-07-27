@@ -1,0 +1,118 @@
+{
+  "cleanup_state": "preserved_pending_thread_safe_gate",
+  "disjoint_wall_clock_percent": {
+    "preparation": 19.457,
+    "reporting": 2.799,
+    "shared_ingestion": 45.716,
+    "submission": 0.364,
+    "unattributed": 3.093,
+    "validation": 28.571
+  },
+  "disjoint_wall_clock_seconds": {
+    "preparation": 8.398,
+    "reporting": 1.208,
+    "shared_ingestion": 19.732,
+    "submission": 0.157,
+    "unattributed": 1.335,
+    "validation": 12.332
+  },
+  "document_id": "B07",
+  "environment_comparable_to_session_baseline": false,
+  "invalid_for_calibration": true,
+  "invalid_reasons": [
+    "environment_changed"
+  ],
+  "justified_reprices": [
+    {
+      "elapsed_seconds": 13.463,
+      "expected_seconds": 61,
+      "reason": "owned_queue_rate"
+    }
+  ],
+  "ocr_risk": "low",
+  "overlapping_evidence": {
+    "confirmed_vectors": {
+      "finished_monotonic": 29.617,
+      "started_monotonic": 29.145,
+      "wall_seconds": 0.472
+    },
+    "owned_queue": {
+      "finished_monotonic": 28.664,
+      "started_monotonic": 9.89,
+      "wall_seconds": 18.774
+    },
+    "quiet": {
+      "finished_monotonic": null,
+      "started_monotonic": null,
+      "wall_seconds": null
+    },
+    "reconnecting": {
+      "finished_monotonic": null,
+      "started_monotonic": null,
+      "wall_seconds": null
+    },
+    "validation": {
+      "finished_monotonic": 41.95,
+      "started_monotonic": 29.622,
+      "wall_seconds": 12.328
+    }
+  },
+  "page_count": 15,
+  "presentation_controller_version": 11,
+  "presentation_route": "run_automatic_gradio_handler",
+  "profile": "ordinary-page-preserving-upload",
+  "progress_calibration": {
+    "20": {
+      "actual_elapsed_percent": 31.197,
+      "allowed_error_points": 5.0,
+      "elapsed_seconds": 13.467,
+      "eta_error_seconds": 17.832,
+      "progress_error_points": -7.197,
+      "reprice_reason": null,
+      "shown_percent": 24.0,
+      "status": "recorded",
+      "temporary_reprice_allowance": false
+    },
+    "40": {
+      "actual_elapsed_percent": 65.639,
+      "allowed_error_points": 5.0,
+      "elapsed_seconds": 28.335,
+      "eta_error_seconds": 17.832,
+      "progress_error_points": -21.639,
+      "reprice_reason": null,
+      "shown_percent": 44.0,
+      "status": "recorded",
+      "temporary_reprice_allowance": false
+    },
+    "60": {
+      "actual_elapsed_percent": 68.62,
+      "allowed_error_points": 5.0,
+      "elapsed_seconds": 29.622,
+      "eta_error_seconds": 17.832,
+      "progress_error_points": 7.38,
+      "reprice_reason": null,
+      "shown_percent": 76.0,
+      "status": "recorded",
+      "temporary_reprice_allowance": false
+    },
+    "80": {
+      "actual_elapsed_percent": 81.994,
+      "allowed_error_points": 5.0,
+      "elapsed_seconds": 35.395,
+      "eta_error_seconds": 17.832,
+      "progress_error_points": -1.994,
+      "reprice_reason": null,
+      "shown_percent": 80.0,
+      "status": "recorded",
+      "temporary_reprice_allowance": false
+    }
+  },
+  "progress_calibration_passed": false,
+  "queue_rate_records_per_minute": 98.499,
+  "schema_version": 1,
+  "size_bytes": 357097,
+  "size_mib": 0.341,
+  "status": "successful",
+  "total_wall_seconds": 43.162,
+  "trial": 2
+}
