@@ -14349,6 +14349,57 @@ class TimingAndInspectionSafetyTests(unittest.TestCase):
             _changed, reused = pipeline.get_batch_inspection_context(args, storage, "other-workspace")
             self.assertFalse(reused)
 
+    def test_healthy_queue_skips_repeated_storage_reads_but_keeps_exact_safety_checks(self):
+        queue = {
+            "queue_records": 25,
+            "desktop_queue_current": 7,
+            "desktop_queue_completed": 6,
+            "desktop_queue_observer_state": "connected",
+            "desktop_queue_last_event_age_seconds": 2,
+        }
+        common = {
+            "expected_records": 25,
+            "has_cached_evidence": True,
+            "last_observation_position": 7,
+            "last_observation_elapsed_seconds": 40,
+        }
+        self.assertFalse(
+            pipeline.storage_observation_due_for_queue(
+                queue, elapsed_seconds=45, **common
+            )
+        )
+        self.assertTrue(
+            pipeline.storage_observation_due_for_queue(
+                {**queue, "desktop_queue_current": 8}, elapsed_seconds=45, **common
+            )
+        )
+        self.assertTrue(
+            pipeline.storage_observation_due_for_queue(
+                queue,
+                elapsed_seconds=(
+                    40 + pipeline.ANYTHINGLLM_HEALTHY_QUEUE_STORAGE_OBSERVATION_INTERVAL_SECONDS
+                ),
+                **common,
+            )
+        )
+        self.assertTrue(
+            pipeline.storage_observation_due_for_queue(
+                {**queue, "desktop_queue_observer_state": "quiet"}, elapsed_seconds=45, **common
+            )
+        )
+
+    def test_exact_vector_proof_with_deferred_live_retrieval_is_successful(self):
+        import rag_pdf_gradio_app as app
+
+        completion = app.automatic_completion([{
+            "api_upload_status": "complete",
+            "post_upload_verification_status": "pass",
+            "anythingllm_runtime_validation_status": "deferred_after_exact_vector_proof",
+        }], True)
+
+        self.assertEqual(completion["state"], "successful")
+        self.assertEqual(completion["code"], "AUTO-RETRIEVAL-DEFERRED-001")
+
 
 if __name__ == "__main__":
     unittest.main()

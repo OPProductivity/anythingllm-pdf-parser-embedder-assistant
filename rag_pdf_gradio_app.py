@@ -12553,6 +12553,7 @@ def automatic_completion(summaries, prepare_and_upload):
             "vector_runtime_timeout",
             "pass_with_chat_timeout",
             "pass_with_vector_timeout",
+            "deferred_after_exact_vector_proof",
         }
         for status in runtime_statuses
     )
@@ -12591,6 +12592,12 @@ def automatic_completion(summaries, prepare_and_upload):
             "message": "Searchable vectors and runtime retrieval succeeded, but the final storage observation could not confirm workspace document-list rows for one or more uploads. Retrieval evidence remains valid; inspect document management separately.",
         }
     if upload_ok and post_searchable_with_caveat and runtime_transient_timeout:
+        if any(status == "deferred_after_exact_vector_proof" for status in runtime_statuses):
+            return {
+                "state": "successful",
+                "code": "AUTO-RETRIEVAL-DEFERRED-001",
+                "message": "Searchable page-parent vectors verified. Live retrieval diagnostics were deferred after a Desktop receipt timeout, so they cannot delay this completed workspace.",
+            }
         return {
             "state": "successful",
             "code": "AUTO-RETRIEVAL-RUNTIME-001",

@@ -10075,6 +10075,70 @@ ANYTHINGLLM_EMBEDDING_RECONCILIATION_TIMEOUT_SECONDS = 480.0
 ANYTHINGLLM_EMBEDDING_RECONCILIATION_ACTIVE_CAP_SECONDS = 3600.0
 ANYTHINGLLM_EMBEDDING_RECONCILIATION_PROGRESS_GRACE_SECONDS = 90.0
 ANYTHINGLLM_EMBEDDING_RECONCILIATION_STALL_SECONDS = 90.0
+# A connected, owned Desktop queue is the primary source of truth while it is
+# actively writing.  Reopening its SQLite/LanceDB state every two seconds adds
+# needless reader pressure.  Inspect on a new owned queue position, with this
+# sparse safety cadence to retain vector evidence if an event is delayed.
+ANYTHINGLLM_HEALTHY_QUEUE_STORAGE_OBSERVATION_INTERVAL_SECONDS = 20.0
+
+
+def healthy_owned_desktop_queue(queue, expected_records=0, *, poll_interval_seconds=2.0):
+    """Return whether current-run SSE evidence proves Desktop is still writing."""
+    queue = dict(queue or {})
+    total = max(0, int(queue.get("queue_records") or expected_records or 0))
+    position = max(
+        int(queue.get("desktop_queue_completed") or 0),
+        int(queue.get("desktop_queue_current") or 0),
+    )
+    try:
+        event_age = float(str(queue.get("desktop_queue_last_event_age_seconds") or ""))
+    except (TypeError, ValueError):
+        event_age = None
+    return bool(
+        total > 0
+        and 0 < position < total
+        and str(queue.get("desktop_queue_observer_state") or "") == "connected"
+        and event_age is not None
+        and event_age <= max(15.0, float(poll_interval_seconds or 2.0) * 3.0)
+    )
+
+
+def storage_observation_due_for_queue(
+    queue,
+    expected_records,
+    *,
+    has_cached_evidence,
+    last_observation_position,
+    elapsed_seconds,
+    last_observation_elapsed_seconds,
+    poll_interval_seconds=2.0,
+):
+    """Decide whether a status poll should reopen mutable local vector storage.
+
+    A healthy current-run queue gets one exact read per newly observed queue
+    position plus a sparse safety read.  All uncertain, quiet, or completed
+    queues retain normal exact-vector observation so recovery never relies on
+    stale SSE alone.
+    """
+    queue = dict(queue or {})
+    position = max(
+        int(queue.get("desktop_queue_completed") or 0),
+        int(queue.get("desktop_queue_current") or 0),
+    )
+    if not healthy_owned_desktop_queue(
+        queue,
+        expected_records,
+        poll_interval_seconds=poll_interval_seconds,
+    ):
+        return True
+    if not has_cached_evidence or position > int(last_observation_position or -1):
+        return True
+    if last_observation_elapsed_seconds is None:
+        return True
+    return (
+        float(elapsed_seconds or 0.0) - float(last_observation_elapsed_seconds)
+        >= ANYTHINGLLM_HEALTHY_QUEUE_STORAGE_OBSERVATION_INTERVAL_SECONDS
+    )
 # Temporary validation uses one shorter, shared observation budget. Its
 # per-batch checkpoint and final document check observe the same Desktop work;
 # they must not add independent 45- and 180-second waits.
@@ -15908,14 +15972,24 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             "last_vector_progress_elapsed_seconds": None,
             "highest_queue_position": 0,
             "last_queue_progress_elapsed_seconds": None,
+            "owned_queue_heartbeat_observed": False,
             "deadline_extensions": 0,
             "effective_deadline_seconds": reconciliation_deadline,
             "storage_busy_observed": False,
-            # Fast observations are deliberately cheap enough to run on the
-            # normal two-second cadence.  The two scheduled diagnostics below
-            # are a *read-only* deeper look at the workspace/document state;
-            # they never enqueue, restart Desktop, retry an upload, or alter
-            # the recovery decision by themselves.
+            # Keep exact-vector reads sparse while the owned Desktop queue is
+            # demonstrably healthy.  The poller still emits status every two
+            # seconds, but returns cached evidence until Desktop advances or a
+            # bounded safety cadence expires.
+            "last_fast_observation_elapsed_seconds": None,
+            "last_fast_observation_queue_position": -1,
+            "last_fast_evidence": None,
+            "storage_observation_count": 0,
+            "storage_observation_skipped_count": 0,
+            "storage_observation_seconds": 0.0,
+            "storage_observation_max_seconds": 0.0,
+            # The scheduled diagnostics below are a *read-only* deeper look
+            # at the workspace/document state; they never enqueue, restart
+            # Desktop, retry an upload, or alter the recovery decision.
             "completed_read_only_checkpoints": set(),
             "read_only_checkpoints": [],
         }
@@ -15942,6 +16016,20 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 "desktop_queue_observer_failures": max(0, int(raw.get("observer_failures") or 0)),
                 "desktop_queue_observer_reason": str(raw.get("observer_reason") or ""),
             }
+
+        def healthy_owned_queue_active(queue=None):
+            """Whether a current-run SSE queue proves Desktop is still writing.
+
+            A healthy owned queue allows UI/status polling to continue without
+            repeatedly opening the same storage that Desktop is mutating.  An
+            uncertain, quiet, completed, or missing queue deliberately falls
+            back to normal exact-vector polling.
+            """
+            return healthy_owned_desktop_queue(
+                queue or live_desktop_queue_snapshot(),
+                len(expected_batch),
+                poll_interval_seconds=float(getattr(args, "post_upload_poll_interval", 2.0)),
+            )
 
         def reconcile_evidence(evidence):
             evidence = dict(evidence or {})
@@ -15974,6 +16062,8 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 heartbeat_age is not None
                 and float(heartbeat_age) <= max(15.0, float(getattr(args, "post_upload_poll_interval", 2.0)) * 3.0)
             )
+            if heartbeat_live:
+                reconciliation_tracker["owned_queue_heartbeat_observed"] = True
             if observed >= len(expected_batch):
                 classification = "reconciliation_exact_vectors_confirmed"
             elif observed > 0 and reconciliation_tracker["last_vector_progress_elapsed_seconds"] == round(elapsed, 3):
@@ -16004,6 +16094,18 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 ],
                 "reconciliation_deadline_extensions": int(reconciliation_tracker["deadline_extensions"]),
                 "reconciliation_storage_busy_observed": bool(reconciliation_tracker["storage_busy_observed"]),
+                "reconciliation_storage_observation_count": int(
+                    reconciliation_tracker["storage_observation_count"]
+                ),
+                "reconciliation_storage_observation_skipped_count": int(
+                    reconciliation_tracker["storage_observation_skipped_count"]
+                ),
+                "reconciliation_storage_observation_seconds": round(
+                    float(reconciliation_tracker["storage_observation_seconds"]), 4
+                ),
+                "reconciliation_storage_observation_max_seconds": round(
+                    float(reconciliation_tracker["storage_observation_max_seconds"]), 4
+                ),
                 "reconciliation_read_only_checkpoints": list(
                     reconciliation_tracker["read_only_checkpoints"]
                 ),
@@ -16158,27 +16260,67 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         )
 
         def inspect_batch_vectors():
-            # The frequent observer is intentionally fast even when the
-            # request receipt was ambiguous.  Performing a full workspace and
-            # frontend materialization every two seconds both slows Desktop
-            # while it is writing and makes the poller itself a source of
-            # contention.  The 60/120-second checkpoints below provide the
-            # deeper, still read-only inspection requested for an unresolved
-            # receipt.
-            evidence = verify_anythingllm_post_upload(
-                storage_dir,
-                target_workspace_slug,
-                source_sha,
-                expected_batch,
-                upload_locations=(batch_report.get("locations") or []),
-                observation_mode="fast",
+            # A status poll is not automatically a storage poll.  While the
+            # owned SSE queue is connected and moving, wait for a new queue
+            # position (or a bounded safety cadence) before opening local
+            # SQLite/LanceDB.  This preserves exact-vector proof without
+            # competing with Desktop's active writer every two seconds.
+            elapsed = max(0.0, time.time() - reconciliation_started_at)
+            queue = live_desktop_queue_snapshot()
+            queue_position = max(
+                int(queue.get("desktop_queue_completed") or 0),
+                int(queue.get("desktop_queue_current") or 0),
             )
+            last_observation_elapsed = reconciliation_tracker["last_fast_observation_elapsed_seconds"]
+            last_observation_position = int(reconciliation_tracker["last_fast_observation_queue_position"] or -1)
+            healthy_queue = healthy_owned_queue_active(queue)
+            cached_evidence = reconciliation_tracker.get("last_fast_evidence")
+            should_read_storage = storage_observation_due_for_queue(
+                queue,
+                len(expected_batch),
+                has_cached_evidence=cached_evidence is not None,
+                last_observation_position=last_observation_position,
+                elapsed_seconds=elapsed,
+                last_observation_elapsed_seconds=last_observation_elapsed,
+                poll_interval_seconds=float(getattr(args, "post_upload_poll_interval", 2.0)),
+            )
+            if should_read_storage:
+                storage_observation_started = time.perf_counter()
+                evidence = verify_anythingllm_post_upload(
+                    storage_dir,
+                    target_workspace_slug,
+                    source_sha,
+                    expected_batch,
+                    upload_locations=(batch_report.get("locations") or []),
+                    observation_mode="fast",
+                )
+                storage_observation_seconds = max(
+                    0.0, time.perf_counter() - storage_observation_started
+                )
+                reconciliation_tracker["last_fast_evidence"] = dict(evidence)
+                reconciliation_tracker["last_fast_observation_elapsed_seconds"] = round(elapsed, 3)
+                reconciliation_tracker["last_fast_observation_queue_position"] = queue_position
+                reconciliation_tracker["storage_observation_count"] += 1
+                reconciliation_tracker["storage_observation_seconds"] += storage_observation_seconds
+                reconciliation_tracker["storage_observation_max_seconds"] = max(
+                    float(reconciliation_tracker["storage_observation_max_seconds"]),
+                    storage_observation_seconds,
+                )
+            else:
+                evidence = dict(cached_evidence)
+                evidence["observation_mode"] = "cached_healthy_queue"
+                reconciliation_tracker["storage_observation_skipped_count"] += 1
             if unresolved_submission:
-                elapsed = max(0.0, time.time() - reconciliation_started_at)
                 for checkpoint_seconds in (60.0, 120.0):
                     if (
                         elapsed < checkpoint_seconds
                         or checkpoint_seconds in reconciliation_tracker["completed_read_only_checkpoints"]
+                        # A healthy owned queue already supplies current-run
+                        # evidence.  Defer broad identity scans to uncertain
+                        # receipt recovery instead of competing with normal
+                        # Desktop indexing.
+                        or reconciliation_tracker["owned_queue_heartbeat_observed"]
+                        or healthy_queue
                     ):
                         continue
                     # ``verify_anythingllm_post_upload`` only opens local
@@ -16915,10 +17057,26 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             }
         ],
     )
+    # A receipt timeout can be normal for Desktop's long-running embedding
+    # endpoint.  Once exact page-parent identities are proven, live retrieval
+    # probes are diagnostics, not a condition of ordinary completion.  Do not
+    # make a cold provider search add five sequential timeouts to the user’s
+    # finished upload; the saved diagnostics route can run them after Desktop
+    # settles.
+    defer_runtime_retrieval_after_exact_proof = bool(
+        args.prepare_and_upload
+        and upload_report.get("uploaded", 0) > 0
+        and post_upload_report.get("status") in REVIEWABLE_POST_UPLOAD_STATUSES
+        and any(
+            bool(batch.get("receipt_deadline_elapsed"))
+            for batch in ((upload_report.get("embedding_update") or {}).get("batches") or [])
+        )
+    )
     if (
         args.prepare_and_upload
         and upload_report.get("uploaded", 0) > 0
         and post_upload_report.get("status") in REVIEWABLE_POST_UPLOAD_STATUSES
+        and not defer_runtime_retrieval_after_exact_proof
     ):
         report_upload_phase(
             "retrieval_sample",
@@ -17010,6 +17168,22 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 for key, value in embedder_probe.items()
                 if key != "cache_reused"
             }
+    elif defer_runtime_retrieval_after_exact_proof:
+        runtime_validation_report = {
+            "status": "deferred_after_exact_vector_proof",
+            "message": (
+                "Exact page-parent vectors were proven after the Desktop receipt deadline. "
+                "Live retrieval probes were deferred so a cold provider search cannot delay ordinary completion."
+            ),
+            "workspace_slug": target_workspace_slug,
+            "vector_checks": [],
+            "chat_check": {},
+            "embedder_probe": {},
+            "total_seconds": 0.0,
+            "vector_search_seconds": 0.0,
+            "chat_seconds": 0.0,
+            "deferred_reason": "receipt_timeout_exact_vector_proof",
+        }
     else:
         runtime_validation_report = {
             "status": (
