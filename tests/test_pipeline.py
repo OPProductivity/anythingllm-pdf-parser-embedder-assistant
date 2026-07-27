@@ -2702,6 +2702,46 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertNotIn("Est:", rendered)
         self.assertNotIn("automatic-run-time-progress", rendered)
 
+    def test_live_run_status_renders_batch_completion_separately_from_queue_evidence(self):
+        import rag_pdf_gradio_app as app
+
+        rendered = app.automatic_live_status_html({
+            "state": "running",
+            "phase": "Current PDF reconciliation window: 0/480s.",
+            "details": "0/17 page-parent vectors confirmed (incomplete)",
+            "batch_completed_files": 7,
+            "batch_total_files": 8,
+            "batch_current_file_index": 8,
+        })
+        self.assertIn("Current PDF reconciliation window: 0/480s.", rendered)
+        self.assertIn("Batch: 7/8 PDFs finished", rendered)
+        self.assertIn("Current PDF: 8/8", rendered)
+        self.assertEqual(rendered.count('role="progressbar"'), 1)
+
+    def test_batch_completion_count_never_regresses_on_later_pdf_callbacks(self):
+        import rag_pdf_gradio_app as app
+
+        original = app.LIVE_AUTOMATIC_RUN_STATUS
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                app.LIVE_AUTOMATIC_RUN_STATUS = {}
+                app.update_live_automatic_run_status(
+                    temp_dir, state="running", phase="Document finished",
+                    batch_completed_files=7, batch_total_files=8,
+                    batch_current_file_index=8,
+                )
+                record = app.update_live_automatic_run_status(
+                    temp_dir, state="running",
+                    phase="Current PDF reconciliation window: 0/480s.",
+                    batch_completed_files=0, batch_total_files=8,
+                    batch_current_file_index=8,
+                )
+        finally:
+            app.LIVE_AUTOMATIC_RUN_STATUS = original
+        self.assertEqual(record["batch_completed_files"], 7)
+        self.assertEqual(record["batch_total_files"], 8)
+        self.assertEqual(record["batch_current_file_index"], 8)
+
     def test_progress_label_never_uses_estimate_text_as_a_second_progress_bar(self):
         import rag_pdf_gradio_app as app
 

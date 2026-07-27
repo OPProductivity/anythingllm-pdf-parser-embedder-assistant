@@ -16500,7 +16500,10 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             report_upload_phase(
                 "identity_set",
                 (
-                    f"AnythingLLM reconciliation {reconciliation_elapsed:.0f}/{reconciliation_deadline_seconds:.0f}s: "
+                    # This is a per-document observation allowance. It
+                    # restarts for the next PDF by design; it is neither a
+                    # batch-wide counter nor a count of searchable vectors.
+                    f"Current PDF reconciliation window: {reconciliation_elapsed:.0f}/{reconciliation_deadline_seconds:.0f}s. "
                     f"{queue_detail}"
                     f"{format_vector_observation(observed, len(expected_batch), operator_state, record_label=vector_record_label)}"
                     f"{checkpoint_detail}{observer_detail}"

@@ -3783,6 +3783,11 @@ body:not(.dark) .gradio-container label[data-testid$="-checkbox-label"] {
     padding-top: 3px;
 }
 .automatic-run-progress-label span { font-variant-numeric: tabular-nums; }
+.automatic-run-batch-count {
+    flex-basis: 100%;
+    color: var(--body-text-color-subdued, #94a3b8);
+    font-size: 0.92em;
+}
 .automatic-run-activity.preparing .automatic-run-progress-label {
     display: block;
     min-height: 2.45em;
@@ -9073,6 +9078,9 @@ def update_live_automatic_run_status(
     total_units=None,
     evidence_kind=None,
     eta_reprice_reason=None,
+    batch_completed_files=None,
+    batch_total_files=None,
+    batch_current_file_index=None,
 ):
     """Persist progress evidence plus a deliberately capped time-based estimate.
 
@@ -9136,6 +9144,24 @@ def update_live_automatic_run_status(
         comparable_value = max(0, int(comparable_value or 0))
     except (TypeError, ValueError):
         comparable_value = 0
+    def _batch_count(value, fallback=0):
+        try:
+            return max(0, int(value if value is not None else fallback or 0))
+        except (TypeError, ValueError):
+            return max(0, int(fallback or 0))
+
+    prior_batch_total = _batch_count(previous.get("batch_total_files"))
+    batch_total = _batch_count(batch_total_files, prior_batch_total)
+    prior_batch_completed = _batch_count(previous.get("batch_completed_files"))
+    incoming_batch_completed = _batch_count(batch_completed_files, prior_batch_completed)
+    # A batch result never becomes unfinished just because a later current-PDF
+    # callback arrives. Queue/vector work remains separate evidence.
+    batch_completed = max(prior_batch_completed, incoming_batch_completed)
+    if batch_total:
+        batch_completed = min(batch_completed, batch_total)
+    batch_current = _batch_count(batch_current_file_index, previous.get("batch_current_file_index"))
+    if batch_total > 1:
+        batch_current = min(batch_current, batch_total)
     remaining_fraction = max(0.0, 1.0 - confirmed)
     # A phase earns at most a modest forecast allowance. If the phase exceeds
     # its budget, the bar waits at the cap for real evidence instead of racing
@@ -9174,6 +9200,9 @@ def update_live_automatic_run_status(
         "progress_phase": incoming_progress_phase or previous_progress_phase,
         "completed_units": completed_units if completed_units is not None else previous.get("completed_units"),
         "total_units": total_units if total_units is not None else previous.get("total_units"),
+        "batch_completed_files": batch_completed,
+        "batch_total_files": batch_total,
+        "batch_current_file_index": batch_current,
         "evidence_kind": str(evidence_kind or previous.get("evidence_kind") or ""),
         # A calibration exception is allowed only immediately after this
         # explicit, evidence-backed ETA reprice.  Persist the reason so a
@@ -9289,6 +9318,9 @@ def update_live_automatic_run_status(
                 "progress_phase": record.get("progress_phase", ""),
                 "completed_units": record.get("completed_units"),
                 "total_units": record.get("total_units"),
+                "batch_completed_files": record.get("batch_completed_files", 0),
+                "batch_total_files": record.get("batch_total_files", 0),
+                "batch_current_file_index": record.get("batch_current_file_index", 0),
                 "evidence_kind": record.get("evidence_kind", ""),
                 "eta_reprice_reason": record.get("eta_reprice_reason", ""),
                 "details": record["details"],
@@ -9393,6 +9425,26 @@ def automatic_live_status_html(status=None):
     phase = html.escape(str(record.get("phase") or "Working"))
     details = html.escape(str(record.get("details") or ""))
     suffix = f" — {details}" if details else ""
+    try:
+        batch_total = max(0, int(record.get("batch_total_files") or 0))
+        batch_completed = max(0, int(record.get("batch_completed_files") or 0))
+        batch_current = max(0, int(record.get("batch_current_file_index") or 0))
+    except (TypeError, ValueError):
+        batch_total = batch_completed = batch_current = 0
+    if batch_total:
+        batch_completed = min(batch_completed, batch_total)
+        batch_current = min(batch_current, batch_total)
+        current_detail = (
+            f" • Current PDF: {batch_current}/{batch_total}"
+            if batch_current else ""
+        )
+        batch_suffix = (
+            '<span class="automatic-run-batch-count">'
+            f"Batch: {batch_completed}/{batch_total} PDFs finished{current_detail}"
+            "</span>"
+        )
+    else:
+        batch_suffix = ""
     percent = paced_progress_percent(record)
     percent_text = f"{percent:d}%"
     now = time.time()
@@ -9433,7 +9485,7 @@ def automatic_live_status_html(status=None):
         f'aria-valuemin="0" aria-valuemax="100" aria-valuenow="{percent:d}">'
         f'<div class="automatic-run-progress-fill" style="width: {percent:d}%"></div></div>'
         f'<div class="automatic-run-progress-label"><strong>Overall progress: {percent_text}</strong> '
-        f'<span>{phase}</span>{suffix}{timing_text}</div></div>'
+        f'<span>{phase}</span>{suffix}{batch_suffix}{timing_text}</div></div>'
     )
 
 
@@ -15086,6 +15138,8 @@ def run_automatic(
             # the first 0.5% for it; actual PDF evidence owns the rest of the
             # early preparation range.
             confirmed_fraction=AUTOMATIC_RUN_PREFLIGHT_DISPLAY_END,
+            batch_completed_files=0,
+            batch_total_files=max(len(files), 1),
         )
         if ocr_preflight_manifest:
             (run_root / "ocr-preflight-manifest.json").write_text(
@@ -15411,6 +15465,7 @@ def run_automatic(
     flat_no_logs_exports = []
     total_files = max(len(files), 1)
     cancellation_requested = False
+    completed_files = 0
     ocr_eta_applied_files = set()
     # The worker supplies this same ordering on every structured event.  Keep
     # it run-local so stale callbacks from an earlier phase cannot repaint the
@@ -15564,6 +15619,9 @@ def run_automatic(
             completed_units=(progress_event or {}).get("completed_units") if phase_name else None,
             total_units=(progress_event or {}).get("total_units") if phase_name else None,
             evidence_kind=(progress_event or {}).get("evidence_kind") if phase_name else None,
+            batch_completed_files=completed_files,
+            batch_total_files=total_files,
+            batch_current_file_index=file_index,
         )
         progress(
             confirmed_fraction,
@@ -16308,6 +16366,31 @@ def run_automatic(
         else:
             progress(end_fraction, desc=format_progress_desc(f"Collected output files for {pdf_path.name}", file_index, total_files))
         summaries.append(summary)
+        # A document becomes batch-complete only once its worker returned a
+        # durable summary.  This count stays monotonic while the next PDF gets
+        # a fresh reconciliation window; it does not reuse queue/vector x/y.
+        completed_files += 1
+        update_live_automatic_run_status(
+            run_root,
+            state="running",
+            phase=(
+                "Document finished — preparing the next PDF"
+                if completed_files < total_files
+                else "All PDF processing finished — completing the batch"
+            ),
+            expected_seconds=expected_seconds,
+            details="",
+            confirmed_fraction=None,
+            cancel_available=not automatic_run_cancellation_requested(run_root),
+            cancel_requested=automatic_run_cancellation_requested(run_root),
+            activity_observed=True,
+            batch_completed_files=completed_files,
+            batch_total_files=total_files,
+            batch_current_file_index=(
+                min(total_files, completed_files + 1)
+                if completed_files < total_files else total_files
+            ),
+        )
         # Prepared text is the operator's usable result even if upload,
         # indexing, or a later verification layer needs review.  Keep it in
         # the general Run output state as well as the dedicated prepared-file
