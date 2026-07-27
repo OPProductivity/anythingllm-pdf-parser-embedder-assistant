@@ -1,7 +1,11 @@
 # Anonymised benchmark report
 
 Measured runs: 16
-Timing-valid runs: 11; calibration acceptance: failed
+Operational completed runs: 16; calibration-eligible runs: 0; calibration acceptance: pending
+
+## Operational view
+
+Includes all completed runs, including warnings and observer uncertainty.
 
 | ID | Trial | Pages | Total s | Calibration | IQR outlier |
 | --- | ---: | ---: | ---: | --- | --- |
@@ -44,3 +48,8 @@ Duration (s): min 19.698, median 54.456, mean 63.038, max 115.688
 | lower | 6 | 22.284 | 0.458 | 60.87 | 10.725 | 2.361 |
 | median | 4 | 19.082 | 0.224 | 57.77 | 19.788 | 1.377 |
 | upper | 6 | 21.68 | 0.311 | 63.03 | 9.09 | 3.226 |
+
+## Calibration view
+
+Only successful, environment-comparable, observer-healthy runs from the current benchmark protocol may influence progress allocation.
+Eligible duration (s): min None, median None, mean None, max None

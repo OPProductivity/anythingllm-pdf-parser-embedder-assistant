@@ -53,6 +53,11 @@ PHASE_BUCKET = {
 # Version 11: no synthetic four-percent worker-start checkpoint, monotonic
 # visible evidence, and mature/bounded queue-rate ETA repricing.
 PRODUCTION_PRESENTATION_CONTROLLER_VERSION = 11
+# Revision 2 adds sparse healthy-queue storage observation and defers optional
+# retrieval work after a receipt timeout has exact vector proof.  Those alter
+# measured wall-clock stages, so controller-version equality alone is not a
+# valid benchmark freshness check.
+BENCHMARK_RUNTIME_PROTOCOL_REVISION = 2
 
 
 @dataclass(frozen=True)
@@ -626,21 +631,55 @@ def trace_observer_uncertainty_reasons(trace_rows: list[dict[str, Any]]) -> list
 
 
 def refresh_public_calibration_eligibility(result: dict[str, Any], *, trace_rows: list[dict[str, Any]] | None = None) -> bool:
-    """Apply safe, derived calibration exclusions to an already-public run."""
+    """Add derived exclusions without rewriting the historical run outcome."""
     reconnecting = ((result.get("overlapping_evidence") or {}).get("reconnecting") or {}).get("wall_seconds")
     serialized = json.dumps(result, ensure_ascii=False).casefold()
     observer_uncertain = reconnecting is not None or any(
         marker in serialized
         for marker in ("sse observer reconnecting", "sse observer unavailable", "sse observer unknown")
     ) or bool(trace_observer_uncertainty_reasons(trace_rows or []))
-    if not observer_uncertain:
-        return False
     reasons = list(result.get("invalid_reasons") or [])
-    if "observer_uncertainty" in reasons:
-        return False
-    result["invalid_for_calibration"] = True
-    result["invalid_reasons"] = [*reasons, "observer_uncertainty"]
-    return True
+    exclusions = list(result.get("calibration_exclusion_reasons") or [])
+    changed = False
+    if observer_uncertain:
+        if "observer_uncertainty" not in reasons:
+            reasons.append("observer_uncertainty")
+            result["invalid_for_calibration"] = True
+            changed = True
+        if "observer_uncertainty" not in exclusions:
+            exclusions.append("observer_uncertainty")
+            changed = True
+    # A warning can be operationally complete but follows a different timing
+    # path. It is excluded unless a named, tested timing-neutral allowlist is
+    # intentionally introduced in a future protocol revision.
+    terminal_state = str(result.get("status") or "").casefold()
+    if terminal_state and terminal_state != "successful" and "terminal_not_successful" not in exclusions:
+        exclusions.append("terminal_not_successful")
+        changed = True
+    if changed:
+        result["invalid_reasons"] = reasons
+        result["calibration_exclusion_reasons"] = exclusions
+    return changed
+
+
+def current_runtime_protocol_result(row: dict[str, Any]) -> bool:
+    """Return whether a public result measures the current timing protocol."""
+    return (
+        int(row.get("presentation_controller_version") or 0)
+        == PRODUCTION_PRESENTATION_CONTROLLER_VERSION
+        and int(row.get("benchmark_runtime_protocol_revision") or 0)
+        == BENCHMARK_RUNTIME_PROTOCOL_REVISION
+    )
+
+
+def calibration_eligible_public_result(row: dict[str, Any]) -> bool:
+    """Return the strict cohort permitted to influence progress allocation."""
+    return bool(
+        current_runtime_protocol_result(row)
+        and str(row.get("status") or "").casefold() == "successful"
+        and bool(row.get("environment_comparable_to_session_baseline"))
+        and not bool(row.get("invalid_for_calibration"))
+    )
 
 
 def run_one(document: BenchmarkDocument, source: dict[str, Any], *, trial: int, private_root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -711,20 +750,24 @@ def run_one(document: BenchmarkDocument, source: dict[str, Any], *, trial: int, 
     terminal = dict(app.LIVE_AUTOMATIC_RUN_STATUS or {})
     terminal_state = str(terminal.get("state") or "failed")
     invalid_reasons = []
-    if terminal_state not in {"successful", "warning"}:
-        invalid_reasons.append("gradio_route_not_completed")
+    calibration_exclusion_reasons = []
+    if terminal_state != "successful":
+        calibration_exclusion_reasons.append("terminal_not_successful")
     if not trace_rows:
         invalid_reasons.append("missing_attributable_timeline")
     invalid_reasons.extend(observer_uncertainty_reasons(observed_events))
     invalid_reasons.extend(trace_observer_uncertainty_reasons(trace_rows))
     invalid_reasons = list(dict.fromkeys(invalid_reasons))
+    calibration_exclusion_reasons.extend(invalid_reasons)
+    calibration_exclusion_reasons = list(dict.fromkeys(calibration_exclusion_reasons))
     public_result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "document_id": document.document_id,
         "trial": int(trial),
         "profile": "ordinary-page-preserving-upload",
         "presentation_route": "run_automatic_gradio_handler",
         "presentation_controller_version": PRODUCTION_PRESENTATION_CONTROLLER_VERSION,
+        "benchmark_runtime_protocol_revision": BENCHMARK_RUNTIME_PROTOCOL_REVISION,
         "page_count": document.page_count,
         "size_bytes": pdf_path.stat().st_size,
         "size_mib": round(pdf_path.stat().st_size / (1024 * 1024), 3),
@@ -742,6 +785,7 @@ def run_one(document: BenchmarkDocument, source: dict[str, Any], *, trial: int, 
         "justified_reprices": production_reprices(trace_rows),
         "invalid_for_calibration": bool(invalid_reasons),
         "invalid_reasons": invalid_reasons,
+        "calibration_exclusion_reasons": calibration_exclusion_reasons,
     }
     private_result = {
         "public_result": public_result,
@@ -847,6 +891,9 @@ def main(argv: list[str] | None = None) -> int:
         if not comparable:
             public_result["invalid_for_calibration"] = True
             public_result["invalid_reasons"] = [*public_result["invalid_reasons"], "environment_changed"]
+            public_result["calibration_exclusion_reasons"] = [
+                *public_result["calibration_exclusion_reasons"], "environment_changed"
+            ]
         # Evidence is durable before any future cleanup implementation is
         # allowed to consider deletion. Default behavior is preservation;
         # cleanup needs a separate, thread-aware ownership gate.
@@ -880,18 +927,17 @@ def main(argv: list[str] | None = None) -> int:
         for document_id in manifest
         for trial in (1, 2)
     }
-    production_route_keys = {
+    current_protocol_keys = {
         (str(row.get("document_id") or ""), int(row.get("trial") or 0))
         for row in published_runs
-        if int(row.get("presentation_controller_version") or 0) == PRODUCTION_PRESENTATION_CONTROLLER_VERSION
+        if current_runtime_protocol_result(row)
     }
     fresh_keys = {
         (str(row.get("document_id") or ""), int(row.get("trial") or 0))
         for row in published_runs
-        if (str(row.get("document_id") or ""), int(row.get("trial") or 0)) in production_route_keys
-        and not bool(row.get("invalid_for_calibration"))
+        if calibration_eligible_public_result(row)
     }
-    missing_or_stale = sorted(expected_keys - production_route_keys)
+    missing_or_stale = sorted(expected_keys - current_protocol_keys)
     calibration_failures = sum(
         not bool(row.get("progress_calibration_passed"))
         for row in published_runs
@@ -904,7 +950,7 @@ def main(argv: list[str] | None = None) -> int:
         # reader cannot mistake stale trials for a calibration-ready cohort.
         "timing_runs_state": (
             "completed"
-            if not missing_or_stale and len(production_route_keys) == len(expected_keys)
+            if not missing_or_stale and len(current_protocol_keys) == len(expected_keys)
             else "awaiting-rerun"
         ),
         "completed_run_count": len(published_runs),

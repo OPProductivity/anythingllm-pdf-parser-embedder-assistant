@@ -38,6 +38,24 @@ timeout. Queue cleanup or restart is allowed only for ledger-proven app-owned
 work; ambiguous ownership or manual activity is preserved rather than changed
 automatically.
 
+## Page-parent queue timing
+
+The current Desktop route processes page-parent records serially inside one
+accepted workspace queue. The assistant therefore prices the initial native
+upload ETA by estimated provider requests per page parent, not by the single
+outer HTTP receipt. It still uses owned queue evidence to reprice a live run.
+Client-side queue concurrency and automatic retries remain disabled because
+they can collide with Desktop's global progress state and create ambiguous
+ownership.
+
+The safe performance target is an upstream Desktop batching change: retain one
+page-parent document identity and progress record for every vector, batch only
+the provider embedding inputs to that provider's supported limit, then map the
+returned vectors back to those same identities. It must be delivered and tested
+against Desktop source, not injected into a packaged runtime; it must also
+preserve ordered per-parent queue evidence. Client concurrency and retry
+changes are not substitutes for that design.
+
 ## Desktop refresh bridge
 
 The bridge is optional. It patches an installed AnythingLLM Desktop archive only

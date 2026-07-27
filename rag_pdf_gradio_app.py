@@ -149,11 +149,11 @@ TIMING_MODEL_RUNS_PATH = TIMING_MODEL_DIR / "timing-runs.jsonl"
 TIMING_MODEL_EVENTS_PATH = TIMING_MODEL_DIR / "timing-events.jsonl"
 DESKTOP_REFRESH_EVENTS_PATH = TIMING_MODEL_DIR / "desktop-refresh-events.jsonl"
 TIMING_MODEL_SUMMARY_PATH = TIMING_MODEL_DIR / "timing-model-summary.json"
-# Version 2 distinguishes a single Desktop-style workspace queue from the
-# retired client-side two-record batch scheduler.  Version-1 rows remain in
-# the append-only log for audit, but must not teach a queue-shaped ETA that a
-# 19-record upload means ten independent HTTP requests.
-TIMING_MODEL_VERSION = 2
+# Version 3 distinguishes a single Desktop-style workspace queue from the
+# retired client-side two-record batch scheduler and records the stock
+# per-page-parent provider-request cadence. Earlier rows remain auditable,
+# but cannot teach a timing formula for a different provider-request cadence.
+TIMING_MODEL_VERSION = 3
 BACKGROUND_LOG_RETENTION_DAYS = 365
 REPEAT_RUN_SETTINGS_SCHEMA_VERSION = 1
 USER_DOWNLOADS_DIR = PORTABLE_APPLICATION_PATHS["downloads"]
@@ -248,6 +248,12 @@ DESKTOP_REFRESH_BRIDGE_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{43}\Z")
 # app is allowed to ask it to reload Desktop. Older descriptors are visible for
 # diagnosis but cannot discard an unsent chat draft.
 DESKTOP_REFRESH_BRIDGE_REQUIRED_DRAFT_GUARD_VERSION = 2
+DESKTOP_SERIAL_PROVIDER_REQUEST_PROTOCOL_REVISION = "desktop-page-parent-serial-v2"
+# The internal Desktop profiler measured a 25-page native-text run at a 2.29 s
+# mean and 1.42 s median per page-parent namespace operation, with substantial
+# provider-tail variance. Use a small conservative first-run allowance until a
+# matching current-protocol cohort is available; queue evidence reprices it.
+DESKTOP_SERIAL_PROVIDER_REQUEST_PRIOR_SECONDS = 3.0
 # Passage lengths and AnythingLLM's text splitter are measured in characters.
 # Embedder capability limits are tokens, so this deliberately conservative
 # estimate is only used to surface an early warning, never as a hard conversion.
@@ -8769,9 +8775,9 @@ def format_estimate_clock(seconds, *, signed=False):
 # can never revoke work the interface has already shown as complete.
 VISIBLE_PROGRESS_SPEED_PER_SECOND = 0.04
 # A queue-rate reprice is based on the observed queue interval and does not
-# yet include the confirmation and handoff tail.  Keep this measured safety
+# yet include the confirmation and handoff tail. Keep this measured safety
 # margin before using that optimistic forecast to pull a real x/y checkpoint
-# forward.  It changes only bar presentation; the visible ETA is unchanged.
+# forward. It changes only bar presentation; the visible ETA is unchanged.
 PRESENTATION_ETA_CONSERVATISM = 1.20
 # A few early Desktop queue events are dominated by worker start-up and SSE
 # delivery timing.  They are evidence of activity, not yet a dependable rate.
@@ -8785,7 +8791,7 @@ QUEUE_ETA_MAX_CHANGE_RATIO = 0.25
 def concurrent_ingestion_progress_fraction(evidence_fraction, elapsed_seconds, expected_seconds):
     """Combine owned queue/vector evidence with the current elapsed/ETA pair.
 
-    This is used only when a real ingestion callback arrives.  The ETA caps
+    This is used only when a real ingestion callback arrives. The ETA caps
     evidence that would otherwise outrun its forecast, but never supplies
     progress by itself: a stalled queue must hold at its last owned x/y
     checkpoint. Queue and exact-vector observations therefore remain one
@@ -11056,6 +11062,8 @@ def timing_formula_lane(features):
         str(features.get("embedding_timing_lane") or "unknown"),
         str(features.get("embedding_submission_strategy") or "not_applicable"),
         str(features.get("embedding_submission_parallelism") or 0),
+        str(features.get("desktop_embedding_batch_protocol") or "not_applicable"),
+        str(features.get("embedding_provider_input_batch_size") or 0),
         str(features.get("embedding_verification_mode") or "not_applicable"),
         str(features.get("embedding_verification_interval") or 0),
     ])
@@ -11188,6 +11196,15 @@ def timing_model_features(profile, mode, native_upload_scope, *, segment_mode=""
         mode == MODE_NATIVE_UPLOAD_LABEL
         and str(ANYTHINGLLM_EMBEDDING_SUBMISSION_STRATEGY or "").casefold() == "desktop_queue"
     )
+    # Desktop serializes normal page-parent files inside the single accepted
+    # queue. The outer receipt therefore is not a provider-work count: every
+    # prepared record remains one owned provider request until an upstream
+    # Desktop implementation exposes a supported internal batching protocol.
+    provider_input_batch_size = 1 if desktop_queue else 0
+    provider_request_count = (
+        math.ceil(records / provider_input_batch_size)
+        if desktop_queue and records else 0
+    )
     result = {
         "mode": mode,
         "native_upload_scope": native_upload_scope,
@@ -11251,6 +11268,11 @@ def timing_model_features(profile, mode, native_upload_scope, *, segment_mode=""
             1
             if mode == MODE_NATIVE_UPLOAD_LABEL else 0
         ),
+        "desktop_embedding_batch_protocol": (
+            DESKTOP_SERIAL_PROVIDER_REQUEST_PROTOCOL_REVISION if desktop_queue else "not_applicable"
+        ),
+        "embedding_provider_input_batch_size": provider_input_batch_size,
+        "estimated_embedding_provider_requests": provider_request_count,
         "embedding_verification_mode": "checkpoint" if mode == MODE_NATIVE_UPLOAD_LABEL else "not_applicable",
         "embedding_verification_interval": (
             int(ANYTHINGLLM_EMBEDDING_VERIFICATION_CHECKPOINT_INTERVAL)
@@ -11284,6 +11306,14 @@ def timing_model_observation_usable(row):
             "Searchable vectors and runtime retrieval succeeded, but the final storage observation could not confirm workspace document-list rows"
         )
     )
+    try:
+        schema_version = int(row.get("schema_version") or 0)
+    except (TypeError, ValueError):
+        schema_version = 0
+    current_desktop_protocol = not (
+        str(row.get("mode") or "") == MODE_NATIVE_UPLOAD_LABEL
+        and str(row.get("embedding_submission_strategy") or "").casefold() == "desktop_queue"
+    ) or schema_version >= TIMING_MODEL_VERSION
     return (
         str(row.get("source") or "") in {"automatic-run", "backfilled-run-summary"}
         and not is_fixture_path
@@ -11292,6 +11322,7 @@ def timing_model_observation_usable(row):
         and int(row.get("page_count") or 0) > 0
         and float(row.get("actual_seconds") or 0) >= 5.0
         and str(row.get("duration_provenance") or "") == "active_observation_window"
+        and current_desktop_protocol
     )
 
 
@@ -11306,6 +11337,10 @@ def timing_model_legacy_observation_usable(row):
     """
     run_key_parts = {part.casefold() for part in Path(str(row.get("run_key") or "")).parts}
     provenance = str(row.get("duration_provenance") or "")
+    current_desktop_protocol = not (
+        str(row.get("mode") or "") == MODE_NATIVE_UPLOAD_LABEL
+        and str(row.get("embedding_submission_strategy") or "").casefold() == "desktop_queue"
+    )
     return (
         str(row.get("source") or "") == "automatic-run"
         and str(row.get("state") or "") == "successful"
@@ -11314,6 +11349,7 @@ def timing_model_legacy_observation_usable(row):
         and int(row.get("page_count") or 0) > 0
         and float(row.get("actual_seconds") or 0) >= 5.0
         and provenance in {"", "legacy_wall_clock", "wall_clock"}
+        and current_desktop_protocol
     )
 
 
@@ -11498,6 +11534,7 @@ def timing_model_base_seconds(features, *, batch_seconds_prior=6.0):
     pages = max(0, int(features.get("page_count") or 0))
     records = max(0, int(features.get("estimated_records") or 0))
     batches = max(0, int(features.get("estimated_batches") or 0))
+    provider_requests = max(0, int(features.get("estimated_embedding_provider_requests") or 0))
     documents = max(1, int(features.get("document_count") or 1))
     preflight_likely_pages = max(0, int(features.get("ocr_preflight_likely_pages") or 0))
     # A multi-PDF run is neither one giant document nor N independent full
@@ -11573,7 +11610,21 @@ def timing_model_base_seconds(features, *, batch_seconds_prior=6.0):
     # a bounded setup difference, not an invented per-document network rate.
     transport_setup = 1.5 if file_upload else .75
     raw_upload = (3.0 if probe_scope else 5.0) + transport_setup + document_boundaries * .5 + records * .05
-    embedding_batches = batches * max(1.5, float(batch_seconds_prior or 6.0))
+    if str(features.get("embedding_submission_strategy") or "").casefold() == "desktop_queue":
+        # The one Desktop HTTP queue is not one embedding operation. In the
+        # stock route it serializes one provider request per page parent.
+        # Pricing only the outer receipt is what caused a 25-page run and a
+        # 663-page run to begin with nearly the same ETA.
+        request_prior = max(
+            1.0,
+            float(
+                features.get("embedding_provider_request_seconds_prior")
+                or DESKTOP_SERIAL_PROVIDER_REQUEST_PRIOR_SECONDS
+            ),
+        )
+        embedding_batches = provider_requests * request_prior
+    else:
+        embedding_batches = batches * max(1.5, float(batch_seconds_prior or 6.0))
     if probe_scope:
         # Unlike a full payload, every probe document waits for its own vector
         # observation and readiness report before the next PDF can begin.  A
@@ -12110,6 +12161,9 @@ def estimate_automatic_run(
     features["batch_seconds_prior"] = round(batch_prior, 3)
     features["batch_prior_source"] = batch_source
     features["batch_prior_samples"] = batch_samples
+    if str(features.get("embedding_submission_strategy") or "").casefold() == "desktop_queue":
+        features["embedding_provider_request_seconds_prior"] = DESKTOP_SERIAL_PROVIDER_REQUEST_PRIOR_SECONDS
+        features["embedding_provider_request_prior_source"] = "measured Desktop serial page-parent first-run prior"
     local_embedding_prior, local_embedding_samples, local_embedding_source = timing_local_embedding_prior(features, history)
     if local_embedding_prior > 0:
         features["local_embedding_seconds_per_record"] = round(local_embedding_prior, 3)
@@ -12196,9 +12250,17 @@ def estimate_automatic_run(
         if int(features.get("document_count") or 1) > 1
         else "one PDF preparation path"
     )
+    native_embedding_term = (
+        f"{features['estimated_embedding_provider_requests']} internal provider request(s) × "
+        f"{float(features.get('embedding_provider_request_seconds_prior') or batch_prior):.1f}s "
+        f"({features.get('embedding_provider_request_prior_source') or batch_source})"
+        if mode == MODE_NATIVE_UPLOAD_LABEL
+        and str(features.get("embedding_submission_strategy") or "").casefold() == "desktop_queue"
+        else f"{features['estimated_batches']} batches × {batch_prior:.1f}s ({batch_source})"
+    )
     formula = (
         f"{base:.0f}s base = {document_term} + extraction/profile + "
-          + (f"batch inspection ({inspection_source}) + raw upload + {features['estimated_batches']} batches × {batch_prior:.1f}s ({batch_source}) + final verification ({probe_observation_source})" if mode == MODE_NATIVE_UPLOAD_LABEL else f"local packaging + selected embedder ({local_embedding_source})")
+          + (f"batch inspection ({inspection_source}) + raw upload + {native_embedding_term} + final verification ({probe_observation_source})" if mode == MODE_NATIVE_UPLOAD_LABEL else f"local packaging + selected embedder ({local_embedding_source})")
         + f"; × {multiplier:.2f} learned conservative multiplier = {expected}s"
     )
     comparable_count = active_ratio_count + legacy_ratio_count
@@ -12496,7 +12558,10 @@ def automatic_completion(summaries, prepare_and_upload):
     if any(summary.get("app_error_code") for summary in summaries):
         return {"state": "failed", "message": "Preparation failed; inspect the generated failure report."}
     if not prepare_and_upload:
-        return {"state": "successful", "message": "Local preparation and checks completed successfully."}
+        return {
+            "state": "successful",
+            "message": "Your document is ready to use. Prepared files and reports are available below.",
+        }
     ocr_withheld = [
         summary for summary in summaries
         if summary.get("api_upload_status") == "skipped_needs_ocr_review"
@@ -12567,8 +12632,8 @@ def automatic_completion(summaries, prepare_and_upload):
         return {
             "state": "successful",
             "message": (
-                "Ready for retrieval: exact vector storage and runtime retrieval checks succeeded. "
-                "Documents drawer visibility is reported separately."
+                "Your document is indexed and ready to use in AnythingLLM. "
+                "All storage and retrieval checks passed. The AnythingLLM Documents list may refresh separately."
             ),
         }
     if upload_ok and post_searchable_with_caveat and runtime_ok:
@@ -12596,12 +12661,20 @@ def automatic_completion(summaries, prepare_and_upload):
             return {
                 "state": "successful",
                 "code": "AUTO-RETRIEVAL-DEFERRED-001",
-                "message": "Searchable page-parent vectors verified. Live retrieval diagnostics were deferred after a Desktop receipt timeout, so they cannot delay this completed workspace.",
+                "message": (
+                    "Your document is indexed and ready to use in AnythingLLM. "
+                    "All page-parent vectors were confirmed. An optional final retrieval check was saved "
+                    "to the run report and did not delay completion."
+                ),
             }
         return {
             "state": "successful",
             "code": "AUTO-RETRIEVAL-RUNTIME-001",
-            "message": "Searchable page-parent vectors verified. An optional live retrieval probe timed out and was saved for diagnostics; it does not block use of this workspace.",
+            "message": (
+                "Your document is indexed and ready to use in AnythingLLM. "
+                "All page-parent vectors were confirmed. An optional final retrieval check was saved "
+                "to the run report and did not delay completion."
+            ),
         }
     if upload_ok and post_searchable_with_caveat and any(
         status == "blocked_provider_authentication" for status in runtime_statuses
@@ -12729,7 +12802,7 @@ def automatic_completion_phase(completion, prepare_and_upload):
     if state == "cancelled":
         return "Processing stopped by operator"
     if state == "successful" and prepare_and_upload:
-        return "Ready for retrieval"
+        return "Document(s) ready in AnythingLLM"
     if code == "AUTO-EMBEDDING-RECONCILE-001":
         return "Preparation complete — AnythingLLM verification pending"
     if code == "AUTO-OCR-REVIEW-001":
@@ -12739,7 +12812,7 @@ def automatic_completion_phase(completion, prepare_and_upload):
     if state == "warning" and prepare_and_upload:
         return "Searchable vectors verified; document-list observation needs review"
     if state == "successful":
-        return "Local preparation complete"
+        return "Document(s) ready to go"
     return "Run needs attention"
 
 
@@ -15295,10 +15368,38 @@ def run_automatic(
     active_file_index = 0
     planned_batch_adjustments = {}
     initial_expected_seconds = expected_seconds
-    initial_estimated_batches = max(0, int((run_timing_estimate.get("features") or {}).get("estimated_batches") or 0))
+    timing_features = dict(run_timing_estimate.get("features") or {})
+    desktop_serial_queue = (
+        str(timing_features.get("embedding_submission_strategy") or "").casefold()
+        == "desktop_queue"
+    )
+    # The Desktop receipt is one outer request, but the stock Desktop server
+    # invokes the provider once per page parent.  Keep all later exact-count
+    # adjustment arithmetic in those same units; otherwise the first segment
+    # plan would incorrectly erase most of the per-page ETA we just priced.
+    initial_estimated_batches = max(
+        0,
+        int(
+            timing_features.get(
+                "estimated_embedding_provider_requests"
+                if desktop_serial_queue else "estimated_batches"
+            )
+            or 0
+        ),
+    )
+    timing_unit_prior = max(
+        1.0,
+        float(
+            timing_features.get(
+                "embedding_provider_request_seconds_prior"
+                if desktop_serial_queue else "batch_seconds_prior"
+            )
+            or 0.0
+        ),
+    )
     initial_non_batch_seconds = max(
         20.0,
-        float(initial_expected_seconds) - initial_estimated_batches * float((run_timing_estimate.get("features") or {}).get("batch_seconds_prior") or 0.0),
+        float(initial_expected_seconds) - initial_estimated_batches * timing_unit_prior,
     )
 
     def record_pipeline_timing(stage, batch_report=None):
@@ -15405,23 +15506,24 @@ def run_automatic(
             ):
                 allocation = progress_allocations[active_file_index - 1]
                 planned_for_file = (
-                    1
-                    if native_upload_scope == NATIVE_UPLOAD_SCOPE_PROBE_LABEL and exact_records
-                    else math.ceil(
-                        max(0, int(allocation.get("estimated_records") or 0))
-                        / max(1, int(ANYTHINGLLM_EMBEDDING_UPDATE_BATCH_SIZE))
+                    max(0, int(allocation.get("estimated_records") or 0))
+                    if desktop_serial_queue
+                    else (
+                        1
+                        if native_upload_scope == NATIVE_UPLOAD_SCOPE_PROBE_LABEL and exact_records
+                        else math.ceil(
+                            max(0, int(allocation.get("estimated_records") or 0))
+                            / max(1, int(ANYTHINGLLM_EMBEDDING_UPDATE_BATCH_SIZE))
+                        )
                     )
                 )
-                planned_batch_adjustments[active_file_index] = exact_batches - planned_for_file
-                batch_prior = max(
-                    1.0,
-                    float((run_timing_estimate.get("features") or {}).get("batch_seconds_prior") or 0.0),
-                )
+                exact_timing_units = exact_records if desktop_serial_queue else exact_batches
+                planned_batch_adjustments[active_file_index] = exact_timing_units - planned_for_file
                 # Exact segment count is stronger evidence than the initial
                 # character-density approximation. Apply it before the first
                 # native request, but use a modest cap to keep one malformed
-                # PDF from rewriting an entire batch forecast.
-                raw_delta = (exact_batches - planned_for_file) * batch_prior
+                # PDF from rewriting an entire provider-request forecast.
+                raw_delta = (exact_timing_units - planned_for_file) * timing_unit_prior
                 bounded_delta = max(-expected_seconds * .20, min(expected_seconds * .35, raw_delta))
                 if abs(bounded_delta) >= 3:
                     expected_seconds = max(
@@ -15433,6 +15535,8 @@ def run_automatic(
                     "file_index": active_file_index,
                     "exact_records": exact_records,
                     "exact_batches": exact_batches,
+                    "timing_unit": "provider_request" if desktop_serial_queue else "submission_batch",
+                    "exact_timing_units": exact_timing_units,
                     "estimated_batches_before": planned_for_file,
                     "applied_seconds": round(bounded_delta, 3),
                     "expected_seconds": expected_seconds,
@@ -15480,6 +15584,11 @@ def run_automatic(
                         eta_reprice_reason="completed_phase_timing",
                     )
         if str(report.get("timing_event") or "") != "batch_completed":
+            return
+        if desktop_serial_queue:
+            # This event measures the one accepted Desktop receipt, not each
+            # internally serialized provider request. Mature owned queue
+            # evidence above is the only valid live cadence for this route.
             return
         try:
             completed_batch_seconds.append(float(report.get("batch_elapsed_seconds") or 0.0))
@@ -15565,9 +15674,9 @@ def run_automatic(
         active_file_index = file_index
         automatic_phase_rank = 0
         progress_allocation = progress_allocations[file_index - 1]
-        # The first 1% covers run setup and the final 5% covers durable
+        # The first 0.5% covers run setup and the final 3% covers durable
         # reports/downloads. The document protocol therefore receives the
-        # evidence-bearing 1--95% range, weighted across PDFs by the bounded
+        # evidence-bearing 0.5--97% range, weighted across PDFs by the bounded
         # preflight difficulty profile rather than an equal-file split.
         start_fraction = AUTOMATIC_RUN_PREFLIGHT_DISPLAY_END + float(progress_allocation["start_share"]) * AUTOMATIC_RUN_DOCUMENT_DISPLAY_SPAN
         end_fraction = AUTOMATIC_RUN_PREFLIGHT_DISPLAY_END + float(progress_allocation["end_share"]) * AUTOMATIC_RUN_DOCUMENT_DISPLAY_SPAN

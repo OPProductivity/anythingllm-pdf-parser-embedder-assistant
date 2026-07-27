@@ -1,4 +1,7 @@
 {
+  "calibration_exclusion_reasons": [
+    "observer_uncertainty"
+  ],
   "cleanup_state": "preserved_pending_thread_safe_gate",
   "disjoint_wall_clock_percent": {
     "preparation": 20.251,

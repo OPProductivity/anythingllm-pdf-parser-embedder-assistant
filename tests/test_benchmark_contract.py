@@ -249,6 +249,10 @@ def test_report_keeps_anonymous_stage_table_and_checkpoint_metrics(tmp_path: Pat
     for trial, duration in ((1, 40.0), (2, 44.0)):
         (results / f"B01-trial-{trial}.json").write_text(json.dumps({
             "document_id": "B01", "trial": trial, "page_count": 25, "total_wall_seconds": duration,
+            "status": "successful",
+            "environment_comparable_to_session_baseline": True,
+            "presentation_controller_version": runner.PRODUCTION_PRESENTATION_CONTROLLER_VERSION,
+            "benchmark_runtime_protocol_revision": runner.BENCHMARK_RUNTIME_PROTOCOL_REVISION,
             "disjoint_wall_clock_seconds": {stage: duration / 6 for stage in report.STAGES},
             "disjoint_wall_clock_percent": {stage: 100 / 6 for stage in report.STAGES},
             "progress_calibration_passed": False,
@@ -259,16 +263,55 @@ def test_report_keeps_anonymous_stage_table_and_checkpoint_metrics(tmp_path: Pat
     payload = report.write_report(tmp_path / "results")
 
     assert payload["run_count"] == 2
-    assert payload["total_duration"]["median_seconds"] == 42.0
-    assert payload["total_duration"]["min_seconds"] == 40.0
-    assert payload["total_duration"]["max_seconds"] == 44.0
-    assert payload["checkpoint_accuracy"]["20"]["eta_error_mean_seconds"] == 10.0
-    assert payload["queue_rate_records_per_minute"]["mean"] == 12.0
-    assert payload["data_quality"]["timing_valid_run_count"] == 2
+    assert payload["operational"]["total_duration"]["median_seconds"] == 42.0
+    assert payload["calibration"]["total_duration"]["min_seconds"] == 40.0
+    assert payload["operational"]["total_duration"]["max_seconds"] == 44.0
+    assert payload["calibration"]["checkpoint_accuracy"]["20"]["eta_error_mean_seconds"] == 10.0
+    assert payload["calibration"]["queue_rate_records_per_minute"]["mean"] == 12.0
+    assert payload["data_quality"]["calibration_eligible_run_count"] == 2
     assert payload["data_quality"]["calibration_acceptance"] == "failed"
-    assert payload["trial_to_trial_variance"][0]["sample_variance_seconds_squared"] == 8.0
-    assert "groups" in payload["page_count_quartiles"]
+    assert payload["operational"]["trial_to_trial_variance"][0]["sample_variance_seconds_squared"] == 8.0
+    assert "groups" in payload["calibration"]["page_count_quartiles"]
     assert (tmp_path / "results" / "benchmark-report.md").is_file()
+
+
+def test_calibration_view_excludes_warning_stale_and_uncertain_runs_but_operational_keeps_them():
+    base = {
+        "document_id": "B01", "trial": 1, "page_count": 25, "total_wall_seconds": 40,
+        "disjoint_wall_clock_seconds": {}, "disjoint_wall_clock_percent": {},
+        "progress_calibration": {}, "progress_calibration_passed": True,
+        "environment_comparable_to_session_baseline": True,
+        "presentation_controller_version": runner.PRODUCTION_PRESENTATION_CONTROLLER_VERSION,
+        "benchmark_runtime_protocol_revision": runner.BENCHMARK_RUNTIME_PROTOCOL_REVISION,
+    }
+    successful = {**base, "status": "successful", "invalid_for_calibration": False}
+    warning = {**base, "document_id": "B02", "status": "warning", "invalid_for_calibration": False}
+    uncertain = {**base, "document_id": "B03", "status": "successful", "invalid_for_calibration": True, "invalid_reasons": ["observer_uncertainty"]}
+    stale = {**base, "document_id": "B04", "benchmark_runtime_protocol_revision": 1, "status": "successful", "invalid_for_calibration": False}
+
+    payload = report.report_payload([successful, warning, uncertain, stale])
+
+    assert payload["operational"]["run_count"] == 4
+    assert payload["calibration"]["run_count"] == 1
+    assert payload["data_quality"]["calibration_excluded_run_count"] == 3
+
+
+def test_warning_is_excluded_without_rewriting_run_validity_and_protocol_controls_freshness():
+    warning = {"status": "warning", "invalid_for_calibration": False, "invalid_reasons": []}
+
+    assert runner.refresh_public_calibration_eligibility(warning)
+    assert warning["invalid_for_calibration"] is False
+    assert warning["invalid_reasons"] == []
+    assert warning["calibration_exclusion_reasons"] == ["terminal_not_successful"]
+    assert not runner.calibration_eligible_public_result(warning)
+    assert runner.current_runtime_protocol_result({
+        "presentation_controller_version": runner.PRODUCTION_PRESENTATION_CONTROLLER_VERSION,
+        "benchmark_runtime_protocol_revision": runner.BENCHMARK_RUNTIME_PROTOCOL_REVISION,
+    })
+    assert not runner.current_runtime_protocol_result({
+        "presentation_controller_version": runner.PRODUCTION_PRESENTATION_CONTROLLER_VERSION,
+        "benchmark_runtime_protocol_revision": runner.BENCHMARK_RUNTIME_PROTOCOL_REVISION - 1,
+    })
 
 
 def test_benchmark_uses_the_production_gradio_handler_and_records_its_reprices():

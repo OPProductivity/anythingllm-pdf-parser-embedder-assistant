@@ -1,14 +1,34 @@
 {
-  "calibration_acceptance": "failed",
-  "calibration_eligible_run_count": 11,
-  "calibration_failure_count": 11,
+  "calibration_acceptance": "pending",
+  "calibration_eligible_run_count": 0,
+  "calibration_failure_count": 0,
   "completed_run_count": 16,
   "elapsed_seconds": 1008.609,
   "invalid_for_calibration_count": 5,
-  "missing_or_stale_runs": [],
-  "next_action": "All production-route trials are present; repair any failed calibration or reliability findings before reweighting.",
+  "missing_or_stale_runs": [
+    "B01-trial-1",
+    "B01-trial-2",
+    "B02-trial-1",
+    "B02-trial-2",
+    "B03-trial-1",
+    "B03-trial-2",
+    "B04-trial-1",
+    "B04-trial-2",
+    "B05-trial-1",
+    "B05-trial-2",
+    "B06-trial-1",
+    "B06-trial-2",
+    "B07-trial-1",
+    "B07-trial-2",
+    "B08-trial-1",
+    "B08-trial-2"
+  ],
+  "next_action": "Run 16 remaining or stale serial trial(s) through the production presentation route.",
   "runs": [
     {
+      "calibration_exclusion_reasons": [
+        "observer_uncertainty"
+      ],
       "cleanup_state": "preserved_pending_thread_safe_gate",
       "disjoint_wall_clock_percent": {
         "preparation": 25.77,
@@ -127,6 +147,9 @@
       "trial": 1
     },
     {
+      "calibration_exclusion_reasons": [
+        "observer_uncertainty"
+      ],
       "cleanup_state": "preserved_pending_thread_safe_gate",
       "disjoint_wall_clock_percent": {
         "preparation": 20.251,
@@ -250,6 +273,9 @@
       "trial": 2
     },
     {
+      "calibration_exclusion_reasons": [
+        "observer_uncertainty"
+      ],
       "cleanup_state": "preserved_pending_thread_safe_gate",
       "disjoint_wall_clock_percent": {
         "preparation": 9.467,
@@ -368,6 +394,9 @@
       "trial": 1
     },
     {
+      "calibration_exclusion_reasons": [
+        "observer_uncertainty"
+      ],
       "cleanup_state": "preserved_pending_thread_safe_gate",
       "disjoint_wall_clock_percent": {
         "preparation": 10.827,
@@ -607,6 +636,9 @@
       "trial": 1
     },
     {
+      "calibration_exclusion_reasons": [
+        "observer_uncertainty"
+      ],
       "cleanup_state": "preserved_pending_thread_safe_gate",
       "disjoint_wall_clock_percent": {
         "preparation": 16.123,
@@ -851,6 +883,9 @@
       "trial": 1
     },
     {
+      "calibration_exclusion_reasons": [
+        "terminal_not_successful"
+      ],
       "cleanup_state": "preserved_pending_thread_safe_gate",
       "disjoint_wall_clock_percent": {
         "preparation": 35.765,
@@ -1930,6 +1965,6 @@
       "trial": 2
     }
   ],
-  "state": "calibration-failed",
-  "timing_runs_state": "completed"
+  "state": "awaiting-rerun",
+  "timing_runs_state": "awaiting-rerun"
 }

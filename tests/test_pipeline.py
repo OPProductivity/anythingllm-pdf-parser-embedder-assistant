@@ -1118,8 +1118,17 @@ class PipelineCoreTests(unittest.TestCase):
         }
         successful_completion = app.automatic_completion([successful_upload], True)
         self.assertEqual(successful_completion["state"], "successful")
-        self.assertIn("Ready for retrieval", successful_completion["message"])
-        self.assertIn("Documents drawer", successful_completion["message"])
+        self.assertIn("indexed and ready to use in AnythingLLM", successful_completion["message"])
+        self.assertIn("storage and retrieval checks passed", successful_completion["message"])
+        self.assertEqual(
+            app.automatic_completion_phase(successful_completion, True),
+            "Document(s) ready in AnythingLLM",
+        )
+        local_completion = app.automatic_completion([{}], False)
+        self.assertEqual(
+            app.automatic_completion_phase(local_completion, False),
+            "Document(s) ready to go",
+        )
         runtime_warning = dict(successful_upload, anythingllm_runtime_validation_status="vector_retrieval_failed")
         runtime_completion = app.automatic_completion([runtime_warning], True)
         self.assertEqual(runtime_completion["state"], "warning")
@@ -1128,11 +1137,11 @@ class PipelineCoreTests(unittest.TestCase):
         chat_timeout = dict(successful_upload, anythingllm_runtime_validation_status="pass_with_chat_timeout")
         timeout_completion = app.automatic_completion([chat_timeout], True)
         self.assertEqual(timeout_completion["state"], "successful")
-        self.assertIn("does not block use", timeout_completion["message"])
+        self.assertIn("did not delay completion", timeout_completion["message"])
         vector_timeout = dict(successful_upload, anythingllm_runtime_validation_status="vector_runtime_timeout")
         vector_timeout_completion = app.automatic_completion([vector_timeout], True)
         self.assertEqual(vector_timeout_completion["state"], "successful")
-        self.assertIn("Searchable page-parent vectors verified", vector_timeout_completion["message"])
+        self.assertIn("indexed and ready to use in AnythingLLM", vector_timeout_completion["message"])
         provider_auth = dict(successful_upload, anythingllm_runtime_validation_status="blocked_provider_authentication")
         provider_auth_completion = app.automatic_completion([provider_auth], True)
         self.assertEqual(provider_auth_completion["code"], "AUTO-RETRIEVAL-AUTH-001")
@@ -1216,7 +1225,7 @@ class PipelineCoreTests(unittest.TestCase):
         }
         completion = app.automatic_completion([successful_upload], True)
 
-        self.assertIn("Documents drawer visibility is reported separately", completion["message"])
+        self.assertIn("Documents list may refresh separately", completion["message"])
         self.assertNotIn("will request", completion["message"])
 
     def test_top_anythingllm_status_distinguishes_running_from_unavailable_desktop(self):
@@ -3163,6 +3172,41 @@ class PipelineCoreTests(unittest.TestCase):
 
         self.assertEqual(features["estimated_records"], 13)
         self.assertEqual(features["estimated_batches"], 1)
+
+    def test_serial_desktop_eta_counts_each_page_parent_as_a_provider_request(self):
+        import rag_pdf_gradio_app as app
+
+        features = app.timing_model_features(
+            {
+                "page_count": 25, "documents": 1, "mean_chars_per_page": 3_800,
+                "ocr_risk_bucket": "low", "text_density_bucket": "high",
+                "layout_bucket": "text_first", "line_density_bucket": "medium",
+                "page_variability_bucket": "consistent", "file_size_bucket": "light",
+            },
+            app.MODE_NATIVE_UPLOAD_LABEL,
+            app.NATIVE_UPLOAD_SCOPE_ALL_LABEL,
+            segment_mode=app.SEGMENT_PAGE_LIMIT_LABEL,
+            chunk_size=8191,
+            native_upload_transport="raw_text_document",
+            native_upload_representation="page_parents",
+        )
+
+        self.assertEqual(features["estimated_records"], 25)
+        self.assertEqual(features["embedding_provider_input_batch_size"], 1)
+        self.assertEqual(features["estimated_embedding_provider_requests"], 25)
+        self.assertEqual(features["desktop_embedding_batch_protocol"], app.DESKTOP_SERIAL_PROVIDER_REQUEST_PROTOCOL_REVISION)
+
+        ten_page_features = dict(
+            features,
+            page_count=10,
+            estimated_records=10,
+            estimated_embedding_provider_requests=10,
+        )
+        ten_page_base = app.timing_model_base_seconds(ten_page_features)
+        twenty_five_page_base = app.timing_model_base_seconds(features)
+        # The stock Desktop route has one outer queue receipt, but 15 more
+        # page parents still require 15 more internal provider operations.
+        self.assertGreater(twenty_five_page_base - ten_page_base, 40.0)
 
     def test_partial_indexing_takes_priority_over_generic_submission_timeout(self):
         import rag_pdf_gradio_app as app
