@@ -1,75 +1,55 @@
 {
-  "calibration_acceptance": "pending",
-  "calibration_eligible_run_count": 0,
-  "calibration_failure_count": 0,
+  "calibration_acceptance": "failed",
+  "calibration_eligible_run_count": 15,
+  "calibration_failure_count": 15,
   "completed_run_count": 16,
-  "elapsed_seconds": 1008.609,
-  "invalid_for_calibration_count": 5,
-  "missing_or_stale_runs": [
-    "B01-trial-1",
-    "B01-trial-2",
-    "B02-trial-1",
-    "B02-trial-2",
-    "B03-trial-1",
-    "B03-trial-2",
-    "B04-trial-1",
-    "B04-trial-2",
-    "B05-trial-1",
-    "B05-trial-2",
-    "B06-trial-1",
-    "B06-trial-2",
-    "B07-trial-1",
-    "B07-trial-2",
-    "B08-trial-1",
-    "B08-trial-2"
-  ],
-  "next_action": "Run 16 remaining or stale serial trial(s) through the production presentation route.",
+  "elapsed_seconds": 620.741,
+  "invalid_for_calibration_count": 1,
+  "missing_or_stale_runs": [],
+  "next_action": "All production-route trials are present; repair any failed calibration or reliability findings before reweighting.",
   "runs": [
     {
-      "calibration_exclusion_reasons": [
-        "observer_uncertainty"
-      ],
+      "benchmark_runtime_protocol_revision": 3,
+      "calibration_exclusion_reasons": [],
       "cleanup_state": "preserved_pending_thread_safe_gate",
       "disjoint_wall_clock_percent": {
-        "preparation": 25.77,
-        "reporting": 2.431,
-        "shared_ingestion": 58.084,
-        "submission": 0.364,
-        "unattributed": 3.549,
-        "validation": 9.802
+        "preparation": 22.184,
+        "reporting": 1.19,
+        "shared_ingestion": 44.538,
+        "submission": 26.293,
+        "unattributed": 5.785,
+        "validation": 0.01
       },
       "disjoint_wall_clock_seconds": {
-        "preparation": 12.118,
-        "reporting": 1.143,
-        "shared_ingestion": 27.313,
-        "submission": 0.171,
-        "unattributed": 1.669,
-        "validation": 4.609
+        "preparation": 4.567,
+        "reporting": 0.245,
+        "shared_ingestion": 9.169,
+        "submission": 5.413,
+        "unattributed": 1.191,
+        "validation": 0.002
       },
       "document_id": "B01",
       "environment_comparable_to_session_baseline": true,
-      "invalid_for_calibration": true,
-      "invalid_reasons": [
-        "observer_uncertainty"
-      ],
+      "invalid_for_calibration": false,
+      "invalid_reasons": [],
       "justified_reprices": [
         {
-          "elapsed_seconds": 15.489,
-          "expected_seconds": 67,
+          "elapsed_seconds": 11.868,
+          "expected_seconds": 124,
           "reason": "owned_queue_rate"
         }
       ],
       "ocr_risk": "low",
       "overlapping_evidence": {
         "confirmed_vectors": {
-          "finished_monotonic": 41.267,
-          "started_monotonic": 34.1,
-          "wall_seconds": 7.167
+          "finished_monotonic": 20.338,
+          "started_monotonic": 11.171,
+          "wall_seconds": 9.167
         },
         "owned_queue": {
-          "finished_monotonic": 21.728,
-          "started_monotonic": 13.958,
-          "wall_seconds": 7.77
+          "finished_monotonic": null,
+          "started_monotonic": null,
+          "wall_seconds": null
         },
         "quiet": {
           "finished_monotonic": null,
@@ -77,14 +57,14 @@
           "wall_seconds": null
         },
         "reconnecting": {
-          "finished_monotonic": 6904.865,
-          "started_monotonic": 6904.865,
-          "wall_seconds": 0.0
+          "finished_monotonic": null,
+          "started_monotonic": null,
+          "wall_seconds": null
         },
         "validation": {
-          "finished_monotonic": 45.876,
-          "started_monotonic": 41.271,
-          "wall_seconds": 4.605
+          "finished_monotonic": 20.34,
+          "started_monotonic": 20.34,
+          "wall_seconds": 0.0
         }
       },
       "page_count": 25,
@@ -93,109 +73,337 @@
       "profile": "ordinary-page-preserving-upload",
       "progress_calibration": {
         "20": {
-          "actual_elapsed_percent": 31.863,
+          "actual_elapsed_percent": 88.111,
+          "allowed_error_points": 10.0,
+          "elapsed_seconds": 18.142,
+          "eta_error_seconds": 103.41,
+          "progress_error_points": -68.111,
+          "reprice_reason": "owned_queue_rate",
+          "shown_percent": 20.0,
+          "status": "recorded",
+          "temporary_reprice_allowance": true
+        },
+        "40": {
+          "actual_elapsed_percent": 98.786,
           "allowed_error_points": 5.0,
-          "elapsed_seconds": 14.985,
-          "eta_error_seconds": 41.97,
-          "progress_error_points": -11.863,
+          "elapsed_seconds": 20.34,
+          "eta_error_seconds": 103.41,
+          "progress_error_points": -2.786,
+          "reprice_reason": null,
+          "shown_percent": 96.0,
+          "status": "recorded",
+          "temporary_reprice_allowance": false
+        },
+        "60": {
+          "actual_elapsed_percent": 98.786,
+          "allowed_error_points": 5.0,
+          "elapsed_seconds": 20.34,
+          "eta_error_seconds": 103.41,
+          "progress_error_points": -2.786,
+          "reprice_reason": null,
+          "shown_percent": 96.0,
+          "status": "recorded",
+          "temporary_reprice_allowance": false
+        },
+        "80": {
+          "actual_elapsed_percent": 98.786,
+          "allowed_error_points": 5.0,
+          "elapsed_seconds": 20.34,
+          "eta_error_seconds": 103.41,
+          "progress_error_points": -2.786,
+          "reprice_reason": null,
+          "shown_percent": 96.0,
+          "status": "recorded",
+          "temporary_reprice_allowance": false
+        }
+      },
+      "progress_calibration_passed": false,
+      "queue_rate_records_per_minute": 59666.898,
+      "schema_version": 2,
+      "size_bytes": 432620,
+      "size_mib": 0.413,
+      "status": "successful",
+      "total_wall_seconds": 20.587,
+      "trial": 1
+    },
+    {
+      "benchmark_runtime_protocol_revision": 3,
+      "calibration_exclusion_reasons": [],
+      "cleanup_state": "preserved_pending_thread_safe_gate",
+      "disjoint_wall_clock_percent": {
+        "preparation": 24.379,
+        "reporting": 0.816,
+        "shared_ingestion": 44.629,
+        "submission": 26.186,
+        "unattributed": 3.978,
+        "validation": 0.013
+      },
+      "disjoint_wall_clock_seconds": {
+        "preparation": 11.479,
+        "reporting": 0.384,
+        "shared_ingestion": 21.014,
+        "submission": 12.33,
+        "unattributed": 1.873,
+        "validation": 0.006
+      },
+      "document_id": "B01",
+      "environment_comparable_to_session_baseline": true,
+      "invalid_for_calibration": false,
+      "invalid_reasons": [],
+      "justified_reprices": [
+        {
+          "elapsed_seconds": 27.34,
+          "expected_seconds": 84,
+          "reason": "owned_queue_rate"
+        }
+      ],
+      "ocr_risk": "low",
+      "overlapping_evidence": {
+        "confirmed_vectors": {
+          "finished_monotonic": 46.69,
+          "started_monotonic": 25.682,
+          "wall_seconds": 21.008
+        },
+        "owned_queue": {
+          "finished_monotonic": null,
+          "started_monotonic": null,
+          "wall_seconds": null
+        },
+        "quiet": {
+          "finished_monotonic": null,
+          "started_monotonic": null,
+          "wall_seconds": null
+        },
+        "reconnecting": {
+          "finished_monotonic": null,
+          "started_monotonic": null,
+          "wall_seconds": null
+        },
+        "validation": {
+          "finished_monotonic": 46.696,
+          "started_monotonic": 46.696,
+          "wall_seconds": 0.0
+        }
+      },
+      "page_count": 25,
+      "presentation_controller_version": 11,
+      "presentation_route": "run_automatic_gradio_handler",
+      "profile": "ordinary-page-preserving-upload",
+      "progress_calibration": {
+        "20": {
+          "actual_elapsed_percent": 68.898,
+          "allowed_error_points": 10.0,
+          "elapsed_seconds": 32.451,
+          "eta_error_seconds": 36.9,
+          "progress_error_points": -48.898,
+          "reprice_reason": "owned_queue_rate",
+          "shown_percent": 20.0,
+          "status": "recorded",
+          "temporary_reprice_allowance": true
+        },
+        "40": {
+          "actual_elapsed_percent": 98.293,
+          "allowed_error_points": 5.0,
+          "elapsed_seconds": 46.296,
+          "eta_error_seconds": 36.9,
+          "progress_error_points": -47.293,
+          "reprice_reason": null,
+          "shown_percent": 51.0,
+          "status": "recorded",
+          "temporary_reprice_allowance": false
+        },
+        "60": {
+          "actual_elapsed_percent": 99.142,
+          "allowed_error_points": 5.0,
+          "elapsed_seconds": 46.696,
+          "eta_error_seconds": 36.9,
+          "progress_error_points": -3.142,
+          "reprice_reason": null,
+          "shown_percent": 96.0,
+          "status": "recorded",
+          "temporary_reprice_allowance": false
+        },
+        "80": {
+          "actual_elapsed_percent": 99.142,
+          "allowed_error_points": 5.0,
+          "elapsed_seconds": 46.696,
+          "eta_error_seconds": 36.9,
+          "progress_error_points": -3.142,
+          "reprice_reason": null,
+          "shown_percent": 96.0,
+          "status": "recorded",
+          "temporary_reprice_allowance": false
+        }
+      },
+      "progress_calibration_passed": false,
+      "queue_rate_records_per_minute": 23804.776,
+      "schema_version": 2,
+      "size_bytes": 432620,
+      "size_mib": 0.413,
+      "status": "successful",
+      "total_wall_seconds": 47.086,
+      "trial": 2
+    },
+    {
+      "benchmark_runtime_protocol_revision": 3,
+      "calibration_exclusion_reasons": [],
+      "cleanup_state": "preserved_pending_thread_safe_gate",
+      "disjoint_wall_clock_percent": {
+        "preparation": 42.836,
+        "reporting": 1.31,
+        "shared_ingestion": 47.2,
+        "submission": 3.212,
+        "unattributed": 5.431,
+        "validation": 0.011
+      },
+      "disjoint_wall_clock_seconds": {
+        "preparation": 7.588,
+        "reporting": 0.232,
+        "shared_ingestion": 8.361,
+        "submission": 0.569,
+        "unattributed": 0.962,
+        "validation": 0.002
+      },
+      "document_id": "B02",
+      "environment_comparable_to_session_baseline": true,
+      "invalid_for_calibration": false,
+      "invalid_reasons": [],
+      "justified_reprices": [
+        {
+          "elapsed_seconds": 9.847,
+          "expected_seconds": 90,
+          "reason": "owned_queue_rate"
+        }
+      ],
+      "ocr_risk": "low",
+      "overlapping_evidence": {
+        "confirmed_vectors": {
+          "finished_monotonic": 17.477,
+          "started_monotonic": 9.119,
+          "wall_seconds": 8.358
+        },
+        "owned_queue": {
+          "finished_monotonic": null,
+          "started_monotonic": null,
+          "wall_seconds": null
+        },
+        "quiet": {
+          "finished_monotonic": null,
+          "started_monotonic": null,
+          "wall_seconds": null
+        },
+        "reconnecting": {
+          "finished_monotonic": null,
+          "started_monotonic": null,
+          "wall_seconds": null
+        },
+        "validation": {
+          "finished_monotonic": 17.48,
+          "started_monotonic": 17.48,
+          "wall_seconds": 0.0
+        }
+      },
+      "page_count": 17,
+      "presentation_controller_version": 11,
+      "presentation_route": "run_automatic_gradio_handler",
+      "profile": "ordinary-page-preserving-upload",
+      "progress_calibration": {
+        "20": {
+          "actual_elapsed_percent": 91.726,
+          "allowed_error_points": 5.0,
+          "elapsed_seconds": 16.253,
+          "eta_error_seconds": 72.281,
+          "progress_error_points": -71.726,
           "reprice_reason": null,
           "shown_percent": 20.0,
           "status": "recorded",
           "temporary_reprice_allowance": false
         },
         "40": {
-          "actual_elapsed_percent": 72.507,
+          "actual_elapsed_percent": 98.651,
           "allowed_error_points": 5.0,
-          "elapsed_seconds": 34.1,
-          "eta_error_seconds": 19.97,
-          "progress_error_points": -24.507,
+          "elapsed_seconds": 17.48,
+          "eta_error_seconds": 72.281,
+          "progress_error_points": -2.651,
           "reprice_reason": null,
-          "shown_percent": 48.0,
+          "shown_percent": 96.0,
           "status": "recorded",
           "temporary_reprice_allowance": false
         },
         "60": {
-          "actual_elapsed_percent": 87.755,
+          "actual_elapsed_percent": 98.651,
           "allowed_error_points": 5.0,
-          "elapsed_seconds": 41.271,
-          "eta_error_seconds": 19.97,
-          "progress_error_points": -11.755,
+          "elapsed_seconds": 17.48,
+          "eta_error_seconds": 72.281,
+          "progress_error_points": -2.651,
           "reprice_reason": null,
-          "shown_percent": 76.0,
+          "shown_percent": 96.0,
           "status": "recorded",
           "temporary_reprice_allowance": false
         },
         "80": {
-          "actual_elapsed_percent": 96.041,
+          "actual_elapsed_percent": 98.651,
           "allowed_error_points": 5.0,
-          "elapsed_seconds": 45.168,
-          "eta_error_seconds": 19.97,
-          "progress_error_points": -14.041,
+          "elapsed_seconds": 17.48,
+          "eta_error_seconds": 72.281,
+          "progress_error_points": -2.651,
           "reprice_reason": null,
-          "shown_percent": 82.0,
+          "shown_percent": 96.0,
           "status": "recorded",
           "temporary_reprice_allowance": false
         }
       },
       "progress_calibration_passed": false,
-      "queue_rate_records_per_minute": 128.695,
-      "schema_version": 1,
-      "size_bytes": 432620,
-      "size_mib": 0.413,
+      "queue_rate_records_per_minute": 57490.607,
+      "schema_version": 2,
+      "size_bytes": 137084,
+      "size_mib": 0.131,
       "status": "successful",
-      "total_wall_seconds": 47.023,
+      "total_wall_seconds": 17.714,
       "trial": 1
     },
     {
-      "calibration_exclusion_reasons": [
-        "observer_uncertainty"
-      ],
+      "benchmark_runtime_protocol_revision": 3,
+      "calibration_exclusion_reasons": [],
       "cleanup_state": "preserved_pending_thread_safe_gate",
       "disjoint_wall_clock_percent": {
-        "preparation": 20.251,
-        "reporting": 1.733,
-        "shared_ingestion": 71.01,
-        "submission": 0.29,
-        "unattributed": 2.878,
-        "validation": 3.837
+        "preparation": 27.376,
+        "reporting": 1.171,
+        "shared_ingestion": 41.785,
+        "submission": 25.268,
+        "unattributed": 4.381,
+        "validation": 0.019
       },
       "disjoint_wall_clock_seconds": {
-        "preparation": 11.37,
-        "reporting": 0.973,
-        "shared_ingestion": 39.868,
-        "submission": 0.163,
-        "unattributed": 1.616,
-        "validation": 2.154
+        "preparation": 10.172,
+        "reporting": 0.435,
+        "shared_ingestion": 15.526,
+        "submission": 9.389,
+        "unattributed": 1.628,
+        "validation": 0.007
       },
-      "document_id": "B01",
+      "document_id": "B02",
       "environment_comparable_to_session_baseline": true,
-      "invalid_for_calibration": true,
-      "invalid_reasons": [
-        "observer_uncertainty"
-      ],
+      "invalid_for_calibration": false,
+      "invalid_reasons": [],
       "justified_reprices": [
         {
-          "elapsed_seconds": 14.687,
-          "expected_seconds": 67,
-          "reason": "owned_queue_rate"
-        },
-        {
-          "elapsed_seconds": 50.881,
-          "expected_seconds": 59,
+          "elapsed_seconds": 22.893,
+          "expected_seconds": 90,
           "reason": "owned_queue_rate"
         }
       ],
       "ocr_risk": "low",
       "overlapping_evidence": {
         "confirmed_vectors": {
-          "finished_monotonic": 53.012,
-          "started_monotonic": 33.873,
-          "wall_seconds": 19.139
+          "finished_monotonic": 36.705,
+          "started_monotonic": 21.189,
+          "wall_seconds": 15.516
         },
         "owned_queue": {
-          "finished_monotonic": 33.374,
-          "started_monotonic": 13.149,
-          "wall_seconds": 20.225
+          "finished_monotonic": null,
+          "started_monotonic": null,
+          "wall_seconds": null
         },
         "quiet": {
           "finished_monotonic": null,
@@ -208,100 +416,97 @@
           "wall_seconds": null
         },
         "validation": {
-          "finished_monotonic": 55.167,
-          "started_monotonic": 53.017,
-          "wall_seconds": 2.15
+          "finished_monotonic": 36.715,
+          "started_monotonic": 36.715,
+          "wall_seconds": 0.0
         }
       },
-      "page_count": 25,
+      "page_count": 17,
       "presentation_controller_version": 11,
       "presentation_route": "run_automatic_gradio_handler",
       "profile": "ordinary-page-preserving-upload",
       "progress_calibration": {
         "20": {
-          "actual_elapsed_percent": 26.162,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 14.69,
-          "eta_error_seconds": 10.849,
-          "progress_error_points": -2.162,
-          "reprice_reason": null,
-          "shown_percent": 24.0,
+          "actual_elapsed_percent": 75.406,
+          "allowed_error_points": 10.0,
+          "elapsed_seconds": 28.026,
+          "eta_error_seconds": 52.833,
+          "progress_error_points": -55.406,
+          "reprice_reason": "owned_queue_rate",
+          "shown_percent": 20.0,
           "status": "recorded",
-          "temporary_reprice_allowance": false
+          "temporary_reprice_allowance": true
         },
         "40": {
-          "actual_elapsed_percent": 57.196,
+          "actual_elapsed_percent": 98.784,
           "allowed_error_points": 5.0,
-          "elapsed_seconds": 32.116,
-          "eta_error_seconds": 10.849,
-          "progress_error_points": -12.196,
+          "elapsed_seconds": 36.715,
+          "eta_error_seconds": 52.833,
+          "progress_error_points": -2.784,
           "reprice_reason": null,
-          "shown_percent": 45.0,
+          "shown_percent": 96.0,
           "status": "recorded",
           "temporary_reprice_allowance": false
         },
         "60": {
-          "actual_elapsed_percent": 77.365,
+          "actual_elapsed_percent": 98.784,
           "allowed_error_points": 5.0,
-          "elapsed_seconds": 43.441,
-          "eta_error_seconds": 10.849,
-          "progress_error_points": -17.365,
+          "elapsed_seconds": 36.715,
+          "eta_error_seconds": 52.833,
+          "progress_error_points": -2.784,
           "reprice_reason": null,
-          "shown_percent": 60.0,
+          "shown_percent": 96.0,
           "status": "recorded",
           "temporary_reprice_allowance": false
         },
         "80": {
-          "actual_elapsed_percent": 96.134,
+          "actual_elapsed_percent": 98.784,
           "allowed_error_points": 5.0,
-          "elapsed_seconds": 53.98,
-          "eta_error_seconds": 2.849,
-          "progress_error_points": -14.134,
+          "elapsed_seconds": 36.715,
+          "eta_error_seconds": 52.833,
+          "progress_error_points": -2.784,
           "reprice_reason": null,
-          "shown_percent": 82.0,
+          "shown_percent": 96.0,
           "status": "recorded",
           "temporary_reprice_allowance": false
         }
       },
       "progress_calibration_passed": false,
-      "queue_rate_records_per_minute": 104.166,
-      "schema_version": 1,
-      "size_bytes": 432620,
-      "size_mib": 0.413,
+      "queue_rate_records_per_minute": 27303.448,
+      "schema_version": 2,
+      "size_bytes": 137084,
+      "size_mib": 0.131,
       "status": "successful",
-      "total_wall_seconds": 56.144,
+      "total_wall_seconds": 37.157,
       "trial": 2
     },
     {
-      "calibration_exclusion_reasons": [
-        "observer_uncertainty"
-      ],
+      "benchmark_runtime_protocol_revision": 3,
+      "calibration_exclusion_reasons": [],
       "cleanup_state": "preserved_pending_thread_safe_gate",
       "disjoint_wall_clock_percent": {
-        "preparation": 9.467,
-        "reporting": 1.022,
-        "shared_ingestion": 60.582,
-        "submission": 0.183,
-        "unattributed": 1.354,
-        "validation": 27.392
+        "preparation": 28.904,
+        "reporting": 1.709,
+        "shared_ingestion": 66.419,
+        "submission": 1.117,
+        "unattributed": 1.843,
+        "validation": 0.007
       },
       "disjoint_wall_clock_seconds": {
-        "preparation": 9.089,
-        "reporting": 0.981,
-        "shared_ingestion": 58.162,
-        "submission": 0.176,
-        "unattributed": 1.3,
-        "validation": 26.298
+        "preparation": 12.498,
+        "reporting": 0.739,
+        "shared_ingestion": 28.719,
+        "submission": 0.483,
+        "unattributed": 0.797,
+        "validation": 0.003
       },
-      "document_id": "B02",
+      "document_id": "B03",
       "environment_comparable_to_session_baseline": true,
-      "invalid_for_calibration": true,
-      "invalid_reasons": [
-        "observer_uncertainty"
-      ],
+      "invalid_for_calibration": false,
+      "invalid_reasons": [],
       "justified_reprices": [
         {
-          "elapsed_seconds": 16.45,
+          "elapsed_seconds": 14.394,
           "expected_seconds": 62,
           "reason": "owned_queue_rate"
         }
@@ -309,14 +514,14 @@
       "ocr_risk": "low",
       "overlapping_evidence": {
         "confirmed_vectors": {
-          "finished_monotonic": 68.723,
-          "started_monotonic": 30.785,
-          "wall_seconds": 37.938
+          "finished_monotonic": 42.493,
+          "started_monotonic": 13.778,
+          "wall_seconds": 28.715
         },
         "owned_queue": {
-          "finished_monotonic": 30.273,
-          "started_monotonic": 10.565,
-          "wall_seconds": 19.708
+          "finished_monotonic": null,
+          "started_monotonic": null,
+          "wall_seconds": null
         },
         "quiet": {
           "finished_monotonic": null,
@@ -329,9 +534,9 @@
           "wall_seconds": null
         },
         "validation": {
-          "finished_monotonic": 95.02,
-          "started_monotonic": 68.727,
-          "wall_seconds": 26.293
+          "finished_monotonic": 42.497,
+          "started_monotonic": 42.497,
+          "wall_seconds": 0.0
         }
       },
       "page_count": 17,
@@ -340,472 +545,101 @@
       "profile": "ordinary-page-preserving-upload",
       "progress_calibration": {
         "20": {
-          "actual_elapsed_percent": 16.945,
+          "actual_elapsed_percent": 37.906,
           "allowed_error_points": 5.0,
-          "elapsed_seconds": 16.269,
-          "eta_error_seconds": -14.013,
-          "progress_error_points": 5.055,
+          "elapsed_seconds": 16.392,
+          "eta_error_seconds": 18.756,
+          "progress_error_points": -9.906,
           "reprice_reason": null,
-          "shown_percent": 22.0,
+          "shown_percent": 28.0,
           "status": "recorded",
           "temporary_reprice_allowance": false
         },
         "40": {
-          "actual_elapsed_percent": 30.379,
+          "actual_elapsed_percent": 60.186,
           "allowed_error_points": 5.0,
-          "elapsed_seconds": 29.168,
-          "eta_error_seconds": -34.013,
-          "progress_error_points": 10.621,
-          "reprice_reason": null,
-          "shown_percent": 41.0,
-          "status": "recorded",
-          "temporary_reprice_allowance": false
-        },
-        "60": {
-          "actual_elapsed_percent": 42.413,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 40.722,
-          "eta_error_seconds": -34.013,
-          "progress_error_points": 17.587,
-          "reprice_reason": null,
-          "shown_percent": 60.0,
-          "status": "recorded",
-          "temporary_reprice_allowance": false
-        },
-        "80": {
-          "actual_elapsed_percent": 87.281,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 83.801,
-          "eta_error_seconds": -34.013,
-          "progress_error_points": -5.281,
-          "reprice_reason": null,
-          "shown_percent": 82.0,
-          "status": "recorded",
-          "temporary_reprice_allowance": false
-        }
-      },
-      "progress_calibration_passed": false,
-      "queue_rate_records_per_minute": 25.201,
-      "schema_version": 1,
-      "size_bytes": 137084,
-      "size_mib": 0.131,
-      "status": "successful",
-      "total_wall_seconds": 96.006,
-      "trial": 1
-    },
-    {
-      "calibration_exclusion_reasons": [
-        "observer_uncertainty"
-      ],
-      "cleanup_state": "preserved_pending_thread_safe_gate",
-      "disjoint_wall_clock_percent": {
-        "preparation": 10.827,
-        "reporting": 1.172,
-        "shared_ingestion": 83.933,
-        "submission": 0.205,
-        "unattributed": 1.585,
-        "validation": 2.279
-      },
-      "disjoint_wall_clock_seconds": {
-        "preparation": 9.098,
-        "reporting": 0.985,
-        "shared_ingestion": 70.531,
-        "submission": 0.172,
-        "unattributed": 1.332,
-        "validation": 1.915
-      },
-      "document_id": "B02",
-      "environment_comparable_to_session_baseline": true,
-      "invalid_for_calibration": true,
-      "invalid_reasons": [
-        "observer_uncertainty"
-      ],
-      "justified_reprices": [
-        {
-          "elapsed_seconds": 40.379,
-          "expected_seconds": 103,
-          "reason": "owned_queue_rate"
-        },
-        {
-          "elapsed_seconds": 71.636,
-          "expected_seconds": 125,
-          "reason": "owned_queue_rate"
-        }
-      ],
-      "ocr_risk": "low",
-      "overlapping_evidence": {
-        "confirmed_vectors": {
-          "finished_monotonic": 81.128,
-          "started_monotonic": 30.757,
-          "wall_seconds": 50.371
-        },
-        "owned_queue": {
-          "finished_monotonic": 30.057,
-          "started_monotonic": 10.602,
-          "wall_seconds": 19.455
-        },
-        "quiet": {
-          "finished_monotonic": null,
-          "started_monotonic": null,
-          "wall_seconds": null
-        },
-        "reconnecting": {
-          "finished_monotonic": null,
-          "started_monotonic": null,
-          "wall_seconds": null
-        },
-        "validation": {
-          "finished_monotonic": 83.043,
-          "started_monotonic": 81.133,
-          "wall_seconds": 1.91
-        }
-      },
-      "page_count": 17,
-      "presentation_controller_version": 11,
-      "presentation_route": "run_automatic_gradio_handler",
-      "profile": "ordinary-page-preserving-upload",
-      "progress_calibration": {
-        "20": {
-          "actual_elapsed_percent": 21.241,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 17.851,
-          "eta_error_seconds": -2.039,
-          "progress_error_points": -1.241,
-          "reprice_reason": null,
-          "shown_percent": 20.0,
-          "status": "recorded",
-          "temporary_reprice_allowance": false
-        },
-        "40": {
-          "actual_elapsed_percent": 50.879,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 42.758,
-          "eta_error_seconds": 18.961,
-          "progress_error_points": -10.879,
+          "elapsed_seconds": 26.027,
+          "eta_error_seconds": 18.756,
+          "progress_error_points": -20.186,
           "reprice_reason": null,
           "shown_percent": 40.0,
           "status": "recorded",
           "temporary_reprice_allowance": false
         },
         "60": {
-          "actual_elapsed_percent": 96.536,
+          "actual_elapsed_percent": 97.644,
           "allowed_error_points": 5.0,
-          "elapsed_seconds": 81.128,
-          "eta_error_seconds": 40.961,
-          "progress_error_points": -36.536,
-          "reprice_reason": null,
-          "shown_percent": 60.0,
-          "status": "recorded",
-          "temporary_reprice_allowance": false
-        },
-        "80": {
-          "actual_elapsed_percent": 97.797,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 82.188,
-          "eta_error_seconds": 40.961,
-          "progress_error_points": -15.797,
-          "reprice_reason": null,
-          "shown_percent": 82.0,
-          "status": "recorded",
-          "temporary_reprice_allowance": false
-        }
-      },
-      "progress_calibration_passed": false,
-      "queue_rate_records_per_minute": 10.228,
-      "schema_version": 1,
-      "size_bytes": 137084,
-      "size_mib": 0.131,
-      "status": "successful",
-      "total_wall_seconds": 84.033,
-      "trial": 2
-    },
-    {
-      "cleanup_state": "preserved_pending_thread_safe_gate",
-      "disjoint_wall_clock_percent": {
-        "preparation": 39.912,
-        "reporting": 2.344,
-        "shared_ingestion": 20.193,
-        "submission": 0.363,
-        "unattributed": 2.96,
-        "validation": 34.228
-      },
-      "disjoint_wall_clock_seconds": {
-        "preparation": 18.903,
-        "reporting": 1.11,
-        "shared_ingestion": 9.564,
-        "submission": 0.172,
-        "unattributed": 1.402,
-        "validation": 16.211
-      },
-      "document_id": "B03",
-      "environment_comparable_to_session_baseline": true,
-      "invalid_for_calibration": false,
-      "invalid_reasons": [],
-      "justified_reprices": [
-        {
-          "elapsed_seconds": 22.079,
-          "expected_seconds": 64,
-          "reason": "owned_queue_rate"
-        }
-      ],
-      "ocr_risk": "low",
-      "overlapping_evidence": {
-        "confirmed_vectors": {
-          "finished_monotonic": 30.037,
-          "started_monotonic": 29.868,
-          "wall_seconds": 0.169
-        },
-        "owned_queue": {
-          "finished_monotonic": 29.371,
-          "started_monotonic": 20.477,
-          "wall_seconds": 8.894
-        },
-        "quiet": {
-          "finished_monotonic": null,
-          "started_monotonic": null,
-          "wall_seconds": null
-        },
-        "reconnecting": {
-          "finished_monotonic": null,
-          "started_monotonic": null,
-          "wall_seconds": null
-        },
-        "validation": {
-          "finished_monotonic": 46.248,
-          "started_monotonic": 30.041,
-          "wall_seconds": 16.207
-        }
-      },
-      "page_count": 17,
-      "presentation_controller_version": 11,
-      "presentation_route": "run_automatic_gradio_handler",
-      "profile": "ordinary-page-preserving-upload",
-      "progress_calibration": {
-        "20": {
-          "actual_elapsed_percent": 43.229,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 20.477,
-          "eta_error_seconds": 37.631,
-          "progress_error_points": -23.229,
-          "reprice_reason": null,
-          "shown_percent": 20.0,
-          "status": "recorded",
-          "temporary_reprice_allowance": false
-        },
-        "40": {
-          "actual_elapsed_percent": 55.435,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 26.259,
-          "eta_error_seconds": 16.631,
-          "progress_error_points": -15.435,
-          "reprice_reason": null,
-          "shown_percent": 40.0,
-          "status": "recorded",
-          "temporary_reprice_allowance": false
-        },
-        "60": {
-          "actual_elapsed_percent": 63.419,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 30.041,
-          "eta_error_seconds": 16.631,
-          "progress_error_points": 12.581,
-          "reprice_reason": null,
-          "shown_percent": 76.0,
-          "status": "recorded",
-          "temporary_reprice_allowance": false
-        },
-        "80": {
-          "actual_elapsed_percent": 86.065,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 40.768,
-          "eta_error_seconds": 16.631,
-          "progress_error_points": -4.065,
-          "reprice_reason": null,
-          "shown_percent": 82.0,
-          "status": "recorded",
-          "temporary_reprice_allowance": false
-        }
-      },
-      "progress_calibration_passed": false,
-      "queue_rate_records_per_minute": 216.315,
-      "schema_version": 1,
-      "size_bytes": 1370363,
-      "size_mib": 1.307,
-      "status": "successful",
-      "total_wall_seconds": 47.362,
-      "trial": 1
-    },
-    {
-      "calibration_exclusion_reasons": [
-        "observer_uncertainty"
-      ],
-      "cleanup_state": "preserved_pending_thread_safe_gate",
-      "disjoint_wall_clock_percent": {
-        "preparation": 16.123,
-        "reporting": 0.972,
-        "shared_ingestion": 66.373,
-        "submission": 0.145,
-        "unattributed": 1.133,
-        "validation": 15.254
-      },
-      "disjoint_wall_clock_seconds": {
-        "preparation": 18.652,
-        "reporting": 1.124,
-        "shared_ingestion": 76.786,
-        "submission": 0.168,
-        "unattributed": 1.311,
-        "validation": 17.647
-      },
-      "document_id": "B03",
-      "environment_comparable_to_session_baseline": true,
-      "invalid_for_calibration": true,
-      "invalid_reasons": [
-        "observer_uncertainty"
-      ],
-      "justified_reprices": [
-        {
-          "elapsed_seconds": 25.029,
-          "expected_seconds": 64,
-          "reason": "owned_queue_rate"
-        },
-        {
-          "elapsed_seconds": 63.938,
-          "expected_seconds": 80,
-          "reason": "owned_queue_rate"
-        },
-        {
-          "elapsed_seconds": 94.004,
-          "expected_seconds": 100,
-          "reason": "owned_queue_rate"
-        }
-      ],
-      "ocr_risk": "low",
-      "overlapping_evidence": {
-        "confirmed_vectors": {
-          "finished_monotonic": 96.912,
-          "started_monotonic": 40.313,
-          "wall_seconds": 56.599
-        },
-        "owned_queue": {
-          "finished_monotonic": 38.525,
-          "started_monotonic": 20.131,
-          "wall_seconds": 18.394
-        },
-        "quiet": {
-          "finished_monotonic": null,
-          "started_monotonic": null,
-          "wall_seconds": null
-        },
-        "reconnecting": {
-          "finished_monotonic": null,
-          "started_monotonic": null,
-          "wall_seconds": null
-        },
-        "validation": {
-          "finished_monotonic": 114.559,
-          "started_monotonic": 96.917,
-          "wall_seconds": 17.642
-        }
-      },
-      "page_count": 17,
-      "presentation_controller_version": 11,
-      "presentation_route": "run_automatic_gradio_handler",
-      "profile": "ordinary-page-preserving-upload",
-      "progress_calibration": {
-        "20": {
-          "actual_elapsed_percent": 17.4,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 20.131,
-          "eta_error_seconds": -30.694,
-          "progress_error_points": 2.6,
-          "reprice_reason": null,
-          "shown_percent": 20.0,
-          "status": "recorded",
-          "temporary_reprice_allowance": false
-        },
-        "40": {
-          "actual_elapsed_percent": 33.299,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 38.525,
-          "eta_error_seconds": -51.694,
-          "progress_error_points": 7.701,
-          "reprice_reason": null,
-          "shown_percent": 41.0,
-          "status": "recorded",
-          "temporary_reprice_allowance": false
-        },
-        "60": {
-          "actual_elapsed_percent": 79.154,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 91.577,
-          "eta_error_seconds": -35.694,
-          "progress_error_points": -17.154,
+          "elapsed_seconds": 42.225,
+          "eta_error_seconds": 18.756,
+          "progress_error_points": -35.644,
           "reprice_reason": null,
           "shown_percent": 62.0,
           "status": "recorded",
           "temporary_reprice_allowance": false
         },
         "80": {
-          "actual_elapsed_percent": 90.917,
+          "actual_elapsed_percent": 98.273,
           "allowed_error_points": 5.0,
-          "elapsed_seconds": 105.186,
-          "eta_error_seconds": -15.694,
-          "progress_error_points": -8.917,
+          "elapsed_seconds": 42.497,
+          "eta_error_seconds": 18.756,
+          "progress_error_points": -2.273,
           "reprice_reason": null,
-          "shown_percent": 82.0,
+          "shown_percent": 96.0,
           "status": "recorded",
           "temporary_reprice_allowance": false
         }
       },
       "progress_calibration_passed": false,
-      "queue_rate_records_per_minute": 16.695,
-      "schema_version": 1,
+      "queue_rate_records_per_minute": 54473.262,
+      "schema_version": 2,
       "size_bytes": 1370363,
       "size_mib": 1.307,
       "status": "successful",
-      "total_wall_seconds": 115.688,
-      "trial": 2
+      "total_wall_seconds": 43.239,
+      "trial": 1
     },
     {
+      "benchmark_runtime_protocol_revision": 3,
+      "calibration_exclusion_reasons": [],
       "cleanup_state": "preserved_pending_thread_safe_gate",
       "disjoint_wall_clock_percent": {
-        "preparation": 15.505,
-        "reporting": 1.43,
-        "shared_ingestion": 62.748,
-        "submission": 0.209,
-        "unattributed": 1.668,
-        "validation": 18.441
+        "preparation": 44.745,
+        "reporting": 0.837,
+        "shared_ingestion": 31.572,
+        "submission": 19.168,
+        "unattributed": 3.659,
+        "validation": 0.019
       },
       "disjoint_wall_clock_seconds": {
-        "preparation": 12.932,
-        "reporting": 1.193,
-        "shared_ingestion": 52.337,
-        "submission": 0.174,
-        "unattributed": 1.391,
-        "validation": 15.381
+        "preparation": 21.438,
+        "reporting": 0.401,
+        "shared_ingestion": 15.127,
+        "submission": 9.184,
+        "unattributed": 1.753,
+        "validation": 0.009
       },
-      "document_id": "B04",
+      "document_id": "B03",
       "environment_comparable_to_session_baseline": true,
       "invalid_for_calibration": false,
       "invalid_reasons": [],
       "justified_reprices": [
         {
-          "elapsed_seconds": 18.048,
-          "expected_seconds": 75,
+          "elapsed_seconds": 34.018,
+          "expected_seconds": 62,
           "reason": "owned_queue_rate"
         }
       ],
       "ocr_risk": "low",
       "overlapping_evidence": {
         "confirmed_vectors": {
-          "finished_monotonic": 66.829,
-          "started_monotonic": 34.665,
-          "wall_seconds": 32.164
+          "finished_monotonic": 47.496,
+          "started_monotonic": 32.375,
+          "wall_seconds": 15.121
         },
         "owned_queue": {
-          "finished_monotonic": 32.979,
-          "started_monotonic": 14.497,
-          "wall_seconds": 18.482
+          "finished_monotonic": null,
+          "started_monotonic": null,
+          "wall_seconds": null
         },
         "quiet": {
           "finished_monotonic": null,
@@ -818,113 +652,116 @@
           "wall_seconds": null
         },
         "validation": {
-          "finished_monotonic": 82.211,
-          "started_monotonic": 66.834,
-          "wall_seconds": 15.377
+          "finished_monotonic": 47.502,
+          "started_monotonic": 47.502,
+          "wall_seconds": 0.0
         }
       },
-      "page_count": 31,
+      "page_count": 17,
       "presentation_controller_version": 11,
       "presentation_route": "run_automatic_gradio_handler",
       "profile": "ordinary-page-preserving-upload",
       "progress_calibration": {
         "20": {
-          "actual_elapsed_percent": 20.092,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 16.76,
-          "eta_error_seconds": 5.585,
-          "progress_error_points": -0.092,
-          "reprice_reason": null,
+          "actual_elapsed_percent": 81.922,
+          "allowed_error_points": 10.0,
+          "elapsed_seconds": 39.257,
+          "eta_error_seconds": 14.08,
+          "progress_error_points": -61.922,
+          "reprice_reason": "owned_queue_rate",
           "shown_percent": 20.0,
           "status": "recorded",
-          "temporary_reprice_allowance": false
+          "temporary_reprice_allowance": true
         },
         "40": {
-          "actual_elapsed_percent": 39.073,
+          "actual_elapsed_percent": 98.212,
           "allowed_error_points": 5.0,
-          "elapsed_seconds": 32.593,
-          "eta_error_seconds": -8.415,
-          "progress_error_points": 2.927,
+          "elapsed_seconds": 47.063,
+          "eta_error_seconds": 14.08,
+          "progress_error_points": -29.212,
           "reprice_reason": null,
-          "shown_percent": 42.0,
+          "shown_percent": 69.0,
           "status": "recorded",
           "temporary_reprice_allowance": false
         },
         "60": {
-          "actual_elapsed_percent": 61.644,
+          "actual_elapsed_percent": 98.212,
           "allowed_error_points": 5.0,
-          "elapsed_seconds": 51.42,
-          "eta_error_seconds": -8.415,
-          "progress_error_points": 1.356,
+          "elapsed_seconds": 47.063,
+          "eta_error_seconds": 14.08,
+          "progress_error_points": -29.212,
           "reprice_reason": null,
-          "shown_percent": 63.0,
+          "shown_percent": 69.0,
           "status": "recorded",
           "temporary_reprice_allowance": false
         },
         "80": {
-          "actual_elapsed_percent": 94.502,
+          "actual_elapsed_percent": 99.128,
           "allowed_error_points": 5.0,
-          "elapsed_seconds": 78.829,
-          "eta_error_seconds": -8.415,
-          "progress_error_points": -12.502,
+          "elapsed_seconds": 47.502,
+          "eta_error_seconds": 14.08,
+          "progress_error_points": -3.128,
           "reprice_reason": null,
-          "shown_percent": 82.0,
+          "shown_percent": 96.0,
           "status": "recorded",
           "temporary_reprice_allowance": false
         }
       },
       "progress_calibration_passed": false,
-      "queue_rate_records_per_minute": 49.292,
-      "schema_version": 1,
-      "size_bytes": 335295,
-      "size_mib": 0.32,
+      "queue_rate_records_per_minute": 26511.755,
+      "schema_version": 2,
+      "size_bytes": 1370363,
+      "size_mib": 1.307,
       "status": "successful",
-      "total_wall_seconds": 83.408,
-      "trial": 1
+      "total_wall_seconds": 47.912,
+      "trial": 2
     },
     {
+      "benchmark_runtime_protocol_revision": 3,
       "calibration_exclusion_reasons": [
-        "terminal_not_successful"
+        "observer_uncertainty"
       ],
       "cleanup_state": "preserved_pending_thread_safe_gate",
       "disjoint_wall_clock_percent": {
-        "preparation": 35.765,
-        "reporting": 10.095,
-        "shared_ingestion": 49.493,
-        "submission": 0.493,
-        "unattributed": 4.014,
-        "validation": 0.14
+        "preparation": 56.938,
+        "reporting": 2.515,
+        "shared_ingestion": 34.373,
+        "submission": 2.837,
+        "unattributed": 3.328,
+        "validation": 0.008
       },
       "disjoint_wall_clock_seconds": {
-        "preparation": 12.474,
-        "reporting": 3.521,
-        "shared_ingestion": 17.262,
-        "submission": 0.172,
-        "unattributed": 1.4,
-        "validation": 0.049
+        "preparation": 14.489,
+        "reporting": 0.64,
+        "shared_ingestion": 8.747,
+        "submission": 0.722,
+        "unattributed": 0.847,
+        "validation": 0.002
       },
       "document_id": "B04",
       "environment_comparable_to_session_baseline": true,
-      "invalid_for_calibration": false,
-      "invalid_reasons": [],
+      "invalid_for_calibration": true,
+      "invalid_reasons": [
+        "observer_uncertainty"
+      ],
       "justified_reprices": [
         {
-          "elapsed_seconds": 15.632,
-          "expected_seconds": 67,
+          "elapsed_seconds": 16.874,
+          "expected_seconds": 141,
           "reason": "owned_queue_rate"
         }
       ],
       "ocr_risk": "low",
       "overlapping_evidence": {
         "confirmed_vectors": {
-          "finished_monotonic": 31.304,
-          "started_monotonic": 31.112,
-          "wall_seconds": 0.192
+          "finished_monotonic": 24.802,
+          "started_monotonic": 16.058,
+          "wall_seconds": 8.744
         },
         "owned_queue": {
-          "finished_monotonic": 30.572,
-          "started_monotonic": 14.046,
-          "wall_seconds": 16.526
+          "finished_monotonic": null,
+          "started_monotonic": null,
+          "wall_seconds": null
         },
         "quiet": {
           "finished_monotonic": null,
@@ -932,14 +769,14 @@
           "wall_seconds": null
         },
         "reconnecting": {
-          "finished_monotonic": null,
-          "started_monotonic": null,
-          "wall_seconds": null
+          "finished_monotonic": 48944.104,
+          "started_monotonic": 48944.104,
+          "wall_seconds": 0.0
         },
         "validation": {
-          "finished_monotonic": 31.353,
-          "started_monotonic": 31.308,
-          "wall_seconds": 0.045
+          "finished_monotonic": 24.805,
+          "started_monotonic": 24.805,
+          "wall_seconds": 0.0
         }
       },
       "page_count": 31,
@@ -948,104 +785,101 @@
       "profile": "ordinary-page-preserving-upload",
       "progress_calibration": {
         "20": {
-          "actual_elapsed_percent": 43.288,
+          "actual_elapsed_percent": 88.543,
           "allowed_error_points": 5.0,
-          "elapsed_seconds": 15.101,
-          "eta_error_seconds": 54.115,
-          "progress_error_points": -23.288,
+          "elapsed_seconds": 22.535,
+          "eta_error_seconds": 115.549,
+          "progress_error_points": -68.543,
           "reprice_reason": null,
           "shown_percent": 20.0,
           "status": "recorded",
           "temporary_reprice_allowance": false
         },
         "40": {
-          "actual_elapsed_percent": 78.638,
+          "actual_elapsed_percent": 97.462,
           "allowed_error_points": 5.0,
-          "elapsed_seconds": 27.433,
-          "eta_error_seconds": 32.115,
-          "progress_error_points": -38.638,
+          "elapsed_seconds": 24.805,
+          "eta_error_seconds": 115.549,
+          "progress_error_points": -1.462,
           "reprice_reason": null,
-          "shown_percent": 40.0,
+          "shown_percent": 96.0,
           "status": "recorded",
           "temporary_reprice_allowance": false
         },
         "60": {
-          "actual_elapsed_percent": 89.746,
+          "actual_elapsed_percent": 97.462,
           "allowed_error_points": 5.0,
-          "elapsed_seconds": 31.308,
-          "eta_error_seconds": 32.115,
-          "progress_error_points": -13.746,
+          "elapsed_seconds": 24.805,
+          "eta_error_seconds": 115.549,
+          "progress_error_points": -1.462,
           "reprice_reason": null,
-          "shown_percent": 76.0,
+          "shown_percent": 96.0,
           "status": "recorded",
           "temporary_reprice_allowance": false
         },
         "80": {
-          "actual_elapsed_percent": 89.792,
+          "actual_elapsed_percent": 97.462,
           "allowed_error_points": 5.0,
-          "elapsed_seconds": 31.324,
-          "eta_error_seconds": 32.115,
-          "progress_error_points": -7.792,
+          "elapsed_seconds": 24.805,
+          "eta_error_seconds": 115.549,
+          "progress_error_points": -1.462,
           "reprice_reason": null,
-          "shown_percent": 82.0,
+          "shown_percent": 96.0,
           "status": "recorded",
           "temporary_reprice_allowance": false
         }
       },
       "progress_calibration_passed": false,
-      "queue_rate_records_per_minute": 199.257,
-      "schema_version": 1,
+      "queue_rate_records_per_minute": 32545.691,
+      "schema_version": 2,
       "size_bytes": 335295,
       "size_mib": 0.32,
-      "status": "warning",
-      "total_wall_seconds": 34.878,
-      "trial": 2
+      "status": "successful",
+      "total_wall_seconds": 25.447,
+      "trial": 1
     },
     {
+      "benchmark_runtime_protocol_revision": 3,
+      "calibration_exclusion_reasons": [],
       "cleanup_state": "preserved_pending_thread_safe_gate",
       "disjoint_wall_clock_percent": {
-        "preparation": 22.335,
-        "reporting": 2.409,
-        "shared_ingestion": 67.517,
-        "submission": 0.328,
-        "unattributed": 2.6,
-        "validation": 4.812
+        "preparation": 19.118,
+        "reporting": 0.717,
+        "shared_ingestion": 49.497,
+        "submission": 27.727,
+        "unattributed": 2.929,
+        "validation": 0.012
       },
       "disjoint_wall_clock_seconds": {
-        "preparation": 11.786,
-        "reporting": 1.271,
-        "shared_ingestion": 35.628,
-        "submission": 0.173,
-        "unattributed": 1.372,
-        "validation": 2.539
+        "preparation": 10.849,
+        "reporting": 0.407,
+        "shared_ingestion": 28.089,
+        "submission": 15.735,
+        "unattributed": 1.662,
+        "validation": 0.007
       },
-      "document_id": "B05",
+      "document_id": "B04",
       "environment_comparable_to_session_baseline": true,
       "invalid_for_calibration": false,
       "invalid_reasons": [],
       "justified_reprices": [
         {
-          "elapsed_seconds": 15.878,
-          "expected_seconds": 66,
-          "reason": "owned_queue_rate"
-        },
-        {
-          "elapsed_seconds": 46.343,
-          "expected_seconds": 55,
+          "elapsed_seconds": 29.999,
+          "expected_seconds": 141,
           "reason": "owned_queue_rate"
         }
       ],
       "ocr_risk": "low",
       "overlapping_evidence": {
         "confirmed_vectors": {
-          "finished_monotonic": 48.955,
-          "started_monotonic": 35.536,
-          "wall_seconds": 13.419
+          "finished_monotonic": 56.328,
+          "started_monotonic": 28.246,
+          "wall_seconds": 28.082
         },
         "owned_queue": {
-          "finished_monotonic": 35.009,
-          "started_monotonic": 13.331,
-          "wall_seconds": 21.678
+          "finished_monotonic": null,
+          "started_monotonic": null,
+          "wall_seconds": null
         },
         "quiet": {
           "finished_monotonic": null,
@@ -1058,9 +892,127 @@
           "wall_seconds": null
         },
         "validation": {
-          "finished_monotonic": 51.493,
-          "started_monotonic": 48.959,
-          "wall_seconds": 2.534
+          "finished_monotonic": 56.335,
+          "started_monotonic": 56.335,
+          "wall_seconds": 0.0
+        }
+      },
+      "page_count": 31,
+      "presentation_controller_version": 11,
+      "presentation_route": "run_automatic_gradio_handler",
+      "profile": "ordinary-page-preserving-upload",
+      "progress_calibration": {
+        "20": {
+          "actual_elapsed_percent": 60.728,
+          "allowed_error_points": 10.0,
+          "elapsed_seconds": 34.47,
+          "eta_error_seconds": 84.239,
+          "progress_error_points": -40.728,
+          "reprice_reason": "owned_queue_rate",
+          "shown_percent": 20.0,
+          "status": "recorded",
+          "temporary_reprice_allowance": true
+        },
+        "40": {
+          "actual_elapsed_percent": 99.249,
+          "allowed_error_points": 5.0,
+          "elapsed_seconds": 56.335,
+          "eta_error_seconds": 84.239,
+          "progress_error_points": -3.249,
+          "reprice_reason": null,
+          "shown_percent": 96.0,
+          "status": "recorded",
+          "temporary_reprice_allowance": false
+        },
+        "60": {
+          "actual_elapsed_percent": 99.249,
+          "allowed_error_points": 5.0,
+          "elapsed_seconds": 56.335,
+          "eta_error_seconds": 84.239,
+          "progress_error_points": -3.249,
+          "reprice_reason": null,
+          "shown_percent": 96.0,
+          "status": "recorded",
+          "temporary_reprice_allowance": false
+        },
+        "80": {
+          "actual_elapsed_percent": 99.249,
+          "allowed_error_points": 5.0,
+          "elapsed_seconds": 56.335,
+          "eta_error_seconds": 84.239,
+          "progress_error_points": -3.249,
+          "reprice_reason": null,
+          "shown_percent": 96.0,
+          "status": "recorded",
+          "temporary_reprice_allowance": false
+        }
+      },
+      "progress_calibration_passed": false,
+      "queue_rate_records_per_minute": 28696.5,
+      "schema_version": 2,
+      "size_bytes": 335295,
+      "size_mib": 0.32,
+      "status": "successful",
+      "total_wall_seconds": 56.749,
+      "trial": 2
+    },
+    {
+      "benchmark_runtime_protocol_revision": 3,
+      "calibration_exclusion_reasons": [],
+      "cleanup_state": "preserved_pending_thread_safe_gate",
+      "disjoint_wall_clock_percent": {
+        "preparation": 23.452,
+        "reporting": 1.346,
+        "shared_ingestion": 42.634,
+        "submission": 28.415,
+        "unattributed": 4.145,
+        "validation": 0.009
+      },
+      "disjoint_wall_clock_seconds": {
+        "preparation": 5.07,
+        "reporting": 0.291,
+        "shared_ingestion": 9.217,
+        "submission": 6.143,
+        "unattributed": 0.896,
+        "validation": 0.002
+      },
+      "document_id": "B05",
+      "environment_comparable_to_session_baseline": true,
+      "invalid_for_calibration": false,
+      "invalid_reasons": [],
+      "justified_reprices": [
+        {
+          "elapsed_seconds": 12.8,
+          "expected_seconds": 119,
+          "reason": "owned_queue_rate"
+        }
+      ],
+      "ocr_risk": "low",
+      "overlapping_evidence": {
+        "confirmed_vectors": {
+          "finished_monotonic": 21.324,
+          "started_monotonic": 12.109,
+          "wall_seconds": 9.215
+        },
+        "owned_queue": {
+          "finished_monotonic": null,
+          "started_monotonic": null,
+          "wall_seconds": null
+        },
+        "quiet": {
+          "finished_monotonic": null,
+          "started_monotonic": null,
+          "wall_seconds": null
+        },
+        "reconnecting": {
+          "finished_monotonic": null,
+          "started_monotonic": null,
+          "wall_seconds": null
+        },
+        "validation": {
+          "finished_monotonic": 21.326,
+          "started_monotonic": 21.326,
+          "wall_seconds": 0.0
         }
       },
       "page_count": 25,
@@ -1069,76 +1021,78 @@
       "profile": "ordinary-page-preserving-upload",
       "progress_calibration": {
         "20": {
-          "actual_elapsed_percent": 29.356,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 15.493,
-          "eta_error_seconds": 35.224,
-          "progress_error_points": -9.356,
-          "reprice_reason": null,
+          "actual_elapsed_percent": 89.094,
+          "allowed_error_points": 10.0,
+          "elapsed_seconds": 19.264,
+          "eta_error_seconds": 97.378,
+          "progress_error_points": -69.094,
+          "reprice_reason": "owned_queue_rate",
           "shown_percent": 20.0,
           "status": "recorded",
-          "temporary_reprice_allowance": false
+          "temporary_reprice_allowance": true
         },
         "40": {
-          "actual_elapsed_percent": 60.128,
+          "actual_elapsed_percent": 98.631,
           "allowed_error_points": 5.0,
-          "elapsed_seconds": 31.733,
-          "eta_error_seconds": 13.224,
-          "progress_error_points": -20.128,
+          "elapsed_seconds": 21.326,
+          "eta_error_seconds": 97.378,
+          "progress_error_points": -2.631,
           "reprice_reason": null,
-          "shown_percent": 40.0,
+          "shown_percent": 96.0,
           "status": "recorded",
           "temporary_reprice_allowance": false
         },
         "60": {
-          "actual_elapsed_percent": 82.729,
+          "actual_elapsed_percent": 98.631,
           "allowed_error_points": 5.0,
-          "elapsed_seconds": 43.661,
-          "eta_error_seconds": 13.224,
-          "progress_error_points": -21.729,
+          "elapsed_seconds": 21.326,
+          "eta_error_seconds": 97.378,
+          "progress_error_points": -2.631,
           "reprice_reason": null,
-          "shown_percent": 61.0,
+          "shown_percent": 96.0,
           "status": "recorded",
           "temporary_reprice_allowance": false
         },
         "80": {
-          "actual_elapsed_percent": 95.31,
+          "actual_elapsed_percent": 98.631,
           "allowed_error_points": 5.0,
-          "elapsed_seconds": 50.301,
-          "eta_error_seconds": 2.224,
-          "progress_error_points": -13.31,
+          "elapsed_seconds": 21.326,
+          "eta_error_seconds": 97.378,
+          "progress_error_points": -2.631,
           "reprice_reason": null,
-          "shown_percent": 82.0,
+          "shown_percent": 96.0,
           "status": "recorded",
           "temporary_reprice_allowance": false
         }
       },
       "progress_calibration_passed": false,
-      "queue_rate_records_per_minute": 59.688,
-      "schema_version": 1,
+      "queue_rate_records_per_minute": 38338.828,
+      "schema_version": 2,
       "size_bytes": 204669,
       "size_mib": 0.195,
       "status": "successful",
-      "total_wall_seconds": 52.769,
+      "total_wall_seconds": 21.619,
       "trial": 1
     },
     {
+      "benchmark_runtime_protocol_revision": 3,
+      "calibration_exclusion_reasons": [],
       "cleanup_state": "preserved_pending_thread_safe_gate",
       "disjoint_wall_clock_percent": {
-        "preparation": 10.456,
-        "reporting": 1.259,
-        "shared_ingestion": 69.326,
-        "submission": 0.184,
-        "unattributed": 1.267,
-        "validation": 17.508
+        "preparation": 22.358,
+        "reporting": 0.845,
+        "shared_ingestion": 46.536,
+        "submission": 26.4,
+        "unattributed": 3.851,
+        "validation": 0.01
       },
       "disjoint_wall_clock_seconds": {
-        "preparation": 11.622,
-        "reporting": 1.399,
-        "shared_ingestion": 77.059,
-        "submission": 0.205,
-        "unattributed": 1.408,
-        "validation": 19.461
+        "preparation": 11.003,
+        "reporting": 0.416,
+        "shared_ingestion": 22.902,
+        "submission": 12.992,
+        "unattributed": 1.895,
+        "validation": 0.005
       },
       "document_id": "B05",
       "environment_comparable_to_session_baseline": true,
@@ -1146,32 +1100,22 @@
       "invalid_reasons": [],
       "justified_reprices": [
         {
-          "elapsed_seconds": 24.108,
-          "expected_seconds": 110,
-          "reason": "owned_queue_rate"
-        },
-        {
-          "elapsed_seconds": 57.572,
-          "expected_seconds": 120,
-          "reason": "owned_queue_rate"
-        },
-        {
-          "elapsed_seconds": 87.71,
-          "expected_seconds": 96,
+          "elapsed_seconds": 27.618,
+          "expected_seconds": 119,
           "reason": "owned_queue_rate"
         }
       ],
       "ocr_risk": "low",
       "overlapping_evidence": {
         "confirmed_vectors": {
-          "finished_monotonic": 90.29,
-          "started_monotonic": 33.358,
-          "wall_seconds": 56.932
+          "finished_monotonic": 48.786,
+          "started_monotonic": 25.89,
+          "wall_seconds": 22.896
         },
         "owned_queue": {
-          "finished_monotonic": 32.262,
-          "started_monotonic": 13.235,
-          "wall_seconds": 19.027
+          "finished_monotonic": null,
+          "started_monotonic": null,
+          "wall_seconds": null
         },
         "quiet": {
           "finished_monotonic": null,
@@ -1184,9 +1128,9 @@
           "wall_seconds": null
         },
         "validation": {
-          "finished_monotonic": 109.751,
-          "started_monotonic": 90.294,
-          "wall_seconds": 19.457
+          "finished_monotonic": 48.792,
+          "started_monotonic": 48.792,
+          "wall_seconds": 0.0
         }
       },
       "page_count": 25,
@@ -1195,76 +1139,78 @@
       "profile": "ordinary-page-preserving-upload",
       "progress_calibration": {
         "20": {
-          "actual_elapsed_percent": 13.327,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 14.814,
-          "eta_error_seconds": -23.16,
-          "progress_error_points": 6.673,
-          "reprice_reason": null,
+          "actual_elapsed_percent": 66.047,
+          "allowed_error_points": 10.0,
+          "elapsed_seconds": 32.509,
+          "eta_error_seconds": 69.779,
+          "progress_error_points": -46.047,
+          "reprice_reason": "owned_queue_rate",
           "shown_percent": 20.0,
           "status": "recorded",
-          "temporary_reprice_allowance": false
+          "temporary_reprice_allowance": true
         },
         "40": {
-          "actual_elapsed_percent": 40.946,
+          "actual_elapsed_percent": 99.116,
           "allowed_error_points": 5.0,
-          "elapsed_seconds": 45.516,
-          "eta_error_seconds": -1.16,
-          "progress_error_points": -0.946,
+          "elapsed_seconds": 48.786,
+          "eta_error_seconds": 69.779,
+          "progress_error_points": -59.116,
           "reprice_reason": null,
           "shown_percent": 40.0,
           "status": "recorded",
           "temporary_reprice_allowance": false
         },
         "60": {
-          "actual_elapsed_percent": 70.752,
+          "actual_elapsed_percent": 99.128,
           "allowed_error_points": 5.0,
-          "elapsed_seconds": 78.648,
-          "eta_error_seconds": 8.84,
-          "progress_error_points": -10.752,
+          "elapsed_seconds": 48.792,
+          "eta_error_seconds": 69.779,
+          "progress_error_points": -3.128,
           "reprice_reason": null,
-          "shown_percent": 60.0,
+          "shown_percent": 96.0,
           "status": "recorded",
           "temporary_reprice_allowance": false
         },
         "80": {
-          "actual_elapsed_percent": 90.956,
+          "actual_elapsed_percent": 99.128,
           "allowed_error_points": 5.0,
-          "elapsed_seconds": 101.107,
-          "eta_error_seconds": -15.16,
-          "progress_error_points": -8.956,
+          "elapsed_seconds": 48.792,
+          "eta_error_seconds": 69.779,
+          "progress_error_points": -3.128,
           "reprice_reason": null,
-          "shown_percent": 82.0,
+          "shown_percent": 96.0,
           "status": "recorded",
           "temporary_reprice_allowance": false
         }
       },
       "progress_calibration_passed": false,
-      "queue_rate_records_per_minute": 17.541,
-      "schema_version": 1,
+      "queue_rate_records_per_minute": 24722.054,
+      "schema_version": 2,
       "size_bytes": 204669,
       "size_mib": 0.195,
       "status": "successful",
-      "total_wall_seconds": 111.154,
+      "total_wall_seconds": 49.213,
       "trial": 2
     },
     {
+      "benchmark_runtime_protocol_revision": 3,
+      "calibration_exclusion_reasons": [],
       "cleanup_state": "preserved_pending_thread_safe_gate",
       "disjoint_wall_clock_percent": {
-        "preparation": 16.463,
-        "reporting": 1.975,
-        "shared_ingestion": 51.574,
-        "submission": 0.327,
-        "unattributed": 2.373,
-        "validation": 27.287
+        "preparation": 19.057,
+        "reporting": 0.416,
+        "shared_ingestion": 77.664,
+        "submission": 1.27,
+        "unattributed": 1.589,
+        "validation": 0.004
       },
       "disjoint_wall_clock_seconds": {
-        "preparation": 9.359,
-        "reporting": 1.123,
-        "shared_ingestion": 29.319,
-        "submission": 0.186,
-        "unattributed": 1.349,
-        "validation": 15.512
+        "preparation": 10.216,
+        "reporting": 0.223,
+        "shared_ingestion": 41.635,
+        "submission": 0.681,
+        "unattributed": 0.852,
+        "validation": 0.002
       },
       "document_id": "B06",
       "environment_comparable_to_session_baseline": true,
@@ -1272,607 +1218,7 @@
       "invalid_reasons": [],
       "justified_reprices": [
         {
-          "elapsed_seconds": 7.613,
-          "expected_seconds": 117,
-          "reason": "exact_segment_count"
-        },
-        {
-          "elapsed_seconds": 15.381,
-          "expected_seconds": 88,
-          "reason": "owned_queue_rate"
-        }
-      ],
-      "ocr_risk": "low",
-      "overlapping_evidence": {
-        "confirmed_vectors": {
-          "finished_monotonic": 40.208,
-          "started_monotonic": 31.054,
-          "wall_seconds": 9.154
-        },
-        "owned_queue": {
-          "finished_monotonic": 30.481,
-          "started_monotonic": 10.894,
-          "wall_seconds": 19.587
-        },
-        "quiet": {
-          "finished_monotonic": null,
-          "started_monotonic": null,
-          "wall_seconds": null
-        },
-        "reconnecting": {
-          "finished_monotonic": null,
-          "started_monotonic": null,
-          "wall_seconds": null
-        },
-        "validation": {
-          "finished_monotonic": 55.721,
-          "started_monotonic": 40.213,
-          "wall_seconds": 15.508
-        }
-      },
-      "page_count": 16,
-      "presentation_controller_version": 11,
-      "presentation_route": "run_automatic_gradio_handler",
-      "profile": "ordinary-page-preserving-upload",
-      "progress_calibration": {
-        "20": {
-          "actual_elapsed_percent": 27.06,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 15.385,
-          "eta_error_seconds": 31.145,
-          "progress_error_points": -7.06,
-          "reprice_reason": null,
-          "shown_percent": 20.0,
-          "status": "recorded",
-          "temporary_reprice_allowance": false
-        },
-        "40": {
-          "actual_elapsed_percent": 65.027,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 36.971,
-          "eta_error_seconds": 31.145,
-          "progress_error_points": -24.027,
-          "reprice_reason": null,
-          "shown_percent": 41.0,
-          "status": "recorded",
-          "temporary_reprice_allowance": false
-        },
-        "60": {
-          "actual_elapsed_percent": 70.729,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 40.213,
-          "eta_error_seconds": 31.145,
-          "progress_error_points": 5.271,
-          "reprice_reason": null,
-          "shown_percent": 76.0,
-          "status": "recorded",
-          "temporary_reprice_allowance": false
-        },
-        "80": {
-          "actual_elapsed_percent": 71.897,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 40.877,
-          "eta_error_seconds": 31.145,
-          "progress_error_points": 8.103,
-          "reprice_reason": null,
-          "shown_percent": 80.0,
-          "status": "recorded",
-          "temporary_reprice_allowance": false
-        }
-      },
-      "progress_calibration_passed": false,
-      "queue_rate_records_per_minute": 43.06,
-      "schema_version": 1,
-      "size_bytes": 1760494,
-      "size_mib": 1.679,
-      "status": "successful",
-      "total_wall_seconds": 56.848,
-      "trial": 1
-    },
-    {
-      "cleanup_state": "preserved_pending_thread_safe_gate",
-      "disjoint_wall_clock_percent": {
-        "preparation": 18.195,
-        "reporting": 2.182,
-        "shared_ingestion": 72.836,
-        "submission": 0.353,
-        "unattributed": 2.597,
-        "validation": 3.836
-      },
-      "disjoint_wall_clock_seconds": {
-        "preparation": 9.381,
-        "reporting": 1.125,
-        "shared_ingestion": 37.553,
-        "submission": 0.182,
-        "unattributed": 1.339,
-        "validation": 1.978
-      },
-      "document_id": "B06",
-      "environment_comparable_to_session_baseline": true,
-      "invalid_for_calibration": false,
-      "invalid_reasons": [],
-      "justified_reprices": [
-        {
-          "elapsed_seconds": 7.643,
-          "expected_seconds": 117,
-          "reason": "exact_segment_count"
-        },
-        {
-          "elapsed_seconds": 21.378,
-          "expected_seconds": 88,
-          "reason": "owned_queue_rate"
-        }
-      ],
-      "ocr_risk": "low",
-      "overlapping_evidence": {
-        "confirmed_vectors": {
-          "finished_monotonic": 48.451,
-          "started_monotonic": 31.075,
-          "wall_seconds": 17.376
-        },
-        "owned_queue": {
-          "finished_monotonic": 22.179,
-          "started_monotonic": 10.902,
-          "wall_seconds": 11.277
-        },
-        "quiet": {
-          "finished_monotonic": null,
-          "started_monotonic": null,
-          "wall_seconds": null
-        },
-        "reconnecting": {
-          "finished_monotonic": null,
-          "started_monotonic": null,
-          "wall_seconds": null
-        },
-        "validation": {
-          "finished_monotonic": 50.428,
-          "started_monotonic": 48.455,
-          "wall_seconds": 1.973
-        }
-      },
-      "page_count": 16,
-      "presentation_controller_version": 11,
-      "presentation_route": "run_automatic_gradio_handler",
-      "profile": "ordinary-page-preserving-upload",
-      "progress_calibration": {
-        "20": {
-          "actual_elapsed_percent": 40.691,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 20.982,
-          "eta_error_seconds": 65.436,
-          "progress_error_points": -20.691,
-          "reprice_reason": null,
-          "shown_percent": 20.0,
-          "status": "recorded",
-          "temporary_reprice_allowance": false
-        },
-        "40": {
-          "actual_elapsed_percent": 77.108,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 39.76,
-          "eta_error_seconds": 36.436,
-          "progress_error_points": -34.108,
-          "reprice_reason": null,
-          "shown_percent": 43.0,
-          "status": "recorded",
-          "temporary_reprice_allowance": false
-        },
-        "60": {
-          "actual_elapsed_percent": 93.971,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 48.455,
-          "eta_error_seconds": 36.436,
-          "progress_error_points": -17.971,
-          "reprice_reason": null,
-          "shown_percent": 76.0,
-          "status": "recorded",
-          "temporary_reprice_allowance": false
-        },
-        "80": {
-          "actual_elapsed_percent": 95.955,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 49.478,
-          "eta_error_seconds": 36.436,
-          "progress_error_points": -15.955,
-          "reprice_reason": null,
-          "shown_percent": 80.0,
-          "status": "recorded",
-          "temporary_reprice_allowance": false
-        }
-      },
-      "progress_calibration_passed": false,
-      "queue_rate_records_per_minute": 41.496,
-      "schema_version": 1,
-      "size_bytes": 1760494,
-      "size_mib": 1.679,
-      "status": "successful",
-      "total_wall_seconds": 51.558,
-      "trial": 2
-    },
-    {
-      "cleanup_state": "preserved_pending_thread_safe_gate",
-      "disjoint_wall_clock_percent": {
-        "preparation": 19.782,
-        "reporting": 2.226,
-        "shared_ingestion": 71.045,
-        "submission": 0.426,
-        "unattributed": 3.042,
-        "validation": 3.479
-      },
-      "disjoint_wall_clock_seconds": {
-        "preparation": 8.727,
-        "reporting": 0.982,
-        "shared_ingestion": 31.342,
-        "submission": 0.188,
-        "unattributed": 1.342,
-        "validation": 1.535
-      },
-      "document_id": "B07",
-      "environment_comparable_to_session_baseline": true,
-      "invalid_for_calibration": false,
-      "invalid_reasons": [],
-      "justified_reprices": [
-        {
-          "elapsed_seconds": 24.515,
-          "expected_seconds": 108,
-          "reason": "owned_queue_rate"
-        }
-      ],
-      "ocr_risk": "low",
-      "overlapping_evidence": {
-        "confirmed_vectors": {
-          "finished_monotonic": 41.594,
-          "started_monotonic": 30.372,
-          "wall_seconds": 11.222
-        },
-        "owned_queue": {
-          "finished_monotonic": 28.664,
-          "started_monotonic": 10.257,
-          "wall_seconds": 18.407
-        },
-        "quiet": {
-          "finished_monotonic": null,
-          "started_monotonic": null,
-          "wall_seconds": null
-        },
-        "reconnecting": {
-          "finished_monotonic": null,
-          "started_monotonic": null,
-          "wall_seconds": null
-        },
-        "validation": {
-          "finished_monotonic": 43.13,
-          "started_monotonic": 41.599,
-          "wall_seconds": 1.531
-        }
-      },
-      "page_count": 15,
-      "presentation_controller_version": 11,
-      "presentation_route": "run_automatic_gradio_handler",
-      "profile": "ordinary-page-preserving-upload",
-      "progress_calibration": {
-        "20": {
-          "actual_elapsed_percent": 49.466,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 21.826,
-          "eta_error_seconds": 41.877,
-          "progress_error_points": -28.466,
-          "reprice_reason": null,
-          "shown_percent": 21.0,
-          "status": "recorded",
-          "temporary_reprice_allowance": false
-        },
-        "40": {
-          "actual_elapsed_percent": 94.28,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 41.599,
-          "eta_error_seconds": 63.877,
-          "progress_error_points": -18.28,
-          "reprice_reason": null,
-          "shown_percent": 76.0,
-          "status": "recorded",
-          "temporary_reprice_allowance": false
-        },
-        "60": {
-          "actual_elapsed_percent": 94.28,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 41.599,
-          "eta_error_seconds": 63.877,
-          "progress_error_points": -18.28,
-          "reprice_reason": null,
-          "shown_percent": 76.0,
-          "status": "recorded",
-          "temporary_reprice_allowance": false
-        },
-        "80": {
-          "actual_elapsed_percent": 95.773,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 42.258,
-          "eta_error_seconds": 63.877,
-          "progress_error_points": -15.773,
-          "reprice_reason": null,
-          "shown_percent": 80.0,
-          "status": "recorded",
-          "temporary_reprice_allowance": false
-        }
-      },
-      "progress_calibration_passed": false,
-      "queue_rate_records_per_minute": 18.337,
-      "schema_version": 1,
-      "size_bytes": 357097,
-      "size_mib": 0.341,
-      "status": "successful",
-      "total_wall_seconds": 44.116,
-      "trial": 1
-    },
-    {
-      "cleanup_state": "preserved_pending_thread_safe_gate",
-      "disjoint_wall_clock_percent": {
-        "preparation": 44.055,
-        "reporting": 3.645,
-        "shared_ingestion": 44.268,
-        "submission": 0.939,
-        "unattributed": 6.894,
-        "validation": 0.198
-      },
-      "disjoint_wall_clock_seconds": {
-        "preparation": 8.678,
-        "reporting": 0.718,
-        "shared_ingestion": 8.72,
-        "submission": 0.185,
-        "unattributed": 1.358,
-        "validation": 0.039
-      },
-      "document_id": "B07",
-      "environment_comparable_to_session_baseline": true,
-      "invalid_for_calibration": false,
-      "invalid_reasons": [],
-      "justified_reprices": [
-        {
-          "elapsed_seconds": 12.086,
-          "expected_seconds": 65,
-          "reason": "owned_queue_rate"
-        }
-      ],
-      "ocr_risk": "low",
-      "overlapping_evidence": {
-        "confirmed_vectors": {
-          "finished_monotonic": 18.938,
-          "started_monotonic": 18.752,
-          "wall_seconds": 0.186
-        },
-        "owned_queue": {
-          "finished_monotonic": 18.212,
-          "started_monotonic": 10.221,
-          "wall_seconds": 7.991
-        },
-        "quiet": {
-          "finished_monotonic": null,
-          "started_monotonic": null,
-          "wall_seconds": null
-        },
-        "reconnecting": {
-          "finished_monotonic": null,
-          "started_monotonic": null,
-          "wall_seconds": null
-        },
-        "validation": {
-          "finished_monotonic": 18.976,
-          "started_monotonic": 18.941,
-          "wall_seconds": 0.035
-        }
-      },
-      "page_count": 15,
-      "presentation_controller_version": 11,
-      "presentation_route": "run_automatic_gradio_handler",
-      "profile": "ordinary-page-preserving-upload",
-      "progress_calibration": {
-        "20": {
-          "actual_elapsed_percent": 61.35,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 12.089,
-          "eta_error_seconds": 45.295,
-          "progress_error_points": -40.35,
-          "reprice_reason": null,
-          "shown_percent": 21.0,
-          "status": "recorded",
-          "temporary_reprice_allowance": false
-        },
-        "40": {
-          "actual_elapsed_percent": 96.123,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 18.941,
-          "eta_error_seconds": 45.295,
-          "progress_error_points": -20.123,
-          "reprice_reason": null,
-          "shown_percent": 76.0,
-          "status": "recorded",
-          "temporary_reprice_allowance": false
-        },
-        "60": {
-          "actual_elapsed_percent": 96.123,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 18.941,
-          "eta_error_seconds": 45.295,
-          "progress_error_points": -20.123,
-          "reprice_reason": null,
-          "shown_percent": 76.0,
-          "status": "recorded",
-          "temporary_reprice_allowance": false
-        },
-        "80": {
-          "actual_elapsed_percent": 96.163,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 18.949,
-          "eta_error_seconds": 45.295,
-          "progress_error_points": -16.163,
-          "reprice_reason": null,
-          "shown_percent": 80.0,
-          "status": "recorded",
-          "temporary_reprice_allowance": false
-        }
-      },
-      "progress_calibration_passed": false,
-      "queue_rate_records_per_minute": 148.672,
-      "schema_version": 1,
-      "size_bytes": 357097,
-      "size_mib": 0.341,
-      "status": "successful",
-      "total_wall_seconds": 19.698,
-      "trial": 2
-    },
-    {
-      "cleanup_state": "preserved_pending_thread_safe_gate",
-      "disjoint_wall_clock_percent": {
-        "preparation": 15.543,
-        "reporting": 2.069,
-        "shared_ingestion": 72.557,
-        "submission": 0.315,
-        "unattributed": 2.169,
-        "validation": 7.348
-      },
-      "disjoint_wall_clock_seconds": {
-        "preparation": 9.389,
-        "reporting": 1.25,
-        "shared_ingestion": 43.83,
-        "submission": 0.19,
-        "unattributed": 1.31,
-        "validation": 4.439
-      },
-      "document_id": "B08",
-      "environment_comparable_to_session_baseline": true,
-      "invalid_for_calibration": false,
-      "invalid_reasons": [],
-      "justified_reprices": [
-        {
-          "elapsed_seconds": 7.536,
-          "expected_seconds": 116,
-          "reason": "exact_segment_count"
-        },
-        {
-          "elapsed_seconds": 23.474,
-          "expected_seconds": 109,
-          "reason": "owned_queue_rate"
-        }
-      ],
-      "ocr_risk": "low",
-      "overlapping_evidence": {
-        "confirmed_vectors": {
-          "finished_monotonic": 54.714,
-          "started_monotonic": 31.18,
-          "wall_seconds": 23.534
-        },
-        "owned_queue": {
-          "finished_monotonic": 30.992,
-          "started_monotonic": 10.889,
-          "wall_seconds": 20.103
-        },
-        "quiet": {
-          "finished_monotonic": null,
-          "started_monotonic": null,
-          "wall_seconds": null
-        },
-        "reconnecting": {
-          "finished_monotonic": null,
-          "started_monotonic": null,
-          "wall_seconds": null
-        },
-        "validation": {
-          "finished_monotonic": 59.154,
-          "started_monotonic": 54.719,
-          "wall_seconds": 4.435
-        }
-      },
-      "page_count": 16,
-      "presentation_controller_version": 11,
-      "presentation_route": "run_automatic_gradio_handler",
-      "profile": "ordinary-page-preserving-upload",
-      "progress_calibration": {
-        "20": {
-          "actual_elapsed_percent": 33.486,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 20.231,
-          "eta_error_seconds": 55.584,
-          "progress_error_points": -13.486,
-          "reprice_reason": null,
-          "shown_percent": 20.0,
-          "status": "recorded",
-          "temporary_reprice_allowance": false
-        },
-        "40": {
-          "actual_elapsed_percent": 74.735,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 45.152,
-          "eta_error_seconds": 48.584,
-          "progress_error_points": -34.735,
-          "reprice_reason": null,
-          "shown_percent": 40.0,
-          "status": "recorded",
-          "temporary_reprice_allowance": false
-        },
-        "60": {
-          "actual_elapsed_percent": 90.57,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 54.719,
-          "eta_error_seconds": 48.584,
-          "progress_error_points": -14.57,
-          "reprice_reason": null,
-          "shown_percent": 76.0,
-          "status": "recorded",
-          "temporary_reprice_allowance": false
-        },
-        "80": {
-          "actual_elapsed_percent": 91.673,
-          "allowed_error_points": 5.0,
-          "elapsed_seconds": 55.385,
-          "eta_error_seconds": 48.584,
-          "progress_error_points": -11.673,
-          "reprice_reason": null,
-          "shown_percent": 80.0,
-          "status": "recorded",
-          "temporary_reprice_allowance": false
-        }
-      },
-      "progress_calibration_passed": false,
-      "queue_rate_records_per_minute": 20.889,
-      "schema_version": 1,
-      "size_bytes": 129162,
-      "size_mib": 0.123,
-      "status": "successful",
-      "total_wall_seconds": 60.408,
-      "trial": 1
-    },
-    {
-      "cleanup_state": "preserved_pending_thread_safe_gate",
-      "disjoint_wall_clock_percent": {
-        "preparation": 19.663,
-        "reporting": 2.069,
-        "shared_ingestion": 52.94,
-        "submission": 0.389,
-        "unattributed": 2.736,
-        "validation": 22.203
-      },
-      "disjoint_wall_clock_seconds": {
-        "preparation": 9.343,
-        "reporting": 0.983,
-        "shared_ingestion": 25.155,
-        "submission": 0.185,
-        "unattributed": 1.3,
-        "validation": 10.55
-      },
-      "document_id": "B08",
-      "environment_comparable_to_session_baseline": true,
-      "invalid_for_calibration": false,
-      "invalid_reasons": [],
-      "justified_reprices": [
-        {
-          "elapsed_seconds": 7.357,
-          "expected_seconds": 116,
-          "reason": "exact_segment_count"
-        },
-        {
-          "elapsed_seconds": 16.356,
+          "elapsed_seconds": 12.61,
           "expected_seconds": 87,
           "reason": "owned_queue_rate"
         }
@@ -1880,14 +1226,14 @@
       "ocr_risk": "low",
       "overlapping_evidence": {
         "confirmed_vectors": {
-          "finished_monotonic": 35.978,
-          "started_monotonic": 30.893,
-          "wall_seconds": 5.085
+          "finished_monotonic": 53.381,
+          "started_monotonic": 11.749,
+          "wall_seconds": 41.632
         },
         "owned_queue": {
-          "finished_monotonic": 29.547,
-          "started_monotonic": 10.828,
-          "wall_seconds": 18.719
+          "finished_monotonic": null,
+          "started_monotonic": null,
+          "wall_seconds": null
         },
         "quiet": {
           "finished_monotonic": null,
@@ -1900,9 +1246,9 @@
           "wall_seconds": null
         },
         "validation": {
-          "finished_monotonic": 46.528,
-          "started_monotonic": 35.983,
-          "wall_seconds": 10.545
+          "finished_monotonic": 53.384,
+          "started_monotonic": 53.384,
+          "wall_seconds": 0.0
         }
       },
       "page_count": 16,
@@ -1911,60 +1257,660 @@
       "profile": "ordinary-page-preserving-upload",
       "progress_calibration": {
         "20": {
-          "actual_elapsed_percent": 34.425,
+          "actual_elapsed_percent": 28.428,
           "allowed_error_points": 5.0,
-          "elapsed_seconds": 16.36,
-          "eta_error_seconds": 39.477,
-          "progress_error_points": -13.425,
+          "elapsed_seconds": 15.241,
+          "eta_error_seconds": 33.387,
+          "progress_error_points": -8.428,
           "reprice_reason": null,
-          "shown_percent": 21.0,
+          "shown_percent": 20.0,
           "status": "recorded",
           "temporary_reprice_allowance": false
         },
         "40": {
-          "actual_elapsed_percent": 75.707,
+          "actual_elapsed_percent": 69.69,
           "allowed_error_points": 5.0,
-          "elapsed_seconds": 35.978,
-          "eta_error_seconds": 39.477,
-          "progress_error_points": -35.707,
+          "elapsed_seconds": 37.363,
+          "eta_error_seconds": 33.387,
+          "progress_error_points": -28.69,
+          "reprice_reason": null,
+          "shown_percent": 41.0,
+          "status": "recorded",
+          "temporary_reprice_allowance": false
+        },
+        "60": {
+          "actual_elapsed_percent": 99.573,
+          "allowed_error_points": 5.0,
+          "elapsed_seconds": 53.384,
+          "eta_error_seconds": 33.387,
+          "progress_error_points": -3.573,
+          "reprice_reason": null,
+          "shown_percent": 96.0,
+          "status": "recorded",
+          "temporary_reprice_allowance": false
+        },
+        "80": {
+          "actual_elapsed_percent": 99.573,
+          "allowed_error_points": 5.0,
+          "elapsed_seconds": 53.384,
+          "eta_error_seconds": 33.387,
+          "progress_error_points": -3.573,
+          "reprice_reason": null,
+          "shown_percent": 96.0,
+          "status": "recorded",
+          "temporary_reprice_allowance": false
+        }
+      },
+      "progress_calibration_passed": false,
+      "queue_rate_records_per_minute": 44075.239,
+      "schema_version": 2,
+      "size_bytes": 1760494,
+      "size_mib": 1.679,
+      "status": "successful",
+      "total_wall_seconds": 53.609,
+      "trial": 1
+    },
+    {
+      "benchmark_runtime_protocol_revision": 3,
+      "calibration_exclusion_reasons": [],
+      "cleanup_state": "preserved_pending_thread_safe_gate",
+      "disjoint_wall_clock_percent": {
+        "preparation": 30.692,
+        "reporting": 1.132,
+        "shared_ingestion": 39.307,
+        "submission": 23.162,
+        "unattributed": 5.686,
+        "validation": 0.021
+      },
+      "disjoint_wall_clock_seconds": {
+        "preparation": 11.465,
+        "reporting": 0.423,
+        "shared_ingestion": 14.683,
+        "submission": 8.652,
+        "unattributed": 2.124,
+        "validation": 0.008
+      },
+      "document_id": "B06",
+      "environment_comparable_to_session_baseline": true,
+      "invalid_for_calibration": false,
+      "invalid_reasons": [],
+      "justified_reprices": [
+        {
+          "elapsed_seconds": 23.964,
+          "expected_seconds": 87,
+          "reason": "owned_queue_rate"
+        }
+      ],
+      "ocr_risk": "low",
+      "overlapping_evidence": {
+        "confirmed_vectors": {
+          "finished_monotonic": 36.918,
+          "started_monotonic": 22.241,
+          "wall_seconds": 14.677
+        },
+        "owned_queue": {
+          "finished_monotonic": null,
+          "started_monotonic": null,
+          "wall_seconds": null
+        },
+        "quiet": {
+          "finished_monotonic": null,
+          "started_monotonic": null,
+          "wall_seconds": null
+        },
+        "reconnecting": {
+          "finished_monotonic": null,
+          "started_monotonic": null,
+          "wall_seconds": null
+        },
+        "validation": {
+          "finished_monotonic": 36.924,
+          "started_monotonic": 36.924,
+          "wall_seconds": 0.0
+        }
+      },
+      "page_count": 16,
+      "presentation_controller_version": 11,
+      "presentation_route": "run_automatic_gradio_handler",
+      "profile": "ordinary-page-preserving-upload",
+      "progress_calibration": {
+        "20": {
+          "actual_elapsed_percent": 77.803,
+          "allowed_error_points": 10.0,
+          "elapsed_seconds": 29.072,
+          "eta_error_seconds": 49.634,
+          "progress_error_points": -57.803,
+          "reprice_reason": "owned_queue_rate",
+          "shown_percent": 20.0,
+          "status": "recorded",
+          "temporary_reprice_allowance": true
+        },
+        "40": {
+          "actual_elapsed_percent": 97.723,
+          "allowed_error_points": 5.0,
+          "elapsed_seconds": 36.515,
+          "eta_error_seconds": 49.634,
+          "progress_error_points": -57.723,
           "reprice_reason": null,
           "shown_percent": 40.0,
           "status": "recorded",
           "temporary_reprice_allowance": false
         },
         "60": {
-          "actual_elapsed_percent": 75.717,
+          "actual_elapsed_percent": 98.817,
           "allowed_error_points": 5.0,
-          "elapsed_seconds": 35.983,
-          "eta_error_seconds": 39.477,
-          "progress_error_points": 0.283,
+          "elapsed_seconds": 36.924,
+          "eta_error_seconds": 49.634,
+          "progress_error_points": -2.817,
           "reprice_reason": null,
-          "shown_percent": 76.0,
+          "shown_percent": 96.0,
           "status": "recorded",
           "temporary_reprice_allowance": false
         },
         "80": {
-          "actual_elapsed_percent": 89.645,
+          "actual_elapsed_percent": 98.817,
           "allowed_error_points": 5.0,
-          "elapsed_seconds": 42.602,
-          "eta_error_seconds": 39.477,
-          "progress_error_points": -9.645,
+          "elapsed_seconds": 36.924,
+          "eta_error_seconds": 49.634,
+          "progress_error_points": -2.817,
           "reprice_reason": null,
-          "shown_percent": 80.0,
+          "shown_percent": 96.0,
           "status": "recorded",
           "temporary_reprice_allowance": false
         }
       },
       "progress_calibration_passed": false,
-      "queue_rate_records_per_minute": 51.953,
-      "schema_version": 1,
+      "queue_rate_records_per_minute": 24243.432,
+      "schema_version": 2,
+      "size_bytes": 1760494,
+      "size_mib": 1.679,
+      "status": "successful",
+      "total_wall_seconds": 37.355,
+      "trial": 2
+    },
+    {
+      "benchmark_runtime_protocol_revision": 3,
+      "calibration_exclusion_reasons": [],
+      "cleanup_state": "preserved_pending_thread_safe_gate",
+      "disjoint_wall_clock_percent": {
+        "preparation": 9.869,
+        "reporting": 0.577,
+        "shared_ingestion": 87.617,
+        "submission": 0.956,
+        "unattributed": 0.972,
+        "validation": 0.009
+      },
+      "disjoint_wall_clock_seconds": {
+        "preparation": 6.47,
+        "reporting": 0.378,
+        "shared_ingestion": 57.441,
+        "submission": 0.627,
+        "unattributed": 0.637,
+        "validation": 0.006
+      },
+      "document_id": "B07",
+      "environment_comparable_to_session_baseline": true,
+      "invalid_for_calibration": false,
+      "invalid_reasons": [],
+      "justified_reprices": [
+        {
+          "elapsed_seconds": 3.604,
+          "expected_seconds": 107,
+          "reason": "exact_segment_count"
+        },
+        {
+          "elapsed_seconds": 8.453,
+          "expected_seconds": 81,
+          "reason": "owned_queue_rate"
+        }
+      ],
+      "ocr_risk": "low",
+      "overlapping_evidence": {
+        "confirmed_vectors": {
+          "finished_monotonic": 65.167,
+          "started_monotonic": 7.734,
+          "wall_seconds": 57.433
+        },
+        "owned_queue": {
+          "finished_monotonic": null,
+          "started_monotonic": null,
+          "wall_seconds": null
+        },
+        "quiet": {
+          "finished_monotonic": null,
+          "started_monotonic": null,
+          "wall_seconds": null
+        },
+        "reconnecting": {
+          "finished_monotonic": null,
+          "started_monotonic": null,
+          "wall_seconds": null
+        },
+        "validation": {
+          "finished_monotonic": 65.175,
+          "started_monotonic": 65.175,
+          "wall_seconds": 0.0
+        }
+      },
+      "page_count": 15,
+      "presentation_controller_version": 11,
+      "presentation_route": "run_automatic_gradio_handler",
+      "profile": "ordinary-page-preserving-upload",
+      "progress_calibration": {
+        "20": {
+          "actual_elapsed_percent": 21.312,
+          "allowed_error_points": 5.0,
+          "elapsed_seconds": 13.975,
+          "eta_error_seconds": 15.427,
+          "progress_error_points": -1.312,
+          "reprice_reason": null,
+          "shown_percent": 20.0,
+          "status": "recorded",
+          "temporary_reprice_allowance": false
+        },
+        "40": {
+          "actual_elapsed_percent": 52.223,
+          "allowed_error_points": 5.0,
+          "elapsed_seconds": 34.244,
+          "eta_error_seconds": 15.427,
+          "progress_error_points": -11.223,
+          "reprice_reason": null,
+          "shown_percent": 41.0,
+          "status": "recorded",
+          "temporary_reprice_allowance": false
+        },
+        "60": {
+          "actual_elapsed_percent": 80.213,
+          "allowed_error_points": 5.0,
+          "elapsed_seconds": 52.598,
+          "eta_error_seconds": 15.427,
+          "progress_error_points": -20.213,
+          "reprice_reason": null,
+          "shown_percent": 60.0,
+          "status": "recorded",
+          "temporary_reprice_allowance": false
+        },
+        "80": {
+          "actual_elapsed_percent": 99.393,
+          "allowed_error_points": 5.0,
+          "elapsed_seconds": 65.175,
+          "eta_error_seconds": 15.427,
+          "progress_error_points": -3.393,
+          "reprice_reason": null,
+          "shown_percent": 96.0,
+          "status": "recorded",
+          "temporary_reprice_allowance": false
+        }
+      },
+      "progress_calibration_passed": false,
+      "queue_rate_records_per_minute": 59956.545,
+      "schema_version": 2,
+      "size_bytes": 357097,
+      "size_mib": 0.341,
+      "status": "successful",
+      "total_wall_seconds": 65.559,
+      "trial": 1
+    },
+    {
+      "benchmark_runtime_protocol_revision": 3,
+      "calibration_exclusion_reasons": [],
+      "cleanup_state": "preserved_pending_thread_safe_gate",
+      "disjoint_wall_clock_percent": {
+        "preparation": 29.385,
+        "reporting": 1.215,
+        "shared_ingestion": 39.5,
+        "submission": 24.652,
+        "unattributed": 5.227,
+        "validation": 0.021
+      },
+      "disjoint_wall_clock_seconds": {
+        "preparation": 9.816,
+        "reporting": 0.406,
+        "shared_ingestion": 13.195,
+        "submission": 8.235,
+        "unattributed": 1.746,
+        "validation": 0.007
+      },
+      "document_id": "B07",
+      "environment_comparable_to_session_baseline": true,
+      "invalid_for_calibration": false,
+      "invalid_reasons": [],
+      "justified_reprices": [
+        {
+          "elapsed_seconds": 10.033,
+          "expected_seconds": 108,
+          "reason": "exact_segment_count"
+        },
+        {
+          "elapsed_seconds": 21.613,
+          "expected_seconds": 81,
+          "reason": "owned_queue_rate"
+        }
+      ],
+      "ocr_risk": "low",
+      "overlapping_evidence": {
+        "confirmed_vectors": {
+          "finished_monotonic": 32.986,
+          "started_monotonic": 19.797,
+          "wall_seconds": 13.189
+        },
+        "owned_queue": {
+          "finished_monotonic": null,
+          "started_monotonic": null,
+          "wall_seconds": null
+        },
+        "quiet": {
+          "finished_monotonic": null,
+          "started_monotonic": null,
+          "wall_seconds": null
+        },
+        "reconnecting": {
+          "finished_monotonic": null,
+          "started_monotonic": null,
+          "wall_seconds": null
+        },
+        "validation": {
+          "finished_monotonic": 32.992,
+          "started_monotonic": 32.992,
+          "wall_seconds": 0.0
+        }
+      },
+      "page_count": 15,
+      "presentation_controller_version": 11,
+      "presentation_route": "run_automatic_gradio_handler",
+      "profile": "ordinary-page-preserving-upload",
+      "progress_calibration": {
+        "20": {
+          "actual_elapsed_percent": 77.854,
+          "allowed_error_points": 10.0,
+          "elapsed_seconds": 26.021,
+          "eta_error_seconds": 47.577,
+          "progress_error_points": -57.854,
+          "reprice_reason": "owned_queue_rate",
+          "shown_percent": 20.0,
+          "status": "recorded",
+          "temporary_reprice_allowance": true
+        },
+        "40": {
+          "actual_elapsed_percent": 98.71,
+          "allowed_error_points": 5.0,
+          "elapsed_seconds": 32.992,
+          "eta_error_seconds": 47.577,
+          "progress_error_points": -2.71,
+          "reprice_reason": null,
+          "shown_percent": 96.0,
+          "status": "recorded",
+          "temporary_reprice_allowance": false
+        },
+        "60": {
+          "actual_elapsed_percent": 98.71,
+          "allowed_error_points": 5.0,
+          "elapsed_seconds": 32.992,
+          "eta_error_seconds": 47.577,
+          "progress_error_points": -2.71,
+          "reprice_reason": null,
+          "shown_percent": 96.0,
+          "status": "recorded",
+          "temporary_reprice_allowance": false
+        },
+        "80": {
+          "actual_elapsed_percent": 98.71,
+          "allowed_error_points": 5.0,
+          "elapsed_seconds": 32.992,
+          "eta_error_seconds": 47.577,
+          "progress_error_points": -2.71,
+          "reprice_reason": null,
+          "shown_percent": 96.0,
+          "status": "recorded",
+          "temporary_reprice_allowance": false
+        }
+      },
+      "progress_calibration_passed": false,
+      "queue_rate_records_per_minute": 27060.357,
+      "schema_version": 2,
+      "size_bytes": 357097,
+      "size_mib": 0.341,
+      "status": "successful",
+      "total_wall_seconds": 33.405,
+      "trial": 2
+    },
+    {
+      "benchmark_runtime_protocol_revision": 3,
+      "calibration_exclusion_reasons": [],
+      "cleanup_state": "preserved_pending_thread_safe_gate",
+      "disjoint_wall_clock_percent": {
+        "preparation": 52.038,
+        "reporting": 1.25,
+        "shared_ingestion": 38.709,
+        "submission": 3.317,
+        "unattributed": 4.67,
+        "validation": 0.017
+      },
+      "disjoint_wall_clock_seconds": {
+        "preparation": 18.733,
+        "reporting": 0.45,
+        "shared_ingestion": 13.935,
+        "submission": 1.194,
+        "unattributed": 1.681,
+        "validation": 0.006
+      },
+      "document_id": "B08",
+      "environment_comparable_to_session_baseline": true,
+      "invalid_for_calibration": false,
+      "invalid_reasons": [],
+      "justified_reprices": [
+        {
+          "elapsed_seconds": 23.213,
+          "expected_seconds": 87,
+          "reason": "owned_queue_rate"
+        }
+      ],
+      "ocr_risk": "low",
+      "overlapping_evidence": {
+        "confirmed_vectors": {
+          "finished_monotonic": 35.536,
+          "started_monotonic": 21.608,
+          "wall_seconds": 13.928
+        },
+        "owned_queue": {
+          "finished_monotonic": null,
+          "started_monotonic": null,
+          "wall_seconds": null
+        },
+        "quiet": {
+          "finished_monotonic": null,
+          "started_monotonic": null,
+          "wall_seconds": null
+        },
+        "reconnecting": {
+          "finished_monotonic": null,
+          "started_monotonic": null,
+          "wall_seconds": null
+        },
+        "validation": {
+          "finished_monotonic": 35.543,
+          "started_monotonic": 35.543,
+          "wall_seconds": 0.0
+        }
+      },
+      "page_count": 16,
+      "presentation_controller_version": 11,
+      "presentation_route": "run_automatic_gradio_handler",
+      "profile": "ordinary-page-preserving-upload",
+      "progress_calibration": {
+        "20": {
+          "actual_elapsed_percent": 78.654,
+          "allowed_error_points": 5.0,
+          "elapsed_seconds": 28.324,
+          "eta_error_seconds": 50.989,
+          "progress_error_points": -45.654,
+          "reprice_reason": null,
+          "shown_percent": 33.0,
+          "status": "recorded",
+          "temporary_reprice_allowance": false
+        },
+        "40": {
+          "actual_elapsed_percent": 98.681,
+          "allowed_error_points": 5.0,
+          "elapsed_seconds": 35.536,
+          "eta_error_seconds": 50.989,
+          "progress_error_points": -58.681,
+          "reprice_reason": null,
+          "shown_percent": 40.0,
+          "status": "recorded",
+          "temporary_reprice_allowance": false
+        },
+        "60": {
+          "actual_elapsed_percent": 98.7,
+          "allowed_error_points": 5.0,
+          "elapsed_seconds": 35.543,
+          "eta_error_seconds": 50.989,
+          "progress_error_points": -2.7,
+          "reprice_reason": null,
+          "shown_percent": 96.0,
+          "status": "recorded",
+          "temporary_reprice_allowance": false
+        },
+        "80": {
+          "actual_elapsed_percent": 98.7,
+          "allowed_error_points": 5.0,
+          "elapsed_seconds": 35.543,
+          "eta_error_seconds": 50.989,
+          "progress_error_points": -2.7,
+          "reprice_reason": null,
+          "shown_percent": 96.0,
+          "status": "recorded",
+          "temporary_reprice_allowance": false
+        }
+      },
+      "progress_calibration_passed": false,
+      "queue_rate_records_per_minute": 28006.286,
+      "schema_version": 2,
       "size_bytes": 129162,
       "size_mib": 0.123,
       "status": "successful",
-      "total_wall_seconds": 47.516,
+      "total_wall_seconds": 35.999,
+      "trial": 1
+    },
+    {
+      "benchmark_runtime_protocol_revision": 3,
+      "calibration_exclusion_reasons": [],
+      "cleanup_state": "preserved_pending_thread_safe_gate",
+      "disjoint_wall_clock_percent": {
+        "preparation": 27.568,
+        "reporting": 1.484,
+        "shared_ingestion": 43.918,
+        "submission": 21.943,
+        "unattributed": 5.069,
+        "validation": 0.018
+      },
+      "disjoint_wall_clock_seconds": {
+        "preparation": 7.744,
+        "reporting": 0.417,
+        "shared_ingestion": 12.337,
+        "submission": 6.164,
+        "unattributed": 1.424,
+        "validation": 0.005
+      },
+      "document_id": "B08",
+      "environment_comparable_to_session_baseline": true,
+      "invalid_for_calibration": false,
+      "invalid_reasons": [],
+      "justified_reprices": [
+        {
+          "elapsed_seconds": 16.61,
+          "expected_seconds": 87,
+          "reason": "owned_queue_rate"
+        }
+      ],
+      "ocr_risk": "low",
+      "overlapping_evidence": {
+        "confirmed_vectors": {
+          "finished_monotonic": 27.662,
+          "started_monotonic": 15.332,
+          "wall_seconds": 12.33
+        },
+        "owned_queue": {
+          "finished_monotonic": null,
+          "started_monotonic": null,
+          "wall_seconds": null
+        },
+        "quiet": {
+          "finished_monotonic": null,
+          "started_monotonic": null,
+          "wall_seconds": null
+        },
+        "reconnecting": {
+          "finished_monotonic": null,
+          "started_monotonic": null,
+          "wall_seconds": null
+        },
+        "validation": {
+          "finished_monotonic": 27.669,
+          "started_monotonic": 27.669,
+          "wall_seconds": 0.0
+        }
+      },
+      "page_count": 16,
+      "presentation_controller_version": 11,
+      "presentation_route": "run_automatic_gradio_handler",
+      "profile": "ordinary-page-preserving-upload",
+      "progress_calibration": {
+        "20": {
+          "actual_elapsed_percent": 79.57,
+          "allowed_error_points": 10.0,
+          "elapsed_seconds": 22.36,
+          "eta_error_seconds": 58.899,
+          "progress_error_points": -59.57,
+          "reprice_reason": "owned_queue_rate",
+          "shown_percent": 20.0,
+          "status": "recorded",
+          "temporary_reprice_allowance": true
+        },
+        "40": {
+          "actual_elapsed_percent": 98.463,
+          "allowed_error_points": 5.0,
+          "elapsed_seconds": 27.669,
+          "eta_error_seconds": 58.899,
+          "progress_error_points": -2.463,
+          "reprice_reason": null,
+          "shown_percent": 96.0,
+          "status": "recorded",
+          "temporary_reprice_allowance": false
+        },
+        "60": {
+          "actual_elapsed_percent": 98.463,
+          "allowed_error_points": 5.0,
+          "elapsed_seconds": 27.669,
+          "eta_error_seconds": 58.899,
+          "progress_error_points": -2.463,
+          "reprice_reason": null,
+          "shown_percent": 96.0,
+          "status": "recorded",
+          "temporary_reprice_allowance": false
+        },
+        "80": {
+          "actual_elapsed_percent": 98.463,
+          "allowed_error_points": 5.0,
+          "elapsed_seconds": 27.669,
+          "eta_error_seconds": 58.899,
+          "progress_error_points": -2.463,
+          "reprice_reason": null,
+          "shown_percent": 96.0,
+          "status": "recorded",
+          "temporary_reprice_allowance": false
+        }
+      },
+      "progress_calibration_passed": false,
+      "queue_rate_records_per_minute": 32148.639,
+      "schema_version": 2,
+      "size_bytes": 129162,
+      "size_mib": 0.123,
+      "status": "successful",
+      "total_wall_seconds": 28.091,
       "trial": 2
     }
   ],
-  "state": "awaiting-rerun",
-  "timing_runs_state": "awaiting-rerun"
+  "state": "calibration-failed",
+  "timing_runs_state": "completed"
 }

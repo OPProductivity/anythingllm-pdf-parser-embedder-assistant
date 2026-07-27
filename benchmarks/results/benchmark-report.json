@@ -2,267 +2,33 @@
   "calibration": {
     "checkpoint_accuracy": {
       "20": {
-        "eta_error_mean_seconds": null,
-        "eta_error_median_seconds": null,
-        "progress_error_mean_points": null,
-        "progress_error_median_points": null
+        "eta_error_mean_seconds": 53.705,
+        "eta_error_median_seconds": 50.989,
+        "progress_error_mean_points": -46.831,
+        "progress_error_median_points": -55.406
       },
       "40": {
-        "eta_error_mean_seconds": null,
-        "eta_error_median_seconds": null,
-        "progress_error_mean_points": null,
-        "progress_error_median_points": null
+        "eta_error_mean_seconds": 53.705,
+        "eta_error_median_seconds": 50.989,
+        "progress_error_mean_points": -22.093,
+        "progress_error_median_points": -11.223
       },
       "60": {
-        "eta_error_mean_seconds": null,
-        "eta_error_median_seconds": null,
-        "progress_error_mean_points": null,
-        "progress_error_median_points": null
+        "eta_error_mean_seconds": 53.705,
+        "eta_error_median_seconds": 50.989,
+        "progress_error_mean_points": -7.98,
+        "progress_error_median_points": -2.817
       },
       "80": {
-        "eta_error_mean_seconds": null,
-        "eta_error_median_seconds": null,
-        "progress_error_mean_points": null,
-        "progress_error_median_points": null
+        "eta_error_mean_seconds": 53.705,
+        "eta_error_median_seconds": 50.989,
+        "progress_error_mean_points": -2.895,
+        "progress_error_median_points": -2.786
       }
     },
     "outlier_bounds_seconds": {
-      "lower": null,
-      "upper": null
-    },
-    "outliers": [],
-    "page_count_quartiles": {
-      "groups": {
-        "lower": {
-          "run_count": 0,
-          "stage_share": {
-            "preparation": {
-              "mean_percent": null,
-              "mean_seconds": null,
-              "median_percent": null,
-              "median_seconds": null
-            },
-            "reporting": {
-              "mean_percent": null,
-              "mean_seconds": null,
-              "median_percent": null,
-              "median_seconds": null
-            },
-            "shared_ingestion": {
-              "mean_percent": null,
-              "mean_seconds": null,
-              "median_percent": null,
-              "median_seconds": null
-            },
-            "submission": {
-              "mean_percent": null,
-              "mean_seconds": null,
-              "median_percent": null,
-              "median_seconds": null
-            },
-            "unattributed": {
-              "mean_percent": null,
-              "mean_seconds": null,
-              "median_percent": null,
-              "median_seconds": null
-            },
-            "validation": {
-              "mean_percent": null,
-              "mean_seconds": null,
-              "median_percent": null,
-              "median_seconds": null
-            }
-          },
-          "total_duration": {
-            "mean_seconds": null,
-            "median_seconds": null
-          }
-        },
-        "median": {
-          "run_count": 0,
-          "stage_share": {
-            "preparation": {
-              "mean_percent": null,
-              "mean_seconds": null,
-              "median_percent": null,
-              "median_seconds": null
-            },
-            "reporting": {
-              "mean_percent": null,
-              "mean_seconds": null,
-              "median_percent": null,
-              "median_seconds": null
-            },
-            "shared_ingestion": {
-              "mean_percent": null,
-              "mean_seconds": null,
-              "median_percent": null,
-              "median_seconds": null
-            },
-            "submission": {
-              "mean_percent": null,
-              "mean_seconds": null,
-              "median_percent": null,
-              "median_seconds": null
-            },
-            "unattributed": {
-              "mean_percent": null,
-              "mean_seconds": null,
-              "median_percent": null,
-              "median_seconds": null
-            },
-            "validation": {
-              "mean_percent": null,
-              "mean_seconds": null,
-              "median_percent": null,
-              "median_seconds": null
-            }
-          },
-          "total_duration": {
-            "mean_seconds": null,
-            "median_seconds": null
-          }
-        },
-        "upper": {
-          "run_count": 0,
-          "stage_share": {
-            "preparation": {
-              "mean_percent": null,
-              "mean_seconds": null,
-              "median_percent": null,
-              "median_seconds": null
-            },
-            "reporting": {
-              "mean_percent": null,
-              "mean_seconds": null,
-              "median_percent": null,
-              "median_seconds": null
-            },
-            "shared_ingestion": {
-              "mean_percent": null,
-              "mean_seconds": null,
-              "median_percent": null,
-              "median_seconds": null
-            },
-            "submission": {
-              "mean_percent": null,
-              "mean_seconds": null,
-              "median_percent": null,
-              "median_seconds": null
-            },
-            "unattributed": {
-              "mean_percent": null,
-              "mean_seconds": null,
-              "median_percent": null,
-              "median_seconds": null
-            },
-            "validation": {
-              "mean_percent": null,
-              "mean_seconds": null,
-              "median_percent": null,
-              "median_seconds": null
-            }
-          },
-          "total_duration": {
-            "mean_seconds": null,
-            "median_seconds": null
-          }
-        }
-      },
-      "lower_threshold": null,
-      "upper_threshold": null
-    },
-    "queue_rate_records_per_minute": {
-      "mean": null,
-      "median": null
-    },
-    "run_count": 0,
-    "stage_summary": {
-      "preparation": {
-        "mean_percent": null,
-        "mean_seconds": null,
-        "median_percent": null,
-        "median_seconds": null
-      },
-      "reporting": {
-        "mean_percent": null,
-        "mean_seconds": null,
-        "median_percent": null,
-        "median_seconds": null
-      },
-      "shared_ingestion": {
-        "mean_percent": null,
-        "mean_seconds": null,
-        "median_percent": null,
-        "median_seconds": null
-      },
-      "submission": {
-        "mean_percent": null,
-        "mean_seconds": null,
-        "median_percent": null,
-        "median_seconds": null
-      },
-      "unattributed": {
-        "mean_percent": null,
-        "mean_seconds": null,
-        "median_percent": null,
-        "median_seconds": null
-      },
-      "validation": {
-        "mean_percent": null,
-        "mean_seconds": null,
-        "median_percent": null,
-        "median_seconds": null
-      }
-    },
-    "table": [],
-    "total_duration": {
-      "max_seconds": null,
-      "mean_seconds": null,
-      "median_seconds": null,
-      "min_seconds": null
-    },
-    "trial_to_trial_variance": []
-  },
-  "data_quality": {
-    "calibration_acceptance": "pending",
-    "calibration_eligible_run_count": 0,
-    "calibration_excluded_run_count": 16,
-    "calibration_failed_count": 0,
-    "calibration_passed_count": 0,
-    "note": "Operational metrics include all completed runs. Calibration metrics include only successful, environment-comparable, observer-healthy current-protocol runs.",
-    "operational_completed_run_count": 16
-  },
-  "operational": {
-    "checkpoint_accuracy": {
-      "20": {
-        "eta_error_mean_seconds": 24.643,
-        "eta_error_median_seconds": 36.427,
-        "progress_error_mean_points": -11.274,
-        "progress_error_median_points": -10.61
-      },
-      "40": {
-        "eta_error_mean_seconds": 17.58,
-        "eta_error_median_seconds": 19.465,
-        "progress_error_mean_points": -16.779,
-        "progress_error_median_points": -19.202
-      },
-      "60": {
-        "eta_error_mean_seconds": 20.58,
-        "eta_error_median_seconds": 25.557,
-        "progress_error_mean_points": -10.181,
-        "progress_error_median_points": -14.158
-      },
-      "80": {
-        "eta_error_mean_seconds": 19.143,
-        "eta_error_median_seconds": 25.557,
-        "progress_error_mean_points": -10.369,
-        "progress_error_median_points": -12.088
-      }
-    },
-    "outlier_bounds_seconds": {
-      "lower": -7.153,
-      "upper": 137.994
+      "lower": 4.027,
+      "upper": 75.283
     },
     "outliers": [],
     "page_count_quartiles": {
@@ -271,135 +37,135 @@
           "run_count": 6,
           "stage_share": {
             "preparation": {
-              "mean_percent": 22.284,
-              "mean_seconds": 9.146,
-              "median_percent": 18.929,
-              "median_seconds": 9.351
+              "mean_percent": 28.102,
+              "mean_seconds": 10.741,
+              "median_percent": 28.477,
+              "median_seconds": 10.016
             },
             "reporting": {
-              "mean_percent": 2.361,
-              "mean_seconds": 1.03,
-              "median_percent": 2.125,
-              "median_seconds": 1.053
+              "mean_percent": 1.012,
+              "mean_seconds": 0.383,
+              "median_percent": 1.173,
+              "median_seconds": 0.411
             },
             "shared_ingestion": {
-              "mean_percent": 60.87,
-              "mean_seconds": 29.32,
-              "median_percent": 61.992,
-              "median_seconds": 30.331
+              "mean_percent": 54.453,
+              "mean_seconds": 25.538,
+              "median_percent": 41.709,
+              "median_seconds": 14.309
             },
             "submission": {
-              "mean_percent": 0.458,
-              "mean_seconds": 0.186,
-              "median_percent": 0.371,
-              "median_seconds": 0.185
+              "mean_percent": 12.55,
+              "mean_seconds": 4.259,
+              "median_percent": 12.63,
+              "median_seconds": 3.679
             },
             "unattributed": {
-              "mean_percent": 3.302,
-              "mean_seconds": 1.333,
-              "median_percent": 2.667,
-              "median_seconds": 1.341
+              "mean_percent": 3.869,
+              "mean_seconds": 1.411,
+              "median_percent": 4.87,
+              "median_seconds": 1.552
             },
             "validation": {
-              "mean_percent": 10.725,
-              "mean_seconds": 5.676,
-              "median_percent": 5.592,
-              "median_seconds": 3.208
+              "mean_percent": 0.015,
+              "mean_seconds": 0.006,
+              "median_percent": 0.018,
+              "median_seconds": 0.006
             }
           },
           "total_duration": {
-            "mean_seconds": 46.691,
-            "median_seconds": 49.537
+            "mean_seconds": 42.336,
+            "median_seconds": 36.677
           }
         },
         "median": {
           "run_count": 4,
           "stage_share": {
             "preparation": {
-              "mean_percent": 19.082,
-              "mean_seconds": 13.936,
-              "median_percent": 13.475,
-              "median_seconds": 13.875
+              "mean_percent": 35.965,
+              "mean_seconds": 12.924,
+              "median_percent": 35.87,
+              "median_seconds": 11.335
             },
             "reporting": {
-              "mean_percent": 1.377,
-              "mean_seconds": 1.05,
-              "median_percent": 1.097,
-              "median_seconds": 1.048
+              "mean_percent": 1.257,
+              "mean_seconds": 0.452,
+              "median_percent": 1.24,
+              "median_seconds": 0.418
             },
             "shared_ingestion": {
-              "mean_percent": 57.77,
-              "mean_seconds": 53.761,
-              "median_percent": 63.478,
-              "median_seconds": 64.347
+              "mean_percent": 46.744,
+              "mean_seconds": 16.933,
+              "median_percent": 44.492,
+              "median_seconds": 15.326
             },
             "submission": {
-              "mean_percent": 0.224,
-              "mean_seconds": 0.172,
-              "median_percent": 0.194,
-              "median_seconds": 0.172
+              "mean_percent": 12.191,
+              "mean_seconds": 4.906,
+              "median_percent": 11.19,
+              "median_seconds": 4.877
             },
             "unattributed": {
-              "mean_percent": 1.758,
-              "mean_seconds": 1.336,
-              "median_percent": 1.47,
-              "median_seconds": 1.321
+              "mean_percent": 3.829,
+              "mean_seconds": 1.285,
+              "median_percent": 4.02,
+              "median_seconds": 1.295
             },
             "validation": {
-              "mean_percent": 19.788,
-              "mean_seconds": 15.518,
-              "median_percent": 21.323,
-              "median_seconds": 16.929
+              "mean_percent": 0.014,
+              "mean_seconds": 0.005,
+              "median_percent": 0.015,
+              "median_seconds": 0.005
             }
           },
           "total_duration": {
-            "mean_seconds": 85.772,
-            "median_seconds": 90.019
+            "mean_seconds": 36.505,
+            "median_seconds": 40.198
           }
         },
         "upper": {
-          "run_count": 6,
+          "run_count": 5,
           "stage_share": {
             "preparation": {
-              "mean_percent": 21.68,
-              "mean_seconds": 12.05,
-              "median_percent": 21.293,
-              "median_seconds": 11.952
+              "mean_percent": 22.298,
+              "mean_seconds": 8.594,
+              "median_percent": 22.358,
+              "median_seconds": 10.849
             },
             "reporting": {
-              "mean_percent": 3.226,
-              "mean_seconds": 1.583,
-              "median_percent": 2.071,
-              "median_seconds": 1.232
+              "mean_percent": 0.983,
+              "mean_seconds": 0.349,
+              "median_percent": 0.845,
+              "median_seconds": 0.384
             },
             "shared_ingestion": {
-              "mean_percent": 63.03,
-              "mean_seconds": 41.578,
-              "median_percent": 65.132,
-              "median_seconds": 37.748
+              "mean_percent": 45.567,
+              "mean_seconds": 18.078,
+              "median_percent": 44.629,
+              "median_seconds": 21.014
             },
             "submission": {
-              "mean_percent": 0.311,
-              "mean_seconds": 0.176,
-              "median_percent": 0.309,
-              "median_seconds": 0.172
+              "mean_percent": 27.004,
+              "mean_seconds": 10.523,
+              "median_percent": 26.4,
+              "median_seconds": 12.33
             },
             "unattributed": {
-              "mean_percent": 2.663,
-              "mean_seconds": 1.476,
-              "median_percent": 2.739,
-              "median_seconds": 1.404
+              "mean_percent": 4.138,
+              "mean_seconds": 1.503,
+              "median_percent": 3.978,
+              "median_seconds": 1.662
             },
             "validation": {
-              "mean_percent": 9.09,
-              "mean_seconds": 7.365,
-              "median_percent": 7.307,
-              "median_seconds": 3.574
+              "mean_percent": 0.011,
+              "mean_seconds": 0.004,
+              "median_percent": 0.01,
+              "median_seconds": 0.005
             }
           },
           "total_duration": {
-            "mean_seconds": 64.229,
-            "median_seconds": 54.456
+            "mean_seconds": 39.051,
+            "median_seconds": 47.086
           }
         }
       },
@@ -407,46 +173,46 @@
       "upper_threshold": 25.0
     },
     "queue_rate_records_per_minute": {
-      "mean": 71.968,
-      "median": 46.176
+      "mean": 37099.908,
+      "median": 28696.5
     },
-    "run_count": 16,
+    "run_count": 15,
     "stage_summary": {
       "preparation": {
-        "mean_percent": 21.257,
-        "mean_seconds": 11.433,
-        "median_percent": 18.929,
-        "median_seconds": 10.38
+        "mean_percent": 28.264,
+        "mean_seconds": 10.607,
+        "median_percent": 27.376,
+        "median_seconds": 10.216
       },
       "reporting": {
-        "mean_percent": 2.44,
-        "mean_seconds": 1.243,
-        "median_percent": 2.069,
-        "median_seconds": 1.123
+        "mean_percent": 1.068,
+        "mean_seconds": 0.39,
+        "median_percent": 1.171,
+        "median_seconds": 0.406
       },
       "shared_ingestion": {
-        "mean_percent": 60.905,
-        "mean_seconds": 40.027,
-        "median_percent": 64.561,
-        "median_seconds": 36.59
+        "mean_percent": 49.435,
+        "mean_seconds": 20.757,
+        "median_percent": 44.538,
+        "median_seconds": 15.127
       },
       "submission": {
-        "mean_percent": 0.345,
-        "mean_seconds": 0.179,
-        "median_percent": 0.328,
-        "median_seconds": 0.175
+        "mean_percent": 17.272,
+        "mean_seconds": 6.519,
+        "median_percent": 23.162,
+        "median_seconds": 6.164
       },
       "unattributed": {
-        "mean_percent": 2.676,
-        "mean_seconds": 1.387,
-        "median_percent": 2.599,
-        "median_seconds": 1.353
+        "mean_percent": 3.948,
+        "mean_seconds": 1.408,
+        "median_percent": 4.145,
+        "median_seconds": 1.628
       },
       "validation": {
-        "mean_percent": 12.378,
-        "mean_seconds": 8.77,
-        "median_percent": 8.575,
-        "median_seconds": 4.524
+        "mean_percent": 0.013,
+        "mean_seconds": 0.005,
+        "median_percent": 0.012,
+        "median_seconds": 0.006
       }
     },
     "table": [
@@ -456,22 +222,22 @@
         "page_count": 25,
         "progress_calibration_passed": false,
         "stage_percent": {
-          "preparation": 25.77,
-          "reporting": 2.431,
-          "shared_ingestion": 58.084,
-          "submission": 0.364,
-          "unattributed": 3.549,
-          "validation": 9.802
+          "preparation": 22.184,
+          "reporting": 1.19,
+          "shared_ingestion": 44.538,
+          "submission": 26.293,
+          "unattributed": 5.785,
+          "validation": 0.01
         },
         "stage_seconds": {
-          "preparation": 12.118,
-          "reporting": 1.143,
-          "shared_ingestion": 27.313,
-          "submission": 0.171,
-          "unattributed": 1.669,
-          "validation": 4.609
+          "preparation": 4.567,
+          "reporting": 0.245,
+          "shared_ingestion": 9.169,
+          "submission": 5.413,
+          "unattributed": 1.191,
+          "validation": 0.002
         },
-        "total_wall_seconds": 47.023,
+        "total_wall_seconds": 20.587,
         "trial": 1
       },
       {
@@ -480,22 +246,22 @@
         "page_count": 25,
         "progress_calibration_passed": false,
         "stage_percent": {
-          "preparation": 20.251,
-          "reporting": 1.733,
-          "shared_ingestion": 71.01,
-          "submission": 0.29,
-          "unattributed": 2.878,
-          "validation": 3.837
+          "preparation": 24.379,
+          "reporting": 0.816,
+          "shared_ingestion": 44.629,
+          "submission": 26.186,
+          "unattributed": 3.978,
+          "validation": 0.013
         },
         "stage_seconds": {
-          "preparation": 11.37,
-          "reporting": 0.973,
-          "shared_ingestion": 39.868,
-          "submission": 0.163,
-          "unattributed": 1.616,
-          "validation": 2.154
+          "preparation": 11.479,
+          "reporting": 0.384,
+          "shared_ingestion": 21.014,
+          "submission": 12.33,
+          "unattributed": 1.873,
+          "validation": 0.006
         },
-        "total_wall_seconds": 56.144,
+        "total_wall_seconds": 47.086,
         "trial": 2
       },
       {
@@ -504,22 +270,22 @@
         "page_count": 17,
         "progress_calibration_passed": false,
         "stage_percent": {
-          "preparation": 9.467,
-          "reporting": 1.022,
-          "shared_ingestion": 60.582,
-          "submission": 0.183,
-          "unattributed": 1.354,
-          "validation": 27.392
+          "preparation": 42.836,
+          "reporting": 1.31,
+          "shared_ingestion": 47.2,
+          "submission": 3.212,
+          "unattributed": 5.431,
+          "validation": 0.011
         },
         "stage_seconds": {
-          "preparation": 9.089,
-          "reporting": 0.981,
-          "shared_ingestion": 58.162,
-          "submission": 0.176,
-          "unattributed": 1.3,
-          "validation": 26.298
+          "preparation": 7.588,
+          "reporting": 0.232,
+          "shared_ingestion": 8.361,
+          "submission": 0.569,
+          "unattributed": 0.962,
+          "validation": 0.002
         },
-        "total_wall_seconds": 96.006,
+        "total_wall_seconds": 17.714,
         "trial": 1
       },
       {
@@ -528,22 +294,22 @@
         "page_count": 17,
         "progress_calibration_passed": false,
         "stage_percent": {
-          "preparation": 10.827,
-          "reporting": 1.172,
-          "shared_ingestion": 83.933,
-          "submission": 0.205,
-          "unattributed": 1.585,
-          "validation": 2.279
+          "preparation": 27.376,
+          "reporting": 1.171,
+          "shared_ingestion": 41.785,
+          "submission": 25.268,
+          "unattributed": 4.381,
+          "validation": 0.019
         },
         "stage_seconds": {
-          "preparation": 9.098,
-          "reporting": 0.985,
-          "shared_ingestion": 70.531,
-          "submission": 0.172,
-          "unattributed": 1.332,
-          "validation": 1.915
+          "preparation": 10.172,
+          "reporting": 0.435,
+          "shared_ingestion": 15.526,
+          "submission": 9.389,
+          "unattributed": 1.628,
+          "validation": 0.007
         },
-        "total_wall_seconds": 84.033,
+        "total_wall_seconds": 37.157,
         "trial": 2
       },
       {
@@ -552,22 +318,22 @@
         "page_count": 17,
         "progress_calibration_passed": false,
         "stage_percent": {
-          "preparation": 39.912,
-          "reporting": 2.344,
-          "shared_ingestion": 20.193,
-          "submission": 0.363,
-          "unattributed": 2.96,
-          "validation": 34.228
+          "preparation": 28.904,
+          "reporting": 1.709,
+          "shared_ingestion": 66.419,
+          "submission": 1.117,
+          "unattributed": 1.843,
+          "validation": 0.007
         },
         "stage_seconds": {
-          "preparation": 18.903,
-          "reporting": 1.11,
-          "shared_ingestion": 9.564,
-          "submission": 0.172,
-          "unattributed": 1.402,
-          "validation": 16.211
+          "preparation": 12.498,
+          "reporting": 0.739,
+          "shared_ingestion": 28.719,
+          "submission": 0.483,
+          "unattributed": 0.797,
+          "validation": 0.003
         },
-        "total_wall_seconds": 47.362,
+        "total_wall_seconds": 43.239,
         "trial": 1
       },
       {
@@ -576,22 +342,22 @@
         "page_count": 17,
         "progress_calibration_passed": false,
         "stage_percent": {
-          "preparation": 16.123,
-          "reporting": 0.972,
-          "shared_ingestion": 66.373,
-          "submission": 0.145,
-          "unattributed": 1.133,
-          "validation": 15.254
+          "preparation": 44.745,
+          "reporting": 0.837,
+          "shared_ingestion": 31.572,
+          "submission": 19.168,
+          "unattributed": 3.659,
+          "validation": 0.019
         },
         "stage_seconds": {
-          "preparation": 18.652,
-          "reporting": 1.124,
-          "shared_ingestion": 76.786,
-          "submission": 0.168,
-          "unattributed": 1.311,
-          "validation": 17.647
+          "preparation": 21.438,
+          "reporting": 0.401,
+          "shared_ingestion": 15.127,
+          "submission": 9.184,
+          "unattributed": 1.753,
+          "validation": 0.009
         },
-        "total_wall_seconds": 115.688,
+        "total_wall_seconds": 47.912,
         "trial": 2
       },
       {
@@ -600,46 +366,22 @@
         "page_count": 31,
         "progress_calibration_passed": false,
         "stage_percent": {
-          "preparation": 15.505,
-          "reporting": 1.43,
-          "shared_ingestion": 62.748,
-          "submission": 0.209,
-          "unattributed": 1.668,
-          "validation": 18.441
+          "preparation": 19.118,
+          "reporting": 0.717,
+          "shared_ingestion": 49.497,
+          "submission": 27.727,
+          "unattributed": 2.929,
+          "validation": 0.012
         },
         "stage_seconds": {
-          "preparation": 12.932,
-          "reporting": 1.193,
-          "shared_ingestion": 52.337,
-          "submission": 0.174,
-          "unattributed": 1.391,
-          "validation": 15.381
+          "preparation": 10.849,
+          "reporting": 0.407,
+          "shared_ingestion": 28.089,
+          "submission": 15.735,
+          "unattributed": 1.662,
+          "validation": 0.007
         },
-        "total_wall_seconds": 83.408,
-        "trial": 1
-      },
-      {
-        "document_id": "B04",
-        "outlier": false,
-        "page_count": 31,
-        "progress_calibration_passed": false,
-        "stage_percent": {
-          "preparation": 35.765,
-          "reporting": 10.095,
-          "shared_ingestion": 49.493,
-          "submission": 0.493,
-          "unattributed": 4.014,
-          "validation": 0.14
-        },
-        "stage_seconds": {
-          "preparation": 12.474,
-          "reporting": 3.521,
-          "shared_ingestion": 17.262,
-          "submission": 0.172,
-          "unattributed": 1.4,
-          "validation": 0.049
-        },
-        "total_wall_seconds": 34.878,
+        "total_wall_seconds": 56.749,
         "trial": 2
       },
       {
@@ -648,22 +390,22 @@
         "page_count": 25,
         "progress_calibration_passed": false,
         "stage_percent": {
-          "preparation": 22.335,
-          "reporting": 2.409,
-          "shared_ingestion": 67.517,
-          "submission": 0.328,
-          "unattributed": 2.6,
-          "validation": 4.812
+          "preparation": 23.452,
+          "reporting": 1.346,
+          "shared_ingestion": 42.634,
+          "submission": 28.415,
+          "unattributed": 4.145,
+          "validation": 0.009
         },
         "stage_seconds": {
-          "preparation": 11.786,
-          "reporting": 1.271,
-          "shared_ingestion": 35.628,
-          "submission": 0.173,
-          "unattributed": 1.372,
-          "validation": 2.539
+          "preparation": 5.07,
+          "reporting": 0.291,
+          "shared_ingestion": 9.217,
+          "submission": 6.143,
+          "unattributed": 0.896,
+          "validation": 0.002
         },
-        "total_wall_seconds": 52.769,
+        "total_wall_seconds": 21.619,
         "trial": 1
       },
       {
@@ -672,22 +414,22 @@
         "page_count": 25,
         "progress_calibration_passed": false,
         "stage_percent": {
-          "preparation": 10.456,
-          "reporting": 1.259,
-          "shared_ingestion": 69.326,
-          "submission": 0.184,
-          "unattributed": 1.267,
-          "validation": 17.508
+          "preparation": 22.358,
+          "reporting": 0.845,
+          "shared_ingestion": 46.536,
+          "submission": 26.4,
+          "unattributed": 3.851,
+          "validation": 0.01
         },
         "stage_seconds": {
-          "preparation": 11.622,
-          "reporting": 1.399,
-          "shared_ingestion": 77.059,
-          "submission": 0.205,
-          "unattributed": 1.408,
-          "validation": 19.461
+          "preparation": 11.003,
+          "reporting": 0.416,
+          "shared_ingestion": 22.902,
+          "submission": 12.992,
+          "unattributed": 1.895,
+          "validation": 0.005
         },
-        "total_wall_seconds": 111.154,
+        "total_wall_seconds": 49.213,
         "trial": 2
       },
       {
@@ -696,22 +438,22 @@
         "page_count": 16,
         "progress_calibration_passed": false,
         "stage_percent": {
-          "preparation": 16.463,
-          "reporting": 1.975,
-          "shared_ingestion": 51.574,
-          "submission": 0.327,
-          "unattributed": 2.373,
-          "validation": 27.287
+          "preparation": 19.057,
+          "reporting": 0.416,
+          "shared_ingestion": 77.664,
+          "submission": 1.27,
+          "unattributed": 1.589,
+          "validation": 0.004
         },
         "stage_seconds": {
-          "preparation": 9.359,
-          "reporting": 1.123,
-          "shared_ingestion": 29.319,
-          "submission": 0.186,
-          "unattributed": 1.349,
-          "validation": 15.512
+          "preparation": 10.216,
+          "reporting": 0.223,
+          "shared_ingestion": 41.635,
+          "submission": 0.681,
+          "unattributed": 0.852,
+          "validation": 0.002
         },
-        "total_wall_seconds": 56.848,
+        "total_wall_seconds": 53.609,
         "trial": 1
       },
       {
@@ -720,22 +462,22 @@
         "page_count": 16,
         "progress_calibration_passed": false,
         "stage_percent": {
-          "preparation": 18.195,
-          "reporting": 2.182,
-          "shared_ingestion": 72.836,
-          "submission": 0.353,
-          "unattributed": 2.597,
-          "validation": 3.836
+          "preparation": 30.692,
+          "reporting": 1.132,
+          "shared_ingestion": 39.307,
+          "submission": 23.162,
+          "unattributed": 5.686,
+          "validation": 0.021
         },
         "stage_seconds": {
-          "preparation": 9.381,
-          "reporting": 1.125,
-          "shared_ingestion": 37.553,
-          "submission": 0.182,
-          "unattributed": 1.339,
-          "validation": 1.978
+          "preparation": 11.465,
+          "reporting": 0.423,
+          "shared_ingestion": 14.683,
+          "submission": 8.652,
+          "unattributed": 2.124,
+          "validation": 0.008
         },
-        "total_wall_seconds": 51.558,
+        "total_wall_seconds": 37.355,
         "trial": 2
       },
       {
@@ -744,22 +486,22 @@
         "page_count": 15,
         "progress_calibration_passed": false,
         "stage_percent": {
-          "preparation": 19.782,
-          "reporting": 2.226,
-          "shared_ingestion": 71.045,
-          "submission": 0.426,
-          "unattributed": 3.042,
-          "validation": 3.479
+          "preparation": 9.869,
+          "reporting": 0.577,
+          "shared_ingestion": 87.617,
+          "submission": 0.956,
+          "unattributed": 0.972,
+          "validation": 0.009
         },
         "stage_seconds": {
-          "preparation": 8.727,
-          "reporting": 0.982,
-          "shared_ingestion": 31.342,
-          "submission": 0.188,
-          "unattributed": 1.342,
-          "validation": 1.535
+          "preparation": 6.47,
+          "reporting": 0.378,
+          "shared_ingestion": 57.441,
+          "submission": 0.627,
+          "unattributed": 0.637,
+          "validation": 0.006
         },
-        "total_wall_seconds": 44.116,
+        "total_wall_seconds": 65.559,
         "trial": 1
       },
       {
@@ -768,22 +510,22 @@
         "page_count": 15,
         "progress_calibration_passed": false,
         "stage_percent": {
-          "preparation": 44.055,
-          "reporting": 3.645,
-          "shared_ingestion": 44.268,
-          "submission": 0.939,
-          "unattributed": 6.894,
-          "validation": 0.198
+          "preparation": 29.385,
+          "reporting": 1.215,
+          "shared_ingestion": 39.5,
+          "submission": 24.652,
+          "unattributed": 5.227,
+          "validation": 0.021
         },
         "stage_seconds": {
-          "preparation": 8.678,
-          "reporting": 0.718,
-          "shared_ingestion": 8.72,
-          "submission": 0.185,
-          "unattributed": 1.358,
-          "validation": 0.039
+          "preparation": 9.816,
+          "reporting": 0.406,
+          "shared_ingestion": 13.195,
+          "submission": 8.235,
+          "unattributed": 1.746,
+          "validation": 0.007
         },
-        "total_wall_seconds": 19.698,
+        "total_wall_seconds": 33.405,
         "trial": 2
       },
       {
@@ -792,22 +534,22 @@
         "page_count": 16,
         "progress_calibration_passed": false,
         "stage_percent": {
-          "preparation": 15.543,
-          "reporting": 2.069,
-          "shared_ingestion": 72.557,
-          "submission": 0.315,
-          "unattributed": 2.169,
-          "validation": 7.348
-        },
-        "stage_seconds": {
-          "preparation": 9.389,
+          "preparation": 52.038,
           "reporting": 1.25,
-          "shared_ingestion": 43.83,
-          "submission": 0.19,
-          "unattributed": 1.31,
-          "validation": 4.439
+          "shared_ingestion": 38.709,
+          "submission": 3.317,
+          "unattributed": 4.67,
+          "validation": 0.017
         },
-        "total_wall_seconds": 60.408,
+        "stage_seconds": {
+          "preparation": 18.733,
+          "reporting": 0.45,
+          "shared_ingestion": 13.935,
+          "submission": 1.194,
+          "unattributed": 1.681,
+          "validation": 0.006
+        },
+        "total_wall_seconds": 35.999,
         "trial": 1
       },
       {
@@ -816,102 +558,794 @@
         "page_count": 16,
         "progress_calibration_passed": false,
         "stage_percent": {
-          "preparation": 19.663,
-          "reporting": 2.069,
-          "shared_ingestion": 52.94,
-          "submission": 0.389,
-          "unattributed": 2.736,
-          "validation": 22.203
+          "preparation": 27.568,
+          "reporting": 1.484,
+          "shared_ingestion": 43.918,
+          "submission": 21.943,
+          "unattributed": 5.069,
+          "validation": 0.018
         },
         "stage_seconds": {
-          "preparation": 9.343,
-          "reporting": 0.983,
-          "shared_ingestion": 25.155,
-          "submission": 0.185,
-          "unattributed": 1.3,
-          "validation": 10.55
+          "preparation": 7.744,
+          "reporting": 0.417,
+          "shared_ingestion": 12.337,
+          "submission": 6.164,
+          "unattributed": 1.424,
+          "validation": 0.005
         },
-        "total_wall_seconds": 47.516,
+        "total_wall_seconds": 28.091,
         "trial": 2
       }
     ],
     "total_duration": {
-      "max_seconds": 115.688,
-      "mean_seconds": 63.038,
-      "median_seconds": 54.456,
-      "min_seconds": 19.698
+      "max_seconds": 65.559,
+      "mean_seconds": 39.686,
+      "median_seconds": 37.355,
+      "min_seconds": 17.714
     },
     "trial_to_trial_variance": [
       {
-        "absolute_trial_delta_seconds": 9.121,
+        "absolute_trial_delta_seconds": 26.499,
         "document_id": "B01",
-        "max_seconds": 56.144,
-        "mean_seconds": 51.584,
-        "min_seconds": 47.023,
-        "sample_variance_seconds_squared": 41.596,
+        "max_seconds": 47.086,
+        "mean_seconds": 33.837,
+        "min_seconds": 20.587,
+        "sample_variance_seconds_squared": 351.099,
         "trial_count": 2
       },
       {
-        "absolute_trial_delta_seconds": 11.973,
+        "absolute_trial_delta_seconds": 19.443,
         "document_id": "B02",
-        "max_seconds": 96.006,
-        "mean_seconds": 90.019,
-        "min_seconds": 84.033,
-        "sample_variance_seconds_squared": 71.676,
+        "max_seconds": 37.157,
+        "mean_seconds": 27.435,
+        "min_seconds": 17.714,
+        "sample_variance_seconds_squared": 189.015,
         "trial_count": 2
       },
       {
-        "absolute_trial_delta_seconds": 68.326,
+        "absolute_trial_delta_seconds": 4.673,
         "document_id": "B03",
-        "max_seconds": 115.688,
-        "mean_seconds": 81.525,
-        "min_seconds": 47.362,
-        "sample_variance_seconds_squared": 2334.221,
+        "max_seconds": 47.912,
+        "mean_seconds": 45.575,
+        "min_seconds": 43.239,
+        "sample_variance_seconds_squared": 10.918,
         "trial_count": 2
       },
       {
-        "absolute_trial_delta_seconds": 48.53,
+        "absolute_trial_delta_seconds": null,
         "document_id": "B04",
-        "max_seconds": 83.408,
-        "mean_seconds": 59.143,
-        "min_seconds": 34.878,
-        "sample_variance_seconds_squared": 1177.58,
-        "trial_count": 2
+        "max_seconds": 56.749,
+        "mean_seconds": 56.749,
+        "min_seconds": 56.749,
+        "sample_variance_seconds_squared": null,
+        "trial_count": 1
       },
       {
-        "absolute_trial_delta_seconds": 58.385,
+        "absolute_trial_delta_seconds": 27.594,
         "document_id": "B05",
-        "max_seconds": 111.154,
-        "mean_seconds": 81.962,
-        "min_seconds": 52.769,
-        "sample_variance_seconds_squared": 1704.404,
+        "max_seconds": 49.213,
+        "mean_seconds": 35.416,
+        "min_seconds": 21.619,
+        "sample_variance_seconds_squared": 380.714,
         "trial_count": 2
       },
       {
-        "absolute_trial_delta_seconds": 5.29,
+        "absolute_trial_delta_seconds": 16.254,
         "document_id": "B06",
-        "max_seconds": 56.848,
-        "mean_seconds": 54.203,
-        "min_seconds": 51.558,
-        "sample_variance_seconds_squared": 13.992,
+        "max_seconds": 53.609,
+        "mean_seconds": 45.482,
+        "min_seconds": 37.355,
+        "sample_variance_seconds_squared": 132.096,
         "trial_count": 2
       },
       {
-        "absolute_trial_delta_seconds": 24.418,
+        "absolute_trial_delta_seconds": 32.154,
         "document_id": "B07",
-        "max_seconds": 44.116,
-        "mean_seconds": 31.907,
-        "min_seconds": 19.698,
-        "sample_variance_seconds_squared": 298.119,
+        "max_seconds": 65.559,
+        "mean_seconds": 49.482,
+        "min_seconds": 33.405,
+        "sample_variance_seconds_squared": 516.94,
         "trial_count": 2
       },
       {
-        "absolute_trial_delta_seconds": 12.892,
+        "absolute_trial_delta_seconds": 7.908,
         "document_id": "B08",
-        "max_seconds": 60.408,
-        "mean_seconds": 53.962,
-        "min_seconds": 47.516,
-        "sample_variance_seconds_squared": 83.102,
+        "max_seconds": 35.999,
+        "mean_seconds": 32.045,
+        "min_seconds": 28.091,
+        "sample_variance_seconds_squared": 31.268,
+        "trial_count": 2
+      }
+    ]
+  },
+  "data_quality": {
+    "calibration_acceptance": "failed",
+    "calibration_eligible_run_count": 15,
+    "calibration_excluded_run_count": 1,
+    "calibration_failed_count": 15,
+    "calibration_passed_count": 0,
+    "note": "Operational metrics include all completed runs. Calibration metrics include only successful, environment-comparable, observer-healthy current-protocol runs.",
+    "operational_completed_run_count": 16
+  },
+  "operational": {
+    "checkpoint_accuracy": {
+      "20": {
+        "eta_error_mean_seconds": 57.57,
+        "eta_error_median_seconds": 51.911,
+        "progress_error_mean_points": -48.188,
+        "progress_error_median_points": -56.605
+      },
+      "40": {
+        "eta_error_mean_seconds": 57.57,
+        "eta_error_median_seconds": 51.911,
+        "progress_error_mean_points": -20.804,
+        "progress_error_median_points": -7.236
+      },
+      "60": {
+        "eta_error_mean_seconds": 57.57,
+        "eta_error_median_seconds": 51.911,
+        "progress_error_mean_points": -7.573,
+        "progress_error_median_points": -2.801
+      },
+      "80": {
+        "eta_error_mean_seconds": 57.57,
+        "eta_error_median_seconds": 51.911,
+        "progress_error_mean_points": -2.806,
+        "progress_error_median_points": -2.785
+      }
+    },
+    "outlier_bounds_seconds": {
+      "lower": -3.781,
+      "upper": 79.448
+    },
+    "outliers": [],
+    "page_count_quartiles": {
+      "groups": {
+        "lower": {
+          "run_count": 6,
+          "stage_share": {
+            "preparation": {
+              "mean_percent": 28.102,
+              "mean_seconds": 10.741,
+              "median_percent": 28.477,
+              "median_seconds": 10.016
+            },
+            "reporting": {
+              "mean_percent": 1.012,
+              "mean_seconds": 0.383,
+              "median_percent": 1.173,
+              "median_seconds": 0.411
+            },
+            "shared_ingestion": {
+              "mean_percent": 54.453,
+              "mean_seconds": 25.538,
+              "median_percent": 41.709,
+              "median_seconds": 14.309
+            },
+            "submission": {
+              "mean_percent": 12.55,
+              "mean_seconds": 4.259,
+              "median_percent": 12.63,
+              "median_seconds": 3.679
+            },
+            "unattributed": {
+              "mean_percent": 3.869,
+              "mean_seconds": 1.411,
+              "median_percent": 4.87,
+              "median_seconds": 1.552
+            },
+            "validation": {
+              "mean_percent": 0.015,
+              "mean_seconds": 0.006,
+              "median_percent": 0.018,
+              "median_seconds": 0.006
+            }
+          },
+          "total_duration": {
+            "mean_seconds": 42.336,
+            "median_seconds": 36.677
+          }
+        },
+        "median": {
+          "run_count": 4,
+          "stage_share": {
+            "preparation": {
+              "mean_percent": 35.965,
+              "mean_seconds": 12.924,
+              "median_percent": 35.87,
+              "median_seconds": 11.335
+            },
+            "reporting": {
+              "mean_percent": 1.257,
+              "mean_seconds": 0.452,
+              "median_percent": 1.24,
+              "median_seconds": 0.418
+            },
+            "shared_ingestion": {
+              "mean_percent": 46.744,
+              "mean_seconds": 16.933,
+              "median_percent": 44.492,
+              "median_seconds": 15.326
+            },
+            "submission": {
+              "mean_percent": 12.191,
+              "mean_seconds": 4.906,
+              "median_percent": 11.19,
+              "median_seconds": 4.877
+            },
+            "unattributed": {
+              "mean_percent": 3.829,
+              "mean_seconds": 1.285,
+              "median_percent": 4.02,
+              "median_seconds": 1.295
+            },
+            "validation": {
+              "mean_percent": 0.014,
+              "mean_seconds": 0.005,
+              "median_percent": 0.015,
+              "median_seconds": 0.005
+            }
+          },
+          "total_duration": {
+            "mean_seconds": 36.505,
+            "median_seconds": 40.198
+          }
+        },
+        "upper": {
+          "run_count": 6,
+          "stage_share": {
+            "preparation": {
+              "mean_percent": 28.072,
+              "mean_seconds": 9.576,
+              "median_percent": 22.905,
+              "median_seconds": 10.926
+            },
+            "reporting": {
+              "mean_percent": 1.238,
+              "mean_seconds": 0.397,
+              "median_percent": 1.018,
+              "median_seconds": 0.395
+            },
+            "shared_ingestion": {
+              "mean_percent": 43.701,
+              "mean_seconds": 16.523,
+              "median_percent": 44.584,
+              "median_seconds": 15.116
+            },
+            "submission": {
+              "mean_percent": 22.976,
+              "mean_seconds": 8.889,
+              "median_percent": 26.346,
+              "median_seconds": 9.236
+            },
+            "unattributed": {
+              "mean_percent": 4.003,
+              "mean_seconds": 1.394,
+              "median_percent": 3.915,
+              "median_seconds": 1.426
+            },
+            "validation": {
+              "mean_percent": 0.01,
+              "mean_seconds": 0.004,
+              "median_percent": 0.01,
+              "median_seconds": 0.004
+            }
+          },
+          "total_duration": {
+            "mean_seconds": 36.784,
+            "median_seconds": 36.267
+          }
+        }
+      },
+      "lower_threshold": 16.0,
+      "upper_threshold": 25.0
+    },
+    "queue_rate_records_per_minute": {
+      "mean": 36815.27,
+      "median": 30422.569
+    },
+    "run_count": 16,
+    "stage_summary": {
+      "preparation": {
+        "mean_percent": 30.056,
+        "mean_seconds": 10.85,
+        "median_percent": 27.472,
+        "median_seconds": 10.532
+      },
+      "reporting": {
+        "mean_percent": 1.158,
+        "mean_seconds": 0.405,
+        "median_percent": 1.18,
+        "median_seconds": 0.406
+      },
+      "shared_ingestion": {
+        "mean_percent": 48.494,
+        "mean_seconds": 20.006,
+        "median_percent": 44.228,
+        "median_seconds": 14.905
+      },
+      "submission": {
+        "mean_percent": 16.37,
+        "mean_seconds": 6.157,
+        "median_percent": 22.553,
+        "median_seconds": 6.153
+      },
+      "unattributed": {
+        "mean_percent": 3.909,
+        "mean_seconds": 1.373,
+        "median_percent": 4.061,
+        "median_seconds": 1.526
+      },
+      "validation": {
+        "mean_percent": 0.013,
+        "mean_seconds": 0.005,
+        "median_percent": 0.011,
+        "median_seconds": 0.005
+      }
+    },
+    "table": [
+      {
+        "document_id": "B01",
+        "outlier": false,
+        "page_count": 25,
+        "progress_calibration_passed": false,
+        "stage_percent": {
+          "preparation": 22.184,
+          "reporting": 1.19,
+          "shared_ingestion": 44.538,
+          "submission": 26.293,
+          "unattributed": 5.785,
+          "validation": 0.01
+        },
+        "stage_seconds": {
+          "preparation": 4.567,
+          "reporting": 0.245,
+          "shared_ingestion": 9.169,
+          "submission": 5.413,
+          "unattributed": 1.191,
+          "validation": 0.002
+        },
+        "total_wall_seconds": 20.587,
+        "trial": 1
+      },
+      {
+        "document_id": "B01",
+        "outlier": false,
+        "page_count": 25,
+        "progress_calibration_passed": false,
+        "stage_percent": {
+          "preparation": 24.379,
+          "reporting": 0.816,
+          "shared_ingestion": 44.629,
+          "submission": 26.186,
+          "unattributed": 3.978,
+          "validation": 0.013
+        },
+        "stage_seconds": {
+          "preparation": 11.479,
+          "reporting": 0.384,
+          "shared_ingestion": 21.014,
+          "submission": 12.33,
+          "unattributed": 1.873,
+          "validation": 0.006
+        },
+        "total_wall_seconds": 47.086,
+        "trial": 2
+      },
+      {
+        "document_id": "B02",
+        "outlier": false,
+        "page_count": 17,
+        "progress_calibration_passed": false,
+        "stage_percent": {
+          "preparation": 42.836,
+          "reporting": 1.31,
+          "shared_ingestion": 47.2,
+          "submission": 3.212,
+          "unattributed": 5.431,
+          "validation": 0.011
+        },
+        "stage_seconds": {
+          "preparation": 7.588,
+          "reporting": 0.232,
+          "shared_ingestion": 8.361,
+          "submission": 0.569,
+          "unattributed": 0.962,
+          "validation": 0.002
+        },
+        "total_wall_seconds": 17.714,
+        "trial": 1
+      },
+      {
+        "document_id": "B02",
+        "outlier": false,
+        "page_count": 17,
+        "progress_calibration_passed": false,
+        "stage_percent": {
+          "preparation": 27.376,
+          "reporting": 1.171,
+          "shared_ingestion": 41.785,
+          "submission": 25.268,
+          "unattributed": 4.381,
+          "validation": 0.019
+        },
+        "stage_seconds": {
+          "preparation": 10.172,
+          "reporting": 0.435,
+          "shared_ingestion": 15.526,
+          "submission": 9.389,
+          "unattributed": 1.628,
+          "validation": 0.007
+        },
+        "total_wall_seconds": 37.157,
+        "trial": 2
+      },
+      {
+        "document_id": "B03",
+        "outlier": false,
+        "page_count": 17,
+        "progress_calibration_passed": false,
+        "stage_percent": {
+          "preparation": 28.904,
+          "reporting": 1.709,
+          "shared_ingestion": 66.419,
+          "submission": 1.117,
+          "unattributed": 1.843,
+          "validation": 0.007
+        },
+        "stage_seconds": {
+          "preparation": 12.498,
+          "reporting": 0.739,
+          "shared_ingestion": 28.719,
+          "submission": 0.483,
+          "unattributed": 0.797,
+          "validation": 0.003
+        },
+        "total_wall_seconds": 43.239,
+        "trial": 1
+      },
+      {
+        "document_id": "B03",
+        "outlier": false,
+        "page_count": 17,
+        "progress_calibration_passed": false,
+        "stage_percent": {
+          "preparation": 44.745,
+          "reporting": 0.837,
+          "shared_ingestion": 31.572,
+          "submission": 19.168,
+          "unattributed": 3.659,
+          "validation": 0.019
+        },
+        "stage_seconds": {
+          "preparation": 21.438,
+          "reporting": 0.401,
+          "shared_ingestion": 15.127,
+          "submission": 9.184,
+          "unattributed": 1.753,
+          "validation": 0.009
+        },
+        "total_wall_seconds": 47.912,
+        "trial": 2
+      },
+      {
+        "document_id": "B04",
+        "outlier": false,
+        "page_count": 31,
+        "progress_calibration_passed": false,
+        "stage_percent": {
+          "preparation": 56.938,
+          "reporting": 2.515,
+          "shared_ingestion": 34.373,
+          "submission": 2.837,
+          "unattributed": 3.328,
+          "validation": 0.008
+        },
+        "stage_seconds": {
+          "preparation": 14.489,
+          "reporting": 0.64,
+          "shared_ingestion": 8.747,
+          "submission": 0.722,
+          "unattributed": 0.847,
+          "validation": 0.002
+        },
+        "total_wall_seconds": 25.447,
+        "trial": 1
+      },
+      {
+        "document_id": "B04",
+        "outlier": false,
+        "page_count": 31,
+        "progress_calibration_passed": false,
+        "stage_percent": {
+          "preparation": 19.118,
+          "reporting": 0.717,
+          "shared_ingestion": 49.497,
+          "submission": 27.727,
+          "unattributed": 2.929,
+          "validation": 0.012
+        },
+        "stage_seconds": {
+          "preparation": 10.849,
+          "reporting": 0.407,
+          "shared_ingestion": 28.089,
+          "submission": 15.735,
+          "unattributed": 1.662,
+          "validation": 0.007
+        },
+        "total_wall_seconds": 56.749,
+        "trial": 2
+      },
+      {
+        "document_id": "B05",
+        "outlier": false,
+        "page_count": 25,
+        "progress_calibration_passed": false,
+        "stage_percent": {
+          "preparation": 23.452,
+          "reporting": 1.346,
+          "shared_ingestion": 42.634,
+          "submission": 28.415,
+          "unattributed": 4.145,
+          "validation": 0.009
+        },
+        "stage_seconds": {
+          "preparation": 5.07,
+          "reporting": 0.291,
+          "shared_ingestion": 9.217,
+          "submission": 6.143,
+          "unattributed": 0.896,
+          "validation": 0.002
+        },
+        "total_wall_seconds": 21.619,
+        "trial": 1
+      },
+      {
+        "document_id": "B05",
+        "outlier": false,
+        "page_count": 25,
+        "progress_calibration_passed": false,
+        "stage_percent": {
+          "preparation": 22.358,
+          "reporting": 0.845,
+          "shared_ingestion": 46.536,
+          "submission": 26.4,
+          "unattributed": 3.851,
+          "validation": 0.01
+        },
+        "stage_seconds": {
+          "preparation": 11.003,
+          "reporting": 0.416,
+          "shared_ingestion": 22.902,
+          "submission": 12.992,
+          "unattributed": 1.895,
+          "validation": 0.005
+        },
+        "total_wall_seconds": 49.213,
+        "trial": 2
+      },
+      {
+        "document_id": "B06",
+        "outlier": false,
+        "page_count": 16,
+        "progress_calibration_passed": false,
+        "stage_percent": {
+          "preparation": 19.057,
+          "reporting": 0.416,
+          "shared_ingestion": 77.664,
+          "submission": 1.27,
+          "unattributed": 1.589,
+          "validation": 0.004
+        },
+        "stage_seconds": {
+          "preparation": 10.216,
+          "reporting": 0.223,
+          "shared_ingestion": 41.635,
+          "submission": 0.681,
+          "unattributed": 0.852,
+          "validation": 0.002
+        },
+        "total_wall_seconds": 53.609,
+        "trial": 1
+      },
+      {
+        "document_id": "B06",
+        "outlier": false,
+        "page_count": 16,
+        "progress_calibration_passed": false,
+        "stage_percent": {
+          "preparation": 30.692,
+          "reporting": 1.132,
+          "shared_ingestion": 39.307,
+          "submission": 23.162,
+          "unattributed": 5.686,
+          "validation": 0.021
+        },
+        "stage_seconds": {
+          "preparation": 11.465,
+          "reporting": 0.423,
+          "shared_ingestion": 14.683,
+          "submission": 8.652,
+          "unattributed": 2.124,
+          "validation": 0.008
+        },
+        "total_wall_seconds": 37.355,
+        "trial": 2
+      },
+      {
+        "document_id": "B07",
+        "outlier": false,
+        "page_count": 15,
+        "progress_calibration_passed": false,
+        "stage_percent": {
+          "preparation": 9.869,
+          "reporting": 0.577,
+          "shared_ingestion": 87.617,
+          "submission": 0.956,
+          "unattributed": 0.972,
+          "validation": 0.009
+        },
+        "stage_seconds": {
+          "preparation": 6.47,
+          "reporting": 0.378,
+          "shared_ingestion": 57.441,
+          "submission": 0.627,
+          "unattributed": 0.637,
+          "validation": 0.006
+        },
+        "total_wall_seconds": 65.559,
+        "trial": 1
+      },
+      {
+        "document_id": "B07",
+        "outlier": false,
+        "page_count": 15,
+        "progress_calibration_passed": false,
+        "stage_percent": {
+          "preparation": 29.385,
+          "reporting": 1.215,
+          "shared_ingestion": 39.5,
+          "submission": 24.652,
+          "unattributed": 5.227,
+          "validation": 0.021
+        },
+        "stage_seconds": {
+          "preparation": 9.816,
+          "reporting": 0.406,
+          "shared_ingestion": 13.195,
+          "submission": 8.235,
+          "unattributed": 1.746,
+          "validation": 0.007
+        },
+        "total_wall_seconds": 33.405,
+        "trial": 2
+      },
+      {
+        "document_id": "B08",
+        "outlier": false,
+        "page_count": 16,
+        "progress_calibration_passed": false,
+        "stage_percent": {
+          "preparation": 52.038,
+          "reporting": 1.25,
+          "shared_ingestion": 38.709,
+          "submission": 3.317,
+          "unattributed": 4.67,
+          "validation": 0.017
+        },
+        "stage_seconds": {
+          "preparation": 18.733,
+          "reporting": 0.45,
+          "shared_ingestion": 13.935,
+          "submission": 1.194,
+          "unattributed": 1.681,
+          "validation": 0.006
+        },
+        "total_wall_seconds": 35.999,
+        "trial": 1
+      },
+      {
+        "document_id": "B08",
+        "outlier": false,
+        "page_count": 16,
+        "progress_calibration_passed": false,
+        "stage_percent": {
+          "preparation": 27.568,
+          "reporting": 1.484,
+          "shared_ingestion": 43.918,
+          "submission": 21.943,
+          "unattributed": 5.069,
+          "validation": 0.018
+        },
+        "stage_seconds": {
+          "preparation": 7.744,
+          "reporting": 0.417,
+          "shared_ingestion": 12.337,
+          "submission": 6.164,
+          "unattributed": 1.424,
+          "validation": 0.005
+        },
+        "total_wall_seconds": 28.091,
+        "trial": 2
+      }
+    ],
+    "total_duration": {
+      "max_seconds": 65.559,
+      "mean_seconds": 38.796,
+      "median_seconds": 37.256,
+      "min_seconds": 17.714
+    },
+    "trial_to_trial_variance": [
+      {
+        "absolute_trial_delta_seconds": 26.499,
+        "document_id": "B01",
+        "max_seconds": 47.086,
+        "mean_seconds": 33.837,
+        "min_seconds": 20.587,
+        "sample_variance_seconds_squared": 351.099,
+        "trial_count": 2
+      },
+      {
+        "absolute_trial_delta_seconds": 19.443,
+        "document_id": "B02",
+        "max_seconds": 37.157,
+        "mean_seconds": 27.435,
+        "min_seconds": 17.714,
+        "sample_variance_seconds_squared": 189.015,
+        "trial_count": 2
+      },
+      {
+        "absolute_trial_delta_seconds": 4.673,
+        "document_id": "B03",
+        "max_seconds": 47.912,
+        "mean_seconds": 45.575,
+        "min_seconds": 43.239,
+        "sample_variance_seconds_squared": 10.918,
+        "trial_count": 2
+      },
+      {
+        "absolute_trial_delta_seconds": 31.302,
+        "document_id": "B04",
+        "max_seconds": 56.749,
+        "mean_seconds": 41.098,
+        "min_seconds": 25.447,
+        "sample_variance_seconds_squared": 489.908,
+        "trial_count": 2
+      },
+      {
+        "absolute_trial_delta_seconds": 27.594,
+        "document_id": "B05",
+        "max_seconds": 49.213,
+        "mean_seconds": 35.416,
+        "min_seconds": 21.619,
+        "sample_variance_seconds_squared": 380.714,
+        "trial_count": 2
+      },
+      {
+        "absolute_trial_delta_seconds": 16.254,
+        "document_id": "B06",
+        "max_seconds": 53.609,
+        "mean_seconds": 45.482,
+        "min_seconds": 37.355,
+        "sample_variance_seconds_squared": 132.096,
+        "trial_count": 2
+      },
+      {
+        "absolute_trial_delta_seconds": 32.154,
+        "document_id": "B07",
+        "max_seconds": 65.559,
+        "mean_seconds": 49.482,
+        "min_seconds": 33.405,
+        "sample_variance_seconds_squared": 516.94,
+        "trial_count": 2
+      },
+      {
+        "absolute_trial_delta_seconds": 7.908,
+        "document_id": "B08",
+        "max_seconds": 35.999,
+        "mean_seconds": 32.045,
+        "min_seconds": 28.091,
+        "sample_variance_seconds_squared": 31.268,
         "trial_count": 2
       }
     ]

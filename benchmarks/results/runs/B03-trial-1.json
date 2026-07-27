@@ -1,20 +1,22 @@
 {
+  "benchmark_runtime_protocol_revision": 3,
+  "calibration_exclusion_reasons": [],
   "cleanup_state": "preserved_pending_thread_safe_gate",
   "disjoint_wall_clock_percent": {
-    "preparation": 39.912,
-    "reporting": 2.344,
-    "shared_ingestion": 20.193,
-    "submission": 0.363,
-    "unattributed": 2.96,
-    "validation": 34.228
+    "preparation": 28.904,
+    "reporting": 1.709,
+    "shared_ingestion": 66.419,
+    "submission": 1.117,
+    "unattributed": 1.843,
+    "validation": 0.007
   },
   "disjoint_wall_clock_seconds": {
-    "preparation": 18.903,
-    "reporting": 1.11,
-    "shared_ingestion": 9.564,
-    "submission": 0.172,
-    "unattributed": 1.402,
-    "validation": 16.211
+    "preparation": 12.498,
+    "reporting": 0.739,
+    "shared_ingestion": 28.719,
+    "submission": 0.483,
+    "unattributed": 0.797,
+    "validation": 0.003
   },
   "document_id": "B03",
   "environment_comparable_to_session_baseline": true,
@@ -22,22 +24,22 @@
   "invalid_reasons": [],
   "justified_reprices": [
     {
-      "elapsed_seconds": 22.079,
-      "expected_seconds": 64,
+      "elapsed_seconds": 14.394,
+      "expected_seconds": 62,
       "reason": "owned_queue_rate"
     }
   ],
   "ocr_risk": "low",
   "overlapping_evidence": {
     "confirmed_vectors": {
-      "finished_monotonic": 30.037,
-      "started_monotonic": 29.868,
-      "wall_seconds": 0.169
+      "finished_monotonic": 42.493,
+      "started_monotonic": 13.778,
+      "wall_seconds": 28.715
     },
     "owned_queue": {
-      "finished_monotonic": 29.371,
-      "started_monotonic": 20.477,
-      "wall_seconds": 8.894
+      "finished_monotonic": null,
+      "started_monotonic": null,
+      "wall_seconds": null
     },
     "quiet": {
       "finished_monotonic": null,
@@ -50,9 +52,9 @@
       "wall_seconds": null
     },
     "validation": {
-      "finished_monotonic": 46.248,
-      "started_monotonic": 30.041,
-      "wall_seconds": 16.207
+      "finished_monotonic": 42.497,
+      "started_monotonic": 42.497,
+      "wall_seconds": 0.0
     }
   },
   "page_count": 17,
@@ -61,56 +63,56 @@
   "profile": "ordinary-page-preserving-upload",
   "progress_calibration": {
     "20": {
-      "actual_elapsed_percent": 43.229,
+      "actual_elapsed_percent": 37.906,
       "allowed_error_points": 5.0,
-      "elapsed_seconds": 20.477,
-      "eta_error_seconds": 37.631,
-      "progress_error_points": -23.229,
+      "elapsed_seconds": 16.392,
+      "eta_error_seconds": 18.756,
+      "progress_error_points": -9.906,
       "reprice_reason": null,
-      "shown_percent": 20.0,
+      "shown_percent": 28.0,
       "status": "recorded",
       "temporary_reprice_allowance": false
     },
     "40": {
-      "actual_elapsed_percent": 55.435,
+      "actual_elapsed_percent": 60.186,
       "allowed_error_points": 5.0,
-      "elapsed_seconds": 26.259,
-      "eta_error_seconds": 16.631,
-      "progress_error_points": -15.435,
+      "elapsed_seconds": 26.027,
+      "eta_error_seconds": 18.756,
+      "progress_error_points": -20.186,
       "reprice_reason": null,
       "shown_percent": 40.0,
       "status": "recorded",
       "temporary_reprice_allowance": false
     },
     "60": {
-      "actual_elapsed_percent": 63.419,
+      "actual_elapsed_percent": 97.644,
       "allowed_error_points": 5.0,
-      "elapsed_seconds": 30.041,
-      "eta_error_seconds": 16.631,
-      "progress_error_points": 12.581,
+      "elapsed_seconds": 42.225,
+      "eta_error_seconds": 18.756,
+      "progress_error_points": -35.644,
       "reprice_reason": null,
-      "shown_percent": 76.0,
+      "shown_percent": 62.0,
       "status": "recorded",
       "temporary_reprice_allowance": false
     },
     "80": {
-      "actual_elapsed_percent": 86.065,
+      "actual_elapsed_percent": 98.273,
       "allowed_error_points": 5.0,
-      "elapsed_seconds": 40.768,
-      "eta_error_seconds": 16.631,
-      "progress_error_points": -4.065,
+      "elapsed_seconds": 42.497,
+      "eta_error_seconds": 18.756,
+      "progress_error_points": -2.273,
       "reprice_reason": null,
-      "shown_percent": 82.0,
+      "shown_percent": 96.0,
       "status": "recorded",
       "temporary_reprice_allowance": false
     }
   },
   "progress_calibration_passed": false,
-  "queue_rate_records_per_minute": 216.315,
-  "schema_version": 1,
+  "queue_rate_records_per_minute": 54473.262,
+  "schema_version": 2,
   "size_bytes": 1370363,
   "size_mib": 1.307,
   "status": "successful",
-  "total_wall_seconds": 47.362,
+  "total_wall_seconds": 43.239,
   "trial": 1
 }

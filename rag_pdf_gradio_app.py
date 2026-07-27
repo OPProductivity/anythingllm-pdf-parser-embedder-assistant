@@ -31,6 +31,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -408,6 +409,7 @@ AUTOMATIC_RUN_PROGRESS_STALE_SECONDS = 180
 # scripts, so a browser-only watchdog placed there never runs in Chrome.  The
 # middleware below injects this small, self-contained script into the initial
 # HTML document while it is still being parsed by the browser.
+LOCAL_APP_INSTANCE_ID = uuid.uuid4().hex
 APP_CONNECTION_WATCHDOG_HEAD = """
 <style id="rag-local-server-connection-watchdog-style">
   #rag-server-connection-banner {
@@ -461,6 +463,11 @@ APP_CONNECTION_WATCHDOG_HEAD = """
     if (window.ragLocalServerConnectionWatchdogInstalled) return;
     window.ragLocalServerConnectionWatchdogInstalled = true;
     document.documentElement.dataset.ragLocalServerConnectionWatchdog = "installed";
+    // Gradio event IDs and queue sessions are specific to one server process.
+    // A stale browser tab can reach /healthz after a restart, but it cannot
+    // safely submit to the new process. Detect that replacement and reload
+    // before the stale tab presents a misleading "Uploading" row.
+    window.ragLocalServerInstance = "__LOCAL_APP_INSTANCE_ID__";
     const ensureBanner = () => {
       let banner = document.getElementById("rag-server-connection-banner");
       if (banner) return banner;
@@ -478,6 +485,12 @@ APP_CONNECTION_WATCHDOG_HEAD = """
       dismiss.setAttribute("aria-label", "Dismiss connection notice");
       dismiss.textContent = "×";
       dismiss.addEventListener("click", () => {
+        // An offline page is deliberately inert. Do not let the user hide the
+        // only explanation for that state; the notice clears on recovery.
+        if (window.ragLocalServerConnectionState === "offline") {
+          render("offline");
+          return;
+        }
         window.clearTimeout(window.ragLocalServerConnectionDismissTimer);
         banner.hidden = true;
       });
@@ -493,7 +506,7 @@ APP_CONNECTION_WATCHDOG_HEAD = """
       if (state === "offline") {
         banner.hidden = false;
         banner.className = "rag-server-connection-banner offline";
-        message.innerHTML = "<strong>Connection to the PDF app was lost.</strong> The localhost server is not responding. Start or restart the PDF app server. Your existing AnythingLLM work is not changed by this warning.";
+        message.innerHTML = "<strong>The PDF app is unavailable.</strong> The localhost server is not responding, so this page cannot start an upload or run until it reconnects. Start or restart the PDF app server. Your existing AnythingLLM work is not changed by this warning.";
       } else if (state === "reconnected") {
         banner.hidden = false;
         banner.className = "rag-server-connection-banner reconnected";
@@ -506,21 +519,23 @@ APP_CONNECTION_WATCHDOG_HEAD = """
         message.textContent = "";
       }
     };
-    // A native file chooser can still open after the localhost server has
-    // stopped.  Do not let that browser-only selection look accepted: clear it
-    // in the capture phase before Gradio's upload handler can render a row.
-    // This covers both the ordinary PDF picker and the directory picker while
-    // leaving already selected files alone.
-    document.addEventListener("change", (event) => {
-      const input = event.target;
-      if (window.ragLocalServerConnectionState !== "offline"
-          || !(input instanceof HTMLInputElement)
-          || input.type !== "file") return;
-      try { input.value = ""; } catch (_) {}
+    // A stale Gradio page can otherwise still open a native file chooser (or
+    // send a queued click) after its server has stopped. Once the independent
+    // health probe has established that the server is unavailable, fail closed
+    // for the app surface. This is deliberately broader than just file inputs:
+    // no old Gradio event/session can truthfully be used until the page either
+    // reconnects or reloads against the replacement server generation.
+    const blockOfflineAppInteraction = (event) => {
+      if (window.ragLocalServerConnectionState !== "offline") return;
+      if (event.target instanceof Element
+          && event.target.closest("#rag-server-connection-banner")) return;
       event.preventDefault();
       event.stopImmediatePropagation();
       render("offline");
-    }, true);
+    };
+    for (const eventName of ["click", "change", "dragenter", "dragover", "drop"]) {
+      document.addEventListener(eventName, blockOfflineAppInteraction, true);
+    }
     let consecutiveConnectionFailures = 0;
     const poll = async () => {
       const prior = window.ragLocalServerConnectionState || "unknown";
@@ -533,6 +548,13 @@ APP_CONNECTION_WATCHDOG_HEAD = """
           headers: { "Cache-Control": "no-cache" },
         });
         reachable = response.ok;
+        const observedInstance = response.headers.get("X-Local-App-Instance") || "";
+        const expectedInstance = window.ragLocalServerInstance || "";
+        if (reachable && observedInstance && expectedInstance && observedInstance !== expectedInstance) {
+          window.ragLocalServerInstance = observedInstance;
+          window.location.reload();
+          return;
+        }
       } catch (_) {
         reachable = false;
       } finally {
@@ -540,10 +562,12 @@ APP_CONNECTION_WATCHDOG_HEAD = """
       }
       if (!reachable) {
         consecutiveConnectionFailures += 1;
-        // A local restart can miss the first three five-second probes while
-        // the server is coming back. Keep that brief recovery silent; only a
-        // longer, sustained loss should show an offline/reconnected pair.
-        if (consecutiveConnectionFailures >= 4) {
+        // The automatic worker can briefly hold the local event loop while it
+        // commits confirmed settings. A single 2.5-second health miss was
+        // therefore producing false offline/recovered notices even though the
+        // same app process continued the run. Two misses still fail closed in
+        // about ten seconds for a genuinely stopped localhost server.
+        if (consecutiveConnectionFailures >= 2) {
           if (prior !== "offline") render("offline");
           window.ragLocalServerConnectionState = "offline";
         }
@@ -568,6 +592,10 @@ APP_CONNECTION_WATCHDOG_HEAD = """
 })();
 </script>
 """
+APP_CONNECTION_WATCHDOG_HEAD = APP_CONNECTION_WATCHDOG_HEAD.replace(
+    "__LOCAL_APP_INSTANCE_ID__",
+    LOCAL_APP_INSTANCE_ID,
+)
 
 
 class LocalServerConnectionWatchdogMiddleware(BaseHTTPMiddleware):
@@ -629,7 +657,13 @@ class LocalServerConnectionWatchdogMiddleware(BaseHTTPMiddleware):
 
 async def local_pdf_app_healthz():
     """Minimal watchdog probe, independent of Gradio's heavier API schema."""
-    return Response(status_code=204)
+    return Response(
+        status_code=204,
+        headers={
+            "Cache-Control": "no-store",
+            "X-Local-App-Instance": LOCAL_APP_INSTANCE_ID,
+        },
+    )
 
 
 def gradio_server_app_with_connection_watchdog():
@@ -8684,32 +8718,29 @@ def automatic_process_button_state(pdf_files=None, folder_pdf_files=None, folder
 
 
 def automatic_selection_action_states(pdf_files=None, folder_pdf_files=None, folder_manifest=None):
-    """Reveal the inert Cancel control only after a real selection settles.
+    """Keep the visibly inert Cancel control synchronized with selection.
 
     Gradio's File.change callback can run before its temporary path has fully
     propagated to an earlier reset handler. Pairing this with the final
     readiness callback keeps Confirm and Cancel visually consistent.
     """
-    folder_candidates, _manifest_reused = folder_manifest_candidates(folder_pdf_files, folder_manifest)
-    has_input = bool(normalize_file_list(pdf_files) or folder_candidates)
     if str((LIVE_AUTOMATIC_RUN_STATUS or {}).get("state") or "") == "preparing":
         clear_live_automatic_run_status()
     return (
         automatic_process_button_state(pdf_files, folder_pdf_files, folder_manifest),
-        gr.update(value="Cancel", interactive=False, visible=has_input),
+        gr.update(value="Cancel", interactive=False, visible=True),
         gr.update(value=automatic_live_status_html({"state": "ready"}), visible=True),
     )
 
 
 def automatic_selection_pending_action_states(pdf_files=None, folder_pdf_files=None):
-    """Show the action row as soon as the selector has a usable value.
+    """Keep the action row stable while a selection becomes usable.
 
     Metadata extraction, history lookup, and workspace-name derivation may be
     expensive for a large batch. They must not make the page look inert. The
     final readiness callback still enables Confirm only after those values are
     settled, so this is presentation feedback rather than early authorization.
     """
-    has_input = bool(normalize_file_list(pdf_files) or normalize_file_list(folder_pdf_files))
     return (
         gr.update(
             value="Confirm and start processing",
@@ -8717,7 +8748,7 @@ def automatic_selection_pending_action_states(pdf_files=None, folder_pdf_files=N
             visible=True,
             variant="primary",
         ),
-        gr.update(value="Cancel", interactive=False, visible=has_input),
+        gr.update(value="Cancel", interactive=False, visible=True),
     )
 
 
@@ -9372,7 +9403,7 @@ def reset_automatic_run_presentation(pdf_files=None, folder_pdf_files=None):
         gr.update(value=""),
         {},
         gr.update(),
-        gr.update(value="Cancel", interactive=False, visible=has_input),
+        gr.update(value="Cancel", interactive=False, visible=True),
         gr.update(value="", visible=False),
         gr.update(value="", visible=False),
         gr.update(value=[], visible=False),
@@ -10580,10 +10611,17 @@ def automatic_run_timing_html(
         elapsed = max(0, int(current_time - started)) if started else 0
         acceleration = max(0, int(round(float(eta_acceleration_seconds or 0))))
         # A remaining-time estimate may reach zero, but it is never a signed
-        # "negative ETA". Completion duration is shown separately at the
-        # terminal state, where it is factual rather than a forecast.
+        # "negative ETA". While an owned queue is still active, zero would
+        # incorrectly imply imminent completion after an underestimated prior.
+        # Say that the estimate is being recalibrated until fresh queue
+        # evidence produces a trustworthy replacement. Completion duration is
+        # shown separately at the terminal state, where it is factual.
         remaining = max(0, expected - elapsed - acceleration)
-        label = f"Est: {format_estimate_clock(remaining)}"
+        label = (
+            "Est: recalculating from Desktop queue…"
+            if expected > 0 and remaining == 0
+            else f"Est: {format_estimate_clock(remaining)}"
+        )
     elif state == "cancelled" and actual is not None:
         label = f"Stopped: {format_estimate_clock(actual)}"
     elif actual is not None and state in {"successful", "warning", "failed"}:
@@ -12660,20 +12698,20 @@ def automatic_completion(summaries, prepare_and_upload):
         if any(status == "deferred_after_exact_vector_proof" for status in runtime_statuses):
             return {
                 "state": "successful",
-                "code": "AUTO-RETRIEVAL-DEFERRED-001",
+                # Retain the timeout classification in the durable run report
+                # without making an otherwise ready document look doubtful.
+                "diagnostic_code": "AUTO-RETRIEVAL-DEFERRED-001",
                 "message": (
                     "Your document is indexed and ready to use in AnythingLLM. "
-                    "All page-parent vectors were confirmed. An optional final retrieval check was saved "
-                    "to the run report and did not delay completion."
+                    "All page-parent vectors were confirmed."
                 ),
             }
         return {
             "state": "successful",
-            "code": "AUTO-RETRIEVAL-RUNTIME-001",
+            "diagnostic_code": "AUTO-RETRIEVAL-RUNTIME-001",
             "message": (
                 "Your document is indexed and ready to use in AnythingLLM. "
-                "All page-parent vectors were confirmed. An optional final retrieval check was saved "
-                "to the run report and did not delay completion."
+                "All page-parent vectors were confirmed."
             ),
         }
     if upload_ok and post_searchable_with_caveat and any(
@@ -13260,7 +13298,7 @@ def prepare_automatic_confirmation(*values):
                 interactive=allowed,
             ),
             gr.update(visible=False, interactive=False),
-            gr.update(value="Cancel", interactive=True),
+            gr.update(value="Cancel", interactive=bool(settings.get("files"))),
             gr.update(value="", visible=False),
         )
     except Exception as exc:
@@ -13489,7 +13527,12 @@ def automatic_preprocessing_started_response():
         automatic_run_timing_html(0, "pre-processing", state="running", server_driven=True),
         gr.update(),
         gr.update(value="", visible=False),
-        gr.update(value="Preparing…", interactive=False, variant="primary"),
+        # This is the visible acknowledgement immediately after the user
+        # commits the settings. Keep it distinct from the later processing
+        # state: validation and run-folder reservation can take a moment,
+        # and a static "Confirm and start processing" button made that pause
+        # look like a missed click.
+        gr.update(value="Confirming…", interactive=False, variant="primary"),
         gr.update(value="Cancel", interactive=False, visible=True),
         gr.update(visible=False, interactive=False),
     )
@@ -17344,7 +17387,10 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                         min_width=0,
                         interactive=False,
                         elem_id="cancel-automatic-run-button",
-                        visible=False,
+                        # The action bar stays stable on a fresh page. There
+                        # is no run to cancel yet, so this control starts
+                        # visibly disabled alongside Confirm.
+                        visible=True,
                     )
                 auto_confirmation_state = gr.State({})
                 background_reconciliation_timer = gr.Timer(
@@ -18460,33 +18506,6 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     automatic_normal_actions,
                     confirm_automatic_run_button,
                     cancel_automatic_run_button,
-                ],
-                show_progress="hidden",
-                queue=False,
-            ).then(
-                fn=refresh_background_reconciliation,
-                inputs=[
-                    api_url,
-                    api_key,
-                    workspace_slug,
-                    inherit_anythingllm_settings,
-                    anythingllm_chunk_size,
-                    anythingllm_chunk_overlap,
-                    anythingllm_embedder_max_chunk,
-                ],
-                outputs=[
-                    workspace_slug,
-                    workspace_status,
-                    native_upload_readiness,
-                    background_reconciliation_status,
-                    anythingllm_settings_snapshot,
-                    anythingllm_chunk_size,
-                    anythingllm_chunk_overlap,
-                    anythingllm_embedder_max_chunk,
-                    anythingllm_embedder_recommended_limit,
-                    anythingllm_embedder_engine,
-                    anythingllm_embedder_model,
-                    anythingllm_reference_values,
                 ],
                 show_progress="hidden",
                 queue=False,

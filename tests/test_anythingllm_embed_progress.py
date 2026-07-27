@@ -1,12 +1,15 @@
 import json
 import threading
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
 from auto_anythingllm_pipeline import (
     _anythingllm_embed_event_matches_locations,
+    _anythingllm_vector_cache_hit,
     anythingllm_embed_progress_message,
+    find_reusable_cached_document_locations,
     listen_for_anythingllm_embed_progress,
     parse_anythingllm_embed_progress_event,
 )
@@ -33,6 +36,65 @@ def test_parses_desktop_embed_progress_event_and_renders_compact_status():
     assert anythingllm_embed_progress_message(event) == (
         "AnythingLLM Desktop queue: record 3/6, chunks 3/4"
     )
+
+
+def test_renders_a_cache_reuse_status_only_for_explicit_cache_evidence(tmp_path):
+    location = "custom-documents/page-parent-p001.txt"
+    cache_dir = tmp_path / "vector-cache"
+    cache_dir.mkdir()
+    (cache_dir / f"{uuid.uuid5(uuid.NAMESPACE_URL, location)}.json").write_text(
+        "[]", encoding="utf-8"
+    )
+
+    assert _anythingllm_vector_cache_hit(tmp_path, location)
+    assert not _anythingllm_vector_cache_hit(tmp_path, "custom-documents/other.txt")
+    assert anythingllm_embed_progress_message(
+        {
+            "type": "doc_starting",
+            "docIndex": 0,
+            "totalDocs": 1,
+            "vector_cache_hit": True,
+        }
+    ) == (
+        "AnythingLLM Desktop queue: reusing cached embeddings for record 1/1; "
+        "writing its page-parent record to this workspace"
+    )
+
+
+def test_reuses_only_an_exact_cached_page_parent_document(tmp_path):
+    location = "custom-documents/existing-page-parent.json"
+    document = {
+        "pageContent": "Exact page-parent text.",
+        "title": "Example title",
+        "docAuthor": "Example author",
+        "description": "PDF page: 1.",
+        "docSource": "local-pdf://sha256/example",
+        "chunkSource": "page-parent://example-p0001",
+    }
+    document_path = tmp_path / "documents" / location
+    document_path.parent.mkdir(parents=True)
+    document_path.write_text(json.dumps(document), encoding="utf-8")
+    cache_dir = tmp_path / "vector-cache"
+    cache_dir.mkdir()
+    (cache_dir / f"{uuid.uuid5(uuid.NAMESPACE_URL, location)}.json").write_text(
+        "[]", encoding="utf-8"
+    )
+    payload = {
+        "textContent": document["pageContent"],
+        "metadata": {
+            key: document[key]
+            for key in ("title", "docAuthor", "description", "docSource", "chunkSource")
+        },
+    }
+    changed_payload = {
+        **payload,
+        "textContent": "A changed page must not reuse the old vector.",
+    }
+
+    assert find_reusable_cached_document_locations(tmp_path, [payload, changed_payload]) == [
+        location,
+        "",
+    ]
 
 
 def test_progress_listener_filters_unrelated_workspace_queue_events():

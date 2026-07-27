@@ -98,7 +98,9 @@ def test_fresh_file_selection_never_displays_prior_success(page, local_app_url, 
     page.goto(local_app_url)
     expect(page.get_by_text("Processing successful", exact=False)).to_have_count(0)
     expect(page.get_by_text("Overall progress: 100%", exact=False)).to_have_count(0)
-    expect(page.locator("#cancel-automatic-run-button")).to_be_hidden()
+    cancel = page.locator("#cancel-automatic-run-button")
+    expect(cancel).to_be_visible()
+    expect(cancel).to_be_disabled()
 
 
 def test_local_only_mode_hides_upload_controls_even_when_advanced_is_open(page, local_app_url):
@@ -185,6 +187,14 @@ def test_selected_pdf_exposes_one_confirm_action_and_safe_prestart_cancel(page, 
     expect(page.get_by_text("Ready — Confirm to begin processing.")).to_be_visible()
     expect(page.get_by_text("Processing successful", exact=False)).to_have_count(0)
     expect(page.get_by_text("Overall progress: 100%", exact=False)).to_have_count(0)
+
+
+def test_fresh_page_shows_both_actions_disabled(page, local_app_url):
+    """There is no run to cancel before a PDF is selected."""
+    page.goto(local_app_url)
+    expect(page.get_by_role("button", name="Confirm and start processing")).to_be_disabled()
+    expect(page.get_by_role("button", name="Cancel")).to_be_visible()
+    expect(page.get_by_role("button", name="Cancel")).to_be_disabled()
 
 
 def test_file_selection_opens_identity_fields_but_keeps_technical_metadata_collapsed(

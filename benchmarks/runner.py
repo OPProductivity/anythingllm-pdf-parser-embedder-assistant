@@ -53,11 +53,10 @@ PHASE_BUCKET = {
 # Version 11: no synthetic four-percent worker-start checkpoint, monotonic
 # visible evidence, and mature/bounded queue-rate ETA repricing.
 PRODUCTION_PRESENTATION_CONTROLLER_VERSION = 11
-# Revision 2 adds sparse healthy-queue storage observation and defers optional
-# retrieval work after a receipt timeout has exact vector proof.  Those alter
-# measured wall-clock stages, so controller-version equality alone is not a
-# valid benchmark freshness check.
-BENCHMARK_RUNTIME_PROTOCOL_REVISION = 2
+# Revision 3 adds exact, provenance-matched cached page-parent reuse before
+# submission. That can materially change local preparation and queue time, so
+# results from the older runtime protocol must stay historical for timing.
+BENCHMARK_RUNTIME_PROTOCOL_REVISION = 3
 
 
 @dataclass(frozen=True)

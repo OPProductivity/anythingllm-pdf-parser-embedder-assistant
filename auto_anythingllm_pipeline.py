@@ -6668,7 +6668,7 @@ def score_candidate(candidate):
 
 
 def inspect_anythingllm_storage(storage_dir: Path, progress_callback=None):
-    result = {
+    result: dict[str, Any] = {
         "storage_dir": str(storage_dir),
         "exists": storage_dir.exists(),
         "lancedb_exists": (storage_dir / "lancedb").exists(),
@@ -6695,7 +6695,7 @@ def inspect_anythingllm_storage(storage_dir: Path, progress_callback=None):
         for table_index, table_name in enumerate(table_names, start=1):
             if callable(progress_callback):
                 progress_callback(table_index - 1, total_tables, table_name, "started")
-            entry = {"name": table_name}
+            entry: dict[str, Any] = {"name": table_name}
             try:
                 table = db.open_table(table_name)
                 entry["row_count"] = int(table.count_rows())
@@ -7697,6 +7697,120 @@ def _normalized_anythingllm_document_location(value):
     return str(value or "").replace("\\", "/").lstrip("./").casefold()
 
 
+def _anythingllm_vector_cache_hit(storage_dir, location):
+    """Return whether Desktop will reuse the exact queued document's vectors.
+
+    AnythingLLM stores each cache entry under UUID-v5(URL, queued-path).json.
+    This mirrors its read-only existence check; it does not infer cache reuse
+    from elapsed time, inspect vector content, or treat a cache entry as
+    completion evidence. The subsequent Desktop queue event and exact vector
+    confirmation still establish that the page-parent record was written.
+    """
+    if not storage_dir or not str(location or "").strip():
+        return False
+    try:
+        cache_dir = Path(storage_dir) / "vector-cache"
+        if not cache_dir.is_dir():
+            return False
+        original = str(location)
+        normalized_separators = original.replace("\\", "/")
+        candidates = list(dict.fromkeys((original, normalized_separators)))
+        return any(
+            (cache_dir / f"{uuid.uuid5(uuid.NAMESPACE_URL, candidate)}.json").is_file()
+            for candidate in candidates
+        )
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _page_parent_payload_reuse_key(payload):
+    """Return a content-and-provenance identity for one raw-text payload.
+
+    AnythingLLM's raw-text endpoint turns the supported metadata fields into
+    top-level document JSON keys.  Matching only a title or source SHA would
+    be too weak: a revised page of the same PDF must never silently attach an
+    old document.  This digest deliberately includes all fields that control
+    the page-parent's searchable text and citation identity.
+    """
+    payload_dict: dict[str, Any] = dict(payload) if isinstance(payload, dict) else {}
+    metadata_value = payload_dict.get("metadata")
+    metadata: dict[str, Any] = dict(metadata_value) if isinstance(metadata_value, dict) else {}
+    identity = {
+        "pageContent": str(payload_dict.get("textContent") or ""),
+        "title": str(metadata.get("title") or ""),
+        "docAuthor": str(metadata.get("docAuthor") or ""),
+        "description": str(metadata.get("description") or ""),
+        "docSource": str(metadata.get("docSource") or ""),
+        "chunkSource": str(metadata.get("chunkSource") or ""),
+    }
+    return hashlib.sha256(
+        json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def find_reusable_cached_document_locations(storage_dir, payloads):
+    """Find exact existing raw-text documents with reusable vector-cache entries.
+
+    Automatic runs normally receive new UUID-suffixed raw-document locations
+    from Desktop.  That prevents the upstream cache (which keys by location)
+    from helping a repeat of the same PDF.  Reuse is allowed only when a local
+    raw document exactly matches this page-parent payload *and* its current
+    vector-cache entry exists.  The returned list stays aligned with
+    ``payloads``; an empty entry means the caller must use ordinary upload.
+    """
+    rows = list(payloads or [])
+    reusable = [""] * len(rows)
+    if not storage_dir or not rows:
+        return reusable
+    try:
+        storage = Path(storage_dir)
+        documents_root = (storage / "documents").resolve()
+        custom_documents = (documents_root / "custom-documents").resolve()
+        if not custom_documents.is_dir() or not custom_documents.is_relative_to(documents_root):
+            return reusable
+        requested_keys = {_page_parent_payload_reuse_key(payload) for payload in rows}
+        candidates_by_key = {}
+        for candidate in custom_documents.rglob("*.json"):
+            try:
+                resolved = candidate.resolve()
+                relative = resolved.relative_to(documents_root).as_posix()
+                if not _anythingllm_vector_cache_hit(storage, relative):
+                    continue
+                raw = json.loads(resolved.read_text(encoding="utf-8"))
+                if not isinstance(raw, dict):
+                    continue
+                raw_document = dict(raw)
+                existing_key = hashlib.sha256(
+                    json.dumps(
+                        {
+                            "pageContent": str(raw_document.get("pageContent") or ""),
+                            "title": str(raw_document.get("title") or ""),
+                            "docAuthor": str(raw_document.get("docAuthor") or ""),
+                            "description": str(raw_document.get("description") or ""),
+                            "docSource": str(raw_document.get("docSource") or ""),
+                            "chunkSource": str(raw_document.get("chunkSource") or ""),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                if existing_key in requested_keys:
+                    candidates_by_key.setdefault(existing_key, []).append(relative)
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+        used_locations = set()
+        for index, payload in enumerate(rows):
+            for location in sorted(candidates_by_key.get(_page_parent_payload_reuse_key(payload), [])):
+                if location not in used_locations:
+                    reusable[index] = location
+                    used_locations.add(location)
+                    break
+    except (OSError, TypeError, ValueError):
+        return reusable
+    return reusable
+
+
 def parse_anythingllm_embed_progress_event(payload):
     """Parse one ``data:`` body from Desktop's ``embed-progress`` SSE feed.
 
@@ -7726,6 +7840,11 @@ def anythingllm_embed_progress_message(event):
             else "AnythingLLM Desktop queue started; record total not yet confirmed"
         )
     if event_type == "doc_starting":
+        if bool((event or {}).get("vector_cache_hit")):
+            return (
+                f"AnythingLLM Desktop queue: reusing cached embeddings for record {record_position}; "
+                "writing its page-parent record to this workspace"
+            )
         return f"AnythingLLM Desktop queue: embedding record {record_position}"
     if event_type == "chunk_progress":
         done = int((event or {}).get("chunksProcessed") or 0)
@@ -11326,6 +11445,7 @@ def update_workspace_embeddings_desktop_queue(
     batch_inspector=None,
     cancel_callback=None,
     record_label="uploaded files",
+    storage_dir=None,
 ):
     """Mirror AnythingLLM Desktop's one-submit, sequential queue contract.
 
@@ -11357,6 +11477,15 @@ def update_workspace_embeddings_desktop_queue(
         }
 
     normalized_record_label = str(record_label or "uploaded files").strip() or "uploaded files"
+    # AnythingLLM's vector cache key is the exact queued document location.
+    # Take this read-only snapshot before the request is submitted.  Checking
+    # from a later ``doc_complete`` callback can observe a cache file written
+    # by the current run and incorrectly claim that it was reused.
+    preexisting_cached_locations = {
+        _normalized_anythingllm_document_location(location)
+        for location in unique_locations
+        if _anythingllm_vector_cache_hit(storage_dir, location)
+    }
     queue_state_lock = threading.Lock()
     queue_state = {
         "completed": 0,
@@ -11373,6 +11502,7 @@ def update_workspace_embeddings_desktop_queue(
         "first_progress_position": 0,
         "last_progress_monotonic": 0.0,
         "last_progress_position": 0,
+        "cached_record_positions": set(),
     }
 
     def queue_snapshot():
@@ -11384,6 +11514,7 @@ def update_workspace_embeddings_desktop_queue(
             last_progress_at = float(queue_state["last_progress_monotonic"] or 0.0)
             first_progress_position = int(queue_state["first_progress_position"] or 0)
             last_progress_position = int(queue_state["last_progress_position"] or 0)
+            cached_records = len(queue_state["cached_record_positions"])
             records_per_second = 0.0
             if last_progress_at > first_progress_at and last_progress_position > first_progress_position:
                 records_per_second = (last_progress_position - first_progress_position) / (
@@ -11413,12 +11544,17 @@ def update_workspace_embeddings_desktop_queue(
                 "desktop_queue_observer_reason": str(queue_state["observer_reason"] or ""),
                 "desktop_queue_records_per_minute": round(records_per_second * 60.0, 3) if records_per_second else None,
                 "desktop_queue_estimated_remaining_seconds": remaining_seconds,
+                "desktop_queue_cached_records": cached_records,
             }
 
     def queue_activity_summary():
         snapshot = queue_snapshot()
         completed = int(snapshot["desktop_queue_completed"])
         current = int(snapshot["desktop_queue_current"])
+        cached_records = min(
+            requested,
+            max(0, int(snapshot.get("desktop_queue_cached_records") or 0)),
+        )
         if completed:
             rate = snapshot.get("desktop_queue_records_per_minute")
             remaining = snapshot.get("desktop_queue_estimated_remaining_seconds")
@@ -11426,8 +11562,22 @@ def update_workspace_embeddings_desktop_queue(
                 f" (~{float(rate):.1f}/min; ~{int(round(float(remaining)))}s queue remaining)"
                 if rate and remaining is not None else ""
             )
-            return f"Desktop completed {completed}/{requested} {normalized_record_label}{forecast}"
+            cache_detail = (
+                f"; cached embeddings reused for {cached_records}/{requested}"
+                if cached_records else ""
+            )
+            return f"Desktop completed {completed}/{requested} {normalized_record_label}{cache_detail}{forecast}"
         if current:
+            if cached_records >= current:
+                return (
+                    f"Desktop is reusing cached embeddings and writing {current}/{requested} "
+                    f"{normalized_record_label} to this workspace"
+                )
+            if cached_records:
+                return (
+                    f"Desktop is writing {current}/{requested} {normalized_record_label}; "
+                    f"cached embeddings are reused for {cached_records}/{current} records"
+                )
             return f"Desktop is embedding {current}/{requested} {normalized_record_label}"
         observer_state = str(snapshot.get("desktop_queue_observer_state") or "unknown")
         if observer_state == "reconnecting":
@@ -11443,7 +11593,8 @@ def update_workspace_embeddings_desktop_queue(
         vector is already searchable.  That distinction stays explicit until
         the targeted vector observer has confirmed the page-parent record.
         """
-        event_type = str((event or {}).get("type") or "").strip()
+        event = dict(event or {})
+        event_type = str(event.get("type") or "").strip()
         try:
             position = int((event or {}).get("docIndex") or 0) + 1
         except (TypeError, ValueError):
@@ -11455,6 +11606,9 @@ def update_workspace_embeddings_desktop_queue(
         total = requested or event_total
         if total <= 0:
             return
+        event_location = _normalized_anythingllm_document_location(event.get("filename"))
+        cache_hit = event_location in preexisting_cached_locations
+        event["vector_cache_hit"] = cache_hit
         with queue_state_lock:
             if event_type == "doc_complete":
                 queue_state["completed"] = max(queue_state["completed"], position)
@@ -11463,6 +11617,8 @@ def update_workspace_embeddings_desktop_queue(
             queue_state["last_event_type"] = event_type
             queue_state["events_observed"] += 1
             queue_state["last_event_monotonic"] = time.monotonic()
+            if cache_hit and position > 0:
+                queue_state["cached_record_positions"].add(position)
             completed = min(total, max(0, int(queue_state["completed"])))
             current = min(total, max(0, int(queue_state["current"])))
             progress_position = max(completed, current)
@@ -11477,15 +11633,23 @@ def update_workspace_embeddings_desktop_queue(
         if not callable(status_callback):
             return
         if event_type == "doc_complete":
+            completion_detail = " (cached embeddings reused)" if cache_hit else ""
             message = (
-                f"AnythingLLM Desktop queue: {completed}/{total} {normalized_record_label} completed; "
+                f"AnythingLLM Desktop queue: {completed}/{total} {normalized_record_label} completed{completion_detail}; "
                 "searchable-vector confirmation is still in progress"
             )
         elif event_type in {"doc_starting", "chunk_progress"}:
-            message = (
-                f"AnythingLLM Desktop queue: embedding {current}/{total} {normalized_record_label}; "
-                f"{completed}/{total} completed; searchable-vector confirmation follows"
-            )
+            if cache_hit:
+                message = (
+                    f"AnythingLLM Desktop queue: reusing cached embeddings for {current}/{total} "
+                    f"{normalized_record_label}; writing page-parent records to this workspace; "
+                    f"{completed}/{total} completed; searchable-vector confirmation follows"
+                )
+            else:
+                message = (
+                    f"AnythingLLM Desktop queue: embedding {current}/{total} {normalized_record_label}; "
+                    f"{completed}/{total} completed; searchable-vector confirmation follows"
+                )
         elif event_type == "all_complete":
             message = (
                 f"AnythingLLM Desktop queue finished {completed}/{total} {normalized_record_label}; "
@@ -11504,6 +11668,7 @@ def update_workspace_embeddings_desktop_queue(
                 "desktop_queue_event_type": event_type,
                 "desktop_events_observed": completed,
                 "desktop_current_record": current,
+                "desktop_queue_vector_cache_hit": cache_hit,
                 **snapshot,
                 "queue_completion_fraction": completed / total,
             },
@@ -11663,6 +11828,7 @@ def maybe_upload_payloads(
     submission_receipt_path=None,
     run_id="",
     record_label="uploaded files",
+    storage_dir=None,
 ):
     if not api_url:
         return {"status": "error_missing_api_url", "uploaded": 0, "embedded": 0, "errors": [{"error": "Missing AnythingLLM API URL."}]}
@@ -11699,17 +11865,45 @@ def maybe_upload_payloads(
     embedded = 0
     errors = []
     locations = []
+    reused_cached_locations = []
     embedding_update = {"accepted": 0, "requested": 0, "batch_size": ANYTHINGLLM_EMBEDDING_UPDATE_BATCH_SIZE, "batches": [], "errors": []}
     upload_rows = select_upload_payloads(payloads, upload_limit, upload_indices)
+    reusable_locations = find_reusable_cached_document_locations(storage_dir, upload_rows)
     correlation_id = f"upload-{uuid.uuid4().hex}"
     try:
-        for payload in upload_rows:
+        for payload, reusable_location in zip(upload_rows, reusable_locations):
             record_submission_receipt(
                 submission_receipt_path, payload,
                 run_id=run_id, workspace_slug=workspace_slug, transport="raw_text",
                 state="submitted", correlation_id=correlation_id,
                 next_check="Reconcile document location, workspace attachment, and targeted vector evidence before any resubmission.",
             )
+            if reusable_location:
+                # The local document, provenance fields, page text, and
+                # AnythingLLM vector-cache key all matched before this run.
+                # Attach that exact document to the new workspace instead of
+                # creating a UUID-suffixed duplicate that cannot hit cache.
+                uploaded += 1
+                locations.append(reusable_location)
+                reused_cached_locations.append(reusable_location)
+                record_submission_receipt(
+                    submission_receipt_path, payload,
+                    run_id=run_id, workspace_slug=workspace_slug, transport="raw_text",
+                    state="reused_cached_location", correlation_id=correlation_id,
+                    location=reusable_location,
+                    next_check="Attach the exact existing document location to the target workspace and verify its page-parent vectors.",
+                )
+                if callable(status_callback):
+                    status_callback(
+                        f"Reusing exact cached page-parent documents: {uploaded}/{len(upload_rows)} ready for AnythingLLM",
+                        {
+                            "timing_event": "cached_attachment_reuse",
+                            "attachments_completed": uploaded,
+                            "attachments_total": len(upload_rows),
+                            "cached_attachment_reused": True,
+                        },
+                    )
+                continue
             try:
                 status, response_text = post_json(endpoint, payload, api_key=api_key)
                 if 200 <= status < 300:
@@ -11767,6 +11961,7 @@ def maybe_upload_payloads(
                 batch_inspector=batch_inspector,
                 cancel_callback=cancel_callback,
                 record_label=record_label,
+                storage_dir=storage_dir,
             )
             embedded = embedding_update["accepted"]
             errors.extend(embedding_update["errors"])
@@ -11817,6 +12012,8 @@ def maybe_upload_payloads(
         "uploaded": uploaded,
         "embedded": embedded,
         "locations": locations,
+        "reused_cached_locations": reused_cached_locations,
+        "reused_cached_documents": len(reused_cached_locations),
         "embedding_update": embedding_update,
         "transport": "raw_text",
         "authentication_mode": authentication_mode,
@@ -11883,22 +12080,34 @@ def maybe_upload_segment_files(
     embedded = 0
     errors = []
     locations = []
+    reused_cached_locations = []
     embedding_update = {"accepted": 0, "requested": 0, "batch_size": ANYTHINGLLM_EMBEDDING_UPDATE_BATCH_SIZE, "batches": [], "errors": []}
     selected_rows = select_upload_payloads(upload_rows, upload_limit, upload_indices)
+    reusable_payloads = []
+    for row in selected_rows:
+        metadata = {
+            "title": row.get("title") or row.get("filename") or "",
+            "docAuthor": row.get("docAuthor") or "",
+            "description": row.get("description") or "",
+            "docSource": row.get("docSource") or "",
+            "chunkSource": row.get("chunkSource") or "",
+        }
+        try:
+            text_content = Path(row.get("text_file") or "").read_text(encoding="utf-8")
+        except OSError:
+            text_content = ""
+        reusable_payloads.append({"metadata": metadata, "textContent": text_content})
+    reusable_locations = find_reusable_cached_document_locations(storage_dir, reusable_payloads)
     correlation_id = f"upload-{uuid.uuid4().hex}"
     try:
-        for row in selected_rows:
+        for row, reusable_location, reusable_payload in zip(
+            selected_rows, reusable_locations, reusable_payloads
+        ):
             text_file = Path(row.get("text_file") or "")
             if not text_file.exists():
                 errors.append({"error": f"Missing upload file: {text_file}", "segment": row.get("chunkSource", "")})
                 break
-            metadata = {
-                "title": row.get("title") or row.get("filename") or "",
-                "docAuthor": row.get("docAuthor") or "",
-                "description": row.get("description") or "",
-                "docSource": row.get("docSource") or "",
-                "chunkSource": row.get("chunkSource") or "",
-            }
+            metadata = reusable_payload["metadata"]
             receipt_payload = {"metadata": metadata, "textContent": ""}
             # The file-upload receipt hashes only the prepared file bytes;
             # unlike raw-text transport it never loads the full text into the
@@ -11914,6 +12123,29 @@ def maybe_upload_segment_files(
                 prepared_payload_hash=prepared_file_hash,
                 next_check="Reconcile document location, workspace attachment, and targeted vector evidence before any resubmission.",
             )
+            if reusable_location:
+                uploaded += 1
+                locations.append(reusable_location)
+                reused_cached_locations.append(reusable_location)
+                record_submission_receipt(
+                    submission_receipt_path, receipt_payload,
+                    run_id=run_id, workspace_slug=workspace_slug, transport="file_upload",
+                    state="reused_cached_location", correlation_id=correlation_id,
+                    location=reusable_location,
+                    prepared_payload_hash=prepared_file_hash,
+                    next_check="Attach the exact existing document location to the target workspace and verify its page-parent vectors.",
+                )
+                if callable(status_callback):
+                    status_callback(
+                        f"Reusing exact cached page-parent documents: {uploaded}/{len(selected_rows)} ready for AnythingLLM",
+                        {
+                            "timing_event": "cached_attachment_reuse",
+                            "attachments_completed": uploaded,
+                            "attachments_total": len(selected_rows),
+                            "cached_attachment_reused": True,
+                        },
+                    )
+                continue
             try:
                 status, response_text = post_multipart_form(
                     endpoint,
@@ -11995,6 +12227,7 @@ def maybe_upload_segment_files(
                 batch_inspector=batch_inspector,
                 cancel_callback=cancel_callback,
                 record_label=record_label,
+                storage_dir=storage_dir,
             )
             embedded = embedding_update["accepted"]
             errors.extend(embedding_update["errors"])
@@ -12041,6 +12274,8 @@ def maybe_upload_segment_files(
         "uploaded": uploaded,
         "embedded": embedded,
         "locations": locations,
+        "reused_cached_locations": reused_cached_locations,
+        "reused_cached_documents": len(reused_cached_locations),
         "embedding_update": embedding_update,
         "transport": "file_upload",
         "document_folder_name": sanitize_anythingllm_relative_folder_path(folder_name),
@@ -12136,6 +12371,7 @@ def maybe_upload_to_anythingllm(
         submission_receipt_path=submission_receipt_path,
         run_id=run_id,
         record_label=record_label,
+        storage_dir=storage_dir,
     )
 
 
@@ -16002,6 +16238,16 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             if not isinstance(raw, dict):
                 return {}
             last_event = float(raw.get("last_event_monotonic") or 0.0)
+            # The active observer owns a set of cache-hit queue positions;
+            # completed reports contain the flattened count instead.  Support
+            # both representations so live reconciliation sees the same exact
+            # cache evidence that the final report records.
+            raw_cached_positions = raw.get("cached_record_positions")
+            cached_records = raw.get("desktop_queue_cached_records")
+            if cached_records is None:
+                cached_records = raw.get("cached_records")
+            if cached_records is None and isinstance(raw_cached_positions, (set, list, tuple)):
+                cached_records = len(raw_cached_positions)
             return {
                 "desktop_queue_completed": max(0, int(raw.get("completed") or 0)),
                 "desktop_queue_current": max(0, int(raw.get("current") or 0)),
@@ -16015,6 +16261,12 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 "desktop_queue_observer_state": str(raw.get("observer_state") or "unknown"),
                 "desktop_queue_observer_failures": max(0, int(raw.get("observer_failures") or 0)),
                 "desktop_queue_observer_reason": str(raw.get("observer_reason") or ""),
+                # This is exact, local cache evidence collected when the owned
+                # queue event is received.  Carry it through the lightweight
+                # reconciliation snapshot as well: otherwise the terminal
+                # report can correctly record cache reuse while the live
+                # progress line falls back to generic “embedding” wording.
+                "desktop_queue_cached_records": max(0, int(cached_records or 0)),
             }
 
         def healthy_owned_queue_active(queue=None):
@@ -16189,6 +16441,10 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             queue_current = int(evidence.get("desktop_queue_current") or 0)
             queue_completed = int(evidence.get("desktop_queue_completed") or 0)
             queue_total = int(evidence.get("queue_records") or len(expected_batch))
+            cached_records = min(
+                queue_total,
+                max(0, int(evidence.get("desktop_queue_cached_records") or 0)),
+            )
             ingestion_evidence = UploadProgressEvidence(
                 queue_current=queue_current,
                 queue_completed=queue_completed,
@@ -16202,11 +16458,26 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 or evidence.get("reconciliation_deadline_seconds")
                 or 0.0
             )
-            queue_detail = (
-                f"Desktop queue: embedding {queue_current}/{queue_total} page-parent files; "
-                f"{queue_completed}/{queue_total} completed. "
-                if queue_total and (queue_current or queue_completed) else ""
-            )
+            if queue_total and (queue_current or queue_completed):
+                if queue_current and cached_records >= queue_current:
+                    queue_detail = (
+                        "Desktop queue: reusing cached embeddings and writing "
+                        f"{queue_current}/{queue_total} page-parent files; "
+                        f"{queue_completed}/{queue_total} completed. "
+                    )
+                elif cached_records:
+                    queue_detail = (
+                        f"Desktop queue: embedding {queue_current}/{queue_total} page-parent files "
+                        f"({cached_records} using cached embeddings); "
+                        f"{queue_completed}/{queue_total} completed. "
+                    )
+                else:
+                    queue_detail = (
+                        f"Desktop queue: embedding {queue_current}/{queue_total} page-parent files; "
+                        f"{queue_completed}/{queue_total} completed. "
+                    )
+            else:
+                queue_detail = ""
             checkpoint_detail = ""
             checkpoints = evidence.get("reconciliation_read_only_checkpoints") or []
             if checkpoints:
@@ -16222,9 +16493,9 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             except (TypeError, ValueError):
                 event_age = None
             observer_detail = (
-                f" SSE observer {observer_state}; last owned queue event {event_age:.0f}s ago."
+                f" AnythingLLM queue observer {observer_state}; last owned queue event {event_age:.0f}s ago."
                 if event_age is not None else
-                f" SSE observer {observer_state}; no owned queue event observed yet."
+                f" AnythingLLM queue observer {observer_state}; no owned queue event observed yet."
             )
             report_upload_phase(
                 "identity_set",
@@ -17057,20 +17328,17 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             }
         ],
     )
-    # A receipt timeout can be normal for Desktop's long-running embedding
-    # endpoint.  Once exact page-parent identities are proven, live retrieval
-    # probes are diagnostics, not a condition of ordinary completion.  Do not
-    # make a cold provider search add five sequential timeouts to the user’s
-    # finished upload; the saved diagnostics route can run them after Desktop
-    # settles.
+    # Once exact page-parent identities are proven, live retrieval probes are
+    # diagnostics, not a condition of ordinary completion.  Do not make a
+    # cold provider search add five sequential timeouts to a finished upload.
+    # This is deliberately independent of the Desktop receipt outcome: the
+    # last run showed that an accepted, batched request can still be followed
+    # by several slow live-search probes.  The saved diagnostics route can run
+    # those probes later, after Desktop and the provider have settled.
     defer_runtime_retrieval_after_exact_proof = bool(
         args.prepare_and_upload
         and upload_report.get("uploaded", 0) > 0
         and post_upload_report.get("status") in REVIEWABLE_POST_UPLOAD_STATUSES
-        and any(
-            bool(batch.get("receipt_deadline_elapsed"))
-            for batch in ((upload_report.get("embedding_update") or {}).get("batches") or [])
-        )
     )
     if (
         args.prepare_and_upload
@@ -17172,8 +17440,8 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         runtime_validation_report = {
             "status": "deferred_after_exact_vector_proof",
             "message": (
-                "Exact page-parent vectors were proven after the Desktop receipt deadline. "
-                "Live retrieval probes were deferred so a cold provider search cannot delay ordinary completion."
+                "Exact page-parent vectors were proven. Live retrieval probes were deferred "
+                "so a cold provider search cannot delay ordinary completion."
             ),
             "workspace_slug": target_workspace_slug,
             "vector_checks": [],
@@ -17182,7 +17450,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             "total_seconds": 0.0,
             "vector_search_seconds": 0.0,
             "chat_seconds": 0.0,
-            "deferred_reason": "receipt_timeout_exact_vector_proof",
+            "deferred_reason": "exact_vector_proof",
         }
     else:
         runtime_validation_report = {

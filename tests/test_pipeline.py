@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import uuid
 import unittest
 from unittest import mock
 
@@ -1137,7 +1138,8 @@ class PipelineCoreTests(unittest.TestCase):
         chat_timeout = dict(successful_upload, anythingllm_runtime_validation_status="pass_with_chat_timeout")
         timeout_completion = app.automatic_completion([chat_timeout], True)
         self.assertEqual(timeout_completion["state"], "successful")
-        self.assertIn("did not delay completion", timeout_completion["message"])
+        self.assertIn("All page-parent vectors were confirmed", timeout_completion["message"])
+        self.assertEqual(timeout_completion["diagnostic_code"], "AUTO-RETRIEVAL-RUNTIME-001")
         vector_timeout = dict(successful_upload, anythingllm_runtime_validation_status="vector_runtime_timeout")
         vector_timeout_completion = app.automatic_completion([vector_timeout], True)
         self.assertEqual(vector_timeout_completion["state"], "successful")
@@ -1340,17 +1342,21 @@ class PipelineCoreTests(unittest.TestCase):
         from fastapi.testclient import TestClient
 
         self.assertIn('fetch("/healthz"', app.APP_CONNECTION_WATCHDOG_HEAD)
-        self.assertIn('Connection to the PDF app was lost.', app.APP_CONNECTION_WATCHDOG_HEAD)
+        self.assertIn('X-Local-App-Instance', app.APP_CONNECTION_WATCHDOG_HEAD)
+        self.assertIn('window.location.reload()', app.APP_CONNECTION_WATCHDOG_HEAD)
+        self.assertIn('The PDF app is unavailable.', app.APP_CONNECTION_WATCHDOG_HEAD)
         self.assertIn('Connection restored.', app.APP_CONNECTION_WATCHDOG_HEAD)
         self.assertIn('Start or restart the PDF app server.', app.APP_CONNECTION_WATCHDOG_HEAD)
         self.assertNotIn('then refresh this page', app.APP_CONNECTION_WATCHDOG_HEAD)
         self.assertNotIn('Refresh this page before starting a new run', app.APP_CONNECTION_WATCHDOG_HEAD)
-        self.assertIn('document.addEventListener("change"', app.APP_CONNECTION_WATCHDOG_HEAD)
-        self.assertIn('input.type !== "file"', app.APP_CONNECTION_WATCHDOG_HEAD)
+        self.assertIn('document.addEventListener(eventName, blockOfflineAppInteraction, true)', app.APP_CONNECTION_WATCHDOG_HEAD)
+        self.assertIn('"dragenter", "dragover", "drop"', app.APP_CONNECTION_WATCHDOG_HEAD)
         self.assertIn('window.ragLocalServerConnectionWatchdogInstalled', app.APP_CONNECTION_WATCHDOG_HEAD)
         self.assertIn('ragLocalServerConnectionWatchdog = "installed"', app.APP_CONNECTION_WATCHDOG_HEAD)
         self.assertNotIn("ragLocalServerWasOffline", app.APP_CONNECTION_WATCHDOG_HEAD)
-        self.assertIn("consecutiveConnectionFailures >= 4", app.APP_CONNECTION_WATCHDOG_HEAD)
+        self.assertIn("consecutiveConnectionFailures >= 2", app.APP_CONNECTION_WATCHDOG_HEAD)
+        self.assertIn("blockOfflineAppInteraction", app.APP_CONNECTION_WATCHDOG_HEAD)
+        self.assertIn('window.ragLocalServerConnectionState === "offline"', app.APP_CONNECTION_WATCHDOG_HEAD)
         self.assertIn('rag-server-connection-dismiss', app.APP_CONNECTION_WATCHDOG_HEAD)
         self.assertIn('}, 4000);', app.APP_CONNECTION_WATCHDOG_HEAD)
         self.assertIn('id="rag-local-server-connection-watchdog-style"', app.APP_CONNECTION_WATCHDOG_HEAD)
@@ -1433,6 +1439,7 @@ class PipelineCoreTests(unittest.TestCase):
 
         response = asyncio.run(app.local_pdf_app_healthz())
         self.assertEqual(response.status_code, 204)
+        self.assertEqual(response.headers["X-Local-App-Instance"], app.LOCAL_APP_INSTANCE_ID)
 
     def test_refresh_top_anythingllm_status_flashes_only_for_an_unchanged_outage(self):
         import rag_pdf_gradio_app as app
@@ -3620,6 +3627,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertNotIn("visible", updates[4])
         self.assertNotIn("visible", updates[7])
         self.assertFalse(updates[8]["interactive"])
+        self.assertTrue(updates[8]["visible"])
         self.assertFalse(updates[10]["visible"])
         self.assertEqual(updates[13], [])
 
@@ -3906,7 +3914,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(app.paced_progress_percent(record, now=100.5), 42)
         self.assertEqual(app.paced_progress_percent(record, now=108.0), 70)
 
-    def test_running_estimate_counts_down_and_stops_at_zero(self):
+    def test_running_estimate_counts_down_and_labels_an_active_overrun_for_recalibration(self):
         import rag_pdf_gradio_app as app
 
         countdown = app.automatic_run_timing_html(
@@ -3922,7 +3930,7 @@ class PipelineCoreTests(unittest.TestCase):
             now=240.0,
         )
         self.assertIn("Est: 02m15s", countdown)
-        self.assertIn("Est: 00m00s", overrun)
+        self.assertIn("Est: recalculating from Desktop queue", overrun)
 
     def test_running_estimate_always_counts_down_and_can_accelerate_with_progress(self):
         import rag_pdf_gradio_app as app
@@ -5925,7 +5933,7 @@ class PipelineCoreTests(unittest.TestCase):
 
         self.assertEqual(len(preprocessing), 12)
         self.assertIn(">preparing<", preprocessing[0]["value"])
-        self.assertEqual(preprocessing[9]["value"], "Preparing…")
+        self.assertEqual(preprocessing[9]["value"], "Confirming…")
         self.assertFalse(preprocessing[10]["interactive"])
         self.assertFalse(preprocessing[11]["visible"])
         self.assertEqual(len(started), 12)
@@ -5968,10 +5976,11 @@ class PipelineCoreTests(unittest.TestCase):
         cancel_id = component_ids["cancel-automatic-run-button"]
         review_id = component_ids["automatic-process-button"]
         components_by_id = {component["id"]: component for component in app.demo.config["components"]}
-        # Confirm stays available as the empty-state call to action; Cancel is
-        # intentionally absent until at least one PDF has been selected.
+        # Both controls stay mounted in the empty state. Cancel is visibly
+        # disabled because there is no run to cancel yet.
         self.assertIsNot(components_by_id[confirm_id].get("props", {}).get("visible"), False)
-        self.assertIs(components_by_id[cancel_id].get("props", {}).get("visible"), False)
+        self.assertIsNot(components_by_id[cancel_id].get("props", {}).get("visible"), False)
+        self.assertFalse(components_by_id[cancel_id].get("props", {}).get("interactive"))
         confirm_dependencies = [
             dependency
             for dependency in app.demo.config["dependencies"]
@@ -11675,6 +11684,63 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertTrue(any("Desktop completed 3/5 page-parent files" in message for message in statuses))
         self.assertFalse(any("Desktop event stream observed" in message for message in statuses))
 
+    def test_desktop_queue_reports_exact_vector_cache_reuse(self):
+        original_post = pipeline.post_json
+        original_listener = pipeline.start_anythingllm_embed_progress_listener
+        statuses = []
+        reports = []
+        location = "custom-documents/page-parent-cache-test.txt"
+
+        class FakeThread:
+            def join(self, timeout=None):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_dir = Path(tmpdir) / "vector-cache"
+            cache_dir.mkdir()
+            digest = uuid.uuid5(uuid.NAMESPACE_URL, location)
+            (cache_dir / f"{digest}.json").write_text("[]", encoding="utf-8")
+            try:
+                def fake_listener(*_args, **kwargs):
+                    observer = kwargs.get("observer_callback")
+                    event = {
+                        "type": "doc_starting",
+                        "filename": location,
+                        "docIndex": 0,
+                        "totalDocs": 1,
+                    }
+                    observer(dict(event))
+                    connected = threading.Event()
+                    connected.set()
+                    return {
+                        "stop_event": threading.Event(),
+                        "thread": FakeThread(),
+                        "connected_event": connected,
+                        "events": [event],
+                        "errors": [],
+                    }
+
+                pipeline.start_anythingllm_embed_progress_listener = fake_listener
+                pipeline.post_json = lambda *_args, **_kwargs: (200, json.dumps({"success": True}))
+                pipeline.update_workspace_embeddings_desktop_queue(
+                    "http://anythingllm",
+                    "key",
+                    "queue-workspace",
+                    [location],
+                    storage_dir=tmpdir,
+                    status_callback=lambda message, report: (statuses.append(message), reports.append(report)),
+                    batch_verifier=lambda report: {
+                        "status": "pass",
+                        "matching_vector_rows": len(report["locations"]),
+                    },
+                )
+            finally:
+                pipeline.post_json = original_post
+                pipeline.start_anythingllm_embed_progress_listener = original_listener
+
+        assert any("reusing cached embeddings" in message for message in statuses)
+        assert any(report.get("desktop_queue_vector_cache_hit") is True for report in reports)
+
     def test_desktop_queue_does_not_replay_an_uncertain_full_list_submission(self):
         original_post = pipeline.post_json
         calls = []
@@ -14442,7 +14508,12 @@ class TimingAndInspectionSafetyTests(unittest.TestCase):
         }], True)
 
         self.assertEqual(completion["state"], "successful")
-        self.assertEqual(completion["code"], "AUTO-RETRIEVAL-DEFERRED-001")
+        self.assertNotIn("code", completion)
+        self.assertEqual(completion["diagnostic_code"], "AUTO-RETRIEVAL-DEFERRED-001")
+        self.assertEqual(
+            completion["message"],
+            "Your document is indexed and ready to use in AnythingLLM. All page-parent vectors were confirmed.",
+        )
 
 
 if __name__ == "__main__":
