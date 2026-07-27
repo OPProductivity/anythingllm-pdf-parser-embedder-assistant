@@ -221,5 +221,4 @@ def write_report(results_dir: Path) -> dict[str, Any]:
     payload = report_payload(load_runs(results_dir / "runs"))
     assert_public_payload_safe(payload)
     write_json(results_dir / "benchmark-report.json", payload)
-    (results_dir / "benchmark-report.md").write_text(report_markdown(payload), encoding="utf-8")
     return payload

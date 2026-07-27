@@ -297,8 +297,9 @@ py -m pytest -q
 py -m pre_commit run --all-files
 ```
 
-Contributions, bug reports, and reproducible test cases are welcome. Read
-[CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md) first.
+Contributions, bug reports, and reproducible test cases are welcome. Please
+redact credentials, private PDF text, local paths, workspace data, and
+AnythingLLM storage archives from any report.
 
 ## Related projects and official references
 

@@ -485,12 +485,8 @@ APP_CONNECTION_WATCHDOG_HEAD = """
       dismiss.setAttribute("aria-label", "Dismiss connection notice");
       dismiss.textContent = "×";
       dismiss.addEventListener("click", () => {
-        // An offline page is deliberately inert. Do not let the user hide the
-        // only explanation for that state; the notice clears on recovery.
-        if (window.ragLocalServerConnectionState === "offline") {
-          render("offline");
-          return;
-        }
+        // Dismissing the notice only hides it; the offline interaction guard
+        // remains active until a successful health probe reports recovery.
         window.clearTimeout(window.ragLocalServerConnectionDismissTimer);
         banner.hidden = true;
       });
@@ -520,15 +516,25 @@ APP_CONNECTION_WATCHDOG_HEAD = """
       }
     };
     // A stale Gradio page can otherwise still open a native file chooser (or
-    // send a queued click) after its server has stopped. Once the independent
-    // health probe has established that the server is unavailable, fail closed
-    // for the app surface. This is deliberately broader than just file inputs:
-    // no old Gradio event/session can truthfully be used until the page either
-    // reconnects or reloads against the replacement server generation.
+    // submit a new run) after its server has stopped. Fail closed only for
+    // actions that contact the server. Navigation and client-only controls
+    // such as tabs, the theme picker, and the notice's dismiss button remain
+    // usable, so a transient health false positive cannot trap the user.
+    const offlineBlockedActionSelector = [
+      "input[type='file']",
+      ".pdf-upload-input",
+      "#choose-pdf-folder-button",
+      "#automatic-process-button",
+      "#confirm-automatic-run-button",
+      "#cancel-automatic-run-button",
+      "#advanced-run-button",
+    ].join(", ");
     const blockOfflineAppInteraction = (event) => {
       if (window.ragLocalServerConnectionState !== "offline") return;
       if (event.target instanceof Element
           && event.target.closest("#rag-server-connection-banner")) return;
+      if (!(event.target instanceof Element)
+          || !event.target.closest(offlineBlockedActionSelector)) return;
       event.preventDefault();
       event.stopImmediatePropagation();
       render("offline");
@@ -537,10 +543,15 @@ APP_CONNECTION_WATCHDOG_HEAD = """
       document.addEventListener(eventName, blockOfflineAppInteraction, true);
     }
     let consecutiveConnectionFailures = 0;
+    let watchdogPollInFlight = false;
     const poll = async () => {
+      // Gradio can hold several same-origin streaming connections during a
+      // normal UI transition. Do not stack health fetches behind them.
+      if (watchdogPollInFlight) return;
+      watchdogPollInFlight = true;
       const prior = window.ragLocalServerConnectionState || "unknown";
       const controller = new AbortController();
-      const timeout = window.setTimeout(() => controller.abort(), 2500);
+      const timeout = window.setTimeout(() => controller.abort(), 8000);
       let reachable = false;
       try {
         const response = await fetch("/healthz", {
@@ -559,14 +570,13 @@ APP_CONNECTION_WATCHDOG_HEAD = """
         reachable = false;
       } finally {
         window.clearTimeout(timeout);
+        watchdogPollInFlight = false;
       }
       if (!reachable) {
         consecutiveConnectionFailures += 1;
-        // The automatic worker can briefly hold the local event loop while it
-        // commits confirmed settings. A single 2.5-second health miss was
-        // therefore producing false offline/recovered notices even though the
-        // same app process continued the run. Two misses still fail closed in
-        // about ten seconds for a genuinely stopped localhost server.
+        // A single delayed response is not proof that the server stopped.
+        // Two complete, patient probes still fail closed for a genuinely
+        // stopped localhost server without falsely alarming during streaming.
         if (consecutiveConnectionFailures >= 2) {
           if (prior !== "offline") render("offline");
           window.ragLocalServerConnectionState = "offline";
@@ -581,8 +591,118 @@ APP_CONNECTION_WATCHDOG_HEAD = """
       }
     };
     poll();
-    window.ragLocalServerConnectionTimer = window.setInterval(poll, 5000);
+    window.ragLocalServerConnectionTimer = window.setInterval(poll, 7500);
     window.addEventListener("online", poll);
+  };
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", install, { once: true });
+  } else {
+    install();
+  }
+})();
+</script>
+<script id="rag-local-theme-controls">
+(() => {
+  const install = () => {
+    if (window.ragLocalThemeControlsInstalled) return;
+    window.ragLocalThemeControlsInstalled = true;
+    const followKey = "rag-pdf-follow-system-theme";
+    const overrideKey = "rag-pdf-theme";
+    const systemTheme = window.matchMedia("(prefers-color-scheme: dark)");
+    const followsSystem = () => {
+      try { return localStorage.getItem(followKey) !== "false"; } catch (_) { return true; }
+    };
+    const isDark = () => document.body.classList.contains("dark")
+      || document.documentElement.classList.contains("dark")
+      || document.querySelector("gradio-app")?.classList.contains("dark");
+    const styleControls = () => {
+      const palette = isDark()
+        ? { border: "#475569", background: "#111c2e", color: "#e5eefc" }
+        : { border: "#bcc9d8", background: "#f4f7fb", color: "#273449" };
+      for (const root of [
+        document.getElementById("follow-windows-theme"),
+        document.getElementById("theme-toggle-button"),
+      ]) {
+        if (!root) continue;
+        for (const node of [root, ...root.querySelectorAll(".wrap, .form, button")]) {
+          node.style.setProperty("border-color", palette.border, "important");
+          node.style.setProperty("background", palette.background, "important");
+          node.style.setProperty("color", palette.color, "important");
+          node.style.setProperty("box-shadow", "none", "important");
+        }
+      }
+    };
+    const apply = (dark) => {
+      document.documentElement.classList.toggle("dark", dark);
+      document.body.classList.toggle("dark", dark);
+      document.querySelector("gradio-app")?.classList.toggle("dark", dark);
+      styleControls();
+    };
+    const syncCheckbox = () => {
+      const checkbox = document.querySelector("#follow-windows-theme input[type='checkbox']");
+      if (checkbox) {
+        checkbox.checked = followsSystem();
+        checkbox.dataset.ragThemeWired = "true";
+      }
+      styleControls();
+    };
+    const applyStoredTheme = () => {
+      if (followsSystem()) {
+        apply(systemTheme.matches);
+        return;
+      }
+      let override = null;
+      try { override = localStorage.getItem(overrideKey); } catch (_) {}
+      apply(override === "dark");
+    };
+    document.addEventListener("change", (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLInputElement)
+          || !target.matches("#follow-windows-theme input[type='checkbox']")) return;
+      // Registered before Gradio. A browser-only preference must never open a
+      // Gradio queue stream or be mistaken for a server connection failure.
+      event.stopImmediatePropagation();
+      try { localStorage.setItem(followKey, target.checked ? "true" : "false"); } catch (_) {}
+      if (target.checked) apply(systemTheme.matches);
+      syncCheckbox();
+    }, true);
+    let lastThemePointerToggleAt = 0;
+    const toggleFromEvent = (event, { allowRecentPointer = false } = {}) => {
+      const target = event.target;
+      if (!(target instanceof Element)
+          || !target.closest("#theme-toggle-button")) return false;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      if (!allowRecentPointer && Date.now() - lastThemePointerToggleAt < 750) return true;
+      const nextDark = !isDark();
+      try {
+        // An explicit toggle is a persistent manual preference, even when it
+        // happens to match Windows' current mode. Following Windows remains
+        // an intentional checkbox choice rather than an accidental side effect.
+        localStorage.setItem(followKey, "false");
+        localStorage.setItem(overrideKey, nextDark ? "dark" : "light");
+      } catch (_) {}
+      apply(nextDark);
+      syncCheckbox();
+      return true;
+    };
+    document.addEventListener("pointerdown", (event) => {
+      if (toggleFromEvent(event, { allowRecentPointer: true })) {
+        // Gradio starts button work before its click callback. Capture the
+        // pointer action first so this local preference never reaches it.
+        lastThemePointerToggleAt = Date.now();
+      }
+    }, true);
+    document.addEventListener("click", (event) => {
+      toggleFromEvent(event);
+    }, true);
+    systemTheme.addEventListener("change", () => {
+      if (followsSystem()) apply(systemTheme.matches);
+    });
+    const observer = new MutationObserver(syncCheckbox);
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+    applyStoredTheme();
+    syncCheckbox();
   };
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", install, { once: true });
@@ -596,14 +716,17 @@ APP_CONNECTION_WATCHDOG_HEAD = APP_CONNECTION_WATCHDOG_HEAD.replace(
     "__LOCAL_APP_INSTANCE_ID__",
     LOCAL_APP_INSTANCE_ID,
 )
+APP_BROWSER_THEME_HEAD = APP_CONNECTION_WATCHDOG_HEAD[
+    APP_CONNECTION_WATCHDOG_HEAD.index('<script id="rag-local-theme-controls">'):
+]
 
 
 class LocalServerConnectionWatchdogMiddleware(BaseHTTPMiddleware):
-    """Place the localhost-loss watchdog in the parser-executed initial HTML.
+    """Place browser-only UI bootstrap code in the initial HTML.
 
     This middleware must be registered on the app *before* Gradio adds its
     Brotli middleware.  It then receives the uncompressed HTML response,
-    injects the watchdog exactly once, and lets Gradio apply normal response
+    injects the bootstrap exactly once, and lets Gradio apply normal response
     compression afterwards.  API and asset responses are deliberately left
     untouched.
     """
@@ -621,7 +744,7 @@ class LocalServerConnectionWatchdogMiddleware(BaseHTTPMiddleware):
 
         body = b"".join([chunk async for chunk in response.body_iterator])
         document = body.decode("utf-8", errors="replace")
-        marker = 'id="rag-local-server-connection-watchdog"'
+        marker = 'id="rag-local-theme-controls"'
         if marker in document or "</head>" not in document.lower():
             return Response(
                 content=body,
@@ -637,7 +760,7 @@ class LocalServerConnectionWatchdogMiddleware(BaseHTTPMiddleware):
 
         document = re.sub(
             r"</head>",
-            f"{APP_CONNECTION_WATCHDOG_HEAD}</head>",
+            f"{APP_BROWSER_THEME_HEAD}</head>",
             document,
             count=1,
             flags=re.IGNORECASE,
@@ -656,9 +779,15 @@ class LocalServerConnectionWatchdogMiddleware(BaseHTTPMiddleware):
 
 
 async def local_pdf_app_healthz():
-    """Minimal watchdog probe, independent of Gradio's heavier API schema."""
+    """Minimal watchdog probe, independent of Gradio's heavier API schema.
+
+    A tiny explicit 200 response is more reliable through the browser-side
+    Gradio transport than an otherwise valid empty 204 response.
+    """
     return Response(
-        status_code=204,
+        content=b"ok",
+        media_type="text/plain",
+        status_code=200,
         headers={
             "Cache-Control": "no-store",
             "X-Local-App-Instance": LOCAL_APP_INSTANCE_ID,
@@ -707,8 +836,27 @@ APP_JS = """
     const downloadToggle = dark
       ? { border: "#60a5fa", background: "#172033", color: "#f8fafc" }
       : { border: "#93c5fd", background: "#dbeafe", color: "#0f172a" };
+    const themeControl = dark
+      ? { border: "#475569", background: "#111c2e", color: "#e5eefc" }
+      : { border: "#bcc9d8", background: "#f4f7fb", color: "#273449" };
 
     setButtonVisual(document.getElementById("expand-all-accordions-button"), subtleButton);
+
+    // Gradio scopes CSS selectors with its generated container classes. That
+    // can outrank an otherwise correct dark-mode selector for these two
+    // intentionally custom controls, so set the visual contract directly.
+    for (const root of [
+      document.getElementById("follow-windows-theme"),
+      document.getElementById("theme-toggle-button"),
+    ]) {
+      if (!root) continue;
+      for (const node of [root, ...root.querySelectorAll(".wrap, .form, button")]) {
+        node.style.setProperty("border-color", themeControl.border, "important");
+        node.style.setProperty("background", themeControl.background, "important");
+        node.style.setProperty("color", themeControl.color, "important");
+        node.style.setProperty("box-shadow", "none", "important");
+      }
+    }
 
     const choosePdfFolderRoot = document.getElementById("choose-pdf-folder-button");
     if (choosePdfFolderRoot) {
@@ -791,14 +939,39 @@ APP_JS = """
     checkbox.checked = followsSystemTheme();
     if (checkbox.dataset.ragThemeWired) return;
     checkbox.dataset.ragThemeWired = "true";
-    checkbox.addEventListener("change", () => {
+    checkbox.addEventListener("change", (event) => {
+      // This preference is browser-only. Prevent Gradio from creating an
+      // otherwise empty server event for a local visual setting.
+      event.stopImmediatePropagation();
       setFollowSystem(checkbox.checked);
-    });
+    }, true);
   };
   const setFollowSystem = (followSystem) => {
     try { localStorage.setItem(themeFollowSystemKey, followSystem ? "true" : "false"); } catch (_) {}
     if (followSystem) applyTheme(systemThemeQuery.matches);
     syncFollowSystemControl();
+  };
+  const toggleTheme = () => {
+    const nextDark = !isDarkTheme();
+    try {
+      localStorage.setItem(themeFollowSystemKey, "false");
+      localStorage.setItem(themeOverrideKey, nextDark ? "dark" : "light");
+    } catch (_) {}
+    applyTheme(nextDark);
+    syncFollowSystemControl();
+  };
+  const wireThemeToggleButton = () => {
+    const button = document.querySelector("#theme-toggle-button button")
+      || document.getElementById("theme-toggle-button");
+    if (!button || button.dataset.ragThemeWired) return;
+    button.dataset.ragThemeWired = "true";
+    button.addEventListener("click", (event) => {
+      // Keep the colour preference out of Gradio's queue entirely. It has no
+      // server state and must remain available during a temporary health miss.
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      toggleTheme();
+    }, true);
   };
   // Old query parameters are one-time legacy overrides. Remove them so a
   // current Windows preference, or the explicit override controls, wins.
@@ -818,6 +991,7 @@ APP_JS = """
   window.setTimeout(() => {
     applySystemTheme();
     syncFollowSystemControl();
+    wireThemeToggleButton();
   }, 0);
   const simulationRefreshCooldownMs = 1500;
 
@@ -1164,6 +1338,7 @@ APP_JS = """
   const themeAwareObserver = new MutationObserver(() => {
     applyThemeAwareControlStyles();
     syncFollowSystemControl();
+    wireThemeToggleButton();
   });
   themeAwareObserver.observe(document.body, {
     attributes: true,
@@ -1171,34 +1346,6 @@ APP_JS = """
     subtree: true,
     attributeFilter: ["class"],
   });
-}
-"""
-THEME_TOGGLE_JS = """
-() => {
-  const nextDark = !(document.body.classList.contains("dark")
-    || document.documentElement.classList.contains("dark")
-    || document.querySelector("gradio-app")?.classList.contains("dark"));
-  const followSystem = nextDark === window.matchMedia("(prefers-color-scheme: dark)").matches;
-  try {
-    localStorage.setItem("rag-pdf-follow-system-theme", followSystem ? "true" : "false");
-    localStorage.setItem("rag-pdf-theme", nextDark ? "dark" : "light");
-  } catch (_) {}
-  document.documentElement.classList.toggle("dark", nextDark);
-  document.body.classList.toggle("dark", nextDark);
-  document.querySelector("gradio-app")?.classList.toggle("dark", nextDark);
-  const checkbox = document.querySelector("#follow-windows-theme input[type='checkbox']");
-  if (checkbox && checkbox.checked !== followSystem) checkbox.click();
-}
-"""
-THEME_FOLLOW_SYSTEM_JS = """
-(followSystem) => {
-  const follow = Boolean(followSystem);
-  try { localStorage.setItem("rag-pdf-follow-system-theme", follow ? "true" : "false"); } catch (_) {}
-  if (!follow) return;
-  const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
-  document.documentElement.classList.toggle("dark", dark);
-  document.body.classList.toggle("dark", dark);
-  document.querySelector("gradio-app")?.classList.toggle("dark", dark);
 }
 """
 EXPAND_ALL_CLICK_JS = """
@@ -2733,15 +2880,18 @@ gradio-app.dark .pdf-upload-input button.rag-selected-file-replace,
 }
 .theme-controls {
     align-items: center !important;
-    justify-content: space-between !important;
+    justify-content: stretch !important;
+    flex-wrap: nowrap !important;
     width: 100% !important;
     gap: 6px !important;
-    flex: 0 1 auto !important;
+    flex: 1 1 100% !important;
+    min-width: 0 !important;
 }
 #follow-windows-theme {
-    flex: 0 1 260px !important;
-    width: 260px !important;
+    flex: 13 1 0 !important;
+    width: auto !important;
     min-width: 0 !important;
+    overflow: hidden !important;
     height: 41px !important;
     min-height: 41px !important;
     padding: 10px 12px !important;
@@ -2775,12 +2925,20 @@ gradio-app.dark .pdf-upload-input button.rag-selected-file-replace,
 #follow-windows-theme .form {
     justify-content: flex-start !important;
     text-align: left !important;
+    min-width: 0 !important;
+    overflow: hidden !important;
+}
+#follow-windows-theme label,
+#follow-windows-theme .label-text {
+    min-width: 0 !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
 }
 #theme-toggle-button {
-    flex: 0 0 auto !important;
-    margin-left: auto !important;
-    width: 260px !important;
-    min-width: 260px !important;
+    flex: 7 1 0 !important;
+    margin-left: 0 !important;
+    width: auto !important;
+    min-width: 0 !important;
     height: 41px !important;
     min-height: 41px !important;
     padding: 10px 12px !important;
@@ -2795,7 +2953,15 @@ gradio-app.dark .pdf-upload-input button.rag-selected-file-replace,
     font-size: 0.82rem !important;
     font-weight: 700 !important;
 }
-body.dark #theme-toggle-button {
+#theme-toggle-button button {
+    width: 100% !important;
+    min-width: 0 !important;
+}
+body.dark #follow-windows-theme,
+body.dark #follow-windows-theme .wrap,
+body.dark #follow-windows-theme .form,
+body.dark #theme-toggle-button,
+body.dark #theme-toggle-button button {
     border-color: #475569 !important;
     background: #111c2e !important;
     color: #e5eefc !important;
@@ -18824,22 +18990,6 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                         min_width=96,
                         elem_id="theme-toggle-button",
                     )
-            theme_follow_system_toggle.change(
-                fn=None,
-                inputs=[theme_follow_system_toggle],
-                outputs=None,
-                js=THEME_FOLLOW_SYSTEM_JS,
-                queue=False,
-                show_progress="hidden",
-            )
-            theme_toggle_button.click(
-                fn=None,
-                inputs=None,
-                outputs=None,
-                js=THEME_TOGGLE_JS,
-                queue=False,
-                show_progress="hidden",
-            )
             with gr.Row(elem_classes=["advanced-output-root-controls"]):
                 advanced_output_root_override = gr.Textbox(
                     label="Advanced diagnostic output folder",

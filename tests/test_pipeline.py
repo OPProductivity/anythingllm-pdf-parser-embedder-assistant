@@ -1341,27 +1341,11 @@ class PipelineCoreTests(unittest.TestCase):
         from fastapi.responses import HTMLResponse
         from fastapi.testclient import TestClient
 
-        self.assertIn('fetch("/healthz"', app.APP_CONNECTION_WATCHDOG_HEAD)
-        self.assertIn('X-Local-App-Instance', app.APP_CONNECTION_WATCHDOG_HEAD)
-        self.assertIn('window.location.reload()', app.APP_CONNECTION_WATCHDOG_HEAD)
-        self.assertIn('The PDF app is unavailable.', app.APP_CONNECTION_WATCHDOG_HEAD)
-        self.assertIn('Connection restored.', app.APP_CONNECTION_WATCHDOG_HEAD)
-        self.assertIn('Start or restart the PDF app server.', app.APP_CONNECTION_WATCHDOG_HEAD)
-        self.assertNotIn('then refresh this page', app.APP_CONNECTION_WATCHDOG_HEAD)
-        self.assertNotIn('Refresh this page before starting a new run', app.APP_CONNECTION_WATCHDOG_HEAD)
-        self.assertIn('document.addEventListener(eventName, blockOfflineAppInteraction, true)', app.APP_CONNECTION_WATCHDOG_HEAD)
-        self.assertIn('"dragenter", "dragover", "drop"', app.APP_CONNECTION_WATCHDOG_HEAD)
-        self.assertIn('window.ragLocalServerConnectionWatchdogInstalled', app.APP_CONNECTION_WATCHDOG_HEAD)
-        self.assertIn('ragLocalServerConnectionWatchdog = "installed"', app.APP_CONNECTION_WATCHDOG_HEAD)
-        self.assertNotIn("ragLocalServerWasOffline", app.APP_CONNECTION_WATCHDOG_HEAD)
-        self.assertIn("consecutiveConnectionFailures >= 2", app.APP_CONNECTION_WATCHDOG_HEAD)
-        self.assertIn("blockOfflineAppInteraction", app.APP_CONNECTION_WATCHDOG_HEAD)
-        self.assertIn('window.ragLocalServerConnectionState === "offline"', app.APP_CONNECTION_WATCHDOG_HEAD)
-        self.assertIn('rag-server-connection-dismiss', app.APP_CONNECTION_WATCHDOG_HEAD)
-        self.assertIn('}, 4000);', app.APP_CONNECTION_WATCHDOG_HEAD)
-        self.assertIn('id="rag-local-server-connection-watchdog-style"', app.APP_CONNECTION_WATCHDOG_HEAD)
-        self.assertIn('#rag-server-connection-banner .rag-server-connection-dismiss', app.APP_CONNECTION_WATCHDOG_HEAD)
-        self.assertIn('#rag-server-connection-banner[hidden]', app.APP_CONNECTION_WATCHDOG_HEAD)
+        self.assertIn('id="rag-local-theme-controls"', app.APP_BROWSER_THEME_HEAD)
+        self.assertIn('A browser-only preference must never open a', app.APP_BROWSER_THEME_HEAD)
+        self.assertIn('document.addEventListener("pointerdown"', app.APP_BROWSER_THEME_HEAD)
+        self.assertNotIn('rag-local-server-connection-watchdog', app.APP_BROWSER_THEME_HEAD)
+        self.assertNotIn('fetch("/healthz"', app.APP_BROWSER_THEME_HEAD)
         # Gradio's launch(js=...) contract requires a callback. Turning this
         # into an IIFE makes Gradio invoke it as an event preprocessor and can
         # erase every input for confirmation-click handlers.
@@ -1383,7 +1367,7 @@ class PipelineCoreTests(unittest.TestCase):
         @test_app.get("/already-instrumented")
         def already_instrumented_page():
             return HTMLResponse(
-                '<html><head><script id="rag-local-server-connection-watchdog"></script></head><body></body></html>'
+                '<html><head><script id="rag-local-theme-controls"></script></head><body></body></html>'
             )
 
         @test_app.get("/not-html")
@@ -1392,35 +1376,33 @@ class PipelineCoreTests(unittest.TestCase):
 
         client = TestClient(test_app)
         initial_document = client.get("/").text
-        self.assertEqual(initial_document.count('id="rag-local-server-connection-watchdog"'), 1)
+        self.assertEqual(initial_document.count('id="rag-local-theme-controls"'), 1)
         self.assertLess(
-            initial_document.index('ragLocalServerConnectionWatchdogInstalled'),
+            initial_document.index('ragLocalThemeControlsInstalled'),
             initial_document.lower().index("</head>"),
         )
-        self.assertNotIn('ragLocalServerConnectionWatchdogInstalled', client.get("/not-html").text)
+        self.assertNotIn('ragLocalThemeControlsInstalled', client.get("/not-html").text)
         self.assertEqual(client.get("/").headers["X-Local-App-Contract"], "preserved")
         # A future route must never inherit an extra script merely because it
         # happens to return HTML, and pre-instrumented HTML remains exactly
-        # one watchdog rather than accumulating copies on middleware changes.
+        # one bootstrap rather than accumulating copies on middleware changes.
         self.assertNotIn(
-            'ragLocalServerConnectionWatchdogInstalled',
+            'ragLocalThemeControlsInstalled',
             client.get("/already-instrumented").text,
         )
         self.assertEqual(
-            client.get("/already-instrumented").text.count('id="rag-local-server-connection-watchdog"'),
+            client.get("/already-instrumented").text.count('id="rag-local-theme-controls"'),
             1,
         )
 
-        # The marker guard is exercised on a root document too: a future
-        # Gradio release may provide its own equivalent script, and our
-        # middleware must preserve it rather than layering a second watcher.
+        # The marker guard is exercised on a root document too.
         preinstrumented_app = FastAPI()
         preinstrumented_app.add_middleware(app.LocalServerConnectionWatchdogMiddleware)
 
         @preinstrumented_app.get("/")
         def preinstrumented_root_page():
             return HTMLResponse(
-                '<html><head><script id="rag-local-server-connection-watchdog"></script></head><body></body></html>',
+                '<html><head><script id="rag-local-theme-controls"></script></head><body></body></html>',
                 headers={"X-Local-App-Contract": "preinstrumented"},
             )
 
@@ -1428,17 +1410,18 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(preinstrumented_response.status_code, 200)
         self.assertEqual(preinstrumented_response.headers["X-Local-App-Contract"], "preinstrumented")
         self.assertEqual(
-            preinstrumented_response.text.count('id="rag-local-server-connection-watchdog"'),
+            preinstrumented_response.text.count('id="rag-local-theme-controls"'),
             1,
         )
-        self.assertNotIn("ragLocalServerConnectionWatchdogInstalled", preinstrumented_response.text)
+        self.assertNotIn("ragLocalThemeControlsInstalled", preinstrumented_response.text)
 
     def test_watchdog_health_endpoint_is_lightweight_and_available(self):
         import asyncio
         import rag_pdf_gradio_app as app
 
         response = asyncio.run(app.local_pdf_app_healthz())
-        self.assertEqual(response.status_code, 204)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.body, b"ok")
         self.assertEqual(response.headers["X-Local-App-Instance"], app.LOCAL_APP_INSTANCE_ID)
 
     def test_refresh_top_anythingllm_status_flashes_only_for_an_unchanged_outage(self):
@@ -4885,17 +4868,23 @@ class PipelineCoreTests(unittest.TestCase):
         import rag_pdf_gradio_app as app
 
         self.assertRegex(app.APP_VERSION, r"^\d+\.\d+\.\d+$")
-        self.assertEqual(app.APP_VERSION, "0.5.0")
+        self.assertEqual(app.APP_VERSION, "0.5.1")
         self.assertEqual(app.APP_BASE_COMMIT, "portable-package")
         self.assertIn('window.matchMedia("(prefers-color-scheme: dark)")', app.APP_JS)
         self.assertIn('systemThemeQuery.addEventListener("change", applySystemTheme)', app.APP_JS)
-        self.assertIn('localStorage.setItem(themeFollowSystemKey, followSystem ? "true" : "false")', app.APP_JS)
+        self.assertIn('localStorage.setItem(themeFollowSystemKey, "false")', app.APP_JS)
+        self.assertIn('localStorage.setItem(themeOverrideKey, nextDark ? "dark" : "light")', app.APP_JS)
         self.assertIn("syncFollowSystemControl", app.APP_JS)
+        self.assertIn("wireThemeToggleButton", app.APP_JS)
+        self.assertIn("event.stopImmediatePropagation()", app.APP_JS)
+        self.assertIn('document.getElementById("theme-toggle-button")', app.APP_JS)
+        self.assertIn('node.style.setProperty("background", themeControl.background, "important")', app.APP_JS)
+        self.assertIn("flex: 13 1 0 !important", app.APP_CSS)
+        self.assertIn("flex: 7 1 0 !important", app.APP_CSS)
         self.assertIn('initialUrl.searchParams.delete("__theme")', app.APP_JS)
-        self.assertIn("THEME_TOGGLE_JS", Path(app.__file__).read_text(encoding="utf-8"))
-        self.assertIn('const followSystem = nextDark === window.matchMedia("(prefers-color-scheme: dark)").matches', app.THEME_TOGGLE_JS)
-        self.assertIn('localStorage.setItem("rag-pdf-follow-system-theme", followSystem ? "true" : "false")', app.THEME_TOGGLE_JS)
-        self.assertIn('localStorage.setItem("rag-pdf-theme", nextDark ? "dark" : "light")', app.THEME_TOGGLE_JS)
+        source = Path(app.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("THEME_TOGGLE_JS", source)
+        self.assertNotIn("THEME_FOLLOW_SYSTEM_JS", source)
         self.assertIn(".gradio-container .progress-text", app.APP_CSS)
         self.assertIn("display: none !important", app.APP_CSS)
         self.assertIn("decorateSelectedPdfActions", app.APP_JS)

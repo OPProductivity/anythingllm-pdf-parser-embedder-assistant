@@ -272,7 +272,8 @@ def test_report_keeps_anonymous_stage_table_and_checkpoint_metrics(tmp_path: Pat
     assert payload["data_quality"]["calibration_acceptance"] == "failed"
     assert payload["operational"]["trial_to_trial_variance"][0]["sample_variance_seconds_squared"] == 8.0
     assert "groups" in payload["calibration"]["page_count_quartiles"]
-    assert (tmp_path / "results" / "benchmark-report.md").is_file()
+    assert (tmp_path / "results" / "benchmark-report.json").is_file()
+    assert not (tmp_path / "results" / "benchmark-report.md").exists()
 
 
 def test_calibration_view_excludes_warning_stale_and_uncertain_runs_but_operational_keeps_them():
