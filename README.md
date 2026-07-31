@@ -68,8 +68,8 @@ flowchart LR
 | Mode | Result |
 | --- | --- |
 | **Create local files only** | Creates a compact transcript/segment export directly in one folder named after the selected PDF, or the first and last PDF in a batch. Nothing is submitted to AnythingLLM. |
-| **Create local files with diagnostic logs** | Creates a local transcript, segments, and ordinary run evidence. Nothing is submitted to AnythingLLM. |
-| **Create local files and upload to AnythingLLM** | Creates local output, then submits prepared records to an explicitly selected existing workspace or a newly created workspace after confirmation. |
+| **Create local files with diagnostic logs** | Creates a local transcript, segments, and ordinary run evidence. The transcript and segment files sit directly in the document output folder. Nothing is submitted to AnythingLLM. |
+| **Create local files and upload to AnythingLLM** | Creates local output, with the transcript and segments directly in the document output folder, then submits prepared records to an explicitly selected existing workspace or a newly created workspace after confirmation. |
 
 ### Segmentation choices
 

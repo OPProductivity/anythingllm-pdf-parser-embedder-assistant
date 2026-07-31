@@ -102,8 +102,8 @@ Choose one output mode:
 | Mode | What happens |
 | --- | --- |
 | **Create local files only** | A compact transcript/segment export with no run logs. Its one output folder is named after the selected PDF, or the first and last PDF in a batch. Nothing is submitted to AnythingLLM. |
-| **Create local files with diagnostic logs** | Text extraction, selected OCR/segmentation, local output, and ordinary run evidence. Nothing is submitted to AnythingLLM. |
-| **Create local files and upload to AnythingLLM** | Local output plus submission of prepared records to an explicitly selected workspace or a newly created workspace. |
+| **Create local files with diagnostic logs** | Text extraction, selected OCR/segmentation, local output, and ordinary run evidence. The transcript and segment files are directly in the document output folder. Nothing is submitted to AnythingLLM. |
+| **Create local files and upload to AnythingLLM** | Local output, with the transcript and segment files directly in the document output folder, plus submission of prepared records to an explicitly selected workspace or a newly created workspace. |
 
 The output-root chooser controls where local run folders are created. Each
 diagnostic-log run receives its own subfolder. Compact local-only exports are

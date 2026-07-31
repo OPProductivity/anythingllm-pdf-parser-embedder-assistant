@@ -73,6 +73,18 @@ def validate_planned_path(
                 "warning",
                 "No-local-segmentation mode delegates final boundaries to AnythingLLM; exact page provenance after upload is not guaranteed.",
             ))
+        elif policy.mode == "custom_page_ranges":
+            # Custom Range deliberately combines consecutive physical pages,
+            # so it is not page-local in the strict one-page-per-record sense.
+            # It nevertheless retains an exact contiguous parent page range
+            # for every prepared record.  Treat that as a disclosed limitation
+            # of downstream splitting, not as a contradiction between an
+            # exposed production control and preflight.
+            findings.append(PreflightFinding(
+                "custom_range_page_group_provenance",
+                "warning",
+                "Custom Range preserves each record's contiguous PDF page range; AnythingLLM may still split within that grouped record after upload.",
+            ))
         else:
             findings.append(PreflightFinding("mode_not_page_local", "blocking", "Current research modes must remain page-local."))
 

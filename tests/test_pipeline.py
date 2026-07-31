@@ -2032,24 +2032,16 @@ class PipelineCoreTests(unittest.TestCase):
             self.assertFalse(lane_review.exists())
             self.assertFalse(supplementary_candidates.exists())
             self.assertTrue((root / "Example-pdf-parsed.txt").exists())
-            self.assertEqual(
-                (root / "segments" / "Example-p001-s01.txt").read_text(encoding="utf-8"),
-                "First page, first chunk.",
-            )
-            self.assertEqual(
-                (root / "segments" / "Example-p001-s02.txt").read_text(encoding="utf-8"),
-                "First page, second chunk.",
-            )
-            self.assertEqual(
-                (root / "segments" / "Example-p002-s01.txt").read_text(encoding="utf-8"),
-                "Second page.",
-            )
+            self.assertEqual((root / "Example-p001-s01.txt").read_text(encoding="utf-8"), "First page, first chunk.")
+            self.assertEqual((root / "Example-p001-s02.txt").read_text(encoding="utf-8"), "First page, second chunk.")
+            self.assertEqual((root / "Example-p002-s01.txt").read_text(encoding="utf-8"), "Second page.")
+            self.assertFalse((root / "segments").exists())
             self.assertFalse((root / "metadata-api").exists())
             self.assertFalse((root / "candidates").exists())
             self.assertFalse((root / "pdf-input-preflight.json").exists())
             self.assertFalse((root / "output-capacity-preflight.json").exists())
             self.assertEqual(compact["artifacts"]["parsed_text"], "Example-pdf-parsed.txt")
-            self.assertEqual(compact["artifacts"]["segments_directory"], "segments")
+            self.assertEqual(compact["artifacts"]["segments_directory"], "")
             self.assertEqual(compact["artifacts"]["retained_segment_files"], 3)
             self.assertEqual(summary["upload_file"], str(root / "Example-pdf-parsed.txt"))
             self.assertEqual(summary["manifest"], "")
@@ -2206,7 +2198,8 @@ class PipelineCoreTests(unittest.TestCase):
             self.assertEqual(collision.read_text(encoding="utf-8"), "existing export")
             self.assertFalse((root / "Example-aaaaaaaaaaaa-complete-pdf-parsed.txt").exists())
             self.assertFalse((root / "Example-aaaaaaaaaaaa-p001-s01.txt").exists())
-            self.assertTrue((root / "segments").is_dir())
+            self.assertFalse((root / "segments").exists())
+            self.assertTrue((root / "Example-p001-s01.txt").exists())
 
     def test_compact_local_only_batch_promotion_uses_one_first_to_last_folder(self):
         import rag_pdf_gradio_app as app

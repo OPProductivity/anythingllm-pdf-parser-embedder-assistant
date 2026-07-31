@@ -1711,6 +1711,20 @@ def retain_successful_run_leanly(out_root: Path, summary, profile, prepared_text
         out_root / "segments",
         segments,
     )
+    # Segment records are useful output, not a diagnostic category. Keep them
+    # beside the prepared transcript so successful upload and diagnostic runs
+    # do not force an operator through a second ``segments`` folder.
+    direct_segments = []
+    for segment_path in retained_segments:
+        direct_path = out_root / segment_path.name
+        if direct_path.exists():
+            raise FileExistsError(f"Refusing to overwrite retained segment: {direct_path}")
+        shutil.move(str(segment_path), str(direct_path))
+        direct_segments.append(direct_path)
+    segment_directory = out_root / "segments"
+    if segment_directory.is_dir():
+        segment_directory.rmdir()
+    retained_segments = direct_segments
     # The live Gradio result is built from this same mutable summary.  Rewrite
     # its paths before returning so downloads and output links never point to
     # the selected/ files we are about to remove.
@@ -1803,7 +1817,7 @@ def retain_successful_run_leanly(out_root: Path, summary, profile, prepared_text
         "artifacts": {
             "parsed_text": retained_text_path.relative_to(out_root).as_posix(),
             "parsed_text_bytes": retained_text_path.stat().st_size,
-            "segments_directory": "segments",
+            "segments_directory": "",
             "retained_segment_files": len(retained_segments),
             "segment_file_naming": "{document}-p{page:03d}-s{within_page:02d}.txt",
         },
@@ -1819,7 +1833,7 @@ def retain_successful_run_leanly(out_root: Path, summary, profile, prepared_text
     return {
         "applied": True,
         "prepared_text": str(retained_text_path),
-        "segments_directory": str(out_root / "segments"),
+        "segments_directory": "",
         "retained_segment_files": len(retained_segments),
         "deleted": sorted(deleted),
     }
@@ -1856,7 +1870,7 @@ def retain_successful_run_without_logs(out_root: Path, summary, profile, prepare
     flat_text = root / compatible_output_filename(root, prefix, "-complete-pdf-parsed.txt")
     if not current_text.is_file():
         return {"applied": False, "reason": "prepared_text_missing_after_lean_cleanup"}
-    segment_root = Path(str(retained.get("segments_directory") or root / "segments"))
+    segment_root = Path(str(retained.get("segments_directory") or root))
     planned_segments = []
     for segment_path in sorted(segment_root.glob("*.txt")) if segment_root.is_dir() else []:
         match = re.search(r"-p(\d+)-s(\d+)\.txt$", segment_path.name, re.IGNORECASE)
@@ -1884,7 +1898,7 @@ def retain_successful_run_without_logs(out_root: Path, summary, profile, prepare
     for segment_path, flat_segment in planned_segments:
         segment_path.replace(flat_segment)
         flat_segments.append(flat_segment)
-    if segment_root.is_dir():
+    if segment_root.is_dir() and segment_root != root:
         shutil.rmtree(segment_root, ignore_errors=True)
     no_logs_receipts = (
         "run-checkpoint.json",
@@ -15812,7 +15826,9 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         else ("pass" if selected["chunk_eval"].get("chunks_without_marker", 0) == 0 else "warning")
     )
 
-    selected_dir = out_root / "selected"
+    # Prepared text and diagnostic evidence belong to the document root. A
+    # separate ``selected`` folder added no identity or recovery value.
+    selected_dir = out_root
     selected_dir.mkdir(parents=True, exist_ok=True)
     src_candidate_dir = Path(selected["candidate_dir"])
     shutil.copy2(src_candidate_dir / "anythingllm-upload.txt", selected_dir / "anythingllm-upload.txt")

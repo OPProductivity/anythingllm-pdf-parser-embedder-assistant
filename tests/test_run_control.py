@@ -144,6 +144,22 @@ def test_preflight_allows_explicit_no_local_segmentation_with_provenance_warning
     assert finding.severity == "warning"
 
 
+def test_preflight_allows_custom_page_ranges_with_range_provenance_warning():
+    resolved = {
+        "compatibility": {"capabilities": {}},
+        "embedder": {},
+        "anomalies": [],
+    }
+    result = validate_planned_path(
+        resolved, "custom_page_ranges", target_length=640, requested_chunk_size=384,
+    )
+
+    assert result.status == "pass_with_review"
+    finding = next(row for row in result.findings if row.code == "custom_range_page_group_provenance")
+    assert finding.severity == "warning"
+    assert "contiguous PDF page range" in finding.message
+
+
 def test_preflight_checks_actual_upload_capabilities_and_runtime_probe():
     resolved = {
         "compatibility": {
