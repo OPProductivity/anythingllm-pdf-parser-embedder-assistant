@@ -89,6 +89,7 @@ from auto_anythingllm_pipeline import (
     native_identity_stem,
     observe_workspace_embedding_queue_activity,
     page_stats_for,
+    parse_custom_page_group_sizes,
     pdf_metadata,
     planned_embedding_batch_count,
     prepare_pdf,
@@ -193,6 +194,7 @@ SEGMENT_PASSAGES_LABEL = "AnythingLLM-parity subchunking"
 SEGMENT_PAGE_ONLY_LABEL = "Whole-page chunks"
 SEGMENT_PAGE_LIMIT_LABEL = "Page - preserve automatically"
 SEGMENT_PAGE_PASSAGES_LABEL = "Shorter page-local passages"
+SEGMENT_CUSTOM_PAGE_RANGE_LABEL = "Custom Range"
 LEGACY_SEGMENT_PAGE_LIMIT_LABEL = "Page-bounded subchunking"
 SEGMENT_NONE_LABEL = "All in one file"
 ADVANCED_BACKEND_AUTOMATIC_LABEL = "Automatic"
@@ -210,6 +212,12 @@ def is_page_preserving_segment_mode(value):
         or "page-preserving" in normalized
         or "page-bounded" in normalized
     )
+
+
+def is_custom_page_range_segment_mode(value):
+    """Return whether a UI label selects explicit consecutive page groups."""
+    normalized = str(value or "").casefold()
+    return normalized == SEGMENT_CUSTOM_PAGE_RANGE_LABEL.casefold() or "custom page range" in normalized
 ADVANCED_BACKEND_TESSERACT_LABEL = "Unstructured OCR (Tesseract)"
 ADVANCED_BACKEND_CHOICES = [
     ADVANCED_BACKEND_AUTOMATIC_LABEL,
@@ -266,6 +274,7 @@ AUTOMATIC_RUN_FIELDS = (
     "anythingllm_document_folder_name", "local_check_mode", "custom_ollama_model", "ollama_url",
     "vector_audit_scope", "deep_extraction", "include_front_matter", "include_back_matter", "backend_mode",
     "first_page_override", "end_page_override", "target_passage_length", "page_preserve_ceiling", "segment_mode",
+    "custom_page_group_sizes",
     "advanced_end_section_names", "automatic_validation_phrases", "unstructured_strategy",
     "generate_inline_fallback", "inherit_anythingllm_settings", "anythingllm_chunk_size",
     "anythingllm_chunk_overlap", "auto_apply_recommended_settings", "download_full_folder",
@@ -289,6 +298,7 @@ ANYTHINGLLM_EMBEDDER_ENGINE_CHOICES = [
     "lemonade",
 ]
 APP_ICON = package_resource_path("assets/anythingllm-pdf-assistant-start.ico")
+UPLOAD_SELECTED_FILES_ICON = package_resource_path("assets/upload-selected-files.svg")
 APP_THEME = gr.themes.Soft(primary_hue="blue", neutral_hue="slate")
 LAST_SIMULATION_DIAGNOSTICS = {}
 LAST_TIMING_ESTIMATE = {}
@@ -1001,14 +1011,25 @@ APP_JS = """
   // two actions. The native clear/X control remains beside it.
   const selectedPdfUploadGlyph = `
     <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-      <path d="M7.5 18.5h10a4 4 0 0 0 .55-7.96A6.25 6.25 0 0 0 6.1 9.3 4.6 4.6 0 0 0 7.5 18.5Z"></path>
-      <path d="M12 16V8"></path>
-      <path d="m8.8 11.2 3.2-3.2 3.2 3.2"></path>
+      <path d="M12 16V3"></path>
+      <path d="m7 8 5-5 5 5"></path>
+      <path d="M4 15v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4"></path>
     </svg>`;
   const decorateSelectedPdfActions = () => {
     for (const uploadRoot of document.querySelectorAll(".pdf-upload-input")) {
       const filePreview = uploadRoot.querySelector(".file-preview");
       const actionHost = uploadRoot.querySelector(".icon-button-wrapper.top-panel");
+      // Gradio can restore a header button in the browser after a server
+      // restart even though it has no selected files.  Keep the reuse action
+      // tied to the visible file preview rather than that stale client state.
+      const reuseButton = actionHost?.querySelector('button[aria-label="Use selected files again"]');
+      if (reuseButton) {
+        reuseButton.style.setProperty(
+          "display",
+          filePreview ? "inline-flex" : "none",
+          "important"
+        );
+      }
       if (!filePreview || !actionHost || actionHost.querySelector(".rag-selected-file-replace")) continue;
       const clearButton = [...actionHost.querySelectorAll("button")].find((button) =>
         !button.classList.contains("rag-selected-file-replace")
@@ -1646,6 +1667,15 @@ gradio-app,
 .gradio-container .top-level-accordion .wrap-inner {
     padding-left: 6px !important;
     padding-right: 6px !important;
+}
+#custom-page-range-controls {
+    clear: both !important;
+    position: static !important;
+    margin: 8px 6px 10px !important;
+}
+#custom-page-range-controls .block,
+#custom-page-range-controls .form {
+    margin: 0 !important;
 }
 .gradio-container .top-level-accordion input[role="combobox"] {
     padding-left: 8px !important;
@@ -2816,25 +2846,45 @@ body.dark .batch-folder-inline-notice {
     align-items: center !important;
     gap: 3px !important;
 }
+.pdf-upload-input button[aria-label="Use selected files again"].custom-button {
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    width: 24px !important;
+    height: 24px !important;
+    min-width: 24px !important;
+    min-height: 24px !important;
+    padding: 0 !important;
+    border-radius: 4px !important;
+}
+.pdf-upload-input button[aria-label="Use selected files again"] .custom-button-label {
+    display: none !important;
+}
+.pdf-upload-input button[aria-label="Use selected files again"] img {
+    display: block !important;
+    width: 14px !important;
+    height: 14px !important;
+    margin: 0 !important;
+}
 .pdf-upload-input button.rag-selected-file-replace {
     display: inline-flex !important;
     align-items: center !important;
     justify-content: center !important;
-    width: 30px !important;
-    height: 30px !important;
-    min-width: 30px !important;
-    min-height: 30px !important;
+    width: 24px !important;
+    height: 24px !important;
+    min-width: 24px !important;
+    min-height: 24px !important;
     padding: 0 !important;
     border: 1px solid #93c5fd !important;
-    border-radius: 6px !important;
+    border-radius: 4px !important;
     background: #eff6ff !important;
     color: #2563eb !important;
     opacity: 1 !important;
 }
 .pdf-upload-input button.rag-selected-file-replace svg {
     display: block !important;
-    width: 17px !important;
-    height: 17px !important;
+    width: 14px !important;
+    height: 14px !important;
     margin: 0 !important;
     overflow: visible !important;
     fill: none !important;
@@ -5624,6 +5674,7 @@ def automatic_run_processing_settings(values):
         "end_page_override": settings.get("end_page_override"),
         "target_passage_length": settings.get("target_passage_length"),
         "segment_mode": settings.get("segment_mode"),
+        "custom_page_group_sizes": settings.get("custom_page_group_sizes"),
         "unstructured_strategy": settings.get("unstructured_strategy"),
         "generate_inline_fallback": settings.get("generate_inline_fallback"),
         "inherit_anythingllm_settings": settings.get("inherit_anythingllm_settings"),
@@ -5684,6 +5735,7 @@ def fresh_automatic_run_setting_values(pdf_files=None, folder_pdf_files=None):
         # 0 means follow the active AnythingLLM splitter/embedder ceiling.
         "page_preserve_ceiling": 0,
         "segment_mode": SEGMENT_PAGE_LIMIT_LABEL,
+        "custom_page_group_sizes": "",
         "advanced_end_section_names": "\n".join(DEFAULT_END_SECTION_HEADINGS),
         "automatic_validation_phrases": "",
         "unstructured_strategy": "auto",
@@ -5707,6 +5759,7 @@ def refresh_automatic_run_estimate_for_fresh_selection(pdf_files=None, folder_pd
         defaults["native_upload_scope"],
         defaults["workspace_slug"],
         defaults["segment_mode"],
+        defaults["custom_page_group_sizes"],
         defaults["target_passage_length"],
         defaults["anythingllm_chunk_size"],
         defaults["anythingllm_chunk_overlap"],
@@ -7585,9 +7638,15 @@ def folder_scan_progress_html(scan):
     directories = int((scan or {}).get("directories_scanned") or 0)
     entries = int((scan or {}).get("files_seen") or 0)
     pdfs = len((scan or {}).get("pdf_paths") or [])
+    subfolders = max(0, directories - 1)
+    location = (
+        "the selected folder"
+        if not subfolders
+        else f"the selected folder and {subfolders} subfolder{'s' if subfolders != 1 else ''}"
+    )
     return (
         '<div class="artifact-placeholder batch-folder-scanning"><strong>Scanning PDF folder…</strong>'
-        f"<br>Checked {directories} folder{'s' if directories != 1 else ''}, {entries} entr{'y' if entries == 1 else 'ies'}; "
+        f"<br>Scanning {location}; inspected {entries} filesystem entr{'y' if entries == 1 else 'ies'}; "
         f"found {pdfs} PDF file{'s' if pdfs != 1 else ''} so far.</div>"
     )
 
@@ -7611,15 +7670,24 @@ def folder_scan_status_html(manifest):
     pdf_count = len(manifest.get("pdf_candidates") or [])
     directories = int(manifest.get("directories_scanned") or 0)
     entries = int(manifest.get("files_seen") or 0)
+    subfolders = max(0, directories - 1)
+    selected_root = str(manifest.get("root") or "").strip()
+    scanned_location = (
+        "the selected folder"
+        if not subfolders
+        else f"the selected folder and {subfolders} subfolder{'s' if subfolders != 1 else ''}"
+    )
+    source = f"Selected folder: {selected_root}. " if selected_root else ""
+    count_label = f"{entries} item{'s' if entries != 1 else ''} (files and folders)"
     if not pdf_count:
-        detail = f"Checked {directories} folder{'s' if directories != 1 else ''} and {entries} entries."
+        detail = f"{source}Scanned {scanned_location}; inspected {count_label}."
         errors = manifest.get("scan_errors") or []
         if errors:
             detail += " Some paths could not be read; see the application log for details."
         return f'<div class="artifact-placeholder"><strong>No readable PDFs found.</strong><br>{html.escape(detail)}</div>'
     detail = (
-        f"Found {pdf_count} readable PDF file{'s' if pdf_count != 1 else ''} "
-        f"across {directories} folder{'s' if directories != 1 else ''} ({entries} entries checked)."
+        f"{source}Found {pdf_count} readable PDF file{'s' if pdf_count != 1 else ''} while scanning "
+        f"{scanned_location} ({count_label} inspected)."
     )
     ignored_non_pdf = int(manifest.get("non_pdf_files") or 0)
     if ignored_non_pdf:
@@ -7752,7 +7820,7 @@ def merge_uploaded_pdfs_into_folder_batch(pdf_files=None, folder_manifest=None):
     folder_paths = [str(path) for path in clean_downloadable_paths(manifest.get("pdf_candidates") or [])]
     if not direct_paths or not folder_paths:
         return (
-            gr.update(), [], manifest, gr.update(), gr.update(), gr.update(), gr.update(),
+            gr.update(), [], manifest, gr.update(), gr.update(), gr.update(),
         )
 
     candidates = list(dict.fromkeys([*folder_paths, *direct_paths]))
@@ -7778,6 +7846,81 @@ def merge_uploaded_pdfs_into_folder_batch(pdf_files=None, folder_manifest=None):
         ),
         gr.update(visible=True),
         gr.update(value=batch_folder_selected_status_html(manifest, selected), visible=True),
+    )
+
+
+def reuse_selected_pdf_files(pdf_files=None):
+    """Re-emit the current ordinary-picker paths without opening a file dialog.
+
+    This is intentionally a fresh-selection action, not a pipeline retry: it
+    clears the previous run presentation through the normal UI chain while
+    keeping the browser's existing selected PDF paths mounted.
+    """
+    selected = inspect_uploaded_pdf_candidates(pdf_files).get("pdf_candidates", [])
+    return gr.update(value=selected)
+
+
+def selected_pdf_files_retry_button_update(pdf_files=None):
+    """Only offer a retry after the ordinary picker has a valid selection."""
+    selected = inspect_uploaded_pdf_candidates(pdf_files).get("pdf_candidates", [])
+    return gr.update(visible=bool(selected))
+
+
+def reuse_selected_pdf_batch(manifest=None, selected_paths=None):
+    """Refresh a batch selection while retaining its checked PDF paths."""
+    updated = dict(manifest or {}) if isinstance(manifest, dict) else {}
+    requested = normalize_file_list(
+        selected_paths if selected_paths is not None else updated.get("selected_pdf_candidates")
+    )
+    inspection = inspect_uploaded_pdf_candidates(requested)
+    selected = [str(path) for path in inspection.get("pdf_candidates") or []]
+    updated["selected_pdf_candidates"] = selected
+    details = dict(updated.get("picker_page_details") or {})
+    details.update(pdf_picker_page_details(selected))
+    updated["picker_page_details"] = details
+    return (
+        selected,
+        updated,
+        gr.update(
+            choices=batch_folder_selection_choices(updated),
+            value=selected,
+            visible=bool(updated.get("pdf_candidates")),
+        ),
+        gr.update(value=batch_folder_selected_status_html(updated, selected), visible=True),
+    )
+
+
+def clear_selected_pdf_batch():
+    """Forget the current batch selection without touching any source files."""
+    return (
+        "",
+        [],
+        {},
+        gr.update(choices=[], value=[], visible=False),
+        gr.update(visible=False),
+        gr.update(value="", visible=False),
+        gr.update(visible=True),
+        gr.update(value="Select PDF Folder Here", interactive=True),
+    )
+
+
+def reset_batch_folder_picker_on_app_open():
+    """Start every newly loaded app session with no retained folder scan.
+
+    Browser-side Gradio state can outlive a localhost restart.  Folder scan
+    results describe a particular local directory and must never be restored
+    merely because the browser still has an old component tree mounted.
+    """
+    return (
+        "",
+        [],
+        {},
+        False,
+        gr.update(choices=[], value=[], visible=False),
+        gr.update(visible=False),
+        gr.update(value="", visible=False),
+        gr.update(visible=True),
+        gr.update(value="Select PDF Folder Here", interactive=True),
     )
 
 
@@ -7835,12 +7978,16 @@ def apply_batch_folder_file_selection(manifest=None, selected_paths=None):
 
 
 def choose_pdf_input_directory_for_scan(current_value=""):
-    """Select a root, then let the next event stream the actual scan visibly."""
+    """Select a root and clear any preceding scan before discovery begins."""
     selected = choose_pdf_input_directory(current_value, preserve_on_cancel=False)
     if selected is None:
         return (
-            gr.update(),
+            "",
             False,
+            [],
+            {},
+            gr.update(choices=[], value=[], visible=False),
+            gr.update(visible=False),
             gr.update(value="", visible=False),
             gr.update(visible=True),
             gr.update(value="Select PDF Folder Here", interactive=True),
@@ -7848,6 +7995,10 @@ def choose_pdf_input_directory_for_scan(current_value=""):
     return (
         selected,
         True,
+        [],
+        {},
+        gr.update(choices=[], value=[], visible=False),
+        gr.update(visible=False),
         gr.update(
             value='<div class="artifact-placeholder batch-folder-scanning"><strong>Preparing folder scan…</strong><br>The selected folder will be searched recursively for PDFs.</div>',
             visible=True,
@@ -7864,7 +8015,11 @@ def stream_selected_pdf_directory(path_text="", scan_requested=False):
         return
     if not scan_requested:
         yield (
-            gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
+            [],
+            {},
+            gr.update(choices=[], value=[], visible=False),
+            gr.update(visible=False),
+            gr.update(value="", visible=False),
             gr.update(visible=True),
             gr.update(value="Select PDF Folder Here", interactive=True),
         )
@@ -7916,17 +8071,20 @@ def stream_selected_pdf_directory(path_text="", scan_requested=False):
     )
     candidates = manifest["pdf_candidates"]
     manifest["selected_pdf_candidates"] = list(candidates)
+    has_candidates = bool(candidates)
     yield (
         candidates,
         manifest,
         gr.update(
             choices=batch_folder_selection_choices(manifest),
             value=candidates,
-            visible=bool(candidates),
+            visible=has_candidates,
         ),
-        gr.update(visible=bool(candidates)),
+        gr.update(visible=has_candidates),
         gr.update(value=batch_folder_selected_status_html(manifest, candidates), visible=True),
-        gr.update(visible=False),
+        # A no-PDF result remains actionable: keep the folder chooser visible
+        # so the person can immediately choose a different root.
+        gr.update(visible=not has_candidates),
         gr.update(value="Select PDF Folder Here", interactive=True),
     )
 
@@ -8493,6 +8651,7 @@ def run_advanced_diagnostics(
     first_page_override,
     end_page_override,
     segment_mode,
+    custom_page_group_sizes,
     target_passage_policy,
     target_passage_length,
     end_section_names,
@@ -8516,6 +8675,15 @@ def run_advanced_diagnostics(
         backend_choice,
         unstructured_strategy,
     )
+    resolved_segment_mode = pipeline_segment_mode(segment_mode)
+    try:
+        resolved_custom_page_group_sizes = (
+            parse_custom_page_group_sizes(custom_page_group_sizes)
+            if resolved_segment_mode == "custom_page_ranges"
+            else ()
+        )
+    except ValueError as exc:
+        raise gr.Error(f"Custom Range is invalid: {exc}") from exc
     sizing = target_passage_sizing_plan(
         segment_mode,
         target_passage_policy,
@@ -8553,7 +8721,8 @@ def run_advanced_diagnostics(
         first_page_override=int(first_page_override or 0),
         end_page_override=int(end_page_override or 0),
         target_passage_length=resolved_target,
-        segment_mode=pipeline_segment_mode(segment_mode),
+        segment_mode=resolved_segment_mode,
+        custom_page_group_sizes=resolved_custom_page_group_sizes,
         end_section_names=merged_end_section_headings(end_section_names),
         validation_phrases=normalize_lines(validation_phrases),
         unstructured_strategy=resolved_strategy,
@@ -9644,7 +9813,7 @@ def reset_automatic_run_settings_to_defaults():
     intact and is still resolved at confirmation time.
     """
     if str((LIVE_AUTOMATIC_RUN_STATUS or {}).get("state") or "") == "running":
-        return tuple(gr.update() for _ in range(41))
+        return tuple(gr.update() for _ in range(43))
     return (
         gr.update(value=""),
         gr.update(value=""),
@@ -9672,6 +9841,8 @@ def reset_automatic_run_settings_to_defaults():
         gr.update(value=True),
         gr.update(value=True),
         gr.update(value=SEGMENT_PAGE_LIMIT_LABEL),
+        gr.update(value=""),
+        gr.update(visible=False),
         gr.update(value="Automatic"),
         gr.update(value=0),
         gr.update(value=0),
@@ -10923,6 +11094,7 @@ def automatic_timing_document_profile(files, *, document_limit=None, page_sample
         "profiled_documents": len(profiled_paths),
         "profile_document_limit": document_limit,
         "page_count": 0,
+        "document_page_counts": [],
         "file_bytes": 0,
         "sampled_pages": 0,
         "sampled_text_chars": 0,
@@ -10947,6 +11119,7 @@ def automatic_timing_document_profile(files, *, document_limit=None, page_sample
             document = fitz.open(path)
             pages = int(document.page_count or 0)
             profile["page_count"] += pages
+            profile["document_page_counts"].append(pages)
             sample_count = min(max(1, int(page_sample_limit or 1)), pages)
             indexes = sorted({round(index * (pages - 1) / max(1, sample_count - 1)) for index in range(sample_count)})
             for index in indexes:
@@ -11214,6 +11387,7 @@ def automatic_progress_file_allocations(
     files,
     *,
     segment_mode="",
+    custom_page_group_sizes="",
     chunk_size=0,
     chunk_overlap=0,
     backend_mode="Automatic",
@@ -11237,6 +11411,7 @@ def automatic_progress_file_allocations(
             MODE_LOCAL_ONLY_LABEL,
             "local only",
             segment_mode=segment_mode,
+            custom_page_group_sizes=custom_page_group_sizes,
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             backend_mode=backend_mode,
@@ -11350,7 +11525,25 @@ def timing_local_simulation_identity(local_check_mode):
     return "ollama", str(choice or "unknown")
 
 
-def timing_model_features(profile, mode, native_upload_scope, *, segment_mode="", chunk_size=0, chunk_overlap=0, target_passage_length=0, backend_mode="", unstructured_strategy="auto", native_upload_transport="", native_upload_representation="", simulation_engine="", simulation_model=""):
+def _custom_page_group_record_count(page_count, page_group_sizes):
+    """Estimate one consecutive record per custom page group without failing ETA refresh."""
+    try:
+        sizes = parse_custom_page_group_sizes(page_group_sizes)
+    except ValueError:
+        # Review reports invalid input precisely.  While it is being typed,
+        # keep the lightweight ETA available using the conservative page count.
+        return max(1, int(page_count or 0)), ()
+    remaining = max(0, int(page_count or 0))
+    count = 0
+    cursor = 0
+    while remaining:
+        remaining -= min(remaining, sizes[cursor % len(sizes)])
+        count += 1
+        cursor += 1
+    return count, sizes
+
+
+def timing_model_features(profile, mode, native_upload_scope, *, segment_mode="", custom_page_group_sizes="", chunk_size=0, chunk_overlap=0, target_passage_length=0, backend_mode="", unstructured_strategy="auto", native_upload_transport="", native_upload_representation="", simulation_engine="", simulation_model=""):
     page_count = max(0, int(profile.get("page_count") or 0))
     document_count = max(1, int(profile.get("documents") or 1))
     density = max(1.0, float(profile.get("mean_chars_per_page") or 1.0))
@@ -11370,7 +11563,22 @@ def timing_model_features(profile, mode, native_upload_scope, *, segment_mode=""
         # Keep the ETA available while the normal validation path reports a
         # real invalid setting at Review time.
         local_target = max(1, int(chunk_size or 512))
-    if normalized_mode == "none" or "all in one file" in normalized_mode or "prepare all content" in normalized_mode:
+    custom_group_sizes = ()
+    if normalized_mode == "custom_page_ranges" or is_custom_page_range_segment_mode(normalized_mode):
+        effective_segment_target = 0
+        per_document_pages = profile.get("document_page_counts") or []
+        if len(per_document_pages) == document_count and sum(per_document_pages) == page_count:
+            records = sum(
+                _custom_page_group_record_count(pages, custom_page_group_sizes)[0]
+                for pages in per_document_pages
+            )
+            try:
+                custom_group_sizes = parse_custom_page_group_sizes(custom_page_group_sizes)
+            except ValueError:
+                custom_group_sizes = ()
+        else:
+            records, custom_group_sizes = _custom_page_group_record_count(page_count, custom_page_group_sizes)
+    elif normalized_mode == "none" or "all in one file" in normalized_mode or "prepare all content" in normalized_mode:
         # None produces one prepared content file per PDF. AnythingLLM can
         # still split it later, but the app submits one local record.
         effective_segment_target = 0
@@ -11474,6 +11682,7 @@ def timing_model_features(profile, mode, native_upload_scope, *, segment_mode=""
             if mode == MODE_NATIVE_UPLOAD_LABEL else "not_applicable"
         ) or "segments",
         "segment_mode": str(segment_mode or "unknown"),
+        "custom_page_group_sizes": ",".join(str(size) for size in custom_group_sizes),
         "page_preserve_text_lane": (
             "native_text_only"
             if is_page_preserving_segment_mode(normalized_mode)
@@ -11680,6 +11889,8 @@ def timing_model_batch_prior_seconds(features, history):
         if str(row.get("native_upload_representation") or "") != str(features.get("native_upload_representation") or ""):
             continue
         if str(row.get("segment_mode") or "") != str(features.get("segment_mode") or ""):
+            continue
+        if str(row.get("custom_page_group_sizes") or "") != str(features.get("custom_page_group_sizes") or ""):
             continue
         if str(row.get("embedding_submission_strategy") or "").casefold() != requested_strategy:
             continue
@@ -12051,7 +12262,7 @@ def bounded_queue_eta_reprice(current_expected, queue_forecast):
 
 def timing_model_similarity(features, historical):
     score = 0.0
-    for key, weight in (("timing_formula_lane", 7), ("mode", 5), ("segment_mode", 4), ("page_preserve_text_lane", 3), ("native_upload_scope", 3), ("native_upload_transport", 2), ("native_upload_representation", 3), ("chunk_size", 3), ("chunk_overlap", 2), ("effective_segment_target", 3), ("target_passage_length", 1), ("backend_mode", 1), ("unstructured_strategy", 2), ("embedding_engine", 3), ("embedding_model", 4), ("text_density_bucket", 2), ("layout_bucket", 2), ("ocr_risk_bucket", 2), ("line_density_bucket", 1), ("page_variability_bucket", 1), ("file_size_bucket", 1)):
+    for key, weight in (("timing_formula_lane", 7), ("mode", 5), ("segment_mode", 4), ("custom_page_group_sizes", 3), ("page_preserve_text_lane", 3), ("native_upload_scope", 3), ("native_upload_transport", 2), ("native_upload_representation", 3), ("chunk_size", 3), ("chunk_overlap", 2), ("effective_segment_target", 3), ("target_passage_length", 1), ("backend_mode", 1), ("unstructured_strategy", 2), ("embedding_engine", 3), ("embedding_model", 4), ("text_density_bucket", 2), ("layout_bucket", 2), ("ocr_risk_bucket", 2), ("line_density_bucket", 1), ("page_variability_bucket", 1), ("file_size_bucket", 1)):
         if str(features.get(key) or "") == str(historical.get(key) or ""):
             score += weight
     expected_ocr = bool(features.get("ocr_planned") or features.get("ocr_observed"))
@@ -12352,6 +12563,7 @@ def estimate_automatic_run(
     native_upload_scope,
     *,
     segment_mode="",
+    custom_page_group_sizes="",
     chunk_size=0,
     chunk_overlap=0,
     target_passage_length=0,
@@ -12382,7 +12594,8 @@ def estimate_automatic_run(
     simulation_engine, simulation_model = timing_local_simulation_identity(local_check_mode)
     features = timing_model_features(
         profile, mode, native_upload_scope,
-        segment_mode=segment_mode, chunk_size=effective_chunk_size, chunk_overlap=effective_chunk_overlap,
+        segment_mode=segment_mode, custom_page_group_sizes=custom_page_group_sizes,
+        chunk_size=effective_chunk_size, chunk_overlap=effective_chunk_overlap,
         target_passage_length=target_passage_length,
         backend_mode=backend_mode, unstructured_strategy=unstructured_strategy,
         native_upload_transport=timing_native_upload_transport(mode, api_url),
@@ -12455,6 +12668,7 @@ def estimate_automatic_run(
             or str(row.get("native_upload_scope") or "") != str(features.get("native_upload_scope") or "")
             or str(row.get("native_upload_transport") or "") != str(features.get("native_upload_transport") or "")
             or str(row.get("segment_mode") or "") != str(features.get("segment_mode") or "")
+            or str(row.get("custom_page_group_sizes") or "") != str(features.get("custom_page_group_sizes") or "")
             # Similar-looking local files can be much slower under a different
             # Ollama model.  Exact local lanes stay separate; cloud lanes are
             # already intentionally pooled at the provider level.
@@ -12738,6 +12952,7 @@ def refresh_automatic_run_estimate(
     native_upload_scope,
     _workspace_slug="",
     segment_mode="",
+    custom_page_group_sizes="",
     target_passage_length=0,
     anythingllm_chunk_size=0,
     anythingllm_chunk_overlap=0,
@@ -12793,6 +13008,7 @@ def refresh_automatic_run_estimate(
         mode,
         native_upload_scope,
         segment_mode=segment_mode,
+        custom_page_group_sizes=custom_page_group_sizes,
         chunk_size=anythingllm_chunk_size,
         chunk_overlap=anythingllm_chunk_overlap,
         target_passage_length=target_passage_length,
@@ -13120,6 +13336,11 @@ def automatic_completion_button_state(completion):
 
 def automatic_confirmation_html(settings):
     mode = settings["mode"]
+    custom_range_detail = (
+        "Custom Range: " + ", ".join(str(value) for value in (settings.get("custom_page_group_sizes") or ())) + " pages"
+        if pipeline_segment_mode(settings.get("segment_mode")) == "custom_page_ranges"
+        else ""
+    )
     if mode != MODE_NATIVE_UPLOAD_LABEL:
         values = [
             mode,
@@ -13129,7 +13350,7 @@ def automatic_confirmation_html(settings):
                 else "Local output only"
             ),
             settings["segment_mode"],
-            f"{settings['target_passage_length']} character target",
+            custom_range_detail or f"{settings['target_passage_length']} character target",
         ]
         summary = '<div class="automatic-confirmation-summary">' + html.escape(" - ".join(str(value) for value in values)) + "</div>"
         return summary + automatic_ocr_preflight_html(settings.get("ocr_preflight_manifest"))
@@ -13143,9 +13364,10 @@ def automatic_confirmation_html(settings):
         workspace_label,
         settings["native_upload_scope"] if mode == MODE_NATIVE_UPLOAD_LABEL else "Local files only",
         settings["segment_mode"],
+        custom_range_detail,
         f"{settings['anythingllm_chunk_size']} chunk / {settings['anythingllm_chunk_overlap']} overlap",
     ]
-    summary = '<div class="automatic-confirmation-summary">' + html.escape(" - ".join(str(value) for value in values)) + "</div>"
+    summary = '<div class="automatic-confirmation-summary">' + html.escape(" - ".join(str(value) for value in values if value)) + "</div>"
     prediction = native_boundary_prediction_html(settings)
     return summary + prediction + automatic_ocr_preflight_html(settings.get("ocr_preflight_manifest"))
 
@@ -13326,6 +13548,24 @@ def validated_automatic_run_settings(values):
     if validation_report:
         return settings, validation_report, [], False
     settings["files"] = files
+    if pipeline_segment_mode(settings.get("segment_mode")) == "custom_page_ranges":
+        try:
+            settings["custom_page_group_sizes"] = parse_custom_page_group_sizes(
+                settings.get("custom_page_group_sizes")
+            )
+        except ValueError as exc:
+            return (
+                settings,
+                app_error_report(
+                    "AUTO-CUSTOM-PAGE-RANGE-001",
+                    "Custom Range needs valid page counts",
+                    [str(exc), "Use one positive count, such as 20, or comma-separated counts, such as 20, 30, 20, 40, 60."],
+                ),
+                [],
+                False,
+            )
+    else:
+        settings["custom_page_group_sizes"] = ()
     if (
         settings["mode"] == MODE_NATIVE_UPLOAD_LABEL
         and settings["native_upload_scope"] == NATIVE_UPLOAD_SCOPE_CUSTOM_LABEL
@@ -13387,6 +13627,7 @@ def validated_automatic_run_settings(values):
         settings["mode"],
         settings["native_upload_scope"],
         segment_mode=settings.get("segment_mode", ""),
+        custom_page_group_sizes=settings.get("custom_page_group_sizes", ()),
         chunk_size=settings.get("anythingllm_chunk_size", 0),
         chunk_overlap=settings.get("anythingllm_chunk_overlap", 0),
         target_passage_length=settings.get("target_passage_length", 0),
@@ -13915,6 +14156,13 @@ def target_passage_length_control_update(segment_mode_value, current_value=750, 
             interactive=False,
             value=value_text,
         )
+    if is_custom_page_range_segment_mode(mode):
+        return gr.update(
+            label="Target passage length",
+            info="Custom page ranges use the pages-per-chunk sequence below. This character target is ignored.",
+            interactive=False,
+            value=value_text,
+        )
     if is_page_preserving_segment_mode(mode):
         return gr.update(
             label="Target passage length",
@@ -14043,6 +14291,12 @@ def page_preserve_ceiling_control_update(segment_mode_value):
     return gr.update(visible=enabled, interactive=enabled)
 
 
+def custom_page_group_sizes_control_update(segment_mode_value):
+    """Show the dedicated Custom Range controls only for that segmentation mode."""
+    enabled = is_custom_page_range_segment_mode(segment_mode_value)
+    return gr.update(visible=enabled)
+
+
 def _recommended_target_passage_length(maximum_characters):
     ceiling = max(1, _positive_int(maximum_characters, DEFAULT_TARGET_PASSAGE_LENGTH))
     preferred = min(DEFAULT_TARGET_PASSAGE_LENGTH, ceiling)
@@ -14101,6 +14355,7 @@ def target_passage_sizing_plan(
     unsegmented = "all in one file" in mode or "prepare all content" in mode or mode == "none"
     whole_page = "whole-page" in mode
     page_preserving = is_page_preserving_segment_mode(mode)
+    custom_page_ranges = is_custom_page_range_segment_mode(mode)
     page_local_passages = "shorter page-local" in mode
     requested_page_ceiling = _positive_int(page_preserve_ceiling, 0)
     page_preserve_effective_ceiling = (
@@ -14124,9 +14379,10 @@ def target_passage_sizing_plan(
         "effective_character_ceiling": effective_character_ceiling,
         "whole_page": whole_page,
         "unsegmented": unsegmented,
-        "target_ignored": whole_page or unsegmented or page_preserving,
+        "target_ignored": whole_page or unsegmented or page_preserving or custom_page_ranges,
         "page_bounded": page_local_passages,
         "page_preserving": page_preserving,
+        "custom_page_ranges": custom_page_ranges,
         "page_preserve_requested_ceiling": requested_page_ceiling,
         "page_preserve_effective_ceiling": page_preserve_effective_ceiling,
         "exceeds_splitter": exceeds_splitter,
@@ -14157,6 +14413,13 @@ def target_passage_length_warning_html(plan):
             if plan.get("page_preserve_requested_ceiling")
             else "the active AnythingLLM splitter and embedder limits"
         )
+    if plan.get("custom_page_ranges"):
+        return (
+            '<div class="setting-reference-note"><strong>Custom Range:</strong> the pages-per-chunk sequence controls the local records. '
+            "A single value repeats; a comma-separated sequence cycles for longer PDFs, and the final group may be shorter. "
+            "The character target is intentionally ignored. Grouped records retain their PDF-page span, but downstream chunking cannot promise an exact single-page citation.</div>"
+        )
+    if plan.get("page_preserving"):
         return (
             '<div class="setting-reference-note"><strong>Page - preserve automatically:</strong> each source page is one prepared record unless '
             f"{origin} requires page-local subdivision. Effective local ceiling: {plan['page_preserve_effective_ceiling']} characters. "
@@ -14283,13 +14546,14 @@ def native_upload_boundary_policy_and_timer_update(
         native_upload_scope,
         workspace_slug,
         segment_mode,
+        "",
         target,
         anythingllm_chunk_size,
         overlap,
         backend_mode,
         unstructured_strategy,
     )
-    return (*updates, timing)
+    return (*updates, custom_page_group_sizes_control_update(segment_mode), timing)
 
 
 def pipeline_segment_mode(segment_mode_value):
@@ -14299,6 +14563,8 @@ def pipeline_segment_mode(segment_mode_value):
         return "none"
     if "shorter page-local" in value:
         return "page_passages"
+    if is_custom_page_range_segment_mode(value):
+        return "custom_page_ranges"
     if "4-page" in value or "four-page" in value:
         # A stale browser session can still submit the retired label. Preserve
         # exact citations rather than silently changing it to global passages.
@@ -15032,6 +15298,7 @@ def run_automatic(
     auto_apply_recommended_settings,
     download_full_folder,
     download_segments_folder,
+    custom_page_group_sizes="",
     expected_seconds=0,
     ocr_preflight_manifest=None,
     estimate_range="",
@@ -15044,6 +15311,12 @@ def run_automatic(
     global LAST_SIMULATION_DIAGNOSTICS
     LAST_SIMULATION_DIAGNOSTICS = {}
     started_at = time.perf_counter()
+    resolved_segment_mode = pipeline_segment_mode(segment_mode)
+    resolved_custom_page_group_sizes = (
+        parse_custom_page_group_sizes(custom_page_group_sizes)
+        if resolved_segment_mode == "custom_page_ranges"
+        else ()
+    )
     run_local_values = locals().copy()
     processing_settings = automatic_run_processing_settings(
         {field: run_local_values.get(field) for field in AUTOMATIC_RUN_FIELDS}
@@ -15474,6 +15747,7 @@ def run_automatic(
     progress_allocations = automatic_progress_file_allocations(
         files,
         segment_mode=segment_mode,
+        custom_page_group_sizes=resolved_custom_page_group_sizes,
         chunk_size=int(target_passage_length or DEFAULT_TARGET_PASSAGE_LENGTH),
         chunk_overlap=int(anythingllm_chunk_overlap or 0),
         backend_mode=backend_mode or "Automatic",
@@ -15948,7 +16222,6 @@ def run_automatic(
         start_fraction = AUTOMATIC_RUN_PREFLIGHT_DISPLAY_END + float(progress_allocation["start_share"]) * AUTOMATIC_RUN_DOCUMENT_DISPLAY_SPAN
         end_fraction = AUTOMATIC_RUN_PREFLIGHT_DISPLAY_END + float(progress_allocation["end_share"]) * AUTOMATIC_RUN_DOCUMENT_DISPLAY_SPAN
         progress(start_fraction, desc=format_progress_desc(f"Preparing {pdf_path.name}", file_index, total_files))
-        resolved_segment_mode = pipeline_segment_mode(segment_mode)
         args = SimpleNamespace(
             document_label=(document_label or "").strip(),
             document_author=(document_author or "").strip(),
@@ -15962,6 +16235,7 @@ def run_automatic(
             end_page_override=int(end_page_override or 0),
             target_passage_length=int(target_passage_length or 750),
             segment_mode=resolved_segment_mode,
+            custom_page_group_sizes=resolved_custom_page_group_sizes,
             end_section_names=merged_end_section_headings(advanced_end_section_names),
             validation_phrases=normalize_lines(automatic_validation_phrases),
             unstructured_strategy=(unstructured_strategy or "fast").casefold(),
@@ -17030,6 +17304,18 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
 
     with gr.Tabs():
         with gr.Tab("Automatic"):
+            # ``File(buttons=...)`` mounts this action in the component header,
+            # beside Gradio's own clear controls, rather than as a separate
+            # confusing row below the selected files.
+            retry_selected_pdf_files_button = gr.Button(
+                "Use selected files again",
+                variant="secondary",
+                size="sm",
+                icon=UPLOAD_SELECTED_FILES_ICON,
+                visible=False,
+                elem_id="retry-selected-pdf-files",
+                elem_classes=["retry-selected-files-button"],
+            )
             auto_pdfs = gr.File(
                 label="PDF files",
                 file_types=[".pdf"],
@@ -17037,6 +17323,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 file_count="multiple",
                 height=156,
                 elem_classes=["pdf-upload-input"],
+                buttons=[retry_selected_pdf_files_button],
             )
             with gr.Group(elem_classes=["batch-folder-panel"]):
                 gr.HTML(
@@ -17073,6 +17360,21 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                             label="PDFs to process",
                             info="All discovered PDFs start selected. Uncheck files to exclude them. This never deletes source files.",
                         )
+                        with gr.Row(elem_classes=["batch-folder-selection-actions"]):
+                            retry_selected_pdf_batch_button = gr.Button(
+                                "↻ Retry selected PDF batch",
+                                variant="secondary",
+                                size="sm",
+                                elem_id="retry-selected-pdf-batch",
+                                elem_classes=["retry-selected-files-button"],
+                            )
+                            clear_selected_pdf_batch_button = gr.Button(
+                                "Clear batch",
+                                variant="secondary",
+                                size="sm",
+                                elem_id="clear-selected-pdf-batch",
+                                elem_classes=["clear-selected-files-button"],
+                            )
                     auto_folder_status = gr.HTML(value="", visible=False, elem_classes=["batch-folder-status"])
             with gr.Accordion("Document metadata", open=False, elem_classes=["top-level-accordion"]) as document_metadata_section:
                 auto_label = gr.Textbox(
@@ -17172,12 +17474,26 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                         SEGMENT_PAGE_ONLY_LABEL,
                         SEGMENT_PAGE_LIMIT_LABEL,
                         SEGMENT_PAGE_PASSAGES_LABEL,
+                        SEGMENT_CUSTOM_PAGE_RANGE_LABEL,
                     ],
                     value=SEGMENT_PAGE_LIMIT_LABEL,
                     label="Segmentation mode",
                     info="All in one file prepares one content file per PDF without local segmentation; AnythingLLM may still re-chunk it.",
                     interactive=True,
                 )
+                with gr.Column(
+                    visible=False,
+                    elem_id="custom-page-range-controls",
+                    elem_classes=["custom-page-range-controls"],
+                ) as custom_page_group_sizes_area:
+                    custom_page_group_sizes = gr.Textbox(
+                        value="",
+                        label="Pages per chunk (Custom Range)",
+                        placeholder="20 or 20, 30, 20, 40, 60",
+                        info="Enter consecutive group sizes. A single value repeats; a comma-separated sequence repeats for longer PDFs. The final group may be shorter.",
+                        lines=1,
+                        max_lines=1,
+                    )
 
             with gr.Accordion(
                 "Native metadata upload",
@@ -17952,6 +18268,8 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 include_front_matter,
                 include_back_matter,
                 segment_mode,
+                custom_page_group_sizes,
+                custom_page_group_sizes_area,
                 backend_mode,
                 first_page_override,
                 end_page_override,
@@ -17999,6 +18317,26 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 show_progress="hidden",
                 queue=False,
             )
+            # Folder scans are local, time-sensitive observations.  Unlike a
+            # completed run presentation, there is no safe reason to restore a
+            # prior scan after the page or localhost server is reloaded.
+            demo.load(
+                fn=reset_batch_folder_picker_on_app_open,
+                inputs=None,
+                outputs=[
+                    auto_folder_path,
+                    auto_folder_pdfs,
+                    auto_folder_manifest,
+                    auto_folder_scan_requested,
+                    auto_folder_file_selector,
+                    batch_folder_selection_panel,
+                    auto_folder_status,
+                    pdf_folder_picker_area,
+                    choose_pdf_folder_button,
+                ],
+                show_progress="hidden",
+                queue=False,
+            )
             automatic_run_inputs = [
                 auto_pdfs,
                 auto_folder_pdfs,
@@ -18029,6 +18367,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 target_passage_length,
                 page_preserve_ceiling,
                 segment_mode,
+                custom_page_group_sizes,
                 advanced_end_section_names,
                 automatic_validation_phrases,
                 unstructured_strategy,
@@ -18049,6 +18388,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 native_upload_scope,
                 workspace_slug,
                 segment_mode,
+                custom_page_group_sizes,
                 target_passage_length,
                 anythingllm_chunk_size,
                 anythingllm_chunk_overlap,
@@ -18127,6 +18467,114 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 ),
                 inputs=[api_url, api_key, workspace_slug],
                 outputs=[native_upload_readiness],
+                show_progress="hidden",
+                queue=False,
+            )
+            auto_pdfs.change(
+                fn=selected_pdf_files_retry_button_update,
+                inputs=[auto_pdfs],
+                outputs=[retry_selected_pdf_files_button],
+                show_progress="hidden",
+                queue=False,
+            )
+            retry_selected_pdf_files_button.click(
+                fn=reuse_selected_pdf_files,
+                inputs=[auto_pdfs],
+                outputs=[auto_pdfs],
+                show_progress="minimal",
+                queue=False,
+            ).then(
+                fn=merge_uploaded_pdfs_into_folder_batch,
+                inputs=[auto_pdfs, auto_folder_manifest],
+                outputs=[
+                    auto_pdfs,
+                    auto_folder_pdfs,
+                    auto_folder_manifest,
+                    auto_folder_file_selector,
+                    batch_folder_selection_panel,
+                    auto_folder_status,
+                ],
+                show_progress="minimal",
+                queue=True,
+                concurrency_limit=1,
+                concurrency_id="automatic-native-page-inspection",
+            ).then(
+                fn=reset_automatic_run_presentation,
+                inputs=[auto_pdfs, auto_folder_pdfs],
+                outputs=fresh_run_presentation_outputs,
+                show_progress="hidden",
+                queue=False,
+            ).then(
+                fn=metadata_selection_layout_state,
+                inputs=[auto_pdfs, auto_folder_pdfs],
+                outputs=[document_metadata_section],
+                show_progress="hidden",
+                queue=False,
+            ).then(
+                fn=reset_automatic_run_settings_to_defaults,
+                inputs=None,
+                outputs=fresh_run_settings_outputs,
+                show_progress="hidden",
+                queue=False,
+            ).then(
+                fn=native_upload_scope_batch_guard,
+                inputs=[native_upload_scope, auto_pdfs, auto_folder_pdfs, segment_mode],
+                outputs=[native_upload_scope, native_upload_custom_range],
+                show_progress="hidden",
+                queue=False,
+            ).then(
+                fn=automatic_selection_pending_action_states,
+                inputs=[auto_pdfs, auto_folder_pdfs],
+                outputs=[confirm_automatic_run_button, cancel_automatic_run_button],
+                show_progress="hidden",
+                queue=False,
+            ).then(
+                fn=refresh_automatic_run_estimate_for_fresh_selection,
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
+                outputs=[auto_run_timing],
+                show_progress="hidden",
+                queue=False,
+            ).then(
+                fn=automatic_mode_ui_updates,
+                inputs=[auto_mode],
+                outputs=automatic_mode_ui_outputs,
+                show_progress="hidden",
+                queue=False,
+            ).then(
+                fn=automatic_selection_action_states,
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
+                outputs=[
+                    confirm_automatic_run_button,
+                    cancel_automatic_run_button,
+                    automatic_run_activity,
+                ],
+                show_progress="hidden",
+                queue=False,
+            ).then(
+                fn=automatic_detected_metadata_preview,
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, auto_folder_manifest],
+                outputs=[
+                    auto_label,
+                    auto_author,
+                    auto_short_label,
+                    auto_metadata_preview,
+                    document_metadata_section,
+                ],
+                show_progress="hidden",
+            ).then(
+                fn=update_new_workspace_name_control,
+                inputs=[workspace_slug, auto_label, auto_pdfs, new_workspace_name, new_workspace_name_auto_state],
+                outputs=[new_workspace_name, new_workspace_name_auto_state],
+                show_progress="hidden",
+                queue=False,
+            ).then(
+                fn=automatic_selection_action_states,
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
+                outputs=[
+                    confirm_automatic_run_button,
+                    cancel_automatic_run_button,
+                    automatic_run_activity,
+                ],
                 show_progress="hidden",
                 queue=False,
             )
@@ -18240,6 +18688,10 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 outputs=[
                     auto_folder_path,
                     auto_folder_scan_requested,
+                    auto_folder_pdfs,
+                    auto_folder_manifest,
+                    auto_folder_file_selector,
+                    batch_folder_selection_panel,
                     auto_folder_status,
                     pdf_folder_picker_area,
                     choose_pdf_folder_button,
@@ -18319,6 +18771,131 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 fn=update_new_workspace_name_control,
                 inputs=[workspace_slug, auto_label, auto_pdfs, new_workspace_name, new_workspace_name_auto_state],
                 outputs=[new_workspace_name, new_workspace_name_auto_state],
+                show_progress="hidden",
+                queue=False,
+            ).then(
+                fn=automatic_selection_action_states,
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
+                outputs=[
+                    confirm_automatic_run_button,
+                    cancel_automatic_run_button,
+                    automatic_run_activity,
+                ],
+                show_progress="hidden",
+                queue=False,
+            )
+            retry_selected_pdf_batch_button.click(
+                fn=reuse_selected_pdf_batch,
+                inputs=[auto_folder_manifest, auto_folder_file_selector],
+                outputs=[
+                    auto_folder_pdfs,
+                    auto_folder_manifest,
+                    auto_folder_file_selector,
+                    auto_folder_status,
+                ],
+                show_progress="minimal",
+                queue=True,
+                concurrency_limit=1,
+                concurrency_id="automatic-native-page-inspection",
+            ).then(
+                fn=reset_automatic_run_presentation,
+                inputs=[auto_pdfs, auto_folder_pdfs],
+                outputs=fresh_run_presentation_outputs,
+                show_progress="hidden",
+                queue=False,
+            ).then(
+                fn=metadata_selection_layout_state,
+                inputs=[auto_pdfs, auto_folder_pdfs],
+                outputs=[document_metadata_section],
+                show_progress="hidden",
+                queue=False,
+            ).then(
+                fn=reset_automatic_run_settings_to_defaults,
+                inputs=None,
+                outputs=fresh_run_settings_outputs,
+                show_progress="hidden",
+                queue=False,
+            ).then(
+                fn=native_upload_scope_batch_guard,
+                inputs=[native_upload_scope, auto_pdfs, auto_folder_pdfs, segment_mode],
+                outputs=[native_upload_scope, native_upload_custom_range],
+                show_progress="hidden",
+                queue=False,
+            ).then(
+                fn=automatic_selection_pending_action_states,
+                inputs=[auto_pdfs, auto_folder_pdfs],
+                outputs=[confirm_automatic_run_button, cancel_automatic_run_button],
+                show_progress="hidden",
+                queue=False,
+            ).then(
+                fn=refresh_automatic_run_estimate_for_fresh_selection,
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
+                outputs=[auto_run_timing],
+                show_progress="hidden",
+                queue=False,
+            ).then(
+                fn=automatic_mode_ui_updates,
+                inputs=[auto_mode],
+                outputs=automatic_mode_ui_outputs,
+                show_progress="hidden",
+                queue=False,
+            ).then(
+                fn=folder_detected_metadata_preview,
+                inputs=[auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, auto_folder_manifest],
+                outputs=[
+                    auto_label,
+                    auto_author,
+                    auto_short_label,
+                    auto_metadata_preview,
+                    document_metadata_section,
+                ],
+                show_progress="hidden",
+            ).then(
+                fn=update_new_workspace_name_control,
+                inputs=[workspace_slug, auto_label, auto_pdfs, new_workspace_name, new_workspace_name_auto_state],
+                outputs=[new_workspace_name, new_workspace_name_auto_state],
+                show_progress="hidden",
+                queue=False,
+            ).then(
+                fn=automatic_selection_action_states,
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
+                outputs=[
+                    confirm_automatic_run_button,
+                    cancel_automatic_run_button,
+                    automatic_run_activity,
+                ],
+                show_progress="hidden",
+                queue=False,
+            )
+            clear_selected_pdf_batch_button.click(
+                fn=clear_selected_pdf_batch,
+                outputs=[
+                    auto_folder_path,
+                    auto_folder_pdfs,
+                    auto_folder_manifest,
+                    auto_folder_file_selector,
+                    batch_folder_selection_panel,
+                    auto_folder_status,
+                    pdf_folder_picker_area,
+                    choose_pdf_folder_button,
+                ],
+                show_progress="hidden",
+                queue=False,
+            ).then(
+                fn=reset_automatic_run_presentation,
+                inputs=[auto_pdfs, auto_folder_pdfs],
+                outputs=fresh_run_presentation_outputs,
+                show_progress="hidden",
+                queue=False,
+            ).then(
+                fn=metadata_selection_layout_state,
+                inputs=[auto_pdfs, auto_folder_pdfs],
+                outputs=[document_metadata_section],
+                show_progress="hidden",
+                queue=False,
+            ).then(
+                fn=reset_automatic_run_settings_to_defaults,
+                outputs=fresh_run_settings_outputs,
                 show_progress="hidden",
                 queue=False,
             ).then(
@@ -18704,6 +19281,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 native_upload_scope,
                 workspace_slug,
                 segment_mode,
+                custom_page_group_sizes,
                 target_passage_length,
                 anythingllm_chunk_size,
                 anythingllm_chunk_overlap,
@@ -18842,6 +19420,22 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             )
             segment_mode.change(
+                fn=custom_page_group_sizes_control_update,
+                inputs=[segment_mode],
+                outputs=[custom_page_group_sizes_area],
+                show_progress="hidden",
+                queue=False,
+                trigger_mode="always_last",
+            )
+            segment_mode.input(
+                fn=custom_page_group_sizes_control_update,
+                inputs=[segment_mode],
+                outputs=[custom_page_group_sizes_area],
+                show_progress="hidden",
+                queue=False,
+                trigger_mode="always_last",
+            )
+            segment_mode.change(
                 fn=native_upload_scope_batch_guard,
                 inputs=[native_upload_scope, auto_pdfs, auto_folder_pdfs, segment_mode],
                 outputs=[native_upload_scope, native_upload_custom_range],
@@ -18922,6 +19516,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     inherit_anythingllm_settings,
                     anythingllm_chunk_overlap,
                     native_boundary_policy_note,
+                    custom_page_group_sizes,
                     auto_run_timing,
                 ],
                 show_progress="hidden",
@@ -19217,9 +19812,19 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                         SEGMENT_PAGE_ONLY_LABEL,
                         SEGMENT_PAGE_LIMIT_LABEL,
                         SEGMENT_PAGE_PASSAGES_LABEL,
+                        SEGMENT_CUSTOM_PAGE_RANGE_LABEL,
                     ],
                     value=SEGMENT_PAGE_LIMIT_LABEL,
                     label="Segmentation mode",
+                )
+                advanced_custom_page_group_sizes = gr.Textbox(
+                    value="",
+                    label="Pages per chunk (Custom Range)",
+                    placeholder="20 or 20, 30, 20, 40, 60",
+                    info="Enter consecutive group sizes. A single value repeats; a comma-separated sequence repeats for longer PDFs. The final group may be shorter.",
+                    visible=False,
+                    lines=1,
+                    max_lines=1,
                 )
                 advanced_target_passage_policy = gr.Radio(
                     choices=[TARGET_PASSAGE_INHERIT_LABEL, TARGET_PASSAGE_CUSTOM_LABEL],
@@ -19321,6 +19926,13 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     show_progress="hidden",
                     queue=False,
                 )
+            advanced_segment_mode.change(
+                fn=custom_page_group_sizes_control_update,
+                inputs=[advanced_segment_mode],
+                outputs=[advanced_custom_page_group_sizes],
+                show_progress="hidden",
+                queue=False,
+            )
 
             advanced_run_button.click(
                 fn=advanced_diagnostic_running_status,
@@ -19344,6 +19956,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     advanced_first_page_override,
                     advanced_end_page_override,
                     advanced_segment_mode,
+                    advanced_custom_page_group_sizes,
                     advanced_target_passage_policy,
                     advanced_target_passage_length,
                     advanced_end_section_names,

@@ -3545,6 +3545,7 @@ def make_segments(
     outline=None,
     segment_mode="passages",
     effective_limit=0,
+    custom_page_group_sizes=(),
 ):
     segments = []
     current_part = ""
@@ -3555,6 +3556,16 @@ def make_segments(
     source_hash_prefix = source_meta["source_sha256"][:12].lower()
     segment_index = 1
     normalized_segment_mode = (segment_mode or "passages").casefold()
+    custom_page_groups = normalized_segment_mode == "custom_page_ranges"
+    # A custom page-group record is built after all source pages have been
+    # normalized.  Keep each input page whole here so the grouping boundary is
+    # governed only by the operator's page counts, not a character target.
+    per_page_mode = "page" if custom_page_groups else normalized_segment_mode
+    # The grouping contract counts selected physical PDF pages, including a
+    # page that legitimately has no extractable text.  Keep that numbering
+    # separate from the emitted text rows so a blank page cannot make a 20
+    # page group silently span 21 physical pages.
+    custom_group_page_numbers = []
     for page_info in pages:
         page_num = int(page_info["page"])
         if page_num < start_page:
@@ -3564,6 +3575,8 @@ def make_segments(
         duplicate_pages = source_meta.get("duplicate_pages") or {}
         if page_num in duplicate_pages:
             continue
+        if custom_page_groups:
+            custom_group_page_numbers.append(page_num)
 
         page_raw = strip_repeated_marginalia(
             page_info.get("text", ""),
@@ -3624,7 +3637,7 @@ def make_segments(
                 clean,
                 target=int(target_chars or 650),
                 hard_limit=hard_limit,
-                mode=normalized_segment_mode,
+                mode=per_page_mode,
                 diagnostic=bool(source_meta.get("boundary_diagnostic_mode")),
             )
             for page_segment in page_segments:
@@ -3686,7 +3699,142 @@ def make_segments(
                 segment_index += 1
     if normalized_segment_mode == "none" and segments:
         return collapse_unsegmented_document_segments(segments, source_hash_prefix)
+    if custom_page_groups and segments:
+        return collapse_custom_page_range_segments(
+            segments,
+            source_hash_prefix,
+            custom_page_group_sizes,
+            page_numbers=custom_group_page_numbers,
+        )
     return segments
+
+
+def parse_custom_page_group_sizes(value):
+    """Parse a repeatable sequence of positive page counts.
+
+    ``20`` means groups of 20 pages.  ``20, 30, 20`` cycles through those
+    counts for longer PDFs, with the final group shortened to the remaining
+    source pages.  This is intentionally a size sequence, not a PDF-page
+    selection syntax; upload-scope page selection is a separate control.
+    """
+    if isinstance(value, (list, tuple)):
+        tokens = [str(item).strip() for item in value]
+    else:
+        tokens = [part.strip() for part in str(value or "").split(",")]
+    if not tokens or not any(tokens):
+        raise ValueError("Enter one or more positive page counts, for example 20 or 20, 30, 20.")
+    sizes = []
+    for token in tokens:
+        if not re.fullmatch(r"\d+", token or ""):
+            raise ValueError(f"Invalid page-group size '{token}'. Use positive whole numbers separated by commas.")
+        size = int(token)
+        if size < 1:
+            raise ValueError("Page-group sizes must be at least 1.")
+        sizes.append(size)
+    return tuple(sizes)
+
+
+def collapse_custom_page_range_segments(page_segments, source_hash_prefix, page_group_sizes, *, page_numbers=None):
+    """Combine normalized physical pages into operator-sized retrieval records."""
+    sizes = parse_custom_page_group_sizes(page_group_sizes)
+    page_rows = {}
+    for row in page_segments:
+        page_rows.setdefault(int(row.get("pdf_page") or 0), []).append(row)
+    ordered_numbers = (
+        [int(page) for page in page_numbers if int(page) > 0]
+        if page_numbers is not None
+        else sorted(page_rows)
+    )
+    ordered_pages = [(page, page_rows.get(page, [])) for page in ordered_numbers]
+    result = []
+    page_cursor = 0
+    group_index = 0
+    while page_cursor < len(ordered_pages):
+        requested_size = sizes[group_index % len(sizes)]
+        member_pages = ordered_pages[page_cursor : page_cursor + requested_size]
+        if not member_pages:
+            break
+        present_rows = [row for _page, rows in member_pages for row in rows]
+        if not present_rows:
+            page_cursor += len(member_pages)
+            group_index += 1
+            continue
+        first_row = dict(present_rows[0])
+        last_row = present_rows[-1]
+        text_parts = []
+        page_spans = []
+        quality_flags = set()
+        offset = 0
+        for page_number, rows in member_pages:
+            if not rows:
+                page_spans.append({
+                    "pdf_page": page_number,
+                    "pdf_page_end": page_number,
+                    "logical_page": "",
+                    "logical_page_end": "",
+                    "text_char_start": None,
+                    "text_char_end": None,
+                    "segment_ids": [],
+                })
+                continue
+            page_text = "\n\n".join(
+                str(row.get("text") or "").strip() for row in rows
+                if str(row.get("text") or "").strip()
+            ).strip()
+            if not page_text:
+                continue
+            if text_parts:
+                offset += 2
+            start = offset
+            text_parts.append(page_text)
+            offset += len(page_text)
+            page_spans.append({
+                "pdf_page": page_number,
+                "pdf_page_end": max(int(row.get("pdf_page_end") or page_number) for row in rows),
+                "logical_page": rows[0].get("logical_page") or "",
+                "logical_page_end": rows[-1].get("logical_page_end") or rows[-1].get("logical_page") or "",
+                "text_char_start": start,
+                "text_char_end": offset,
+                "segment_ids": [str(row.get("segment_id") or "") for row in rows],
+            })
+            for row in rows:
+                quality_flags.update(str(flag) for flag in (row.get("quality_flags") or []) if str(flag))
+        text = "\n\n".join(text_parts).strip()
+        if text:
+            group_number = len(result) + 1
+            first_page = int(member_pages[0][0])
+            last_page = int(member_pages[-1][0])
+            first_row.update({
+                "segment_id": f"pdf_{source_hash_prefix}_p{first_page:04d}_s{group_number:05d}",
+                "segment_index": group_number,
+                "pdf_page": first_page,
+                "pdf_page_end": last_page,
+                "logical_page": first_row.get("logical_page") or "",
+                "logical_page_end": last_row.get("logical_page_end") or last_row.get("logical_page") or "",
+                "reading_region": "",
+                "reading_region_index": 1,
+                "reading_region_count": 1,
+                "source_column_index": 1,
+                "char_start_page": 0,
+                "char_end_page": len(text),
+                "page_line_start": None,
+                "page_line_end": None,
+                "estimated_tokens": max(1, math.ceil(len(text) / 4)),
+                "text": text,
+                "quality_flags": sorted(quality_flags),
+                "boundary_debug": {
+                    "reason": "custom_page_range",
+                    "requested_page_count": requested_size,
+                    "actual_page_count": len(member_pages),
+                    "page_range": [first_page, last_page],
+                    "page_group_pattern": list(sizes),
+                },
+                "page_spans": page_spans,
+            })
+            result.append(first_row)
+        page_cursor += len(member_pages)
+        group_index += 1
+    return result
 
 
 def collapse_unsegmented_document_segments(page_segments, source_hash_prefix):
@@ -15178,6 +15326,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 outline=usable_outline,
                 segment_mode=getattr(args, "segment_mode", "passages"),
                 effective_limit=chunk_size,
+                custom_page_group_sizes=getattr(args, "custom_page_group_sizes", ()),
             )
             lane_review = proposed_supplementary_lane_review(
                 segments,
@@ -15287,6 +15436,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                     outline=usable_outline,
                     segment_mode=getattr(args, "segment_mode", "passages"),
                     effective_limit=chunk_size,
+                    custom_page_group_sizes=getattr(args, "custom_page_group_sizes", ()),
                 )
                 if not variant_segments:
                     return
@@ -17897,6 +18047,9 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         "detected_end_page": selected.get("detected_end_page"),
         "include_back_matter": bool(selected.get("include_back_matter")),
         "segment_mode": getattr(args, "segment_mode", "passages"),
+        "custom_page_group_sizes": list(
+            parse_custom_page_group_sizes(getattr(args, "custom_page_group_sizes", ()))
+        ) if getattr(args, "segment_mode", "passages") == "custom_page_ranges" else [],
         "segmentation_algorithm_version": active_segmentation_policy.algorithm_version,
         "segmentation_policy": active_segmentation_policy.to_dict(),
         "segments": len(selected["segments"]),
@@ -18350,9 +18503,14 @@ def main():
     parser.add_argument("--target-passage-length", type=int, default=750)
     parser.add_argument(
         "--segment-mode",
-        choices=["none", "passages", "page", "page_limit", "page_passages"],
+        choices=["none", "passages", "page", "page_limit", "page_passages", "custom_page_ranges"],
         default="passages",
-        help="`none` creates one prepared content record per PDF; AnythingLLM can still re-chunk it. `passages` pre-chunks near AnythingLLM ingestion. `page_limit` preserves each page until the active safety ceiling requires a split. `page_passages` creates shorter semantic passages without crossing a page boundary. `page` keeps one retrieval unit per included PDF page unless safety limits force subdivision.",
+        help="`none` creates one prepared content record per PDF; AnythingLLM can still re-chunk it. `passages` pre-chunks near AnythingLLM ingestion. `page_limit` preserves each page until the active safety ceiling requires a split. `page_passages` creates shorter semantic passages without crossing a page boundary. `page` keeps one retrieval unit per included PDF page unless safety limits force subdivision. `custom_page_ranges` groups consecutive source pages according to --custom-page-group-sizes.",
+    )
+    parser.add_argument(
+        "--custom-page-group-sizes",
+        default="",
+        help="Comma-separated page counts for custom_page_ranges, such as 20 or 20,30,20. The sequence repeats for longer PDFs.",
     )
     parser.add_argument(
         "--anythingllm-chunk-size",

@@ -3659,16 +3659,17 @@ class PipelineCoreTests(unittest.TestCase):
 
         app.LIVE_AUTOMATIC_RUN_STATUS = {"state": "successful", "phase": "Complete"}
         updates = app.reset_automatic_run_settings_to_defaults()
-        self.assertEqual(len(updates), 41)
+        self.assertEqual(len(updates), 43)
         self.assertEqual(updates[0]["value"], "")  # document label
         self.assertEqual(updates[5]["value"], str(app.AUTO_OUTPUT_DIR))
         self.assertEqual(updates[7]["value"], "")  # visible API-key field
         self.assertEqual(updates[8]["value"], app.INITIAL_WORKSPACE_VALUE)
         self.assertEqual(updates[9]["value"], "")  # new workspace name
         self.assertEqual(updates[10], "")  # generated-name auto state
-        self.assertEqual(updates[25]["value"], "Automatic")
-        self.assertEqual(updates[34]["value"], False)  # do not retain apply-before-run
-        self.assertEqual(updates[38]["value"], "")  # validation phrases
+        self.assertEqual(updates[26]["visible"], False)  # Custom Range controls
+        self.assertEqual(updates[27]["value"], "Automatic")
+        self.assertEqual(updates[36]["value"], False)  # do not retain apply-before-run
+        self.assertEqual(updates[40]["value"], "")  # validation phrases
 
     def test_active_run_blocks_next_selection_presentation_callbacks(self):
         """Late selection events must not redraw an in-flight run as a new one."""
@@ -3803,6 +3804,7 @@ class PipelineCoreTests(unittest.TestCase):
             defaults["native_upload_scope"],
             defaults["workspace_slug"],
             defaults["segment_mode"],
+            defaults["custom_page_group_sizes"],
             defaults["target_passage_length"],
             defaults["anythingllm_chunk_size"],
             defaults["anythingllm_chunk_overlap"],
@@ -3852,21 +3854,22 @@ class PipelineCoreTests(unittest.TestCase):
             "include_front_matter": 22,
             "include_back_matter": 23,
             "segment_mode": 24,
-            "backend_mode": 25,
-            "first_page_override": 26,
-            "end_page_override": 27,
-            "target_passage_length": 29,
-            "page_preserve_ceiling": 30,
-            "inherit_anythingllm_settings": 31,
-            "anythingllm_chunk_size": 32,
-            "anythingllm_chunk_overlap": 33,
-            "auto_apply_recommended_settings": 34,
-            "download_full_folder": 35,
-            "download_segments_folder": 36,
-            "advanced_end_section_names": 37,
-            "automatic_validation_phrases": 38,
-            "unstructured_strategy": 39,
-            "generate_inline_fallback": 40,
+            "custom_page_group_sizes": 25,
+            "backend_mode": 26,
+            "first_page_override": 27,
+            "end_page_override": 28,
+            "target_passage_length": 30,
+            "page_preserve_ceiling": 31,
+            "inherit_anythingllm_settings": 32,
+            "anythingllm_chunk_size": 33,
+            "anythingllm_chunk_overlap": 34,
+            "auto_apply_recommended_settings": 35,
+            "download_full_folder": 36,
+            "download_segments_folder": 37,
+            "advanced_end_section_names": 38,
+            "automatic_validation_phrases": 39,
+            "unstructured_strategy": 40,
+            "generate_inline_fallback": 41,
         }
         for field, index in field_to_update.items():
             self.assertEqual(updates[index]["value"], defaults[field], field)
@@ -6203,6 +6206,49 @@ class PipelineCoreTests(unittest.TestCase):
             self.assertEqual(len(result[2]["choices"]), 2)
             self.assertIn("0 of 2 PDFs selected", result[3]["value"])
 
+    def test_empty_batch_scan_keeps_the_folder_chooser_available(self):
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "notes.txt").write_text("not a PDF", encoding="utf-8")
+            events = list(app.stream_selected_pdf_directory(str(root), True))
+
+        selected, manifest, selector, selection_panel, status, picker_area, button = events[-1]
+        self.assertEqual(selected, [])
+        self.assertEqual(manifest["pdf_candidates"], [])
+        self.assertFalse(selector["visible"])
+        self.assertFalse(selection_panel["visible"])
+        self.assertTrue(picker_area["visible"])
+        self.assertIn("selected folder", status["value"])
+        self.assertIn("item (files and folders)", status["value"])
+        self.assertEqual(button["value"], "Select PDF Folder Here")
+
+    def test_clear_batch_forgets_only_picker_state(self):
+        import rag_pdf_gradio_app as app
+
+        result = app.clear_selected_pdf_batch()
+
+        self.assertEqual(result[:3], ("", [], {}))
+        self.assertFalse(result[3]["visible"])
+        self.assertFalse(result[4]["visible"])
+        self.assertFalse(result[5]["visible"])
+        self.assertTrue(result[6]["visible"])
+        self.assertEqual(result[7]["value"], "Select PDF Folder Here")
+
+    def test_app_open_forgets_a_previous_batch_scan(self):
+        import rag_pdf_gradio_app as app
+
+        result = app.reset_batch_folder_picker_on_app_open()
+
+        self.assertEqual(result[:4], ("", [], {}, False))
+        self.assertEqual(result[4]["choices"], [])
+        self.assertFalse(result[4]["visible"])
+        self.assertFalse(result[5]["visible"])
+        self.assertFalse(result[6]["visible"])
+        self.assertTrue(result[7]["visible"])
+        self.assertEqual(result[8]["value"], "Select PDF Folder Here")
+
     def test_batch_folder_picker_choices_include_page_and_ocr_candidate_counts(self):
         import rag_pdf_gradio_app as app
 
@@ -8494,6 +8540,7 @@ class PipelineCoreTests(unittest.TestCase):
         passages = app.target_passage_length_control_update("AnythingLLM-parity subchunking", 750)
         page_preserving = app.target_passage_length_control_update(app.SEGMENT_PAGE_LIMIT_LABEL, 750)
         page_passages = app.target_passage_length_control_update(app.SEGMENT_PAGE_PASSAGES_LABEL, 750)
+        custom_range = app.target_passage_length_control_update(app.SEGMENT_CUSTOM_PAGE_RANGE_LABEL, 750)
         whole_page = app.target_passage_length_control_update("Whole-page chunks", 750)
         unsegmented = app.target_passage_length_control_update(app.SEGMENT_NONE_LABEL, 750)
 
@@ -8508,11 +8555,38 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(page_passages["label"], "Target subchunk length within each page")
         self.assertIn("without crossing", page_passages["info"])
         self.assertEqual(page_passages["value"], "750")
+        self.assertFalse(custom_range["interactive"])
+        self.assertIn("pages-per-chunk sequence", custom_range["info"])
         self.assertFalse(whole_page["interactive"])
         self.assertIn("ignore this setting", whole_page["info"])
         self.assertEqual(whole_page["value"], "750")
         self.assertFalse(unsegmented["interactive"])
         self.assertIn("No local segmentation", unsegmented["info"])
+
+    def test_custom_range_mode_maps_and_reveals_its_pages_per_chunk_control(self):
+        import rag_pdf_gradio_app as app
+
+        self.assertEqual(app.pipeline_segment_mode(app.SEGMENT_CUSTOM_PAGE_RANGE_LABEL), "custom_page_ranges")
+        self.assertTrue(app.custom_page_group_sizes_control_update(app.SEGMENT_CUSTOM_PAGE_RANGE_LABEL)["visible"])
+        self.assertFalse(app.custom_page_group_sizes_control_update(app.SEGMENT_PAGE_LIMIT_LABEL)["visible"])
+        custom_plan = app.target_passage_sizing_plan(
+            app.SEGMENT_CUSTOM_PAGE_RANGE_LABEL,
+            app.TARGET_PASSAGE_INHERIT_LABEL,
+        )
+        self.assertIn("Custom Range", app.target_passage_length_warning_html(custom_plan))
+        page_plan = app.target_passage_sizing_plan(
+            app.SEGMENT_PAGE_LIMIT_LABEL,
+            app.TARGET_PASSAGE_INHERIT_LABEL,
+        )
+        self.assertIn("Page - preserve automatically", app.target_passage_length_warning_html(page_plan))
+        features = app.timing_model_features(
+            {"page_count": 40, "documents": 2, "document_page_counts": [20, 20], "mean_chars_per_page": 1000},
+            app.MODE_LOCAL_ONLY_LABEL,
+            "local_only",
+            segment_mode=app.SEGMENT_CUSTOM_PAGE_RANGE_LABEL,
+            custom_page_group_sizes="30",
+        )
+        self.assertEqual(features["estimated_records"], 2)
 
     def test_inherited_target_length_follows_mode_and_uses_conservative_embedder_guard(self):
         import rag_pdf_gradio_app as app
@@ -11036,6 +11110,76 @@ class PipelineCoreTests(unittest.TestCase):
         payload = pipeline.generate_api_payloads(segments, "native_header")[0]
         self.assertIn("PDF page range: 10-11", payload["metadata"]["description"])
         self.assertIn("exact page-level citations are unavailable", payload["metadata"]["description"])
+
+    def test_custom_page_ranges_group_consecutive_pages_and_repeat_the_pattern(self):
+        pages = [
+            {"page": page, "text": f"Chapter {page}\n" + (chr(64 + page) * 700)}
+            for page in range(1, 7)
+        ]
+        source_meta = {
+            "source_id": "source-1", "source_title": "Example", "source_author": "Author",
+            "source_short_label": "Example", "source_sha256": "a" * 64,
+            "source_published_epoch_ms": None, "metadata_provenance": {}, "body_start": 1,
+            "end_matter_start": None, "boundary_confidence": "high", "repeated_headers": [],
+            "repeated_footers": [], "duplicate_pages": {},
+        }
+        segments = pipeline.make_segments(
+            Path("example.pdf"), "pymupdf", pages, 1, None, source_meta, 300,
+            outline=None, segment_mode="custom_page_ranges", custom_page_group_sizes="2, 3",
+        )
+
+        self.assertEqual([(row["pdf_page"], row["pdf_page_end"]) for row in segments], [(1, 2), (3, 5), (6, 6)])
+        self.assertEqual([len(row["page_spans"]) for row in segments], [2, 3, 1])
+        self.assertEqual([row["boundary_debug"]["requested_page_count"] for row in segments], [2, 3, 2])
+        self.assertIn("A" * 100, segments[0]["text"])
+        self.assertIn("E" * 100, segments[1]["text"])
+        payload = pipeline.generate_api_payloads(segments, "native_header")[1]
+        self.assertIn("PDF page range: 3-5", payload["metadata"]["description"])
+
+    def test_custom_page_ranges_reject_invalid_group_sizes(self):
+        self.assertEqual(pipeline.parse_custom_page_group_sizes("20, 30, 20"), (20, 30, 20))
+        for invalid in ("", "0", "20, nope", "20, -1"):
+            with self.assertRaises(ValueError):
+                pipeline.parse_custom_page_group_sizes(invalid)
+
+    def test_custom_page_ranges_count_blank_physical_pages(self):
+        source_meta = {
+            "source_id": "source-1", "source_title": "Example", "source_author": "Author",
+            "source_short_label": "Example", "source_sha256": "a" * 64,
+            "source_published_epoch_ms": None, "metadata_provenance": {}, "body_start": 1,
+            "end_matter_start": None, "boundary_confidence": "high", "repeated_headers": [],
+            "repeated_footers": [], "duplicate_pages": {},
+        }
+        segments = pipeline.make_segments(
+            Path("example.pdf"), "pymupdf",
+            [{"page": 1, "text": ""}, {"page": 2, "text": "Two\n" + ("B" * 700)}, {"page": 3, "text": "Three\n" + ("C" * 700)}],
+            1, None, source_meta, 300, segment_mode="custom_page_ranges", custom_page_group_sizes="2",
+        )
+
+        self.assertEqual([(row["pdf_page"], row["pdf_page_end"]) for row in segments], [(1, 2), (3, 3)])
+        self.assertEqual(segments[0]["page_spans"][0]["pdf_page"], 1)
+        self.assertIsNone(segments[0]["page_spans"][0]["text_char_start"])
+
+    def test_retry_picker_helpers_keep_existing_valid_paths(self):
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pdf_path = Path(tmpdir) / "retry.pdf"
+            document = fitz.open()
+            document.new_page().insert_text((72, 72), "Retry selection test")
+            document.save(pdf_path)
+            document.close()
+
+            file_update = app.reuse_selected_pdf_files([str(pdf_path)])
+            self.assertEqual(file_update["value"], [str(pdf_path)])
+            selected, manifest, picker_update, _status = app.reuse_selected_pdf_batch(
+                {"pdf_candidates": [str(pdf_path)], "selected_pdf_candidates": [str(pdf_path)]},
+                [str(pdf_path)],
+            )
+
+        self.assertEqual(selected, [str(pdf_path)])
+        self.assertEqual(manifest["selected_pdf_candidates"], [str(pdf_path)])
+        self.assertEqual(picker_update["value"], [str(pdf_path)])
 
     def test_photographed_regions_keep_the_original_pdf_page_and_expose_region_metadata(self):
         source_meta = {

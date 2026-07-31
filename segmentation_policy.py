@@ -46,6 +46,12 @@ POLICIES = {
     "page": SegmentationPolicy(
         "page", ALGORITHM_VERSION, True, 0.30, 0.35, 1.0, 0.25,
     ),
+    # Fixed page groups intentionally cross source-page boundaries.  Their
+    # page-span manifest remains exact, but downstream chunking cannot promise
+    # a single-page citation inside one grouped record.
+    "custom_page_ranges": SegmentationPolicy(
+        "custom_page_ranges", ALGORITHM_VERSION, False, 0.0, 0.0, 0.0, 1.0,
+    ),
     "passages": SegmentationPolicy(
         "passages", ALGORITHM_VERSION, True, 0.20, 0.45, 0.75, 1.0,
     ),
