@@ -158,7 +158,7 @@ py -m pre_commit run --all-files
 ```
 
 Please redact credentials, private PDF text, local paths, workspace data, and
-AnythingLLM storage archives from bug reports.
+AnythingLLM storage archives from bug reports. Alternatively you can also keep your forked repo private.
 
 ## References
 
