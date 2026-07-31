@@ -2208,25 +2208,52 @@ class PipelineCoreTests(unittest.TestCase):
             self.assertFalse((root / "Example-aaaaaaaaaaaa-p001-s01.txt").exists())
             self.assertTrue((root / "segments").is_dir())
 
-    def test_no_logs_export_promotion_uses_a_stable_title_derived_folder(self):
+    def test_compact_local_only_batch_promotion_uses_one_first_to_last_folder(self):
         import rag_pdf_gradio_app as app
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            pdf = root / "A source title.pdf"
-            pdf.write_bytes(b"source fixture")
-            temporary = root / "app-run-20990101-010101" / "A-source-title"
-            temporary.mkdir(parents=True)
-            parsed = temporary / "A-source-title-aaaaaaaaaaaa-complete-pdf-parsed.txt"
-            parsed.write_text("prepared text", encoding="utf-8")
-            summary = {"source_sha256": "a" * 64, "upload_file": str(parsed)}
+            first_pdf = root / "A source title.pdf"
+            last_pdf = root / "Z final title.pdf"
+            first_pdf.write_bytes(b"first source fixture")
+            last_pdf.write_bytes(b"last source fixture")
+            run_root = root / "r-20990101-010101"
+            first_dir = run_root / "A-source-title"
+            last_dir = run_root / "Z-final-title"
+            first_dir.mkdir(parents=True)
+            last_dir.mkdir(parents=True)
+            first_text = first_dir / "A-source-title-aaaaaaaaaaaa-complete-pdf-parsed.txt"
+            first_segment = first_dir / "A-source-title-aaaaaaaaaaaa-p001-s01.txt"
+            last_text = last_dir / "Z-final-title-bbbbbbbbbbbb-complete-pdf-parsed.txt"
+            first_receipt = first_dir / "run-checkpoint.json"
+            last_receipt = last_dir / "run-checkpoints.jsonl"
+            first_text.write_text("first prepared text", encoding="utf-8")
+            first_segment.write_text("first segment", encoding="utf-8")
+            last_text.write_text("last prepared text", encoding="utf-8")
+            first_receipt.write_text('{"diagnostic": true}', encoding="utf-8")
+            last_receipt.write_text('{"diagnostic": true}', encoding="utf-8")
+            summaries = [{"upload_file": str(first_text)}, {"upload_file": str(last_text)}]
 
-            moved = app.promote_flat_no_logs_output(root, temporary, pdf, summary)
+            moved = app.promote_flat_no_logs_batch_output(
+                root,
+                run_root,
+                [first_pdf, last_pdf],
+                summaries,
+            )
 
-            self.assertEqual(moved.name, "parsed-pdf-A-source-title-aaaaaaaaaaaa")
-            self.assertEqual(summary["upload_file"], str(moved / parsed.name))
-            self.assertTrue((moved / parsed.name).is_file())
-            self.assertNotIn("20990101", moved.name)
+            self.assertEqual(moved.name, "A-source-title--Z-final-title")
+            self.assertEqual(
+                {path.name for path in moved.iterdir()},
+                {first_text.name, first_segment.name, last_text.name},
+            )
+            self.assertTrue(first_dir.is_dir())
+            self.assertTrue(last_dir.is_dir())
+            self.assertTrue(first_receipt.is_file())
+            self.assertTrue(last_receipt.is_file())
+            self.assertFalse((moved / first_receipt.name).exists())
+            self.assertFalse((moved / last_receipt.name).exists())
+            self.assertEqual(summaries[0]["upload_file"], str(moved / first_text.name))
+            self.assertEqual(summaries[1]["upload_file"], str(moved / last_text.name))
 
     def test_generated_output_directory_prefers_the_prepared_text_parent(self):
         import rag_pdf_gradio_app as app
@@ -3689,7 +3716,7 @@ class PipelineCoreTests(unittest.TestCase):
                 ),
                 2,
             )
-            assert_noop(app.automatic_mode_ui_updates(app.MODE_LOCAL_ONLY_LABEL), 15)
+            assert_noop(app.automatic_mode_ui_updates(app.MODE_LOCAL_ONLY_LABEL), 16)
             self.assertEqual(app.automatic_process_button_state(["next.pdf"], [])["__type__"], "update")
             assert_noop(app.scan_selected_pdf_directory("C:\\not-used"), 7)
             assert_noop(app.choose_and_scan_pdf_directory("C:\\not-used"), 9)
@@ -3700,19 +3727,19 @@ class PipelineCoreTests(unittest.TestCase):
         import rag_pdf_gradio_app as app
 
         local_updates = app.automatic_mode_ui_updates(app.MODE_LOCAL_ONLY_LABEL)
-        self.assertEqual(len(local_updates), 15)
-        for update in local_updates[:14]:
+        self.assertEqual(len(local_updates), 16)
+        for update in local_updates[:15]:
             self.assertFalse(update["visible"])
             self.assertNotIn("value", update)
-        self.assertEqual(local_updates[14]["value"], "")
-        self.assertFalse(local_updates[14]["visible"])
+        self.assertEqual(local_updates[15]["value"], "")
+        self.assertFalse(local_updates[15]["visible"])
 
         upload_updates = app.automatic_mode_ui_updates(app.MODE_NATIVE_UPLOAD_LABEL)
-        for update in upload_updates[:14]:
+        for update in upload_updates[:15]:
             self.assertTrue(update["visible"])
             self.assertNotIn("value", update)
-        self.assertEqual(upload_updates[14]["value"], "")
-        self.assertFalse(upload_updates[14]["visible"])
+        self.assertEqual(upload_updates[15]["value"], "")
+        self.assertFalse(upload_updates[15]["visible"])
 
     def test_local_only_confirmation_omits_workspace_and_anythingllm_chunk_summary(self):
         import rag_pdf_gradio_app as app
@@ -3725,7 +3752,7 @@ class PipelineCoreTests(unittest.TestCase):
             "anythingllm_chunk_size": 768,
             "anythingllm_chunk_overlap": 128,
         })
-        self.assertIn("Local output only", rendered)
+        self.assertIn("Flat text-only export (no logs)", rendered)
         self.assertIn("750 character target", rendered)
         self.assertNotIn("workspace", rendered.casefold())
         self.assertNotIn("768 chunk", rendered)

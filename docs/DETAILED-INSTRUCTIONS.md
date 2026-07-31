@@ -101,13 +101,19 @@ Choose one output mode:
 
 | Mode | What happens |
 | --- | --- |
-| **Create local files only** | Text extraction, selected OCR/segmentation, local output, and ordinary run evidence. Nothing is submitted to AnythingLLM. |
-| **Create local files without logs** | A compact local transcript/segment export with deliberately reduced diagnostic output. |
+| **Create local files only** | A compact transcript/segment export with no run logs. Its one output folder is named after the selected PDF, or the first and last PDF in a batch. Nothing is submitted to AnythingLLM. |
+| **Create local files with diagnostic logs** | Text extraction, selected OCR/segmentation, local output, and ordinary run evidence. Nothing is submitted to AnythingLLM. |
 | **Create local files and upload to AnythingLLM** | Local output plus submission of prepared records to an explicitly selected workspace or a newly created workspace. |
 
 The output-root chooser controls where local run folders are created. Each
-ordinary run receives its own subfolder. Keep the selected root reasonably
+diagnostic-log run receives its own subfolder. Compact local-only exports are
+placed directly in the selected root instead. Keep the selected root reasonably
 short: generated paths have a 250-character Windows-compatible safety limit.
+
+The compact export itself contains only the prepared transcript and any chosen
+segments, all at that folder's root. The app keeps its ETA calibration history
+separately under `%LOCALAPPDATA%\AnythingLLM PDF Parser Embedder Assistant\private-run-history\timing-model`.
+Those records contain timing and aggregate counts, not extracted PDF text or API keys.
 
 For upload mode, choose an existing workspace or **New workspace for this
 document**. A new workspace is created only after confirmation. The selection

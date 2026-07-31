@@ -50,6 +50,10 @@ def application_paths() -> dict[str, Path]:
         "outputs": outputs,
         "automatic_outputs": outputs / "automatic-runs",
         "interactive_outputs": outputs / "interactive-runs",
+        # Long-lived, app-private aggregates. These are deliberately separate
+        # from a user-selected export folder so a compact local export stays
+        # compact even while the app retains ETA calibration data.
+        "private_history": root / "private-run-history",
         "logs": root / "logs",
         "config": root / "config",
         "downloads": Path.home() / "Downloads",
@@ -60,7 +64,10 @@ def ensure_application_directories() -> dict[str, Path]:
     """Create the writable application locations and return them."""
 
     paths = application_paths()
-    for key in ("root", "outputs", "automatic_outputs", "interactive_outputs", "logs", "config"):
+    for key in (
+        "root", "outputs", "automatic_outputs", "interactive_outputs",
+        "private_history", "logs", "config",
+    ):
         paths[key].mkdir(parents=True, exist_ok=True)
     return paths
 

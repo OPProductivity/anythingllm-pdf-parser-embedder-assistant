@@ -109,7 +109,6 @@ from auto_anythingllm_pipeline import (
     resolve_embedder_capability,
     resolve_default_simulation_adapter,
     safe_stem,
-    sha256_file,
     simulation_app_config,
     simulation_preflight,
     verify_anythingllm_upload_auth,
@@ -142,16 +141,16 @@ APP_LOGGER = configure_structured_logger(
     PORTABLE_APPLICATION_PATHS["logs"] / "rag-pdf-app.jsonl",
 )
 
-# ``BASE_OUTPUT_DIR`` contains ordinary per-run output. ``AUTO_OUTPUT_DIR`` is
-# an older but still active stable location for aggregate timing/history data.
-# Do not merge the two casually: the former must be unique for every run while
-# the latter deliberately survives across runs for generic model learning.
+# ``BASE_OUTPUT_DIR`` and ``AUTO_OUTPUT_DIR`` contain user-visible run output.
+# Long-lived ETA/history records instead live in a private app folder so they
+# never clutter a user-selected local-only export.
 BASE_OUTPUT_DIR = PORTABLE_APPLICATION_PATHS["interactive_outputs"]
 AUTO_OUTPUT_DIR = PORTABLE_APPLICATION_PATHS["automatic_outputs"]
 ADVANCED_DIAGNOSTICS_OUTPUT_DIR = BASE_OUTPUT_DIR / "advanced-diagnostics"
-INGESTION_HISTORY_PATH = AUTO_OUTPUT_DIR / "ingestion-history.jsonl"
-AUTOMATIC_RECOVERY_HISTORY_PATH = AUTO_OUTPUT_DIR / "automatic-recovery-history.jsonl"
-TIMING_MODEL_DIR = AUTO_OUTPUT_DIR / "timing-model"
+PRIVATE_RUN_HISTORY_DIR = PORTABLE_APPLICATION_PATHS["private_history"]
+INGESTION_HISTORY_PATH = PRIVATE_RUN_HISTORY_DIR / "ingestion-history.jsonl"
+AUTOMATIC_RECOVERY_HISTORY_PATH = PRIVATE_RUN_HISTORY_DIR / "automatic-recovery-history.jsonl"
+TIMING_MODEL_DIR = PRIVATE_RUN_HISTORY_DIR / "timing-model"
 TIMING_MODEL_RUNS_PATH = TIMING_MODEL_DIR / "timing-runs.jsonl"
 TIMING_MODEL_EVENTS_PATH = TIMING_MODEL_DIR / "timing-events.jsonl"
 DESKTOP_REFRESH_EVENTS_PATH = TIMING_MODEL_DIR / "desktop-refresh-events.jsonl"
@@ -181,8 +180,9 @@ SIMULATION_ANYTHINGLLM_DEFAULT_PREFIX = "Default AnythingLLM embedder"
 SIMULATION_ANYTHINGLLM_DEFAULT_LABEL = SIMULATION_ANYTHINGLLM_DEFAULT_PREFIX
 SIMULATION_SKIP_LABEL = "None"
 MODE_LOCAL_ONLY_LABEL = "Create local files only"
-MODE_LOCAL_NO_LOGS_LABEL = "Create local files without logs"
+MODE_LOCAL_WITH_LOGS_LABEL = "Create local files with diagnostic logs"
 MODE_NATIVE_UPLOAD_LABEL = "Create local files and upload to AnythingLLM"
+LEGACY_LOCAL_NO_LOGS_LABEL = "Create local files without logs"
 NEW_DOCUMENT_WORKSPACE_VALUE = "__new_workspace_for_document__"
 NEW_DOCUMENT_WORKSPACE_LABEL = "New workspace for this document"
 NATIVE_UPLOAD_SCOPE_ALL_LABEL = "All segments"
@@ -3681,6 +3681,16 @@ body:not(.dark) .gradio-container label[data-testid$="-radio-label"].selected {
 #output-mode-radio input[type="radio"]::before {
     content: none !important;
 }
+/* Gradio mounts the Automatic advanced accordion independently of the radio
+   callback. Keep its upload connection row suppressed at the CSS boundary as
+   well, so opening the accordion cannot briefly reveal an irrelevant URL/key
+   pair after the user has chosen either local-only output mode. */
+body:has(#output-mode-radio input[value="Create local files only"][aria-checked="true"]) #anythingllm-run-api-controls,
+body:has(#output-mode-radio input[value="Create local files with diagnostic logs"][aria-checked="true"]) #anythingllm-run-api-controls,
+body:has(#output-mode-radio input[value="Create local files only"][aria-checked="true"]) .anythingllm-upload-only-auto-control,
+body:has(#output-mode-radio input[value="Create local files with diagnostic logs"][aria-checked="true"]) .anythingllm-upload-only-auto-control {
+    display: none !important;
+}
 body:not(.dark) .gradio-container button.secondary,
 body:not(.dark) .gradio-container button:not(.primary) {
     border-color: #e0e7ef !important;
@@ -5715,11 +5725,22 @@ def builtin_automatic_run_setting_values(pdf_files=None, folder_pdf_files=None):
     }
 
 
+def normalized_automatic_output_mode(value):
+    """Keep old saved compact-export defaults valid after the clearer label."""
+    return (
+        MODE_LOCAL_ONLY_LABEL
+        if str(value or "").strip() == LEGACY_LOCAL_NO_LOGS_LABEL
+        else value
+    )
+
+
 def fresh_automatic_run_setting_values(pdf_files=None, folder_pdf_files=None):
     """Return defaults for a new selection, never values from the prior run."""
     builtin = builtin_automatic_run_setting_values(pdf_files, folder_pdf_files)
     saved = load_automatic_defaults(builtin)
-    return builtin | saved["defaults"]
+    effective = builtin | saved["defaults"]
+    effective["mode"] = normalized_automatic_output_mode(effective.get("mode"))
+    return effective
 
 
 AUTOMATIC_DEFAULT_EDITOR_FIELDS = (
@@ -5784,6 +5805,7 @@ def open_automatic_default_editor():
     builtin = builtin_automatic_run_setting_values()
     profile = load_automatic_defaults(builtin)
     effective = builtin | profile["defaults"]
+    effective["mode"] = normalized_automatic_output_mode(effective.get("mode"))
     state = {
         "revision": profile["revision"],
         "baseline": {field: effective[field] for field in AUTOMATIC_DEFAULT_EDITOR_FIELDS},
@@ -5910,57 +5932,87 @@ def create_fresh_automatic_run_root(output_root_base):
     raise OSError("Could not reserve a fresh automatic run folder after 999 attempts.")
 
 
-def flat_no_logs_output_folder_name(pdf_path, source_sha="", parent=None):
-    """Name one user-visible flat export without a date/time run container."""
-    pdf = Path(pdf_path)
-    stem = safe_stem(pdf.stem) or "document"
-    digest = str(source_sha or "").strip().lower()
-    if not digest:
-        digest = sha256_file(pdf)
-    preferred = f"parsed-pdf-{stem}-{digest[:12]}"
+def flat_no_logs_batch_output_folder_name(pdf_paths, parent=None):
+    """Name a user-visible compact export from its first and last PDF."""
+    paths = [Path(path) for path in pdf_paths or []]
+    if not paths:
+        return "parsed-pdfs"
+    first = safe_stem(paths[0].stem) or "document"
+    last = safe_stem(paths[-1].stem) or "document"
+    preferred = first if len(paths) == 1 else f"{first}--{last}"
     if parent is None:
-        return preferred[:72].rstrip("-._ ")
+        return preferred[:120].rstrip("-._ ") or "parsed-pdfs"
     available = 250 - len(str(Path(parent))) - 1
     if available < 16:
-        raise OSError("Output root is too long for a Windows-compatible flat export folder.")
+        raise OSError("Output root is too long for a Windows-compatible local export folder.")
     if len(preferred) <= available:
         return preferred
-    # Keep a visible source prefix and the source-content suffix so reruns
-    # remain distinguishable without relying on long Windows paths.
-    suffix = f"-{digest[:12]}"
-    prefix_length = max(1, min(48, available - len("parsed-pdf-") - len(suffix)))
-    return f"parsed-pdf-{stem[:prefix_length].rstrip('-._ ')}{suffix}"
+    if len(paths) == 1:
+        return first[:available].rstrip("-._ ") or "document"
+    separator = "--"
+    first_limit = max(1, (available - len(separator)) // 2)
+    last_limit = max(1, available - len(separator) - first_limit)
+    return f"{first[:first_limit].rstrip('-._ ')}{separator}{last[:last_limit].rstrip('-._ ')}"
 
 
-def promote_flat_no_logs_output(output_root, temporary_output_dir, pdf_path, summary):
-    """Move one ready flat export beside the chosen root and update its UI path.
+def promote_flat_no_logs_batch_output(output_root, temporary_run_dir, pdf_paths, summaries):
+    """Promote successful no-log document exports into one named batch folder.
 
-    Same-content reruns never overwrite an earlier export.  They receive a
-    small numeric suffix, not a date/time marker, so the stable source hash
-    remains visible in the folder name.
+    The worker still stages output in a uniquely owned ``r-*`` directory while
+    it is running. Once every document is ready, only its plain-text export is
+    moved to the user-selected root; the staging receipts are deleted by the
+    caller. This keeps a multi-PDF run as one convenient folder without
+    flattening identities from different source documents into subfolders.
     """
     base = Path(output_root)
-    source = Path(temporary_output_dir)
-    if not source.is_dir():
-        raise FileNotFoundError(f"No-logs export directory is missing: {source}")
-    name = flat_no_logs_output_folder_name(
-        pdf_path,
-        (summary or {}).get("source_sha256"),
-        parent=base,
-    )
+    run_root = Path(temporary_run_dir)
+    name = flat_no_logs_batch_output_folder_name(pdf_paths, parent=base)
     target = base / name
     for suffix in range(2, 1000):
         if not target.exists():
             break
         target = base / f"{name}-{suffix}"
     else:
-        raise OSError("Could not reserve a unique no-logs output folder after 998 retries.")
-    moved = Path(shutil.move(str(source), str(target)))
-    prepared = Path(str((summary or {}).get("upload_file") or ""))
-    if prepared.name:
-        summary["upload_file"] = str(moved / prepared.name)
-    summary["flat_no_logs_output_directory"] = str(moved)
-    return moved
+        raise OSError("Could not reserve a unique local export folder after 998 retries.")
+
+    document_dirs = []
+    for summary in summaries or []:
+        upload_file = Path(str((summary or {}).get("upload_file") or ""))
+        source_dir = upload_file.parent
+        if not upload_file.is_file() or not source_dir.is_dir() or source_dir.parent != run_root:
+            raise FileNotFoundError(f"No-log export is missing a prepared text file: {upload_file}")
+        if source_dir not in document_dirs:
+            document_dirs.append(source_dir)
+    # ``retain_successful_run_without_logs`` leaves exactly one prepared
+    # transcript per document plus page/group records named ``-pNNN-sNN``.
+    # The orchestration wrapper can write its own checkpoint receipts *after*
+    # that retention has run.  Never promote every child of the staging
+    # directory: doing so leaks those diagnostic JSON/JSONL files back into a
+    # user-selected no-logs export.
+    prepared_paths = {
+        Path(str((summary or {}).get("upload_file") or ""))
+        for summary in summaries or []
+    }
+    segment_name = re.compile(r"-p\d{3,}-s\d+\.txt$", re.IGNORECASE)
+    planned = [
+        (source_dir, child)
+        for source_dir in document_dirs
+        for child in sorted(source_dir.iterdir(), key=lambda path: path.name.casefold())
+        if child.is_file()
+        and (child in prepared_paths or bool(segment_name.search(child.name)))
+    ]
+    names = [child.name.casefold() for _source_dir, child in planned]
+    if len(names) != len(set(names)):
+        raise FileExistsError("No-log batch export would create duplicate filenames.")
+
+    target.mkdir(parents=True, exist_ok=False)
+    for _source_dir, child in planned:
+        shutil.move(str(child), str(target / child.name))
+    for summary in summaries or []:
+        upload_file = Path(str(summary.get("upload_file") or ""))
+        summary["upload_file"] = str(target / upload_file.name)
+        summary["flat_no_logs_output_directory"] = str(target)
+    return target
 
 
 def append_ingestion_history(
@@ -9930,7 +9982,10 @@ def reset_automatic_run_settings_to_defaults():
         gr.update(value=defaults["document_author"]),
         gr.update(value=defaults["document_short_label"]),
         gr.update(value=defaults["use_file_title_fallback"]),
-        gr.update(value=defaults["mode"]),
+        # Do not let a quick click race the page-load response that restores
+        # saved defaults. The control is initially disabled and becomes
+        # interactive with this authoritative value.
+        gr.update(value=defaults["mode"], interactive=True),
         gr.update(value=defaults["output_root_override"]),
         gr.update(value=defaults["api_url"]),
         gr.update(value=defaults["api_key"]),
@@ -12916,6 +12971,7 @@ def record_timing_model_run(
     actual_seconds,
     *,
     wall_clock_seconds=None,
+    run_key_override=None,
 ):
     """Store one terminal timing observation and a compact batch-duration audit."""
     try:
@@ -12989,10 +13045,11 @@ def record_timing_model_run(
         # store the selected backend separately as an observed outcome.
         features["selected_backend"] = str(latest_summary.get("selected_backend") or "unknown")
         features["ocr_used"] = bool(latest_summary.get("ocr_assisted_extraction_used"))
+        timing_run_key = str(run_key_override or run_root)
         row = {
             "schema_version": TIMING_MODEL_VERSION,
             "recorded_at": datetime.now().isoformat(timespec="seconds"),
-            "run_key": str(run_root),
+            "run_key": timing_run_key,
             "source": "automatic-run",
             "state": str((completion or {}).get("state") or "unknown"),
             "actual_seconds": round(float(actual_seconds or 0), 3),
@@ -13471,7 +13528,7 @@ def automatic_confirmation_html(settings):
             mode,
             (
                 "Flat text-only export (no logs)"
-                if mode == MODE_LOCAL_NO_LOGS_LABEL
+                if mode == MODE_LOCAL_ONLY_LABEL
                 else "Local output only"
             ),
             settings["segment_mode"],
@@ -13810,7 +13867,7 @@ def automatic_mode_ui_updates(mode):
         # Do not reconfigure mounted control rows mid-run.  The execution
         # already owns an immutable settings snapshot, and changing only the
         # visible mode would make the current progress report misleading.
-        return tuple(gr.update() for _ in range(15))
+        return tuple(gr.update() for _ in range(16))
     upload_enabled = mode == MODE_NATIVE_UPLOAD_LABEL
     # Keep this order paired with automatic_mode_ui_outputs in build_interface.
     # Whole Rows are updated where possible so local-only mode cannot leave an
@@ -13818,6 +13875,7 @@ def automatic_mode_ui_updates(mode):
     upload_updates = (
         gr.update(visible=upload_enabled),  # AnythingLLM documents root
         gr.update(visible=upload_enabled),  # native metadata accordion
+        gr.update(visible=upload_enabled),  # API controls group
         gr.update(visible=upload_enabled),  # API URL
         gr.update(visible=upload_enabled),  # API key
         gr.update(visible=upload_enabled),  # inherit setting
@@ -14938,7 +14996,7 @@ def run_summary_html(value=""):
     status_preparing = "Status: preparing" in text
     local_only_mode = any(
         f"Mode: {label}" in text
-        for label in (MODE_LOCAL_ONLY_LABEL, MODE_LOCAL_NO_LOGS_LABEL)
+        for label in (MODE_LOCAL_ONLY_LABEL, MODE_LOCAL_WITH_LOGS_LABEL)
     )
     readiness_needs_review = "Readiness: needs_review" in text
     upload_completed = "Native metadata upload: complete" in text or "Native metadata upload: complete_with_key_cleanup_warning" in text
@@ -15597,7 +15655,7 @@ def run_automatic(
         )
 
     prepare_and_upload = mode == MODE_NATIVE_UPLOAD_LABEL
-    flat_no_logs_output = mode == MODE_LOCAL_NO_LOGS_LABEL
+    flat_no_logs_output = mode == MODE_LOCAL_ONLY_LABEL
     if not prepare_and_upload:
         native_upload_scope = "local_only"
         native_metadata_mode = "not_applicable"
@@ -16731,9 +16789,7 @@ def run_automatic(
                 and flat_retention.get("applied")
                 and flat_retention.get("policy") == "flat_local_no_logs_v1"
             ):
-                flat_no_logs_exports.append(
-                    promote_flat_no_logs_output(output_root_base, out_dir, pdf_path, summary)
-                )
+                flat_no_logs_exports.append(out_dir)
         except Exception as exc:
             LAST_SIMULATION_DIAGNOSTICS = {
                 "provider": (simulation_adapter or {}).get("provider") or "",
@@ -17252,6 +17308,24 @@ def run_automatic(
         and completion["state"] == "successful"
         and len(flat_no_logs_exports) == len(summaries)
     )
+    flat_no_logs_output_dir = None
+    if flat_no_logs_complete:
+        try:
+            flat_no_logs_output_dir = promote_flat_no_logs_batch_output(
+                output_root_base,
+                run_root,
+                files,
+                summaries,
+            )
+        except (OSError, FileNotFoundError) as exc:
+            flat_no_logs_complete = False
+            completion = {
+                "state": "warning",
+                "message": (
+                    "The local files were prepared, but their compact export could not be promoted. "
+                    f"Detailed staging output was retained for review: {exc}"
+                ),
+            }
     wall_clock_seconds = time.perf_counter() - started_at
     live_timing_status = dict(LIVE_AUTOMATIC_RUN_STATUS or {})
     if live_timing_status.get("run_root") == str(run_root):
@@ -17266,21 +17340,26 @@ def run_automatic(
         # This is a defensive fallback for an early failure before progress
         # could be persisted. It is intentionally marked separately below.
         actual_seconds = wall_clock_seconds
+    record_timing_model_run(
+        run_root,
+        summaries,
+        completion,
+        {
+            "timing_estimate": run_timing_estimate,
+            "source_documents": [
+                {"path": str(path), "pages": int((progress_allocations[index] or {}).get("pages") or 0)}
+                for index, path in enumerate(files)
+            ],
+        },
+        actual_seconds,
+        wall_clock_seconds=wall_clock_seconds,
+        run_key_override=(
+            f"local-only-{hashlib.sha256(str(run_root).encode('utf-8')).hexdigest()[:12]}"
+            if flat_no_logs_complete
+            else None
+        ),
+    )
     if not flat_no_logs_complete:
-        record_timing_model_run(
-            run_root,
-            summaries,
-            completion,
-            {
-                "timing_estimate": run_timing_estimate,
-                "source_documents": [
-                    {"path": str(path), "pages": int((progress_allocations[index] or {}).get("pages") or 0)}
-                    for index, path in enumerate(files)
-                ],
-            },
-            actual_seconds,
-            wall_clock_seconds=wall_clock_seconds,
-        )
         append_ingestion_history(
             run_root,
             summaries,
@@ -17290,6 +17369,8 @@ def run_automatic(
             processing_settings=processing_settings,
             mode=mode,
         )
+    if flat_no_logs_output_dir:
+        lines[0] = f"Output folder: {flat_no_logs_output_dir}"
     display_status = "completed" if completion["state"] == "successful" else completion["state"]
     lines.insert(0, f"Status: {display_status}")
     lines.insert(1, f"Completion assessment: {completion['message']}")
@@ -17564,11 +17645,12 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     )
             with gr.Row():
                 auto_mode = gr.Radio(
-                    choices=[MODE_LOCAL_ONLY_LABEL, MODE_LOCAL_NO_LOGS_LABEL, MODE_NATIVE_UPLOAD_LABEL],
+                    choices=[MODE_LOCAL_ONLY_LABEL, MODE_LOCAL_WITH_LOGS_LABEL, MODE_NATIVE_UPLOAD_LABEL],
                     value=MODE_NATIVE_UPLOAD_LABEL,
                     label="Output mode",
                     info="Every run pauses at the settings confirmation screen before local files are created or AnythingLLM is changed.",
                     elem_id="output-mode-radio",
+                    interactive=False,
                 )
             local_only_mode_notice = gr.HTML(
                 value="",
@@ -17942,21 +18024,27 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 inherit_anythingllm_settings = gr.Checkbox(
                     value=True,
                     label="Inherit current AnythingLLM chunk and embedder limits",
+                    elem_classes=["anythingllm-upload-only-auto-control"],
                 )
-                refresh_anythingllm_settings_button = gr.Button("Refresh current AnythingLLM settings")
+                refresh_anythingllm_settings_button = gr.Button(
+                    "Refresh current AnythingLLM settings",
+                    elem_classes=["anythingllm-upload-only-auto-control"],
+                )
                 anythingllm_settings_snapshot = gr.HTML(
                     value=(
                         '<div class="setting-reference-note"><em>Live AnythingLLM settings have not been '
                         "queried. Use “Refresh current AnythingLLM settings” to inspect them.</em></div>"
                     ),
+                    elem_classes=["anythingllm-upload-only-auto-control"],
                 )
                 anythingllm_reference_values = gr.HTML(
                     value=(
                         '<div class="setting-reference-note"><em>Recommendations will be calculated after '
                         "the current AnythingLLM state is refreshed.</em></div>"
                     ),
+                    elem_classes=["anythingllm-upload-only-auto-control"],
                 )
-                with gr.Row(elem_classes=["aligned-settings-row"]) as anythingllm_chunk_controls:
+                with gr.Row(elem_classes=["aligned-settings-row", "anythingllm-upload-only-auto-control"]) as anythingllm_chunk_controls:
                     anythingllm_chunk_size = gr.Dropdown(
                         choices=CHUNK_SIZE_PRESET_CHOICES,
                         value=current_anythingllm_chunk_size_value(),
@@ -17973,7 +18061,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                         allow_custom_value=True,
                         interactive=True,
                     )
-                with gr.Row(elem_classes=["aligned-settings-row"]) as anythingllm_embedder_limit_controls:
+                with gr.Row(elem_classes=["aligned-settings-row", "anythingllm-upload-only-auto-control"]) as anythingllm_embedder_limit_controls:
                     anythingllm_embedder_max_chunk = gr.Number(
                         value=current_anythingllm_embedder_max_chunk_value(),
                         precision=0,
@@ -17993,7 +18081,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                         "Save embedder max chunk limit to AnythingLLM",
                         elem_classes=["aligned-action-button"],
                     )
-                with gr.Row() as anythingllm_settings_actions:
+                with gr.Row(elem_classes=["anythingllm-upload-only-auto-control"]) as anythingllm_settings_actions:
                     save_anythingllm_chunk_settings_button = gr.Button(
                         "Save chunk size and overlap to AnythingLLM",
                         elem_classes=["aligned-action-button"],
@@ -18012,7 +18100,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                         info="Known models only. Changes shared AnythingLLM settings before an upload run.",
                         elem_id="auto-apply-before-run",
                     )
-                with gr.Row(elem_classes=["aligned-settings-row"]) as anythingllm_embedder_model_controls:
+                with gr.Row(elem_classes=["aligned-settings-row", "anythingllm-upload-only-auto-control"]) as anythingllm_embedder_model_controls:
                     anythingllm_embedder_engine = gr.Dropdown(
                         choices=ANYTHINGLLM_EMBEDDER_ENGINE_CHOICES,
                         value=current_anythingllm_engine_value(),
@@ -18036,13 +18124,14 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                         visible=False,
                         elem_id="anythingllm-embedder-model-auto-refresh",
                     )
-                with gr.Row() as anythingllm_embedder_save_controls:
+                with gr.Row(elem_classes=["anythingllm-upload-only-auto-control"]) as anythingllm_embedder_save_controls:
                     save_anythingllm_embedder_engine_button = gr.Button("Save embedder engine and model to AnythingLLM")
                 anythingllm_embedder_limit_status = gr.Textbox(
                     label="AnythingLLM settings update status",
                     value="",
                     lines=3,
                     interactive=False,
+                    elem_classes=["anythingllm-upload-only-auto-control"],
                 )
                 advanced_end_section_names = gr.Textbox(
                     value="\n".join(DEFAULT_END_SECTION_HEADINGS),
@@ -18440,6 +18529,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
             automatic_mode_ui_outputs = [
                 anythingllm_output_root,
                 native_metadata_section,
+                anythingllm_run_api_controls,
                 api_url,
                 api_key,
                 inherit_anythingllm_settings,
@@ -19423,17 +19513,6 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 show_progress="hidden",
                 queue=False,
             )
-            # Advanced children are lazy-mounted when this accordion opens.
-            # Reapply the active mode at that boundary so local-only cannot
-            # reveal an upload-only control with stale visibility.
-            automatic_advanced_section.expand(
-                fn=automatic_mode_ui_updates,
-                inputs=[auto_mode],
-                outputs=automatic_mode_ui_outputs,
-                show_progress="hidden",
-                queue=False,
-            )
-
             # Keep the timer estimate in sync with the input set and every
             # run-defining visible choice. The callback does no extraction,
             # workspace mutation, or upload work.
@@ -19856,7 +19935,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     label="Use the PDF file title as a fallback",
                 )
                 future_defaults_mode = gr.Radio(
-                    choices=[MODE_LOCAL_ONLY_LABEL, MODE_LOCAL_NO_LOGS_LABEL, MODE_NATIVE_UPLOAD_LABEL],
+                    choices=[MODE_LOCAL_ONLY_LABEL, MODE_LOCAL_WITH_LOGS_LABEL, MODE_NATIVE_UPLOAD_LABEL],
                     value=editor_builtin_defaults["mode"], label="Output mode",
                 )
                 future_defaults_output_root = gr.Textbox(

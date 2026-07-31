@@ -133,28 +133,35 @@ def test_local_only_mode_hides_upload_controls_even_when_advanced_is_open(page, 
     advanced = page.get_by_role("button", name="Advanced preparation overrides ▼")
     expect(advanced).to_have_count(1)
     advanced.click()
+    expect(local_only).to_be_checked()
     expect(page.get_by_label("Extraction backend", exact=True)).to_have_count(0)
-    expect(page.get_by_label("AnythingLLM API URL", exact=True)).to_have_count(0)
-    expect(page.get_by_label("AnythingLLM chunk size", exact=True)).to_have_count(0)
-    expect(page.get_by_role("checkbox", name="Auto-apply before upload run")).to_have_count(0)
+    # The future-defaults editor intentionally has its own API URL default.
+    # Scope this assertion to the active run's native controls instead of
+    # treating that stored-default field as a visible upload control.
+    run_api_url = page.locator("#anythingllm-run-api-controls").get_by_label(
+        "AnythingLLM API URL", exact=True
+    )
+    expect(run_api_url).to_be_hidden()
+    expect(page.get_by_label("AnythingLLM chunk size", exact=True)).to_be_hidden()
+    expect(page.get_by_role("checkbox", name="Auto-apply before upload run")).to_be_hidden()
 
     upload_mode = page.get_by_role("radio", name="Create local files and upload to AnythingLLM")
     expect(upload_mode).to_have_count(1)
     upload_mode.check()
 
     expect(page.locator("#native-metadata-upload-section")).to_be_visible(timeout=5000)
-    expect(page.get_by_label("AnythingLLM API URL", exact=True)).to_be_visible(timeout=5000)
+    expect(run_api_url).to_be_visible(timeout=5000)
     expect(page.get_by_label("AnythingLLM chunk size", exact=True)).to_be_visible()
     expect(page.get_by_role("checkbox", name="Auto-apply before upload run")).to_be_visible()
 
 
-def test_no_logs_mode_is_local_only_and_remains_a_visible_choice(page, local_app_url):
+def test_compact_local_only_mode_remains_a_visible_choice(page, local_app_url):
     page.goto(local_app_url)
 
-    no_logs = page.get_by_role("radio", name="Create local files without logs")
-    expect(no_logs).to_have_count(1)
-    no_logs.check()
-    expect(no_logs).to_be_checked()
+    compact_local_only = page.get_by_role("radio", name="Create local files only")
+    expect(compact_local_only).to_have_count(1)
+    compact_local_only.check()
+    expect(compact_local_only).to_be_checked()
     expect(page.locator("#native-metadata-upload-section")).to_be_hidden()
     expect(page.get_by_label("AnythingLLM API URL", exact=True)).to_have_count(0)
 
