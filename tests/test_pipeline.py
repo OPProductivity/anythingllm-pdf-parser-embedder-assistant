@@ -3855,24 +3855,47 @@ class PipelineCoreTests(unittest.TestCase):
             "include_back_matter": 23,
             "segment_mode": 24,
             "custom_page_group_sizes": 25,
-            "backend_mode": 26,
-            "first_page_override": 27,
-            "end_page_override": 28,
-            "target_passage_length": 30,
-            "page_preserve_ceiling": 31,
-            "inherit_anythingllm_settings": 32,
-            "anythingllm_chunk_size": 33,
-            "anythingllm_chunk_overlap": 34,
-            "auto_apply_recommended_settings": 35,
-            "download_full_folder": 36,
-            "download_segments_folder": 37,
-            "advanced_end_section_names": 38,
-            "automatic_validation_phrases": 39,
-            "unstructured_strategy": 40,
-            "generate_inline_fallback": 41,
+            # Index 26 is the Custom Range visibility container, which has
+            # no value. The remaining mounted controls follow it.
+            "backend_mode": 27,
+            "first_page_override": 28,
+            "end_page_override": 29,
+            "target_passage_length": 31,
+            "page_preserve_ceiling": 32,
+            "inherit_anythingllm_settings": 33,
+            "anythingllm_chunk_size": 34,
+            "anythingllm_chunk_overlap": 35,
+            "auto_apply_recommended_settings": 36,
+            "download_full_folder": 37,
+            "download_segments_folder": 38,
+            "advanced_end_section_names": 39,
+            "automatic_validation_phrases": 40,
+            "unstructured_strategy": 41,
+            "generate_inline_fallback": 42,
         }
         for field, index in field_to_update.items():
             self.assertEqual(updates[index]["value"], defaults[field], field)
+
+    def test_saved_defaults_refresh_only_an_idle_automatic_form(self):
+        import rag_pdf_gradio_app as app
+
+        original_reset = app.reset_automatic_run_settings_to_defaults
+        original_status = app.LIVE_AUTOMATIC_RUN_STATUS
+        expected = tuple({"value": f"saved-{index}"} for index in range(43))
+        try:
+            app.reset_automatic_run_settings_to_defaults = lambda: expected
+            app.LIVE_AUTOMATIC_RUN_STATUS = {}
+            self.assertEqual(app.apply_saved_automatic_defaults_to_idle_form([], []), expected)
+
+            selected = app.apply_saved_automatic_defaults_to_idle_form(["current.pdf"], [])
+            self.assertTrue(all(update.get("__type__") == "update" for update in selected))
+
+            app.LIVE_AUTOMATIC_RUN_STATUS = {"state": "running"}
+            running = app.apply_saved_automatic_defaults_to_idle_form([], [])
+            self.assertTrue(all(update.get("__type__") == "update" for update in running))
+        finally:
+            app.reset_automatic_run_settings_to_defaults = original_reset
+            app.LIVE_AUTOMATIC_RUN_STATUS = original_status
 
     def test_idle_estimate_callback_cannot_replace_a_running_timer(self):
         import rag_pdf_gradio_app as app
@@ -11159,6 +11182,49 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual([(row["pdf_page"], row["pdf_page_end"]) for row in segments], [(1, 2), (3, 3)])
         self.assertEqual(segments[0]["page_spans"][0]["pdf_page"], 1)
         self.assertIsNone(segments[0]["page_spans"][0]["text_char_start"])
+
+    def test_custom_page_ranges_repeat_per_pdf_for_single_and_sequence_defaults(self):
+        source_meta = {
+            "source_id": "source-1", "source_title": "Example", "source_author": "Author",
+            "source_short_label": "Example", "source_sha256": "a" * 64,
+            "source_published_epoch_ms": None, "metadata_provenance": {}, "body_start": 1,
+            "end_matter_start": None, "boundary_confidence": "high", "repeated_headers": [],
+            "repeated_footers": [], "duplicate_pages": {},
+        }
+
+        def segment_ranges(pdf_name, pages, groups):
+            rows = [{"page": page, "text": f"Page {page}\n" + ("x" * 700)} for page in range(1, pages + 1)]
+            segments = pipeline.make_segments(
+                Path(pdf_name), "pymupdf", rows, 1, None, source_meta, 300,
+                segment_mode="custom_page_ranges", custom_page_group_sizes=groups,
+            )
+            return [(row["pdf_page"], row["pdf_page_end"]) for row in segments]
+
+        self.assertEqual(
+            segment_ranges("single-size.pdf", 61, "20"),
+            [(1, 20), (21, 40), (41, 60), (61, 61)],
+        )
+        expected_sequence = [(1, 20), (21, 50), (51, 70), (71, 110), (111, 130)]
+        self.assertEqual(segment_ranges("first-batch.pdf", 130, "20, 30, 20, 40, 60"), expected_sequence)
+        # A batch is made from independently prepared source PDFs. The pattern
+        # must restart at page 1 rather than carry an offset from the prior PDF.
+        self.assertEqual(segment_ranges("second-batch.pdf", 130, "20, 30, 20, 40, 60"), expected_sequence)
+
+    def test_custom_range_field_validation_disables_confirmation_only_while_invalid(self):
+        import rag_pdf_gradio_app as app
+
+        invalid_error, invalid_button = app.automatic_custom_page_group_sizes_validation(
+            app.SEGMENT_CUSTOM_PAGE_RANGE_LABEL, "20, nope", ["selected.pdf"], [], {}
+        )
+        valid_error, valid_button = app.automatic_custom_page_group_sizes_validation(
+            app.SEGMENT_CUSTOM_PAGE_RANGE_LABEL, "20, 30", ["selected.pdf"], [], {}
+        )
+
+        self.assertTrue(invalid_error["visible"])
+        self.assertIn("positive whole number", invalid_error["value"])
+        self.assertFalse(invalid_button["interactive"])
+        self.assertFalse(valid_error["visible"])
+        self.assertTrue(valid_button["interactive"])
 
     def test_retry_picker_helpers_keep_existing_valid_paths(self):
         import rag_pdf_gradio_app as app

@@ -19,10 +19,14 @@ single prepared record will remain a single internal chunk. Its page-aware
 contract is instead based on the identities and provenance of the records it
 submits and later confirms.
 
-The assistant's **Advanced** tab is outside this Desktop boundary. It runs a
-single-PDF local diagnostic preparation workflow and does not submit a
-document, create a workspace, or alter provider configuration. Do not use an
-Advanced diagnostic result as a claim that AnythingLLM has indexed the PDF.
+The assistant's **Advanced diagnostic run** is outside this Desktop boundary.
+It runs a single-PDF local preparation workflow and does not submit a document,
+create a workspace, or alter provider configuration. **Editing future defaults**
+from Advanced is also a non-run action: it affects only a later Automatic
+selection, not the current job or AnythingLLM. It may retain a later run's
+AnythingLLM API URL and workspace target, but never an API key or a generated
+per-document workspace name. Do not use an Advanced diagnostic
+result as a claim that AnythingLLM has indexed the PDF.
 
 ## Page-parent identity contract
 

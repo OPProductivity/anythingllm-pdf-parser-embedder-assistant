@@ -57,6 +57,7 @@ def local_app_url(tmp_path_factory):
     environment = dict(os.environ)
     environment["GRADIO_SERVER_PORT"] = str(port)
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment["ANYTHINGLLM_PDF_ASSISTANT_HOME"] = str(tmp_path_factory.mktemp("gradio-local-home"))
     stderr_path = tmp_path_factory.mktemp("gradio-local-app") / "stderr.log"
     with stderr_path.open("wb") as stderr_handle:
         process = subprocess.Popen(
@@ -162,6 +163,22 @@ def test_selecting_a_pdf_resets_a_prior_local_only_choice_to_the_new_run_default
     expect(upload_mode).to_be_checked(timeout=15000)
     expect(page.get_by_text("Local-only run:", exact=True)).to_have_count(0)
     expect(page.locator("#native-metadata-upload-section")).to_be_visible(timeout=15000)
+
+
+def test_future_defaults_editor_does_not_change_a_selected_automatic_job(page, local_app_url, one_page_pdf):
+    page.goto(local_app_url)
+    page.locator(".pdf-upload-input input[type='file']").set_input_files(str(one_page_pdf))
+    expect(page.get_by_role("button", name="Confirm and start processing")).to_be_enabled(timeout=15000)
+    local_only = page.get_by_role("radio", name="Create local files only")
+    local_only.check()
+
+    page.get_by_role("tab", name="Advanced").click()
+    page.get_by_role("button", name="Edit future Automatic defaults").click()
+    expect(page.locator("#future-automatic-defaults-editor").first).to_be_visible()
+    expect(page.get_by_text("Editing future defaults", exact=True).first).to_be_visible()
+
+    page.get_by_role("tab", name="Automatic").click()
+    expect(local_only).to_be_checked()
 
 
 def test_selected_pdf_exposes_one_confirm_action_and_safe_prestart_cancel(page, local_app_url, one_page_pdf):

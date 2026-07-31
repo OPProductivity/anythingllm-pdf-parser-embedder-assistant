@@ -13,6 +13,7 @@ outputs/
 Test Outputs/
 logs/
 config/
+settings/
 tmp-output/
 tmp/
 tmp-wheel/

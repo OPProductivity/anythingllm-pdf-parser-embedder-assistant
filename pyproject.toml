@@ -61,6 +61,7 @@ py-modules = [
   "anythingllm_pdf_assistant_cli",
   "anythingllm_persistence",
   "anythingllm_state",
+  "automatic_defaults",
   "auto_anythingllm_pipeline",
   "cancellable_preparation_worker",
   "embedder_capabilities",

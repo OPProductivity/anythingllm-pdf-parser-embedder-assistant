@@ -44,6 +44,11 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 from structured_logging import configure_structured_logger
 from portable_paths import ensure_application_directories, package_resource_path
+from automatic_defaults import (
+    PERSISTABLE_AUTOMATIC_DEFAULT_FIELDS,
+    load_automatic_defaults,
+    save_automatic_defaults,
+)
 from embedder_capabilities import (
     PROVIDER_LABELS,
     openrouter_simulation_option_map,
@@ -5694,8 +5699,8 @@ def automatic_run_processing_settings(values):
     }
 
 
-def fresh_automatic_run_setting_values(pdf_files=None, folder_pdf_files=None):
-    """Return the persisted-setting shape applied to every fresh selection."""
+def builtin_automatic_run_setting_values(pdf_files=None, folder_pdf_files=None):
+    """Return factory defaults before a private future-run profile is applied."""
     return {
         "pdf_files": pdf_files,
         "folder_pdf_files": folder_pdf_files,
@@ -5747,6 +5752,146 @@ def fresh_automatic_run_setting_values(pdf_files=None, folder_pdf_files=None):
         "download_full_folder": False,
         "download_segments_folder": False,
     }
+
+
+def fresh_automatic_run_setting_values(pdf_files=None, folder_pdf_files=None):
+    """Return defaults for a new selection, never values from the prior run."""
+    builtin = builtin_automatic_run_setting_values(pdf_files, folder_pdf_files)
+    saved = load_automatic_defaults(builtin)
+    return builtin | saved["defaults"]
+
+
+AUTOMATIC_DEFAULT_EDITOR_FIELDS = (
+    "use_file_title_fallback",
+    "mode",
+    "output_root_override",
+    "api_url",
+    "workspace_slug",
+    "native_upload_scope",
+    "native_metadata_mode",
+    "anythingllm_create_document_folders",
+    "local_check_mode",
+    "ollama_url",
+    "vector_audit_scope",
+    "deep_extraction",
+    "include_front_matter",
+    "include_back_matter",
+    "backend_mode",
+    "first_page_override",
+    "end_page_override",
+    "target_passage_length",
+    "page_preserve_ceiling",
+    "segment_mode",
+    "custom_page_group_sizes",
+    "advanced_end_section_names",
+    "automatic_validation_phrases",
+    "unstructured_strategy",
+    "generate_inline_fallback",
+    "inherit_anythingllm_settings",
+    "anythingllm_chunk_size",
+    "anythingllm_chunk_overlap",
+    "download_full_folder",
+    "download_segments_folder",
+)
+assert set(AUTOMATIC_DEFAULT_EDITOR_FIELDS) == PERSISTABLE_AUTOMATIC_DEFAULT_FIELDS
+
+
+def _automatic_default_editor_values(values):
+    return dict(zip(AUTOMATIC_DEFAULT_EDITOR_FIELDS, values, strict=True))
+
+
+def _automatic_default_editor_control_update(field, value):
+    """Keep a previously saved workspace target selectable until it is reviewed.
+
+    A Desktop workspace can be renamed or removed while the defaults editor is
+    closed.  Preserve the saved slug in the editor rather than silently
+    changing it; the ordinary upload readiness checks remain responsible for
+    rejecting a target that no longer exists.
+    """
+    if field != "workspace_slug":
+        return gr.update(value=value)
+    choices = workspace_choices_with_new_document(local_workspace_choices()[0])
+    valid_values = {str(choice[1]) for choice in choices if len(choice) >= 2}
+    normalized = str(value or "").strip()
+    if normalized and normalized not in valid_values:
+        choices.append((f"Previously saved workspace ({normalized})", normalized))
+    return gr.update(value=value, choices=choices)
+
+
+def open_automatic_default_editor():
+    """Load a separate future-default editor without changing a current run."""
+    builtin = builtin_automatic_run_setting_values()
+    profile = load_automatic_defaults(builtin)
+    effective = builtin | profile["defaults"]
+    state = {
+        "revision": profile["revision"],
+        "baseline": {field: effective[field] for field in AUTOMATIC_DEFAULT_EDITOR_FIELDS},
+    }
+    notice = profile["notice"] or "Editing future defaults only. The selected or running Automatic job is unchanged."
+    return (
+        *(_automatic_default_editor_control_update(field, effective[field]) for field in AUTOMATIC_DEFAULT_EDITOR_FIELDS),
+        gr.update(visible=effective["segment_mode"] == SEGMENT_CUSTOM_PAGE_RANGE_LABEL),
+        state,
+        gr.update(value=notice, visible=True),
+        gr.update(open=True),
+        gr.update(visible=False),
+        gr.update(visible=False),
+    )
+
+
+def save_automatic_default_editor(editor_state, *values, overwrite=False):
+    """Save only future defaults; failures retain the editor values unchanged."""
+    builtin = builtin_automatic_run_setting_values()
+    state = editor_state if isinstance(editor_state, dict) else {}
+    edited = _automatic_default_editor_values(values)
+    if is_custom_page_range_segment_mode(edited["segment_mode"]):
+        try:
+            parse_custom_page_group_sizes(edited["custom_page_group_sizes"])
+        except ValueError as exc:
+            return (
+                gr.update(value=f"Custom Range defaults were not saved: {exc}", visible=True),
+                gr.update(open=True),
+                state,
+                gr.update(visible=False),
+                gr.update(visible=False),
+            )
+    result = save_automatic_defaults(
+        edited,
+        builtin,
+        expected_revision=int(state.get("revision") or 0),
+        overwrite=overwrite,
+    )
+    if result["status"] == "saved":
+        updated_state = {
+            "revision": result["revision"],
+            "baseline": edited,
+        }
+        return (
+            gr.update(value=result["message"], visible=True),
+            gr.update(open=False),
+            updated_state,
+            gr.update(visible=False),
+            gr.update(visible=False),
+        )
+    conflict = result["status"] == "conflict"
+    retry_note = " You can Retry or Cancel." if result["status"] == "error" else ""
+    return (
+        gr.update(value=result["message"] + retry_note, visible=True),
+        gr.update(open=True),
+        state,
+        gr.update(visible=conflict),
+        gr.update(visible=False),
+    )
+
+
+def request_automatic_default_editor_cancel(editor_state, *values):
+    """Require an explicit choice before throwing away dirty future defaults."""
+    state = editor_state if isinstance(editor_state, dict) else {}
+    baseline = state.get("baseline") if isinstance(state.get("baseline"), dict) else {}
+    dirty = _automatic_default_editor_values(values) != baseline
+    if dirty:
+        return gr.update(visible=True), gr.update(value="Unsaved changes: Save, Discard, or keep editing.", visible=True)
+    return gr.update(visible=False), gr.update(value="", visible=False)
 
 
 def refresh_automatic_run_estimate_for_fresh_selection(pdf_files=None, folder_pdf_files=None, folder_manifest=None):
@@ -9805,7 +9950,7 @@ def reset_automatic_run_presentation(pdf_files=None, folder_pdf_files=None):
 
 
 def reset_automatic_run_settings_to_defaults():
-    """Restore each per-run control to the same defaults as a fresh page load.
+    """Restore controls to saved future-run defaults for a fresh selection.
 
     Persisted AnythingLLM engine/model settings are intentionally not changed:
     they are application configuration, not state inherited from a previous
@@ -9814,52 +9959,67 @@ def reset_automatic_run_settings_to_defaults():
     """
     if str((LIVE_AUTOMATIC_RUN_STATUS or {}).get("state") or "") == "running":
         return tuple(gr.update() for _ in range(43))
+    defaults = fresh_automatic_run_setting_values()
     return (
-        gr.update(value=""),
-        gr.update(value=""),
-        gr.update(value=""),
-        gr.update(value=True),
-        gr.update(value=MODE_NATIVE_UPLOAD_LABEL),
-        gr.update(value=str(AUTO_OUTPUT_DIR)),
-        gr.update(value=DEFAULT_ANYTHINGLLM_API_URL),
-        gr.update(value=""),
-        gr.update(value=INITIAL_WORKSPACE_VALUE),
+        gr.update(value=defaults["document_label"]),
+        gr.update(value=defaults["document_author"]),
+        gr.update(value=defaults["document_short_label"]),
+        gr.update(value=defaults["use_file_title_fallback"]),
+        gr.update(value=defaults["mode"]),
+        gr.update(value=defaults["output_root_override"]),
+        gr.update(value=defaults["api_url"]),
+        gr.update(value=defaults["api_key"]),
+        gr.update(value=defaults["workspace_slug"]),
         gr.update(value="", visible=True),
         "",
-        gr.update(value=NATIVE_UPLOAD_SCOPE_ALL_LABEL),
-        gr.update(value="", visible=False),
+        gr.update(value=defaults["native_upload_scope"]),
+        gr.update(value=defaults["native_upload_custom_range"], visible=False),
         gr.update(value=NATIVE_BOUNDARY_CURRENT_LABEL),
-        gr.update(value="Native title header (priority)"),
+        gr.update(value=defaults["native_metadata_mode"]),
         # Keep reset aligned with the visible-by-default initial control.
-        gr.update(value=False),
-        gr.update(value=""),
-        gr.update(value=INITIAL_SIMULATION_VALUE),
-        gr.update(value=""),
-        gr.update(value=DEFAULT_OLLAMA_URL),
-        gr.update(value="Full corpus"),
-        gr.update(value=False),
-        gr.update(value=True),
-        gr.update(value=True),
-        gr.update(value=SEGMENT_PAGE_LIMIT_LABEL),
-        gr.update(value=""),
-        gr.update(visible=False),
-        gr.update(value="Automatic"),
-        gr.update(value=0),
-        gr.update(value=0),
+        gr.update(value=defaults["anythingllm_create_document_folders"]),
+        gr.update(value=defaults["anythingllm_document_folder_name"]),
+        gr.update(value=defaults["local_check_mode"]),
+        gr.update(value=defaults["custom_ollama_model"]),
+        gr.update(value=defaults["ollama_url"]),
+        gr.update(value=defaults["vector_audit_scope"]),
+        gr.update(value=defaults["deep_extraction"]),
+        gr.update(value=defaults["include_front_matter"]),
+        gr.update(value=defaults["include_back_matter"]),
+        gr.update(value=defaults["segment_mode"]),
+        gr.update(value=defaults["custom_page_group_sizes"]),
+        gr.update(visible=defaults["segment_mode"] == SEGMENT_CUSTOM_PAGE_RANGE_LABEL),
+        gr.update(value=defaults["backend_mode"]),
+        gr.update(value=defaults["first_page_override"]),
+        gr.update(value=defaults["end_page_override"]),
         gr.update(value=TARGET_PASSAGE_INHERIT_LABEL),
-        gr.update(value=str(DEFAULT_TARGET_PASSAGE_LENGTH)),
-        gr.update(value=0, visible=True),
-        gr.update(value=True),
-        gr.update(value=current_anythingllm_chunk_size_value()),
-        gr.update(value=current_anythingllm_chunk_overlap_value()),
-        gr.update(value=False),
-        gr.update(value=False),
-        gr.update(value=False),
-        gr.update(value="\n".join(DEFAULT_END_SECTION_HEADINGS)),
-        gr.update(value=""),
-        gr.update(value="auto"),
-        gr.update(value=True),
+        gr.update(value=defaults["target_passage_length"]),
+        gr.update(value=defaults["page_preserve_ceiling"], visible=True),
+        gr.update(value=defaults["inherit_anythingllm_settings"]),
+        gr.update(value=defaults["anythingllm_chunk_size"]),
+        gr.update(value=defaults["anythingllm_chunk_overlap"]),
+        gr.update(value=defaults["auto_apply_recommended_settings"]),
+        gr.update(value=defaults["download_full_folder"]),
+        gr.update(value=defaults["download_segments_folder"]),
+        gr.update(value=defaults["advanced_end_section_names"]),
+        gr.update(value=defaults["automatic_validation_phrases"]),
+        gr.update(value=defaults["unstructured_strategy"]),
+        gr.update(value=defaults["generate_inline_fallback"]),
     )
+
+
+def apply_saved_automatic_defaults_to_idle_form(pdf_files=None, folder_pdf_files=None):
+    """Refresh an idle Automatic form without rewriting an active selection.
+
+    Saved preferences are immediately visible after a page reload or returning
+    to Automatic.  Once a PDF is selected, its controls are a run snapshot and
+    must remain untouched until that selection is cleared or replaced.
+    """
+    if str((LIVE_AUTOMATIC_RUN_STATUS or {}).get("state") or "") == "running":
+        return tuple(gr.update() for _ in range(43))
+    if normalize_file_list(pdf_files) or normalize_file_list(folder_pdf_files):
+        return tuple(gr.update() for _ in range(43))
+    return reset_automatic_run_settings_to_defaults()
 
 
 def active_automatic_run_root():
@@ -14297,6 +14457,30 @@ def custom_page_group_sizes_control_update(segment_mode_value):
     return gr.update(visible=enabled)
 
 
+def automatic_custom_page_group_sizes_validation(
+    segment_mode_value,
+    group_sizes_value,
+    pdf_files=None,
+    folder_pdf_files=None,
+    folder_manifest=None,
+):
+    """Keep Confirm disabled while a visible Custom Range value is invalid."""
+    if not is_custom_page_range_segment_mode(segment_mode_value):
+        return gr.update(value="", visible=False), automatic_process_button_state(
+            pdf_files, folder_pdf_files, folder_manifest
+        )
+    try:
+        parse_custom_page_group_sizes(group_sizes_value)
+    except ValueError as exc:
+        return (
+            gr.update(value=f"<div class='field-error'>{html.escape(str(exc))}</div>", visible=True),
+            gr.update(value="Confirm and start processing", interactive=False, variant="secondary"),
+        )
+    return gr.update(value="", visible=False), automatic_process_button_state(
+        pdf_files, folder_pdf_files, folder_manifest
+    )
+
+
 def _recommended_target_passage_length(maximum_characters):
     ceiling = max(1, _positive_int(maximum_characters, DEFAULT_TARGET_PASSAGE_LENGTH))
     preferred = min(DEFAULT_TARGET_PASSAGE_LENGTH, ceiling)
@@ -17303,7 +17487,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
         )
 
     with gr.Tabs():
-        with gr.Tab("Automatic"):
+        with gr.Tab("Automatic") as automatic_tab:
             # ``File(buttons=...)`` mounts this action in the component header,
             # beside Gradio's own clear controls, rather than as a separate
             # confusing row below the selected files.
@@ -17494,6 +17678,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                         lines=1,
                         max_lines=1,
                     )
+                    custom_page_group_sizes_error = gr.HTML(value="", visible=False)
 
             with gr.Accordion(
                 "Native metadata upload",
@@ -18334,6 +18519,23 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     pdf_folder_picker_area,
                     choose_pdf_folder_button,
                 ],
+                show_progress="hidden",
+                queue=False,
+            )
+            # Page load is an idle Automatic form, so show the user's saved
+            # future defaults immediately. A selected/running run is guarded
+            # by the callback and is never reset by this refresh.
+            demo.load(
+                fn=apply_saved_automatic_defaults_to_idle_form,
+                inputs=[auto_pdfs, auto_folder_pdfs],
+                outputs=fresh_run_settings_outputs,
+                show_progress="hidden",
+                queue=False,
+            )
+            automatic_tab.select(
+                fn=apply_saved_automatic_defaults_to_idle_form,
+                inputs=[auto_pdfs, auto_folder_pdfs],
+                outputs=fresh_run_settings_outputs,
                 show_progress="hidden",
                 queue=False,
             )
@@ -19435,6 +19637,15 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
                 trigger_mode="always_last",
             )
+            for custom_range_input in [segment_mode, custom_page_group_sizes]:
+                custom_range_input.input(
+                    fn=automatic_custom_page_group_sizes_validation,
+                    inputs=[segment_mode, custom_page_group_sizes, auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
+                    outputs=[custom_page_group_sizes_error, confirm_automatic_run_button],
+                    show_progress="hidden",
+                    queue=False,
+                    trigger_mode="always_last",
+                )
             segment_mode.change(
                 fn=native_upload_scope_batch_guard,
                 inputs=[native_upload_scope, auto_pdfs, auto_folder_pdfs, segment_mode],
@@ -19668,17 +19879,218 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                         min_width=96,
                         elem_id="theme-toggle-button",
                     )
-            with gr.Row(elem_classes=["advanced-output-root-controls"]):
-                advanced_output_root_override = gr.Textbox(
-                    label="Advanced diagnostic output folder",
-                    value=str(ADVANCED_DIAGNOSTICS_OUTPUT_DIR),
-                    lines=1,
-                    max_lines=1,
-                    scale=4,
+            with gr.Accordion(
+                "Edit future Automatic defaults",
+                open=False,
+                elem_id="future-automatic-defaults-editor",
+                elem_classes=["top-level-accordion", "future-automatic-defaults-accordion"],
+            ) as future_defaults_editor:
+                future_defaults_status = gr.Markdown(visible=False)
+                gr.Markdown(
+                    "### Editing future defaults\n\n"
+                    "These values apply only to a later PDF selection or a fresh setup. They never alter the selected or running Automatic job. "
+                    "Source files, document metadata, API keys, per-document names, upload page ranges, and recovery state are intentionally not stored."
                 )
-                choose_advanced_output_root_button = gr.Button(
-                    "Choose Advanced output folder",
-                    scale=1,
+                editor_builtin_defaults = builtin_automatic_run_setting_values()
+                future_defaults_use_file_title_fallback = gr.Checkbox(
+                    value=editor_builtin_defaults["use_file_title_fallback"],
+                    label="Use the PDF file title as a fallback",
+                )
+                future_defaults_mode = gr.Radio(
+                    choices=[MODE_LOCAL_ONLY_LABEL, MODE_LOCAL_NO_LOGS_LABEL, MODE_NATIVE_UPLOAD_LABEL],
+                    value=editor_builtin_defaults["mode"], label="Output mode",
+                )
+                future_defaults_output_root = gr.Textbox(
+                    value=editor_builtin_defaults["output_root_override"], label="Default output folder", lines=1,
+                )
+                with gr.Accordion("Upload, workspace, and download defaults", open=False, elem_classes=["native-upload-subaccordion"]):
+                    future_defaults_api_url = gr.Textbox(
+                        value=editor_builtin_defaults["api_url"], label="AnythingLLM API URL", lines=1,
+                        info="The address of the AnythingLLM server to use for later upload runs. API keys are never saved here.",
+                    )
+                    future_defaults_workspace = gr.Dropdown(
+                        choices=INITIAL_WORKSPACE_CHOICES,
+                        value=editor_builtin_defaults["workspace_slug"],
+                        label="Default workspace",
+                        allow_custom_value=False,
+                        info="Use New workspace for this document to create a separate workspace only after a later run is confirmed.",
+                    )
+                    future_defaults_native_scope = gr.Dropdown(
+                        choices=[NATIVE_UPLOAD_SCOPE_ALL_LABEL, NATIVE_UPLOAD_SCOPE_CUSTOM_LABEL],
+                        value=editor_builtin_defaults["native_upload_scope"],
+                        label="Default native upload scope",
+                        info="A Custom range still needs its page range entered for each individual PDF.",
+                    )
+                    with gr.Row():
+                        future_defaults_download_full = gr.Checkbox(
+                            value=editor_builtin_defaults["download_full_folder"], label="Download full prepared-output folder",
+                        )
+                        future_defaults_download_segments = gr.Checkbox(
+                            value=editor_builtin_defaults["download_segments_folder"], label="Download segments folder",
+                        )
+                with gr.Row():
+                    future_defaults_native_metadata = gr.Dropdown(
+                        choices=["Native title header (priority)", "Strict metadata only"],
+                        value=editor_builtin_defaults["native_metadata_mode"], label="Native metadata strategy",
+                    )
+                    future_defaults_document_folders = gr.Checkbox(
+                        value=editor_builtin_defaults["anythingllm_create_document_folders"],
+                        label="Create dedicated AnythingLLM document folders",
+                    )
+                with gr.Row():
+                    future_defaults_simulation = gr.Dropdown(
+                        choices=INITIAL_SIMULATION_CHOICES, value=editor_builtin_defaults["local_check_mode"],
+                        label="Simulation embedder", allow_custom_value=False,
+                    )
+                    future_defaults_ollama_url = gr.Textbox(
+                        value=editor_builtin_defaults["ollama_url"], label="Ollama URL", lines=1,
+                    )
+                    future_defaults_audit_scope = gr.Dropdown(
+                        choices=["Full corpus", "Focused (up to 300 chunks)"],
+                        value=editor_builtin_defaults["vector_audit_scope"], label="Simulation workload",
+                    )
+                with gr.Row():
+                    future_defaults_deep_extraction = gr.Checkbox(value=editor_builtin_defaults["deep_extraction"], label="Force Unstructured")
+                    future_defaults_front_matter = gr.Checkbox(value=editor_builtin_defaults["include_front_matter"], label="Include foreword/preface")
+                    future_defaults_back_matter = gr.Checkbox(value=editor_builtin_defaults["include_back_matter"], label="Include notes/bibliography/index")
+                    future_defaults_inline_fallback = gr.Checkbox(value=editor_builtin_defaults["generate_inline_fallback"], label="Generate inline metadata fallback files")
+                with gr.Row():
+                    future_defaults_backend = gr.Dropdown(
+                        choices=["Automatic", "PyMuPDF", "PyMuPDF4LLM", "Unstructured"],
+                        value=editor_builtin_defaults["backend_mode"], label="Extraction backend",
+                    )
+                    future_defaults_unstructured_strategy = gr.Dropdown(
+                        choices=["auto", "fast", "hi_res", "ocr_only"],
+                        value=editor_builtin_defaults["unstructured_strategy"], label="Unstructured strategy",
+                    )
+                with gr.Row():
+                    future_defaults_first_page = gr.Number(value=0, precision=0, minimum=0, label="First PDF page override")
+                    future_defaults_end_page = gr.Number(value=0, precision=0, minimum=0, label="End-matter start override")
+                    future_defaults_page_ceiling = gr.Number(value=0, precision=0, minimum=0, label="Page-preserve safety ceiling")
+                future_defaults_segment_mode = gr.Dropdown(
+                    choices=[SEGMENT_NONE_LABEL, SEGMENT_PASSAGES_LABEL, SEGMENT_PAGE_ONLY_LABEL, SEGMENT_PAGE_LIMIT_LABEL, SEGMENT_PAGE_PASSAGES_LABEL, SEGMENT_CUSTOM_PAGE_RANGE_LABEL],
+                    value=editor_builtin_defaults["segment_mode"], label="Segmentation mode",
+                )
+                with gr.Column(visible=False) as future_defaults_custom_range_area:
+                    future_defaults_custom_groups = gr.Textbox(
+                        value="", label="Pages per chunk (Custom Range)", placeholder="20 or 20, 30, 20, 40, 60",
+                    )
+                with gr.Row():
+                    future_defaults_target_passage = gr.Dropdown(
+                        choices=TARGET_PASSAGE_LENGTH_PRESET_CHOICES,
+                        value=editor_builtin_defaults["target_passage_length"], allow_custom_value=True,
+                        label="Target passage length",
+                    )
+                    future_defaults_inherit_settings = gr.Checkbox(
+                        value=editor_builtin_defaults["inherit_anythingllm_settings"],
+                        label="Inherit current AnythingLLM chunk and embedder limits",
+                    )
+                    future_defaults_chunk_size = gr.Dropdown(
+                        choices=CHUNK_SIZE_PRESET_CHOICES, value=editor_builtin_defaults["anythingllm_chunk_size"],
+                        allow_custom_value=True, label="AnythingLLM chunk size",
+                    )
+                    future_defaults_chunk_overlap = gr.Dropdown(
+                        choices=CHUNK_OVERLAP_PRESET_CHOICES, value=editor_builtin_defaults["anythingllm_chunk_overlap"],
+                        allow_custom_value=True, label="AnythingLLM chunk overlap",
+                    )
+                future_defaults_end_sections = gr.Textbox(
+                    value=editor_builtin_defaults["advanced_end_section_names"], lines=4, label="End-section headings",
+                )
+                future_defaults_validation_phrases = gr.Textbox(
+                    value=editor_builtin_defaults["automatic_validation_phrases"], lines=3, label="Automatic validation phrases",
+                )
+                future_defaults_state = gr.State({})
+                with gr.Row():
+                    save_future_defaults_button = gr.Button("Save future defaults", variant="primary")
+                    cancel_future_defaults_button = gr.Button("Cancel")
+                with gr.Group(visible=False) as future_defaults_conflict_actions:
+                    gr.Markdown("Another browser session saved newer defaults. Reload its values or explicitly replace them with these edits.")
+                    with gr.Row():
+                        reload_future_defaults_button = gr.Button("Reload saved defaults")
+                        overwrite_future_defaults_button = gr.Button("Overwrite saved defaults", variant="stop")
+                with gr.Group(visible=False) as future_defaults_unsaved_actions:
+                    gr.Markdown("Unsaved changes")
+                    with gr.Row():
+                        save_unsaved_future_defaults_button = gr.Button("Save", variant="primary")
+                        discard_future_defaults_button = gr.Button("Discard")
+                        keep_editing_future_defaults_button = gr.Button("Keep editing")
+                future_defaults_controls = [
+                    future_defaults_use_file_title_fallback, future_defaults_mode, future_defaults_output_root,
+                    future_defaults_api_url, future_defaults_workspace, future_defaults_native_scope,
+                    future_defaults_native_metadata, future_defaults_document_folders, future_defaults_simulation,
+                    future_defaults_ollama_url, future_defaults_audit_scope,
+                    future_defaults_deep_extraction, future_defaults_front_matter, future_defaults_back_matter,
+                    future_defaults_backend, future_defaults_first_page, future_defaults_end_page,
+                    future_defaults_target_passage, future_defaults_page_ceiling, future_defaults_segment_mode,
+                    future_defaults_custom_groups, future_defaults_end_sections, future_defaults_validation_phrases,
+                    future_defaults_unstructured_strategy, future_defaults_inline_fallback,
+                    future_defaults_inherit_settings, future_defaults_chunk_size, future_defaults_chunk_overlap,
+                    future_defaults_download_full, future_defaults_download_segments,
+                ]
+                future_defaults_editor.expand(
+                    fn=open_automatic_default_editor, outputs=[
+                        *future_defaults_controls, future_defaults_custom_range_area, future_defaults_state, future_defaults_status,
+                        future_defaults_editor, future_defaults_conflict_actions, future_defaults_unsaved_actions,
+                    ], show_progress="hidden", queue=False,
+                )
+                future_defaults_segment_mode.change(
+                    fn=custom_page_group_sizes_control_update, inputs=future_defaults_segment_mode,
+                    outputs=future_defaults_custom_range_area, show_progress="hidden", queue=False,
+                )
+                save_future_defaults_event = save_future_defaults_button.click(
+                    fn=save_automatic_default_editor, inputs=[future_defaults_state, *future_defaults_controls],
+                    outputs=[future_defaults_status, future_defaults_editor, future_defaults_state, future_defaults_conflict_actions, future_defaults_unsaved_actions],
+                    show_progress="hidden", queue=False,
+                )
+                save_future_defaults_event.then(
+                    fn=apply_saved_automatic_defaults_to_idle_form,
+                    inputs=[auto_pdfs, auto_folder_pdfs],
+                    outputs=fresh_run_settings_outputs,
+                    show_progress="hidden",
+                    queue=False,
+                )
+                cancel_future_defaults_button.click(
+                    fn=request_automatic_default_editor_cancel, inputs=[future_defaults_state, *future_defaults_controls],
+                    outputs=[future_defaults_unsaved_actions, future_defaults_status], show_progress="hidden", queue=False,
+                )
+                discard_future_defaults_button.click(
+                    fn=lambda: (gr.update(open=False), gr.update(visible=False), gr.update(value="", visible=False)),
+                    outputs=[future_defaults_editor, future_defaults_unsaved_actions, future_defaults_status], show_progress="hidden", queue=False,
+                )
+                keep_editing_future_defaults_button.click(
+                    fn=lambda: gr.update(visible=False), outputs=future_defaults_unsaved_actions,
+                    show_progress="hidden", queue=False,
+                )
+                reload_future_defaults_button.click(
+                    fn=open_automatic_default_editor, outputs=[
+                        *future_defaults_controls, future_defaults_custom_range_area, future_defaults_state, future_defaults_status,
+                        future_defaults_editor, future_defaults_conflict_actions, future_defaults_unsaved_actions,
+                    ], show_progress="hidden", queue=False,
+                )
+                overwrite_future_defaults_event = overwrite_future_defaults_button.click(
+                    fn=lambda state, *values: save_automatic_default_editor(state, *values, overwrite=True),
+                    inputs=[future_defaults_state, *future_defaults_controls],
+                    outputs=[future_defaults_status, future_defaults_editor, future_defaults_state, future_defaults_conflict_actions, future_defaults_unsaved_actions],
+                    show_progress="hidden", queue=False,
+                )
+                overwrite_future_defaults_event.then(
+                    fn=apply_saved_automatic_defaults_to_idle_form,
+                    inputs=[auto_pdfs, auto_folder_pdfs],
+                    outputs=fresh_run_settings_outputs,
+                    show_progress="hidden",
+                    queue=False,
+                )
+                save_unsaved_future_defaults_event = save_unsaved_future_defaults_button.click(
+                    fn=save_automatic_default_editor, inputs=[future_defaults_state, *future_defaults_controls],
+                    outputs=[future_defaults_status, future_defaults_editor, future_defaults_state, future_defaults_conflict_actions, future_defaults_unsaved_actions],
+                    show_progress="hidden", queue=False,
+                )
+                save_unsaved_future_defaults_event.then(
+                    fn=apply_saved_automatic_defaults_to_idle_form,
+                    inputs=[auto_pdfs, auto_folder_pdfs],
+                    outputs=fresh_run_settings_outputs,
+                    show_progress="hidden",
+                    queue=False,
                 )
             with gr.Accordion("Completed-run diagnostics", open=True, elem_classes=["top-level-accordion"]):
                 diagnostics_run_directory = gr.Textbox(
@@ -19712,6 +20124,19 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 )
 
             gr.HTML('<div class="advanced-new-run-divider">New Diagnostics Run</div>')
+            with gr.Accordion("Diagnostic output location", open=False, elem_classes=["top-level-accordion"]):
+                with gr.Row(elem_classes=["advanced-output-root-controls"]):
+                    advanced_output_root_override = gr.Textbox(
+                        label="Advanced diagnostic output folder",
+                        value=str(ADVANCED_DIAGNOSTICS_OUTPUT_DIR),
+                        lines=1,
+                        max_lines=1,
+                        scale=4,
+                    )
+                    choose_advanced_output_root_button = gr.Button(
+                        "Choose Advanced output folder",
+                        scale=1,
+                    )
             with gr.Row(elem_classes=["advanced-source-row"]):
                 with gr.Column(elem_classes=["advanced-source-card", "advanced-pdf-card"]):
                     advanced_pdf = gr.File(

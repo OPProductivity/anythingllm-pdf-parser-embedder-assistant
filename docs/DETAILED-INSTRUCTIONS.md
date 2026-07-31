@@ -113,6 +113,23 @@ For upload mode, choose an existing workspace or **New workspace for this
 document**. A new workspace is created only after confirmation. The selection
 does not prove that Desktop has stored or embedded any record.
 
+## Save future Automatic defaults
+
+The **Advanced** tab's **Edit future Automatic defaults** fold-down stores
+reusable choices for later Automatic setups. This includes the output mode and
+folder, fallback-title preference, AnythingLLM API URL, workspace target,
+native upload scope and metadata strategy, simulation endpoint and workload,
+extraction/segmentation settings, and download preferences. After Save, an
+idle Automatic tab reflects those values immediately; a selected or running
+job keeps its own snapshot.
+
+The private profile never stores source files, document title/author/citation
+metadata, API keys, generated workspace or document-folder names, custom
+per-PDF upload page ranges, recovery state, or controls that write shared
+AnythingLLM provider settings. If a saved workspace is later removed, it stays
+visible as a previously saved target until you choose another one; readiness
+checks prevent an invalid upload.
+
 ## Choose extraction and segmentation
 
 Automatic mode evaluates the source text and OCR risk. It can use native PDF
@@ -189,14 +206,25 @@ summary and diagnostic artifacts.
 
 ## Use Advanced diagnostics
 
-The **Advanced** tab is a local, single-PDF diagnostic tool. It gives direct
-control over extraction backend, OCR/deep extraction choices, matter inclusion,
-page boundaries, segmentation, validation phrases, and evidence retention.
-
-An Advanced diagnostic run does not upload to AnythingLLM, create or alter a
-workspace, or edit Automatic defaults. It is useful for understanding a
+The **Advanced diagnostic run** is a local, single-PDF diagnostic tool. It
+gives direct control over extraction backend, OCR/deep extraction choices,
+matter inclusion, page boundaries, segmentation, validation phrases, and
+evidence retention. It does not upload to AnythingLLM, create or alter a
+workspace, or edit the current Automatic job. It is useful for understanding a
 difficult source before starting an ordinary Automatic upload; it is not a
 retry or recovery mechanism for an already submitted run.
+
+The **Edit future Automatic defaults** fold-down section opens a separate,
+non-run editor from Advanced. Save stores only safe future preparation/output
+preferences for the current Windows user and immediately reflects them in an
+idle Automatic form. Cancel leaves them unchanged. The editor never stores
+PDF selections or inferred metadata, API keys, generated per-document
+workspace or document-folder names, custom upload ranges, diagnostics,
+recovery state, or a current run. It does retain the reusable API URL and
+workspace target selected for a later upload.
+Saved defaults appear immediately in an idle Automatic form and apply to a
+future selection; they never rewrite a selection already on screen or a
+running job.
 
 ## Troubleshoot safely
 
