@@ -19,6 +19,11 @@ single prepared record will remain a single internal chunk. Its page-aware
 contract is instead based on the identities and provenance of the records it
 submits and later confirms.
 
+The assistant's **Advanced** tab is outside this Desktop boundary. It runs a
+single-PDF local diagnostic preparation workflow and does not submit a
+document, create a workspace, or alter provider configuration. Do not use an
+Advanced diagnostic result as a claim that AnythingLLM has indexed the PDF.
+
 ## Page-parent identity contract
 
 For ordinary page-preserving operation, the assistant produces records tied to
@@ -117,6 +122,13 @@ The assistant does not overwrite or delete existing AnythingLLM workspaces.
 For upload runs, choose an existing workspace or explicitly request a new
 workspace for the document. A new workspace is created only after run
 confirmation.
+
+The direct-file and folder pickers can both contribute valid files to one
+pending Automatic batch. This is a selection convenience only; each source is
+still prepared and evidenced separately. Clear an unwanted picker selection
+before confirmation. Folder traversal is bounded, skips directory symlinks,
+and reports local files/folders inspected rather than claiming that count is a
+number of PDFs or vectors.
 
 ## Optional Desktop refresh bridge
 

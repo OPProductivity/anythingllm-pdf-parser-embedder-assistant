@@ -18,6 +18,22 @@ The app can make one bounded attempt to start a local Desktop runtime when
 needed. It does not change your embedding-provider settings or silently repair
 an ambiguous Desktop queue.
 
+### Local app availability and browser restarts
+
+The browser tab is only a view of the local app. If the **Stop AnythingLLM PDF
+Assistant** shortcut was used, the existing tab cannot begin a new upload or
+run. Start the app again with the matching Start shortcut, then refresh the
+tab if it does not reconnect by itself. A red connection notice means the
+browser cannot currently reach the localhost app; it does **not** mean that
+AnythingLLM Desktop documents were deleted or changed.
+
+The app probes its local server cautiously so one delayed browser request does
+not immediately look like an outage. A temporary reconnecting notice can occur
+while Gradio replaces UI components or while a long action is handed to the
+server. Wait for the green restoration notice or refresh the page before
+starting another run. Never assume an old browser tab has a live server merely
+because its form controls are still visible.
+
 ## Choose files
 
 You can use either picker in the Automatic tab.
@@ -45,11 +61,23 @@ folder path, manifest, selected PDFs, choices, and status. If the folder has
 no readable PDFs, the chooser remains available so you can select a different
 root immediately.
 
+The two pickers describe the same pending Automatic batch. If both currently
+contain files, the assistant treats the valid direct-file selection and the
+checked folder selection as one batch. Use **Clear batch** or the ordinary
+picker's clear control before confirming if that is not what you intend. The
+app never deletes source files from either picker.
+
 On a browser reload or localhost restart, batch-folder scan state is cleared
 intentionally. An old folder scan must not be treated as a fresh current
 selection. If you had a batch prepared, choose the folder again. This rule is
 stricter than the same-session reuse action because a scan result is local,
 time-sensitive evidence.
+
+Choosing a new folder or cancelling a folder chooser clears an incomplete
+previous folder-scan state. If an earlier scan was interrupted by a restart,
+select the folder again instead of relying on a visible old count. Folder scans
+skip directory symlinks and stop at the displayed interactive PDF safety limit;
+choose a narrower folder when a large library is truncated.
 
 ## Choose the output mode
 
@@ -112,6 +140,13 @@ Desktop queue evidence materially changes. A reconnecting or quiet SSE
 observer is useful diagnostic information, but does not by itself prove the
 upload failed.
 
+For a multi-PDF run, the UI also keeps a separate monotonic completed-document
+count. The current document's Desktop reconciliation counter can restart from
+zero when the pipeline moves to the next PDF; that is a per-document evidence
+counter, not a claim that already completed PDFs were lost. Read the completed
+batch count for whole-batch progress and the queue/vector line for the current
+document's evidence.
+
 ## What “ready” means
 
 The assistant distinguishes four evidence layers:
@@ -147,6 +182,19 @@ The app deliberately avoids broad workspace audits as an ordinary success
 blocker. Those audits, manual chat/citation probes, and optional retrieval
 checks are diagnostics when something needs investigation.
 
+## Advanced diagnostic runs
+
+The **Advanced** tab is a local, single-PDF diagnostic tool. It offers direct
+control over the extraction backend, OCR/deep extraction choices, matter
+inclusion, page boundaries, segmentation, validation phrases, and evidence
+retention. Use it to inspect a difficult source before choosing ordinary
+Automatic upload settings.
+
+An Advanced diagnostic run does not upload to AnythingLLM, mutate an
+AnythingLLM workspace, or save a new Automatic default profile. Its output is
+kept under the Advanced diagnostic output root selected in that tab. It is not
+a recovery or retry mechanism for an already submitted Automatic run.
+
 ## Safe troubleshooting
 
 - Use `anythingllm-pdf-assistant doctor` for startup/path diagnostics.
@@ -156,5 +204,8 @@ checks are diagnostics when something needs investigation.
   the count is traversal work, not selected PDFs.
 - If the local page reconnects after a server restart, reselect a batch folder
   rather than relying on a previously displayed batch result.
+- If the output root is deeply nested, choose a shorter folder before
+  processing. Generated run and export paths must remain within the app's
+  Windows-compatible 250-character limit.
 - Do not post provider keys, local PDF contents, absolute paths, AnythingLLM
   storage archives, or raw run timelines in issues.

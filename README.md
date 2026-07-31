@@ -69,6 +69,9 @@ and the configured embedding provider.
   picker. This starts a fresh setup pass; it never silently resumes an old run.
 - Use light, dark, or Windows-following appearance settings and launch the
   application from Windows desktop shortcuts after installation.
+- Use the **Advanced** tab for a one-PDF local diagnostic preparation run when
+  you need to isolate extraction, segmentation, or metadata behavior before an
+  ordinary upload. It is not a second upload workflow.
 - Optionally use the Desktop refresh bridge when a validated installation of
   that bridge is appropriate for the local AnythingLLM version.
 
@@ -253,6 +256,11 @@ then `anythingllm-pdf-assistant shortcuts repair`.
    runs, distinguish local preparation, document storage, exact vector
    confirmation, and optional retrieval evidence in the run report.
 
+The **Advanced** tab is deliberately separate from ordinary processing. It
+accepts one readable PDF and creates a local diagnostic result with explicit
+extraction and segmentation controls. It does not upload to AnythingLLM, edit
+Automatic defaults, resume an Automatic run, or alter an existing workspace.
+
 For a detailed walkthrough, including batch scan counts, reuse behavior,
 Custom Range semantics, and the meaning of each completion state, see
 [docs/USAGE.md](docs/USAGE.md). For Desktop-specific safety and verification
@@ -310,6 +318,9 @@ using the bridge or relying on a workspace for citations.
   `%LOCALAPPDATA%\AnythingLLM PDF Parser Embedder Assistant` by default.
 - Set `ANYTHINGLLM_PDF_ASSISTANT_HOME` before launching to use another writable
   location, including a portable drive.
+- Windows-compatible generated paths are kept within a 250-character safety
+  limit. If the chosen output root is already very long, select a shorter root
+  before processing; the app will not create an over-limit run path.
 - Your PDFs remain local unless you choose AnythingLLM upload. Your configured
   AnythingLLM embedding provider may send text to the provider you selected;
   check that provider's policy before uploading sensitive material.
