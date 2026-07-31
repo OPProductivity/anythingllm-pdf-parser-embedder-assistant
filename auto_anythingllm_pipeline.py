@@ -16339,6 +16339,11 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         if upload_representation == "page_parents"
         else "segment vectors"
     )
+    upload_record_label = (
+        "page-parent files"
+        if upload_representation == "page_parents"
+        else "segment files"
+    )
 
     def verify_embedding_batch(batch_report):
         """Reconcile a batch through attachment first, then vector evidence.
@@ -16628,18 +16633,18 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 if queue_current and cached_records >= queue_current:
                     queue_detail = (
                         "Desktop queue: reusing cached embeddings and writing "
-                        f"{queue_current}/{queue_total} page-parent files; "
+                        f"{queue_current}/{queue_total} {upload_record_label}; "
                         f"{queue_completed}/{queue_total} completed. "
                     )
                 elif cached_records:
                     queue_detail = (
-                        f"Desktop queue: embedding {queue_current}/{queue_total} page-parent files "
+                        f"Desktop queue: embedding {queue_current}/{queue_total} {upload_record_label} "
                         f"({cached_records} using cached embeddings); "
                         f"{queue_completed}/{queue_total} completed. "
                     )
                 else:
                     queue_detail = (
-                        f"Desktop queue: embedding {queue_current}/{queue_total} page-parent files; "
+                        f"Desktop queue: embedding {queue_current}/{queue_total} {upload_record_label}; "
                         f"{queue_completed}/{queue_total} completed. "
                     )
             else:

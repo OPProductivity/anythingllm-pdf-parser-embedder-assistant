@@ -4992,7 +4992,7 @@ if INITIAL_SIMULATION_DISCOVERY_STATUS:
 def initial_automatic_section_state():
     """Open core preparation/upload choices while keeping secondary tools collapsed."""
     return [
-        gr.update(open=False),
+        gr.update(open=True),
         gr.update(open=True),
         gr.update(open=True),
         gr.update(open=False),
@@ -6069,6 +6069,46 @@ def append_ingestion_history(
     except (OSError, TypeError, ValueError) as exc:
         APP_LOGGER.warning("could not append ingestion history: %s", exc)
     return record
+
+
+FAILED_PREPARATION_MARKER_DIRECTORY = "_Run failed to create parsed files"
+
+
+def run_has_prepared_text_or_segments(out_dir, summary=None):
+    """Return whether a failed document left a usable local preparation behind."""
+    root = Path(out_dir)
+    report = summary if isinstance(summary, dict) else {}
+    upload_file = Path(str(report.get("upload_file") or ""))
+    try:
+        segment_count = int(report.get("segments") or 0)
+    except (TypeError, ValueError):
+        segment_count = 0
+    if upload_file.is_file() or segment_count > 0:
+        return True
+    if not root.is_dir():
+        return False
+    return any(root.glob("*-pdf-parsed.txt")) or any(root.glob("*-p[0-9][0-9][0-9]-s*.txt"))
+
+
+def write_failed_preparation_marker(run_root, out_dir, pdf_path, exc, summary=None):
+    """Make failures with no usable prepared output obvious at the run root."""
+    if run_has_prepared_text_or_segments(out_dir, summary):
+        return None
+    marker = Path(run_root) / FAILED_PREPARATION_MARKER_DIRECTORY
+    marker.mkdir(parents=True, exist_ok=True)
+    source_name = Path(pdf_path).name
+    source_id = hashlib.sha256(source_name.encode("utf-8")).hexdigest()[:12]
+    _write_automatic_run_json(
+        marker / f"failed-document-{source_id}.json",
+        {
+            "status": "failed_before_prepared_output",
+            "source_filename": source_name,
+            "document_output_folder": str(out_dir),
+            "failure_report": str(Path(out_dir) / "diagnostics.html"),
+            "error": str(exc),
+        },
+    )
+    return marker
 
 
 def ingestion_history_html(workspace_slug="", limit=12):
@@ -12780,10 +12820,8 @@ def estimate_automatic_run(
         backend_mode=backend_mode, unstructured_strategy=unstructured_strategy,
         native_upload_transport=timing_native_upload_transport(mode, api_url),
         native_upload_representation=(
-            "page_parents"
-            if mode == MODE_NATIVE_UPLOAD_LABEL
-            and is_page_preserving_segment_mode(segment_mode)
-            else "segments"
+            native_upload_representation_for_segment_mode(segment_mode)
+            if mode == MODE_NATIVE_UPLOAD_LABEL else "segments"
         ),
         simulation_engine=simulation_engine,
         simulation_model=simulation_model,
@@ -14788,6 +14826,16 @@ def pipeline_segment_mode(segment_mode_value):
     return "passages"
 
 
+def native_upload_representation_for_segment_mode(segment_mode_value):
+    """Select the upload record that preserves the local source-range contract."""
+    mode = str(segment_mode_value or "").casefold()
+    if mode in {"page_limit", "custom_page_ranges"}:
+        return "page_parents"
+    if is_page_preserving_segment_mode(mode) or is_custom_page_range_segment_mode(mode):
+        return "page_parents"
+    return "segments"
+
+
 
 
 def extraction_backend_help(choice):
@@ -16482,16 +16530,11 @@ def run_automatic(
             native_metadata_upload_mode=(
                 "strict" if native_metadata_mode == "Strict metadata only" else "native_header"
             ),
-            # Page-bounded subchunks are retained in the local manifest, but
-            # sending each ~300-character child as an independent AnythingLLM
-            # document creates hundreds of one-chunk provider requests. Upload
-            # one page parent instead: its native metadata keeps the exact PDF
-            # page and its child map retains the original subchunk ranges for
-            # audit/recovery, while AnythingLLM can batch its own internal
-            # chunks efficiently.
-            native_upload_representation=(
-                "page_parents" if resolved_segment_mode == "page_limit" else "segments"
-            ),
+            # Page-preserving and Custom Range records retain their child map
+            # locally. Upload their page/range parent instead of each child so
+            # AnythingLLM receives the submitted contiguous source span as one
+            # record, while it may still split internally for retrieval.
+            native_upload_representation=native_upload_representation_for_segment_mode(resolved_segment_mode),
             anythingllm_create_document_folders=bool(anythingllm_create_document_folders),
             anythingllm_document_folder_name=(anythingllm_document_folder_name or "").strip(),
             anythingllm_storage_dir="",
@@ -16816,6 +16859,14 @@ def run_automatic(
                 summary["app_error_message"] = str(exc)
                 summary["app_error_next_steps"] = classified_error["next_steps"]
                 summary["automatic_recovery_scheduled"] = recovery_scheduled
+                try:
+                    failure_marker = write_failed_preparation_marker(
+                        run_root, out_dir, pdf_path, exc, summary,
+                    )
+                    if failure_marker:
+                        summary["failed_preparation_marker"] = str(failure_marker)
+                except OSError as marker_exc:
+                    APP_LOGGER.warning("could not write failed-preparation marker: %s", marker_exc)
             except Exception as failure_exc:
                 return automatic_error_outputs(
                     "AUTO-PIPELINE-002",
@@ -17606,7 +17657,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                                 elem_classes=["clear-selected-files-button"],
                             )
                     auto_folder_status = gr.HTML(value="", visible=False, elem_classes=["batch-folder-status"])
-            with gr.Accordion("Document metadata", open=False, elem_classes=["top-level-accordion"]) as document_metadata_section:
+            with gr.Accordion("Document metadata", open=True, elem_classes=["top-level-accordion"]) as document_metadata_section:
                 auto_label = gr.Textbox(
                     label="Document title",
                     placeholder="Filled from PDF metadata when available; edit if needed",
@@ -17623,11 +17674,10 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     value=True,
                     label="Use the file title as a fallback",
                 )
-                # Opening this parent after a new file is detected exposes
-                # only the three editable identity controls. The potentially
-                # long technical report stays opt-in below.
+                # The editable title/author controls are available immediately;
+                # the potentially long technical report stays opt-in below.
                 with gr.Accordion(
-                    "Citation label and detected PDF metadata",
+                    "Detected Metadata",
                     open=False,
                     elem_classes=["document-metadata-details"],
                 ):

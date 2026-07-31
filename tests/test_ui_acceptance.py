@@ -298,8 +298,13 @@ def test_fresh_page_shows_both_actions_disabled(page, local_app_url):
 def test_file_selection_opens_identity_fields_but_keeps_technical_metadata_collapsed(
     page, local_app_url, one_page_pdf
 ):
-    """A new file should invite metadata editing without expanding the long report."""
+    """Identity fields start open while the long detected-metadata report stays folded."""
     page.goto(local_app_url)
+    expect(page.get_by_label("Document title", exact=True)).to_be_visible()
+    details = page.get_by_role("button", name="Detected Metadata ▼")
+    expect(details).to_be_visible()
+    expect(page.get_by_label("Short citation label", exact=True)).to_be_hidden()
+
     upload = page.locator(".pdf-upload-input input[type='file']")
     expect(upload).to_have_count(1)
     upload.set_input_files(str(one_page_pdf))
@@ -308,8 +313,6 @@ def test_file_selection_opens_identity_fields_but_keeps_technical_metadata_colla
     expect(page.get_by_label("Author", exact=True)).to_be_visible()
     expect(page.get_by_role("checkbox", name="Use the file title as a fallback")).to_be_visible()
 
-    details = page.get_by_role("button", name="Citation label and detected PDF metadata ▼")
-    expect(details).to_be_visible()
     expect(page.get_by_label("Short citation label", exact=True)).to_be_hidden()
     expect(page.get_by_role("button", name="Refresh detected PDF metadata")).to_be_hidden()
 

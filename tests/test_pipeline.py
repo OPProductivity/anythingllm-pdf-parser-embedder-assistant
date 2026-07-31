@@ -8631,6 +8631,14 @@ class PipelineCoreTests(unittest.TestCase):
         import rag_pdf_gradio_app as app
 
         self.assertEqual(app.pipeline_segment_mode(app.SEGMENT_CUSTOM_PAGE_RANGE_LABEL), "custom_page_ranges")
+        self.assertEqual(
+            app.native_upload_representation_for_segment_mode(app.SEGMENT_CUSTOM_PAGE_RANGE_LABEL),
+            "page_parents",
+        )
+        self.assertEqual(
+            app.native_upload_representation_for_segment_mode("custom_page_ranges"),
+            "page_parents",
+        )
         self.assertTrue(app.custom_page_group_sizes_control_update(app.SEGMENT_CUSTOM_PAGE_RANGE_LABEL)["visible"])
         self.assertFalse(app.custom_page_group_sizes_control_update(app.SEGMENT_PAGE_LIMIT_LABEL)["visible"])
         custom_plan = app.target_passage_sizing_plan(
@@ -8651,6 +8659,30 @@ class PipelineCoreTests(unittest.TestCase):
             custom_page_group_sizes="30",
         )
         self.assertEqual(features["estimated_records"], 2)
+
+    def test_failed_preparation_marker_is_created_only_without_prepared_output(self):
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            document_dir = root / "document"
+            document_dir.mkdir()
+            marker = app.write_failed_preparation_marker(
+                root, document_dir, "example.pdf", RuntimeError("preflight failed"), {"segments": 0},
+            )
+            self.assertEqual(marker, root / app.FAILED_PREPARATION_MARKER_DIRECTORY)
+            detail_files = list(marker.glob("failed-document-*.json"))
+            self.assertEqual(len(detail_files), 1)
+            self.assertEqual(
+                json.loads(detail_files[0].read_text(encoding="utf-8"))["status"],
+                "failed_before_prepared_output",
+            )
+            (document_dir / "example-pdf-parsed.txt").write_text("Prepared text", encoding="utf-8")
+            self.assertIsNone(
+                app.write_failed_preparation_marker(
+                    root, document_dir, "example.pdf", RuntimeError("upload failed"), {"segments": 0},
+                )
+            )
 
     def test_inherited_target_length_follows_mode_and_uses_conservative_embedder_guard(self):
         import rag_pdf_gradio_app as app
