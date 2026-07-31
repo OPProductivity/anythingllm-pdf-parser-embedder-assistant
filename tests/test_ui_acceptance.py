@@ -95,6 +95,20 @@ def one_page_pdf(tmp_path: Path) -> Path:
     return path
 
 
+@pytest.fixture
+def two_pdf_files(tmp_path: Path) -> list[Path]:
+    paths = [tmp_path / "browser-first.pdf", tmp_path / "browser-second.pdf"]
+    for index, path in enumerate(paths, start=1):
+        document = fitz.open()
+        try:
+            page = document.new_page()
+            page.insert_text((72, 72), f"Browser multi-file acceptance PDF {index}.")
+            document.save(path)
+        finally:
+            document.close()
+    return paths
+
+
 def test_fresh_file_selection_never_displays_prior_success(page, local_app_url, one_page_pdf):
     page.goto(local_app_url)
     expect(page.get_by_text("Processing successful", exact=False)).to_have_count(0)
@@ -204,6 +218,66 @@ def test_selected_pdf_exposes_one_confirm_action_and_safe_prestart_cancel(page, 
     expect(page.get_by_text("Ready — Confirm to begin processing.")).to_be_visible()
     expect(page.get_by_text("Processing successful", exact=False)).to_have_count(0)
     expect(page.get_by_text("Overall progress: 100%", exact=False)).to_have_count(0)
+
+
+def test_multiple_pdf_selection_keeps_both_files_in_the_pending_batch(page, local_app_url, two_pdf_files):
+    page.goto(local_app_url)
+    upload = page.locator(".pdf-upload-input input[type='file']")
+    expect(upload).to_have_count(1)
+    upload.set_input_files([str(path) for path in two_pdf_files])
+
+    confirm = page.get_by_role("button", name="Confirm and start processing")
+    expect(confirm).to_be_enabled(timeout=15000)
+    expect(page.get_by_role("button", name="Remove this file")).to_have_count(2)
+
+
+def test_selected_pdf_reuse_action_has_an_icon_not_an_empty_square(page, local_app_url, one_page_pdf):
+    """The selected-file controls retain distinct, meaningful compact glyphs."""
+    page.goto(local_app_url)
+    reuse_actions = page.locator('.pdf-upload-input button[aria-label="Use selected files again"]')
+    expect(reuse_actions).to_be_hidden()
+
+    page.locator(".pdf-upload-input input[type='file']").set_input_files(str(one_page_pdf))
+
+    visible_reuse_action = page.locator(
+        '.pdf-upload-input button[aria-label="Use selected files again"]:visible'
+    )
+    expect(visible_reuse_action).not_to_have_count(0, timeout=15000)
+    visible_icon_styles = visible_reuse_action.evaluate_all(
+        "buttons => buttons.map(button => getComputedStyle(button, '::after').backgroundImage)"
+    )
+    assert visible_icon_styles and all("M3 12a9" in style for style in visible_icon_styles)
+    visible_upload_action = page.locator(
+        '.pdf-upload-input button[aria-label="common.upload"]:visible'
+    )
+    visible_upload_icon_styles = visible_upload_action.evaluate_all(
+        "buttons => buttons.map(button => getComputedStyle(button, '::after').backgroundImage)"
+    )
+    assert visible_upload_icon_styles and all("M12 19V5" in style for style in visible_upload_icon_styles)
+    with page.expect_file_chooser(timeout=10000) as chooser_info:
+        visible_upload_action.click()
+    chooser_info.value
+    action_orders = page.locator(".pdf-upload-input .icon-button-wrapper.top-panel").evaluate_all(
+        "hosts => hosts.map(host => Array.from(host.querySelectorAll(':scope > button'))"
+        ".filter(button => getComputedStyle(button).display !== 'none')"
+        ".map(button => button.getAttribute('aria-label'))).filter(order => order.length >= 3)"
+    )
+    assert ["common.upload", "Clear", "Use selected files again"] in action_orders
+    action_layouts = page.locator(".pdf-upload-input .icon-button-wrapper.top-panel").evaluate_all(
+        "hosts => hosts.map(host => Array.from(host.querySelectorAll(':scope > button'))"
+        ".filter(button => getComputedStyle(button).display !== 'none')"
+        ".map(button => { const box = button.getBoundingClientRect(); return { label: button.getAttribute('aria-label'), left: box.left, right: box.right, width: box.width }; }))"
+        ".filter(layout => layout.length >= 3)"
+    )
+    matching_layout = next(
+        layout
+        for layout in action_layouts
+        if [item["label"] for item in layout]
+        == ["common.upload", "Clear", "Use selected files again"]
+    )
+    assert matching_layout[0]["width"] >= 18
+    assert matching_layout[0]["right"] <= matching_layout[1]["left"]
+    assert matching_layout[1]["right"] <= matching_layout[2]["left"]
 
 
 def test_fresh_page_shows_both_actions_disabled(page, local_app_url):

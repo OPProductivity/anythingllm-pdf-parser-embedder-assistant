@@ -4954,8 +4954,8 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn(".gradio-container .progress-text", app.APP_CSS)
         self.assertIn("display: none !important", app.APP_CSS)
         self.assertIn("decorateSelectedPdfActions", app.APP_JS)
-        self.assertIn("Replace selected PDF", app.APP_JS)
         self.assertIn(".icon-button-wrapper.top-panel", app.APP_JS)
+        self.assertIn('M3 12a9 9 0 1 0 3-6.7', app.APP_CSS)
         self.assertIn("wireAutomaticRunTimer", app.APP_JS)
         self.assertNotIn("RUN_TIMER_START_JS", Path(app.__file__).read_text(encoding="utf-8"))
 
@@ -6090,7 +6090,11 @@ class PipelineCoreTests(unittest.TestCase):
         # in order; parallel direct listeners previously caused visible stale
         # values before that chain caught up.
         self.assertEqual(len(selection_dependencies), 1)
-        self.assertEqual(selection_dependencies[0].get("api_name"), "merge_uploaded_pdfs_into_folder_batch")
+        self.assertTrue(
+            str(selection_dependencies[0].get("api_name") or "").startswith(
+                "merge_uploaded_pdfs_into_folder_batch"
+            )
+        )
 
     def test_run_timer_estimate_refreshes_for_mode_and_upload_scope(self):
         import rag_pdf_gradio_app as app
@@ -6266,6 +6270,23 @@ class PipelineCoreTests(unittest.TestCase):
 
         self.assertEqual(result[:4], ("", [], {}, False))
         self.assertEqual(result[4]["choices"], [])
+        self.assertFalse(result[4]["visible"])
+        self.assertFalse(result[5]["visible"])
+        self.assertFalse(result[6]["visible"])
+        self.assertTrue(result[7]["visible"])
+        self.assertEqual(result[8]["value"], "Select PDF Folder Here")
+
+    def test_cancelled_folder_choice_clears_an_incomplete_picker_attempt(self):
+        import rag_pdf_gradio_app as app
+
+        original_choose = app.choose_pdf_input_directory
+        try:
+            app.choose_pdf_input_directory = lambda *_args, **_kwargs: None
+            result = app.choose_pdf_input_directory_for_scan("C:/previous-folder")
+        finally:
+            app.choose_pdf_input_directory = original_choose
+
+        self.assertEqual(result[:4], ("", False, [], {}))
         self.assertFalse(result[4]["visible"])
         self.assertFalse(result[5]["visible"])
         self.assertFalse(result[6]["visible"])

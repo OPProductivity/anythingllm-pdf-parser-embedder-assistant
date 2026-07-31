@@ -303,7 +303,7 @@ ANYTHINGLLM_EMBEDDER_ENGINE_CHOICES = [
     "lemonade",
 ]
 APP_ICON = package_resource_path("assets/anythingllm-pdf-assistant-start.ico")
-UPLOAD_SELECTED_FILES_ICON = package_resource_path("assets/upload-selected-files.svg")
+REUSE_SELECTED_FILES_ICON = package_resource_path("assets/upload-selected-files.svg")
 APP_THEME = gr.themes.Soft(primary_hue="blue", neutral_hue="slate")
 LAST_SIMULATION_DIAGNOSTICS = {}
 LAST_TIMING_ESTIMATE = {}
@@ -1010,16 +1010,10 @@ APP_JS = """
   }, 0);
   const simulationRefreshCooldownMs = 1500;
 
-  // Gradio 6 separates a selected file's filename/size table from its
-  // upper-right action container. Add an explicit replacement button to that
-  // real top-right container instead of guessing that the file row contains
-  // two actions. The native clear/X control remains beside it.
-  const selectedPdfUploadGlyph = `
-    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-      <path d="M12 16V3"></path>
-      <path d="m7 8 5-5 5 5"></path>
-      <path d="M4 15v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4"></path>
-    </svg>`;
+  // Gradio 6 keeps selected-file actions in a separate top-right container.
+  // Its native upload and clear actions already occupy that container; this
+  // helper only controls the app's additional "use selected files again"
+  // action so it cannot survive with stale browser state after a restart.
   const decorateSelectedPdfActions = () => {
     for (const uploadRoot of document.querySelectorAll(".pdf-upload-input")) {
       const filePreview = uploadRoot.querySelector(".file-preview");
@@ -1035,37 +1029,6 @@ APP_JS = """
           "important"
         );
       }
-      if (!filePreview || !actionHost || actionHost.querySelector(".rag-selected-file-replace")) continue;
-      const clearButton = [...actionHost.querySelectorAll("button")].find((button) =>
-        !button.classList.contains("rag-selected-file-replace")
-      );
-      if (!clearButton) continue;
-      const replaceButton = document.createElement("button");
-      replaceButton.type = "button";
-      replaceButton.className = "rag-selected-file-replace";
-      replaceButton.setAttribute("aria-label", "Replace selected PDF");
-      replaceButton.setAttribute("title", "Replace selected PDF");
-      replaceButton.innerHTML = selectedPdfUploadGlyph;
-      replaceButton.addEventListener("click", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        clearButton.click();
-        // Clearing re-renders the normal uploader synchronously in Gradio.
-        // Try the next frames as well so slower page updates still open its
-        // native file picker without leaving the app in an ambiguous state.
-        let attempts = 0;
-        const openNativePicker = () => {
-          const uploadButton = uploadRoot.querySelector('button[aria-label="Click to upload or drop files"]');
-          if (uploadButton) {
-            uploadButton.click();
-            return;
-          }
-          attempts += 1;
-          if (attempts < 4) requestAnimationFrame(openNativePicker);
-        };
-        requestAnimationFrame(openNativePicker);
-      });
-      actionHost.insertBefore(replaceButton, clearButton);
     }
   };
   decorateSelectedPdfActions();
@@ -2844,12 +2807,30 @@ body.dark .batch-folder-inline-notice {
 #advanced-pdf-upload button[aria-label="Click to upload or drop files"] .wrap .or {
     display: none !important;
 }
-/* APP_JS inserts a real replacement action into Gradio's selected-file
-   top-right action container. This avoids relying on a missing stock glyph or
-   an inferred sibling relationship in the filename table. */
+/* Keep the app's retry action compact beside Gradio's native upload and clear
+   actions. Gradio owns the order and behavior of its two native controls. */
 .pdf-upload-input .icon-button-wrapper.top-panel {
     align-items: center !important;
     gap: 3px !important;
+}
+/* Gradio's compact File upload action currently renders as an empty circle in
+   this header. Keep its native upload behavior, but give that action the
+   familiar upward arrow glyph so it is distinguishable from Clear and Retry. */
+.pdf-upload-input button[aria-label="common.upload"] > * {
+    /* This descendant owns Gradio's native file-picker click. It must remain
+       interactive; opacity hides its glyph without suppressing that action. */
+    opacity: 0 !important;
+}
+.pdf-upload-input button[aria-label="common.upload"]::after {
+    content: "";
+    display: block !important;
+    position: absolute !important;
+    inset: 0 !important;
+    width: 14px !important;
+    height: 14px !important;
+    margin: auto !important;
+    pointer-events: none !important;
+    background: center / contain no-repeat url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%232563eb' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 19V5'/%3E%3Cpath d='m6 11 6-6 6 6'/%3E%3C/svg%3E") !important;
 }
 .pdf-upload-input button[aria-label="Use selected files again"].custom-button {
     display: inline-flex !important;
@@ -2865,45 +2846,25 @@ body.dark .batch-folder-inline-notice {
 .pdf-upload-input button[aria-label="Use selected files again"] .custom-button-label {
     display: none !important;
 }
-.pdf-upload-input button[aria-label="Use selected files again"] img {
+.pdf-upload-input button[aria-label="Use selected files again"]::after {
+    content: "";
     display: block !important;
     width: 14px !important;
     height: 14px !important;
     margin: 0 !important;
+    background: center / contain no-repeat url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%232563eb' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 12a9 9 0 1 0 3-6.7'/%3E%3Cpath d='M3 4v5h5'/%3E%3C/svg%3E") !important;
 }
-.pdf-upload-input button.rag-selected-file-replace {
-    display: inline-flex !important;
-    align-items: center !important;
-    justify-content: center !important;
-    width: 24px !important;
-    height: 24px !important;
-    min-width: 24px !important;
-    min-height: 24px !important;
-    padding: 0 !important;
-    border: 1px solid #93c5fd !important;
-    border-radius: 4px !important;
-    background: #eff6ff !important;
-    color: #2563eb !important;
-    opacity: 1 !important;
+/* Cover the short initial render before APP_JS observes the picker. */
+.pdf-upload-input:not(:has(.file-preview)) button[aria-label="Use selected files again"] {
+    display: none !important;
 }
-.pdf-upload-input button.rag-selected-file-replace svg {
-    display: block !important;
-    width: 14px !important;
-    height: 14px !important;
-    margin: 0 !important;
-    overflow: visible !important;
-    fill: none !important;
-    stroke: currentColor !important;
-    stroke-width: 2 !important;
-    stroke-linecap: round !important;
-    stroke-linejoin: round !important;
-    opacity: 1 !important;
+gradio-app.dark .pdf-upload-input button[aria-label="Use selected files again"]::after,
+.dark .pdf-upload-input button[aria-label="Use selected files again"]::after {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23bfdbfe' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 12a9 9 0 1 0 3-6.7'/%3E%3Cpath d='M3 4v5h5'/%3E%3C/svg%3E") !important;
 }
-gradio-app.dark .pdf-upload-input button.rag-selected-file-replace,
-.dark .pdf-upload-input button.rag-selected-file-replace {
-    border-color: #60a5fa !important;
-    background: #172554 !important;
-    color: #bfdbfe !important;
+gradio-app.dark .pdf-upload-input button[aria-label="common.upload"]::after,
+.dark .pdf-upload-input button[aria-label="common.upload"]::after {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23bfdbfe' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 19V5'/%3E%3Cpath d='m6 11 6-6 6 6'/%3E%3C/svg%3E") !important;
 }
 .copy-storage-path-button {
     margin-left: 8px;
@@ -7966,6 +7927,7 @@ def merge_uploaded_pdfs_into_folder_batch(pdf_files=None, folder_manifest=None):
     if not direct_paths or not folder_paths:
         return (
             gr.update(), [], manifest, gr.update(), gr.update(), gr.update(),
+            gr.update(visible=bool(direct_paths)),
         )
 
     candidates = list(dict.fromkeys([*folder_paths, *direct_paths]))
@@ -7991,6 +7953,9 @@ def merge_uploaded_pdfs_into_folder_batch(pdf_files=None, folder_manifest=None):
         ),
         gr.update(visible=True),
         gr.update(value=batch_folder_selected_status_html(manifest, selected), visible=True),
+        # Direct paths have moved into the folder-batch selector, so its
+        # dedicated retry control must not survive as an empty header action.
+        gr.update(visible=False),
     )
 
 
@@ -17495,7 +17460,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 "Use selected files again",
                 variant="secondary",
                 size="sm",
-                icon=UPLOAD_SELECTED_FILES_ICON,
+                icon=REUSE_SELECTED_FILES_ICON,
                 visible=False,
                 elem_id="retry-selected-pdf-files",
                 elem_classes=["retry-selected-files-button"],
@@ -18672,13 +18637,6 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 show_progress="hidden",
                 queue=False,
             )
-            auto_pdfs.change(
-                fn=selected_pdf_files_retry_button_update,
-                inputs=[auto_pdfs],
-                outputs=[retry_selected_pdf_files_button],
-                show_progress="hidden",
-                queue=False,
-            )
             retry_selected_pdf_files_button.click(
                 fn=reuse_selected_pdf_files,
                 inputs=[auto_pdfs],
@@ -18695,6 +18653,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     auto_folder_file_selector,
                     batch_folder_selection_panel,
                     auto_folder_status,
+                    retry_selected_pdf_files_button,
                 ],
                 show_progress="minimal",
                 queue=True,
