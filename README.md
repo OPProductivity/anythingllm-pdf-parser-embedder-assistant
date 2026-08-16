@@ -99,7 +99,7 @@ workflow; labels, layouts, and progress values can differ between versions.
 ## Important limits
 
 - This is Windows software for a locally running AnythingLLM Desktop instance.
-- The assistant automatically parses and embeds PDF files only in workspaces that you select (no EPUB)
+- The assistant automatically parses and embeds PDF files in workspaces that you select (no EPUB or MOBI support available)
 - Your configured embedding provider—not this README—determines provider cost,
   privacy, availability, and much of the upload duration.
 - AnythingLLM owns the global embedding queue and may re-split submitted text.
@@ -112,10 +112,8 @@ workflow; labels, layouts, and progress values can differ between versions.
 
 ## Privacy and local data
 
-PDF extraction, OCR decisions, segmentation, local artifacts, and this app's
-own run reports remain on the machine. Upload mode submits prepared text to
-AnythingLLM Desktop, whose configured embedding provider may be local or
-cloud-hosted. Review that provider's policy before processing sensitive text.
+PDF extraction, OCR text, file segments, metadata remains local only. Whenever you let the assistant upload your texts to AnythingLLM it will expose the PDF files to AI models and text embedding providers that you have selected inside AnythingLLM.
+Embedding providers OpenRouter models configured in AnythingLLM may be local or cloud-hosted. Review the respective provider's policy before processing sensitive text.
 
 By default, generated output, logs, and local configuration are kept under
 `%LOCALAPPDATA%\AnythingLLM PDF Parser Embedder Assistant`. Set
