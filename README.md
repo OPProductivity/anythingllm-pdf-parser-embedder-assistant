@@ -1,4 +1,4 @@
-# AnythingLLM PDF Parser and Embedder Assistant
+# AnythingLLM Assistant - Upload PDFs to AnythingLLM Desktop workspaces
 
 Turn PDFs into inspectable, page-aware text records for
 [AnythingLLM Desktop](https://anythingllm.com/desktop)—or keep the prepared
