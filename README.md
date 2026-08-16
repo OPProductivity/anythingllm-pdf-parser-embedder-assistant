@@ -92,9 +92,9 @@ The full historical screenshot collection is now versioned in
 a long, hard-to-navigate README gallery. Images are visual examples of the
 workflow; labels, layouts, and progress values can differ between versions.
 
-| Light Mode | Dark Mode | Time Saving |
+| Light Mode | Dark Mode |
 | --- | --- |
-| ![Automatic setup screen](docs/screenshots/01.png) | ![Dark processing screen](docs/screenshots/04.png) | x |
+| ![Automatic setup screen](docs/screenshots/01.png) | ![Dark processing screen](docs/screenshots/04.png) |
 
 ## Important limits
 
