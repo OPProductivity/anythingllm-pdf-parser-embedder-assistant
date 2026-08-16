@@ -12,7 +12,7 @@ The assistant knows when a file has been uploaded and embedded and waits for exa
 vector embeddings before calling the workspace ready. You will not even have to upload and embed
 the finished PDF file, it is automatically done for you. (Changeable in the settings).
 
-AnythingLLM Desktop for Windows is open-source software that allows you to chat with paid, free, and local LLM models and attach text files. PDF files are not directly supported and need to be converted to TXT first, uploaded and embedded to your workspace. That is where this assistant steps in and fully automizes the process.
+AnythingLLM Desktop for Windows is open-source software that allows you to chat with paid, free, and local LLM models and attach text files. PDF files are not directly supported and need to be converted to TXT first, uploaded and embedded to your workspace. That is where this assistant steps in and fully automizes the process and saves significant amounts of time.
 
 > **Beta software, built with generative AI.**
 > Although this software has been debugged and tested over months and should work as expected, test the results in your own AnythingLLM setup before relying
@@ -29,12 +29,10 @@ AnythingLLM Desktop for Windows is open-source software that allows you to chat 
 4. Open the new **Start AnythingLLM PDF Assistant** desktop shortcut, choose a
    PDF, review the settings, and select **Confirm and start processing**.
 
-You do not need Git, a repository checkout, or a pre-existing Python setup for
-the recommended installation. The installer explains any missing dependency
-and asks before offering an optional Python installation.
+You do not need a git repo, git on your pc, or install dependencies. The installer automatically explains any missing Python dependency
+and asks for confirmation before installing them during setup. You can also copy the repo and let Codex or Claude Cowork or Antigravity Desktop install inspect and install the assistant for you on your pc.
 
-For a complete installation guide, normal workflow, troubleshooting, and the
-meaning of each result, read [Detailed instructions](docs/DETAILED-INSTRUCTIONS.md).
+For a complete installation guide and explanation see [Detailed instructions](docs/DETAILED-INSTRUCTIONS.md).
 
 ## Why use it?
 
@@ -42,10 +40,10 @@ meaning of each result, read [Detailed instructions](docs/DETAILED-INSTRUCTIONS.
   extraction, selective/full OCR, or Unstructured-assisted extraction for
   difficult layouts.
 - **Preserve useful provenance.** Choose whole-page, page-preserving,
-  page-local, or contiguous Custom Range records before AnythingLLM applies
+  page-local, or custom page ranges before AnythingLLM applies
   its own internal splitter.
 - **Process a deliberate batch.** Choose individual PDFs or recursively scan a
-  folder, inspect the selected files, then confirm before any workspace change.
+  folder, inspect the selected files, then confirm which ones you want to parse and upload.
 - **Retain evidence, not just a success toast.** Local outputs and run reports
   distinguish preparation, storage, vector confirmation, and optional live
   retrieval diagnostics.
@@ -110,7 +108,7 @@ Checkout the full screenshot collection here: [docs/screenshots](docs/screenshot
 
 ## Privacy and local data
 
-PDF extraction, OCR text, file segments, metadata remains local only. Whenever you let the assistant upload your texts to AnythingLLM it will expose the PDF files to AI models and text embedding providers that you have selected inside AnythingLLM.
+PDF extraction, OCR text, file segments, metadata remains local. Whenever you let the assistant upload your texts to AnythingLLM it will expose the PDF files to AI models and text embedding providers that you have selected inside AnythingLLM.
 Embedding providers and AI models configured in AnythingLLM may be local or cloud-hosted (OpenRouter). Review the respective provider's policy before processing sensitive text.
 
 By default, generated output, logs, and local configuration are kept under
