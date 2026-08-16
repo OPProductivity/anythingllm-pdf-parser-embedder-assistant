@@ -99,6 +99,7 @@ workflow; labels, layouts, and progress values can differ between versions.
 ## Important limits
 
 - This is Windows software for a locally running AnythingLLM Desktop instance.
+- The assistant automatically parses and embeds PDF files only in workspaces that you select (no EPUB)
 - Your configured embedding provider—not this README—determines provider cost,
   privacy, availability, and much of the upload duration.
 - AnythingLLM owns the global embedding queue and may re-split submitted text.
