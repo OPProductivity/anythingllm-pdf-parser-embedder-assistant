@@ -113,7 +113,7 @@ workflow; labels, layouts, and progress values can differ between versions.
 ## Privacy and local data
 
 PDF extraction, OCR text, file segments, metadata remains local only. Whenever you let the assistant upload your texts to AnythingLLM it will expose the PDF files to AI models and text embedding providers that you have selected inside AnythingLLM.
-Embedding providers OpenRouter models configured in AnythingLLM may be local or cloud-hosted. Review the respective provider's policy before processing sensitive text.
+Embedding providers and AI models configured in AnythingLLM may be local or cloud-hosted (OpenRouter). Review the respective provider's policy before processing sensitive text.
 
 By default, generated output, logs, and local configuration are kept under
 `%LOCALAPPDATA%\AnythingLLM PDF Parser Embedder Assistant`. Set
