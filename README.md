@@ -2,19 +2,19 @@
 
 Turn PDFs into inspectable, page-aware text records for
 [AnythingLLM Desktop](https://anythingllm.com/desktop)—or keep the prepared
-files locally. The assistant is a Windows-local workflow for people who want
-more control than a direct PDF upload gives them: extraction choices, OCR
-decisions, page provenance, local output, and evidence of what reached an
-AnythingLLM workspace.
+files locally. This AnythingLLM assistant lets users upload massive PDF files and gives them: 
+extraction choices, OCR decisions, page settings, local output, and 
+AnythingLLM workspace settings and embedding settings. Parse and upload 400 page PDF documents
+to AnythingLLM Desktop (Windows 11) in 2 minutes. Parser Assistant can be operated
+with graphical user interface (no terminal commands or coding required). Install in one click.
 
-It is deliberately honest about the boundary: an accepted upload is not proof
-that an embedding provider has finished. For ordinary page-aware uploads, the
-assistant waits for exact current-run record/vector evidence before calling the
-workspace ready. See [how readiness is proved](docs/ANYTHINGLLM-INTEGRATION.md).
+The assistant knows when a file has been uploaded and embedded and waits for exact evidence of
+vector embeddings before calling the workspace ready. You will not even have to upload and embed
+the finished PDF file, it is automatically done for you. (Changeable in the settings).
 
-> **Beta software, built with iterative AI assistance.** Review generated text
-> and test with your own AnythingLLM setup before relying on it for important
-> work. This project is independent of Mintplex Labs and AnythingLLM, and is
+> **Beta software, built with generative AI.**
+> Although it should work, test the results in your own AnythingLLM setup before relying
+> on it for business critical work. This project is independent of Mintplex Labs and AnythingLLM, and is
 > provided under the MIT License without warranty.
 
 ## Start here
@@ -67,7 +67,7 @@ flowchart LR
 
 | Mode | Result |
 | --- | --- |
-| **Create local files only** | Creates a compact transcript/segment export directly in one folder named after the selected PDF, or the first and last PDF in a batch. Nothing is submitted to AnythingLLM. |
+| **Create local files only** | Creates a compact transcript/segment export directly in one folder named after the selected PDF, or the first and last PDF when processing a batch. Nothing is submitted to AnythingLLM. |
 | **Create local files with diagnostic logs** | Creates a local transcript, segments, and ordinary run evidence. The transcript and segment files sit directly in the document output folder. Nothing is submitted to AnythingLLM. |
 | **Create local files and upload to AnythingLLM** | Creates local output, with the transcript and segments directly in the document output folder, then submits prepared records to an explicitly selected existing workspace or a newly created workspace after confirmation. |
 
