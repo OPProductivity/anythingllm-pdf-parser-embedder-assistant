@@ -12,8 +12,10 @@ The assistant knows when a file has been uploaded and embedded and waits for exa
 vector embeddings before calling the workspace ready. You will not even have to upload and embed
 the finished PDF file, it is automatically done for you. (Changeable in the settings).
 
+AnythingLLM Desktop for Windows is open-source software that allows you to chat with paid, free, and local LLM models and attach text files. PDF files are not directly supported and need to be converted to TXT first, uploaded and embedded to your workspace. That is where this assistant steps in and fully automizes the process.
+
 > **Beta software, built with generative AI.**
-> Although it should work, test the results in your own AnythingLLM setup before relying
+> Although this software has been debugged and tested over months and should work as expected, test the results in your own AnythingLLM setup before relying
 > on it for business critical work. This project is independent of Mintplex Labs and AnythingLLM, and is
 > provided under the MIT License without warranty.
 
@@ -82,15 +84,11 @@ flowchart LR
 | **Custom Range** | Creates contiguous page-range records. `20` repeats 20-page groups; `20, 30, 20` repeats that sequence for each PDF. |
 
 Custom Range produces a **page-range parent identity**, such as pages 21–50.
-It preserves provenance for that range, not a promise that a downstream
-AnythingLLM citation will identify one individual page within it.
+It preserves a range while conserving original page numbers of the pfd file.
 
 ## Screenshots
 
-The full historical screenshot collection is now versioned in
-[docs/screenshots](docs/screenshots/README.md), rather than being embedded as
-a long, hard-to-navigate README gallery. Images are visual examples of the
-workflow; labels, layouts, and progress values can differ between versions.
+Checkout the full screenshot collection here: [docs/screenshots](docs/screenshots/README.md).
 
 | Light Mode | Dark Mode |
 | --- | --- |
