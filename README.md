@@ -1,4 +1,4 @@
-# AnythingLLM Assistant - Upload PDFs to AnythingLLM Desktop workspaces
+# AnythingLLM Assistant - Upload PDFs to AnythingLLM Desktop Workspaces
 
 Turn PDFs into inspectable, page-aware text records for
 [AnythingLLM Desktop](https://anythingllm.com/desktop)—or keep the prepared
