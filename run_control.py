@@ -9,6 +9,8 @@ checkpoint files; review-needed and failed runs retain the richer evidence.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import time
 import traceback
 from dataclasses import asdict, dataclass, field
@@ -37,6 +39,47 @@ TERMINAL_STAGE_STATUSES = {"success", "degraded", "blocked", "failed", "skipped"
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def atomic_write_json(path: Path, payload: dict, *, retries: int = 3) -> None:
+    """Durably replace a recovery record without ever exposing partial JSON.
+
+    Windows antivirus and file indexing can hold a just-written checkpoint for
+    a moment. Retry only that transient sharing violation; all other failures
+    remain visible to the caller and the previous checkpoint is preserved.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        attempts = max(1, int(retries or 1))
+        for attempt in range(attempts):
+            try:
+                os.replace(temporary, path)
+                temporary = None
+                return
+            except PermissionError:
+                if attempt + 1 >= attempts:
+                    raise
+                time.sleep(0.08 * (attempt + 1))
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 @dataclass
@@ -101,9 +144,11 @@ class RunRecorder:
         payload = self.result.to_dict()
         payload["event"] = event
         payload["persisted_at"] = utc_now()
-        self.checkpoint_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        atomic_write_json(self.checkpoint_path, payload)
         with self.event_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
 
     def execute(self, stage, action: Callable[[], Any], safe_retry=True):
         if stage not in MAJOR_STAGES:
@@ -148,8 +193,5 @@ class RunRecorder:
         self.result.ended_at = utc_now()
         self.result.total_elapsed_seconds = round(time.perf_counter() - self._run_started, 4)
         self.persist("run_finished")
-        (self.output_root / "run-result.json").write_text(
-            json.dumps(self.result.to_dict(), indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        atomic_write_json(self.output_root / "run-result.json", self.result.to_dict())
         return self.result

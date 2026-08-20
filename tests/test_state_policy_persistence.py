@@ -1,10 +1,11 @@
 import json
 import sqlite3
+from pathlib import Path
 
 import pytest
 
-from anythingllm_persistence import AnythingLLMPersistenceAdapter
-from anythingllm_state import resolve_state, sanitized_json
+from anythingllm_persistence import AnythingLLMPersistenceAdapter, _env_value
+from anythingllm_state import read_env_values, resolve_state, sanitized_json
 from segmentation_policy import (
     ALGORITHM_VERSION,
     UNKNOWN_MODEL_HARD_LIMIT,
@@ -118,7 +119,7 @@ def test_guarded_sqlite_write_snapshots_and_restores(tmp_path):
     adapter = AnythingLLMPersistenceAdapter(storage, "run-1", tmp_path / "snapshots")
 
     result = adapter.write_sqlite_setting("text_splitter_chunk_size", 900)
-    snapshot = json.loads((tmp_path / "snapshots" / "anythingllm-settings-snapshot-before.json").read_text())
+    snapshot = json.loads(Path(result["snapshot"]).read_text())
 
     assert result["status"] == "verified"
     assert snapshot["sqlite"]["text_splitter_chunk_size"] == "768"
@@ -151,3 +152,68 @@ def test_env_snapshot_redacts_secret_and_restore_skips_unrecoverable_secret(tmp_
     assert payload["env"]["OPENROUTER_API_KEY"]["present"] is True
     assert payload["env"]["OPENROUTER_API_KEY"]["value"] is None
     assert payload["env"]["EMBEDDING_ENGINE"]["value"] == "openrouter"
+
+
+def test_guarded_env_write_rejects_multiline_or_malformed_assignments(tmp_path):
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    create_storage(storage)
+    env_path = storage / ".env"
+    env_path.write_text("EMBEDDING_ENGINE='openrouter'\n", encoding="utf-8")
+    adapter = AnythingLLMPersistenceAdapter(storage, "run-3", tmp_path / "snapshots")
+
+    with pytest.raises(ValueError, match="Unsupported environment setting name"):
+        adapter.write_env_setting("EMBEDDING_ENGINE\nOTHER_SETTING", "ollama")
+    with pytest.raises(ValueError, match="single-line"):
+        adapter.write_env_setting("EMBEDDING_ENGINE", "ollama\nOTHER_SETTING='changed'")
+
+    assert env_path.read_text(encoding="utf-8") == "EMBEDDING_ENGINE='openrouter'\n"
+
+
+def test_guarded_env_write_round_trips_quotes_and_keeps_each_snapshot(tmp_path):
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    create_storage(storage)
+    env_path = storage / ".env"
+    env_path.write_text("EMBEDDING_ENGINE='openrouter'\n", encoding="utf-8")
+    adapter = AnythingLLMPersistenceAdapter(storage, "run-4", tmp_path / "snapshots")
+    expected = 'provider with "quotes", apostrophe\'s, and \\slashes'
+
+    first = adapter.write_env_setting("EMBEDDING_ENGINE", expected)
+    second = adapter.write_env_setting("LLM_PROVIDER", "openrouter")
+
+    written = env_path.read_text(encoding="utf-8")
+    assert _env_value(written, "EMBEDDING_ENGINE") == expected
+    assert first["snapshot"] != second["snapshot"]
+    assert Path(first["snapshot"]).is_file()
+    assert Path(second["snapshot"]).is_file()
+
+    restored = adapter.restore(first["snapshot"])
+
+    assert restored["restored"]["env"] == ["EMBEDDING_ENGINE"]
+    assert _env_value(env_path.read_text(encoding="utf-8"), "EMBEDDING_ENGINE") == "openrouter"
+
+
+def test_env_restore_removes_a_setting_that_was_absent_in_the_snapshot(tmp_path):
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    create_storage(storage)
+    env_path = storage / ".env"
+    env_path.write_text("EMBEDDING_ENGINE='openrouter'\n", encoding="utf-8")
+    adapter = AnythingLLMPersistenceAdapter(storage, "run-absent-env", tmp_path / "snapshots")
+
+    write = adapter.write_env_setting("LLM_PROVIDER", "openrouter")
+    assert _env_value(env_path.read_text(encoding="utf-8"), "LLM_PROVIDER") == "openrouter"
+
+    restored = adapter.restore(write["snapshot"])
+
+    assert "LLM_PROVIDER" in restored["restored"]["env"]
+    assert _env_value(env_path.read_text(encoding="utf-8"), "LLM_PROVIDER") is None
+
+
+def test_state_reader_decodes_json_quoted_environment_values(tmp_path):
+    expected = 'model with "quotes", apostrophe\'s, and \\slashes'
+    env_path = tmp_path / ".env"
+    env_path.write_text(f"EMBEDDING_MODEL_PREF={json.dumps(expected)}\n", encoding="utf-8")
+
+    assert read_env_values(env_path)["EMBEDDING_MODEL_PREF"] == expected

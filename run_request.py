@@ -86,7 +86,10 @@ class RunRequest:
     native_metadata_upload_mode: str = "native_header"
     native_upload_representation: str = "segments"
     native_upload_transport: str = "raw_text"
-    create_document_folders: bool = True
+    # The default mode is local-only, where native document folders are
+    # invalid intent. Native adapters explicitly opt into their established
+    # default of ``True`` when they construct an upload request.
+    create_document_folders: bool = False
     document_folder_name: str | None = None
     temporary_validation_requested: bool = False
     temporary_validation_cleanup_policy: str = "cleanup_always"
@@ -158,7 +161,14 @@ class RunRequest:
         metadata mode, transport, and upload limit). This keeps Gradio display
         strings out of the shared request contract.
         """
-        inputs = _paths(settings.get("pdf_files")) + _paths(settings.get("folder_pdf_files"))
+        # The live confirmation flow has already merged direct picker and
+        # folder-picker sources into ``files``. Retain the two older keys for
+        # direct callers and historical settings snapshots, but prefer the
+        # normalized list so this typed boundary can be enabled without
+        # rejecting every current multi-file confirmation as input-less.
+        inputs = _paths(settings.get("files")) or (
+            _paths(settings.get("pdf_files")) + _paths(settings.get("folder_pdf_files"))
+        )
         native = mode == NATIVE_UPLOAD
         inherit = bool(settings.get("inherit_anythingllm_settings"))
         return cls(

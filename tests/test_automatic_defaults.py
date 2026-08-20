@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -125,3 +126,46 @@ def test_save_failure_keeps_existing_profile_and_does_not_claim_success(tmp_path
     assert failed["status"] == "error"
     assert defaults.load_automatic_defaults(builtin_defaults, home_directory=tmp_path)["defaults"]["deep_extraction"] is False
     assert not list(defaults.automatic_defaults_path(tmp_path).parent.glob("*.tmp"))
+
+
+def test_overlapping_saves_do_not_silently_accept_the_same_revision(tmp_path, builtin_defaults, monkeypatch):
+    entered_replace = threading.Event()
+    release_replace = threading.Event()
+    replace_calls = 0
+    replace_calls_lock = threading.Lock()
+    original_replace = defaults.os.replace
+
+    def delayed_first_replace(source, destination):
+        nonlocal replace_calls
+        with replace_calls_lock:
+            replace_calls += 1
+            is_first = replace_calls == 1
+        if is_first:
+            entered_replace.set()
+            assert release_replace.wait(timeout=3)
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(defaults.os, "replace", delayed_first_replace)
+    results = []
+
+    def save(value):
+        results.append(defaults.save_automatic_defaults(
+            builtin_defaults | {"deep_extraction": value},
+            builtin_defaults,
+            expected_revision=0,
+            home_directory=tmp_path,
+        ))
+
+    first = threading.Thread(target=save, args=(True,))
+    second = threading.Thread(target=save, args=(False,))
+    first.start()
+    assert entered_replace.wait(timeout=3)
+    second.start()
+    release_replace.set()
+    first.join(timeout=3)
+    second.join(timeout=3)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert sorted(result["status"] for result in results) == ["conflict", "saved"]
+    assert defaults.load_automatic_defaults(builtin_defaults, home_directory=tmp_path)["revision"] == 1

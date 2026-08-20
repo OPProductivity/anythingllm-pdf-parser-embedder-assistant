@@ -9,7 +9,9 @@ cancel operation rather than an optimistic browser-state change.
 from __future__ import annotations
 
 import json
+import os
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -20,15 +22,37 @@ from orchestration import execute_preparation, legacy_summary_from_run
 
 
 _EVENT_WRITE_LOCK = threading.Lock()
+_RESULT_WRITE_LOCK = threading.Lock()
 
 
 def _write_json(path: Path, payload: dict) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, default=str),
-        encoding="utf-8",
-    )
-    temporary.replace(path)
+    # Windows can reject simultaneous replacements of one result path even
+    # with separate temporary files. The terminal record is tiny, so this
+    # lock avoids that race without serialising OCR or upload work.
+    with _RESULT_WRITE_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                delete=False,
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+            ) as handle:
+                temporary = Path(handle.name)
+                handle.write(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+            temporary = None
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
 
 def _emit_event(

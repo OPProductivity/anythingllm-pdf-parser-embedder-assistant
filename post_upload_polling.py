@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass, field, asdict
 from typing import Any, Callable, Collection, Literal, Mapping, Protocol, TypedDict, cast
@@ -11,6 +12,7 @@ from validation_contract import post_upload_status_class
 
 
 LOGGER = logging.getLogger(__name__)
+MINIMUM_POLL_INTERVAL_SECONDS = 0.05
 
 OperatorStatus = Literal["pass", "pass_with_review", "error", "incomplete"]
 PollingStatus = Literal["pass", "pass_with_review", "error", "timeout"]
@@ -68,10 +70,23 @@ class PollingPolicy:
         timeout_seconds: float = 60.0,
         hard_cap_seconds: float = 90.0,
     ) -> "PollingPolicy":
-        hard_cap = max(0.0, float(hard_cap_seconds))
+        def finite_nonnegative(value: float, fallback: float) -> float:
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                return fallback
+            return max(0.0, parsed) if math.isfinite(parsed) else fallback
+
+        hard_cap = finite_nonnegative(hard_cap_seconds, 90.0)
+        timeout = finite_nonnegative(timeout_seconds, 60.0)
+        interval = finite_nonnegative(interval_seconds, 2.0)
         return cls(
-            interval_seconds=max(0.0, float(interval_seconds)),
-            timeout_seconds=min(max(0.0, float(timeout_seconds)), hard_cap),
+            # An incomplete observation with a zero-second cadence previously
+            # spun against local SQLite/LanceDB until its deadline. Keep
+            # first-attempt success immediate, but yield a small bounded delay
+            # between incomplete observations.
+            interval_seconds=max(MINIMUM_POLL_INTERVAL_SECONDS, interval),
+            timeout_seconds=min(timeout, hard_cap),
             hard_cap_seconds=hard_cap,
         )
 
@@ -106,7 +121,18 @@ def poll_post_upload(
     attempts = 0
     while True:
         attempts += 1
-        evidence = dict(inspector() or {})
+        try:
+            evidence: Evidence = dict(inspector() or {})
+        except Exception as exc:
+            # Storage inspection is part of the post-upload verdict, not a
+            # cosmetic observer. Convert an unexpected local I/O/database
+            # failure into durable terminal evidence so callers can show a
+            # clear failed verification rather than lose the whole receipt.
+            evidence = {
+                "status": "error",
+                "inspection_error": str(exc) or "post-upload inspection failed",
+                "inspection_exception_type": type(exc).__name__,
+            }
         evidence["attempt"] = attempts
         evidence["observed_elapsed_seconds"] = round(monotonic() - started, 4)
         observations.append(evidence)

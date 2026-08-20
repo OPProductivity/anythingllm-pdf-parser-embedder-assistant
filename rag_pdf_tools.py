@@ -202,6 +202,21 @@ def ensure_unstructured_asyncio_compatibility():
         asyncio.iscoroutinefunction = inspect.iscoroutinefunction
 
 
+def default_tesseract_executable_candidates():
+    """Return only absolute environment-derived Tesseract install paths."""
+    candidates = []
+    for root_text, relative_path in (
+        (os.environ.get("ProgramFiles"), ("Tesseract-OCR", "tesseract.exe")),
+        (os.environ.get("ProgramFiles(x86)"), ("Tesseract-OCR", "tesseract.exe")),
+        (os.environ.get("LOCALAPPDATA"), ("Programs", "Tesseract-OCR", "tesseract.exe")),
+    ):
+        root_text = str(root_text or "").strip()
+        root = Path(root_text) if root_text else None
+        if root and root.is_absolute():
+            candidates.append(root.joinpath(*relative_path))
+    return candidates
+
+
 @lru_cache(maxsize=1)
 def detect_tesseract_executable():
     candidates = []
@@ -214,15 +229,7 @@ def detect_tesseract_executable():
     for env_key in ("TESSERACT_CMD", "TESSERACT_PATH"):
         add(os.environ.get(env_key))
     add(shutil.which("tesseract"))
-
-    program_files = Path(os.environ.get("ProgramFiles") or "")
-    program_files_x86 = Path(os.environ.get("ProgramFiles(x86)") or "")
-    local_app_data = Path(os.environ.get("LOCALAPPDATA") or "")
-    for candidate in (
-        program_files / "Tesseract-OCR" / "tesseract.exe",
-        program_files_x86 / "Tesseract-OCR" / "tesseract.exe",
-        local_app_data / "Programs" / "Tesseract-OCR" / "tesseract.exe",
-    ):
+    for candidate in default_tesseract_executable_candidates():
         add(candidate)
 
     seen = set()

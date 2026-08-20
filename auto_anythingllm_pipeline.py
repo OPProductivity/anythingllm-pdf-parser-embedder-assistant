@@ -132,6 +132,61 @@ def compatible_output_document_directory(output_root, pdf_path, *, reserve_relat
     return candidate
 
 
+def compatible_output_document_directories(output_root, pdf_paths, *, reserve_relative_characters=82):
+    """Allocate distinct Windows-safe output directories for one PDF batch.
+
+    A readable basename is not an identity: two PDFs named ``article.pdf`` in
+    different folders must not share a staging directory and overwrite one
+    another's prepared artifacts. Keep the plain stem where it is unique, and
+    add a stable source-path suffix only for colliding siblings.
+    """
+    root = Path(output_root)
+    used_names = set()
+    allocated = {}
+    for raw_path in pdf_paths or []:
+        pdf = Path(raw_path)
+        candidate = compatible_output_document_directory(
+            root, pdf, reserve_relative_characters=reserve_relative_characters
+        )
+        if candidate.name.casefold() in used_names:
+            available = (
+                WINDOWS_COMPATIBLE_OUTPUT_PATH_LIMIT
+                - len(str(root))
+                - 1
+                - int(reserve_relative_characters)
+            )
+            if available < 16:
+                raise OSError("Could not allocate a Windows-compatible document output folder.")
+            digest = hashlib.sha256(
+                str(pdf.resolve()).encode("utf-8", errors="surrogatepass")
+            ).hexdigest()[:10]
+            suffix_number = 1
+            while True:
+                extra = "" if suffix_number == 1 else f"-{suffix_number}"
+                stem_limit = max(
+                    1,
+                    min(LOCAL_OUTPUT_DOCUMENT_NAME_LIMIT, available)
+                    - len(digest)
+                    - len(extra)
+                    - 1,
+                )
+                stem = _bounded_output_component(
+                    pdf.stem,
+                    stem_limit,
+                    fallback="document",
+                    identity=f"{pdf}|{suffix_number}",
+                )
+                candidate = root / f"{stem}-{digest}{extra}"
+                if candidate.name.casefold() not in used_names:
+                    break
+                suffix_number += 1
+        if len(str(candidate)) + int(reserve_relative_characters) > WINDOWS_COMPATIBLE_OUTPUT_PATH_LIMIT:
+            raise OSError("Could not allocate a Windows-compatible document output folder.")
+        used_names.add(candidate.name.casefold())
+        allocated[str(pdf)] = candidate
+    return allocated
+
+
 def compatible_output_filename(parent, preferred_stem, suffix, *, fallback="artifact"):
     """Bound one generated filename so its absolute path stays <= 250 chars."""
     directory = Path(parent)
@@ -329,7 +384,16 @@ def get_batch_inspection_context(args, storage_dir: Path, workspace_slug: str):
         workspace_slug,
         getattr(args, "anythingllm_api_url", ""),
     )
-    reused = context.get("fingerprint") == fingerprint and bool(context.get("global_read_only"))
+    # A cancellable Automatic worker returns this context through JSON. JSON
+    # turns the tuple fingerprint into a list, so compare normalized sequence
+    # values rather than making every later PDF repeat the same four
+    # batch-global read-only inspections.
+    stored_fingerprint = context.get("fingerprint")
+    reused = (
+        isinstance(stored_fingerprint, (list, tuple))
+        and tuple(stored_fingerprint) == fingerprint
+        and bool(context.get("global_read_only"))
+    )
     if not reused:
         # Configuration/runtime resolution happens earlier in the PDF path
         # than this inspection initializer. Preserve those batch-global
@@ -1656,7 +1720,16 @@ def materialize_retained_segments(prepared_text_path: Path, segments_dir: Path, 
     return retained
 
 
-def retain_successful_run_leanly(out_root: Path, summary, profile, prepared_text_path: Path, *, segments=()):
+def retain_successful_run_leanly(
+    out_root: Path,
+    summary,
+    profile,
+    prepared_text_path: Path,
+    *,
+    segments=(),
+    allow_exact_vector_runtime_deferred=False,
+    shared_batch_receipt=None,
+):
     """Replace a successful run's forensic tree with usable text + compact facts.
 
     Full candidates, metadata payload files, storage snapshots, and repeated
@@ -1675,10 +1748,14 @@ def retain_successful_run_leanly(out_root: Path, summary, profile, prepared_text
         and post_status == "not_checked_no_upload"
         and runtime_status == "not_checked_no_upload"
     )
+    runtime_verified = runtime_status == "pass" or (
+        bool(allow_exact_vector_runtime_deferred)
+        and runtime_status == "deferred_after_exact_vector_proof"
+    )
     fully_verified_upload = (
         upload_status in {"complete", "complete_with_key_cleanup_warning"}
         and post_status == "pass"
-        and runtime_status == "pass"
+        and runtime_verified
     )
     if not (local_only_complete or fully_verified_upload):
         # Do not shrink evidence merely because extraction itself was ready.
@@ -1732,6 +1809,23 @@ def retain_successful_run_leanly(out_root: Path, summary, profile, prepared_text
     for key in LEAN_SUCCESS_NONRETAINED_SUMMARY_PATH_FIELDS:
         summary[key] = ""
     summary["variant_outputs"] = {}
+    # Persist the usable transcript location before pruning any evidence.  If
+    # Windows, a power loss, or a shared-folder lock interrupts cleanup, this
+    # durable summary still points the UI and recovery tooling to the retained
+    # text rather than the selected/ artifact that cleanup may have removed.
+    # Extra artifacts are harmless; a missing transcript or plan is not.
+    write_json(
+        out_root / "run-summary.json",
+        {
+            **summary,
+            "lean_retention": {
+                "applied": False,
+                "cleanup_in_progress": True,
+                "prepared_text": str(retained_text_path),
+                "reason": "durable_summary_written_before_cleanup",
+            },
+        },
+    )
     if selected_dir.exists() and selected_dir != out_root:
         for child in selected_dir.iterdir():
             if child.is_dir():
@@ -1797,12 +1891,15 @@ def retain_successful_run_leanly(out_root: Path, summary, profile, prepared_text
                 "records_requested": summary.get("api_embedding_queue_records", 0),
                 "observation": summary.get("api_embedding_progress_observation", {}),
             },
+            "shared_batch": dict(shared_batch_receipt or {}),
         },
         "source": {
             "file": profile.get("source_file", ""),
             "filename": profile.get("filename", ""),
             "title": profile.get("detected_title", ""),
             "author": profile.get("detected_author", ""),
+            "short_label": profile.get("source_short_label", ""),
+            "metadata_provenance": dict(profile.get("metadata_provenance") or {}),
             "sha256": profile.get("source_sha256", ""),
             "pdf_page_count": profile.get("pdf_page_count", 0),
         },
@@ -1825,7 +1922,14 @@ def retain_successful_run_leanly(out_root: Path, summary, profile, prepared_text
             "state": "completed",
             "resume_required": False,
             "detailed_evidence_retained": False,
-            "note": "Ready runs retain only parsed text and this compact summary. Review-needed or failed runs keep detailed evidence.",
+            "note": (
+                "Ready runs retain only parsed text and this compact summary. "
+                "Review-needed or failed runs keep detailed evidence."
+                + (
+                    " Shared-batch cleanup began only after exact per-source vector proof."
+                    if shared_batch_receipt else ""
+                )
+            ),
         },
         "deleted_artifact_groups": sorted(deleted),
     }
@@ -1837,6 +1941,114 @@ def retain_successful_run_leanly(out_root: Path, summary, profile, prepared_text
         "retained_segment_files": len(retained_segments),
         "deleted": sorted(deleted),
     }
+
+
+def finalize_deferred_batch_lean_retention(out_root: Path, summary):
+    """Safely compact one successful member of an Automatic native batch.
+
+    Automatic workers intentionally defer compacting because the outer shared
+    submission consumes the generated plan after every worker has exited.
+    This is the only later cleanup boundary. It is deliberately fail-closed:
+    no plan, transcript, manifest, upload, or verification evidence is removed
+    unless this individual source has exact vector proof *and* the complete
+    batch has already been declared successful by the caller.
+    """
+    summary = summary if isinstance(summary, dict) else {}
+    retention = dict(summary.get("lean_retention") or {})
+    if not retention.get("deferred"):
+        return {"applied": False, "reason": "not_deferred"}
+    if str(retention.get("reason") or "") != "awaiting_shared_automatic_batch_upload":
+        return {"applied": False, "reason": "unknown_deferred_retention_state"}
+
+    out_root = Path(out_root)
+    prepared_text = Path(str(summary.get("upload_file") or ""))
+    manifest_path = Path(str(summary.get("manifest") or ""))
+    if not out_root.is_dir():
+        return {"applied": False, "reason": "output_root_missing"}
+    if not prepared_text.is_file():
+        return {"applied": False, "reason": "prepared_text_missing"}
+    if not manifest_path.is_file():
+        return {"applied": False, "reason": "selected_segment_manifest_missing"}
+
+    segments = []
+    try:
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if not isinstance(row, dict) or "text" not in row:
+                    return {
+                        "applied": False,
+                        "reason": "selected_segment_manifest_invalid",
+                        "line": line_number,
+                    }
+                segments.append(row)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return {
+            "applied": False,
+            "reason": "selected_segment_manifest_unreadable",
+            "error": str(exc),
+        }
+    expected_segments = max(0, int(summary.get("segments") or 0))
+    if expected_segments and len(segments) != expected_segments:
+        return {
+            "applied": False,
+            "reason": "selected_segment_manifest_count_mismatch",
+            "expected_segments": expected_segments,
+            "manifest_segments": len(segments),
+        }
+
+    profile_path = out_root / "source-profile.json"
+    profile = {}
+    if profile_path.is_file():
+        try:
+            candidate = json.loads(profile_path.read_text(encoding="utf-8"))
+            if isinstance(candidate, dict):
+                profile = candidate
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            # The compact receipt can be built from the durable summary, but
+            # never use a malformed profile to invent provenance fields.
+            profile = {}
+    source_path = str(summary.get("pdf") or profile.get("source_file") or "")
+    profile = {
+        **profile,
+        "source_file": source_path,
+        "filename": str(profile.get("filename") or Path(source_path or "document.pdf").name),
+        "source_sha256": str(summary.get("source_sha256") or profile.get("source_sha256") or ""),
+        "pdf_page_count": int(summary.get("pdf_page_count") or profile.get("pdf_page_count") or 0),
+    }
+    batch_result = dict(summary.get("batch_upload_result") or {})
+    expected_records = max(0, int(summary.get("post_upload_expected_payloads") or 0))
+    confirmed_vectors = max(0, int(summary.get("post_upload_matching_vectors") or 0))
+    receipt = {
+        "protocol": "automatic_shared_batch_retention_v1",
+        "source_sha256": profile["source_sha256"],
+        "expected_records": expected_records,
+        "confirmed_vectors": confirmed_vectors,
+        "upload_status": str(summary.get("api_upload_status") or ""),
+        "post_upload_status": str(summary.get("post_upload_verification_status") or ""),
+        "runtime_status": str(summary.get("anythingllm_runtime_validation_status") or ""),
+        "queue_requested": int(summary.get("api_embedding_update_requested") or 0),
+        "queue_accepted": int(summary.get("api_embedding_update_accepted") or 0),
+        "source_locations": list(batch_result.get("locations") or []),
+    }
+    if not (expected_records and confirmed_vectors == expected_records and batch_result.get("searchability_proven")):
+        return {"applied": False, "reason": "exact_batch_vector_proof_missing", "receipt": receipt}
+
+    retained = retain_successful_run_leanly(
+        out_root,
+        summary,
+        profile,
+        prepared_text,
+        segments=segments,
+        allow_exact_vector_runtime_deferred=True,
+        shared_batch_receipt=receipt,
+    )
+    if retained.get("applied"):
+        retained["policy"] = "lean_success_after_shared_batch_v1"
+        retained["receipt"] = receipt
+    return retained
 
 
 def retain_successful_run_without_logs(out_root: Path, summary, profile, prepared_text_path: Path, *, segments=()):
@@ -4537,7 +4749,13 @@ def check_status(ok, warn=False):
     return "warning" if warn else "fail"
 
 
-def evaluate_edge_cases(profile, selected, selected_dir: Path, native_payloads):
+def evaluate_edge_cases(
+    profile,
+    selected,
+    selected_dir: Path,
+    native_payloads,
+    inline_fallback_required=False,
+):
     rows = []
 
     def add(check, status, details):
@@ -4558,7 +4776,32 @@ def evaluate_edge_cases(profile, selected, selected_dir: Path, native_payloads):
     )
     add("segment_count", check_status(len(selected.get("segments", [])) > 0), f"segments={len(selected.get('segments', []))}")
     marker = selected.get("marker_stats") or {}
-    add("metadata_ratio", check_status(float(marker.get("marker_char_ratio") or 1) <= 0.15), f"marker_char_ratio={marker.get('marker_char_ratio')}")
+    inline_fallback_required = bool(
+        inline_fallback_required or selected.get("inline_fallback_required")
+    )
+    marker_ratio_raw = marker.get("marker_char_ratio")
+    try:
+        marker_ratio = float(str(marker_ratio_raw or 0.0))
+        marker_ratio_valid = True
+    except (TypeError, ValueError):
+        marker_ratio = 0.0
+        marker_ratio_valid = False
+    if inline_fallback_required:
+        add(
+            "metadata_ratio",
+            check_status(marker_ratio_valid and marker_ratio <= 0.15),
+            f"marker_char_ratio={marker_ratio_raw}; inline fallback is the selected provenance path",
+        )
+    else:
+        add(
+            "metadata_ratio",
+            "pass",
+            (
+                f"marker_char_ratio={marker_ratio_raw}; inline fallback is auxiliary and native metadata is primary"
+                if marker_ratio_valid
+                else "marker_char_ratio was not recorded; inline fallback is auxiliary and native metadata is primary"
+            ),
+        )
     chunk_eval = selected.get("chunk_eval") or {}
     add(
         "fallback_marker_survival",
@@ -4705,7 +4948,7 @@ def build_run_diagnostics(
     candidates,
     storage_report,
     upload_report,
-    workspace_gate,
+    workspace_configuration,
     post_upload_report,
     metadata_schema_report,
     runtime_validation_report,
@@ -4919,12 +5162,6 @@ def build_run_diagnostics(
             "error": "ANYTHINGLLM_UPLOAD_OR_EMBED_FAILED",
         }.get(upload_status, "ANYTHINGLLM_UPLOAD_NOT_CONFIRMED")
         add(upload_code, "error", "anythingllm", f"Upload status: {upload_status}. {upload_report.get('errors') or ''}", "Correct the reported API/workspace problem and retry; generated files remain usable.")
-    if (
-        upload_status != "skipped_prepare_only"
-        and workspace_gate.get("status")
-        in {"workspace_missing", "blocked_model_not_configured", "blocked_claude_or_anthropic_model"}
-    ):
-        add("ANYTHINGLLM_WORKSPACE_MODEL_GATE_BLOCKED", "warning", "anythingllm", workspace_gate.get("message") or workspace_gate.get("status"), "Select an existing DeepSeek-configured test workspace before accepting an in-app result.")
     if post_upload_report.get("status") not in {
         "not_checked",
         "workspace_missing",
@@ -4938,11 +5175,11 @@ def build_run_diagnostics(
     runtime_status = runtime_validation_report.get("status")
     if runtime_status == "blocked_provider_authentication":
         add(
-            "ANYTHINGLLM_DEEPSEEK_PROVIDER_AUTHENTICATION_FAILED",
+            "ANYTHINGLLM_CHAT_PROVIDER_AUTHENTICATION_FAILED",
             "error",
             "anythingllm_chat",
-            "The workspace is configured for DeepSeek, but the provider rejected its API credential.",
-            "Update the DeepSeek V4 Pro provider credential in AnythingLLM, then rerun native metadata validation.",
+            "The configured AnythingLLM chat provider rejected its API credential.",
+            "Update that provider's credential in AnythingLLM, then rerun native metadata validation.",
         )
     elif runtime_status == "vector_retrieval_failed":
         add(
@@ -4957,7 +5194,7 @@ def build_run_diagnostics(
             "ANYTHINGLLM_NATIVE_METADATA_CHAT_CITATION_FAILED",
             "error",
             "anythingllm_chat",
-            "DeepSeek answered, but did not reproduce the expected page and segment from sourceDocument.",
+            "The configured chat model answered, but did not reproduce the expected page and segment from sourceDocument.",
             "Use the filename/title fallback or inline metadata fallback and rerun the test.",
         )
     elif runtime_status in {
@@ -5066,21 +5303,20 @@ def write_failure_package(pdf_path: Path, out_root: Path, exc, args=None):
     write_json(out_root / "edge-case-summary.json", {k: v for k, v in edge_case_report.items() if k != "rows"})
     storage_dir = Path(getattr(args, "anythingllm_storage_dir", "") or default_anythingllm_storage_dir()) if args else default_anythingllm_storage_dir()
     target_workspace_slug = getattr(args, "test_workspace_slug", "test") if args else "test"
-    workspace_gate = read_workspace_model_gate(storage_dir, target_workspace_slug)
+    workspace_configuration = read_workspace_model_configuration(storage_dir, target_workspace_slug)
     inspection_dir = out_root / "inspection"
-    write_json(inspection_dir / "workspace-model-gate.json", workspace_gate)
+    write_json(inspection_dir / "workspace-model-configuration.json", workspace_configuration)
     write_csv(
-        inspection_dir / "workspace-model-gate.csv",
+        inspection_dir / "workspace-model-configuration.csv",
         [
             {
-                "status": workspace_gate.get("status"),
-                "workspace_slug": workspace_gate.get("workspace_slug"),
-                "workspace_name": workspace_gate.get("workspace_name"),
-                "chat_provider": workspace_gate.get("chat_provider"),
-                "chat_model": workspace_gate.get("chat_model"),
-                "deepseek_like": workspace_gate.get("deepseek_like"),
-                "blocked_terms_present": workspace_gate.get("blocked_terms_present"),
-                "message": workspace_gate.get("message"),
+                "status": workspace_configuration.get("status"),
+                "workspace_slug": workspace_configuration.get("workspace_slug"),
+                "workspace_name": workspace_configuration.get("workspace_name"),
+                "chat_provider": workspace_configuration.get("chat_provider"),
+                "chat_model": workspace_configuration.get("chat_model"),
+                "chat_model_configured": workspace_configuration.get("chat_model_configured"),
+                "message": workspace_configuration.get("message"),
             }
         ],
     )
@@ -5127,9 +5363,9 @@ def write_failure_package(pdf_path: Path, out_root: Path, exc, args=None):
         "edge_case_warnings": 0,
         "edge_case_report": str(out_root / "edge-case-report.html"),
         "edge_case_results": str(out_root / "edge-case-results.csv"),
-        "workspace_model_gate_status": workspace_gate.get("status"),
-        "workspace_model_gate_message": workspace_gate.get("message"),
-        "workspace_model_gate": str(inspection_dir / "workspace-model-gate.csv"),
+        "workspace_model_configuration_status": workspace_configuration.get("status"),
+        "workspace_model_configuration_message": workspace_configuration.get("message"),
+        "workspace_model_configuration": str(inspection_dir / "workspace-model-configuration.csv"),
         "post_upload_verification_status": post_upload["status"],
         "post_upload_classification": post_upload["classification"],
         "post_upload_verification": str(inspection_dir / "post-upload-verification.csv"),
@@ -5634,7 +5870,7 @@ def write_native_metadata_test_kit(segments, out_dir: Path, workspace_slug="test
         "",
         f"Target workspace: `{workspace_slug}`",
         "",
-        "1. In AnythingLLM, configure the target workspace to a DeepSeek-like chat model and not Claude/Sonnet.",
+        "1. Confirm the target workspace's configured chat model is available in AnythingLLM.",
         "2. Upload the generated manual segment files, or use the raw-text payloads if API access becomes available.",
         "3. After upload, run the tool's read-only verification again against the same workspace.",
         "4. Check whether page/segment information survives in workspace document metadata and LanceDB rows.",
@@ -5887,7 +6123,17 @@ def read_env_file_values(path: Path):
         if "=" not in raw_line or raw_line.lstrip().startswith("#"):
             continue
         key, value = raw_line.split("=", 1)
-        values[key.strip()] = value.strip().strip("'\"")
+        raw_value = value.strip()
+        if len(raw_value) >= 2 and raw_value[0] == "'" and raw_value[-1] == "'":
+            values[key.strip()] = raw_value[1:-1]
+        elif len(raw_value) >= 2 and raw_value[0] == '"' and raw_value[-1] == '"':
+            try:
+                decoded = json.loads(raw_value)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                decoded = raw_value[1:-1]
+            values[key.strip()] = decoded if isinstance(decoded, str) else raw_value[1:-1]
+        else:
+            values[key.strip()] = raw_value
     return values
 
 
@@ -7115,37 +7361,77 @@ def provider_model_key_for_engine(engine: str):
     return "EMBEDDING_MODEL_PREF"
 
 
-def write_anythingllm_env_value(storage_dir: Path, key: str, value):
+ENVIRONMENT_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# The settings UI can invoke two callbacks in parallel. Atomic replacement
+# alone cannot protect their read-modify-write transaction from a lost update.
+ANYTHINGLLM_ENV_WRITE_LOCK = threading.RLock()
+
+
+def _validated_environment_value(key: str, value) -> tuple[str, str]:
+    normalized_key = str(key or "").strip()
+    normalized_value = str(value)
+    if not ENVIRONMENT_KEY_PATTERN.fullmatch(normalized_key):
+        raise ValueError(f"Unsupported environment setting name: {key!r}")
+    if "\r" in normalized_value or "\n" in normalized_value:
+        raise ValueError("Environment setting values must be single-line.")
+    return normalized_key, normalized_value
+
+
+def write_anythingllm_env_values(storage_dir: Path, values: dict[str, object]):
+    """Atomically update and verify one related group of AnythingLLM .env values."""
     env_path = Path(storage_dir) / ".env"
-    if not env_path.exists():
-        raise FileNotFoundError(f"AnythingLLM .env was not found at {env_path}")
-    original = env_path.read_text(encoding="utf-8", errors="replace")
-    pattern = re.compile(rf"^(?P<prefix>\s*{re.escape(key)}\s*=\s*)(?P<value>.*)$", re.MULTILINE)
-    replacement = f"{key}='{value}'"
-    if pattern.search(original):
-        updated = pattern.sub(replacement, original, count=1)
-    else:
-        newline = "" if not original or original.endswith("\n") else "\n"
-        updated = original + newline + replacement + "\n"
-    env_path.write_text(updated, encoding="utf-8")
+    updates = [_validated_environment_value(key, value) for key, value in values.items()]
+    with ANYTHINGLLM_ENV_WRITE_LOCK:
+        if not env_path.exists():
+            raise FileNotFoundError(f"AnythingLLM .env was not found at {env_path}")
+        original = env_path.read_text(encoding="utf-8", errors="replace")
+        updated = original
+        for key, value in updates:
+            pattern = re.compile(rf"^\s*{re.escape(key)}\s*=.*$", re.MULTILINE)
+            replacement = f"{key}={json.dumps(value, ensure_ascii=False)}"
+            if pattern.search(updated):
+                updated = pattern.sub(lambda _match: replacement, updated, count=1)
+            else:
+                newline = "" if not updated or updated.endswith("\n") else "\n"
+                updated = updated + newline + replacement + "\n"
+        atomic_write_text(env_path, updated)
+        persisted = read_env_file_values(env_path)
+        for key, value in updates:
+            if persisted.get(key) != value:
+                raise RuntimeError(f"Write verification failed for {key}")
     return env_path
 
 
-def write_anythingllm_sqlite_setting(storage_dir: Path, label: str, value):
+def write_anythingllm_env_value(storage_dir: Path, key: str, value):
+    return write_anythingllm_env_values(storage_dir, {key: value})
+
+
+def write_anythingllm_sqlite_settings(storage_dir: Path, values: dict[str, object]):
+    """Commit a related group of system settings as one verified transaction."""
     db_path = Path(storage_dir) / "anythingllm.db"
     if not db_path.exists():
         raise FileNotFoundError(f"AnythingLLM SQLite database was not found at {db_path}")
-    con = sqlite3.connect(db_path)
+    updates = [(str(label), str(value)) for label, value in values.items()]
+    con = sqlite3.connect(db_path, timeout=5.0)
     try:
-        existing = con.execute("select value from system_settings where label = ?", (label,)).fetchone()
-        if existing:
-            con.execute("update system_settings set value = ? where label = ?", (str(value), label))
-        else:
-            con.execute("insert into system_settings(label, value) values (?, ?)", (label, str(value)))
-        con.commit()
+        with con:
+            for label, value in updates:
+                existing = con.execute("select value from system_settings where label = ?", (label,)).fetchone()
+                if existing:
+                    con.execute("update system_settings set value = ? where label = ?", (value, label))
+                else:
+                    con.execute("insert into system_settings(label, value) values (?, ?)", (label, value))
+        for label, value in updates:
+            verified = con.execute("select value from system_settings where label = ?", (label,)).fetchone()
+            if not verified or verified[0] != value:
+                raise RuntimeError(f"Write verification failed for {label}")
     finally:
         con.close()
     return db_path
+
+
+def write_anythingllm_sqlite_setting(storage_dir: Path, label: str, value):
+    return write_anythingllm_sqlite_settings(storage_dir, {label: value})
 
 
 def anythingllm_runtime_verification_status(storage_dir: Path, api_url=DEFAULT_ANYTHINGLLM_API_URL):
@@ -7314,8 +7600,10 @@ def should_verify_anythingllm_runtime_during_preparation(args):
 
 
 def persist_anythingllm_chunk_settings(storage_dir: Path, chunk_size, chunk_overlap):
-    chunk_db = write_anythingllm_sqlite_setting(storage_dir, "text_splitter_chunk_size", int(chunk_size))
-    overlap_db = write_anythingllm_sqlite_setting(storage_dir, "text_splitter_chunk_overlap", int(chunk_overlap))
+    settings_db = write_anythingllm_sqlite_settings(storage_dir, {
+        "text_splitter_chunk_size": int(chunk_size),
+        "text_splitter_chunk_overlap": int(chunk_overlap),
+    })
     persisted = anythingllm_chunk_settings(storage_dir)
     runtime = anythingllm_runtime_verification_status(storage_dir)
     return {
@@ -7328,7 +7616,7 @@ def persist_anythingllm_chunk_settings(storage_dir: Path, chunk_size, chunk_over
             "chunk_size": int(persisted.get("chunk_size") or 0),
             "chunk_overlap": int(persisted.get("chunk_overlap") or 0),
         },
-        "paths": [str(chunk_db), str(overlap_db)],
+        "paths": [str(settings_db)],
         "runtime_verification_status": runtime.get("status"),
         "runtime_verification_message": runtime.get("message"),
         "restart_likely_required": False,
@@ -7338,11 +7626,12 @@ def persist_anythingllm_chunk_settings(storage_dir: Path, chunk_size, chunk_over
 
 def persist_anythingllm_embedder_settings(storage_dir: Path, engine, model):
     storage = Path(storage_dir)
-    env_path = write_anythingllm_env_value(storage, "EMBEDDING_ENGINE", engine)
+    updates = {"EMBEDDING_ENGINE": engine}
     model_key = provider_model_key_for_engine(engine)
     if model:
-        write_anythingllm_env_value(storage, model_key, model)
-        write_anythingllm_env_value(storage, "EMBEDDING_MODEL_PREF", model)
+        updates[model_key] = model
+        updates["EMBEDDING_MODEL_PREF"] = model
+    env_path = write_anythingllm_env_values(storage, updates)
     persisted = anythingllm_embedding_config(storage)
     runtime = anythingllm_runtime_verification_status(storage)
     return {
@@ -7576,7 +7865,14 @@ def simulation_preflight(adapter, effective_limit, batch_size=1):
         return result
 
 
-def read_workspace_model_gate(storage_dir: Path, workspace_slug="test"):
+def read_workspace_model_configuration(storage_dir: Path, workspace_slug="test"):
+    """Read the selected workspace's chat configuration without judging it.
+
+    Any provider/model supported by the user's AnythingLLM installation may
+    power a workspace.  Upload and vector retrieval do not depend on the chat
+    model, and a runtime chat probe must report its real result rather than be
+    suppressed by a project-specific provider allowlist.
+    """
     result = {
         "status": "not_checked",
         "workspace_slug": workspace_slug,
@@ -7586,9 +7882,7 @@ def read_workspace_model_gate(storage_dir: Path, workspace_slug="test"):
         "top_n": "",
         "similarity_threshold": "",
         "vector_search_mode": "",
-        "deepseek_like": False,
-        "blocked_terms_present": False,
-        "observed_deepseek_workspaces": [],
+        "chat_model_configured": False,
         "message": "",
         "error": "",
     }
@@ -7605,17 +7899,6 @@ def read_workspace_model_gate(storage_dir: Path, workspace_slug="test"):
         workspaces = [dict(row) for row in cur.execute(
             "select id,name,slug,chatProvider,chatModel,topN,similarityThreshold,vectorSearchMode,chatMode from workspaces order by id"
         )]
-        for workspace in workspaces:
-            model_text = f"{workspace.get('chatProvider') or ''} {workspace.get('chatModel') or ''}".casefold()
-            if "deepseek" in model_text:
-                result["observed_deepseek_workspaces"].append(
-                    {
-                        "name": workspace.get("name"),
-                        "slug": workspace.get("slug"),
-                        "chatProvider": workspace.get("chatProvider"),
-                        "chatModel": workspace.get("chatModel"),
-                    }
-                )
         target = next((row for row in workspaces if row.get("slug") == workspace_slug), None)
         if not target:
             result["status"] = "workspace_missing"
@@ -7631,26 +7914,22 @@ def read_workspace_model_gate(storage_dir: Path, workspace_slug="test"):
                 "vector_search_mode": target.get("vectorSearchMode") or "",
             }
         )
-        model_text = f"{result['chat_provider']} {result['chat_model']}".casefold()
-        result["deepseek_like"] = "deepseek" in model_text
-        result["blocked_terms_present"] = any(term in model_text for term in ["claude", "anthropic", "sonnet"])
-        if result["blocked_terms_present"]:
-            result["status"] = "blocked_claude_or_anthropic_model"
-            result["message"] = f"Workspace `{workspace_slug}` is configured with a blocked model/provider: {model_text.strip() or 'empty'}."
-        elif result["deepseek_like"]:
-            result["status"] = "pass"
-            result["message"] = f"Workspace `{workspace_slug}` is configured with a DeepSeek-like model."
+        result["chat_model_configured"] = bool(result["chat_provider"] or result["chat_model"])
+        result["status"] = "configured"
+        if result["chat_model_configured"]:
+            result["message"] = (
+                f"Workspace `{workspace_slug}` uses `{result['chat_provider'] or 'default provider'}` / "
+                f"`{result['chat_model'] or 'default model'}`."
+            )
         else:
-            suggestion = ""
-            if result["observed_deepseek_workspaces"]:
-                observed = result["observed_deepseek_workspaces"][0]
-                suggestion = f" Observed DeepSeek-like example: workspace `{observed['slug']}` uses `{observed.get('chatModel')}`."
-            result["status"] = "blocked_model_not_configured"
-            result["message"] = f"Workspace `{workspace_slug}` must be configured in AnythingLLM to a DeepSeek-like model before the inside-AnythingLLM test can count.{suggestion}"
+            result["message"] = (
+                f"Workspace `{workspace_slug}` does not store a workspace-specific chat model; "
+                "AnythingLLM may inherit its global setting."
+            )
     except Exception as exc:
         result["status"] = "error"
         result["error"] = str(exc)
-        result["message"] = "Workspace model gate failed while reading AnythingLLM SQLite data."
+        result["message"] = "Workspace chat configuration could not be read from AnythingLLM SQLite data."
     finally:
         try:
             if con:
@@ -7703,18 +7982,13 @@ def read_validation_workspace_template(storage_dir: Path):
         workspaces = [dict(row) for row in cur.execute(
             "select id,name,slug,chatProvider,chatModel,topN,similarityThreshold,vectorSearchMode,chatMode from workspaces order by id desc"
         )]
-        preferred = None
-        fallback = None
+        chosen = None
         for workspace in workspaces:
             provider = str(workspace.get("chatProvider") or "")
             model = str(workspace.get("chatModel") or "")
-            model_text = f"{provider} {model}".casefold()
             if provider or model:
-                fallback = fallback or workspace
-            if "deepseek" in model_text:
-                preferred = workspace
+                chosen = workspace
                 break
-        chosen = preferred or fallback
         if not chosen:
             if llm_info.get("provider") and llm_info.get("model"):
                 result.update(
@@ -7815,7 +8089,7 @@ def update_workspace_runtime_template_sqlite(storage_dir: Path, workspace_slug: 
             ),
         )
         con.commit()
-        verified = read_workspace_model_gate(storage_dir, workspace_slug)
+        verified = read_workspace_model_configuration(storage_dir, workspace_slug)
         result["verified"] = verified.get("chat_provider") == applied["chatProvider"] and verified.get("chat_model") == applied["chatModel"]
         result["status"] = "pass" if result["verified"] else "persisted_but_runtime_unverified"
         result["applied"] = applied
@@ -7910,7 +8184,7 @@ def _page_parent_payload_reuse_key(payload):
     ).hexdigest()
 
 
-def find_reusable_cached_document_locations(storage_dir, payloads):
+def find_reusable_cached_document_locations(storage_dir, payloads, *, folder_names=None):
     """Find exact existing raw-text documents with reusable vector-cache entries.
 
     Automatic runs normally receive new UUID-suffixed raw-document locations
@@ -7919,11 +8193,26 @@ def find_reusable_cached_document_locations(storage_dir, payloads):
     raw document exactly matches this page-parent payload *and* its current
     vector-cache entry exists.  The returned list stays aligned with
     ``payloads``; an empty entry means the caller must use ordinary upload.
+
+    When ``folder_names`` is supplied, each reused record must already live in
+    that exact relative folder. A root-layout request must never reuse an
+    otherwise-identical record from a nested folder: AnythingLLM Desktop's
+    Documents drawer is non-recursive, so doing so silently changes the user's
+    requested visible-layout policy.
     """
     rows = list(payloads or [])
     reusable = [""] * len(rows)
     if not storage_dir or not rows:
         return reusable
+    expected_folders = None
+    if folder_names is not None:
+        raw_folders = list(folder_names)
+        if len(raw_folders) != len(rows):
+            return reusable
+        expected_folders = [
+            str(folder or "custom-documents").replace("\\", "/").strip("/").casefold()
+            for folder in raw_folders
+        ]
     try:
         storage = Path(storage_dir)
         documents_root = (storage / "documents").resolve()
@@ -7958,12 +8247,17 @@ def find_reusable_cached_document_locations(storage_dir, payloads):
                     ).encode("utf-8")
                 ).hexdigest()
                 if existing_key in requested_keys:
-                    candidates_by_key.setdefault(existing_key, []).append(relative)
+                    candidates_by_key.setdefault(existing_key, []).append(
+                        (relative, Path(relative).parent.as_posix().casefold())
+                    )
             except (OSError, TypeError, ValueError, json.JSONDecodeError):
                 continue
         used_locations = set()
         for index, payload in enumerate(rows):
-            for location in sorted(candidates_by_key.get(_page_parent_payload_reuse_key(payload), [])):
+            expected_folder = expected_folders[index] if expected_folders is not None else ""
+            for location, actual_folder in sorted(candidates_by_key.get(_page_parent_payload_reuse_key(payload), [])):
+                if expected_folder and actual_folder != expected_folder:
+                    continue
                 if location not in used_locations:
                     reusable[index] = location
                     used_locations.add(location)
@@ -8101,8 +8395,12 @@ def listen_for_anythingllm_embed_progress(
                 if isinstance(connected_event, threading.Event):
                     connected_event.set()
                 for raw_line in response:
-                    if stop_event.is_set():
-                        return
+                    # Do not abandon bytes that urllib has already buffered
+                    # just because the synchronous update returned. Its final
+                    # queue event is often sent immediately before that
+                    # response, and dropping it makes a completed document
+                    # look silently unobserved. The outer loop still honours
+                    # the stop request before opening another SSE connection.
                     line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
                     if line.startswith("data:"):
                         payload_lines.append(line[5:].lstrip())
@@ -8590,16 +8888,20 @@ def remove_confirmed_workspace_queue_entries(
 
 def default_anythingllm_desktop_executable_candidates():
     candidates = []
-    local_app_data = Path(os.environ.get("LOCALAPPDATA") or "")
-    program_files = Path(os.environ.get("ProgramFiles") or "")
-    program_files_x86 = Path(os.environ.get("ProgramFiles(x86)") or "")
-    for candidate in (
-        local_app_data / "Programs" / "AnythingLLM" / "AnythingLLM.exe",
-        program_files / "AnythingLLM" / "AnythingLLM.exe",
-        program_files_x86 / "AnythingLLM" / "AnythingLLM.exe",
+    # ``Path(\"\")`` is the current directory. Building a candidate from an
+    # absent Windows environment variable would therefore probe a relative
+    # ``Programs/...`` path in the user's chosen working directory.
+    local_app_data = str(os.environ.get("LOCALAPPDATA") or "").strip()
+    program_files = str(os.environ.get("ProgramFiles") or "").strip()
+    program_files_x86 = str(os.environ.get("ProgramFiles(x86)") or "").strip()
+    for root_text, relative_path in (
+        (local_app_data, ("Programs", "AnythingLLM", "AnythingLLM.exe")),
+        (program_files, ("AnythingLLM", "AnythingLLM.exe")),
+        (program_files_x86, ("AnythingLLM", "AnythingLLM.exe")),
     ):
-        if candidate and str(candidate) not in {"", "."}:
-            candidates.append(candidate)
+        root = Path(root_text) if root_text else None
+        if root and root.is_absolute():
+            candidates.append(root.joinpath(*relative_path))
     seen = set()
     deduped = []
     for candidate in candidates:
@@ -8619,12 +8921,16 @@ def find_anythingllm_desktop_executable():
 
 
 def anythingllm_desktop_process_running():
+    # This guard is consulted from startup/recovery paths. A wedged process
+    # enumerator must be treated as unavailable rather than blocking PDF work.
+    process_query_timeout_seconds = 5
     try:
         if os.name == "nt":
             result = subprocess.run(
                 ["tasklist", "/FI", "IMAGENAME eq AnythingLLM.exe", "/FO", "CSV", "/NH"],
                 capture_output=True,
                 text=True,
+                timeout=process_query_timeout_seconds,
                 check=False,
             )
             output = (result.stdout or "").strip()
@@ -8633,10 +8939,11 @@ def anythingllm_desktop_process_running():
             ["pgrep", "-f", "AnythingLLM"],
             capture_output=True,
             text=True,
+            timeout=process_query_timeout_seconds,
             check=False,
         )
         return result.returncode == 0 and bool((result.stdout or "").strip())
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         return False
 
 
@@ -9753,7 +10060,15 @@ def run_temporary_workspace_validation(
                 "uploaded": upload_report.get("uploaded", 0),
             },
         )
-    if upload_report.get("uploaded", 0) > 0:
+    # ``uploaded`` can be nonzero even when a later embedding batch failed.
+    # Do not spend the full reconciliation timeout observing a known failed,
+    # partial submission (or accidentally present its surviving vectors as a
+    # successful validation). Only a complete submission may enter the
+    # document-wide vector and runtime-validation phases.
+    if (
+        upload_report.get("uploaded", 0) > 0
+        and upload_report.get("status") in SUCCESSFUL_UPLOAD_STATUSES
+    ):
         # A successful update-embeddings response confirms submission, not that
         # the Desktop worker has finished materialising every vector.  Do one
         # bounded, auditable poll before querying retrieval.  Without it, a
@@ -10046,7 +10361,10 @@ def select_upload_payloads(payloads, upload_limit=0, upload_indices=None):
 def load_upload_plan_rows(upload_plan_path):
     rows = []
     path = Path(upload_plan_path or "")
-    if not path.exists():
+    # ``Path(\"\")`` denotes the current directory. Treat a missing/corrupt
+    # plan reference as an empty plan instead of trying to open that directory
+    # and converting a recoverable staged-batch error into PermissionError.
+    if not path.is_file():
         return rows
     with path.open("r", encoding="utf-8", newline="") as handle:
         for row in csv.DictReader(handle):
@@ -10058,13 +10376,21 @@ def upload_plan_rows_to_expected_payloads(upload_rows):
     payloads = []
     for row in upload_rows:
         filename = row.get("filename") or ""
-        text_content = ""
-        text_file = Path(row.get("text_file") or "")
-        if text_file.exists():
-            try:
-                text_content = text_file.read_text(encoding="utf-8")
-            except Exception:
-                text_content = ""
+        cached_text = row.get("_validated_text_content")
+        if isinstance(cached_text, str):
+            text_content = cached_text
+        else:
+            text_content = ""
+            text_file = Path(row.get("text_file") or "")
+            if text_file.exists():
+                try:
+                    text_content = text_file.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    # This compatibility helper is also used for historic
+                    # plans outside the Automatic batch boundary. The live
+                    # batch validates readability before any mutation, while
+                    # legacy callers retain their existing empty fallback.
+                    text_content = ""
         payloads.append(
             {
                 "filename": filename,
@@ -10677,6 +11003,24 @@ def _update_workspace_embeddings_batched_serial(
     post-upload/observer checks for that separate fact.
     """
     unique_locations = list(dict.fromkeys(str(location) for location in locations if location))
+
+    def wait_for_rate_limit_retry_or_cancellation():
+        """Wait for the one safe 429 retry without making Cancel unresponsive."""
+        retry_seconds = max(0.0, float(ANYTHINGLLM_EMBEDDING_RATE_LIMIT_RETRY_SECONDS))
+        if not callable(cancel_callback):
+            time.sleep(retry_seconds)
+            return False
+        deadline = time.monotonic() + retry_seconds
+        while True:
+            if cancel_callback():
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            # Keep the UI's cancellation authority responsive without adding
+            # a new request or retry policy during the backoff period.
+            time.sleep(min(0.25, remaining))
+
     try:
         normalized_batch_size = max(1, int(batch_size or ANYTHINGLLM_EMBEDDING_UPDATE_BATCH_SIZE))
     except (TypeError, ValueError):
@@ -10872,7 +11216,24 @@ def _update_workspace_embeddings_batched_serial(
                         ),
                         dict(batch_report),
                     )
-                time.sleep(ANYTHINGLLM_EMBEDDING_RATE_LIMIT_RETRY_SECONDS)
+                if wait_for_rate_limit_retry_or_cancellation():
+                    batch_report["submission_state"] = "cancelled_before_retry"
+                    batch_report["error"] = "The operator requested a stop before the rate-limited batch was retried."
+                    set_embedding_batch_lifecycle(
+                        batch_report,
+                        "cancelled_before_retry",
+                        batch_report["error"],
+                    )
+                    result["errors"].append(
+                        {
+                            "endpoint": "operator-cancellation",
+                            "batch": batch_number,
+                            "error": batch_report["error"],
+                        }
+                    )
+                    result["inflight_batch"] = dict(batch_report)
+                    _write_embedding_batch_ledger(ledger_path, workspace_slug, result)
+                    break
                 set_embedding_batch_lifecycle(
                     batch_report,
                     "submitted",
@@ -10881,7 +11242,9 @@ def _update_workspace_embeddings_batched_serial(
                 result["inflight_batch"] = dict(batch_report)
                 _write_embedding_batch_ledger(ledger_path, workspace_slug, result)
             batch_report["http_status"] = status
-            if 200 <= status < 300:
+            if batch_report["submission_state"] == "cancelled_before_retry":
+                batch_report["submission_seconds"] = round(time.perf_counter() - submission_started, 4)
+            elif 200 <= status < 300:
                 batch_report["accepted"] = len(batch)
                 batch_report["submission_state"] = "accepted"
                 batch_report["acceptance_basis"] = "http_2xx_submission_only"
@@ -12028,12 +12391,22 @@ def maybe_upload_payloads(
     errors = []
     locations = []
     reused_cached_locations = []
+    attachment_results = []
     embedding_update = {"accepted": 0, "requested": 0, "batch_size": ANYTHINGLLM_EMBEDDING_UPDATE_BATCH_SIZE, "batches": [], "errors": []}
     upload_rows = select_upload_payloads(payloads, upload_limit, upload_indices)
     reusable_locations = find_reusable_cached_document_locations(storage_dir, upload_rows)
     correlation_id = f"upload-{uuid.uuid4().hex}"
     try:
         for payload, reusable_location in zip(upload_rows, reusable_locations):
+            metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+            attachment = {
+                "filename": str(payload.get("filename") or ""),
+                "chunk_source": str(metadata.get("chunkSource") or ""),
+                "source_path": str(payload.get("_automatic_source_path") or ""),
+                "status": "pending",
+                "location": "",
+                "error": "",
+            }
             record_submission_receipt(
                 submission_receipt_path, payload,
                 run_id=run_id, workspace_slug=workspace_slug, transport="raw_text",
@@ -12048,6 +12421,8 @@ def maybe_upload_payloads(
                 uploaded += 1
                 locations.append(reusable_location)
                 reused_cached_locations.append(reusable_location)
+                attachment.update(status="reused_cached_location", location=reusable_location)
+                attachment_results.append(attachment)
                 record_submission_receipt(
                     submission_receipt_path, payload,
                     run_id=run_id, workspace_slug=workspace_slug, transport="raw_text",
@@ -12067,7 +12442,14 @@ def maybe_upload_payloads(
                     )
                 continue
             try:
-                status, response_text = post_json(endpoint, payload, api_key=api_key)
+                # Internal batch-only correlation fields must never become
+                # part of AnythingLLM's public raw-text payload schema.
+                request_payload = {
+                    key: payload.get(key)
+                    for key in ("filename", "textContent", "metadata")
+                    if key in payload
+                }
+                status, response_text = post_json(endpoint, request_payload, api_key=api_key)
                 if 200 <= status < 300:
                     uploaded += 1
                     location = extract_document_location(response_text)
@@ -12083,6 +12465,13 @@ def maybe_upload_payloads(
                     )
                     if location:
                         locations.append(location)
+                        attachment.update(status="attached", location=location)
+                    else:
+                        attachment.update(
+                            status="attached_location_unknown",
+                            error="AnythingLLM accepted the raw-text record but did not report its document location.",
+                        )
+                    attachment_results.append(attachment)
                     if callable(status_callback):
                         status_callback(
                             f"Attaching prepared records to AnythingLLM: {uploaded}/{len(upload_rows)} accepted",
@@ -12093,6 +12482,8 @@ def maybe_upload_payloads(
                             },
                         )
                 else:
+                    attachment.update(status="rejected", error=f"HTTP {status}")
+                    attachment_results.append(attachment)
                     errors.append({"status": status, "segment": payload.get("metadata", {}).get("chunkSource", "")})
                     record_submission_receipt(
                         submission_receipt_path, payload,
@@ -12102,6 +12493,8 @@ def maybe_upload_payloads(
                         next_check="Inspect the server response and correct the request before an explicit resubmission.",
                     )
             except Exception as exc:
+                attachment.update(status="submission_unknown", error=str(exc))
+                attachment_results.append(attachment)
                 errors.append({"error": str(exc), "segment": payload.get("metadata", {}).get("chunkSource", "")})
                 record_submission_receipt(
                     submission_receipt_path, payload,
@@ -12111,7 +12504,15 @@ def maybe_upload_payloads(
                 )
                 break
 
-        if uploaded > 0 and locations:
+        if errors and uploaded > 0:
+            errors.append(
+                {
+                    "endpoint": "update-embeddings",
+                    "classification": "attachment_batch_incomplete",
+                    "error": "At least one prepared record was not attached; no partial workspace embedding request was submitted.",
+                }
+            )
+        elif uploaded > 0 and locations:
             embedding_update = update_workspace_embeddings_desktop_queue(
                 api_url,
                 api_key,
@@ -12176,6 +12577,7 @@ def maybe_upload_payloads(
         "locations": locations,
         "reused_cached_locations": reused_cached_locations,
         "reused_cached_documents": len(reused_cached_locations),
+        "attachment_results": attachment_results,
         "embedding_update": embedding_update,
         "transport": "raw_text",
         "authentication_mode": authentication_mode,
@@ -12243,6 +12645,7 @@ def maybe_upload_segment_files(
     errors = []
     locations = []
     reused_cached_locations = []
+    attachment_results = []
     embedding_update = {"accepted": 0, "requested": 0, "batch_size": ANYTHINGLLM_EMBEDDING_UPDATE_BATCH_SIZE, "batches": [], "errors": []}
     selected_rows = select_upload_payloads(upload_rows, upload_limit, upload_indices)
     reusable_payloads = []
@@ -12259,14 +12662,31 @@ def maybe_upload_segment_files(
         except OSError:
             text_content = ""
         reusable_payloads.append({"metadata": metadata, "textContent": text_content})
-    reusable_locations = find_reusable_cached_document_locations(storage_dir, reusable_payloads)
+    reusable_locations = find_reusable_cached_document_locations(
+        storage_dir,
+        reusable_payloads,
+        folder_names=[
+            row.get("_anythingllm_folder_name") or folder_name
+            for row in selected_rows
+        ],
+    )
     correlation_id = f"upload-{uuid.uuid4().hex}"
     try:
         for row, reusable_location, reusable_payload in zip(
             selected_rows, reusable_locations, reusable_payloads
         ):
+            attachment = {
+                "filename": str(row.get("filename") or ""),
+                "chunk_source": str(row.get("chunkSource") or ""),
+                "source_path": str(row.get("_automatic_source_path") or ""),
+                "status": "pending",
+                "location": "",
+                "error": "",
+            }
             text_file = Path(row.get("text_file") or "")
             if not text_file.exists():
+                attachment.update(status="missing_upload_file", error=f"Missing upload file: {text_file}")
+                attachment_results.append(attachment)
                 errors.append({"error": f"Missing upload file: {text_file}", "segment": row.get("chunkSource", "")})
                 break
             metadata = reusable_payload["metadata"]
@@ -12289,6 +12709,8 @@ def maybe_upload_segment_files(
                 uploaded += 1
                 locations.append(reusable_location)
                 reused_cached_locations.append(reusable_location)
+                attachment.update(status="reused_cached_location", location=reusable_location)
+                attachment_results.append(attachment)
                 record_submission_receipt(
                     submission_receipt_path, receipt_payload,
                     run_id=run_id, workspace_slug=workspace_slug, transport="file_upload",
@@ -12332,12 +12754,19 @@ def maybe_upload_segment_files(
                     )
                     if location:
                         if storage_dir:
+                            # A grouped Automatic run can carry page-parent
+                            # files from several PDFs.  Keep the destination
+                            # per source row so opting into document folders
+                            # does not collapse every source into one folder.
+                            row_folder_name = row.get("_anythingllm_folder_name") or folder_name
                             location, relocation_error = relocate_uploaded_document(
                                 Path(storage_dir),
                                 location,
-                                folder_name,
+                                row_folder_name,
                             )
                             if relocation_error:
+                                attachment.update(status="relocation_failed", error=relocation_error)
+                                attachment_results.append(attachment)
                                 errors.append(
                                     {
                                         "error": relocation_error,
@@ -12347,6 +12776,13 @@ def maybe_upload_segment_files(
                                 )
                                 break
                         locations.append(location)
+                        attachment.update(status="attached", location=location)
+                    else:
+                        attachment.update(
+                            status="attached_location_unknown",
+                            error="AnythingLLM accepted the file but did not report its document location.",
+                        )
+                    attachment_results.append(attachment)
                     if callable(status_callback):
                         status_callback(
                             f"Attaching page-parent files to AnythingLLM: {uploaded}/{len(selected_rows)} accepted",
@@ -12357,6 +12793,8 @@ def maybe_upload_segment_files(
                             },
                         )
                 else:
+                    attachment.update(status="rejected", error=f"HTTP {status}")
+                    attachment_results.append(attachment)
                     errors.append({"status": status, "segment": row.get("chunkSource", ""), "filename": row.get("filename", "")})
                     record_submission_receipt(
                         submission_receipt_path, receipt_payload,
@@ -12367,6 +12805,8 @@ def maybe_upload_segment_files(
                         next_check="Inspect the server response and correct the request before an explicit resubmission.",
                     )
             except Exception as exc:
+                attachment.update(status="submission_unknown", error=str(exc))
+                attachment_results.append(attachment)
                 errors.append({"error": str(exc), "segment": row.get("chunkSource", ""), "filename": row.get("filename", "")})
                 record_submission_receipt(
                     submission_receipt_path, receipt_payload,
@@ -12377,7 +12817,15 @@ def maybe_upload_segment_files(
                 )
                 break
 
-        if uploaded > 0 and locations:
+        if errors and uploaded > 0:
+            errors.append(
+                {
+                    "endpoint": "update-embeddings",
+                    "classification": "attachment_batch_incomplete",
+                    "error": "At least one prepared record was not attached; no partial workspace embedding request was submitted.",
+                }
+            )
+        elif uploaded > 0 and locations:
             embedding_update = update_workspace_embeddings_desktop_queue(
                 api_url,
                 api_key,
@@ -12438,6 +12886,7 @@ def maybe_upload_segment_files(
         "locations": locations,
         "reused_cached_locations": reused_cached_locations,
         "reused_cached_documents": len(reused_cached_locations),
+        "attachment_results": attachment_results,
         "embedding_update": embedding_update,
         "transport": "file_upload",
         "document_folder_name": sanitize_anythingllm_relative_folder_path(folder_name),
@@ -12714,8 +13163,13 @@ def runtime_validation_query_text(payload, limit=240):
     leaves a meaningful body prefix, score that prefix instead.
     """
     raw_text = str(payload.get("textContent") or "")
+    # PDF extraction often joins a visible heading to the preceding sentence
+    # instead of keeping it at the beginning of a physical line.  Treat a
+    # references heading as a boundary in either representation; otherwise a
+    # bibliography can win the density score and make a perfectly indexed
+    # substantive page look unretrievable in the optional live check.
     body_prefix = re.split(
-        r"(?im)^\s*(?:references|bibliography|works\s+cited)\b",
+        r"(?i)\b(?:references|bibliography|works\s+cited)\b",
         raw_text,
         maxsplit=1,
     )[0]
@@ -12890,7 +13344,7 @@ def validate_anythingllm_native_runtime(
     result = {
         "status": "not_checked",
         "workspace_slug": workspace_slug,
-        "model_gate": read_workspace_model_gate(storage_dir, workspace_slug),
+        "model_configuration": read_workspace_model_configuration(storage_dir, workspace_slug),
         "embedder_probe": embedder_probe,
         "vector_checks": [],
         "vector_recheck_status": "not_needed",
@@ -12902,10 +13356,6 @@ def validate_anythingllm_native_runtime(
         "authentication_mode": "provided_api_key" if api_key else "none",
         "temporary_key_cleanup": {"status": "not_applicable", "error": ""},
     }
-    if result["model_gate"].get("status") != "pass":
-        result["status"] = "blocked_model_gate"
-        return result
-
     runtime_key, authentication_mode = resolve_anythingllm_api_key(api_url, api_key, storage_dir)
     result["authentication_mode"] = authentication_mode
     temporary_key_id = None
@@ -13048,7 +13498,7 @@ def validate_anythingllm_native_runtime(
                     "reset": False,
                 },
                 api_key=runtime_key,
-                timeout_label="DeepSeek chat",
+                timeout_label="AnythingLLM chat",
                 timeout_seconds=45,
                 # Vector retrieval above is the indexing gate. A repeated
                 # timed-out generation call adds up to another 45 seconds and
@@ -13061,8 +13511,8 @@ def validate_anythingllm_native_runtime(
             text_response = chat_data.get("textResponse") or ""
             result["chat_check"] = {
                 "http_status": chat_response["http_status"],
-                "configured_provider": result["model_gate"].get("chat_provider"),
-                "configured_model": result["model_gate"].get("chat_model"),
+                "configured_provider": result["model_configuration"].get("chat_provider"),
+                "configured_model": result["model_configuration"].get("chat_model"),
                 "expected_page": expected["page_number"],
                 "expected_segment": expected["segment_number"],
                 "response_contains_expected_page_segment": response_contains_page_segment(
@@ -13392,11 +13842,21 @@ def inspect_native_metadata_count(
             return result
         table = db.open_table(workspace_namespace)
         columns = [field.name for field in table.schema]
-        if "docSource" not in columns:
+        normalized_source_sha = str(source_sha or "").strip()
+        if normalized_source_sha and "docSource" not in columns:
             result["status"] = "docSource_column_missing"
             return result
-        expected_doc_source = f"local-pdf://sha256/{source_sha}".replace("'", "''")
-        filters = [f"docSource = '{expected_doc_source}'"]
+        # A normal single-PDF observation includes ``source_sha`` as a cheap
+        # additional guard. A grouped submission deliberately spans several
+        # source hashes, so its exact ``chunkSource`` identity set is the
+        # authoritative scope instead. Never manufacture
+        # ``local-pdf://sha256/`` as a filter for that grouped case: it can
+        # match no real document and turn a successful batch into a false
+        # verification failure.
+        filters = []
+        if normalized_source_sha:
+            expected_doc_source = f"local-pdf://sha256/{normalized_source_sha}".replace("'", "''")
+            filters.append(f"docSource = '{expected_doc_source}'")
         normalized_chunk_sources = sorted(
             {
                 str(value).strip()
@@ -13415,6 +13875,10 @@ def inspect_native_metadata_count(
                 for value in normalized_chunk_sources
             )
             filters.append(f"chunkSource IN ({quoted_sources})")
+        elif not filters:
+            result["status"] = "identity_unavailable"
+            result["error"] = "A grouped vector observation requires expected chunkSource identities."
+            return result
         row_filter = " AND ".join(filters)
         result["matching_rows"] = int(table.count_rows(filter=row_filter))
         result["matching_table_names"] = [workspace_namespace] if result["matching_rows"] else []
@@ -13790,6 +14254,15 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
         "upload_chain_local_expected_count": 0,
         "upload_chain_custom_documents_matching_count": 0,
         "upload_chain_lancedb_matching_count": 0,
+        # These counters are scoped to the exact raw-document locations
+        # created by this submission.  Workspace-wide chunkSource identity is
+        # useful for detecting old duplicates, but it cannot tell whether a
+        # newly submitted UUID-suffixed record actually indexed.
+        "current_upload_workspace_document_count": 0,
+        "current_upload_document_vector_count": 0,
+        "current_upload_documents_with_vectors": 0,
+        "current_upload_vector_evidence_complete": None,
+        "current_upload_vector_expanded": False,
         "chunk_survival_ratio": 0.0,
         "chunk_survival_flag": "unknown",
         "identity_set_checked": False,
@@ -13884,6 +14357,64 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
         )
         result["upload_chain_local_expected_count"] = result["expected_payload_count"]
         result["upload_chain_custom_documents_matching_count"] = result["upload_location_matching_files"]
+        # Identify the exact workspace-document rows for this submission by
+        # their freshly generated custom-document paths.  ``chunkSource`` is
+        # deliberately stable across attempts for provenance, so a workspace
+        # can legitimately contain an older matching identity.  Counting that
+        # older row as progress for this attempt made displays such as
+        # "526/386" and kept the final reconciliation waiting for duplicates
+        # that can never disappear on their own.
+        normalized_upload_locations = sorted({
+            str(location or "").replace("\\", "/").lstrip("/")
+            for location in (upload_locations or [])
+            if str(location or "").strip()
+        })
+        current_upload_docs = []
+        if normalized_upload_locations:
+            for offset in range(0, len(normalized_upload_locations), 800):
+                location_slice = normalized_upload_locations[offset:offset + 800]
+                placeholders = ",".join("?" for _ in location_slice)
+                current_upload_docs.extend(
+                    dict(row) for row in cur.execute(
+                        "select docId,filename,docpath,metadata from workspace_documents "
+                        f"where workspaceId = ? and docpath in ({placeholders})",
+                        (workspace_id, *location_slice),
+                    )
+                )
+        result["current_upload_workspace_document_count"] = len(current_upload_docs)
+        current_upload_doc_ids = [
+            row.get("docId") for row in current_upload_docs if row.get("docId")
+        ]
+        current_upload_vector_doc_ids = []
+        for offset in range(0, len(current_upload_doc_ids), 800):
+            doc_id_slice = current_upload_doc_ids[offset:offset + 800]
+            if not doc_id_slice:
+                continue
+            placeholders = ",".join("?" for _ in doc_id_slice)
+            current_upload_vector_doc_ids.extend(
+                row[0] for row in cur.execute(
+                    f"select docId from document_vectors where docId in ({placeholders})",
+                    doc_id_slice,
+                ).fetchall()
+            )
+        result["current_upload_document_vector_count"] = len(current_upload_vector_doc_ids)
+        result["current_upload_documents_with_vectors"] = len(set(current_upload_vector_doc_ids))
+        if normalized_upload_locations:
+            expected_count = result["expected_payload_count"]
+            current_raw_documents_complete = bool(
+                expected_count
+                and result["upload_location_matching_files"] == expected_count
+                and result["current_upload_workspace_document_count"] == expected_count
+                and result["current_upload_documents_with_vectors"] == expected_count
+            )
+            result["current_upload_vector_evidence_complete"] = bool(
+                current_raw_documents_complete
+                and result["current_upload_document_vector_count"] == expected_count
+            )
+            result["current_upload_vector_expanded"] = bool(
+                current_raw_documents_complete
+                and result["current_upload_document_vector_count"] > expected_count
+            )
         matching_docs = []
         for doc in docs:
             haystack = " ".join(str(doc.get(key) or "") for key in ["filename", "docpath", "metadata"])
@@ -14010,6 +14541,16 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
                 result["chunk_survival_flag"] = "partial_or_missing"
         elif result["uploaded_payload_count"] > 0:
             result["chunk_survival_flag"] = "missing_after_upload"
+        if result["current_upload_vector_evidence_complete"]:
+            # This attempt's raw documents each have exactly one linked
+            # document-vector row. Older vectors with the same stable
+            # chunkSource remain useful workspace-cleanup evidence, but must
+            # not be misreported as this upload being re-chunked.
+            result["chunk_survival_ratio"] = 1.0
+            result["chunk_survival_flag"] = (
+                "preserved_current_submission_with_workspace_duplicates"
+                if result["duplicate_chunk_source_count"] else "preserved"
+            )
         identity_provenance_evidence = bool(
             result["identity_set_checked"] and result["identity_set_complete"]
         )
@@ -14028,7 +14569,20 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
         # cancelled/failed embedding batch can leave genuinely retrievable
         # vectors behind.  Report that honestly instead of letting the later
         # document/vector branches call the upload a pass.
-        if result["identity_set_checked"] and not result["identity_set_complete"]:
+        if (
+            result["current_upload_vector_evidence_complete"]
+            and result["identity_set_checked"]
+            and not result["identity_set_complete"]
+        ):
+            result["status"] = "pass_with_review"
+            result["classification"] = "current_batch_exact_workspace_duplicate_identities"
+            result["message"] = (
+                f"This submission indexed {result['current_upload_document_vector_count']}/"
+                f"{result['expected_payload_count']} planned records exactly. The workspace also contains "
+                f"{result['duplicate_chunk_source_count']} older duplicate vector row(s) with the same "
+                "source identities; they are not counted as new progress."
+            )
+        elif result["identity_set_checked"] and not result["identity_set_complete"]:
             result["status"] = "partial_vector_coverage"
             result["classification"] = "page_parent_identity_set_mismatch"
             result["message"] = (
@@ -14162,6 +14716,11 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
             result["message"] += (
                 f" Uploaded payloads expanded from {result['uploaded_payload_count']} to "
                 f"{result['lancedb_matching_rows']} LanceDB row(s), so chunk boundaries likely did not survive intact."
+            )
+        elif result["chunk_survival_flag"] == "preserved_current_submission_with_workspace_duplicates":
+            result["message"] += (
+                " The current submission retained one vector per planned record; the additional rows belong "
+                "to older workspace duplicates and should be cleaned up separately."
             )
         elif result["chunk_survival_flag"] == "preserved":
             result["message"] += (
@@ -14385,6 +14944,181 @@ def workspace_storage_inspector(storage_dir: Path, workspace_slug):
     except Exception as exc:
         result["status"] = "error"
         result["error"] = str(exc)
+    return result
+
+
+def workspace_duplicate_identity_audit(
+    storage_dir: Path,
+    workspace_slug: str,
+    payloads=None,
+    *,
+    sample_limit=20,
+):
+    """Read-only duplicate inventory for one workspace.
+
+    ``chunkSource`` is deliberately stable for a PDF/page identity, so a
+    repeated value is useful evidence of an earlier import.  This helper is
+    intentionally scoped to ``workspace_documents`` plus their linked
+    ``document_vectors`` rows: it never infers that a global LanceDB match
+    belongs to the chosen workspace and it never deletes, rewrites, or
+    re-embeds anything.
+
+    When prepared payloads are supplied, the result additionally states which
+    *complete PDFs* are already indexed.  Callers can safely skip only those
+    complete sources; a partial match remains an advisory and must not turn a
+    new upload into a silently incomplete document.
+    """
+    result: dict[str, Any] = {
+        "status": "not_checked",
+        "workspace_slug": str(workspace_slug or "").strip(),
+        "workspace_found": False,
+        "workspace_document_count": 0,
+        "expected_chunk_source_count": 0,
+        "expected_ready_chunk_source_count": 0,
+        # Private, per-call reconciliation evidence.  Callers may use this
+        # exact set to submit only missing selected records, but must remove it
+        # before persisting a user-facing audit report: a large batch does not
+        # need a second full copy of every identity in its report.
+        "_ready_expected_chunk_sources": [],
+        "expected_missing_chunk_sources": [],
+        "fully_indexed_source_paths": [],
+        "partially_indexed_source_paths": [],
+        "duplicate_identity_count": 0,
+        "duplicate_workspace_document_rows": 0,
+        "duplicate_vector_rows": 0,
+        "duplicate_groups": [],
+        "error": "",
+    }
+    slug = result["workspace_slug"]
+    if not slug:
+        result.update(status="missing_workspace", error="Select a workspace before running a duplicate audit.")
+        return result
+    db_path = Path(storage_dir) / "anythingllm.db"
+    if not db_path.exists():
+        result.update(status="missing_db", error=f"AnythingLLM database was not found at {db_path}.")
+        return result
+
+    def metadata_value(raw_metadata, key):
+        if isinstance(raw_metadata, dict):
+            return str(raw_metadata.get(key) or "").strip()
+        try:
+            parsed = json.loads(str(raw_metadata or ""))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed = {}
+        return str(parsed.get(key) or "").strip() if isinstance(parsed, dict) else ""
+
+    expected_by_source_path = {}
+    for payload in payloads or []:
+        if not isinstance(payload, dict):
+            continue
+        metadata = payload.get("metadata") or {}
+        chunk_source = metadata_value(metadata, "chunkSource")
+        if not chunk_source:
+            continue
+        source_path = str(payload.get("_automatic_source_path") or "").strip()
+        expected_by_source_path.setdefault(source_path, set()).add(chunk_source)
+    expected_sources = set().union(*expected_by_source_path.values()) if expected_by_source_path else set()
+    result["expected_chunk_source_count"] = len(expected_sources)
+
+    con = None
+    try:
+        con = sqlite_readonly_connection(db_path)
+        con.row_factory = sqlite3.Row
+        cur = con.cursor()
+        workspace = cur.execute(
+            "select id from workspaces where slug = ? limit 1", (slug,)
+        ).fetchone()
+        if not workspace:
+            result.update(status="workspace_missing", error=f"Workspace `{slug}` was not found.")
+            return result
+        result["workspace_found"] = True
+        rows = [
+            dict(row)
+            for row in cur.execute(
+                "select docId,filename,docpath,metadata from workspace_documents where workspaceId = ?",
+                (workspace["id"],),
+            )
+        ]
+        result["workspace_document_count"] = len(rows)
+        doc_ids = [str(row.get("docId") or "").strip() for row in rows if str(row.get("docId") or "").strip()]
+        vector_counts = {}
+        for offset in range(0, len(doc_ids), 800):
+            current_ids = doc_ids[offset:offset + 800]
+            if not current_ids:
+                continue
+            placeholders = ",".join("?" for _ in current_ids)
+            for vector_row in cur.execute(
+                f"select docId, count(*) as vector_count from document_vectors where docId in ({placeholders}) group by docId",
+                current_ids,
+            ):
+                vector_counts[str(vector_row["docId"])] = int(vector_row["vector_count"] or 0)
+
+        identity_rows = {}
+        for row in rows:
+            chunk_source = metadata_value(row.get("metadata"), "chunkSource")
+            if not chunk_source:
+                continue
+            entry: dict[str, Any] = {
+                "doc_id": str(row.get("docId") or ""),
+                "filename": str(row.get("filename") or ""),
+                "docpath": str(row.get("docpath") or ""),
+            }
+            entry["vector_count"] = int(vector_counts.get(entry["doc_id"], 0))
+            identity_rows.setdefault(chunk_source, []).append(entry)
+
+        ready_expected_sources = {
+            chunk_source
+            for chunk_source in expected_sources
+            if any(int(entry.get("vector_count") or 0) > 0 for entry in identity_rows.get(chunk_source, []))
+        }
+        result["expected_ready_chunk_source_count"] = len(ready_expected_sources)
+        result["_ready_expected_chunk_sources"] = sorted(ready_expected_sources)
+        result["expected_missing_chunk_sources"] = sorted(expected_sources - ready_expected_sources)[:sample_limit]
+        for source_path, source_chunk_sources in expected_by_source_path.items():
+            if source_chunk_sources and source_chunk_sources <= ready_expected_sources:
+                result["fully_indexed_source_paths"].append(source_path)
+            elif source_chunk_sources & ready_expected_sources:
+                result["partially_indexed_source_paths"].append(source_path)
+
+        duplicate_groups = []
+        for chunk_source, entries in identity_rows.items():
+            if len(entries) < 2:
+                continue
+            vector_rows = sum(int(entry.get("vector_count") or 0) for entry in entries)
+            duplicate_groups.append(
+                {
+                    "chunk_source": chunk_source,
+                    "workspace_document_rows": len(entries),
+                    "vector_rows": vector_rows,
+                    "filenames": sorted({entry["filename"] for entry in entries if entry["filename"]})[:4],
+                    "docpaths": sorted({entry["docpath"] for entry in entries if entry["docpath"]})[:4],
+                    # The review UI needs enough immutable provenance to let
+                    # an operator locate a duplicate through AnythingLLM's
+                    # own document-management surface.  This is inventory
+                    # data only; no consumer is authorized to delete from it.
+                    "document_rows": sorted(
+                        entries,
+                        key=lambda entry: (-int(entry.get("vector_count") or 0), entry.get("doc_id") or ""),
+                    ),
+                }
+            )
+        duplicate_groups.sort(key=lambda group: (-group["vector_rows"], group["chunk_source"]))
+        result["duplicate_identity_count"] = len(duplicate_groups)
+        result["duplicate_workspace_document_rows"] = sum(
+            max(0, int(group["workspace_document_rows"]) - 1) for group in duplicate_groups
+        )
+        result["duplicate_vector_rows"] = sum(
+            max(0, int(group["vector_rows"]) - 1) for group in duplicate_groups
+        )
+        result["duplicate_groups"] = duplicate_groups[:sample_limit]
+        result["status"] = "complete"
+    except (sqlite3.OperationalError, OSError) as exc:
+        result.update(status="inspection_unavailable", error=str(exc))
+    except Exception as exc:
+        result.update(status="error", error=str(exc))
+    finally:
+        if con is not None:
+            con.close()
     return result
 
 
@@ -15251,7 +15985,15 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             else:
                 candidate_detected_end_page = candidate_end_detected["page"] if candidate_end_detected else None
             include_back_matter = bool(getattr(args, "include_back_matter", False))
-            candidate_end_page = None if include_back_matter else candidate_detected_end_page
+            # An explicit final-page selection is a hard user boundary.  It
+            # must take precedence over the broader "include back matter"
+            # option; otherwise the UI can accept an end-page override and
+            # silently process every remaining page.
+            candidate_end_page = (
+                candidate_detected_end_page
+                if end_page_override > 0
+                else (None if include_back_matter else candidate_detected_end_page)
+            )
             raw_quality = extraction_quality(pages, stats, 1, None)
             if shared_boundary_reference:
                 start_page = int(shared_boundary_reference["start_page"])
@@ -15992,12 +16734,24 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
 
     metadata_artifact_started = time.perf_counter()
     metadata_dir = out_root / "metadata-api"
-    lean_retention = bool(getattr(args, "lean_retention", False))
+    requested_lean_retention = bool(getattr(args, "lean_retention", False))
+    # Automatic native uploads stage every PDF locally and submit their plans
+    # together only after the final PDF has finished. A per-PDF compacting
+    # pass would first suppress raw-text plan materialization and then remove
+    # ``metadata-api`` before that shared submission can read it. Keep the
+    # plans and source files intact until the outer batch has made its upload
+    # and verification decision.
+    defer_lean_retention = bool(getattr(args, "defer_lean_retention", False))
+    lean_retention = requested_lean_retention and not defer_lean_retention
     requested_upload_transport = getattr(args, "native_upload_transport", "raw_text")
     materialize_metadata_artifacts = not lean_retention or requested_upload_transport == "file_upload"
     report_upload_phase(
         "payloads",
-        "Preparing native upload payloads" if lean_retention else "Generating native metadata payloads and test kit",
+        (
+            "Preparing native upload records"
+            if lean_retention
+            else "Preparing upload records and verification files"
+        ),
         completed_units=0,
         total_units=1,
         fallback_fraction=metadata_progress,
@@ -16056,7 +16810,15 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     else:
         native_test_kit = {"files_dir": "", "upload_plan": "", "checklist": "", "file_count": 0}
         native_probe_kit = {"files_dir": "", "upload_plan": "", "checklist": "", "file_count": 0}
-    edge_case_report = evaluate_edge_cases(profile, selected, selected_dir, native_payloads)
+    edge_case_report = evaluate_edge_cases(
+        profile,
+        selected,
+        selected_dir,
+        native_payloads,
+        inline_fallback_required=bool(
+            getattr(args, "inline_fallback_required", False)
+        ),
+    )
     write_csv(out_root / "edge-case-results.csv", edge_case_report["rows"])
     (out_root / "edge-case-report.html").write_text(build_edge_case_html(edge_case_report), encoding="utf-8")
     write_json(out_root / "edge-case-summary.json", {k: v for k, v in edge_case_report.items() if k != "rows"})
@@ -16119,7 +16881,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             }
         inspection_steps = [
             ("Reading local AnythingLLM storage baseline", "storage_report", lambda: inspect_anythingllm_storage(storage_dir)),
-            ("Reading workspace model configuration", "workspace_gate", lambda: read_workspace_model_gate(storage_dir, target_workspace_slug)),
+            ("Reading workspace model configuration", "workspace_configuration", lambda: read_workspace_model_configuration(storage_dir, target_workspace_slug)),
             ("Reading AnythingLLM metadata schema", "metadata_schema_report", lambda: get_anythingllm_metadata_schema(
                 (args.anythingllm_api_url or "").strip(), args.anythingllm_api_key,
             )),
@@ -16148,7 +16910,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 )
     author_eval = dict(global_reads.get("author_eval") or {})
     storage_report = dict(global_reads.get("storage_report") or {"status": "not_available"})
-    workspace_gate = dict(global_reads.get("workspace_gate") or {"status": "not_available"})
+    workspace_configuration = dict(global_reads.get("workspace_configuration") or {"status": "not_available"})
     metadata_schema_report = dict(global_reads.get("metadata_schema_report") or {"status": "not_available"})
     workspace_layer_report = dict(global_reads.get("workspace_layer_report") or {"status": "not_available"})
     metadata_schema = metadata_schema_report.get("schema")
@@ -16162,19 +16924,18 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         author_eval["reused_from_batch"] = True
         author_eval["source_package"] = str((inspection_context.get("inspection_dirs") or [""])[0])
     write_json(inspection_dir / "lancedb-before.json", storage_report)
-    write_json(inspection_dir / "workspace-model-gate.json", workspace_gate)
+    write_json(inspection_dir / "workspace-model-configuration.json", workspace_configuration)
     write_csv(
-        inspection_dir / "workspace-model-gate.csv",
+        inspection_dir / "workspace-model-configuration.csv",
         [
             {
-                "status": workspace_gate.get("status"),
-                "workspace_slug": workspace_gate.get("workspace_slug"),
-                "workspace_name": workspace_gate.get("workspace_name"),
-                "chat_provider": workspace_gate.get("chat_provider"),
-                "chat_model": workspace_gate.get("chat_model"),
-                "deepseek_like": workspace_gate.get("deepseek_like"),
-                "blocked_terms_present": workspace_gate.get("blocked_terms_present"),
-                "message": workspace_gate.get("message"),
+                "status": workspace_configuration.get("status"),
+                "workspace_slug": workspace_configuration.get("workspace_slug"),
+                "workspace_name": workspace_configuration.get("workspace_name"),
+                "chat_provider": workspace_configuration.get("chat_provider"),
+                "chat_model": workspace_configuration.get("chat_model"),
+                "chat_model_configured": workspace_configuration.get("chat_model_configured"),
+                "message": workspace_configuration.get("message"),
             }
         ],
     )
@@ -16279,7 +17040,37 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 pass
 
     payloads_to_upload = []
-    upload_representation = getattr(args, "native_upload_representation", "segments")
+    requested_upload_representation = getattr(args, "native_upload_representation", "segments")
+    upload_representation = requested_upload_representation
+    # ``page_parents`` normally provides the clearest page-level identity.
+    # It is unsafe when a source page already exceeds the active splitter
+    # ceiling: Desktop will silently re-chunk that parent, duplicate its
+    # chunkSource identity, and make exact batch reconciliation impossible.
+    # The selected child segments are already page-local and ceiling-bounded,
+    # so switch only those affected documents to segment records. This keeps
+    # page parents for ordinary pages while making "Page - preserve
+    # automatically" honour its promise to subdivide oversized pages.
+    parent_units_over_limit = int(
+        next(
+            (
+                row.get("units_exceeding_effective_limit", 0)
+                for row in harmonization_report_rows
+                if str(row.get("representation") or "") == "page_parents"
+            ),
+            0,
+        )
+        or 0
+    )
+    upload_representation_adjustment = {}
+    if upload_representation == "page_parents" and parent_units_over_limit:
+        upload_representation = "segments"
+        upload_representation_adjustment = {
+            "applied": True,
+            "requested": "page_parents",
+            "effective": "segments",
+            "reason": "page_parent_exceeds_effective_splitter_limit",
+            "oversized_page_parent_units": parent_units_over_limit,
+        }
     requested_upload_transport = getattr(args, "native_upload_transport", "raw_text")
     # Keep legacy callers that do not yet provide this option compatible with
     # the Desktop 1.15 Documents drawer: it only enumerates direct children of
@@ -17634,7 +18425,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 else "not_checked_no_upload"
             ),
             "workspace_slug": target_workspace_slug,
-            "model_gate": workspace_gate,
+            "model_configuration": workspace_configuration,
             "vector_checks": [],
             "chat_check": {},
             "authentication_mode": "not_applicable",
@@ -17772,7 +18563,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         chat_check = runtime_validation_report["chat_check"]
         runtime_rows.append(
             {
-                "check": "deepseek_chat_page_segment",
+                "check": "chat_page_segment",
                 "status": (
                     "pass"
                     if chat_check.get("response_contains_expected_page_segment")
@@ -17801,7 +18592,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         candidates,
         storage_report,
         upload_report,
-        workspace_gate,
+        workspace_configuration,
         post_upload_report,
         metadata_schema_report,
         runtime_validation_report,
@@ -17923,7 +18714,12 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         },
         "end_matter": {
             "starts_at_pdf_page": selected.get("detected_end_page"),
-            "included_in_primary_output": bool(selected.get("include_back_matter")),
+            # ``include_back_matter`` records the broad preference, while an
+            # explicit end-page override can narrow this particular run.
+            # Report the effective output, not only the preference.
+            "included_in_primary_output": bool(
+                selected.get("include_back_matter") and selected.get("end_page") is None
+            ),
             "effective_selected_end_page": selected.get("end_page"),
             "heading": selected.get("end_heading") or "",
             "source": selected.get("end_source") or "",
@@ -17936,7 +18732,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             ),
             "excluded_end_range": (
                 f"{selected.get('detected_end_page')}-{profile.get('pdf_page_count')}"
-                if selected.get("detected_end_page") and not selected.get("include_back_matter")
+                if selected.get("detected_end_page") and selected.get("end_page") is not None
                 else "none"
             ),
         },
@@ -17992,7 +18788,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         inspection_dir / "author-inference-evaluation.json",
         inspection_dir / "anythingllm-metadata-schema.json",
         inspection_dir / "native-metadata-storage-report.csv",
-        inspection_dir / "workspace-model-gate.csv",
+        inspection_dir / "workspace-model-configuration.csv",
         inspection_dir / "post-upload-verification.csv",
         inspection_dir / "anythingllm-runtime-validation.csv",
         inspection_dir / "anythingllm-runtime-validation.json",
@@ -18032,9 +18828,23 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     summary = {
         "output_root": str(out_root),
         "source_sha256": profile.get("source_sha256", ""),
+        # Keep the resolved source identity in the worker summary. The batch
+        # runner needs this exact post-preparation evidence to prove that one
+        # PDF's detected metadata never became another PDF's page-parent base.
+        "detected_title": profile.get("detected_title", ""),
+        "detected_author": profile.get("detected_author", ""),
+        "source_short_label": profile.get("source_short_label", ""),
+        "metadata_provenance": dict(profile.get("metadata_provenance") or {}),
         "total_pipeline_seconds": round(time.perf_counter() - total_started, 2),
         "readiness_status": selected["readiness_status"],
         "readiness_reasons": selected["readiness_reasons"],
+        # The Automatic UI stages workers before its one shared Desktop queue
+        # request. Preserve the worker's upload policy and exact selected
+        # record scope so the outer submission cannot accidentally upload a
+        # held OCR document or expand a Custom Range back to the full PDF.
+        "batch_upload_blocked_reason": selected.get("upload_blocked_reason", ""),
+        "batch_upload_limit": int(getattr(args, "upload_limit", 0) or 0),
+        "batch_upload_indices": list(upload_indices),
         "vector_validation_status": selected["vector_validation_status"],
         "vector_error_detail": selected.get("vector_error_detail", ""),
         "vector_eval_seconds": selected.get("vector_eval_seconds", 0),
@@ -18079,6 +18889,8 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         "page_parent_units_exceeding_effective_limit": parent_harmonization.get("units_exceeding_effective_limit", 0),
         "segment_harmonization_risk": segment_harmonization.get("harmonization_risk", ""),
         "page_parent_harmonization_risk": parent_harmonization.get("harmonization_risk", ""),
+        "native_upload_representation_requested": requested_upload_representation,
+        "native_upload_representation_adjustment": upload_representation_adjustment,
         "marker_char_ratio": selected.get("marker_stats", {}).get("marker_char_ratio"),
         "avg_content_chars": selected.get("marker_stats", {}).get("avg_content_chars"),
         "outline_reliability": selected.get("outline_validation", {}).get("reliability"),
@@ -18146,6 +18958,17 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         "metadata_payloads": str(metadata_dir / "raw-text-payloads-native-header.jsonl"),
         "page_parent_metadata_payloads": str(metadata_dir / "raw-text-payloads-page-parents-native-header.jsonl"),
         "page_parent_upload_plan": str(metadata_dir / "page-parent-upload-plan.csv"),
+        # The selected representation may be page parents or individual
+        # segments.  Automatic grouped uploads consume this exact plan after
+        # every PDF has been staged, instead of rediscovering files by name.
+        "native_upload_plan": str(
+            metadata_dir
+            / (
+                "page-parent-upload-plan.csv"
+                if upload_representation == "page_parents"
+                else "upload-plan.csv"
+            )
+        ),
         "native_upload_representation": upload_representation,
         "native_upload_transport": upload_transport,
         "storage_inspection_status": storage_report.get("status"),
@@ -18215,8 +19038,8 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         "edge_case_warnings": edge_case_report.get("warnings"),
         "native_test_kit": native_test_kit,
         "native_probe_kit": native_probe_kit,
-        "workspace_model_gate_status": workspace_gate.get("status"),
-        "workspace_model_gate_message": workspace_gate.get("message"),
+        "workspace_model_configuration_status": workspace_configuration.get("status"),
+        "workspace_model_configuration_message": workspace_configuration.get("message"),
         "post_upload_verification_status": post_upload_report.get("status"),
         "post_upload_classification": post_upload_report.get("classification"),
         "post_upload_matching_workspace_documents": post_upload_report.get(
@@ -18337,11 +19160,18 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         "diagnostics_csv": str(out_root / "diagnostics.csv"),
         "diagnostic_error_count": sum(1 for row in diagnostics if row["severity"] == "error"),
         "diagnostic_warning_count": sum(1 for row in diagnostics if row["severity"] == "warning"),
-        "workspace_model_gate": str(inspection_dir / "workspace-model-gate.csv"),
+        "workspace_model_configuration": str(inspection_dir / "workspace-model-configuration.csv"),
         "post_upload_verification": str(inspection_dir / "post-upload-verification.csv"),
     }
     write_json(out_root / "run-summary.json", summary)
-    if bool(getattr(args, "flat_output_without_logs", False)):
+    if defer_lean_retention and requested_lean_retention:
+        summary["lean_retention"] = {
+            "applied": False,
+            "deferred": True,
+            "reason": "awaiting_shared_automatic_batch_upload",
+        }
+        write_json(out_root / "run-summary.json", summary)
+    elif bool(getattr(args, "flat_output_without_logs", False)):
         summary["lean_retention"] = retain_successful_run_without_logs(
             out_root,
             summary,
@@ -18476,6 +19306,21 @@ def output_capacity_preflight(pdf_path: Path, out_root: Path, safety_reserve_byt
             else f"Insufficient free space at {out_root}: need {required:,} bytes, found {usage.free:,} bytes."
         ),
     }
+
+
+def create_fresh_cli_run_root(base_output: Path, *, timestamp: str | None = None) -> Path:
+    """Create one exclusive CLI batch root without merging concurrent launches."""
+    base = Path(base_output)
+    stamp = timestamp or datetime.now().strftime("%Y%m%d-%H%M%S")
+    for suffix in range(10_000):
+        name = f"run-{stamp}" if suffix == 0 else f"run-{stamp}-{suffix}"
+        candidate = base / name
+        try:
+            candidate.mkdir(parents=True, exist_ok=False)
+            return candidate
+        except FileExistsError:
+            continue
+    raise OSError(f"Could not allocate a unique CLI run directory below {base}")
 
 
 def discover_pdfs(input_path: Path):
@@ -18656,9 +19501,7 @@ def main():
     input_path = Path(args.input)
     default_out = application_paths()["automatic_outputs"]
     base_out = Path(args.out_dir) if args.out_dir else default_out
-    run_stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    run_root = base_out / f"run-{run_stamp}"
-    run_root.mkdir(parents=True, exist_ok=True)
+    run_root = create_fresh_cli_run_root(base_out)
 
     summaries = []
     for pdf in discover_pdfs(input_path):

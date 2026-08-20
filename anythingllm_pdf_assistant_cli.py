@@ -9,6 +9,8 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
+import threading
 from pathlib import Path
 
 from portable_paths import application_paths, ensure_application_directories, package_resource_path
@@ -17,6 +19,9 @@ from portable_paths import application_paths, ensure_application_directories, pa
 SERVER_MARKER_NAME = "localhost-server.json"
 START_SHORTCUT_NAME = "Start AnythingLLM PDF Assistant.lnk"
 STOP_SHORTCUT_NAME = "Stop AnythingLLM PDF Assistant.lnk"
+POWERSHELL_COMMAND_TIMEOUT_SECONDS = 15
+BRIDGE_COMMAND_TIMEOUT_SECONDS = 120
+_SERVER_MARKER_WRITE_LOCK = threading.Lock()
 
 
 def _port_is_available(port: int) -> bool:
@@ -56,20 +61,39 @@ def _server_marker_path() -> Path:
 
 def _write_server_marker(port: int) -> Path:
     marker = _server_marker_path()
-    temporary = marker.with_suffix(marker.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(
-            {
-                "pid": os.getpid(),
-                "port": int(port),
-                "executable": str(Path(sys.executable).resolve()),
-                "command": "anythingllm-pdf-assistant start",
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-    temporary.replace(marker)
+    payload = {
+        "pid": os.getpid(),
+        "port": int(port),
+        "executable": str(Path(sys.executable).resolve()),
+        "command": "anythingllm-pdf-assistant start",
+    }
+    # A fixed ``.tmp`` name allowed two shortcut launches to clobber each
+    # other's marker staging file. The marker is the ownership boundary for
+    # Stop, so publish it only after one complete, durable write.
+    with _SERVER_MARKER_WRITE_LOCK:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=marker.parent,
+                prefix=f".{marker.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temporary = Path(handle.name)
+                json.dump(payload, handle, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, marker)
+            temporary = None
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
     return marker
 
 
@@ -90,18 +114,22 @@ def _desktop_directory() -> Path:
     powershell = _powershell()
     if sys.platform != "win32" or not powershell:
         raise RuntimeError("Desktop shortcuts are supported on Windows with PowerShell.")
-    result = subprocess.run(
-        [
-            powershell,
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "[Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory)",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            [
+                powershell,
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory)",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=POWERSHELL_COMMAND_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"Windows Desktop-folder lookup did not complete: {exc}") from exc
     desktop = Path(result.stdout.strip()) if result.returncode == 0 and result.stdout.strip() else None
     if desktop is None:
         raise RuntimeError("Windows did not return a usable Desktop folder.")
@@ -173,13 +201,17 @@ def _write_windows_shortcut(path: Path, arguments: str, icon_path: Path, descrip
             "$shortcut.Save()",
         ]
     )
-    result = subprocess.run(
-        [powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            [powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=POWERSHELL_COMMAND_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"PowerShell did not create the shortcut before the timeout: {exc}") from exc
     if result.returncode != 0 or not path.is_file():
         detail = (result.stderr or result.stdout or "PowerShell did not create the shortcut.").strip()
         raise RuntimeError(detail)
@@ -238,24 +270,39 @@ def _stop() -> int:
     # can pass the string literal and ``+ $env:...`` as separate arguments,
     # making the owned-server check falsely reject the very CLI process that
     # wrote the marker.
-    observed = subprocess.run(
-        [
-            powershell,
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "(Get-CimInstance Win32_Process -Filter ('ProcessId = ' + $env:ANYTHINGLLM_SERVER_PID)).CommandLine",
-        ],
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        observed = subprocess.run(
+            [
+                powershell,
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "(Get-CimInstance Win32_Process -Filter ('ProcessId = ' + $env:ANYTHINGLLM_SERVER_PID)).CommandLine",
+            ],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=POWERSHELL_COMMAND_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"Could not verify the owned local PDF assistant server: {exc}", file=sys.stderr)
+        return 1
     command_line = observed.stdout.casefold()
     if not any(token in command_line for token in ("anythingllm_pdf_assistant_cli", "anythingllm-pdf-assistant")):
         print("The recorded process is no longer the owned PDF assistant server; refusing to stop it.", file=sys.stderr)
         return 1
-    stopped = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True, check=False)
+    try:
+        stopped = subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            capture_output=True,
+            text=True,
+            timeout=POWERSHELL_COMMAND_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"Could not stop the owned local PDF assistant server: {exc}", file=sys.stderr)
+        return 1
     if stopped.returncode != 0:
         print((stopped.stderr or stopped.stdout or "Could not stop the local server.").strip(), file=sys.stderr)
         return 1
@@ -305,7 +352,11 @@ def _bridge(action: str, resources_path: str) -> int:
         command.append("-Uninstall")
     elif action == "upgrade":
         command.append("-Upgrade")
-    return subprocess.run(command, check=False).returncode
+    try:
+        return subprocess.run(command, timeout=BRIDGE_COMMAND_TIMEOUT_SECONDS, check=False).returncode
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"AnythingLLM Desktop refresh bridge did not complete: {exc}", file=sys.stderr)
+        return 1
 
 
 def build_parser() -> argparse.ArgumentParser:

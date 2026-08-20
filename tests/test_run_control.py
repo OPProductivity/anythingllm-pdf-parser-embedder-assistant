@@ -3,6 +3,7 @@ import sqlite3
 from types import SimpleNamespace
 
 import pytest
+import run_control
 
 from orchestration import (
     build_phase_timing_breakdown,
@@ -11,7 +12,12 @@ from orchestration import (
     legacy_summary_from_run,
 )
 from anythingllm_state import resolve_state
-from post_upload_polling import PollingPolicy, operator_status, poll_post_upload
+from post_upload_polling import (
+    MINIMUM_POLL_INTERVAL_SECONDS,
+    PollingPolicy,
+    operator_status,
+    poll_post_upload,
+)
 from preflight import validate_planned_path
 from run_control import RunRecorder, RunResult
 from segmentation_policy import policy_for
@@ -35,6 +41,38 @@ def test_run_recorder_persists_success_and_failure_evidence(tmp_path):
     assert final.stages["state_resolution"].status == "failed"
     assert checkpoint["status"] == "error"
     assert (tmp_path / "run-checkpoints.jsonl").exists()
+
+
+def test_recovery_json_write_failure_preserves_last_valid_checkpoint(tmp_path, monkeypatch):
+    path = tmp_path / "run-checkpoint.json"
+    run_control.atomic_write_json(path, {"status": "running"})
+    monkeypatch.setattr(run_control.os, "replace", lambda *_args: (_ for _ in ()).throw(OSError("disk full")))
+
+    with pytest.raises(OSError, match="disk full"):
+        run_control.atomic_write_json(path, {"status": "finished"})
+
+    assert json.loads(path.read_text(encoding="utf-8")) == {"status": "running"}
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_recovery_json_writer_retries_a_transient_windows_sharing_violation(tmp_path, monkeypatch):
+    path = tmp_path / "run-checkpoint.json"
+    original_replace = run_control.os.replace
+    attempts = {"count": 0}
+
+    def flaky_replace(source, target):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise PermissionError("temporary sharing violation")
+        return original_replace(source, target)
+
+    monkeypatch.setattr(run_control.os, "replace", flaky_replace)
+    monkeypatch.setattr(run_control.time, "sleep", lambda _seconds: None)
+
+    run_control.atomic_write_json(path, {"status": "finished"})
+
+    assert attempts["count"] == 2
+    assert json.loads(path.read_text(encoding="utf-8")) == {"status": "finished"}
 
 
 def test_preflight_uses_4096_fallback_and_blocks_excessive_request():
@@ -214,7 +252,7 @@ def test_polling_accumulates_evidence_until_pass():
 def test_polling_policy_clamps_timeout_and_sleep_cadence():
     policy = PollingPolicy.from_values(interval_seconds=-2, timeout_seconds=120, hard_cap_seconds=45)
 
-    assert policy.interval_seconds == 0
+    assert policy.interval_seconds == MINIMUM_POLL_INTERVAL_SECONDS
     assert policy.timeout_seconds == 45
     assert policy.hard_cap_seconds == 45
 
@@ -240,6 +278,39 @@ def test_polling_policy_clamps_timeout_and_sleep_cadence():
     assert result.status == "timeout"
     assert result.elapsed_seconds == 12
     assert sleeps == [10, 2]
+
+
+def test_polling_zero_or_nonfinite_cadence_never_spins_tightly():
+    policy = PollingPolicy.from_values(
+        interval_seconds=0,
+        timeout_seconds=float("inf"),
+        hard_cap_seconds=float("nan"),
+    )
+    assert policy.interval_seconds == MINIMUM_POLL_INTERVAL_SECONDS
+    assert policy.timeout_seconds == 60
+    assert policy.hard_cap_seconds == 90
+
+    clock = {"value": 0.0}
+    sleeps = []
+
+    def monotonic():
+        return clock["value"]
+
+    def sleeper(seconds):
+        sleeps.append(seconds)
+        clock["value"] += seconds
+
+    result = poll_post_upload(
+        lambda: {"status": "partial_vector_coverage"},
+        interval_seconds=0,
+        timeout_seconds=0.15,
+        monotonic=monotonic,
+        sleeper=sleeper,
+        retryable_evidence_codes={"partial_vector_coverage"},
+    )
+
+    assert result.status == "timeout"
+    assert sleeps == pytest.approx([MINIMUM_POLL_INTERVAL_SECONDS] * 2 + [0.05])
 
 
 def test_polling_maps_technical_review_status_to_operator_status():
@@ -327,6 +398,19 @@ def test_polling_retains_success_when_observation_callback_fails():
         }
     ]
     assert result.to_dict()["observer_failures"] == result.observer_failures
+
+
+def test_polling_returns_durable_error_evidence_when_storage_inspector_raises():
+    result = poll_post_upload(
+        lambda: (_ for _ in ()).throw(OSError("LanceDB is temporarily unavailable")),
+        interval_seconds=0,
+        timeout_seconds=1,
+    )
+
+    assert result.status == "error"
+    assert result.attempts == 1
+    assert result.final_evidence["inspection_exception_type"] == "OSError"
+    assert "temporarily unavailable" in result.final_evidence["inspection_error"]
 
 
 def test_common_facade_returns_run_result_and_legacy_summary(tmp_path):

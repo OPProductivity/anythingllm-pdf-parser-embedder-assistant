@@ -18,7 +18,7 @@ from pathlib import Path
 from anythingllm_compatibility import characterize
 from anythingllm_state import resolve_state
 from preflight import validate_planned_path
-from run_control import RunRecorder, RunResult
+from run_control import RunRecorder, RunResult, atomic_write_json
 from segmentation_policy import policy_for
 from validation_contract import evidence_layers_succeeded
 
@@ -107,7 +107,7 @@ def persist_phase_timing_breakdown(output: Path, breakdown: dict):
     if not isinstance(stored, dict):
         return
     stored["phase_timing"] = breakdown
-    summary_path.write_text(json.dumps(stored, indent=2, ensure_ascii=False), encoding="utf-8")
+    atomic_write_json(summary_path, stored)
 
 
 def compact_ready_run_control(output: Path, result: RunResult, summary: dict):
@@ -135,7 +135,10 @@ def compact_ready_run_control(output: Path, result: RunResult, summary: dict):
         "total_elapsed_seconds": result.total_elapsed_seconds,
         "orchestration_status": result.status,
     }
-    summary_path.write_text(json.dumps(compact, indent=2, ensure_ascii=False), encoding="utf-8")
+    # Only remove the richer recovery files after the merged summary is safely
+    # on disk. A direct write here could turn a ready run into an unrecoverable
+    # partial summary during a crash or short Windows file-sharing failure.
+    atomic_write_json(summary_path, compact)
     for name in ("run-checkpoint.json", "run-checkpoints.jsonl", "run-result.json"):
         (output / name).unlink(missing_ok=True)
 

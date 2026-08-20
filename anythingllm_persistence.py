@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
+import tempfile
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -13,6 +16,7 @@ from anythingllm_compatibility import characterize
 
 ENV_SECRET_MARKERS = ("KEY", "SECRET", "TOKEN", "PASSWORD")
 SQLITE_SETTINGS = {"text_splitter_chunk_size", "text_splitter_chunk_overlap"}
+ENVIRONMENT_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _now():
@@ -25,13 +29,67 @@ def _read_env_lines(path):
 
 def _env_value(text, key):
     match = re.search(rf"^\s*{re.escape(key)}\s*=\s*(.*)$", text, re.MULTILINE)
-    return match.group(1).strip().strip("'\"") if match else None
+    if not match:
+        return None
+    value = match.group(1).strip()
+    if len(value) >= 2 and value[0] == "'" and value[-1] == "'":
+        return value[1:-1]
+    if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+        try:
+            decoded = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return value[1:-1]
+        return decoded if isinstance(decoded, str) else value[1:-1]
+    return value
 
 
 def _redacted_value(key, value):
     if any(marker in key.upper() for marker in ENV_SECRET_MARKERS):
         return {"present": bool(value), "value": None}
     return {"present": value is not None, "value": value}
+
+
+def _validated_environment_assignment(key, value):
+    normalized_key = str(key or "").strip()
+    normalized_value = str(value)
+    if not ENVIRONMENT_KEY_PATTERN.fullmatch(normalized_key):
+        raise ValueError(f"Unsupported environment setting name: {key!r}")
+    if "\r" in normalized_value or "\n" in normalized_value:
+        raise ValueError("Environment setting values must be single-line.")
+    return normalized_key, normalized_value
+
+
+def _environment_assignment_line(key, value):
+    """Encode one .env scalar without allowing quotes to corrupt its line."""
+    return f"{key}={json.dumps(value, ensure_ascii=False)}"
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Replace a settings artifact only after its full UTF-8 content is durable."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            delete=False,
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 class AnythingLLMPersistenceAdapter:
@@ -58,7 +116,11 @@ class AnythingLLMPersistenceAdapter:
         env_values = {key: _redacted_value(key, _env_value(env_text, key)) for key in env_keys}
         sqlite_values = {}
         if sqlite_labels:
-            con = sqlite3.connect(f"file:{self.storage / 'anythingllm.db'}?mode=ro", uri=True)
+            con = sqlite3.connect(
+                f"file:{self.storage / 'anythingllm.db'}?mode=ro",
+                uri=True,
+                timeout=1.0,
+            )
             try:
                 for label in sqlite_labels:
                     row = con.execute("select value from system_settings where label=?", (label,)).fetchone()
@@ -75,19 +137,25 @@ class AnythingLLMPersistenceAdapter:
             "sqlite": sqlite_values,
         }
         self.snapshot_dir.mkdir(parents=True, exist_ok=True)
-        path = self.snapshot_dir / "anythingllm-settings-snapshot-before.json"
-        path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        # Each mutation needs an immutable restoration point. A fixed filename
+        # used to overwrite the snapshot from an earlier setting change in the
+        # same run, making a full rollback impossible.
+        path = self.snapshot_dir / f"anythingllm-settings-snapshot-{uuid.uuid4().hex}.json"
+        _atomic_write_text(path, json.dumps(payload, indent=2, ensure_ascii=False))
         return path
 
     def write_env_setting(self, key, value, reason="operator_requested_change"):
         self._require("can_write_env_settings")
+        key, value = _validated_environment_assignment(key, value)
         snapshot = self.snapshot(env_keys=[key], reason=reason)
         path = self.storage / ".env"
         original = _read_env_lines(path)
-        replacement = f"{key}='{value}'"
+        replacement = _environment_assignment_line(key, value)
         pattern = re.compile(rf"^\s*{re.escape(key)}\s*=.*$", re.MULTILINE)
-        updated = pattern.sub(replacement, original, count=1) if pattern.search(original) else original.rstrip() + "\n" + replacement + "\n"
-        path.write_text(updated, encoding="utf-8")
+        updated = pattern.sub(lambda _match: replacement, original, count=1) if pattern.search(original) else original.rstrip() + "\n" + replacement + "\n"
+        _atomic_write_text(path, updated)
+        if _env_value(_read_env_lines(path), key) != value:
+            raise RuntimeError(f"Write verification failed for {key}")
         return {"status": "verified", "snapshot": str(snapshot), "key": key, "restart_likely_required": True}
 
     def write_sqlite_setting(self, label, value, reason="operator_requested_change"):
@@ -95,7 +163,7 @@ class AnythingLLMPersistenceAdapter:
             raise ValueError(f"Unsupported guarded SQLite setting: {label}")
         self._require("can_write_sqlite_settings")
         snapshot = self.snapshot(sqlite_labels=[label], reason=reason)
-        con = sqlite3.connect(self.storage / "anythingllm.db")
+        con = sqlite3.connect(self.storage / "anythingllm.db", timeout=1.0)
         try:
             row = con.execute("select value from system_settings where label=?", (label,)).fetchone()
             if row:
@@ -113,19 +181,56 @@ class AnythingLLMPersistenceAdapter:
     def restore(self, snapshot_path):
         self._require("can_restore_snapshotted_settings")
         payload = json.loads(Path(snapshot_path).read_text(encoding="utf-8"))
-        restored = {"env": [], "sqlite": []}
+        restored = {"env": [], "sqlite": [], "skipped_env": []}
+        env_updates = []
+        env_removals = []
         for key, record in payload.get("env", {}).items():
-            if record.get("value") is None:
+            if not isinstance(record, dict):
+                restored["skipped_env"].append(str(key))
                 continue
+            if record.get("value") is None:
+                # A redacted secret that existed cannot be restored because
+                # its value intentionally never enters the snapshot. An
+                # originally absent key, however, has an exact safe restore:
+                # remove the assignment written after the snapshot.
+                if record.get("present") is False:
+                    try:
+                        key, _ = _validated_environment_assignment(key, "")
+                    except (KeyError, ValueError, TypeError):
+                        restored["skipped_env"].append(str(key))
+                        continue
+                    env_removals.append(key)
+                else:
+                    restored["skipped_env"].append(str(key))
+                continue
+            try:
+                key, value = _validated_environment_assignment(key, record["value"])
+            except (KeyError, ValueError, TypeError):
+                restored["skipped_env"].append(str(key))
+                continue
+            env_updates.append((key, value))
+        if env_updates or env_removals:
             path = self.storage / ".env"
-            original = _read_env_lines(path)
-            replacement = f"{key}='{record['value']}'"
-            pattern = re.compile(rf"^\s*{re.escape(key)}\s*=.*$", re.MULTILINE)
-            updated = pattern.sub(replacement, original, count=1) if pattern.search(original) else original.rstrip() + "\n" + replacement + "\n"
-            path.write_text(updated, encoding="utf-8")
-            restored["env"].append(key)
+            updated = _read_env_lines(path)
+            for key, value in env_updates:
+                replacement = _environment_assignment_line(key, value)
+                pattern = re.compile(rf"^\s*{re.escape(key)}\s*=.*$", re.MULTILINE)
+                updated = pattern.sub(lambda _match: replacement, updated, count=1) if pattern.search(updated) else updated.rstrip() + "\n" + replacement + "\n"
+            for key in env_removals:
+                pattern = re.compile(rf"^\s*{re.escape(key)}\s*=.*(?:\r?\n|$)", re.MULTILINE)
+                updated = pattern.sub("", updated, count=1)
+            _atomic_write_text(path, updated)
+            persisted = _read_env_lines(path)
+            for key, value in env_updates:
+                if _env_value(persisted, key) != value:
+                    raise RuntimeError(f"Restore verification failed for {key}")
+                restored["env"].append(key)
+            for key in env_removals:
+                if _env_value(persisted, key) is not None:
+                    raise RuntimeError(f"Restore verification failed for absent {key}")
+                restored["env"].append(key)
         if payload.get("sqlite"):
-            con = sqlite3.connect(self.storage / "anythingllm.db")
+            con = sqlite3.connect(self.storage / "anythingllm.db", timeout=1.0)
             try:
                 for label, value in payload["sqlite"].items():
                     if label not in SQLITE_SETTINGS:
@@ -138,6 +243,12 @@ class AnythingLLMPersistenceAdapter:
                         con.execute("insert into system_settings(label,value) values(?,?)", (label, value))
                     restored["sqlite"].append(label)
                 con.commit()
+                for label, value in payload["sqlite"].items():
+                    if label not in SQLITE_SETTINGS:
+                        continue
+                    row = con.execute("select value from system_settings where label=?", (label,)).fetchone()
+                    if (row[0] if row else None) != value:
+                        raise RuntimeError(f"Restore verification failed for {label}")
             finally:
                 con.close()
         return {"status": "restored", "restored": restored, "restart_likely_required": bool(restored["env"])}

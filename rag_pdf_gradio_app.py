@@ -15,6 +15,9 @@ AnythingLLM mutation, passive observation, and guarded Desktop sidebar refresh
 are deliberately different actions with different safety rules.
 """
 
+import csv
+from collections import OrderedDict
+from functools import wraps
 import json
 import html
 import hashlib
@@ -33,7 +36,7 @@ import urllib.error
 import urllib.request
 import uuid
 import zipfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -66,6 +69,7 @@ from auto_anythingllm_pipeline import (
     ANYTHINGLLM_RAW_TEXT_METADATA_FIELDS,
     ANYTHINGLLM_SOURCE_CONTRACT,
     apply_recommended_anythingllm_settings,
+    atomic_write_text,
     anythingllm_desktop_process_running,
     anythingllm_storage_audit,
     anythingllm_stale_artifact_report,
@@ -76,6 +80,7 @@ from auto_anythingllm_pipeline import (
     build_ollama_simulation_adapter,
     build_openrouter_simulation_adapter,
     compatible_output_document_directory,
+    compatible_output_document_directories,
     create_validation_workspace,
     confirmed_submission_locations_from_ledger,
     create_temporary_desktop_api_key,
@@ -84,6 +89,7 @@ from auto_anythingllm_pipeline import (
     default_short_label,
     describe_simulation_adapter,
     enrich_page_stats,
+    finalize_deferred_batch_lean_retention,
     extraction_quality,
     finalize_batch_inspection_context,
     get_anythingllm_metadata_schema,
@@ -91,6 +97,9 @@ from auto_anythingllm_pipeline import (
     is_local_anythingllm_url,
     is_lancedb_safe_namespace,
     lancedb_safe_workspace_name,
+    load_upload_plan_rows,
+    managed_anythingllm_upload_folder_name,
+    maybe_upload_to_anythingllm,
     native_identity_stem,
     observe_workspace_embedding_queue_activity,
     page_stats_for,
@@ -109,12 +118,20 @@ from auto_anythingllm_pipeline import (
     resolve_embedder_capability,
     resolve_default_simulation_adapter,
     safe_stem,
+    select_upload_payloads,
     simulation_app_config,
     simulation_preflight,
     verify_anythingllm_upload_auth,
     update_workspace_embeddings_batched,
+    upload_plan_rows_to_expected_payloads,
     verify_anythingllm_post_upload,
+    validate_anythingllm_native_runtime,
+    # Retain this app-level compatibility seam for the Automatic runner's
+    # runtime preflight/test doubles. The canonical implementation remains in
+    # the pipeline module.
+    verify_anythingllm_runtime_embedder,  # noqa: F401 - public app-level test/extension seam
     workspace_segment_preview,
+    workspace_duplicate_identity_audit,
     workspace_storage_inspector,
     write_failure_package,
 )
@@ -155,6 +172,14 @@ TIMING_MODEL_RUNS_PATH = TIMING_MODEL_DIR / "timing-runs.jsonl"
 TIMING_MODEL_EVENTS_PATH = TIMING_MODEL_DIR / "timing-events.jsonl"
 DESKTOP_REFRESH_EVENTS_PATH = TIMING_MODEL_DIR / "desktop-refresh-events.jsonl"
 TIMING_MODEL_SUMMARY_PATH = TIMING_MODEL_DIR / "timing-model-summary.json"
+# History events can be recorded by overlapping Gradio callbacks. Keep the
+# read/prune/append sequence serial in this process so retention never races
+# an append and a partial malformed line does not poison future audits.
+PERSISTED_HISTORY_LOCK = threading.RLock()
+# Backfilling older run summaries is a read-then-append import. It needs its
+# own reservation lock so two initial UI callbacks cannot learn the same run
+# twice before either append becomes visible in the shared history.
+TIMING_MODEL_BACKFILL_LOCK = threading.RLock()
 # Version 3 distinguishes a single Desktop-style workspace queue from the
 # retired client-side two-record batch scheduler and records the stock
 # per-page-parent provider-request cadence. Earlier rows remain auditable,
@@ -190,6 +215,8 @@ NATIVE_UPLOAD_SCOPE_CUSTOM_LABEL = "Custom range"
 # Kept only to read older saved settings and timing rows. It is no longer a
 # selectable production scope: partial uploads must be explicit and legible.
 NATIVE_UPLOAD_SCOPE_PROBE_LABEL = "Two test segments"
+WORKSPACE_DUPLICATE_POLICY_SKIP = "Skip PDFs already fully indexed in this workspace (recommended)"
+WORKSPACE_DUPLICATE_POLICY_UPLOAD = "Upload selected PDFs again, even if identical records exist"
 NATIVE_BOUNDARY_CURRENT_LABEL = "Use current AnythingLLM re-chunking"
 NATIVE_BOUNDARY_PASSAGES_LABEL = "Passage records with zero additional overlap"
 NATIVE_BOUNDARY_PAGE_LIMIT_LABEL = "Page-bounded records with zero overlap"
@@ -274,7 +301,7 @@ DESKTOP_SERIAL_PROVIDER_REQUEST_PRIOR_SECONDS = 3.0
 CONSERVATIVE_CHARS_PER_EMBEDDING_TOKEN = 3
 AUTOMATIC_RUN_FIELDS = (
     "pdf_files", "folder_pdf_files", "document_label", "document_author", "document_short_label",
-    "use_file_title_fallback", "mode", "output_root_override", "api_url", "api_key", "workspace_slug",
+    "use_file_title_fallback", "apply_batch_metadata_overrides", "mode", "output_root_override", "api_url", "api_key", "workspace_slug",
     "native_upload_scope", "native_upload_custom_range", "native_metadata_mode", "anythingllm_create_document_folders",
     "anythingllm_document_folder_name", "local_check_mode", "custom_ollama_model", "ollama_url",
     "vector_audit_scope", "deep_extraction", "include_front_matter", "include_back_matter", "backend_mode",
@@ -283,7 +310,7 @@ AUTOMATIC_RUN_FIELDS = (
     "advanced_end_section_names", "automatic_validation_phrases", "unstructured_strategy",
     "generate_inline_fallback", "inherit_anythingllm_settings", "anythingllm_chunk_size",
     "anythingllm_chunk_overlap", "auto_apply_recommended_settings", "download_full_folder",
-    "download_segments_folder",
+    "download_segments_folder", "existing_workspace_duplicate_policy",
 )
 ANYTHINGLLM_EMBEDDER_ENGINE_CHOICES = [
     "anythingllm",
@@ -311,6 +338,10 @@ LAST_TIMING_ESTIMATE = {}
 # read-mostly record. The durable copy lives beside the generated artifacts so
 # an error can always be inspected after the browser event has ended.
 LIVE_AUTOMATIC_RUN_STATUS = {}
+# Gradio progress/status callbacks can overlap in one process.  The durable
+# JSON writer alone cannot prevent two callbacks from deriving records from
+# the same stale in-memory checkpoint, so protect the whole transition.
+LIVE_AUTOMATIC_RUN_STATUS_LOCK = threading.RLock()
 # This is deliberately a short-lived UI cache, not a timing-model input.  It
 # avoids re-reading a selected PDF for every settings change solely to render
 # the repeat-run notice.  The cache is invalidated when the path's size or
@@ -414,7 +445,16 @@ AUTOMATIC_RUNTIME_RECOVERY_STARTUP_FAST_POLL_WINDOW_SECONDS = 45.0
 # cooperative cancellation and recovery, never as a licence to kill a reused
 # PID after a restart.
 ACTIVE_AUTOMATIC_RUN_WORKER_PROCESSES = {}
+ACTIVE_AUTOMATIC_RUN_WORKER_PROCESSES_LOCK = threading.RLock()
 ACTIVE_AUTOMATIC_RECOVERY_THREADS = {}
+AUTOMATIC_RECOVERY_SCHEDULING_LOCK = threading.RLock()
+AUTOMATIC_RUN_JSON_WRITE_LOCK = threading.Lock()
+# Automatic progress, cancellation, and recovery are intentionally process-wide
+# while AnythingLLM Desktop itself is a single local runtime.  Every Confirm
+# action therefore shares one queue slot; Cancel uses its own unqueued path so
+# it can still reach the active worker immediately.
+AUTOMATIC_RUN_CONCURRENCY_ID = "automatic-run"
+AUTOMATIC_RUN_CONCURRENCY_LIMIT = 1
 # A cross-process worker proves liveness by refreshing run-progress.json.
 # Older records remain recovery evidence, but must never turn a pre-start
 # Cancel click into a stop request against an unrelated historical run.
@@ -690,14 +730,15 @@ APP_CONNECTION_WATCHDOG_HEAD = """
       event.stopImmediatePropagation();
       if (!allowRecentPointer && Date.now() - lastThemePointerToggleAt < 750) return true;
       const nextDark = !isDark();
+      // Toggling back to the current Windows colour restores the automatic
+      // mode.  Leaving a manual override behind in that identical state is
+      // surprising: the next Windows theme change would then appear broken.
+      const followSystem = nextDark === systemTheme.matches;
       try {
-        // An explicit toggle is a persistent manual preference, even when it
-        // happens to match Windows' current mode. Following Windows remains
-        // an intentional checkbox choice rather than an accidental side effect.
-        localStorage.setItem(followKey, "false");
+        localStorage.setItem(followKey, followSystem ? "true" : "false");
         localStorage.setItem(overrideKey, nextDark ? "dark" : "light");
       } catch (_) {}
-      apply(nextDark);
+      apply(followSystem ? systemTheme.matches : nextDark);
       syncCheckbox();
       return true;
     };
@@ -968,11 +1009,14 @@ APP_JS = """
   };
   const toggleTheme = () => {
     const nextDark = !isDarkTheme();
+    // Match the head bootstrap behaviour: a manual contrast toggle becomes
+    // automatic again when it lands on the current Windows theme.
+    const followSystem = nextDark === systemThemeQuery.matches;
     try {
-      localStorage.setItem(themeFollowSystemKey, "false");
+      localStorage.setItem(themeFollowSystemKey, followSystem ? "true" : "false");
       localStorage.setItem(themeOverrideKey, nextDark ? "dark" : "light");
     } catch (_) {}
-    applyTheme(nextDark);
+    applyTheme(followSystem ? systemThemeQuery.matches : nextDark);
     syncFollowSystemControl();
   };
   const wireThemeToggleButton = () => {
@@ -5566,6 +5610,243 @@ def workspace_verification_card_html(api_url, workspace_slug):
     )
 
 
+def workspace_duplicate_identity_audit_html(workspace_slug):
+    """Render a preview-only workspace duplicate inventory."""
+    report = workspace_duplicate_identity_audit(
+        default_anythingllm_storage_dir(),
+        str(workspace_slug or ""),
+    )
+    if report.get("status") != "complete":
+        detail = report.get("error") or "The duplicate inventory could not be read."
+        return (
+            '<div class="metadata-summary"><section class="metadata-file"><div class="metadata-file-name">'
+            'Duplicate source-identity preview</div><div class="metadata-status">'
+            f'{html.escape(str(detail))}</div></section></div>'
+        )
+    rows = [
+        ("Workspace", report.get("workspace_slug")),
+        ("Workspace document rows", report.get("workspace_document_count")),
+        ("Repeated source identities", report.get("duplicate_identity_count")),
+        ("Extra workspace-document rows", report.get("duplicate_workspace_document_rows")),
+        ("Extra linked vector rows", report.get("duplicate_vector_rows")),
+    ]
+    grid = "".join(
+        f'<div class="metadata-key">{html.escape(str(key))}</div><div class="metadata-value">{html.escape(str(value))}</div>'
+        for key, value in rows
+    )
+    examples = report.get("duplicate_groups") or []
+    sample = [
+        {
+            "chunkSource": group.get("chunk_source"),
+            "workspace_documents": group.get("workspace_document_rows"),
+            "linked_vectors": group.get("vector_rows"),
+            "files": group.get("filenames"),
+            "paths": group.get("docpaths"),
+        }
+        for group in examples
+    ]
+    detail = (
+        "No repeated source identities were found in this workspace."
+        if not examples
+        else "Preview only: no document, vector, or file was changed. Export/review these identities before any future cleanup action."
+    )
+    return (
+        '<div class="metadata-summary"><section class="metadata-file"><div class="metadata-file-name">'
+        'Duplicate source-identity preview</div><div class="metadata-status">'
+        f'{html.escape(detail)}</div><div class="metadata-grid">{grid}</div></section>'
+        '<section class="metadata-file"><div class="metadata-file-name">Sample repeated identities</div><pre class="inspector-pre">'
+        f'{html.escape(json.dumps(sample, ensure_ascii=False, indent=2))}</pre></section></div>'
+    )
+
+
+def export_workspace_duplicate_cleanup_review_html(workspace_slug):
+    """Write a non-mutating, operator-reviewable duplicate cleanup package.
+
+    AnythingLLM stores one document across SQLite rows, custom-document files,
+    and vector-table records.  Deleting only one of those layers would make a
+    duplicate audit look better while corrupting retrieval or leaving orphans.
+    Until the installed AnythingLLM build exposes one atomic document-delete
+    contract for all three layers, the safe cleanup implementation is a
+    complete review package, deliberately not an unsafe direct-SQL delete.
+    """
+    report = workspace_duplicate_identity_audit(
+        default_anythingllm_storage_dir(),
+        str(workspace_slug or ""),
+        sample_limit=500,
+    )
+    if report.get("status") != "complete":
+        detail = report.get("error") or "The duplicate inventory could not be read."
+        return (
+            '<div class="metadata-summary"><section class="metadata-file"><div class="metadata-file-name">'
+            'Duplicate cleanup review package</div><div class="metadata-status">'
+            f'{html.escape(str(detail))}</div></section></div>'
+        )
+    proposals = []
+    for group in report.get("duplicate_groups") or []:
+        rows = list(group.get("document_rows") or [])
+        keep_candidate = rows[0] if rows else {}
+        proposals.append(
+            {
+                "chunk_source": group.get("chunk_source"),
+                "workspace_document_rows": group.get("workspace_document_rows"),
+                "linked_vector_rows": group.get("vector_rows"),
+                "suggested_keep_candidate": keep_candidate,
+                "review_candidates": rows[1:],
+                "operator_action": (
+                    "Verify the retained content through AnythingLLM, then use AnythingLLM's supported "
+                    "document-management UI/API to remove only confirmed duplicates. Re-run this audit afterward."
+                ),
+            }
+        )
+    try:
+        review_root = create_fresh_automatic_run_root(AUTO_OUTPUT_DIR, prefix="workspace-duplicate-review")
+        review_path = review_root / "workspace-duplicate-cleanup-review.json"
+        _write_automatic_run_json(
+            review_path,
+            {
+                "status": "review_required",
+                "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "workspace_slug": report.get("workspace_slug"),
+                "mutation_policy": "no deletion, rewrite, re-embedding, or direct database mutation",
+                "why_no_automatic_cleanup": (
+                    "The installed AnythingLLM document deletion path is not verified as an atomic cleanup across "
+                    "workspace rows, custom-document files, and vector storage."
+                ),
+                "audit_totals": {
+                    key: report.get(key)
+                    for key in (
+                        "workspace_document_count", "duplicate_identity_count",
+                        "duplicate_workspace_document_rows", "duplicate_vector_rows",
+                    )
+                },
+                "proposals": proposals,
+            },
+        )
+    except OSError as exc:
+        return (
+            '<div class="metadata-summary"><section class="metadata-file"><div class="metadata-file-name">'
+            'Duplicate cleanup review package</div><div class="metadata-status">'
+            f'Could not write the review package: {html.escape(str(exc))}</div></section></div>'
+        )
+    detail = (
+        "No duplicates were found; the package records that clean result."
+        if not proposals else
+        f"Prepared {len(proposals)} duplicate-identity review group(s). No workspace data was changed."
+    )
+    return (
+        '<div class="metadata-summary"><section class="metadata-file"><div class="metadata-file-name">'
+        'Duplicate cleanup review package</div><div class="metadata-status">'
+        f'{html.escape(detail)}</div><div class="metadata-grid">'
+        f'<div class="metadata-key">Saved package</div><div class="metadata-value">{html.escape(str(review_path))}</div>'
+        f'<div class="metadata-key">Mutation policy</div><div class="metadata-value">review only — no deletion</div>'
+        '</div></section></div>'
+    )
+
+
+def _latest_workspace_runtime_payloads(workspace_slug, limit=600):
+    """Load safe, recent assistant-owned payloads for an optional live probe."""
+    slug = str(workspace_slug or "").strip()
+    documents_root = default_anythingllm_documents_dir().resolve()
+    candidates = sorted(
+        automatic_run_artifact_paths(AUTO_OUTPUT_DIR, "**/batch-native-upload-report.json"),
+        key=lambda path: path.stat().st_mtime if path.exists() else 0,
+        reverse=True,
+    )
+    for report_path in candidates:
+        run_root = report_path.parent
+        config = _read_automatic_run_json(run_root / ".automatic-batch-upload-config.json")
+        if str(config.get("workspace_slug") or "") != slug:
+            continue
+        report = _read_automatic_run_json(report_path)
+        if str(report.get("status") or "") not in {"complete", "complete_with_key_cleanup_warning"}:
+            continue
+        payloads = []
+        for location in (report.get("locations") or [])[:max(1, int(limit or 1))]:
+            relative = str(location or "").replace("\\", "/").lstrip("/")
+            candidate = (documents_root / Path(relative)).resolve()
+            try:
+                candidate.relative_to(documents_root)
+            except ValueError:
+                continue
+            try:
+                raw = json.loads(candidate.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(raw, dict):
+                continue
+            text = str(raw.get("pageContent") or raw.get("textContent") or "").strip()
+            chunk_source = str(raw.get("chunkSource") or "").strip()
+            if not text or not chunk_source:
+                continue
+            payloads.append({
+                "textContent": text,
+                "metadata": {
+                    key: str(raw.get(key) or "")
+                    for key in ("title", "docAuthor", "description", "docSource", "chunkSource", "published")
+                },
+            })
+        if payloads:
+            return run_root, payloads
+    return None, []
+
+
+def optional_workspace_live_retrieval_check(api_url, api_key, workspace_slug, include_chat_probe=False):
+    """Run a user-requested retrieval diagnostic without changing embeddings."""
+    slug = str(workspace_slug or "").strip()
+    if not slug:
+        return '<div class="artifact-placeholder"><strong>Select a workspace before running a live retrieval check.</strong></div>'
+    run_root, payloads = _latest_workspace_runtime_payloads(slug)
+    if not payloads:
+        return (
+            '<div class="artifact-placeholder"><strong>No assistant-owned successful upload receipt was found for this workspace.</strong>'
+            '<br>Run this check after a successful PDF Parser Embedder Assistant upload.</div>'
+        )
+    report = validate_anythingllm_native_runtime(
+        str(api_url or DEFAULT_ANYTHINGLLM_API_URL).strip(),
+        str(api_key or "").strip(),
+        slug,
+        payloads,
+        0,
+        default_anythingllm_storage_dir(),
+        include_chat_probe=bool(include_chat_probe),
+        runtime_probe_limit=min(3, max(1, int(math.ceil(math.sqrt(len(payloads)))))),
+        vector_timeout_seconds=20,
+        vector_max_attempts=1,
+        retry_timed_out_siblings=False,
+    )
+    report["requested_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    report["source_run_root"] = str(run_root)
+    report["mutation_policy"] = "read_only_runtime_query; no upload, embedding, delete, or retry"
+    artifact_path = Path(run_root) / "optional-live-retrieval-check.json"
+    try:
+        _write_automatic_run_json(artifact_path, report)
+    except OSError as exc:
+        report["artifact_write_error"] = str(exc)
+    vector_checks = list(report.get("vector_checks") or [])
+    passed = sum(1 for check in vector_checks if check.get("expected_in_top_n"))
+    rows = [
+        ("Workspace", slug),
+        ("Result", report.get("status") or "not_checked"),
+        ("Vector probes", f"{passed}/{len(vector_checks)} expected source identities found"),
+        ("Chat citation probe", (report.get("chat_check") or {}).get("status") or ("requested" if include_chat_probe else "not requested")),
+        ("Runtime model", " / ".join(filter(None, [str((report.get("model_configuration") or {}).get("chat_provider") or ""), str((report.get("model_configuration") or {}).get("chat_model") or "")])) or "not reported"),
+        ("Saved report", str(artifact_path)),
+    ]
+    grid = "".join(
+        f'<div class="metadata-key">{html.escape(str(key))}</div><div class="metadata-value">{html.escape(str(value))}</div>'
+        for key, value in rows
+    )
+    detail = (
+        "Optional diagnostic completed. It queried existing workspace retrieval only; it did not upload, embed, delete, or retry any PDF."
+    )
+    if report.get("error"):
+        detail += f" {report['error']}"
+    return (
+        '<div class="workspace-verification-card"><strong>Optional live retrieval check</strong>'
+        f'<div>{html.escape(detail)}</div><div class="metadata-grid">{grid}</div></div>'
+    )
+
+
 def _safe_history_value(value, limit=500):
     return str(value or "").replace("\n", " ")[:limit]
 
@@ -5578,35 +5859,60 @@ def prune_background_jsonl(path, retention_days=BACKGROUND_LOG_RETENTION_DAYS):
     """
     history_path = Path(path)
     result = {"status": "not_needed", "kept": 0, "removed": 0}
-    if not history_path.exists():
-        return result
     try:
-        cutoff = datetime.now() - timedelta(days=max(1, int(retention_days or BACKGROUND_LOG_RETENTION_DAYS)))
-        kept_lines = []
-        removed = 0
-        for line in history_path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            try:
-                record = json.loads(line)
-                recorded_at = datetime.fromisoformat(str(record.get("recorded_at") or ""))
-            except (TypeError, ValueError, json.JSONDecodeError):
-                kept_lines.append(line)
-                continue
-            if recorded_at < cutoff:
-                removed += 1
-            else:
-                kept_lines.append(line)
-        result = {"status": "unchanged" if not removed else "pruned", "kept": len(kept_lines), "removed": removed}
-        if removed:
-            temporary_path = history_path.with_name(history_path.name + ".retention.tmp")
-            temporary_path.write_text(
-                "".join(f"{line}\n" for line in kept_lines),
-                encoding="utf-8",
-            )
-            temporary_path.replace(history_path)
-            APP_LOGGER.info("pruned %s expired background log records from %s", removed, history_path)
-        return result
+        with PERSISTED_HISTORY_LOCK:
+            if not history_path.exists():
+                return result
+            cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, int(retention_days or BACKGROUND_LOG_RETENTION_DAYS)))
+            kept_lines = []
+            removed = 0
+            for line in history_path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                    if not isinstance(record, dict):
+                        kept_lines.append(line)
+                        continue
+                    recorded_at = datetime.fromisoformat(str(record.get("recorded_at") or ""))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    kept_lines.append(line)
+                    continue
+                if recorded_at.tzinfo is None:
+                    # Historical app records predate timezone-aware stamps.
+                    # Their dates are still useful for coarse retention, and
+                    # treating them consistently avoids comparing aware and
+                    # naive datetimes when current records include an offset.
+                    recorded_at = recorded_at.replace(tzinfo=timezone.utc)
+                else:
+                    recorded_at = recorded_at.astimezone(timezone.utc)
+                if recorded_at < cutoff:
+                    removed += 1
+                else:
+                    kept_lines.append(line)
+            result = {"status": "unchanged" if not removed else "pruned", "kept": len(kept_lines), "removed": removed}
+            if removed:
+                temporary_path = None
+                try:
+                    with tempfile.NamedTemporaryFile(
+                        mode="w",
+                        encoding="utf-8",
+                        dir=history_path.parent,
+                        prefix=f".{history_path.name}.",
+                        suffix=".retention.tmp",
+                        delete=False,
+                    ) as handle:
+                        temporary_path = Path(handle.name)
+                        handle.write("".join(f"{line}\n" for line in kept_lines))
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(temporary_path, history_path)
+                    temporary_path = None
+                finally:
+                    if temporary_path is not None:
+                        temporary_path.unlink(missing_ok=True)
+                APP_LOGGER.info("pruned %s expired background log records from %s", removed, history_path)
+            return result
     except OSError as exc:
         APP_LOGGER.warning("could not apply background-log retention to %s: %s", history_path, exc)
         return {"status": "error", "kept": 0, "removed": 0, "error": str(exc)}
@@ -5632,6 +5938,10 @@ def automatic_run_processing_settings(values):
         "document_author": settings.get("document_author"),
         "document_short_label": settings.get("document_short_label"),
         "use_file_title_fallback": settings.get("use_file_title_fallback"),
+        # A batch has no shared metadata by default.  The explicit opt-in is
+        # part of the processing identity so a past accidental shared title
+        # can never be mistaken for per-PDF recognition on a repeat run.
+        "apply_batch_metadata_overrides": settings.get("apply_batch_metadata_overrides"),
         "mode": settings.get("mode"),
         # Local-only runs must not be marked as different merely because an
         # invisible upload-only control retained its previous value.
@@ -5639,6 +5949,9 @@ def automatic_run_processing_settings(values):
         "native_metadata_mode": "not_applicable" if local_only else settings.get("native_metadata_mode"),
         "anythingllm_create_document_folders": False if local_only else settings.get("anythingllm_create_document_folders"),
         "anythingllm_document_folder_name": "" if local_only else settings.get("anythingllm_document_folder_name"),
+        "existing_workspace_duplicate_policy": (
+            "not_applicable" if local_only else settings.get("existing_workspace_duplicate_policy")
+        ),
         "local_check_mode": settings.get("local_check_mode"),
         "custom_ollama_model": settings.get("custom_ollama_model"),
         "vector_audit_scope": settings.get("vector_audit_scope"),
@@ -5679,6 +5992,7 @@ def builtin_automatic_run_setting_values(pdf_files=None, folder_pdf_files=None):
         "document_author": "",
         "document_short_label": "",
         "use_file_title_fallback": True,
+        "apply_batch_metadata_overrides": False,
         "mode": MODE_NATIVE_UPLOAD_LABEL,
         "output_root_override": str(AUTO_OUTPUT_DIR),
         "api_url": DEFAULT_ANYTHINGLLM_API_URL,
@@ -5694,6 +6008,7 @@ def builtin_automatic_run_setting_values(pdf_files=None, folder_pdf_files=None):
         # advanced opt-in for people who accept that limitation.
         "anythingllm_create_document_folders": False,
         "anythingllm_document_folder_name": "",
+        "existing_workspace_duplicate_policy": WORKSPACE_DUPLICATE_POLICY_SKIP,
         "local_check_mode": INITIAL_SIMULATION_VALUE,
         "custom_ollama_model": "",
         "ollama_url": DEFAULT_OLLAMA_URL,
@@ -5752,6 +6067,7 @@ AUTOMATIC_DEFAULT_EDITOR_FIELDS = (
     "native_upload_scope",
     "native_metadata_mode",
     "anythingllm_create_document_folders",
+    "existing_workspace_duplicate_policy",
     "local_check_mode",
     "ollama_url",
     "vector_audit_scope",
@@ -5913,12 +6229,13 @@ def automatic_run_artifact_paths(root, relative_pattern):
     ]
 
 
-def create_fresh_automatic_run_root(output_root_base):
+def create_fresh_automatic_run_root(output_root_base, *, prefix="r"):
     """Atomically reserve a new output folder, even for same-second retries."""
     base = Path(output_root_base)
+    normalized_prefix = safe_stem(str(prefix or "r")) or "r"
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     for suffix in range(1, 1000):
-        label = f"r-{stamp}" if suffix == 1 else f"r-{stamp}-{suffix}"
+        label = f"{normalized_prefix}-{stamp}" if suffix == 1 else f"{normalized_prefix}-{stamp}-{suffix}"
         candidate = base / label
         if len(str(candidate)) > 250:
             raise OSError(
@@ -6059,13 +6376,14 @@ def append_ingestion_history(
         # A terminal audit record must not turn a completed cancellation into a
         # UI failure if a future setting gains a Path-like value. Preserve it
         # as its literal local path instead.
-        (Path(run_root) / "ingestion-terminal-record.json").write_text(
-            json.dumps(record, indent=2, default=str), encoding="utf-8"
-        )
+        atomic_write_text(Path(run_root) / "ingestion-terminal-record.json", json.dumps(record, indent=2, default=str))
         AUTO_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        prune_background_jsonl(INGESTION_HISTORY_PATH)
-        with INGESTION_HISTORY_PATH.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        with PERSISTED_HISTORY_LOCK:
+            prune_background_jsonl(INGESTION_HISTORY_PATH)
+            with INGESTION_HISTORY_PATH.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
     except (OSError, TypeError, ValueError) as exc:
         APP_LOGGER.warning("could not append ingestion history: %s", exc)
     return record
@@ -6115,9 +6433,24 @@ def ingestion_history_html(workspace_slug="", limit=12):
     if not INGESTION_HISTORY_PATH.exists():
         return '<div class="artifact-placeholder"><strong>No completed-run history yet.</strong></div>'
     try:
-        records = [json.loads(line) for line in INGESTION_HISTORY_PATH.read_text(encoding="utf-8").splitlines() if line.strip()]
-    except (OSError, json.JSONDecodeError) as exc:
+        with PERSISTED_HISTORY_LOCK:
+            lines = INGESTION_HISTORY_PATH.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
         return f'<div class="artifact-placeholder"><strong>Could not read run history:</strong> {html.escape(str(exc))}</div>'
+    records = []
+    malformed = 0
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            malformed += 1
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+        else:
+            malformed += 1
     slug = str(workspace_slug or "").strip()
     if slug:
         records = [record for record in records if str(record.get("workspace_slug") or "") == slug]
@@ -6127,10 +6460,11 @@ def ingestion_history_html(workspace_slug="", limit=12):
     cards = []
     for record in reversed(records):
         state = str(record.get("state") or "warning")
-        documents = ", ".join(doc.get("name") or "document" for doc in record.get("documents") or []) or "no document recorded"
+        documents_for_record = [doc for doc in record.get("documents") or [] if isinstance(doc, dict)]
+        documents = ", ".join(doc.get("name") or "document" for doc in documents_for_record) or "no document recorded"
         smoke = ", ".join(
             f"{doc.get('runtime_validation', 'not checked')} ({(doc.get('retrieval_smoke') or {}).get('vector_checks_passed', 0)}/{(doc.get('retrieval_smoke') or {}).get('vector_checks_total', 0)} vector checks)"
-            for doc in record.get("documents") or []
+            for doc in documents_for_record
         ) or "not checked"
         cards.append(
             f'<section class="metadata-file ingestion-history {html.escape(state)}"><div class="metadata-file-name">'
@@ -6138,7 +6472,11 @@ def ingestion_history_html(workspace_slug="", limit=12):
             f'<div class="metadata-status">{html.escape(_safe_history_value(record.get("message")))}</div>'
             f'<div class="metadata-status">Workspace: {html.escape(record.get("workspace_slug") or "local only")}<br>Documents: {html.escape(documents)}<br>Retrieval smoke: {html.escape(smoke)}</div></section>'
         )
-    return '<div class="metadata-summary">' + "".join(cards) + "</div>"
+    warning = (
+        f'<div class="metadata-status">Ignored {malformed} malformed history record(s); valid runs remain available.</div>'
+        if malformed else ""
+    )
+    return '<div class="metadata-summary">' + warning + "".join(cards) + "</div>"
 
 
 def latest_resume_manifest(workspace_slug):
@@ -6149,9 +6487,13 @@ def latest_resume_manifest(workspace_slug):
             manifest = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
+        if not isinstance(manifest, dict):
+            continue
         if slug and manifest.get("workspace_slug") != slug:
             continue
         recovery = manifest.get("recovery") or {}
+        if not isinstance(recovery, dict):
+            continue
         if recovery.get("state") == "resume_available":
             return path, manifest
     return None, None
@@ -6628,13 +6970,23 @@ def anythingllm_desktop_process_seen():
 
 def _observer_tail_log_lines(storage_dir, workspace_slug, limit_bytes=131072):
     logs_dir = Path(storage_dir) / "logs"
-    log_files = sorted(logs_dir.glob("backend-*.log"), key=lambda path: path.stat().st_mtime, reverse=True)
+    log_files = []
+    # AnythingLLM can rotate or remove a backend log while the observer is
+    # refreshing. Keep the observer read-only and best-effort instead of
+    # letting that normal race abort the whole workspace snapshot.
+    for candidate in logs_dir.glob("backend-*.log"):
+        try:
+            metadata = candidate.stat()
+        except OSError:
+            continue
+        log_files.append((candidate, metadata.st_mtime, metadata.st_size))
+    log_files.sort(key=lambda item: item[1], reverse=True)
     if not log_files:
         return {"file": "", "modified_epoch": 0.0, "matches": []}
-    log_path = log_files[0]
+    log_path, modified_epoch, size_bytes = log_files[0]
     try:
         with log_path.open("rb") as handle:
-            handle.seek(max(0, log_path.stat().st_size - limit_bytes))
+            handle.seek(max(0, size_bytes - limit_bytes))
             text = handle.read().decode("utf-8", errors="replace")
     except OSError as exc:
         return {"file": str(log_path), "modified_epoch": 0.0, "matches": [], "error": str(exc)}
@@ -6647,7 +6999,7 @@ def _observer_tail_log_lines(storage_dir, workspace_slug, limit_bytes=131072):
     ]
     return {
         "file": str(log_path),
-        "modified_epoch": log_path.stat().st_mtime,
+        "modified_epoch": modified_epoch,
         "matches": matches[-4:],
     }
 
@@ -7262,11 +7614,11 @@ def artifact_type(path):
     if "edge-case" in name:
         return "Edge-case report"
     if "workspace-model" in name:
-        return "Workspace model gate"
+        return "Workspace model configuration"
     if "post-upload" in name:
         return "Post-upload verification"
     if "upload-plan" in name or "checklist" in name or suffix == ".zip":
-        return "Manual test kit"
+        return "Manual upload verification files"
     if suffix == ".csv":
         return "CSV report"
     if suffix == ".json" or suffix == ".jsonl":
@@ -7279,7 +7631,7 @@ def artifact_placeholder_html(title="Generated files"):
         expected = [
             "edge-case-report.html",
             "edge-case-results.csv",
-            "workspace-model-gate.csv",
+            "workspace-model-configuration.csv",
             "post-upload-verification.csv",
             "raw-text-payloads-native-header.jsonl",
             "segment-manifest.jsonl",
@@ -7951,7 +8303,12 @@ def batch_folder_relative_label(path_value, root=""):
         return path.name
 
 
-PDF_PICKER_NATIVE_INSPECTION_CACHE = {}
+# Full native coverage includes one small record for every low-text page. Keep
+# enough recent source versions to avoid duplicate scans during selection and
+# confirmation, but do not retain every PDF ever chosen in this long-lived UI.
+PDF_PICKER_NATIVE_INSPECTION_CACHE_LIMIT = 96
+PDF_PICKER_NATIVE_INSPECTION_CACHE = OrderedDict()
+PDF_PICKER_NATIVE_INSPECTION_CACHE_LOCK = threading.Lock()
 
 
 def pdf_picker_native_inspection_key(path):
@@ -7969,9 +8326,11 @@ def pdf_picker_native_inspection(path):
     """Reuse an exact page scan until the selected source file changes."""
     source = Path(path)
     key = pdf_picker_native_inspection_key(source)
-    cached = PDF_PICKER_NATIVE_INSPECTION_CACHE.get(key)
-    if cached:
-        return cached
+    with PDF_PICKER_NATIVE_INSPECTION_CACHE_LOCK:
+        cached = PDF_PICKER_NATIVE_INSPECTION_CACHE.get(key)
+        if cached:
+            PDF_PICKER_NATIVE_INSPECTION_CACHE.move_to_end(key)
+            return cached
     coverage = automatic_full_native_text_coverage(source)
     if coverage.get("status") != "verified":
         raise RuntimeError(coverage.get("error") or "native page inspection failed")
@@ -7982,7 +8341,11 @@ def pdf_picker_native_inspection(path):
         "page_scan_complete": True,
     }
     result = {"coverage": coverage, "detail": detail}
-    PDF_PICKER_NATIVE_INSPECTION_CACHE[key] = result
+    with PDF_PICKER_NATIVE_INSPECTION_CACHE_LOCK:
+        PDF_PICKER_NATIVE_INSPECTION_CACHE[key] = result
+        PDF_PICKER_NATIVE_INSPECTION_CACHE.move_to_end(key)
+        while len(PDF_PICKER_NATIVE_INSPECTION_CACHE) > PDF_PICKER_NATIVE_INSPECTION_CACHE_LIMIT:
+            PDF_PICKER_NATIVE_INSPECTION_CACHE.popitem(last=False)
     return result
 
 
@@ -8554,6 +8917,8 @@ def preview_manifest_segment(paths, segment_number):
             for line in manifest.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
+        if not all(isinstance(row, dict) for row in rows):
+            return "Could not read segment manifest: it contains a non-object record."
         for position, row in enumerate(rows):
             if int(row.get("segment_index") or position + 1) != index:
                 continue
@@ -8606,6 +8971,8 @@ def preview_workspace_segment(paths, workspace_slug, segment_number):
             for line in manifest.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
+        if not all(isinstance(row, dict) for row in rows):
+            return "Could not read segment manifest: it contains a non-object record."
     except Exception as exc:
         return f"Could not read segment manifest: {exc}"
 
@@ -9198,6 +9565,7 @@ def folder_detected_metadata_preview(
     current_author="",
     current_short_label="",
     use_file_title_fallback=True,
+    apply_batch_metadata_overrides=False,
     folder_manifest=None,
 ):
     candidates, _manifest_reused = folder_manifest_candidates(folder_files, folder_manifest)
@@ -9207,6 +9575,7 @@ def folder_detected_metadata_preview(
         current_author=current_author,
         current_short_label=current_short_label,
         use_file_title_fallback=use_file_title_fallback,
+        apply_batch_metadata_overrides=apply_batch_metadata_overrides,
     )
 
 
@@ -9217,6 +9586,7 @@ def automatic_detected_metadata_preview(
     current_author="",
     current_short_label="",
     use_file_title_fallback=True,
+    apply_batch_metadata_overrides=False,
     folder_manifest=None,
 ):
     """Inspect the batch when present, otherwise the ordinary picker files."""
@@ -9227,6 +9597,7 @@ def automatic_detected_metadata_preview(
         current_author=current_author,
         current_short_label=current_short_label,
         use_file_title_fallback=use_file_title_fallback,
+        apply_batch_metadata_overrides=apply_batch_metadata_overrides,
     )
 
 
@@ -9428,6 +9799,16 @@ def paced_progress_fraction(record, now=None):
     return min(target, anchor + elapsed * VISIBLE_PROGRESS_SPEED_PER_SECOND)
 
 
+def _synchronized_live_automatic_status(callback):
+    """Serialize in-memory Automatic status transitions across callbacks."""
+    @wraps(callback)
+    def wrapped(*args, **kwargs):
+        with LIVE_AUTOMATIC_RUN_STATUS_LOCK:
+            return callback(*args, **kwargs)
+    return wrapped
+
+
+@_synchronized_live_automatic_status
 def update_live_automatic_run_status(
     run_root=None,
     *,
@@ -9665,12 +10046,15 @@ def update_live_automatic_run_status(
     record["display_anchor_epoch"] = now
     record["display_target_fraction"] = display_target
     LIVE_AUTOMATIC_RUN_STATUS = record
+    if terminal_state and record["run_root"]:
+        # The durable cancellation marker remains the cross-process source of
+        # truth. Drop this process-local fast-path once a run is terminal so a
+        # long-lived Gradio server does not retain every historical run root.
+        CANCELLED_AUTOMATIC_RUN_ROOTS.discard(str(Path(record["run_root"])))
     status_path = Path(record["run_root"]) / "run-progress.json" if record["run_root"] else None
     if status_path:
         try:
-            temporary_path = status_path.with_suffix(".json.tmp")
-            temporary_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
-            temporary_path.replace(status_path)
+            _write_automatic_run_json(status_path, record)
         except OSError as exc:
             APP_LOGGER.warning("could not persist automatic run progress: %s", exc)
     # The JSON snapshot above powers recovery. This compact append-only trace
@@ -9954,12 +10338,14 @@ def refresh_live_automatic_run_ui():
     )
 
 
+@_synchronized_live_automatic_status
 def clear_live_automatic_run_status():
     global LIVE_AUTOMATIC_RUN_STATUS
     LIVE_AUTOMATIC_RUN_STATUS = {}
     return gr.update(value=automatic_live_status_html({"state": "ready"}), visible=True)
 
 
+@_synchronized_live_automatic_status
 def reset_automatic_run_presentation(pdf_files=None, folder_pdf_files=None):
     """Return the complete fresh-run presentation after a selection change.
 
@@ -9969,7 +10355,18 @@ def reset_automatic_run_presentation(pdf_files=None, folder_pdf_files=None):
     history lookup that cannot resume or otherwise alter the new run.
     """
     global LIVE_AUTOMATIC_RUN_STATUS
-    if str((LIVE_AUTOMATIC_RUN_STATUS or {}).get("state") or "") == "running":
+    live_status = LIVE_AUTOMATIC_RUN_STATUS or {}
+    # File-change events can be delivered after Confirm has reserved a run
+    # folder but before the worker changes the status to ``running``.  That
+    # preparation phase is already an in-flight operation: clearing it would
+    # hide its durable evidence and reset the controls underneath the start.
+    if (
+        str(live_status.get("state") or "") == "running"
+        or (
+            str(live_status.get("state") or "") == "preparing"
+            and bool(str(live_status.get("run_root") or "").strip())
+        )
+    ):
         # A selection event must not erase an in-flight run's durable evidence
         # or make a completed batch look like a fresh idle state. The selected
         # files are still preserved by Gradio for the next explicit run.
@@ -10006,6 +10403,7 @@ def reset_automatic_run_presentation(pdf_files=None, folder_pdf_files=None):
     )
 
 
+@_synchronized_live_automatic_status
 def reset_automatic_run_settings_to_defaults():
     """Restore controls to saved future-run defaults for a fresh selection.
 
@@ -10014,14 +10412,22 @@ def reset_automatic_run_settings_to_defaults():
     PDF run.  The API key input returns to blank; the managed local key remains
     intact and is still resolved at confirmation time.
     """
-    if str((LIVE_AUTOMATIC_RUN_STATUS or {}).get("state") or "") == "running":
-        return tuple(gr.update() for _ in range(43))
+    live_status = LIVE_AUTOMATIC_RUN_STATUS or {}
+    if (
+        str(live_status.get("state") or "") == "running"
+        or (
+            str(live_status.get("state") or "") == "preparing"
+            and bool(str(live_status.get("run_root") or "").strip())
+        )
+    ):
+        return tuple(gr.update() for _ in range(45))
     defaults = fresh_automatic_run_setting_values()
     return (
         gr.update(value=defaults["document_label"]),
         gr.update(value=defaults["document_author"]),
         gr.update(value=defaults["document_short_label"]),
         gr.update(value=defaults["use_file_title_fallback"]),
+        gr.update(value=defaults["apply_batch_metadata_overrides"]),
         # Do not let a quick click race the page-load response that restores
         # saved defaults. The control is initially disabled and becomes
         # interactive with this authoritative value.
@@ -10039,6 +10445,7 @@ def reset_automatic_run_settings_to_defaults():
         # Keep reset aligned with the visible-by-default initial control.
         gr.update(value=defaults["anythingllm_create_document_folders"]),
         gr.update(value=defaults["anythingllm_document_folder_name"]),
+        gr.update(value=defaults["existing_workspace_duplicate_policy"]),
         gr.update(value=defaults["local_check_mode"]),
         gr.update(value=defaults["custom_ollama_model"]),
         gr.update(value=defaults["ollama_url"]),
@@ -10076,9 +10483,9 @@ def apply_saved_automatic_defaults_to_idle_form(pdf_files=None, folder_pdf_files
     must remain untouched until that selection is cleared or replaced.
     """
     if str((LIVE_AUTOMATIC_RUN_STATUS or {}).get("state") or "") == "running":
-        return tuple(gr.update() for _ in range(43))
+        return tuple(gr.update() for _ in range(45))
     if normalize_file_list(pdf_files) or normalize_file_list(folder_pdf_files):
-        return tuple(gr.update() for _ in range(43))
+        return tuple(gr.update() for _ in range(45))
     return reset_automatic_run_settings_to_defaults()
 
 
@@ -10114,9 +10521,12 @@ def _read_automatic_run_json(path):
 
 def _append_automatic_recovery_history(record):
     try:
-        AUTOMATIC_RECOVERY_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with AUTOMATIC_RECOVERY_HISTORY_PATH.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        with PERSISTED_HISTORY_LOCK:
+            AUTOMATIC_RECOVERY_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with AUTOMATIC_RECOVERY_HISTORY_PATH.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
     except OSError as exc:
         APP_LOGGER.warning("could not record automatic recovery history: %s", exc)
 
@@ -10124,7 +10534,11 @@ def _append_automatic_recovery_history(record):
 def _recovery_ledger_groups(run_root):
     """Yield each ledger with its nearest worker configuration, never a sibling's."""
     root = Path(run_root)
-    for ledger_path in sorted(root.rglob("embedding-batch-ledger.json")):
+    ledger_paths = {
+        *root.rglob("embedding-batch-ledger.json"),
+        *root.rglob("batch-embedding-ledger.json"),
+    }
+    for ledger_path in sorted(ledger_paths):
         ledger = _read_automatic_run_json(ledger_path)
         workspace_slug = str(ledger.get("workspace_slug") or "").strip()
         locations = confirmed_submission_locations_from_ledger(ledger)
@@ -10133,9 +10547,12 @@ def _recovery_ledger_groups(run_root):
         config = {}
         parent = ledger_path.parent
         while True:
-            candidate = parent / ".automatic-worker-config.json"
-            if candidate.is_file():
-                config = _read_automatic_run_json(candidate)
+            for filename in (".automatic-batch-upload-config.json", ".automatic-worker-config.json"):
+                candidate = parent / filename
+                if candidate.is_file():
+                    config = _read_automatic_run_json(candidate)
+                    break
+            if config:
                 break
             if parent == root or root not in parent.parents:
                 break
@@ -10145,8 +10562,8 @@ def _recovery_ledger_groups(run_root):
             "ledger_path": str(ledger_path),
             "workspace_slug": workspace_slug,
             "locations": locations,
-            "api_url": str(args.get("anythingllm_api_url") or DEFAULT_ANYTHINGLLM_API_URL).strip(),
-            "provided_api_key": str(args.get("anythingllm_api_key") or "").strip(),
+            "api_url": str(config.get("api_url") or args.get("anythingllm_api_url") or DEFAULT_ANYTHINGLLM_API_URL).strip(),
+            "provided_api_key": str(config.get("provided_api_key") or args.get("anythingllm_api_key") or "").strip(),
         }
 
 
@@ -10159,7 +10576,13 @@ def _is_most_recent_recovery_run(run_root):
     )
     if not candidates:
         return True
-    return root == candidates[0].parents[2]
+    latest = candidates[0]
+    # Per-document manifests live at ``<run>/<pdf>/inspection`` while the
+    # shared batch ledger/manifest lives directly at ``<run>``. Treat both as
+    # first-class recovery artifacts instead of applying the old fixed-depth
+    # assumption to the latter.
+    latest_root = latest.parents[2] if latest.parent.name == "inspection" else latest.parent
+    return root == latest_root
 
 
 def recover_automatic_run(
@@ -10288,35 +10711,37 @@ def schedule_automatic_recovery(run_root, *, reason="runtime_interrupted"):
     root = Path(run_root)
     key = str(root)
     attempt_path = root / AUTOMATIC_RUN_RECOVERY_ATTEMPT
-    if attempt_path.is_file():
-        return False
-    existing = ACTIVE_AUTOMATIC_RECOVERY_THREADS.get(key)
-    if existing and existing.is_alive():
-        return False
-    try:
-        _write_automatic_run_json(
-            attempt_path,
-            {"scheduled_at": datetime.now().isoformat(timespec="seconds"), "reason": str(reason or "runtime_interrupted")},
-        )
-    except OSError:
-        return False
-
-    def recover_in_background():
+    with AUTOMATIC_RECOVERY_SCHEDULING_LOCK:
+        if attempt_path.is_file():
+            return False
+        existing = ACTIVE_AUTOMATIC_RECOVERY_THREADS.get(key)
+        if existing and existing.is_alive():
+            return False
         try:
-            recover_automatic_run(root, policy="automatic_recover", automatic=True)
-        except Exception as exc:
-            APP_LOGGER.warning("automatic recovery attempt failed: %s", exc)
-        finally:
-            ACTIVE_AUTOMATIC_RECOVERY_THREADS.pop(key, None)
+            _write_automatic_run_json(
+                attempt_path,
+                {"scheduled_at": datetime.now().isoformat(timespec="seconds"), "reason": str(reason or "runtime_interrupted")},
+            )
+        except OSError:
+            return False
 
-    thread = threading.Thread(
-        target=recover_in_background,
-        name=f"anythingllm-recovery-{root.name}",
-        daemon=True,
-    )
-    ACTIVE_AUTOMATIC_RECOVERY_THREADS[key] = thread
-    thread.start()
-    return True
+        def recover_in_background():
+            try:
+                recover_automatic_run(root, policy="automatic_recover", automatic=True)
+            except Exception as exc:
+                APP_LOGGER.warning("automatic recovery attempt failed: %s", exc)
+            finally:
+                with AUTOMATIC_RECOVERY_SCHEDULING_LOCK:
+                    ACTIVE_AUTOMATIC_RECOVERY_THREADS.pop(key, None)
+
+        thread = threading.Thread(
+            target=recover_in_background,
+            name=f"anythingllm-recovery-{root.name}",
+            daemon=True,
+        )
+        ACTIVE_AUTOMATIC_RECOVERY_THREADS[key] = thread
+        thread.start()
+        return True
 
 
 def request_automatic_run_cancellation(run_root):
@@ -10349,11 +10774,19 @@ def automatic_run_cancellation_requested(run_root):
 
 
 def _write_automatic_run_json(path, payload):
-    """Atomically persist small control records used across Gradio workers."""
+    """Atomically persist small control records used across concurrent callbacks."""
     target = Path(path)
-    temporary = target.with_suffix(target.suffix + ".tmp")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(target)
+    # Windows can reject simultaneous replacements of the same destination,
+    # even when each writer owns a distinct temporary file. These files are
+    # tiny control records, so serialising only their final write avoids a
+    # cross-callback race without serialising PDF preparation or uploads.
+    with AUTOMATIC_RUN_JSON_WRITE_LOCK:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # Reuse the bounded PermissionError retry used for other recovery
+        # artifacts. Antivirus/indexing briefly holds Windows files open in
+        # practice; failing one progress write must not make a running job
+        # appear permanently stalled after a server refresh.
+        atomic_write_text(target, json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 def active_automatic_run_worker(run_root):
@@ -10380,6 +10813,65 @@ def active_automatic_run_worker(run_root):
     return {"pid": pid, "marker": str(marker), **record}
 
 
+def remove_owned_automatic_worker_marker(run_root, process):
+    """Remove a worker marker only when it still identifies this process.
+
+    A Desktop restart can recursively launch a replacement worker using the
+    same run directory before the original invocation reaches its ``finally``
+    block.  The old invocation must never delete that replacement's marker.
+    """
+    root = Path(str(run_root or ""))
+    marker = root / AUTOMATIC_RUN_WORKER_MARKER
+    current = active_automatic_run_worker(root)
+    if current is None:
+        # A missing marker is already clean. Preserve malformed/unverified
+        # content as recovery evidence instead of deleting an unknown record.
+        return not marker.exists()
+    try:
+        owns_marker = int(current.get("pid") or 0) == int(process.pid)
+    except (AttributeError, TypeError, ValueError):
+        owns_marker = False
+    if not owns_marker:
+        return False
+    try:
+        marker.unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
+
+
+def stop_unregistered_automatic_worker(process):
+    """Best-effort cleanup when a just-spawned worker cannot be registered."""
+    try:
+        if os.name == "nt":
+            completed = subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            stopped = completed.returncode == 0
+        else:
+            process.terminate()
+            stopped = True
+    except (AttributeError, OSError, subprocess.SubprocessError):
+        stopped = False
+    if not stopped:
+        try:
+            process.terminate()
+        except (AttributeError, OSError):
+            pass
+    try:
+        process.wait(timeout=10)
+    except (AttributeError, OSError, subprocess.TimeoutExpired):
+        try:
+            process.kill()
+            process.wait(timeout=10)
+        except (AttributeError, OSError, subprocess.SubprocessError):
+            pass
+
+
 def terminate_automatic_run_worker(run_root):
     """Hard-stop the exact process tree created for this automatic PDF run.
 
@@ -10391,7 +10883,8 @@ def terminate_automatic_run_worker(run_root):
     if not worker:
         return False
     worker_key = str(Path(run_root))
-    process = ACTIVE_AUTOMATIC_RUN_WORKER_PROCESSES.get(worker_key)
+    with ACTIVE_AUTOMATIC_RUN_WORKER_PROCESSES_LOCK:
+        process = ACTIVE_AUTOMATIC_RUN_WORKER_PROCESSES.get(worker_key)
     if process is None or process.pid != worker["pid"] or process.poll() is not None:
         APP_LOGGER.warning(
             "refusing taskkill for an unowned automatic worker marker",
@@ -10416,6 +10909,19 @@ def terminate_automatic_run_worker(run_root):
             extra={"run_root": str(run_root), "pid": worker["pid"]},
         )
     return stopped
+
+
+def stop_automatic_run_worker_and_wait(run_root, process, timeout_seconds=10):
+    """Request an owned worker stop and prove it exited before replacement."""
+    terminate_automatic_run_worker(run_root)
+    try:
+        process.wait(timeout=timeout_seconds)
+        return True
+    except (AttributeError, OSError, subprocess.TimeoutExpired):
+        try:
+            return process.poll() is not None
+        except AttributeError:
+            return False
 
 
 def write_automatic_cancellation_recovery(run_root, pdf_path=None, worker_record=None):
@@ -10539,6 +11045,42 @@ def cleanup_automatic_success_worker_artifacts(output_dir, summary):
     return removed
 
 
+def finalize_successful_automatic_batch_retention(summaries):
+    """Compact a fully proven shared native batch, source by source.
+
+    This runs only after the outer queue has reported each source as uploaded
+    and exactly searchable. A failure to compact is intentionally visible and
+    non-destructive: detailed artifacts remain available instead of turning a
+    successful upload into an unrecoverable local-output failure.
+    """
+    results = []
+    for summary in summaries or []:
+        if not isinstance(summary, dict):
+            continue
+        output_root = Path(str(summary.get("output_root") or ""))
+        result = finalize_deferred_batch_lean_retention(output_root, summary)
+        if result.get("applied"):
+            summary["lean_retention"] = dict(result)
+            worker_receipts = cleanup_automatic_success_worker_artifacts(output_root, summary)
+            result["worker_receipts_deleted"] = worker_receipts
+        results.append(
+            {
+                "pdf": str(summary.get("pdf") or ""),
+                "output_root": str(output_root),
+                **result,
+            }
+        )
+    return {
+        "protocol": "automatic_shared_batch_retention_v1",
+        "status": (
+            "complete"
+            if results and all(bool(result.get("applied")) for result in results)
+            else ("not_required" if not results else "retained_for_review")
+        ),
+        "documents": results,
+    }
+
+
 def new_automatic_runtime_guard():
     return {
         "desktop_required": False,
@@ -10554,8 +11096,11 @@ def append_automatic_runtime_event(run_root, event):
     record = dict(event or {})
     record.setdefault("recorded_at", datetime.now().isoformat(timespec="seconds"))
     path = Path(run_root) / AUTOMATIC_RUN_RUNTIME_EVENTS
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    with PERSISTED_HISTORY_LOCK:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
 
 
 def attempt_automatic_runtime_start(run_root, api_url, api_key, *, stage="", status_callback=None):
@@ -10818,27 +11363,40 @@ def execute_automatic_preparation_in_worker(
         },
     )
     creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    process = subprocess.Popen(
-        [sys.executable, str(worker_script), str(config_path)],
-        cwd=str(Path(__file__).resolve().parent),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=creationflags,
-    )
-    worker_marker = root / AUTOMATIC_RUN_WORKER_MARKER
-    _write_automatic_run_json(
-        worker_marker,
-        {
-            "kind": "automatic-preparation-worker",
-            "pid": process.pid,
-            "run_root": str(root),
-            "pdf_path": str(pdf_path),
-            "started_at": datetime.now().isoformat(),
-        },
-    )
     worker_key = str(root)
-    ACTIVE_AUTOMATIC_RUN_WORKER_PROCESSES[worker_key] = process
+    # Register the durable ownership marker and its in-memory process handle
+    # as one cancellation boundary.  Without this lock a Cancel click could
+    # observe the marker between these writes, accept the request, and be
+    # unable to stop the just-created owned process until it happened to poll
+    # the durable marker itself.
+    with ACTIVE_AUTOMATIC_RUN_WORKER_PROCESSES_LOCK:
+        process = subprocess.Popen(
+            [sys.executable, str(worker_script), str(config_path)],
+            cwd=str(Path(__file__).resolve().parent),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creationflags,
+        )
+        worker_marker = root / AUTOMATIC_RUN_WORKER_MARKER
+        try:
+            _write_automatic_run_json(
+                worker_marker,
+                {
+                    "kind": "automatic-preparation-worker",
+                    "pid": process.pid,
+                    "run_root": str(root),
+                    "pdf_path": str(pdf_path),
+                    "started_at": datetime.now().isoformat(),
+                },
+            )
+        except BaseException:
+            # Without the marker and in-memory registration, Cancel cannot prove
+            # ownership of this child. Stop the worker tree before propagating the
+            # setup error rather than leaving it to process PDFs invisibly.
+            stop_unregistered_automatic_worker(process)
+            raise
+        ACTIVE_AUTOMATIC_RUN_WORKER_PROCESSES[worker_key] = process
     event_offset = 0
     latest_progress_value = 0.0
     latest_stage = ""
@@ -10854,11 +11412,7 @@ def execute_automatic_preparation_in_worker(
     try:
         while process.poll() is None:
             if automatic_run_cancellation_requested(root):
-                terminate_automatic_run_worker(root)
-                try:
-                    process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    pass
+                stop_automatic_run_worker_and_wait(root, process)
                 recovery = write_automatic_cancellation_recovery(root, pdf_path, worker_record)
                 return {"status": "cancelled", "recovery": recovery}
             try:
@@ -10867,6 +11421,8 @@ def execute_automatic_preparation_in_worker(
                     for line in handle:
                         try:
                             event = json.loads(line)
+                            if not isinstance(event, dict):
+                                continue
                             if event.get("type") == "timing":
                                 latest_stage = event.get("stage", latest_stage)
                                 if callable(timing_event_callback):
@@ -10962,11 +11518,17 @@ def execute_automatic_preparation_in_worker(
                     latest_progress_value,
                     "AnythingLLM runtime unavailable; stopping this worker and starting Desktop once",
                 )
-                terminate_automatic_run_worker(root)
-                try:
-                    process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    pass
+                worker_stopped = stop_automatic_run_worker_and_wait(root, process)
+                if not worker_stopped:
+                    return {
+                        "status": "runtime_unavailable",
+                        "error": (
+                            "AnythingLLM became unavailable and the current preparation worker did not stop "
+                            "within 10 seconds. No replacement worker was started, so inspect the saved run "
+                            "folder before rerunning."
+                        ),
+                        "runtime_guard": runtime_guard,
+                    }
                 if not allow_runtime_restart_resume:
                     return {
                         "status": "runtime_unavailable",
@@ -11054,6 +11616,8 @@ def execute_automatic_preparation_in_worker(
                 handle.seek(event_offset)
                 for line in handle:
                     event = json.loads(line)
+                    if not isinstance(event, dict):
+                        continue
                     if event.get("type") == "timing":
                         if callable(timing_event_callback):
                             timing_event_callback(event.get("stage", ""), event.get("batch_report") or {})
@@ -11075,6 +11639,11 @@ def execute_automatic_preparation_in_worker(
                 "status": "failed",
                 "error": f"The preparation worker ended without a readable result: {exc}",
             }
+        if not isinstance(result, dict):
+            return {
+                "status": "failed",
+                "error": "The preparation worker ended with a malformed non-object result record.",
+            }
         if result.get("status") != "completed":
             return {"status": result.get("status") or "failed", **result}
         if result.get("run_status") != "pass":
@@ -11089,13 +11658,13 @@ def execute_automatic_preparation_in_worker(
         return {"status": "completed", **result}
     finally:
         # A stale marker must never authorize a later Cancel click against a
-        # reused Windows PID.  The cancellation recovery record remains.
-        try:
-            worker_marker.unlink(missing_ok=True)
-        except OSError:
-            pass
-        if ACTIVE_AUTOMATIC_RUN_WORKER_PROCESSES.get(worker_key) is process:
-            ACTIVE_AUTOMATIC_RUN_WORKER_PROCESSES.pop(worker_key, None)
+        # reused Windows PID. A replacement worker may already own this run
+        # root after a controlled Desktop restart, so remove only our marker.
+        # The cancellation recovery record remains.
+        remove_owned_automatic_worker_marker(root, process)
+        with ACTIVE_AUTOMATIC_RUN_WORKER_PROCESSES_LOCK:
+            if ACTIVE_AUTOMATIC_RUN_WORKER_PROCESSES.get(worker_key) is process:
+                ACTIVE_AUTOMATIC_RUN_WORKER_PROCESSES.pop(worker_key, None)
 
 
 def cancellation_safe_display_progress(run_root, proposed_fraction):
@@ -11264,21 +11833,41 @@ def automatic_run_timing_html(
 def _append_timing_jsonl(path, record):
     """Append a small, inspectable timing record without PDF text or API keys."""
     try:
-        TIMING_MODEL_DIR.mkdir(parents=True, exist_ok=True)
-        prune_background_jsonl(path)
-        with Path(path).open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+        with PERSISTED_HISTORY_LOCK:
+            TIMING_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+            prune_background_jsonl(path)
+            with Path(path).open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+                handle.flush()
     except OSError as exc:
         APP_LOGGER.warning("could not persist timing-model record: %s", exc)
 
 
 def _read_timing_jsonl(path, limit=240):
-    if not Path(path).exists():
+    history_path = Path(path)
+    if not history_path.exists():
         return []
     try:
-        rows = [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
+        with PERSISTED_HISTORY_LOCK:
+            lines = history_path.read_text(encoding="utf-8").splitlines()
+        rows = []
+        malformed = 0
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                malformed += 1
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+            else:
+                malformed += 1
+        if malformed:
+            APP_LOGGER.warning("ignored %s malformed timing-model history record(s) in %s", malformed, history_path)
         return rows[-max(1, int(limit)):]
-    except (OSError, json.JSONDecodeError) as exc:
+    except OSError as exc:
         APP_LOGGER.warning("could not read timing-model history: %s", exc)
         return []
 
@@ -12570,6 +13159,12 @@ def _timing_percentile(values, percentile=.75):
 
 def ensure_timing_model_backfill():
     """Seed the central model from existing app run summaries exactly once."""
+    with TIMING_MODEL_BACKFILL_LOCK:
+        return _ensure_timing_model_backfill()
+
+
+def _ensure_timing_model_backfill():
+    """Seed the central model from existing app run summaries exactly once."""
     existing = {str(row.get("run_key") or "") for row in _read_timing_jsonl(TIMING_MODEL_RUNS_PATH, limit=1000)}
     seeded = 0
     for summary_path in sorted(automatic_run_artifact_paths(AUTO_OUTPUT_DIR, "*/run-summary.json"), key=lambda path: path.stat().st_mtime)[-100:]:
@@ -13116,7 +13711,7 @@ def record_timing_model_run(
             "formula": row["estimate_formula"],
         }
         TIMING_MODEL_DIR.mkdir(parents=True, exist_ok=True)
-        TIMING_MODEL_SUMMARY_PATH.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        atomic_write_text(TIMING_MODEL_SUMMARY_PATH, json.dumps(summary, indent=2))
         return row
     except (OSError, TypeError, ValueError) as exc:
         APP_LOGGER.warning("could not record terminal timing model row: %s", exc)
@@ -13158,9 +13753,12 @@ def record_timing_model_event(run_root, stage, batch_report=None):
     # payload content—and a write failure must never affect the run itself.
     try:
         timeline_path = Path(run_root) / "timing-evidence-timeline.jsonl"
-        timeline_path.parent.mkdir(parents=True, exist_ok=True)
-        with timeline_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+        with PERSISTED_HISTORY_LOCK:
+            timeline_path.parent.mkdir(parents=True, exist_ok=True)
+            with timeline_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
     except (OSError, TypeError, ValueError) as exc:
         APP_LOGGER.warning("could not persist run timing timeline: %s", exc)
 
@@ -13246,6 +13844,90 @@ def refresh_automatic_run_estimate(
     )
 
 
+def automatic_completion_receipt(summaries):
+    """Return a small, user-facing receipt without conflating global totals.
+
+    ``api_embedded`` is the exact per-PDF proof count. It is intentionally not
+    replaced with a workspace-wide LanceDB total, which can include older
+    records from unrelated or prior imports.
+    """
+    rows = [summary for summary in (summaries or []) if isinstance(summary, dict)]
+    def positive_int(value):
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+    planned = sum(
+        positive_int(summary.get("post_upload_expected_payloads") or summary.get("api_uploaded"))
+        for summary in rows
+    )
+    newly_linked = sum(positive_int(summary.get("api_uploaded")) for summary in rows)
+    confirmed = sum(positive_int(summary.get("api_embedded")) for summary in rows)
+    existing_skipped = sum(
+        1 for summary in rows
+        if str(summary.get("post_upload_classification") or "") == "workspace_existing_content_skipped"
+    )
+    existing_records_reused = sum(
+        positive_int(summary.get("workspace_existing_records"))
+        for summary in rows
+    )
+    partially_reconciled_pdfs = sum(
+        1 for summary in rows
+        if str(summary.get("post_upload_classification") or "")
+        == "batch_exact_partial_existing_content_reconciled"
+    )
+    failures = sum(
+        1 for summary in rows
+        if str(summary.get("api_upload_status") or "") not in {
+            "complete", "complete_with_key_cleanup_warning", "", "not_requested"
+        }
+    )
+    runtime_deferred = any(
+        str(summary.get("anythingllm_runtime_validation_status") or "")
+        == "deferred_after_exact_vector_proof"
+        for summary in rows
+    )
+    return {
+        "pdfs": len(rows),
+        "planned_records": planned,
+        "newly_linked_records": newly_linked,
+        "confirmed_records": confirmed,
+        "existing_pdfs_skipped": existing_skipped,
+        "existing_records_reused": existing_records_reused,
+        "partially_reconciled_pdfs": partially_reconciled_pdfs,
+        "failed_pdfs": failures,
+        "runtime_retrieval_deferred": runtime_deferred,
+    }
+
+
+def automatic_completion_success_message(summaries, *, include_runtime_note=True):
+    receipt = automatic_completion_receipt(summaries)
+    existing_records = max(
+        0,
+        receipt["confirmed_records"] - receipt["newly_linked_records"],
+    )
+    lead = (
+        f"{receipt['pdfs']} PDF(s): {receipt['planned_records']} prepared page record(s) — "
+        f"{existing_records} already indexed + {receipt['newly_linked_records']} newly uploaded; "
+        f"all {receipt['confirmed_records']} confirmed in this workspace; "
+        f"{receipt['failed_pdfs']} failed."
+    )
+    if receipt["existing_pdfs_skipped"]:
+        lead += (
+            f" {receipt['existing_pdfs_skipped']} fully indexed PDF(s) were skipped; "
+            "only missing records were sent to AnythingLLM."
+        )
+    if receipt["partially_reconciled_pdfs"]:
+        lead += (
+            f" {receipt['existing_records_reused']} existing record(s) across "
+            f"{receipt['partially_reconciled_pdfs']} partially indexed PDF(s) were safely reused."
+        )
+    body = " Your document(s) are indexed and ready to use in AnythingLLM."
+    if include_runtime_note and receipt["runtime_retrieval_deferred"]:
+        body += " Optional live retrieval checking was not run; use Workspace verification when you want that separate diagnostic."
+    return lead + body
+
+
 def automatic_completion(summaries, prepare_and_upload):
     if any(summary.get("app_error_code") for summary in summaries):
         return {"state": "failed", "message": "Preparation failed; inspect the generated failure report."}
@@ -13258,6 +13940,58 @@ def automatic_completion(summaries, prepare_and_upload):
         summary for summary in summaries
         if summary.get("api_upload_status") == "skipped_needs_ocr_review"
     ]
+    batch_incomplete = [
+        summary for summary in summaries
+        if summary.get("api_upload_status") == "skipped_batch_incomplete"
+    ]
+    # A review hold is intentionally non-destructive, but it must not mask a
+    # separate failed submission in the same run.  This can happen after an
+    # interrupted batch has already produced a local OCR hold for one PDF.
+    hard_upload_failures = []
+    for summary in summaries:
+        status = summary.get("api_upload_status")
+        if status in {
+            "",
+            None,
+            "complete",
+            "complete_with_key_cleanup_warning",
+            "skipped_needs_ocr_review",
+            "skipped_batch_incomplete",
+            "reconciliation_pending",
+        }:
+            continue
+        # Later branches describe these two evidence-backed outcomes much more
+        # accurately than a generic submission failure. A client timeout is
+        # unknown rather than rejected; partial vector coverage proves that
+        # some of the original queue made progress.
+        if str(summary.get("post_upload_verification_status") or "") == "partial_vector_coverage":
+            continue
+        if str(summary.get("api_upload_error_classification") or "") in {
+            "client_timeout_submission_unknown",
+            "client_transport_submission_unknown",
+        }:
+            continue
+        hard_upload_failures.append(summary)
+    if hard_upload_failures:
+        first = hard_upload_failures[0]
+        names = ", ".join(
+            Path(str(summary.get("pdf") or "document")).name
+            for summary in hard_upload_failures[:3]
+        )
+        suffix = "" if len(hard_upload_failures) <= 3 else f" (+{len(hard_upload_failures) - 3} more)"
+        detail = str(
+            first.get("api_upload_error")
+            or ((first.get("api_upload_report") or {}).get("error") if isinstance(first.get("api_upload_report"), dict) else "")
+            or "AnythingLLM did not confirm the embedding submission."
+        )
+        return {
+            "state": "failed",
+            "code": "AUTO-EMBEDDING-SUBMISSION-001",
+            "message": (
+                f"AnythingLLM upload failed for {names}{suffix}: {detail} "
+                "Prepared files and recovery evidence were retained; no failed request was retried automatically."
+            ),
+        }
     if ocr_withheld:
         names = ", ".join(Path(str(summary.get("pdf") or "document")).name for summary in ocr_withheld[:3])
         suffix = "" if len(ocr_withheld) <= 3 else f" (+{len(ocr_withheld) - 3} more)"
@@ -13274,7 +14008,11 @@ def automatic_completion(summaries, prepare_and_upload):
                 else "AUTO-OCR-REVIEW-001"
             ),
             "message": (
-                f"Local preparation completed, but AnythingLLM upload was withheld for {names}{suffix} "
+                f"Local preparation completed, but AnythingLLM upload was withheld for {names}{suffix}. "
+                + (
+                    "No other selected PDF was queued, so the existing workspace was not partially mutated. "
+                    if batch_incomplete else ""
+                )
                 + (
                     f"because {warning_detail[0].lower() + warning_detail[1:]} "
                     "Review the saved readiness report."
@@ -13315,6 +14053,21 @@ def automatic_completion(summaries, prepare_and_upload):
         for status in runtime_statuses
     )
     upload_ok = all(summary.get("api_upload_status") in {"complete", "complete_with_key_cleanup_warning"} for summary in summaries)
+    workspace_duplicate_advisory = any(
+        str(summary.get("post_upload_classification") or "")
+        == "batch_exact_current_submission_with_workspace_duplicate_advisory"
+        for summary in summaries
+    )
+    if upload_ok and post_searchable_with_caveat and workspace_duplicate_advisory:
+        return {
+            "state": "warning",
+            "code": "AUTO-WORKSPACE-DUPLICATES-001",
+            "message": (
+                "This submission's planned records were indexed exactly, but the selected workspace already contains "
+                "older duplicate vectors for the same source identities. No automatic retry or deletion was performed; "
+                "use the retained workspace-cleanup evidence before relying on duplicate-sensitive retrieval."
+            ),
+        }
     if upload_ok and post_ok and runtime_ok:
         # Storage, vector search, and chat are proven independently below.
         # Desktop's visible workspace list is a fourth concern: it needs the
@@ -13323,8 +14076,9 @@ def automatic_completion(summaries, prepare_and_upload):
         # is absent (for example, after an AnythingLLM restart or update).
         return {
             "state": "successful",
+            "receipt": automatic_completion_receipt(summaries),
             "message": (
-                "Your document is indexed and ready to use in AnythingLLM. "
+                automatic_completion_success_message(summaries, include_runtime_note=False) + " "
                 "All storage and retrieval checks passed. The AnythingLLM Documents list may refresh separately."
             ),
         }
@@ -13355,18 +14109,14 @@ def automatic_completion(summaries, prepare_and_upload):
                 # Retain the timeout classification in the durable run report
                 # without making an otherwise ready document look doubtful.
                 "diagnostic_code": "AUTO-RETRIEVAL-DEFERRED-001",
-                "message": (
-                    "Your document is indexed and ready to use in AnythingLLM. "
-                    "All page-parent vectors were confirmed."
-                ),
+                "receipt": automatic_completion_receipt(summaries),
+                "message": automatic_completion_success_message(summaries),
             }
         return {
             "state": "successful",
             "diagnostic_code": "AUTO-RETRIEVAL-RUNTIME-001",
-            "message": (
-                "Your document is indexed and ready to use in AnythingLLM. "
-                "All page-parent vectors were confirmed."
-            ),
+            "receipt": automatic_completion_receipt(summaries),
+            "message": automatic_completion_success_message(summaries),
         }
     if upload_ok and post_searchable_with_caveat and any(
         status == "blocked_provider_authentication" for status in runtime_statuses
@@ -13399,6 +14149,10 @@ def automatic_completion(summaries, prepare_and_upload):
     partial = [summary for summary in summaries if str(summary.get("post_upload_verification_status") or "") == "partial_vector_coverage"]
     if partial:
         first = partial[0]
+        partial_names = ", ".join(
+            Path(str(summary.get("pdf") or "document")).name for summary in partial[:3]
+        )
+        partial_suffix = "" if len(partial) <= 3 else f" (+{len(partial) - 3} more)"
         observed = int(first.get("post_upload_matching_vectors") or 0)
         expected = int(first.get("post_upload_expected_payloads") or 0)
         remaining = max(0, expected - observed)
@@ -13420,7 +14174,7 @@ def automatic_completion(summaries, prepare_and_upload):
         return {
             "state": "failed",
             "code": "AUTO-EMBEDDING-PARTIAL-001",
-            "message": f"AnythingLLM indexing stalled: {counts}{recovery}.{cap_detail} The original Desktop queue was not replayed automatically because its remaining outcome is ambiguous; the saved recovery manifest limits any later resume to this run's exact missing records.",
+            "message": f"AnythingLLM indexing stalled for {partial_names}{partial_suffix}: {counts}{recovery}.{cap_detail} The original Desktop queue was not replayed automatically because its remaining outcome is ambiguous; the saved recovery manifest limits any later resume to this run's exact missing records.",
         }
     reconciliation_pending = [
         summary for summary in summaries
@@ -13440,6 +14194,11 @@ def automatic_completion(summaries, prepare_and_upload):
     failed_uploads = [summary for summary in summaries if summary.get("api_upload_status") not in {"complete", "complete_with_key_cleanup_warning"}]
     if failed_uploads:
         first = failed_uploads[0]
+        failed_names = ", ".join(
+            Path(str(summary.get("pdf") or "document")).name
+            for summary in failed_uploads[:3]
+        )
+        failed_suffix = "" if len(failed_uploads) <= 3 else f" (+{len(failed_uploads) - 3} more)"
         upload_error = str(
             first.get("api_upload_error")
             or ((first.get("api_upload_report") or {}).get("error") if isinstance(first.get("api_upload_report"), dict) else "")
@@ -13472,7 +14231,7 @@ def automatic_completion(summaries, prepare_and_upload):
         return {
             "state": "failed",
             "code": "AUTO-EMBEDDING-SUBMIT-001",
-            "message": f"AnythingLLM embedding submission failed before any partial searchable coverage could be confirmed: {upload_error}",
+            "message": f"AnythingLLM embedding submission failed for {failed_names}{failed_suffix} before complete searchable coverage could be confirmed: {upload_error}",
         }
     return {
         "state": "failed",
@@ -13583,6 +14342,14 @@ def automatic_confirmation_html(settings):
         mode,
         workspace_label,
         settings["native_upload_scope"] if mode == MODE_NATIVE_UPLOAD_LABEL else "Local files only",
+        (
+            "Shared metadata override for every selected PDF"
+            if len(settings.get("files") or []) > 1 and settings.get("apply_batch_metadata_overrides")
+            else "Per-PDF detected metadata"
+            if len(settings.get("files") or []) > 1
+            else "Single-PDF detected metadata"
+        ),
+        settings.get("existing_workspace_duplicate_policy") if mode == MODE_NATIVE_UPLOAD_LABEL else "",
         settings["segment_mode"],
         custom_range_detail,
         f"{settings['anythingllm_chunk_size']} chunk / {settings['anythingllm_chunk_overlap']} overlap",
@@ -13768,6 +14535,24 @@ def validated_automatic_run_settings(values):
     if validation_report:
         return settings, validation_report, [], False
     settings["files"] = files
+    batch_metadata_shared_values_present = bool(
+        len(files) > 1
+        and any(
+            str(settings.get(field) or "").strip()
+            for field in ("document_label", "document_author", "document_short_label")
+        )
+    )
+    settings["batch_metadata_shared_fields_ignored"] = bool(
+        batch_metadata_shared_values_present
+        and not bool(settings.get("apply_batch_metadata_overrides"))
+    )
+    if settings["batch_metadata_shared_fields_ignored"]:
+        # Canonical confirmation state, including a suggested new-workspace
+        # name, must follow the same policy as execution. Otherwise a stale
+        # first-file title could not rename page parents, yet still leak into
+        # the workspace name or a saved confirmation snapshot.
+        for field in ("document_label", "document_author", "document_short_label"):
+            settings[field] = ""
     if pipeline_segment_mode(settings.get("segment_mode")) == "custom_page_ranges":
         try:
             settings["custom_page_group_sizes"] = parse_custom_page_group_sizes(
@@ -13869,6 +14654,13 @@ def validated_automatic_run_settings(values):
     settings["estimate_comparable_runs"] = estimate.get("comparable_runs", 0)
     settings["timing_estimate"] = estimate
     warnings = []
+    if (
+        settings.get("batch_metadata_shared_fields_ignored")
+    ):
+        warnings.append(
+            "Batch metadata safeguard: shared title, author, and short-label fields will be ignored; each PDF will be freshly recognized. "
+            "Enable ‘Apply the title, author, and short label above to every selected PDF’ only for an intentional shared override."
+        )
     if settings["mode"] == MODE_NATIVE_UPLOAD_LABEL and not (settings["workspace_slug"] or "").strip():
         warnings.append("Native upload is blocked until you select or create a workspace.")
     elif settings["mode"] == MODE_NATIVE_UPLOAD_LABEL and is_new_document_workspace_choice(settings["workspace_slug"]):
@@ -14864,7 +15656,14 @@ def extraction_backend_help(choice):
     return f'<div class="metadata-summary"><div class="metadata-file"><div class="metadata-status">{body}</div></div></div>'
 
 
-def detected_metadata_preview(pdf_files, current_title="", current_author="", current_short_label="", use_file_title_fallback=True):
+def detected_metadata_preview(
+    pdf_files,
+    current_title="",
+    current_author="",
+    current_short_label="",
+    use_file_title_fallback=True,
+    apply_batch_metadata_overrides=False,
+):
     if str((LIVE_AUTOMATIC_RUN_STATUS or {}).get("state") or "") == "running":
         # Metadata inspection can be slow on large PDFs and is strictly
         # next-run preparation.  Never let a late selection callback replace
@@ -14999,9 +15798,16 @@ def detected_metadata_preview(pdf_files, current_title="", current_author="", cu
     author_value = current_author or (detected_author if should_fill_fields else "")
     short_value = current_short_label or (detected_short if should_fill_fields else "")
     if len(files) > 1:
+        # Avoid leaving a first-file inference visibly mounted as a deceptive
+        # batch-wide override. An operator can still enter shared values after
+        # selection, but must also make the explicit batch-override choice.
+        if not apply_batch_metadata_overrides:
+            title_value = ""
+            author_value = ""
+            short_value = ""
         previews.insert(
             0,
-            '<section class="metadata-file"><div class="metadata-status">Multiple PDFs selected. Shared override fields remain empty because each document may have different metadata.</div></section>',
+            '<section class="metadata-file"><div class="metadata-status">Multiple PDFs selected. Each file is inspected independently, and the run will freshly inspect every selected PDF again before preparation. Shared fields are cleared and do not affect this batch unless “Apply the title, author, and short label above to every selected PDF” is explicitly enabled.</div></section>',
         )
 
     return (
@@ -15513,6 +16319,968 @@ def classify_pipeline_exception(exc):
     }
 
 
+def _batch_upload_hold_message(block_reason):
+    reason = str(block_reason or "").strip()
+    if reason == "ocr_backend_text_coverage_disagreement":
+        return "AnythingLLM upload was withheld because OCR extractors materially disagree about text coverage."
+    if reason == "photographed_spread_requires_manual_review":
+        return "AnythingLLM upload was withheld because photographed spreads require visual review."
+    return "AnythingLLM upload was withheld because reliable OCR is required but unavailable."
+
+
+def _write_grouped_upload_csv(path, row):
+    """Keep the compact CSV companions truthful after outer batch submission."""
+    values = {
+        str(key): (
+            json.dumps(value, ensure_ascii=False, sort_keys=True)
+            if isinstance(value, (dict, list, tuple))
+            else value
+        )
+        for key, value in (row or {}).items()
+    }
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with Path(path).open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(values) or ["status"])
+            writer.writeheader()
+            writer.writerow(values or {"status": "not_checked"})
+    except OSError as exc:
+        APP_LOGGER.warning("could not persist grouped upload CSV %s: %s", path, exc)
+
+
+def persist_grouped_upload_outcome(summary, document_result):
+    """Synchronize a staged PDF's durable artifacts with the outer upload.
+
+    Automatic workers intentionally finish before the shared Desktop queue is
+    submitted. Their initial reports therefore describe preparation-only work;
+    leaving those reports untouched would make a later restart diagnose a
+    successful workspace mutation as a local-only run.
+    """
+    error = str(document_result.get("error") or "")
+    summary.update(
+        {
+            "api_upload_status": document_result.get("status") or "error",
+            "api_uploaded": int(document_result.get("uploaded") or 0),
+            "api_embedded": int(document_result.get("embedded") or 0),
+            "workspace_existing_records": int(document_result.get("existing_workspace_records") or 0),
+            "api_upload_error": error,
+            "api_upload_warning": str(document_result.get("warning") or ""),
+            "api_embedding_update_requested": int(document_result.get("queue_requested") or 0),
+            "api_embedding_update_accepted": int(document_result.get("queue_accepted") or 0),
+            "api_embedding_update_batches": list(document_result.get("queue_batches") or []),
+            "api_embedding_batch_ledger": str(document_result.get("ledger_path") or ""),
+            "post_upload_verification_status": document_result.get("post_status") or "not_checked",
+            "post_upload_classification": document_result.get("post_classification") or "batch_evidence_incomplete",
+            "post_upload_expected_payloads": int(document_result.get("records") or 0),
+            "post_upload_matching_vectors": int(document_result.get("embedded") or 0),
+            "anythingllm_runtime_validation_status": document_result.get("runtime_status") or "not_checked",
+            "batch_upload_result": dict(document_result),
+        }
+    )
+    output_root_value = str(summary.get("output_root") or "").strip()
+    if not output_root_value:
+        return
+    output_root = Path(output_root_value)
+    if not output_root.is_dir():
+        return
+    inspection = output_root / "inspection"
+    inspection.mkdir(parents=True, exist_ok=True)
+    _write_automatic_run_json(output_root / "run-summary.json", summary)
+    api_report = _read_automatic_run_json(inspection / "api-upload-report.json")
+    api_report.update(
+        {
+            "status": summary["api_upload_status"],
+            "uploaded": summary["api_uploaded"],
+            "embedded": summary["api_embedded"],
+            "existing_workspace_records": summary["workspace_existing_records"],
+            "errors": ([{"error": error}] if error else []),
+            "warnings": ([{"warning": summary["api_upload_warning"]}] if summary["api_upload_warning"] else []),
+            "embedding_update": {
+                "requested": summary["api_embedding_update_requested"],
+                "accepted": summary["api_embedding_update_accepted"],
+                "batches": summary["api_embedding_update_batches"],
+            },
+            "grouped_batch_result": dict(document_result),
+        }
+    )
+    _write_automatic_run_json(inspection / "api-upload-report.json", api_report)
+    post_report = _read_automatic_run_json(inspection / "post-upload-verification.json")
+    post_report.update(
+        {
+            "status": summary["post_upload_verification_status"],
+            "classification": summary["post_upload_classification"],
+            "expected_payload_count": summary["post_upload_expected_payloads"],
+            "matching_vector_rows": summary["post_upload_matching_vectors"],
+            "lancedb_matching_rows": summary["post_upload_matching_vectors"],
+            "grouped_batch_result": dict(document_result),
+        }
+    )
+    _write_automatic_run_json(inspection / "post-upload-verification.json", post_report)
+    _write_grouped_upload_csv(inspection / "post-upload-verification.csv", post_report)
+    runtime_report = _read_automatic_run_json(inspection / "anythingllm-runtime-validation.json")
+    runtime_report.update(
+        {
+            "status": summary["anythingllm_runtime_validation_status"],
+            "grouped_batch_result": dict(document_result),
+        }
+    )
+    _write_automatic_run_json(inspection / "anythingllm-runtime-validation.json", runtime_report)
+    _write_automatic_run_json(inspection / "grouped-batch-upload-outcome.json", document_result)
+
+
+def batch_upload_filename_is_safe(filename):
+    """Accept only a plain generated filename, never a plan-supplied path."""
+    value = str(filename or "").strip()
+    if not value or value in {".", ".."}:
+        return False
+    # Plans are portable text artifacts, so reject both Windows and POSIX
+    # separators even when a test or migration reads the plan on the other OS.
+    return "/" not in value and "\\" not in value and Path(value).name == value
+
+
+def disambiguate_batch_upload_filenames(rows):
+    """Make colliding staged filenames unique before one shared upload.
+
+    A segment filename is readable provenance, not a globally unique key:
+    two PDFs can have the same title, or a long title can lose its page/segment
+    suffix when truncated.  AnythingLLM stores files by location, so duplicate
+    names in one ``custom-documents`` folder can replace an earlier PDF without
+    a transport error.  Keep normal single-document names unchanged, but add a
+    stable source/path digest to *every* member of a colliding group.
+    """
+    groups = {}
+    for row in rows or []:
+        filename = str((row or {}).get("filename") or "").strip()
+        groups.setdefault(filename.casefold(), []).append(row)
+
+    used = {
+        str((row or {}).get("filename") or "").strip().casefold()
+        for row in rows or []
+    }
+    remaps = []
+    for original_key, colliding_rows in groups.items():
+        if len(colliding_rows) < 2:
+            continue
+        original = str(colliding_rows[0].get("filename") or "").strip()
+        suffix = Path(original).suffix or ".txt"
+        stem = Path(original).stem or "document"
+        for ordinal, row in enumerate(colliding_rows, start=1):
+            source_identity = "|".join(
+                [
+                    str(row.get("_automatic_source_path") or ""),
+                    str(row.get("chunkSource") or ""),
+                    str(ordinal),
+                ]
+            )
+            digest = hashlib.sha256(source_identity.encode("utf-8", errors="surrogatepass")).hexdigest()[:10]
+            # Keep the generated name bounded while preserving its extension
+            # and collision proof.  The original plan convention uses a
+            # 140-character stem, so retain that compatibility ceiling.
+            suffix_with_digest = f"-d{digest}{suffix}"
+            max_stem = max(1, 140 - len(suffix_with_digest))
+            candidate_stem = stem[:max_stem].rstrip("-._ ") or "document"
+            candidate = f"{candidate_stem}{suffix_with_digest}"
+            counter = 2
+            while candidate.casefold() in used - {original_key}:
+                numbered_suffix = f"-d{digest}-{counter}{suffix}"
+                candidate_stem = stem[:max(1, 140 - len(numbered_suffix))].rstrip("-._ ") or "document"
+                candidate = f"{candidate_stem}{numbered_suffix}"
+                counter += 1
+            used.add(candidate.casefold())
+            row["filename"] = candidate
+            remaps.append(
+                {
+                    "source_path": str(row.get("_automatic_source_path") or ""),
+                    "chunk_source": str(row.get("chunkSource") or ""),
+                    "original_filename": original,
+                    "filename": candidate,
+                }
+            )
+    return remaps
+
+
+def upload_prepared_automatic_batch(
+    summaries,
+    *,
+    api_url,
+    api_key,
+    workspace_slug,
+    run_root,
+    create_document_folders=False,
+    explicit_folder_name="",
+    existing_workspace_duplicate_policy=WORKSPACE_DUPLICATE_POLICY_SKIP,
+    status_callback=None,
+    cancel_callback=None,
+):
+    """Submit all staged Automatic-run records through one Desktop queue call.
+
+    PDF extraction remains isolated per source, but AnythingLLM receives the
+    selected sources as one ordered submission.  This preserves each generated
+    page-parent identity while avoiding the former N independent queue updates
+    that could leave a pre-existing workspace in a partly-mutated state.
+    """
+    storage_dir = default_anythingllm_storage_dir()
+    all_rows = []
+    grouped_rows = []
+    document_results = {}
+    ineligible = []
+    already_completed = []
+    for summary in summaries:
+        plan_path = str(summary.get("native_upload_plan") or "").strip()
+        source_path = str(summary.get("pdf") or "")
+        source_sha = str(summary.get("source_sha256") or "")
+        source_name = Path(source_path or "document").name
+        if summary.get("app_error_code"):
+            ineligible.append((summary, source_path, "preparation_failed", "Preparation failed before this PDF could enter the shared upload batch."))
+            continue
+        block_reason = str(summary.get("batch_upload_blocked_reason") or "").strip()
+        if block_reason:
+            ineligible.append((summary, source_path, "skipped_needs_ocr_review", _batch_upload_hold_message(block_reason)))
+            continue
+        rows = load_upload_plan_rows(plan_path)
+        try:
+            rows = select_upload_payloads(
+                rows,
+                int(summary.get("batch_upload_limit") or 0),
+                tuple(summary.get("batch_upload_indices") or ()),
+            )
+        except (TypeError, ValueError) as exc:
+            ineligible.append((summary, source_path, "error_invalid_upload_scope", str(exc)))
+            continue
+        if not rows:
+            if (
+                str(summary.get("api_upload_status") or "") in {"complete", "complete_with_key_cleanup_warning"}
+                and str(summary.get("post_upload_verification_status") or "") == "pass"
+            ):
+                already_completed.append((summary, source_path))
+                continue
+            ineligible.append((summary, source_path, "error_missing_upload_files", f"{source_name} produced no selected native upload records."))
+            continue
+        invalid_row_reason = ""
+        for position, row in enumerate(rows, start=1):
+            if not isinstance(row, dict):
+                invalid_row_reason = f"upload-plan row {position} is not an object."
+                break
+            missing_fields = [
+                field for field in ("filename", "chunkSource", "text_file")
+                if not str(row.get(field) or "").strip()
+            ]
+            if missing_fields:
+                invalid_row_reason = (
+                    f"upload-plan row {position} is missing {', '.join(missing_fields)}."
+                )
+                break
+            if not batch_upload_filename_is_safe(row.get("filename")):
+                invalid_row_reason = (
+                    f"upload-plan row {position} has an unsafe filename; only a plain filename is allowed."
+                )
+                break
+            if not Path(str(row["text_file"])).is_file():
+                invalid_row_reason = (
+                    f"upload-plan row {position} refers to a missing prepared text file."
+                )
+                break
+            try:
+                prepared_text = Path(str(row["text_file"])).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                invalid_row_reason = (
+                    f"upload-plan row {position} has an unreadable prepared text file: {exc}."
+                )
+                break
+            if not prepared_text.strip():
+                invalid_row_reason = (
+                    f"upload-plan row {position} has an empty prepared text file."
+                )
+                break
+            # Avoid re-reading every selected record solely to make the
+            # expected-payload verifier. The transport still uses the durable
+            # staged file, but the validated snapshot makes an empty fallback
+            # impossible at the verification boundary.
+            row["_validated_text_content"] = prepared_text
+        if invalid_row_reason:
+            ineligible.append((summary, source_path, "error_invalid_upload_plan", invalid_row_reason))
+            continue
+        folder_name = managed_anythingllm_upload_folder_name(
+            workspace_slug=workspace_slug,
+            source_title=Path(source_path).stem,
+            source_sha=source_sha,
+            create_document_folders=bool(create_document_folders),
+            explicit_folder_name=explicit_folder_name,
+        )
+        for row in rows:
+            row["_automatic_source_path"] = source_path
+            row["_anythingllm_folder_name"] = folder_name
+        grouped_rows.append((summary, rows, source_sha, source_path))
+        all_rows.extend(rows)
+
+    # A prior run can leave a complete PDF beside new PDFs in the same
+    # selection. That is not an unsafe mixed state: it is exactly the case in
+    # which a pre-submit identity check should omit only the already-indexed
+    # PDF and submit the remaining records once. Never use a global vector
+    # count here; every decision is scoped to stable chunkSource identities in
+    # the selected workspace and requires linked document-vector rows.
+    duplicate_preflight = {
+        "status": "not_requested",
+        "policy": str(existing_workspace_duplicate_policy or WORKSPACE_DUPLICATE_POLICY_SKIP),
+        "skipped_source_paths": [],
+    }
+    if grouped_rows and (
+        str(existing_workspace_duplicate_policy or "").strip()
+        == WORKSPACE_DUPLICATE_POLICY_SKIP
+    ):
+        audit_payloads = upload_plan_rows_to_expected_payloads(all_rows)
+        for payload, row in zip(audit_payloads, all_rows):
+            payload["_automatic_source_path"] = row.get("_automatic_source_path") or ""
+        duplicate_preflight = workspace_duplicate_identity_audit(
+            storage_dir,
+            workspace_slug,
+            audit_payloads,
+        )
+        duplicate_preflight["policy"] = WORKSPACE_DUPLICATE_POLICY_SKIP
+        duplicate_preflight.setdefault("skipped_source_paths", [])
+        ready_chunk_sources = {
+            str(chunk_source).strip()
+            for chunk_source in (duplicate_preflight.pop("_ready_expected_chunk_sources", []) or [])
+            if str(chunk_source).strip()
+        }
+        fully_indexed_paths = {
+            str(path) for path in (duplicate_preflight.get("fully_indexed_source_paths") or [])
+            if str(path).strip()
+        }
+        if duplicate_preflight.get("status") == "complete" and ready_chunk_sources:
+            remaining_groups = []
+            for summary, rows, source_sha, source_path in grouped_rows:
+                source_chunk_sources = {
+                    str(row.get("chunkSource") or "").strip() for row in rows
+                    if str(row.get("chunkSource") or "").strip()
+                }
+                # The audit's source-level result is backed by every selected
+                # source identity. Recheck that local invariant before a
+                # non-mutating skip so a malformed payload can never be
+                # represented as complete.
+                if source_path in fully_indexed_paths and source_chunk_sources:
+                    summary.update(
+                        api_upload_status="complete",
+                        api_uploaded=0,
+                        api_embedded=len(source_chunk_sources),
+                        api_upload_error="",
+                        api_upload_warning=(
+                            f"Skipped {len(source_chunk_sources)} selected record(s): this PDF is already fully "
+                            "indexed in the selected workspace."
+                        ),
+                        post_upload_verification_status="pass",
+                        post_upload_classification="workspace_existing_content_skipped",
+                        post_upload_expected_payloads=len(source_chunk_sources),
+                        post_upload_matching_vectors=len(source_chunk_sources),
+                        anythingllm_runtime_validation_status="deferred_after_exact_vector_proof",
+                        api_embedding_update_requested=0,
+                        api_embedding_update_accepted=0,
+                        api_embedding_update_batches=[],
+                        workspace_duplicate_preflight={
+                            "status": "skipped_complete_existing_content",
+                            "expected_records": len(source_chunk_sources),
+                        },
+                    )
+                    result = {
+                        "status": "complete",
+                        "records": len(rows),
+                        "uploaded": 0,
+                        "embedded": len(source_chunk_sources),
+                        "existing_workspace_records": len(source_chunk_sources),
+                        "error": "",
+                        "warning": summary["api_upload_warning"],
+                        "post_status": "pass",
+                        "post_classification": "workspace_existing_content_skipped",
+                        "runtime_status": "deferred_after_exact_vector_proof",
+                        "queue_requested": 0,
+                        "queue_accepted": 0,
+                        "queue_batches": [],
+                        "searchability_proven": True,
+                    }
+                    document_results[source_path] = result
+                    persist_grouped_upload_outcome(summary, result)
+                    already_completed.append((summary, source_path))
+                    duplicate_preflight["skipped_source_paths"].append(source_path)
+                else:
+                    existing_chunk_sources = source_chunk_sources & ready_chunk_sources
+                    if existing_chunk_sources:
+                        # A prior interrupted run (or a manual AnythingLLM
+                        # import) can leave only part of one selected PDF
+                        # linked to vectors.  Re-submiting its complete plan
+                        # would recreate the identities we can already prove.
+                        # Keep the full PDF receipt, but hand only its missing
+                        # page-parent records to the shared queue.
+                        missing_rows = [
+                            row for row in rows
+                            if str(row.get("chunkSource") or "").strip() not in existing_chunk_sources
+                        ]
+                        if missing_rows:
+                            summary["_workspace_existing_selected_records"] = len(existing_chunk_sources)
+                            summary["_workspace_total_selected_records"] = len(source_chunk_sources)
+                            summary["workspace_duplicate_preflight"] = {
+                                "status": "partial_existing_content_reconciled",
+                                "existing_records": len(existing_chunk_sources),
+                                "missing_records_submitted": len(missing_rows),
+                                "selected_records": len(source_chunk_sources),
+                            }
+                            duplicate_preflight.setdefault("partially_reconciled_sources", []).append(
+                                {
+                                    "source_path": source_path,
+                                    "existing_records": len(existing_chunk_sources),
+                                    "missing_records_submitted": len(missing_rows),
+                                    "selected_records": len(source_chunk_sources),
+                                }
+                            )
+                            remaining_groups.append((summary, missing_rows, source_sha, source_path))
+                        else:
+                            # This cannot normally happen because the complete
+                            # branch above owns it, but refusing a zero-record
+                            # partial queue is safer than silently losing it.
+                            ineligible.append((summary, source_path, "error_duplicate_reconciliation", "Duplicate reconciliation found no missing records to submit but could not establish a complete selected-PDF proof."))
+                    else:
+                        remaining_groups.append((summary, rows, source_sha, source_path))
+            grouped_rows = remaining_groups
+            all_rows = [row for _summary, rows, _source_sha, _source_path in grouped_rows for row in rows]
+            if callable(status_callback):
+                status_callback(
+                    f"Workspace duplicate preflight: skipped {len(duplicate_preflight['skipped_source_paths'])} fully indexed PDF(s), "
+                    f"reconciled {len(duplicate_preflight.get('partially_reconciled_sources') or [])} partially indexed PDF(s); "
+                    f"{len(grouped_rows)} PDF(s) / {len(all_rows)} page record(s) remain for submission",
+                    {
+                        "timing_event": "workspace_duplicate_preflight_complete",
+                        "skipped_documents": len(duplicate_preflight["skipped_source_paths"]),
+                        "partially_reconciled_documents": len(duplicate_preflight.get("partially_reconciled_sources") or []),
+                        "remaining_documents": len(grouped_rows),
+                        "selected_records": int(duplicate_preflight.get("expected_chunk_source_count") or 0),
+                        "remaining_records": len(all_rows),
+                    },
+                )
+        elif duplicate_preflight.get("status") != "complete" and callable(status_callback):
+            status_callback(
+                "Workspace duplicate preflight was unavailable; proceeding without a skip decision",
+                {
+                    "timing_event": "workspace_duplicate_preflight_unavailable",
+                    "reason": duplicate_preflight.get("error") or duplicate_preflight.get("status"),
+                },
+            )
+    elif grouped_rows:
+        duplicate_preflight["status"] = "operator_requested_reupload"
+
+    filename_disambiguations = disambiguate_batch_upload_filenames(all_rows)
+
+    if ineligible:
+        blocked_names = ", ".join(Path(path or "document").name for _summary, path, _status, _message in ineligible[:3])
+        suffix = "" if len(ineligible) <= 3 else f" (+{len(ineligible) - 3} more)"
+        for summary, source_path, status, message in ineligible:
+            result = {
+                "status": status,
+                "records": 0,
+                "uploaded": 0,
+                "embedded": 0,
+                "error": "" if status == "skipped_needs_ocr_review" else message,
+                "warning": message if status == "skipped_needs_ocr_review" else "",
+                "post_status": "not_checked_no_upload",
+                "post_classification": "batch_not_submitted",
+                "runtime_status": "not_checked_no_upload",
+                "queue_requested": 0,
+                "queue_accepted": 0,
+                "queue_batches": [],
+            }
+            document_results[source_path] = result
+            persist_grouped_upload_outcome(summary, result)
+        for summary, rows, _source_sha, source_path in grouped_rows:
+            result = {
+                "status": "skipped_batch_incomplete",
+                "records": max(
+                    len(rows),
+                    int(summary.get("_workspace_total_selected_records") or 0),
+                ),
+                "uploaded": 0,
+                "embedded": 0,
+                "error": "",
+                "warning": f"No PDF was uploaded because the selected batch is incomplete: {blocked_names}{suffix} needs attention.",
+                "post_status": "not_checked_no_upload",
+                "post_classification": "batch_not_submitted",
+                "runtime_status": "not_checked_no_upload",
+                "queue_requested": 0,
+                "queue_accepted": 0,
+                "queue_batches": [],
+            }
+            document_results[source_path] = result
+            persist_grouped_upload_outcome(summary, result)
+        return {
+            "status": "blocked_batch_incomplete",
+            "uploaded": 0,
+            "embedded": 0,
+            "errors": [{"error": f"No AnythingLLM queue request was submitted because {blocked_names}{suffix} needs attention."}],
+            "document_results": document_results,
+        }
+
+    if already_completed and not grouped_rows:
+        for summary, source_path in already_completed:
+            if source_path in document_results:
+                continue
+            document_results[source_path] = {
+                "status": summary.get("api_upload_status"),
+                "records": int(summary.get("post_upload_expected_payloads") or summary.get("api_uploaded") or 0),
+                "uploaded": int(summary.get("api_uploaded") or 0),
+                "embedded": int(summary.get("api_embedded") or 0),
+                "error": str(summary.get("api_upload_error") or ""),
+                "warning": str(summary.get("api_upload_warning") or ""),
+                "post_status": "pass",
+                "post_classification": str(summary.get("post_upload_classification") or ""),
+                "runtime_status": str(summary.get("anythingllm_runtime_validation_status") or ""),
+                "queue_requested": int(summary.get("api_embedding_update_requested") or 0),
+                "queue_accepted": int(summary.get("api_embedding_update_accepted") or 0),
+                "queue_batches": list(summary.get("api_embedding_update_batches") or []),
+                "searchability_proven": True,
+            }
+        return {
+            "status": "complete",
+            "uploaded": sum(int(result.get("uploaded") or 0) for result in document_results.values()),
+            "embedded": sum(int(result.get("embedded") or 0) for result in document_results.values()),
+            "errors": [],
+            "document_results": document_results,
+            "duplicate_preflight": duplicate_preflight,
+        }
+
+    if not all_rows:
+        return {
+            "status": "error_missing_upload_files",
+            "uploaded": 0,
+            "embedded": 0,
+            "errors": [{"error": "The selected PDFs produced no native upload records."}],
+            "document_results": {},
+        }
+
+    transports = {
+        str(summary.get("native_upload_transport") or "file_upload").strip().casefold()
+        for summary, rows, _source_sha, _source_path in grouped_rows
+        if rows
+    }
+    if len(transports) != 1:
+        message = "Selected PDFs resolved to different upload transports; no workspace queue request was submitted."
+        for summary, rows, _source_sha, source_path in grouped_rows:
+            result = {
+                "status": "error_mixed_upload_transport",
+                "records": len(rows),
+                "uploaded": 0,
+                "embedded": 0,
+                "error": message,
+                "warning": "",
+                "post_status": "not_checked_no_upload",
+                "post_classification": "batch_not_submitted",
+                "runtime_status": "not_checked_no_upload",
+                "queue_requested": 0,
+                "queue_accepted": 0,
+                "queue_batches": [],
+            }
+            document_results[source_path] = result
+            persist_grouped_upload_outcome(summary, result)
+        return {
+            "status": "error_mixed_upload_transport",
+            "uploaded": 0,
+            "embedded": 0,
+            "errors": [{"error": message}],
+            "document_results": document_results,
+        }
+    transport = transports.pop()
+    expected_payloads = upload_plan_rows_to_expected_payloads(all_rows)
+    for payload, row in zip(expected_payloads, all_rows):
+        payload["_automatic_source_path"] = row.get("_automatic_source_path") or ""
+
+    def verify_batch(batch_report):
+        start = max(0, int(batch_report.get("start_index") or 0))
+        end = max(start, int(batch_report.get("end_index") or start))
+        expected_batch = expected_payloads[start:end]
+        deadline_seconds = 480.0
+        started = time.monotonic()
+        last_report = {}
+        while True:
+            last_report = verify_anythingllm_post_upload(
+                storage_dir,
+                workspace_slug,
+                "",
+                expected_batch,
+                upload_locations=list(batch_report.get("locations") or []),
+                # ``chunkSource`` is a globally unique source/page-parent identity
+                # in the generated plan. Identity mode returns that exact set so a
+                # mixed-source batch can be partitioned truthfully afterwards.
+                observation_mode="identity",
+                frontend_api_url=api_url,
+            )
+            observed = max(
+                int(last_report.get("matching_vector_rows") or 0),
+                int(last_report.get("lancedb_matching_rows") or 0),
+            )
+            current_submission_vectors = int(
+                last_report.get("current_upload_document_vector_count") or 0
+            )
+            current_submission_complete = bool(
+                last_report.get("current_upload_vector_evidence_complete")
+            )
+            current_submission_expanded = bool(
+                last_report.get("current_upload_vector_expanded")
+            )
+            unique_identities = int(last_report.get("observed_chunk_source_count") or 0)
+            duplicate_identities = int(last_report.get("duplicate_chunk_source_count") or 0)
+            exact = (
+                current_submission_complete
+                if last_report.get("current_upload_vector_evidence_complete") is not None
+                else (
+                    bool(last_report.get("identity_set_checked"))
+                    and bool(last_report.get("identity_set_complete"))
+                    and observed >= len(expected_batch)
+                )
+            )
+            if current_submission_expanded:
+                # A retry would add another copy of the same UUID-backed
+                # documents and make retrieval noisier. Stop the current
+                # verification round immediately and preserve the evidence so
+                # a later clean-workspace/segment-policy recovery can make a
+                # deliberate choice.
+                if callable(status_callback):
+                    status_callback(
+                        f"AnythingLLM reconciliation round 2/2: {len(expected_batch)} submitted records expanded "
+                        f"to {current_submission_vectors} vectors; automatic retry withheld to avoid duplicates",
+                        {
+                            "timing_event": "current_submission_vector_expanded",
+                            "batch": batch_report.get("batch"),
+                            "total_batches": batch_report.get("total_batches"),
+                            "requested": len(expected_batch),
+                            "current_submission_vectors": current_submission_vectors,
+                        },
+                    )
+                return {
+                    **last_report,
+                    "status": "review",
+                    "classification": "current_submission_vector_expanded",
+                    "message": (
+                        f"AnythingLLM indexed all {len(expected_batch)} submitted records, but expanded them into "
+                        f"{current_submission_vectors} vectors. No automatic retry was sent because it would create "
+                        "more duplicates; use the retained recovery evidence to choose a smaller segment policy or a clean workspace."
+                    ),
+                }
+            if exact:
+                if callable(status_callback):
+                    if duplicate_identities:
+                        status_callback(
+                            f"AnythingLLM reconciliation round 2/2: {current_submission_vectors}/{len(expected_batch)} "
+                            f"new records indexed; {duplicate_identities} older duplicate workspace vector row(s) retained for review",
+                            {
+                                "timing_event": "exact_vector_reconciliation_complete_with_workspace_duplicates",
+                                "batch": batch_report.get("batch"),
+                                "total_batches": batch_report.get("total_batches"),
+                                "requested": len(expected_batch),
+                                "current_submission_vectors": current_submission_vectors,
+                                "unique_identities": unique_identities,
+                                "workspace_duplicate_vectors": duplicate_identities,
+                            },
+                        )
+                    else:
+                        status_callback(
+                            f"AnythingLLM reconciliation round 2/2: {current_submission_vectors or unique_identities}/"
+                            f"{len(expected_batch)} newly submitted records indexed and verified",
+                            {
+                                "timing_event": "exact_vector_reconciliation_complete",
+                                "batch": batch_report.get("batch"),
+                                "total_batches": batch_report.get("total_batches"),
+                                "requested": len(expected_batch),
+                                "current_submission_vectors": current_submission_vectors,
+                                "unique_identities": unique_identities,
+                            },
+                        )
+                # Foldered native storage is an explicit advanced choice. In
+                # Desktop 1.15 it may not be enumerated in the flat Documents
+                # drawer, but that presentation limitation cannot invalidate
+                # an otherwise exact, provenance-matched vector proof. Keep
+                # the drawer limitation as an advisory while allowing the
+                # accepted batch to complete truthfully.
+                if (
+                    str(last_report.get("status") or "") == "review"
+                    and str(last_report.get("classification") or "")
+                    == "desktop_drawer_layout_nested"
+                ):
+                    return {
+                        **last_report,
+                        "status": "pass_with_review",
+                        "message": (
+                            "Exact per-source vectors were confirmed. The requested document-folder layout "
+                            "may be hidden by AnythingLLM Desktop's flat Documents drawer."
+                        ),
+                    }
+                return last_report
+            elapsed = time.monotonic() - started
+            if automatic_run_cancellation_requested(run_root) or (cancel_callback and cancel_callback()):
+                return {
+                    **last_report,
+                    "status": "timeout",
+                    "classification": "batch_observation_cancelled",
+                    "message": "AnythingLLM submission was accepted, but exact vector observation stopped after cancellation. No record was resubmitted.",
+                    "reconciliation_elapsed_seconds": round(elapsed, 3),
+                    "reconciliation_effective_deadline_seconds": deadline_seconds,
+                }
+            if elapsed >= deadline_seconds:
+                return {
+                    **last_report,
+                    "status": "timeout",
+                    "classification": "batch_exact_vector_observation_timeout",
+                    "message": (
+                        f"AnythingLLM accepted this batch, but only {observed}/{len(expected_batch)} exact "
+                        "page-parent vectors were observed before the 480-second reconciliation deadline."
+                    ),
+                    "reconciliation_elapsed_seconds": round(elapsed, 3),
+                    "reconciliation_effective_deadline_seconds": deadline_seconds,
+                }
+            if callable(status_callback):
+                if current_submission_vectors:
+                    progress_detail = (
+                        f"AnythingLLM indexing round 1/2: {current_submission_vectors}/{len(expected_batch)} "
+                        "newly submitted records linked to searchable vectors"
+                    )
+                else:
+                    progress_detail = (
+                        f"AnythingLLM indexing round 1/2: {unique_identities}/{len(expected_batch)} "
+                        "unique source identities observed"
+                    )
+                status_callback(
+                    progress_detail,
+                    {
+                        "timing_event": "exact_vector_observation",
+                        "batch": batch_report.get("batch"),
+                        "total_batches": batch_report.get("total_batches"),
+                        "requested": len(expected_batch),
+                        "matching_vectors": current_submission_vectors or unique_identities,
+                        "raw_workspace_vectors": observed,
+                        "workspace_duplicate_vectors": duplicate_identities,
+                        "observation_status": last_report.get("status"),
+                    },
+                )
+            time.sleep(2.0)
+
+    batch_root = Path(run_root)
+    batch_root.mkdir(parents=True, exist_ok=True)
+    _write_automatic_run_json(
+        batch_root / ".automatic-batch-upload-config.json",
+        {
+            "run_root": str(run_root),
+            "api_url": str(api_url or ""),
+            "provided_api_key": str(api_key or ""),
+            "workspace_slug": str(workspace_slug or ""),
+            "source_paths": [source_path for _summary, _rows, _sha, source_path in grouped_rows],
+            "filename_disambiguations": filename_disambiguations,
+        },
+    )
+
+    report = maybe_upload_to_anythingllm(
+        api_url,
+        api_key,
+        expected_payloads,
+        workspace_slug=workspace_slug,
+        upload_transport=transport,
+        upload_plan_rows=all_rows if transport == "file_upload" else None,
+        storage_dir=storage_dir,
+        folder_name="custom-documents",
+        embedding_ledger_path=Path(run_root) / "batch-embedding-ledger.json",
+        status_callback=status_callback,
+        batch_verifier=verify_batch,
+        cancel_callback=cancel_callback,
+        submission_receipt_path=Path(run_root) / "batch-submission-receipts.jsonl",
+        run_id=Path(run_root).name,
+        record_label=f"{len(grouped_rows)} selected PDF(s)",
+    )
+    batch_reports = list((report.get("embedding_update") or {}).get("batches") or [])
+    searchable = bool(batch_reports) and all(
+        bool(batch.get("searchability_proven")) for batch in batch_reports
+    )
+    attachment_by_source = {}
+    for attachment in report.get("attachment_results") or []:
+        source_path = str(attachment.get("source_path") or "")
+        attachment_by_source.setdefault(source_path, []).append(dict(attachment))
+    observed_sources = {
+        str(chunk_source).strip()
+        for batch in batch_reports
+        for chunk_source in ((batch.get("verification") or {}).get("observed_chunk_sources") or [])
+        if str(chunk_source).strip()
+    }
+    global_errors = [
+        str(error.get("error") or error.get("details") or error.get("response") or "").strip()
+        for error in (report.get("errors") or [])
+        if isinstance(error, dict)
+    ]
+    drawer_visibility_advisory = any(
+        str((batch.get("verification") or {}).get("classification") or "")
+        == "desktop_drawer_layout_nested"
+        for batch in batch_reports
+    )
+    workspace_duplicate_advisory = any(
+        str((batch.get("verification") or {}).get("classification") or "")
+        == "current_batch_exact_workspace_duplicate_identities"
+        for batch in batch_reports
+    )
+    ledger_path = str(Path(run_root) / "batch-embedding-ledger.json")
+    for summary, rows, _source_sha, source_path in grouped_rows:
+        existing_workspace_records = max(
+            0,
+            int(summary.get("_workspace_existing_selected_records") or 0),
+        )
+        selected_record_count = max(
+            len(rows) + existing_workspace_records,
+            int(summary.get("_workspace_total_selected_records") or 0),
+        )
+        source_attachments = attachment_by_source.get(source_path, [])
+        source_locations = [
+            str(attachment.get("location") or "")
+            for attachment in source_attachments
+            if str(attachment.get("location") or "")
+        ]
+        source_errors = [
+            str(attachment.get("error") or "")
+            for attachment in source_attachments
+            if str(attachment.get("status") or "") not in {"attached", "reused_cached_location"}
+        ]
+        attached_count = sum(
+            1
+            for attachment in source_attachments
+            if str(attachment.get("status") or "") in {"attached", "reused_cached_location"}
+        )
+        expected_sources = {str(row.get("chunkSource") or "").strip() for row in rows if str(row.get("chunkSource") or "").strip()}
+        matched_sources = expected_sources if searchable else expected_sources & observed_sources
+        attached_complete = len(source_attachments) == len(rows) and all(
+            str(attachment.get("status") or "") in {"attached", "reused_cached_location"}
+            for attachment in source_attachments
+        )
+        queue_batches = []
+        for batch in batch_reports:
+            batch_locations = {str(location) for location in (batch.get("locations") or [])}
+            source_count = sum(1 for location in source_locations if location in batch_locations)
+            if not source_count:
+                continue
+            batch_copy = {
+                "batch": batch.get("batch"),
+                "requested": source_count,
+                "accepted": source_count if str(batch.get("submission_state") or "") == "accepted" else 0,
+                "submission_state": batch.get("submission_state"),
+                "searchability_proven": bool(searchable) and len(matched_sources) == len(expected_sources) and bool(expected_sources),
+                "submission_seconds": batch.get("submission_seconds", 0),
+                "verification_seconds": batch.get("verification_seconds", 0),
+                "batch_elapsed_seconds": batch.get("batch_elapsed_seconds", 0),
+            }
+            queue_batches.append(batch_copy)
+        if source_errors:
+            status = "error"
+            error = next((value for value in source_errors if value), "This PDF was not attached to AnythingLLM.")
+        elif not attached_complete:
+            status = "error"
+            error = "This PDF was not fully attached to AnythingLLM; no partial workspace queue was submitted."
+        elif (
+            report.get("status") in {"complete", "complete_with_key_cleanup_warning", "reconciliation_pending"}
+            and searchable
+        ):
+            status = str(report.get("status"))
+            error = ""
+        else:
+            status = "error"
+            error = next(
+                (value for value in global_errors if value),
+                "AnythingLLM accepted the shared submission, but did not confirm the current upload's exact vector records.",
+            )
+        exact = bool(searchable) and bool(expected_sources) and len(matched_sources) == len(expected_sources)
+        post_status = "pass" if exact else ("partial_vector_coverage" if matched_sources else "not_checked")
+        partial_existing_content = existing_workspace_records > 0
+        result = {
+            "status": status,
+            # ``records`` is the selected-PDF total, while ``uploaded`` is
+            # deliberately only the missing subset that this run attached.
+            # This keeps a partial reconciliation legible without pretending
+            # that older workspace vectors were newly embedded.
+            "records": selected_record_count,
+            "uploaded": attached_count,
+            "embedded": existing_workspace_records + len(matched_sources),
+            "existing_workspace_records": existing_workspace_records,
+            "locations": source_locations,
+            "error": error,
+            "warning": " ".join(part for part in (
+                (
+                    "Exact per-source vectors were confirmed. The requested document-folder layout may be hidden "
+                    "by AnythingLLM Desktop's flat Documents drawer."
+                    if exact and drawer_visibility_advisory else ""
+                ),
+                (
+                    "This submission is complete, but the workspace contains older duplicate vector rows for these "
+                    "same source identities. They were excluded from this run's progress count."
+                    if exact and workspace_duplicate_advisory else ""
+                ),
+                (
+                    f"Reused {existing_workspace_records} already-indexed selected record(s) and submitted only "
+                    f"{len(rows)} missing record(s) for this PDF."
+                    if exact and partial_existing_content else ""
+                ),
+            ) if part),
+            "post_status": post_status,
+            "post_classification": (
+                "batch_exact_partial_existing_content_reconciled"
+                if exact and partial_existing_content
+                else ("batch_exact_current_submission_with_workspace_duplicate_advisory"
+                if exact and workspace_duplicate_advisory
+                else (
+                "batch_exact_vector_evidence_with_drawer_visibility_advisory"
+                if exact and drawer_visibility_advisory
+                else ("batch_exact_vector_evidence" if exact else "batch_evidence_incomplete")
+                ))
+            ),
+            "runtime_status": "deferred_after_exact_vector_proof" if exact else "not_checked",
+            "queue_requested": sum(int(batch.get("requested") or 0) for batch in queue_batches),
+            "queue_accepted": sum(int(batch.get("accepted") or 0) for batch in queue_batches),
+            "queue_batches": queue_batches,
+            "ledger_path": ledger_path,
+            "searchability_proven": exact,
+            "filename_disambiguations": [
+                remap for remap in filename_disambiguations
+                if remap["source_path"] == source_path
+            ],
+        }
+        document_results[source_path] = result
+        persist_grouped_upload_outcome(summary, result)
+    # A resumed/previously-complete PDF may be intentionally absent from the
+    # new shared queue while its siblings are uploaded. Keep its exact prior
+    # receipt in the batch report instead of making a mixed selection look as
+    # though that file vanished.
+    for summary, source_path in already_completed:
+        if source_path in document_results:
+            continue
+        document_results[source_path] = {
+            "status": str(summary.get("api_upload_status") or "complete"),
+            "records": int(summary.get("post_upload_expected_payloads") or summary.get("api_uploaded") or 0),
+            "uploaded": int(summary.get("api_uploaded") or 0),
+            "embedded": int(summary.get("api_embedded") or 0),
+            "existing_workspace_records": int(summary.get("api_embedded") or 0),
+            "error": str(summary.get("api_upload_error") or ""),
+            "warning": str(summary.get("api_upload_warning") or ""),
+            "post_status": "pass",
+            "post_classification": str(summary.get("post_upload_classification") or ""),
+            "runtime_status": str(summary.get("anythingllm_runtime_validation_status") or ""),
+            "queue_requested": int(summary.get("api_embedding_update_requested") or 0),
+            "queue_accepted": int(summary.get("api_embedding_update_accepted") or 0),
+            "queue_batches": list(summary.get("api_embedding_update_batches") or []),
+            "searchability_proven": True,
+        }
+    report["document_results"] = document_results
+    report["filename_disambiguations"] = filename_disambiguations
+    report["duplicate_preflight"] = duplicate_preflight
+    report["prepared_record_cache_reused_count"] = len(report.get("reused_cached_locations") or [])
+    report["new_workspace_attachment_count"] = sum(
+        1
+        for attachment in (report.get("attachment_results") or [])
+        if str((attachment or {}).get("status") or "") in {"attached", "reused_cached_location"}
+    )
+    report["cache_reuse_explanation"] = (
+        "Prepared custom-document records were reused locally; this is distinct from existing workspace content."
+        if report["prepared_record_cache_reused_count"] else "No prepared-record cache reuse was needed."
+    )
+    return report
+
+
 def run_automatic(
     pdf_files,
     folder_pdf_files,
@@ -15561,6 +17329,8 @@ def run_automatic(
     estimate_comparable_runs=None,
     run_root_override=None,
     retain_detailed_evidence=False,
+    existing_workspace_duplicate_policy=WORKSPACE_DUPLICATE_POLICY_SKIP,
+    apply_batch_metadata_overrides=False,
     progress=gr.Progress(track_tqdm=False),
 ):
     global LAST_SIMULATION_DIAGNOSTICS
@@ -15992,6 +17762,10 @@ def run_automatic(
     downloadable = []
     flat_no_logs_exports = []
     total_files = max(len(files), 1)
+    # Reserve all batch destinations before any worker starts. Otherwise two
+    # same-named PDFs selected from different folders reuse one directory and
+    # the later document can overwrite the earlier document's artifacts.
+    batch_output_directories = compatible_output_document_directories(run_root, files)
     cancellation_requested = False
     completed_files = 0
     ocr_eta_applied_files = set()
@@ -16462,6 +18236,33 @@ def run_automatic(
     # runtime-failure reason, never extracted text, and prevents a known-missing
     # OCR dependency from being retried for every remaining scan PDF.
     unstructured_circuit_breaker = {}
+    batch_uses_per_pdf_metadata = len(files) > 1 and not bool(apply_batch_metadata_overrides)
+    batch_metadata_policy = (
+        "per_pdf_detected_metadata"
+        if batch_uses_per_pdf_metadata
+        else ("explicit_shared_override" if len(files) > 1 else "single_pdf_override_or_detection")
+    )
+
+    def prepared_page_parent_metadata_evidence(summary):
+        """Return compact, exact naming evidence from one staged upload plan."""
+        try:
+            plan_rows = load_upload_plan_rows(str(summary.get("native_upload_plan") or ""))
+        except (OSError, ValueError, TypeError):
+            plan_rows = []
+        titles = [str(row.get("title") or "") for row in plan_rows if str(row.get("title") or "")]
+        filenames = [str(row.get("filename") or "") for row in plan_rows if str(row.get("filename") or "")]
+        bases = set()
+        for value in [*titles, *filenames]:
+            match = re.match(r"^(.*?)-p\d+(?:-\d+)?(?:-lp\d+)?-page-parent(?:\.txt)?$", value, re.I)
+            if match and match.group(1).strip():
+                bases.add(match.group(1).strip())
+        return {
+            "selected_record_count": len(plan_rows),
+            "page_parent_bases": sorted(bases),
+            "sample_page_parent_titles": titles[:3],
+            "sample_prepared_filenames": filenames[:3],
+        }
+
     for file_index, file_path in enumerate(files, start=1):
         if automatic_run_cancellation_requested(run_root):
             cancellation_requested = True
@@ -16478,9 +18279,13 @@ def run_automatic(
         end_fraction = AUTOMATIC_RUN_PREFLIGHT_DISPLAY_END + float(progress_allocation["end_share"]) * AUTOMATIC_RUN_DOCUMENT_DISPLAY_SPAN
         progress(start_fraction, desc=format_progress_desc(f"Preparing {pdf_path.name}", file_index, total_files))
         args = SimpleNamespace(
-            document_label=(document_label or "").strip(),
-            document_author=(document_author or "").strip(),
-            document_short_label=(document_short_label or "").strip(),
+            # Never allow a title inferred for (or left over from) one PDF to
+            # become the page-parent base for every member of a batch. A
+            # shared override remains available, but only after an explicit
+            # opt-in control records that intent in the confirmed settings.
+            document_label="" if batch_uses_per_pdf_metadata else (document_label or "").strip(),
+            document_author="" if batch_uses_per_pdf_metadata else (document_author or "").strip(),
+            document_short_label="" if batch_uses_per_pdf_metadata else (document_short_label or "").strip(),
             use_file_title_fallback=bool(use_file_title_fallback),
             deep_extraction=bool(deep_extraction),
             include_front_matter=bool(include_front_matter),
@@ -16507,6 +18312,11 @@ def run_automatic(
             # forensic review; it does not alter the prepared payload,
             # AnythingLLM calls, or verification decision.
             lean_retention=not bool(retain_detailed_evidence),
+            # A native batch cannot compact individual PDFs before the outer
+            # shared upload has consumed their plans. The pipeline retains
+            # those artifacts on both success and failure until that batch
+            # boundary decides what is safe to remove.
+            defer_lean_retention=bool(prepare_and_upload and not retain_detailed_evidence),
             flat_output_without_logs=flat_no_logs_output,
             run_vector_eval=bool(run_vector_eval),
             simulation_adapter=simulation_adapter,
@@ -16515,7 +18325,11 @@ def run_automatic(
             ollama_url=ollama_embed_url,
             max_vector_probes=8,
             max_vector_chunks=0 if vector_audit_scope == "Full corpus" else 300,
-            prepare_and_upload=prepare_and_upload,
+            # The Automatic runner stages every selected PDF first, then sends
+            # their combined native plan through one Desktop queue submission.
+            # Keeping this worker-local prevents an early PDF from mutating the
+            # workspace while later selections are still being prepared.
+            prepare_and_upload=False,
             anythingllm_api_url=resolved_api_url,
             anythingllm_api_key=(api_key or "").strip(),
             workspace_slug=workspace_slug,
@@ -16559,7 +18373,7 @@ def run_automatic(
             temporary_validation_cleanup_policy="cleanup_always",
             cancel_callback=lambda root=run_root: automatic_run_cancellation_requested(root),
         )
-        out_dir = compatible_output_document_directory(run_root, pdf_path)
+        out_dir = batch_output_directories[str(pdf_path)]
         try:
             worker_result = execute_automatic_preparation_in_worker(
                 pdf_path,
@@ -16895,6 +18709,17 @@ def run_automatic(
             )
         else:
             progress(end_fraction, desc=format_progress_desc(f"Collected output files for {pdf_path.name}", file_index, total_files))
+        summary["pdf"] = str(pdf_path)
+        summary["batch_metadata_resolution"] = {
+            "policy": batch_metadata_policy,
+            "shared_fields_ignored": bool(batch_uses_per_pdf_metadata),
+            "detected_title": str(summary.get("detected_title") or ""),
+            "detected_author": str(summary.get("detected_author") or ""),
+            "detected_short_label": str(summary.get("source_short_label") or ""),
+            "metadata_provenance": dict(summary.get("metadata_provenance") or {}),
+            "source_sha256": str(summary.get("source_sha256") or ""),
+            **prepared_page_parent_metadata_evidence(summary),
+        }
         summaries.append(summary)
         # A document becomes batch-complete only once its worker returned a
         # durable summary.  This count stays monotonic while the next PDF gets
@@ -16961,7 +18786,7 @@ def run_automatic(
             "edge_case_results",
             "diagnostics_report",
             "diagnostics_csv",
-            "workspace_model_gate",
+            "workspace_model_configuration",
             "post_upload_verification",
             "anythingllm_runtime_validation",
         ]:
@@ -16987,6 +18812,149 @@ def run_automatic(
         if automatic_run_cancellation_requested(run_root):
             cancellation_requested = True
             break
+
+    # Persist the actual, post-preparation metadata independently from the UI
+    # preview. The preview is an early convenience check; this artifact proves
+    # what each worker freshly read and what was actually used for page-parent
+    # names in this particular multi-PDF run.
+    batch_metadata_manifest_path = Path(run_root) / "batch-metadata-resolution.json"
+    try:
+        _write_automatic_run_json(
+            batch_metadata_manifest_path,
+            {
+                "schema_version": 1,
+                "run_root": str(run_root),
+                "selected_pdf_count": len(files),
+                "policy": batch_metadata_policy,
+                "shared_override_requested": bool(apply_batch_metadata_overrides),
+                "shared_override_values": {
+                    "title": (document_label or "").strip() if not batch_uses_per_pdf_metadata else "",
+                    "author": (document_author or "").strip() if not batch_uses_per_pdf_metadata else "",
+                    "short_label": (document_short_label or "").strip() if not batch_uses_per_pdf_metadata else "",
+                },
+                "documents": [
+                    {
+                        "pdf": str(summary.get("pdf") or ""),
+                        **dict(summary.get("batch_metadata_resolution") or {}),
+                    }
+                    for summary in summaries
+                ],
+            },
+        )
+        downloadable.append(str(batch_metadata_manifest_path))
+    except OSError as exc:
+        APP_LOGGER.warning("could not persist batch metadata resolution evidence: %s", exc)
+
+    batch_upload_report = {}
+    batch_upload_report_path = run_root / "batch-native-upload-report.json"
+    if prepare_and_upload and summaries and not cancellation_requested:
+        def report_grouped_upload_status(stage, report=None):
+            nonlocal expected_seconds
+            report = report or {}
+            if str(report.get("timing_event") or "") == "workspace_duplicate_preflight_complete":
+                # The initial estimate must assume every prepared page record
+                # needs a Desktop queue operation. Once the read-only
+                # duplicate proof has established that most records already
+                # exist, retain elapsed preparation time but scale only the
+                # *remaining* queue allowance. This is presentation-only and
+                # cannot change the selected upload plan or duplicate policy.
+                selected_records = max(0, int(report.get("selected_records") or 0))
+                remaining_records = max(0, int(report.get("remaining_records") or 0))
+                elapsed = max(0.0, time.perf_counter() - started_at)
+                if selected_records > remaining_records >= 0:
+                    current_remaining = max(0.0, float(expected_seconds) - elapsed)
+                    repriced_remaining = max(
+                        20.0,
+                        current_remaining * (remaining_records / selected_records),
+                    )
+                    repriced_expected = int(math.ceil(elapsed + repriced_remaining))
+                    if repriced_expected + 10 < int(expected_seconds):
+                        expected_seconds = repriced_expected
+                        run_timing_estimate["expected_seconds"] = expected_seconds
+            update_live_automatic_run_status(
+                run_root,
+                state="running",
+                phase="Submitting the selected PDF batch to AnythingLLM",
+                expected_seconds=expected_seconds,
+                details=str(stage),
+                confirmed_fraction=None,
+                cancel_available=not automatic_run_cancellation_requested(run_root),
+                cancel_requested=automatic_run_cancellation_requested(run_root),
+                activity_observed=True,
+                batch_completed_files=completed_files,
+                batch_total_files=total_files,
+                batch_current_file_index=total_files,
+            )
+
+        try:
+            batch_upload_report = upload_prepared_automatic_batch(
+                summaries,
+                api_url=resolved_api_url,
+                api_key=(api_key or "").strip(),
+                workspace_slug=workspace_slug,
+                run_root=run_root,
+                create_document_folders=bool(anythingllm_create_document_folders),
+                explicit_folder_name=(anythingllm_document_folder_name or "").strip(),
+                existing_workspace_duplicate_policy=existing_workspace_duplicate_policy,
+                status_callback=report_grouped_upload_status,
+                cancel_callback=lambda root=run_root: automatic_run_cancellation_requested(root),
+            )
+            _write_automatic_run_json(batch_upload_report_path, batch_upload_report)
+            downloadable.append(str(batch_upload_report_path))
+            batch_ledger = run_root / "batch-embedding-ledger.json"
+            if automatic_run_cancellation_requested(run_root):
+                cancellation_requested = True
+                if batch_ledger.is_file():
+                    schedule_automatic_recovery(run_root, reason="operator_cancellation_during_grouped_upload")
+            elif (
+                batch_ledger.is_file()
+                and str(batch_upload_report.get("status") or "") in {"error", "reconciliation_pending"}
+            ):
+                schedule_automatic_recovery(run_root, reason="grouped_upload_runtime_or_reconciliation_failure")
+        except Exception as exc:
+            APP_LOGGER.exception("automatic grouped native upload failed")
+            for summary in summaries:
+                summary["api_upload_status"] = "error"
+                summary["api_upload_error"] = str(exc)
+                summary["post_upload_verification_status"] = "not_checked"
+                summary["anythingllm_runtime_validation_status"] = "not_checked"
+            batch_upload_report = {"status": "error", "errors": [{"error": str(exc)}]}
+            _write_automatic_run_json(batch_upload_report_path, batch_upload_report)
+            downloadable.append(str(batch_upload_report_path))
+            if (run_root / "batch-embedding-ledger.json").is_file():
+                schedule_automatic_recovery(run_root, reason="grouped_upload_exception")
+
+    batch_retention_report = {"status": "not_required", "documents": []}
+    batch_retention_report_path = run_root / "batch-retention-report.json"
+    # Worker-level lean cleanup was deferred solely because this outer batch
+    # still needed each source's plan. Once the *whole* native batch is proven
+    # successful, compact it at this one final boundary. Do not compact a
+    # single green member beside a warning/failed/cancelled sibling: the batch
+    # recovery evidence must remain coherent in that situation.
+    if (
+        prepare_and_upload
+        and summaries
+        and not cancellation_requested
+        and not retain_detailed_evidence
+        and automatic_completion(summaries, prepare_and_upload).get("state") == "successful"
+    ):
+        try:
+            batch_retention_report = finalize_successful_automatic_batch_retention(summaries)
+            _write_automatic_run_json(batch_retention_report_path, batch_retention_report)
+            downloadable.append(str(batch_retention_report_path))
+        except Exception as exc:
+            # The workspace evidence is already complete. A local cleanup
+            # failure must neither trigger a re-upload nor conceal the rich
+            # artifacts required to resolve the filesystem problem.
+            APP_LOGGER.exception("automatic shared-batch retention finalization failed")
+            batch_retention_report = {
+                "protocol": "automatic_shared_batch_retention_v1",
+                "status": "retained_for_review",
+                "error": str(exc),
+                "documents": [],
+            }
+            _write_automatic_run_json(batch_retention_report_path, batch_retention_report)
+            downloadable.append(str(batch_retention_report_path))
 
     if automatic_batch_diagnostics_required(
         summaries,
@@ -17109,6 +19077,38 @@ def run_automatic(
         f"Embedder auto-correction: {auto_correction.get('message') or 'not needed'}",
         f"AnythingLLM settings source: {'inherit current local settings' if inherit_anythingllm_settings else 'manual chunking values'}",
     ]
+    if batch_upload_report:
+        cache_reused = int(batch_upload_report.get("prepared_record_cache_reused_count") or 0)
+        newly_attached = int(batch_upload_report.get("new_workspace_attachment_count") or batch_upload_report.get("uploaded") or 0)
+        lines.append(
+            "Grouped AnythingLLM submission: "
+            f"{batch_upload_report.get('status') or 'unknown'} "
+            f"({newly_attached} newly linked records, "
+            f"{batch_upload_report.get('embedded', 0)} confirmed by the queue)"
+        )
+        if cache_reused:
+            lines.append(
+                f"Prepared-record cache: reused {cache_reused} local record(s); this did not mean they already existed in the selected workspace."
+            )
+        duplicate_preflight = batch_upload_report.get("duplicate_preflight") or {}
+        if duplicate_preflight.get("skipped_source_paths"):
+            lines.append(
+                f"Workspace duplicate preflight: safely skipped {len(duplicate_preflight['skipped_source_paths'])} fully indexed PDF(s)."
+            )
+        if duplicate_preflight.get("partially_indexed_source_paths"):
+            lines.append(
+                f"Workspace duplicate preflight: {len(duplicate_preflight['partially_indexed_source_paths'])} PDF(s) had partial prior coverage; "
+                "their selected records were submitted and the retained report identifies the overlap."
+            )
+    if batch_retention_report.get("status") != "not_required":
+        lines.append(
+            "Batch output retention: "
+            + (
+                "compact output finalized after exact per-PDF vector proof"
+                if batch_retention_report.get("status") == "complete"
+                else "detailed local evidence retained because compact cleanup needs review"
+            )
+        )
     if lines_for_batch_audit:
         lines.append(lines_for_batch_audit)
     if folder_inspection["ignored_non_pdf"]:
@@ -17121,6 +19121,16 @@ def run_automatic(
         )
     if simulation_warning:
         lines.append(f"Retrieval simulation warning: {simulation_warning}")
+    if prepare_and_upload:
+        receipt = automatic_completion_receipt(summaries)
+        lines.append(
+            "Final receipt: "
+            f"{receipt['pdfs']} PDF(s) · {receipt['planned_records']} planned · "
+            f"{receipt['newly_linked_records']} newly linked · {receipt['confirmed_records']} confirmed · "
+            f"{receipt['failed_pdfs']} failed"
+        )
+        if receipt["runtime_retrieval_deferred"]:
+            lines.append("Optional live retrieval check: not run during upload; use Workspace verification to run it separately.")
     for summary in summaries:
         document_name = Path(summary.get("upload_file") or summary.get("pdf") or "document").stem
         if summary.get("upload_file"):
@@ -17183,6 +19193,12 @@ def run_automatic(
                 f"Segment mode: {summary.get('segment_mode', 'passages')}",
                 f"Segments: {summary.get('segments', 'unknown')}",
                 f"Page-parent records: {summary.get('page_parents', 'unknown')}",
+                (
+                    "Native record adjustment: oversized page parent(s) were submitted as page-local segments "
+                    f"({(summary.get('native_upload_representation_adjustment') or {}).get('oversized_page_parent_units', 0)} over the active limit)"
+                    if (summary.get("native_upload_representation_adjustment") or {}).get("applied")
+                    else "Native record adjustment: not needed"
+                ),
                 f"Harmonization risk: segments {summary.get('segment_harmonization_risk', 'unknown')} ({summary.get('segment_units_exceeding_effective_limit', '0')} exceed effective limit), page parents {summary.get('page_parent_harmonization_risk', 'unknown')} ({summary.get('page_parent_units_exceeding_effective_limit', '0')} exceed effective limit)",
                 f"Marker overhead: {summary.get('marker_char_ratio', '')}",
                 f"Average segment content: {summary.get('avg_content_chars', '')} characters",
@@ -17221,7 +19237,7 @@ def run_automatic(
                 f"Storage sample custom-document title: {summary.get('storage_sample_custom_document_title') or 'not found'}",
                 f"Storage sample LanceDB title: {summary.get('storage_sample_lancedb_title') or 'not found'}",
                 f"AnythingLLM runtime API: {runtime_api_status}",
-                "Native metadata payload files: generated for manual/API testing",
+                "Upload records and verification files: created for optional manual/API inspection; not uploaded separately",
                 f"Edge-case tests: {summary.get('edge_case_status')} ({summary.get('edge_case_failures')} failures, {summary.get('edge_case_warnings')} warnings)",
                 f"Run diagnostics: {summary.get('diagnostic_error_count', 0)} errors, {summary.get('diagnostic_warning_count', 0)} warnings",
             ]
@@ -17259,7 +19275,7 @@ def run_automatic(
                         "Acceptance is verified separately from searchable-vector completion."
                     ),
                     f"Native metadata rows found: {summary.get('native_metadata_rows', 0)}",
-                    f"Workspace model gate: {summary.get('workspace_model_gate_status')}",
+                    f"Workspace model configuration: {summary.get('workspace_model_configuration_status')}",
                     f"Post-upload verification: {summary.get('post_upload_verification_status')} ({summary.get('post_upload_classification')})",
                     f"AnythingLLM runtime validation: {summary.get('anythingllm_runtime_validation_status')} ({summary.get('anythingllm_runtime_vector_checks_passed', 0)}/{summary.get('anythingllm_runtime_vector_checks_total', 0)} vector probes at rank 1)",
                     f"AnythingLLM chat model: {summary.get('anythingllm_runtime_chat_model') or 'not run'}",
@@ -17271,9 +19287,9 @@ def run_automatic(
                 [
                     f"AnythingLLM API/upload: skipped because mode is {mode}",
                     (
-                        "Workspace model gate: skipped in summary until Native metadata upload is used"
+                        "Workspace model configuration: skipped in summary until Native metadata upload is used"
                         if summary.get("temporary_workspace_validation_status") in {"", "not_run"}
-                        else "Workspace model gate: checked inside the chunk survival test workspace"
+                        else "Workspace model configuration: recorded inside the chunk survival test workspace"
                     ),
                     (
                         f"Chunk survival test: {summary.get('temporary_workspace_validation_status')}"
@@ -17354,6 +19370,18 @@ def run_automatic(
         if cancellation_requested
         else automatic_completion(summaries, prepare_and_upload)
     )
+    if (
+        completion["state"] == "successful"
+        and batch_retention_report.get("status") == "retained_for_review"
+    ):
+        completion = {
+            "state": "warning",
+            "code": "AUTO-OUTPUT-RETENTION-001",
+            "message": (
+                "AnythingLLM upload and vector verification succeeded, but compact local-output cleanup "
+                "needs review. Detailed source artifacts were retained; no upload was repeated."
+            ),
+        }
     flat_no_logs_complete = (
         flat_no_logs_output
         and completion["state"] == "successful"
@@ -17480,8 +19508,7 @@ def run_edge_case_tests(
     if not files:
         raise gr.Error("Choose at least one PDF.")
 
-    run_root = AUTO_OUTPUT_DIR / f"edge-case-run-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-    run_root.mkdir(parents=True, exist_ok=True)
+    run_root = create_fresh_automatic_run_root(AUTO_OUTPUT_DIR, prefix="edge-case-run")
     summaries = []
     downloadable = []
     for file_path in files:
@@ -17521,7 +19548,7 @@ def run_edge_case_tests(
         except Exception as exc:
             summary = write_failure_package(pdf_path, out_dir, exc, args)
         summaries.append(summary)
-        for key in ["edge_case_report", "edge_case_results", "workspace_model_gate", "post_upload_verification", "metadata_payloads", "manifest"]:
+        for key in ["edge_case_report", "edge_case_results", "workspace_model_configuration", "post_upload_verification", "metadata_payloads", "manifest"]:
             if summary.get(key):
                 downloadable.append(summary[key])
         if summary.get("native_test_kit"):
@@ -17544,13 +19571,13 @@ def run_edge_case_tests(
                 f"{Path(summary['upload_file']).parent.parent.name}",
                 f"Readiness: {summary['readiness_status']}",
                 f"Edge-case tests: {summary.get('edge_case_status')} ({summary.get('edge_case_failures')} failures, {summary.get('edge_case_warnings')} warnings)",
-                f"Workspace model gate: {summary.get('workspace_model_gate_status')}",
-                f"Gate message: {summary.get('workspace_model_gate_message')}",
+                f"Workspace model configuration: {summary.get('workspace_model_configuration_status')}",
+                f"Configuration: {summary.get('workspace_model_configuration_message')}",
                 f"Post-upload verification: {summary.get('post_upload_verification_status')} ({summary.get('post_upload_classification')})",
                 f"Native manual files: {summary.get('native_test_kit', {}).get('file_count', 0)}",
             ]
         )
-    return "\n".join(lines), gr.update(value=downloadable, visible=True), artifact_display_html(downloadable, "Test reports and native metadata kit")
+    return "\n".join(lines), gr.update(value=downloadable, visible=True), artifact_display_html(downloadable, "Run reports and upload verification files")
 
 
 INITIAL_WORKSPACE_CHOICES, INITIAL_WORKSPACE_VALUE, INITIAL_WORKSPACE_STATUS = initial_workspace_controls()
@@ -17673,6 +19700,14 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 auto_use_file_title_fallback = gr.Checkbox(
                     value=True,
                     label="Use the file title as a fallback",
+                )
+                apply_batch_metadata_overrides = gr.Checkbox(
+                    value=False,
+                    label="Apply the title, author, and short label above to every selected PDF",
+                    info=(
+                        "Off by default. With multiple PDFs, each file is freshly read and keeps its own detected "
+                        "metadata. Turn this on only for an intentional shared override."
+                    ),
                 )
                 # The editable title/author controls are available immediately;
                 # the potentially long technical report stays opt-in below.
@@ -17831,6 +19866,20 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                             lines=1,
                             max_lines=1,
                         )
+                        existing_workspace_duplicate_policy = gr.Dropdown(
+                            choices=[
+                                WORKSPACE_DUPLICATE_POLICY_SKIP,
+                                WORKSPACE_DUPLICATE_POLICY_UPLOAD,
+                            ],
+                            value=WORKSPACE_DUPLICATE_POLICY_SKIP,
+                            label="If this workspace already has the same PDF records",
+                            info=(
+                                "The assistant checks stable page/segment identities immediately before submission. "
+                                "The default skips only a PDF whose entire selected record set already has linked vectors; "
+                                "partial matches remain eligible for upload and are reported."
+                            ),
+                            interactive=True,
+                        )
                         native_boundary_policy = gr.Dropdown(
                             choices=[
                                 NATIVE_BOUNDARY_CURRENT_LABEL,
@@ -17913,9 +19962,18 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                             "A concise, read-only terminal check. It separates embedded-vector evidence from the "
                             "AnythingLLM document-list state so an empty Documents pane is never silently treated as a failed embedding."
                         )
-                        verify_current_workspace_button = gr.Button("Verify current workspace")
+                        with gr.Row():
+                            verify_current_workspace_button = gr.Button("Verify current workspace")
+                            run_optional_live_retrieval_button = gr.Button("Run optional live retrieval check", variant="secondary")
+                        optional_live_retrieval_chat_probe = gr.Checkbox(
+                            value=False,
+                            label="Also run a chat citation probe (can be slower and creates a diagnostic chat session)",
+                        )
                         workspace_verification = gr.HTML(
                             value='<div class="artifact-placeholder">Select a workspace, then verify its current storage and runtime evidence.</div>'
+                        )
+                        optional_live_retrieval_status = gr.HTML(
+                            value='<div class="artifact-placeholder">Optional live retrieval has not been run. Indexing success does not require this diagnostic.</div>'
                         )
                     with gr.Accordion("AnythingLLM native metadata contract", open=False, elem_classes=["native-upload-subaccordion"]):
                         metadata_schema_status = gr.Textbox(
@@ -17941,6 +19999,20 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                             value=(
                                 '<div class="artifact-placeholder"><strong>Dry-run stale-artifact repair plan has not run.</strong>'
                                 "<br>This report is read-only and only proposes candidate cleanup buckets and review order.</div>"
+                            ),
+                        )
+                        preview_duplicate_identities_button = gr.Button("Preview duplicate source identities (read-only)")
+                        export_duplicate_cleanup_review_button = gr.Button("Export duplicate cleanup review package", variant="secondary")
+                        duplicate_identity_preview = gr.HTML(
+                            value=(
+                                '<div class="artifact-placeholder"><strong>Duplicate preview has not run.</strong>'
+                                '<br>This is a review-only inventory; it never deletes or rewrites workspace data.</div>'
+                            ),
+                        )
+                        duplicate_cleanup_review = gr.HTML(
+                            value=(
+                                '<div class="artifact-placeholder">Export a review package to preserve the exact duplicate '
+                                'candidates and recommended manual cleanup order. It never changes the workspace.</div>'
                             ),
                         )
                     with gr.Accordion("Run history and recovery", open=False, elem_classes=["native-upload-subaccordion"]):
@@ -18369,6 +20441,14 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 show_progress="hidden",
                 queue=False,
             )
+            run_optional_live_retrieval_button.click(
+                fn=optional_workspace_live_retrieval_check,
+                inputs=[api_url, api_key, workspace_slug, optional_live_retrieval_chat_probe],
+                outputs=optional_live_retrieval_status,
+                show_progress="full",
+                concurrency_limit=1,
+                concurrency_id="optional-workspace-live-retrieval",
+            )
             refresh_ingestion_history_button.click(
                 fn=ingestion_history_html,
                 inputs=workspace_slug,
@@ -18412,6 +20492,20 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 inputs=workspace_slug,
                 outputs=stale_artifact_report,
                 show_progress="hidden",
+            )
+            preview_duplicate_identities_button.click(
+                fn=workspace_duplicate_identity_audit_html,
+                inputs=workspace_slug,
+                outputs=duplicate_identity_preview,
+                show_progress="hidden",
+                queue=False,
+            )
+            export_duplicate_cleanup_review_button.click(
+                fn=export_workspace_duplicate_cleanup_review_html,
+                inputs=workspace_slug,
+                outputs=duplicate_cleanup_review,
+                show_progress="hidden",
+                queue=False,
             )
             start_embedding_observer_button.click(
                 fn=start_embedding_observer,
@@ -18536,6 +20630,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 auto_author,
                 auto_short_label,
                 auto_use_file_title_fallback,
+                apply_batch_metadata_overrides,
                 auto_mode,
                 output_root_override,
                 api_url,
@@ -18549,6 +20644,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 native_metadata_mode,
                 anythingllm_create_document_folders,
                 anythingllm_document_folder_name,
+                existing_workspace_duplicate_policy,
                 local_check_mode,
                 custom_ollama_model,
                 ollama_url,
@@ -18651,6 +20747,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 auto_author,
                 auto_short_label,
                 auto_use_file_title_fallback,
+                apply_batch_metadata_overrides,
                 auto_mode,
                 output_root_override,
                 api_url,
@@ -18685,6 +20782,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 auto_apply_before_run,
                 auto_download_full_folder,
                 auto_download_segments_folder,
+                existing_workspace_duplicate_policy,
                 new_workspace_name,
                 retain_detailed_evidence,
             ]
@@ -18853,7 +20951,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=automatic_detected_metadata_preview,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, auto_folder_manifest],
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest],
                 outputs=[
                     auto_label,
                     auto_author,
@@ -18954,7 +21052,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=automatic_detected_metadata_preview,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, auto_folder_manifest],
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest],
                 outputs=[
                     auto_label,
                     auto_author,
@@ -19059,7 +21157,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=folder_detected_metadata_preview,
-                inputs=[auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, auto_folder_manifest],
+                inputs=[auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest],
                 outputs=[
                     auto_label,
                     auto_author,
@@ -19142,7 +21240,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=folder_detected_metadata_preview,
-                inputs=[auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, auto_folder_manifest],
+                inputs=[auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest],
                 outputs=[
                     auto_label,
                     auto_author,
@@ -19229,7 +21327,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=folder_detected_metadata_preview,
-                inputs=[auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, auto_folder_manifest],
+                inputs=[auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest],
                 outputs=[
                     auto_label,
                     auto_author,
@@ -19264,7 +21362,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
             )
             auto_use_file_title_fallback.change(
                 fn=detected_metadata_preview,
-                inputs=[auto_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback],
+                inputs=[auto_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides],
                 outputs=[
                     auto_label,
                     auto_author,
@@ -19283,7 +21381,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
             )
             refresh_metadata_button.click(
                 fn=detected_metadata_preview,
-                inputs=[auto_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback],
+                inputs=[auto_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides],
                 outputs=[
                     auto_label,
                     auto_author,
@@ -19292,6 +21390,20 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     document_metadata_section,
                 ],
                 show_progress="hidden",
+            )
+            apply_batch_metadata_overrides.change(
+                fn=automatic_detected_metadata_preview,
+                inputs=[
+                    auto_pdfs, auto_folder_pdfs, auto_label, auto_author,
+                    auto_short_label, auto_use_file_title_fallback,
+                    apply_batch_metadata_overrides, auto_folder_manifest,
+                ],
+                outputs=[
+                    auto_label, auto_author, auto_short_label,
+                    auto_metadata_preview, document_metadata_section,
+                ],
+                show_progress="hidden",
+                queue=False,
             )
             local_check_mode.change(
                 fn=describe_simulation_choice,
@@ -19610,6 +21722,8 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 ],
                 show_progress="full",
                 show_progress_on=auto_summary,
+                concurrency_limit=AUTOMATIC_RUN_CONCURRENCY_LIMIT,
+                concurrency_id=AUTOMATIC_RUN_CONCURRENCY_ID,
             ).then(
                 fn=lambda: gr.update(value=""),
                 inputs=None,
@@ -20025,6 +22139,11 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                         value=editor_builtin_defaults["anythingllm_create_document_folders"],
                         label="Create dedicated AnythingLLM document folders",
                     )
+                    future_defaults_duplicate_policy = gr.Dropdown(
+                        choices=[WORKSPACE_DUPLICATE_POLICY_SKIP, WORKSPACE_DUPLICATE_POLICY_UPLOAD],
+                        value=editor_builtin_defaults["existing_workspace_duplicate_policy"],
+                        label="When a selected PDF is already fully indexed",
+                    )
                 with gr.Row():
                     future_defaults_simulation = gr.Dropdown(
                         choices=INITIAL_SIMULATION_CHOICES, value=editor_builtin_defaults["local_check_mode"],
@@ -20105,7 +22224,8 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 future_defaults_controls = [
                     future_defaults_use_file_title_fallback, future_defaults_mode, future_defaults_output_root,
                     future_defaults_api_url, future_defaults_workspace, future_defaults_native_scope,
-                    future_defaults_native_metadata, future_defaults_document_folders, future_defaults_simulation,
+                    future_defaults_native_metadata, future_defaults_document_folders, future_defaults_duplicate_policy,
+                    future_defaults_simulation,
                     future_defaults_ollama_url, future_defaults_audit_scope,
                     future_defaults_deep_extraction, future_defaults_front_matter, future_defaults_back_matter,
                     future_defaults_backend, future_defaults_first_page, future_defaults_end_page,

@@ -97,6 +97,40 @@ def test_reuses_only_an_exact_cached_page_parent_document(tmp_path):
     ]
 
 
+def test_cached_reuse_respects_requested_document_folder_layout(tmp_path):
+    location = "custom-documents/nested/example-page-parent.json"
+    document = {
+        "pageContent": "Exact page-parent text.",
+        "title": "Example title",
+        "docAuthor": "Example author",
+        "description": "PDF page: 1.",
+        "docSource": "local-pdf://sha256/example",
+        "chunkSource": "page-parent://example-p0001",
+    }
+    document_path = tmp_path / "documents" / location
+    document_path.parent.mkdir(parents=True)
+    document_path.write_text(json.dumps(document), encoding="utf-8")
+    cache_dir = tmp_path / "vector-cache"
+    cache_dir.mkdir()
+    (cache_dir / f"{uuid.uuid5(uuid.NAMESPACE_URL, location)}.json").write_text(
+        "[]", encoding="utf-8"
+    )
+    payload = {
+        "textContent": document["pageContent"],
+        "metadata": {
+            key: document[key]
+            for key in ("title", "docAuthor", "description", "docSource", "chunkSource")
+        },
+    }
+
+    assert find_reusable_cached_document_locations(
+        tmp_path, [payload], folder_names=["custom-documents"]
+    ) == [""]
+    assert find_reusable_cached_document_locations(
+        tmp_path, [payload], folder_names=["custom-documents/nested"]
+    ) == [location]
+
+
 def test_progress_listener_filters_unrelated_workspace_queue_events():
     expected = {"custom-documents/expected-p001-s01.txt"}
     matched = set()

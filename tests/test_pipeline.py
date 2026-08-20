@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -32,6 +33,56 @@ pytestmark = pytest.mark.offline_deterministic
 
 
 class PipelineCoreTests(unittest.TestCase):
+    def test_cli_run_root_does_not_merge_two_launches_with_the_same_timestamp(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            first = pipeline.create_fresh_cli_run_root(base, timestamp="20260820-120000")
+            second = pipeline.create_fresh_cli_run_root(base, timestamp="20260820-120000")
+
+        self.assertEqual(first.name, "run-20260820-120000")
+        self.assertEqual(second.name, "run-20260820-120000-1")
+        self.assertNotEqual(first, second)
+
+    def test_edge_case_run_root_uses_the_same_exclusive_allocator(self):
+        import rag_pdf_gradio_app as app
+
+        fixed_now = app.datetime(2026, 8, 20, 12, 0, 0)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.object(app, "datetime", SimpleNamespace(now=lambda: fixed_now)):
+                first = app.create_fresh_automatic_run_root(temp_dir, prefix="edge-case-run")
+                second = app.create_fresh_automatic_run_root(temp_dir, prefix="edge-case-run")
+
+        self.assertEqual(first.name, "edge-case-run-20260820-120000")
+        self.assertEqual(second.name, "edge-case-run-20260820-120000-2")
+
+    def test_windows_executable_candidates_do_not_fall_back_to_relative_paths(self):
+        import rag_pdf_tools
+
+        with mock.patch.dict(
+            pipeline.os.environ,
+            {"LOCALAPPDATA": "", "ProgramFiles": "", "ProgramFiles(x86)": ""},
+            clear=False,
+        ):
+            self.assertEqual(pipeline.default_anythingllm_desktop_executable_candidates(), [])
+        with mock.patch.dict(
+            rag_pdf_tools.os.environ,
+            {"LOCALAPPDATA": "", "ProgramFiles": "", "ProgramFiles(x86)": ""},
+            clear=False,
+        ):
+            self.assertEqual(rag_pdf_tools.default_tesseract_executable_candidates(), [])
+        with mock.patch.dict(
+            pipeline.os.environ,
+            {"LOCALAPPDATA": "relative-local", "ProgramFiles": "relative-program-files", "ProgramFiles(x86)": ""},
+            clear=False,
+        ):
+            self.assertEqual(pipeline.default_anythingllm_desktop_executable_candidates(), [])
+        with mock.patch.dict(
+            rag_pdf_tools.os.environ,
+            {"LOCALAPPDATA": "relative-local", "ProgramFiles": "relative-program-files", "ProgramFiles(x86)": ""},
+            clear=False,
+        ):
+            self.assertEqual(rag_pdf_tools.default_tesseract_executable_candidates(), [])
+
     def test_unstructured_asyncio_compatibility_uses_supported_inspect_predicate(self):
         import asyncio
         import inspect
@@ -63,6 +114,25 @@ class PipelineCoreTests(unittest.TestCase):
         finally:
             rag_pdf_tools.importlib.import_module = original_import_module
             rag_pdf_tools.ensure_unstructured_asyncio_compatibility = original_compatibility
+
+    def test_observer_log_rotation_does_not_abort_snapshot(self):
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "logs" / "backend-rotating.log"
+            log_path.parent.mkdir()
+            log_path.write_text("workspace-a indexed\n", encoding="utf-8")
+            original_stat = Path.stat
+
+            def disappearing_log_stat(path, *args, **kwargs):
+                if path == log_path:
+                    raise FileNotFoundError("log rotated")
+                return original_stat(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "stat", disappearing_log_stat):
+                snapshot = app._observer_tail_log_lines(temp_dir, "workspace-a")
+
+        self.assertEqual(snapshot, {"file": "", "modified_epoch": 0.0, "matches": []})
 
     def test_unstructured_runtime_status_requires_importable_partition_module(self):
         import rag_pdf_tools
@@ -1184,6 +1254,27 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn("upload withheld", phase)
         self.assertNotIn("vectors verified", phase.casefold())
 
+    def test_upload_failure_is_not_masked_by_a_separate_ocr_review_hold(self):
+        import rag_pdf_gradio_app as app
+
+        completion = app.automatic_completion([
+            {
+                "pdf": "needs-ocr.pdf",
+                "api_upload_status": "skipped_needs_ocr_review",
+                "api_upload_warning": "AnythingLLM upload was withheld because OCR needs review.",
+            },
+            {
+                "pdf": "submission-failed.pdf",
+                "api_upload_status": "error",
+                "api_upload_error": "AnythingLLM returned HTTP 500.",
+            },
+        ], True)
+
+        self.assertEqual(completion["state"], "failed")
+        self.assertEqual(completion["code"], "AUTO-EMBEDDING-SUBMISSION-001")
+        self.assertIn("submission-failed.pdf", completion["message"])
+        self.assertIn("HTTP 500", completion["message"])
+
     def test_photographed_spread_hold_is_not_described_as_missing_ocr(self):
         import rag_pdf_gradio_app as app
 
@@ -1783,6 +1874,134 @@ class PipelineCoreTests(unittest.TestCase):
                 app.threading.Thread = original_thread
                 app.ACTIVE_AUTOMATIC_RECOVERY_THREADS.pop(key, None)
 
+    def test_overlapping_recovery_schedulers_reserve_only_one_attempt(self):
+        """A concurrent callback must observe the first durable reservation."""
+        import rag_pdf_gradio_app as app
+
+        original_write = app._write_automatic_run_json
+        original_recover = app.recover_automatic_run
+        first_write_entered = threading.Event()
+        release_first_write = threading.Event()
+        write_count = 0
+        write_count_lock = threading.Lock()
+        results = []
+        errors = []
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "app-run-interrupted"
+            root.mkdir()
+            attempt_path = root / app.AUTOMATIC_RUN_RECOVERY_ATTEMPT
+
+            def delayed_attempt_write(path, payload):
+                nonlocal write_count
+                if Path(path) == attempt_path:
+                    with write_count_lock:
+                        write_count += 1
+                        is_first_write = write_count == 1
+                    if is_first_write:
+                        first_write_entered.set()
+                        self.assertTrue(release_first_write.wait(timeout=2))
+                return original_write(path, payload)
+
+            def schedule(reason):
+                try:
+                    results.append(app.schedule_automatic_recovery(root, reason=reason))
+                except Exception as exc:  # Surface thread failures in the test.
+                    errors.append(exc)
+
+            try:
+                app._write_automatic_run_json = delayed_attempt_write
+                app.recover_automatic_run = lambda *_args, **_kwargs: None
+                first = threading.Thread(target=schedule, args=("first",))
+                first.start()
+                self.assertTrue(first_write_entered.wait(timeout=2))
+                second = threading.Thread(target=schedule, args=("second",))
+                second.start()
+                release_first_write.set()
+                first.join(timeout=2)
+                second.join(timeout=2)
+            finally:
+                app._write_automatic_run_json = original_write
+                app.recover_automatic_run = original_recover
+                app.ACTIVE_AUTOMATIC_RECOVERY_THREADS.pop(str(root), None)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(results), [False, True])
+        self.assertEqual(write_count, 1)
+
+    def test_overlapping_timing_backfills_do_not_learn_one_run_twice(self):
+        import rag_pdf_gradio_app as app
+
+        original_output_root = app.AUTO_OUTPUT_DIR
+        original_timing_dir = app.TIMING_MODEL_DIR
+        original_runs_path = app.TIMING_MODEL_RUNS_PATH
+        original_append = app._append_timing_jsonl
+        first_append_entered = threading.Event()
+        release_first_append = threading.Event()
+        append_count = 0
+        append_count_lock = threading.Lock()
+        results = []
+        errors = []
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_root = Path(tmpdir) / "output"
+            summary_path = output_root / "r-fixture" / "document" / "run-summary.json"
+            summary_path.parent.mkdir(parents=True)
+            summary_path.write_text(json.dumps({
+                "total_pipeline_seconds": 20,
+                "pdf_page_count": 2,
+            }), encoding="utf-8")
+            app.AUTO_OUTPUT_DIR = output_root
+            app.TIMING_MODEL_DIR = Path(tmpdir) / "timing"
+            app.TIMING_MODEL_RUNS_PATH = app.TIMING_MODEL_DIR / "timing-runs.jsonl"
+
+            def delayed_append(path, row):
+                nonlocal append_count
+                with append_count_lock:
+                    append_count += 1
+                    first = append_count == 1
+                if first:
+                    first_append_entered.set()
+                    self.assertTrue(release_first_append.wait(timeout=2))
+                return original_append(path, row)
+
+            def backfill():
+                try:
+                    results.append(app.ensure_timing_model_backfill())
+                except Exception as exc:
+                    errors.append(exc)
+
+            try:
+                app._append_timing_jsonl = delayed_append
+                first = threading.Thread(target=backfill)
+                first.start()
+                self.assertTrue(first_append_entered.wait(timeout=2))
+                second = threading.Thread(target=backfill)
+                second.start()
+                release_first_append.set()
+                first.join(timeout=2)
+                second.join(timeout=2)
+                rows = [
+                    json.loads(line)
+                    for line in app.TIMING_MODEL_RUNS_PATH.read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+            finally:
+                app.AUTO_OUTPUT_DIR = original_output_root
+                app.TIMING_MODEL_DIR = original_timing_dir
+                app.TIMING_MODEL_RUNS_PATH = original_runs_path
+                app._append_timing_jsonl = original_append
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(results), [0, 1])
+        self.assertEqual(append_count, 1)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["run_key"], str(summary_path.parent.parent))
+
     def test_scheduled_recovery_uses_the_guarded_automatic_policy(self):
         import rag_pdf_gradio_app as app
 
@@ -2082,6 +2301,88 @@ class PipelineCoreTests(unittest.TestCase):
 
         self.assertFalse(result["applied"])
         self.assertEqual(result["reason"], "upload_or_verification_needs_review")
+
+    def test_deferred_batch_lean_retention_compacts_only_after_exact_vector_proof(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            selected = root / "selected"
+            selected.mkdir()
+            parsed = selected / "Example-pdf-parsed.txt"
+            parsed.write_text("prepared text", encoding="utf-8")
+            manifest = selected / "segment-manifest.jsonl"
+            manifest.write_text(
+                '\n'.join([
+                    json.dumps({"pdf_page": 1, "text": "First selected segment."}),
+                    json.dumps({"pdf_page": 2, "text": "Second selected segment."}),
+                ]) + '\n',
+                encoding="utf-8",
+            )
+            (root / "metadata-api").mkdir()
+            (root / "metadata-api" / "page-parent-upload-plan.csv").write_text("plan", encoding="utf-8")
+            (root / "source-profile.json").write_text(
+                json.dumps({"source_file": "C:/Example.pdf", "filename": "Example.pdf", "source_sha256": "f" * 64}),
+                encoding="utf-8",
+            )
+            summary = {
+                "output_root": str(root),
+                "pdf": "C:/Example.pdf",
+                "readiness_status": "ready",
+                "segments": 2,
+                "upload_file": str(parsed),
+                "manifest": str(manifest),
+                "api_upload_status": "complete",
+                "post_upload_verification_status": "pass",
+                "post_upload_expected_payloads": 2,
+                "post_upload_matching_vectors": 2,
+                "anythingllm_runtime_validation_status": "deferred_after_exact_vector_proof",
+                "batch_upload_result": {"searchability_proven": True, "locations": ["custom-documents/example.txt"]},
+                "lean_retention": {"deferred": True, "reason": "awaiting_shared_automatic_batch_upload"},
+            }
+
+            result = pipeline.finalize_deferred_batch_lean_retention(root, summary)
+            compact = json.loads((root / "run-summary.json").read_text(encoding="utf-8"))
+
+            self.assertTrue(result["applied"])
+            self.assertEqual(result["policy"], "lean_success_after_shared_batch_v1")
+            self.assertFalse(selected.exists())
+            self.assertFalse((root / "metadata-api").exists())
+            self.assertTrue((root / "Example-pdf-parsed.txt").is_file())
+            self.assertTrue((root / "Example-p001-s01.txt").is_file())
+            self.assertEqual(compact["verification_receipt"]["shared_batch"]["expected_records"], 2)
+            self.assertEqual(compact["verification_receipt"]["shared_batch"]["confirmed_vectors"], 2)
+
+    def test_deferred_batch_lean_retention_keeps_all_artifacts_without_exact_vector_proof(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            selected = root / "selected"
+            selected.mkdir()
+            parsed = selected / "Example-pdf-parsed.txt"
+            parsed.write_text("prepared text", encoding="utf-8")
+            manifest = selected / "segment-manifest.jsonl"
+            manifest.write_text(json.dumps({"pdf_page": 1, "text": "Selected segment."}) + "\n", encoding="utf-8")
+            (root / "metadata-api").mkdir()
+            summary = {
+                "output_root": str(root),
+                "readiness_status": "ready",
+                "segments": 1,
+                "upload_file": str(parsed),
+                "manifest": str(manifest),
+                "api_upload_status": "complete",
+                "post_upload_verification_status": "pass",
+                "post_upload_expected_payloads": 1,
+                "post_upload_matching_vectors": 0,
+                "anythingllm_runtime_validation_status": "deferred_after_exact_vector_proof",
+                "batch_upload_result": {"searchability_proven": False},
+                "lean_retention": {"deferred": True, "reason": "awaiting_shared_automatic_batch_upload"},
+            }
+
+            result = pipeline.finalize_deferred_batch_lean_retention(root, summary)
+
+            self.assertFalse(result["applied"])
+            self.assertEqual(result["reason"], "exact_batch_vector_proof_missing")
+            self.assertTrue(parsed.exists())
+            self.assertTrue(manifest.exists())
+            self.assertTrue((root / "metadata-api").exists())
 
     def test_no_logs_retention_creates_only_flat_text_files(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2427,7 +2728,9 @@ class PipelineCoreTests(unittest.TestCase):
             now=111,
         )
 
-        self.assertIn("Est: 00m00s", rendered)
+        # An exhausted running estimate is recalibrated from live Desktop
+        # queue evidence rather than rendered as a misleading zero countdown.
+        self.assertIn("Est: recalculating from Desktop queue", rendered)
         self.assertNotIn("Est: -", rendered)
 
     def test_workspace_name_is_sanitized_before_anythingllm_can_create_an_invalid_namespace(self):
@@ -2499,8 +2802,12 @@ class PipelineCoreTests(unittest.TestCase):
 
         self.assertEqual(updates[-1], "refreshed ETA")
         self.assertEqual(observed[0][5], app.SEGMENT_PAGE_LIMIT_LABEL)
-        self.assertEqual(observed[0][6], "750")
-        self.assertEqual(observed[0][8], "0")
+        # ``refresh_automatic_run_estimate`` now carries Custom Range group
+        # sizes between segmentation mode and target length.
+        self.assertEqual(observed[0][6], "")
+        self.assertEqual(observed[0][7], "750")
+        self.assertEqual(observed[0][8], "512")
+        self.assertEqual(observed[0][9], "0")
 
     def test_timing_features_distinguish_none_mode_and_local_target_length(self):
         import rag_pdf_gradio_app as app
@@ -3262,6 +3569,7 @@ class PipelineCoreTests(unittest.TestCase):
         import rag_pdf_gradio_app as app
 
         completion = app.automatic_completion([{
+            "pdf": "not-fully-indexed.pdf",
             "api_upload_status": "failed",
             "api_upload_error": "timed out",
             "post_upload_verification_status": "partial_vector_coverage",
@@ -3274,6 +3582,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn("8 of 28", completion["message"])
         self.assertIn("20", completion["message"])
         self.assertIn("segment vectors", completion["message"])
+        self.assertIn("not-fully-indexed.pdf", completion["message"])
 
     def test_ambiguous_timeout_is_never_reported_as_submission_rejection(self):
         import rag_pdf_gradio_app as app
@@ -3716,6 +4025,26 @@ class PipelineCoreTests(unittest.TestCase):
         finally:
             app.LIVE_AUTOMATIC_RUN_STATUS = original_status
 
+    def test_reserved_preparing_run_blocks_late_selection_reset_callbacks(self):
+        """Startup is in-flight before the worker changes status to running."""
+        import rag_pdf_gradio_app as app
+
+        original_status = app.LIVE_AUTOMATIC_RUN_STATUS
+        reserved = {"state": "preparing", "run_root": "reserved-run", "phase": "Starting"}
+        try:
+            app.LIVE_AUTOMATIC_RUN_STATUS = dict(reserved)
+            presentation = app.reset_automatic_run_presentation(["next.pdf"], [])
+            settings = app.reset_automatic_run_settings_to_defaults()
+            observed_status = dict(app.LIVE_AUTOMATIC_RUN_STATUS)
+        finally:
+            app.LIVE_AUTOMATIC_RUN_STATUS = original_status
+
+        self.assertEqual(observed_status, reserved)
+        self.assertEqual(len(presentation), 19)
+        self.assertTrue(all(update.get("__type__") == "update" for update in presentation))
+        self.assertEqual(len(settings), 43)
+        self.assertTrue(all(update.get("__type__") == "update" for update in settings))
+
     def test_output_mode_updates_hide_upload_only_controls_without_rewriting_values(self):
         import rag_pdf_gradio_app as app
 
@@ -4083,6 +4412,30 @@ class PipelineCoreTests(unittest.TestCase):
             app.CANCELLED_AUTOMATIC_RUN_ROOTS.clear()
             app.CANCELLED_AUTOMATIC_RUN_ROOTS.update(original_cancelled)
 
+    def test_terminal_status_releases_process_local_cancellation_root(self):
+        import rag_pdf_gradio_app as app
+
+        original_status = app.LIVE_AUTOMATIC_RUN_STATUS
+        original_cancelled = set(app.CANCELLED_AUTOMATIC_RUN_ROOTS)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_root = Path(temp_dir) / "cancelled-run"
+            try:
+                self.assertTrue(app.request_automatic_run_cancellation(run_root))
+                self.assertIn(str(run_root), app.CANCELLED_AUTOMATIC_RUN_ROOTS)
+
+                app.update_live_automatic_run_status(
+                    run_root,
+                    state="cancelled",
+                    phase="Processing stopped by operator",
+                    cancel_requested=True,
+                )
+                self.assertNotIn(str(run_root), app.CANCELLED_AUTOMATIC_RUN_ROOTS)
+                self.assertTrue(app.automatic_run_cancellation_requested(run_root))
+            finally:
+                app.LIVE_AUTOMATIC_RUN_STATUS = original_status
+                app.CANCELLED_AUTOMATIC_RUN_ROOTS.clear()
+                app.CANCELLED_AUTOMATIC_RUN_ROOTS.update(original_cancelled)
+
     def test_prestart_cancel_preserves_the_ready_confirm_action(self):
         import rag_pdf_gradio_app as app
 
@@ -4259,6 +4612,89 @@ class PipelineCoreTests(unittest.TestCase):
                 self.assertFalse(app.terminate_automatic_run_worker(run_root))
             taskkill.assert_not_called()
 
+    def test_old_worker_cleanup_preserves_a_replacement_worker_marker(self):
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_root = Path(tmpdir) / "app-run-restarted"
+            run_root.mkdir()
+            marker = run_root / app.AUTOMATIC_RUN_WORKER_MARKER
+            marker.write_text(
+                json.dumps(
+                    {
+                        "kind": "automatic-preparation-worker",
+                        "pid": 9002,
+                        "run_root": str(run_root),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            removed = app.remove_owned_automatic_worker_marker(
+                run_root,
+                SimpleNamespace(pid=9001),
+            )
+            successor = app.active_automatic_run_worker(run_root)
+
+        self.assertFalse(removed)
+        self.assertEqual(successor["pid"], 9002)
+
+    def test_worker_registration_failure_stops_the_untracked_child(self):
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "app-run"
+            output = root / "output"
+            process = mock.Mock(pid=9003)
+            process.poll.return_value = None
+            process.wait.return_value = 0
+            writes = []
+
+            def write_then_fail_marker(*args, **_kwargs):
+                writes.append(args[0])
+                if len(writes) == 2:
+                    raise OSError("worker marker storage unavailable")
+
+            args = SimpleNamespace()
+            with (
+                mock.patch.object(app, "_write_automatic_run_json", side_effect=write_then_fail_marker),
+                mock.patch.object(app.subprocess, "Popen", return_value=process),
+                mock.patch.object(app.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as taskkill,
+            ):
+                with self.assertRaisesRegex(OSError, "worker marker storage unavailable"):
+                    app.execute_automatic_preparation_in_worker(
+                        "source.pdf",
+                        output,
+                        args,
+                        root,
+                        lambda *_args, **_kwargs: None,
+                    )
+
+        taskkill.assert_called_once_with(
+            ["taskkill", "/PID", "9003", "/T", "/F"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        process.wait.assert_called_once_with(timeout=10)
+
+    def test_worker_replacement_requires_the_original_process_to_exit(self):
+        import rag_pdf_gradio_app as app
+
+        process = mock.Mock()
+        process.wait.side_effect = subprocess.TimeoutExpired("worker", 10)
+        process.poll.return_value = None
+        original_terminate = app.terminate_automatic_run_worker
+        try:
+            app.terminate_automatic_run_worker = lambda _root: True
+            stopped = app.stop_automatic_run_worker_and_wait("C:/temp/app-run", process)
+        finally:
+            app.terminate_automatic_run_worker = original_terminate
+
+        self.assertFalse(stopped)
+        process.wait.assert_called_once_with(timeout=10)
+
     def test_confirmed_submission_locations_exclude_unsubmitted_plans(self):
         locations = pipeline.confirmed_submission_locations_from_ledger(
             {
@@ -4337,6 +4773,32 @@ class PipelineCoreTests(unittest.TestCase):
             app.remove_confirmed_workspace_queue_entries = original_remove
         self.assertEqual([row["api_url"] for row in result["groups"]], ["http://127.0.0.1:3001", "http://127.0.0.1:3002"])
         self.assertTrue(all(row["status"] == "blocked_by_manual_activity_or_uncertainty" for row in result["groups"]))
+
+    def test_grouped_root_ledger_is_discoverable_with_its_batch_configuration(self):
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "app-run-current"
+            root.mkdir()
+            (root / ".automatic-batch-upload-config.json").write_text(
+                json.dumps({
+                    "api_url": "http://127.0.0.1:3009",
+                    "provided_api_key": "batch-key",  # pragma: allowlist secret -- synthetic recovery fixture
+                }),
+                encoding="utf-8",
+            )
+            (root / "batch-embedding-ledger.json").write_text(
+                json.dumps({"workspace_slug": "grouped-workspace", "batches": [
+                    {"submission_state": "unresolved", "locations": ["custom-documents/grouped.json"]}
+                ]}),
+                encoding="utf-8",
+            )
+            groups = list(app._recovery_ledger_groups(root))
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["workspace_slug"], "grouped-workspace")
+        self.assertEqual(groups[0]["api_url"], "http://127.0.0.1:3009")
+        self.assertEqual(groups[0]["provided_api_key"], "batch-key")
 
     def test_restart_anyway_requires_explicit_confirmation(self):
         import rag_pdf_gradio_app as app
@@ -4938,6 +5400,8 @@ class PipelineCoreTests(unittest.TestCase):
                 "\n".join([
                     json.dumps({"recorded_at": "2024-01-01T00:00:00", "state": "old"}),
                     json.dumps({"recorded_at": app.datetime.now().isoformat(timespec="seconds"), "state": "recent"}),
+                    json.dumps({"recorded_at": app.datetime.now(app.timezone.utc).isoformat(), "state": "recent-aware"}),
+                    json.dumps(["non-object-history-record"]),
                     "malformed-for-manual-inspection",
                 ]) + "\n",
                 encoding="utf-8",
@@ -4948,7 +5412,101 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(result["status"], "pruned")
         self.assertEqual(result["removed"], 1)
         self.assertIn('"state": "recent"', remaining)
+        self.assertIn('"state": "recent-aware"', remaining)
+        self.assertIn('["non-object-history-record"]', remaining)
         self.assertIn("malformed-for-manual-inspection", remaining)
+
+    def test_timing_history_ignores_one_malformed_jsonl_line_without_losing_valid_evidence(self):
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "timing.jsonl"
+            path.write_text(
+                "\n".join([
+                    json.dumps({"run_key": "first", "actual_seconds": 10}),
+                    "{partial-write",
+                    json.dumps({"run_key": "second", "actual_seconds": 20}),
+                    json.dumps(["non-object-record"]),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            rows = app._read_timing_jsonl(path)
+
+        self.assertEqual([row["run_key"] for row in rows], ["first", "second"])
+
+    def test_per_run_timing_timeline_stays_valid_under_overlapping_callbacks(self):
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "run"
+            timing_dir = Path(temp_dir) / "timing-model"
+            original_dir = app.TIMING_MODEL_DIR
+            original_events = app.TIMING_MODEL_EVENTS_PATH
+            start = threading.Event()
+            try:
+                app.TIMING_MODEL_DIR = timing_dir
+                app.TIMING_MODEL_EVENTS_PATH = timing_dir / "timing-events.jsonl"
+                writers = [
+                    threading.Thread(
+                        target=lambda index=index: (
+                            start.wait(),
+                            app.record_timing_model_event(root, "Embedding", {"batch": index}),
+                        ),
+                    )
+                    for index in range(12)
+                ]
+                for writer in writers:
+                    writer.start()
+                start.set()
+                for writer in writers:
+                    writer.join(timeout=3)
+            finally:
+                app.TIMING_MODEL_DIR = original_dir
+                app.TIMING_MODEL_EVENTS_PATH = original_events
+
+            timeline = root / "timing-evidence-timeline.jsonl"
+            rows = [json.loads(line) for line in timeline.read_text(encoding="utf-8").splitlines()]
+
+        self.assertTrue(all(not writer.is_alive() for writer in writers))
+        self.assertEqual(sorted(row["batch"] for row in rows), list(range(12)))
+
+    def test_ingestion_history_keeps_valid_runs_visible_when_one_jsonl_record_is_bad(self):
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "ingestion-history.jsonl"
+            path.write_text(
+                "\n".join([
+                    json.dumps({
+                        "recorded_at": "2026-08-20T12:00:00",
+                        "state": "successful",
+                        "workspace_slug": "research",
+                        "documents": [{"name": "valid.pdf", "runtime_validation": "pass"}, "invalid-document"],
+                    }),
+                    json.dumps(["non-object-record"]),
+                    "{interrupted-json",
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            original_path = app.INGESTION_HISTORY_PATH
+            try:
+                app.INGESTION_HISTORY_PATH = path
+                rendered = app.ingestion_history_html("research")
+            finally:
+                app.INGESTION_HISTORY_PATH = original_path
+
+        self.assertIn("valid.pdf", rendered)
+        self.assertIn("Ignored 2 malformed history record(s)", rendered)
+
+    def test_segment_preview_reports_non_object_jsonl_record_without_attribute_error(self):
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manifest = Path(temp_dir) / "segment-manifest.jsonl"
+            manifest.write_text(json.dumps(["invalid-record"]) + "\n", encoding="utf-8")
+            rendered = app.preview_manifest_segment([str(manifest)], 1)
+
+        self.assertIn("non-object record", rendered)
 
     def test_version_and_system_theme_are_explicit_ui_contracts(self):
         import rag_pdf_gradio_app as app
@@ -4958,7 +5516,14 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(app.APP_BASE_COMMIT, "portable-package")
         self.assertIn('window.matchMedia("(prefers-color-scheme: dark)")', app.APP_JS)
         self.assertIn('systemThemeQuery.addEventListener("change", applySystemTheme)', app.APP_JS)
-        self.assertIn('localStorage.setItem(themeFollowSystemKey, "false")', app.APP_JS)
+        self.assertIn(
+            'const followSystem = nextDark === systemThemeQuery.matches;',
+            app.APP_JS,
+        )
+        self.assertIn(
+            'localStorage.setItem(themeFollowSystemKey, followSystem ? "true" : "false")',
+            app.APP_JS,
+        )
         self.assertIn('localStorage.setItem(themeOverrideKey, nextDark ? "dark" : "light")', app.APP_JS)
         self.assertIn("syncFollowSystemControl", app.APP_JS)
         self.assertIn("wireThemeToggleButton", app.APP_JS)
@@ -5020,7 +5585,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(capability["recommended_anythingllm_limit"], 4096)
         self.assertEqual(capability["safe_max_chunk_length"], 4096)
 
-    def test_read_validation_workspace_template_prefers_deepseek_like_workspace(self):
+    def test_read_validation_workspace_template_uses_most_recent_configured_workspace(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             storage = Path(tmpdir)
             db_path = storage / "anythingllm.db"
@@ -5045,7 +5610,7 @@ class PipelineCoreTests(unittest.TestCase):
                     "insert into workspaces(id,name,slug,chatProvider,chatModel,topN,similarityThreshold,vectorSearchMode,chatMode) values (1,'Other','other','openrouter','gpt-4.1-mini',4,0.25,'default','query')"
                 )
                 con.execute(
-                    "insert into workspaces(id,name,slug,chatProvider,chatModel,topN,similarityThreshold,vectorSearchMode,chatMode) values (2,'DeepSeek','deepseek-main','openrouter','deepseek-v4-pro',8,0.3,'default','query')"
+                    "insert into workspaces(id,name,slug,chatProvider,chatModel,topN,similarityThreshold,vectorSearchMode,chatMode) values (2,'Qwen','qwen-main','generic-openai','qwen3-8-max',8,0.3,'default','query')"
                 )
                 con.commit()
             finally:
@@ -5053,10 +5618,10 @@ class PipelineCoreTests(unittest.TestCase):
 
             template = pipeline.read_validation_workspace_template(storage)
             self.assertEqual(template["status"], "pass")
-            self.assertEqual(template["source_workspace_slug"], "deepseek-main")
-            self.assertEqual(template["chat_model"], "deepseek-v4-pro")
+            self.assertEqual(template["source_workspace_slug"], "qwen-main")
+            self.assertEqual(template["chat_model"], "qwen3-8-max")
 
-    def test_update_workspace_runtime_template_sqlite_applies_chat_model_gate(self):
+    def test_update_workspace_runtime_template_sqlite_applies_chat_model_configuration(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             storage = Path(tmpdir)
             db_path = storage / "anythingllm.db"
@@ -5097,11 +5662,33 @@ class PipelineCoreTests(unittest.TestCase):
                     "chat_mode": "query",
                 },
             )
-            gate = pipeline.read_workspace_model_gate(storage, "validation-1")
+            configuration = pipeline.read_workspace_model_configuration(storage, "validation-1")
             self.assertEqual(result["status"], "pass")
             self.assertTrue(result["verified"])
-            self.assertEqual(gate["chat_provider"], "openrouter")
-            self.assertEqual(gate["chat_model"], "deepseek-v4-pro")
+            self.assertEqual(configuration["chat_provider"], "openrouter")
+            self.assertEqual(configuration["chat_model"], "deepseek-v4-pro")
+
+    def test_workspace_model_configuration_is_provider_neutral(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage = Path(tmpdir)
+            db_path = storage / "anythingllm.db"
+            con = sqlite3.connect(db_path)
+            try:
+                con.execute(
+                    "create table workspaces(id integer primary key,name text,slug text,chatProvider text,chatModel text,topN integer,similarityThreshold real,vectorSearchMode text,chatMode text)"
+                )
+                con.execute(
+                    "insert into workspaces values (1,'Deneen Vance','deneen-vance','generic-openai','qwen3-8-max',4,0.25,'default','query')"
+                )
+                con.commit()
+            finally:
+                con.close()
+
+            configuration = pipeline.read_workspace_model_configuration(storage, "deneen-vance")
+
+        self.assertEqual(configuration["status"], "configured")
+        self.assertTrue(configuration["chat_model_configured"])
+        self.assertEqual(configuration["chat_model"], "qwen3-8-max")
 
     def test_run_temporary_workspace_validation_cleans_workspace_by_default(self):
         original_create = pipeline.create_validation_workspace
@@ -6074,6 +6661,9 @@ class PipelineCoreTests(unittest.TestCase):
         # review data, so the direct action cannot become a visible no-op.
         self.assertGreater(len(confirm_dependencies[0]["inputs"]), 1)
         self.assertEqual(len(confirm_dependencies[0]["outputs"]), 12)
+        confirm_function = app.demo.fns[confirm_dependencies[0]["id"]]
+        self.assertEqual(confirm_function.concurrency_id, app.AUTOMATIC_RUN_CONCURRENCY_ID)
+        self.assertEqual(confirm_function.concurrency_limit, 1)
 
     def test_run_control_containers_never_use_dynamic_visibility(self):
         """A Gradio container visibility transition previously stacked action bars."""
@@ -6366,6 +6956,46 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertTrue(item["page_scan_complete"])
         self.assertEqual(manifest["files"][0]["image_backed_low_text_page_count"], 0)
         self.assertEqual(len(calls), 1)
+
+    def test_pdf_picker_native_inspection_cache_is_bounded_lru(self):
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pdf_paths = [Path(tmpdir) / f"source-{index}.pdf" for index in range(3)]
+            for pdf_path in pdf_paths:
+                pdf_path.write_bytes(b"%PDF-1.4\nfixture\n")
+
+            original_coverage = app.automatic_full_native_text_coverage
+            original_limit = app.PDF_PICKER_NATIVE_INSPECTION_CACHE_LIMIT
+            calls = []
+
+            def counted_coverage(path):
+                calls.append(Path(path).name)
+                return {
+                    "status": "verified",
+                    "page_count": 1,
+                    "low_text_pages": [],
+                    "image_backed_low_text_pages": [],
+                }
+
+            app.PDF_PICKER_NATIVE_INSPECTION_CACHE.clear()
+            app.PDF_PICKER_NATIVE_INSPECTION_CACHE_LIMIT = 2
+            app.automatic_full_native_text_coverage = counted_coverage
+            try:
+                app.pdf_picker_native_inspection(pdf_paths[0])
+                app.pdf_picker_native_inspection(pdf_paths[1])
+                app.pdf_picker_native_inspection(pdf_paths[0])
+                app.pdf_picker_native_inspection(pdf_paths[2])
+                app.pdf_picker_native_inspection(pdf_paths[1])
+            finally:
+                app.automatic_full_native_text_coverage = original_coverage
+                app.PDF_PICKER_NATIVE_INSPECTION_CACHE_LIMIT = original_limit
+                app.PDF_PICKER_NATIVE_INSPECTION_CACHE.clear()
+
+        self.assertEqual(
+            calls,
+            ["source-0.pdf", "source-1.pdf", "source-2.pdf", "source-1.pdf"],
+        )
 
     def test_new_ordinary_picker_pdf_merges_into_existing_folder_batch(self):
         import rag_pdf_gradio_app as app
@@ -6881,6 +7511,7 @@ class PipelineCoreTests(unittest.TestCase):
 
             def fake_prepare(pdf_path, out_dir, args):
                 captured["prepare_and_upload"] = args.prepare_and_upload
+                captured["defer_lean_retention"] = args.defer_lean_retention
                 captured["upload_limit"] = args.upload_limit
                 captured["native_upload_transport"] = args.native_upload_transport
                 captured["native_upload_representation"] = args.native_upload_representation
@@ -6962,7 +7593,10 @@ class PipelineCoreTests(unittest.TestCase):
             app.native_upload_readiness_report = original_readiness
             app.verify_anythingllm_runtime_embedder = original_embedder_probe
 
-        self.assertTrue(captured["prepare_and_upload"])
+        # Automatic upload mode stages this worker locally; the one shared
+        # Desktop queue is submitted only after every selected PDF finishes.
+        self.assertFalse(captured["prepare_and_upload"])
+        self.assertTrue(captured["defer_lean_retention"])
         self.assertEqual(captured["upload_limit"], 0)
         self.assertEqual(captured["native_upload_transport"], "file_upload")
         self.assertEqual(captured["native_upload_representation"], "page_parents")
@@ -7158,7 +7792,7 @@ class PipelineCoreTests(unittest.TestCase):
                     "edge_case_results": "",
                     "diagnostics_report": "",
                     "diagnostics_csv": "",
-                    "workspace_model_gate": "",
+                    "workspace_model_configuration": "",
                     "post_upload_verification": str(post_upload),
                     "anythingllm_runtime_validation": str(runtime_probe),
                     "native_test_kit": {},
@@ -7242,7 +7876,7 @@ class PipelineCoreTests(unittest.TestCase):
                     "api_document_folder_path": "C:\\\\tmp\\\\documents\\\\Codex Native Upload Smoke Test",
                     "api_temporary_key_cleanup": "deleted",
                     "native_metadata_rows": 2,
-                    "workspace_model_gate_status": "pass",
+                    "workspace_model_configuration_status": "configured",
                     "post_upload_verification_status": "pass",
                     "post_upload_classification": "native_metadata_llm_visible",
                     "anythingllm_runtime_validation_status": "pass",
@@ -7543,7 +8177,7 @@ class PipelineCoreTests(unittest.TestCase):
             pipeline.run_temporary_workspace_validation = original_run_temp_validation
             pipeline.detect_anythingllm_api_url = original_detect_api
 
-    def test_build_run_diagnostics_skips_workspace_gate_warning_for_local_only(self):
+    def test_build_run_diagnostics_does_not_turn_workspace_configuration_into_a_gate(self):
         diagnostics = pipeline.build_run_diagnostics(
             profile={"needs_password": False},
             selected={
@@ -7556,7 +8190,7 @@ class PipelineCoreTests(unittest.TestCase):
             candidates=[],
             storage_report={"status": "complete"},
             upload_report={"status": "skipped_prepare_only"},
-            workspace_gate={
+            workspace_configuration={
                 "status": "workspace_missing",
                 "message": "Workspace `test` was not found.",
             },
@@ -7584,7 +8218,7 @@ class PipelineCoreTests(unittest.TestCase):
             candidates=[],
             storage_report={"status": "complete"},
             upload_report={"status": "skipped_prepare_only"},
-            workspace_gate={"status": "not_checked", "message": ""},
+            workspace_configuration={"status": "not_checked", "message": ""},
             post_upload_report={"status": "not_checked"},
             metadata_schema_report={"runtime_api_status": "not_checked"},
             runtime_validation_report={"status": "not_run"},
@@ -7609,7 +8243,7 @@ class PipelineCoreTests(unittest.TestCase):
             candidates=[],
             storage_report={"status": "complete"},
             upload_report={"status": "skipped_prepare_only"},
-            workspace_gate={"status": "not_checked", "message": ""},
+            workspace_configuration={"status": "not_checked", "message": ""},
             post_upload_report={"status": "not_checked"},
             metadata_schema_report={"runtime_api_status": "not_checked"},
             runtime_validation_report={"status": "not_run"},
@@ -7675,7 +8309,7 @@ class PipelineCoreTests(unittest.TestCase):
                     "edge_case_results": "",
                     "diagnostics_report": "",
                     "diagnostics_csv": "",
-                    "workspace_model_gate": "",
+                    "workspace_model_configuration": "",
                     "post_upload_verification": "",
                     "anythingllm_runtime_validation": "",
                     "native_test_kit": {},
@@ -7759,7 +8393,7 @@ class PipelineCoreTests(unittest.TestCase):
                     "api_document_folder_path": "",
                     "api_temporary_key_cleanup": "not_applicable",
                     "native_metadata_rows": 0,
-                    "workspace_model_gate_status": "not_checked",
+                    "workspace_model_configuration_status": "not_checked",
                     "post_upload_verification_status": "not_checked",
                     "post_upload_classification": "",
                     "anythingllm_runtime_validation_status": "not_run",
@@ -7906,7 +8540,7 @@ class PipelineCoreTests(unittest.TestCase):
                     "edge_case_results": "",
                     "diagnostics_report": "",
                     "diagnostics_csv": "",
-                    "workspace_model_gate": "",
+                    "workspace_model_configuration": "",
                     "post_upload_verification": "",
                     "anythingllm_runtime_validation": "",
                     "native_test_kit": {},
@@ -7990,7 +8624,7 @@ class PipelineCoreTests(unittest.TestCase):
                     "api_document_folder_path": "",
                     "api_temporary_key_cleanup": "not_applicable",
                     "native_metadata_rows": 0,
-                    "workspace_model_gate_status": "not_checked",
+                    "workspace_model_configuration_status": "not_checked",
                     "post_upload_verification_status": "not_checked",
                     "post_upload_classification": "",
                     "anythingllm_runtime_validation_status": "not_run",
@@ -8375,7 +9009,7 @@ class PipelineCoreTests(unittest.TestCase):
             candidates=[],
             storage_report={"status": "complete"},
             upload_report={"status": "skipped_prepare_only"},
-            workspace_gate={"status": "not_checked", "message": ""},
+            workspace_configuration={"status": "not_checked", "message": ""},
             post_upload_report={"status": "not_checked"},
             metadata_schema_report={"runtime_api_status": "not_checked"},
             runtime_validation_report={"status": "not_run"},
@@ -8544,6 +9178,86 @@ class PipelineCoreTests(unittest.TestCase):
                 app.AUTO_OUTPUT_DIR = original_root
                 app.LIVE_AUTOMATIC_RUN_STATUS = original_live
                 app.CANCELLED_AUTOMATIC_RUN_ROOTS.discard(str(run_root))
+
+    def test_automatic_run_json_writer_remains_valid_under_concurrent_status_updates(self):
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "run-progress.json"
+            start = threading.Event()
+            writers = [
+                threading.Thread(
+                    target=lambda index=index: (
+                        start.wait(), app._write_automatic_run_json(target, {"writer": index})
+                    ),
+                )
+                for index in range(12)
+            ]
+            for writer in writers:
+                writer.start()
+            start.set()
+            for writer in writers:
+                writer.join(timeout=5)
+
+            self.assertTrue(all(not writer.is_alive() for writer in writers))
+            final_record = json.loads(target.read_text(encoding="utf-8"))
+            self.assertIn(final_record["writer"], range(12))
+            self.assertEqual(list(Path(temp_dir).glob(".run-progress.json.*.tmp")), [])
+
+    def test_overlapping_live_status_updates_do_not_lose_the_higher_confirmed_checkpoint(self):
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            original_status = app.LIVE_AUTOMATIC_RUN_STATUS
+            original_write = app.atomic_write_text
+            first_write_entered = threading.Event()
+            release_first_write = threading.Event()
+            writes_lock = threading.Lock()
+            writes = 0
+            errors = []
+
+            def delayed_first_write(*args, **kwargs):
+                nonlocal writes
+                with writes_lock:
+                    writes += 1
+                    is_first = writes == 1
+                if is_first:
+                    first_write_entered.set()
+                    if not release_first_write.wait(timeout=3):
+                        raise TimeoutError("test did not release first status write")
+                return original_write(*args, **kwargs)
+
+            def update(fraction):
+                try:
+                    app.update_live_automatic_run_status(
+                        temp_dir,
+                        state="running",
+                        phase="Embedding",
+                        confirmed_fraction=fraction,
+                    )
+                except Exception as exc:  # pragma: no cover - asserted below
+                    errors.append(exc)
+
+            first = threading.Thread(target=update, args=(0.8,))
+            second = threading.Thread(target=update, args=(0.1,))
+            try:
+                app.LIVE_AUTOMATIC_RUN_STATUS = {}
+                app.atomic_write_text = delayed_first_write
+                first.start()
+                self.assertTrue(first_write_entered.wait(timeout=3))
+                second.start()
+                release_first_write.set()
+                first.join(timeout=3)
+                second.join(timeout=3)
+                final_status = dict(app.LIVE_AUTOMATIC_RUN_STATUS)
+            finally:
+                app.atomic_write_text = original_write
+                app.LIVE_AUTOMATIC_RUN_STATUS = original_status
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(final_status["confirmed_fraction"], 0.8)
 
     def test_cancellation_recovery_records_a_frozen_checkpoint_without_claiming_remote_stop(self):
         import rag_pdf_gradio_app as app
@@ -8908,10 +9622,10 @@ class PipelineCoreTests(unittest.TestCase):
             for component in app.demo.config["components"]
             if component.get("props", {}).get("label") == "Segmentation mode"
         ]
-        # Automatic and Advanced diagnostics intentionally expose the same
-        # segmentation modes.  A second control is no longer a duplicate
-        # implementation with a divergent policy.
-        self.assertEqual(len(segment_components), 2)
+        # Automatic, Advanced diagnostics, and the separate future-defaults
+        # editor intentionally expose the same segmentation policy. The
+        # defaults editor is not a third live-run implementation.
+        self.assertEqual(len(segment_components), 3)
         for component in segment_components:
             self.assertIn(
                 (app.SEGMENT_NONE_LABEL, app.SEGMENT_NONE_LABEL),
@@ -9079,7 +9793,7 @@ class PipelineCoreTests(unittest.TestCase):
             )
         )
 
-    def test_runtime_native_validation_requires_deepseek_and_checks_citation(self):
+    def test_runtime_native_validation_checks_citation_for_configured_model(self):
         payload = {
             "textContent": "Distinctive passage about rights-bearing individuals.",
             "metadata": {
@@ -9087,10 +9801,10 @@ class PipelineCoreTests(unittest.TestCase):
                 "chunkSource": "segment://pdf_hash_p0025_s00001",
             },
         }
-        original_gate = pipeline.read_workspace_model_gate
+        original_gate = pipeline.read_workspace_model_configuration
         original_post = pipeline.post_json_captured
         try:
-            pipeline.read_workspace_model_gate = lambda *args, **kwargs: {
+            pipeline.read_workspace_model_configuration = lambda *args, **kwargs: {
                 "status": "pass",
                 "chat_provider": "generic-openai",
                 "chat_model": "deepseek-v4-pro",
@@ -9132,7 +9846,7 @@ class PipelineCoreTests(unittest.TestCase):
                 include_chat_probe=True,
             )
         finally:
-            pipeline.read_workspace_model_gate = original_gate
+            pipeline.read_workspace_model_configuration = original_gate
             pipeline.post_json_captured = original_post
         self.assertEqual(result["status"], "pass")
         self.assertTrue(result["vector_checks"][0]["top_1_expected"])
@@ -9148,11 +9862,11 @@ class PipelineCoreTests(unittest.TestCase):
                 "chunkSource": "segment://pdf_hash_p0007_s00001",
             },
         }
-        original_gate = pipeline.read_workspace_model_gate
+        original_gate = pipeline.read_workspace_model_configuration
         original_post = pipeline.post_json_captured
         original_probe = pipeline.verify_anythingllm_runtime_embedder
         try:
-            pipeline.read_workspace_model_gate = lambda *args, **kwargs: {
+            pipeline.read_workspace_model_configuration = lambda *args, **kwargs: {
                 "status": "pass", "chat_provider": "generic-openai", "chat_model": "deepseek-v4-pro"
             }
             pipeline.verify_anythingllm_runtime_embedder = lambda *args, **kwargs: {"status": "pass"}
@@ -9170,7 +9884,7 @@ class PipelineCoreTests(unittest.TestCase):
                 "http://127.0.0.1:3001", "provided-key", "test", [payload], 1, Path("unused")
             )
         finally:
-            pipeline.read_workspace_model_gate = original_gate
+            pipeline.read_workspace_model_configuration = original_gate
             pipeline.post_json_captured = original_post
             pipeline.verify_anythingllm_runtime_embedder = original_probe
 
@@ -9283,10 +9997,10 @@ class PipelineCoreTests(unittest.TestCase):
                 "chunkSource": "segment://pdf_hash_p0025_s00001",
             },
         }
-        original_gate = pipeline.read_workspace_model_gate
+        original_gate = pipeline.read_workspace_model_configuration
         original_post = pipeline.post_json_captured
         try:
-            pipeline.read_workspace_model_gate = lambda *args, **kwargs: {
+            pipeline.read_workspace_model_configuration = lambda *args, **kwargs: {
                 "status": "pass", "chat_provider": "generic-openai", "chat_model": "deepseek-v4-pro"
             }
 
@@ -9297,7 +10011,7 @@ class PipelineCoreTests(unittest.TestCase):
                         "data": {"results": [{"metadata": dict(payload["metadata"])}]},
                         "error": "",
                     }
-                return {"http_status": 0, "data": {}, "error": "DeepSeek chat failed: timed out"}
+                return {"http_status": 0, "data": {}, "error": "AnythingLLM chat failed: timed out"}
 
             pipeline.post_json_captured = fake_post
             result = pipeline.validate_anythingllm_native_runtime(
@@ -9305,7 +10019,7 @@ class PipelineCoreTests(unittest.TestCase):
                 include_chat_probe=True,
             )
         finally:
-            pipeline.read_workspace_model_gate = original_gate
+            pipeline.read_workspace_model_configuration = original_gate
             pipeline.post_json_captured = original_post
 
         self.assertTrue(result["vector_checks"][0]["top_1_expected"])
@@ -9319,13 +10033,13 @@ class PipelineCoreTests(unittest.TestCase):
                 "chunkSource": "segment://pdf_hash_p0025_s00001",
             },
         }
-        original_gate = pipeline.read_workspace_model_gate
+        original_gate = pipeline.read_workspace_model_configuration
         original_post = pipeline.post_json_captured
         original_probe = pipeline.verify_anythingllm_runtime_embedder
         original_sleep = pipeline.time.sleep
         vector_attempts = 0
         try:
-            pipeline.read_workspace_model_gate = lambda *args, **kwargs: {
+            pipeline.read_workspace_model_configuration = lambda *args, **kwargs: {
                 "status": "pass", "chat_provider": "generic-openai", "chat_model": "deepseek-v4-pro"
             }
             pipeline.verify_anythingllm_runtime_embedder = lambda *args, **kwargs: {"status": "pass"}
@@ -9355,7 +10069,7 @@ class PipelineCoreTests(unittest.TestCase):
                 "http://127.0.0.1:3001", "provided-key", "test", [payload], 1, Path("unused")
             )
         finally:
-            pipeline.read_workspace_model_gate = original_gate
+            pipeline.read_workspace_model_configuration = original_gate
             pipeline.post_json_captured = original_post
             pipeline.verify_anythingllm_runtime_embedder = original_probe
             pipeline.time.sleep = original_sleep
@@ -9374,12 +10088,12 @@ class PipelineCoreTests(unittest.TestCase):
                 "chunkSource": "segment://pdf_hash_p0025_s00001",
             },
         }
-        original_gate = pipeline.read_workspace_model_gate
+        original_gate = pipeline.read_workspace_model_configuration
         original_post = pipeline.post_json_captured
         original_probe = pipeline.verify_anythingllm_runtime_embedder
         original_sleep = pipeline.time.sleep
         try:
-            pipeline.read_workspace_model_gate = lambda *args, **kwargs: {
+            pipeline.read_workspace_model_configuration = lambda *args, **kwargs: {
                 "status": "pass", "chat_provider": "generic-openai", "chat_model": "deepseek-v4-pro"
             }
             pipeline.verify_anythingllm_runtime_embedder = lambda *args, **kwargs: {"status": "pass"}
@@ -9393,7 +10107,7 @@ class PipelineCoreTests(unittest.TestCase):
                 "http://127.0.0.1:3001", "provided-key", "test", [payload], 1, Path("unused")
             )
         finally:
-            pipeline.read_workspace_model_gate = original_gate
+            pipeline.read_workspace_model_configuration = original_gate
             pipeline.post_json_captured = original_post
             pipeline.verify_anythingllm_runtime_embedder = original_probe
             pipeline.time.sleep = original_sleep
@@ -9410,11 +10124,11 @@ class PipelineCoreTests(unittest.TestCase):
                 "chunkSource": "segment://pdf_hash_p0025_s00001",
             },
         }
-        original_gate = pipeline.read_workspace_model_gate
+        original_gate = pipeline.read_workspace_model_configuration
         original_post = pipeline.post_json_captured
         original_probe = pipeline.verify_anythingllm_runtime_embedder
         try:
-            pipeline.read_workspace_model_gate = lambda *args, **kwargs: {
+            pipeline.read_workspace_model_configuration = lambda *args, **kwargs: {
                 "status": "pass", "chat_provider": "generic-openai", "chat_model": "deepseek-v4-pro"
             }
             pipeline.verify_anythingllm_runtime_embedder = lambda *args, **kwargs: {"status": "pass"}
@@ -9427,7 +10141,7 @@ class PipelineCoreTests(unittest.TestCase):
                 "http://127.0.0.1:3001", "provided-key", "test", [payload], 1, Path("unused")
             )
         finally:
-            pipeline.read_workspace_model_gate = original_gate
+            pipeline.read_workspace_model_configuration = original_gate
             pipeline.post_json_captured = original_post
             pipeline.verify_anythingllm_runtime_embedder = original_probe
 
@@ -9451,13 +10165,13 @@ class PipelineCoreTests(unittest.TestCase):
                 },
             },
         ]
-        original_gate = pipeline.read_workspace_model_gate
+        original_gate = pipeline.read_workspace_model_configuration
         original_post = pipeline.post_json_captured
         original_probe = pipeline.verify_anythingllm_runtime_embedder
         original_sleep = pipeline.time.sleep
         vector_calls = 0
         try:
-            pipeline.read_workspace_model_gate = lambda *args, **kwargs: {
+            pipeline.read_workspace_model_configuration = lambda *args, **kwargs: {
                 "status": "pass", "chat_provider": "generic-openai", "chat_model": "deepseek-v4-pro"
             }
             pipeline.verify_anythingllm_runtime_embedder = lambda *args, **kwargs: {"status": "pass"}
@@ -9482,7 +10196,7 @@ class PipelineCoreTests(unittest.TestCase):
                 "http://127.0.0.1:3001", "provided-key", "test", payloads, 2, Path("unused")
             )
         finally:
-            pipeline.read_workspace_model_gate = original_gate
+            pipeline.read_workspace_model_configuration = original_gate
             pipeline.post_json_captured = original_post
             pipeline.verify_anythingllm_runtime_embedder = original_probe
             pipeline.time.sleep = original_sleep
@@ -9508,13 +10222,13 @@ class PipelineCoreTests(unittest.TestCase):
                 },
             },
         ]
-        original_gate = pipeline.read_workspace_model_gate
+        original_gate = pipeline.read_workspace_model_configuration
         original_post = pipeline.post_json_captured
         original_probe = pipeline.verify_anythingllm_runtime_embedder
         original_sleep = pipeline.time.sleep
         vector_calls = 0
         try:
-            pipeline.read_workspace_model_gate = lambda *args, **kwargs: {
+            pipeline.read_workspace_model_configuration = lambda *args, **kwargs: {
                 "status": "pass", "chat_provider": "generic-openai", "chat_model": "deepseek-v4-pro"
             }
             pipeline.verify_anythingllm_runtime_embedder = lambda *args, **kwargs: {"status": "pass"}
@@ -9545,7 +10259,7 @@ class PipelineCoreTests(unittest.TestCase):
                 "http://127.0.0.1:3001", "provided-key", "test", payloads, 2, Path("unused")
             )
         finally:
-            pipeline.read_workspace_model_gate = original_gate
+            pipeline.read_workspace_model_configuration = original_gate
             pipeline.post_json_captured = original_post
             pipeline.verify_anythingllm_runtime_embedder = original_probe
             pipeline.time.sleep = original_sleep
@@ -10381,6 +11095,19 @@ class PipelineCoreTests(unittest.TestCase):
             self.assertTrue(pipeline.env_file_value_has_wrapping_quotes(env_path, "OPENROUTER_API_KEY"))
             self.assertFalse(pipeline.env_file_value_has_wrapping_quotes(env_path, "EMBEDDING_MODEL_PREF"))
 
+    def test_env_file_reader_decodes_json_quoted_values(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            expected = 'model with "quotes", apostrophe\'s, and \\slashes'
+            env_path.write_text(
+                f"EMBEDDING_MODEL_PREF={json.dumps(expected)}\n",
+                encoding="utf-8",
+            )
+
+            values = pipeline.read_env_file_values(env_path)
+
+        self.assertEqual(values["EMBEDDING_MODEL_PREF"], expected)
+
     def test_openrouter_runtime_failure_hint_is_brief_and_does_not_expose_credentials(self):
         with tempfile.TemporaryDirectory() as storage_dir:
             storage = Path(storage_dir)
@@ -10627,6 +11354,88 @@ class PipelineCoreTests(unittest.TestCase):
             values = pipeline.read_env_file_values(storage / ".env")
             self.assertEqual(values.get("EMBEDDING_MODEL_PREF"), "text-embedding-3-small")
             self.assertEqual(values.get("OPENAI_MODEL_PREF"), "text-embedding-3-small")
+
+    def test_anythingllm_env_writer_rejects_line_injection_and_keeps_prior_settings(self):
+        with tempfile.TemporaryDirectory() as storage_dir:
+            storage = Path(storage_dir)
+            env_path = storage / ".env"
+            original = "EMBEDDING_ENGINE='ollama'\n"
+            env_path.write_text(original, encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "single-line"):
+                pipeline.write_anythingllm_env_value(
+                    storage,
+                    "EMBEDDING_ENGINE",
+                    "openai\nOPENAI_API_KEY=unexpected",
+                )
+
+            self.assertEqual(env_path.read_text(encoding="utf-8"), original)
+
+    def test_related_embedder_env_update_does_not_partially_write_if_atomic_replace_fails(self):
+        with tempfile.TemporaryDirectory() as storage_dir:
+            storage = Path(storage_dir)
+            env_path = storage / ".env"
+            original = "EMBEDDING_ENGINE='anythingllm'\nEMBEDDING_MODEL_PREF='old'\n"
+            env_path.write_text(original, encoding="utf-8")
+            original_write = pipeline.atomic_write_text
+            try:
+                pipeline.atomic_write_text = lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full"))
+                with self.assertRaisesRegex(OSError, "disk full"):
+                    pipeline.persist_anythingllm_embedder_settings(storage, "openai", "text-embedding-3-small")
+            finally:
+                pipeline.atomic_write_text = original_write
+
+            self.assertEqual(env_path.read_text(encoding="utf-8"), original)
+
+    def test_overlapping_anythingllm_env_updates_preserve_both_settings(self):
+        with tempfile.TemporaryDirectory() as storage_dir:
+            storage = Path(storage_dir)
+            env_path = storage / ".env"
+            env_path.write_text("EXISTING_SETTING='keep'\n", encoding="utf-8")
+            first_write_entered = threading.Event()
+            release_first_write = threading.Event()
+            writes_lock = threading.Lock()
+            writes = 0
+            errors = []
+            original_write = pipeline.atomic_write_text
+
+            def delayed_first_write(*args, **kwargs):
+                nonlocal writes
+                with writes_lock:
+                    writes += 1
+                    is_first = writes == 1
+                if is_first:
+                    first_write_entered.set()
+                    if not release_first_write.wait(timeout=3):
+                        raise TimeoutError("test did not release first settings write")
+                return original_write(*args, **kwargs)
+
+            def update(key, value):
+                try:
+                    pipeline.write_anythingllm_env_value(storage, key, value)
+                except Exception as exc:  # pragma: no cover - asserted below
+                    errors.append(exc)
+
+            try:
+                pipeline.atomic_write_text = delayed_first_write
+                first = threading.Thread(target=update, args=("EMBEDDING_ENGINE", "openai"))
+                second = threading.Thread(target=update, args=("EMBEDDING_MODEL_PREF", "text-embedding-3-small"))
+                first.start()
+                self.assertTrue(first_write_entered.wait(timeout=3))
+                second.start()
+                release_first_write.set()
+                first.join(timeout=3)
+                second.join(timeout=3)
+            finally:
+                pipeline.atomic_write_text = original_write
+
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            self.assertEqual(errors, [])
+            values = pipeline.read_env_file_values(env_path)
+            self.assertEqual(values["EXISTING_SETTING"], "keep")
+            self.assertEqual(values["EMBEDDING_ENGINE"], "openai")
+            self.assertEqual(values["EMBEDDING_MODEL_PREF"], "text-embedding-3-small")
 
     def test_anythingllm_resolved_state_separates_chat_and_embedder(self):
         with tempfile.TemporaryDirectory() as storage_dir:
@@ -12500,7 +13309,7 @@ class PipelineCoreTests(unittest.TestCase):
         )
 
     def test_runtime_retrieval_accepts_expected_source_within_top_n(self):
-        original_gate = pipeline.read_workspace_model_gate
+        original_gate = pipeline.read_workspace_model_configuration
         original_key = pipeline.resolve_anythingllm_api_key
         original_request = pipeline.post_json_captured_with_retry
         payload = {
@@ -12512,7 +13321,7 @@ class PipelineCoreTests(unittest.TestCase):
         }
         expected_source = payload["metadata"]["chunkSource"]
         try:
-            pipeline.read_workspace_model_gate = lambda *_args, **_kwargs: {"status": "pass"}
+            pipeline.read_workspace_model_configuration = lambda *_args, **_kwargs: {"status": "configured"}
             pipeline.resolve_anythingllm_api_key = lambda *_args, **_kwargs: ("key", "provided_api_key")
 
             def fake_request(url, _body, **_kwargs):
@@ -12539,7 +13348,7 @@ class PipelineCoreTests(unittest.TestCase):
                 embedder_probe_override={"status": "pass"},
             )
         finally:
-            pipeline.read_workspace_model_gate = original_gate
+            pipeline.read_workspace_model_configuration = original_gate
             pipeline.resolve_anythingllm_api_key = original_key
             pipeline.post_json_captured_with_retry = original_request
 
@@ -12637,7 +13446,10 @@ class PipelineCoreTests(unittest.TestCase):
                 [f"custom-documents/segment-{index}.json" for index in range(25)],
                 concurrent_batch_limit=6,
                 verification_mode="every_batch",
-                batch_verifier=lambda _report: {"status": "pass"},
+                batch_verifier=lambda report: {
+                    "status": "pass",
+                    "matching_vector_rows": len(report.get("locations") or []),
+                },
             )
         finally:
             pipeline.post_json = original_post
@@ -12753,6 +13565,33 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(sleeps, [pipeline.ANYTHINGLLM_EMBEDDING_RATE_LIMIT_RETRY_SECONDS])
         self.assertEqual(result["batches"][1]["rate_limit_retry_count"], 1)
         self.assertEqual(result["errors"][0]["status"], 429)
+
+    def test_embedding_cancellation_during_rate_limit_wait_never_retries(self):
+        original_post = pipeline.post_json
+        locations = ["custom-documents/segment-1.json", "custom-documents/segment-2.json"]
+        calls = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = Path(temp_dir) / "embedding-batch-ledger.json"
+            try:
+                pipeline.post_json = lambda *_args, **_kwargs: (calls.append(1) or 429, "Too Many Requests")
+                result = pipeline.update_workspace_embeddings_batched(
+                    "http://anythingllm",
+                    "key",
+                    "safe-workspace",
+                    locations,
+                    ledger_path=ledger,
+                    cancel_callback=lambda: bool(calls),
+                    verification_mode="none",
+                )
+            finally:
+                pipeline.post_json = original_post
+            recovery = json.loads((Path(temp_dir) / "resume-embedding-manifest.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(calls, [1])
+        self.assertEqual(result["accepted"], 0)
+        self.assertEqual(result["batches"][0]["submission_state"], "cancelled_before_retry")
+        self.assertEqual(result["errors"][0]["endpoint"], "operator-cancellation")
+        self.assertEqual(recovery["recovery"]["remaining_locations"], locations)
 
     def test_embedding_non_429_rejection_stops_before_later_serial_batches(self):
         original_post = pipeline.post_json
@@ -13083,6 +13922,109 @@ class PipelineCoreTests(unittest.TestCase):
             self.assertEqual(calls[0][0], "multipart")
             self.assertEqual(calls[0][3], sample_file.name)
             self.assertEqual(calls[0][2]["chunkSource"], "segment://seg-1")
+
+    def test_six_file_uploads_share_one_desktop_embedding_submission(self):
+        """Six staged source files must become one Desktop queue payload."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            upload_rows = []
+            for index in range(1, 7):
+                source = tmp_path / f"batch-source-{index}.txt"
+                source.write_text(f"batch source {index}", encoding="utf-8")
+                upload_rows.append(
+                    {
+                        "filename": source.name,
+                        "title": f"Batch source {index}",
+                        "docSource": f"local-pdf://sha256/source-{index}",
+                        "chunkSource": f"batch://source-{index}",
+                        "text_file": str(source),
+                    }
+                )
+            original_multipart = pipeline.post_multipart_form
+            original_json = pipeline.post_json
+            multipart_calls = []
+            embedding_calls = []
+            try:
+                def fake_multipart(_url, fields, file_field_name, file_path, **_kwargs):
+                    filename = Path(file_path).name
+                    multipart_calls.append(filename)
+                    return 200, json.dumps({"documents": [{"location": f"custom-documents/{filename}.json"}]})
+
+                def fake_json(_url, body, **_kwargs):
+                    embedding_calls.append(body)
+                    return 200, json.dumps({"success": True})
+
+                pipeline.post_multipart_form = fake_multipart
+                pipeline.post_json = fake_json
+                report = pipeline.maybe_upload_to_anythingllm(
+                    "http://anythingllm",
+                    "key",
+                    [],
+                    workspace_slug="six-file-workspace",
+                    upload_transport="file_upload",
+                    upload_plan_rows=upload_rows,
+                    batch_verifier=lambda batch: {
+                        "status": "pass",
+                        "matching_vector_rows": len(batch["locations"]),
+                    },
+                )
+            finally:
+                pipeline.post_multipart_form = original_multipart
+                pipeline.post_json = original_json
+
+        self.assertEqual(multipart_calls, [row["filename"] for row in upload_rows])
+        self.assertEqual(len(embedding_calls), 1)
+        self.assertEqual(len(embedding_calls[0]["adds"]), 6)
+        self.assertEqual(report["embedded"], 6)
+
+    def test_attachment_failure_does_not_submit_a_partial_workspace_queue(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "first.txt"
+            second = root / "second.txt"
+            first.write_text("first", encoding="utf-8")
+            second.write_text("second", encoding="utf-8")
+            rows = [
+                {
+                    "filename": path.name,
+                    "title": path.stem,
+                    "docSource": f"local-pdf://sha256/{path.stem}",
+                    "chunkSource": f"page-parent://{path.stem}",
+                    "text_file": str(path),
+                    "_automatic_source_path": f"{path.stem}.pdf",
+                }
+                for path in (first, second)
+            ]
+            original_multipart = pipeline.post_multipart_form
+            original_json = pipeline.post_json
+            multipart_calls = []
+            queue_calls = []
+            try:
+                def fake_multipart(*_args, **kwargs):
+                    multipart_calls.append(Path(kwargs["file_path"]).name)
+                    if len(multipart_calls) == 1:
+                        return 200, json.dumps({"documents": [{"location": "custom-documents/first.json"}]})
+                    return 500, "attachment failed"
+
+                def fake_json(_url, body, **_kwargs):
+                    queue_calls.append(body)
+                    return 200, json.dumps({"success": True})
+
+                pipeline.post_multipart_form = fake_multipart
+                pipeline.post_json = fake_json
+                report = pipeline.maybe_upload_to_anythingllm(
+                    "http://anythingllm", "key", [], workspace_slug="workspace",
+                    upload_transport="file_upload", upload_plan_rows=rows,
+                )
+            finally:
+                pipeline.post_multipart_form = original_multipart
+                pipeline.post_json = original_json
+
+        self.assertEqual(multipart_calls, ["first.txt", "second.txt"])
+        self.assertEqual(queue_calls, [])
+        self.assertEqual(report["status"], "error")
+        self.assertEqual([row["status"] for row in report["attachment_results"]], ["attached", "rejected"])
+        self.assertTrue(any(error.get("classification") == "attachment_batch_incomplete" for error in report["errors"]))
 
     def test_file_upload_transport_moves_segments_into_pdf_subfolder(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -14193,6 +15135,472 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertLessEqual(len(str(parsed)), pipeline.WINDOWS_COMPATIBLE_OUTPUT_PATH_LIMIT)
         self.assertLessEqual(len(str(segment)), pipeline.WINDOWS_COMPATIBLE_OUTPUT_PATH_LIMIT)
 
+    def test_batch_output_directories_do_not_collide_for_same_named_pdfs(self):
+        """A batch must retain both sources even when Windows paths share a basename."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            first = root / "first" / "article.pdf"
+            second = root / "second" / "article.pdf"
+            first.parent.mkdir()
+            second.parent.mkdir()
+            for path, text in ((first, "first source"), (second, "second source")):
+                document = fitz.open()
+                document.new_page().insert_text((72, 72), text)
+                document.save(path)
+                document.close()
+
+            destinations = pipeline.compatible_output_document_directories(
+                root / "run", [first, second]
+            )
+
+        self.assertEqual(len(destinations), 2)
+        self.assertNotEqual(destinations[str(first)], destinations[str(second)])
+        self.assertIn("article", destinations[str(first)].name)
+        self.assertIn("article", destinations[str(second)].name)
+
+    def test_automatic_grouped_upload_submits_all_staged_pdfs_once(self):
+        """The Automatic runner must not create one Desktop queue call per PDF."""
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            summaries = []
+            for index in range(1, 7):
+                text_file = root / f"source-{index}.txt"
+                plan_file = root / f"source-{index}-upload-plan.csv"
+                text_file.write_text(f"Source {index} text", encoding="utf-8")
+                plan_file.write_text(
+                    "filename,title,docAuthor,description,docSource,chunkSource,text_file\n"
+                    f"source-{index}.txt,Source {index},,PDF {index},local-pdf://sha256/hash-{index},"
+                    f"hash-{index}-p001,{text_file}\n",
+                    encoding="utf-8",
+                )
+                summaries.append(
+                    {
+                        "pdf": str(root / f"source-{index}.pdf"),
+                        "source_sha256": f"hash-{index}",
+                        "native_upload_plan": str(plan_file),
+                        "native_upload_transport": "file_upload",
+                    }
+                )
+
+            captured = []
+
+            def fake_upload(*_args, **kwargs):
+                captured.append(kwargs)
+                upload_rows = kwargs["upload_plan_rows"]
+                record_count = len(upload_rows)
+                return {
+                    "status": "complete",
+                    "uploaded": record_count,
+                    "embedded": record_count,
+                    "attachment_results": [
+                        {
+                            "source_path": row["_automatic_source_path"],
+                            "chunk_source": row["chunkSource"],
+                            "location": f"custom-documents/{row['filename']}.json",
+                            "status": "attached",
+                            "error": "",
+                        }
+                        for row in upload_rows
+                    ],
+                    "embedding_update": {
+                        "requested": record_count,
+                        "accepted": record_count,
+                        "batches": [{
+                            "submission_state": "accepted",
+                            "searchability_proven": True,
+                            "locations": [f"custom-documents/{row['filename']}.json" for row in upload_rows],
+                            "verification": {
+                                "observed_chunk_sources": [row["chunkSource"] for row in upload_rows],
+                            },
+                        }],
+                    },
+                }
+
+            with mock.patch.object(app, "maybe_upload_to_anythingllm", side_effect=fake_upload), mock.patch.object(
+                app, "default_anythingllm_storage_dir", return_value=root / "storage"
+            ):
+                report = app.upload_prepared_automatic_batch(
+                    summaries,
+                    api_url="http://anythingllm",
+                    api_key="test-key",  # pragma: allowlist secret -- synthetic upload fixture
+                    workspace_slug="batch-workspace",
+                    run_root=root / "run",
+                )
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(len(captured[0]["upload_plan_rows"]), 6)
+        self.assertEqual(report["status"], "complete")
+        self.assertTrue(all(summary["post_upload_verification_status"] == "pass" for summary in summaries))
+        self.assertTrue(all(summary["api_upload_status"] == "complete" for summary in summaries))
+
+    def test_grouped_upload_disambiguates_identical_segment_filenames_before_submission(self):
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            summaries = []
+            for source in ("first", "second"):
+                text_file = root / f"{source}.txt"
+                text_file.write_text(source, encoding="utf-8")
+                plan_file = root / f"{source}-upload-plan.csv"
+                plan_file.write_text(
+                    "filename,title,docAuthor,description,docSource,chunkSource,text_file\n"
+                    f"shared-p001-s00001.txt,Shared,,,local-pdf://sha256/{source},{source}-p001,{text_file}\n",
+                    encoding="utf-8",
+                )
+                summaries.append(
+                    {
+                        "pdf": str(root / f"{source}.pdf"),
+                        "source_sha256": source,
+                        "native_upload_plan": str(plan_file),
+                        "native_upload_transport": "file_upload",
+                    }
+                )
+
+            captured = {}
+
+            def fake_upload(*_args, **kwargs):
+                captured.update(kwargs)
+                rows = kwargs["upload_plan_rows"]
+                return {
+                    "status": "complete",
+                    "uploaded": len(rows),
+                    "embedded": len(rows),
+                    "attachment_results": [
+                        {
+                            "source_path": row["_automatic_source_path"],
+                            "chunk_source": row["chunkSource"],
+                            "location": f"custom-documents/{row['filename']}.json",
+                            "status": "attached",
+                            "error": "",
+                        }
+                        for row in rows
+                    ],
+                    "embedding_update": {
+                        "requested": len(rows),
+                        "accepted": len(rows),
+                        "batches": [
+                            {
+                                "submission_state": "accepted",
+                                "locations": [f"custom-documents/{row['filename']}.json" for row in rows],
+                                "verification": {
+                                    "observed_chunk_sources": [row["chunkSource"] for row in rows],
+                                },
+                            }
+                        ],
+                    },
+                }
+
+            with mock.patch.object(app, "maybe_upload_to_anythingllm", side_effect=fake_upload), mock.patch.object(
+                app, "default_anythingllm_storage_dir", return_value=root / "storage"
+            ):
+                report = app.upload_prepared_automatic_batch(
+                    summaries,
+                    api_url="http://anythingllm",
+                    api_key="key",  # pragma: allowlist secret -- synthetic upload fixture
+                    workspace_slug="workspace",
+                    run_root=root / "run",
+                )
+
+        submitted = [row["filename"] for row in captured["upload_plan_rows"]]
+        self.assertEqual(len(submitted), 2)
+        self.assertEqual(len({name.casefold() for name in submitted}), 2)
+        self.assertTrue(all(name.startswith("shared-p001-s00001-d") for name in submitted))
+        self.assertEqual(len(report["filename_disambiguations"]), 2)
+        self.assertTrue(all(summary["batch_upload_result"]["filename_disambiguations"] for summary in summaries))
+
+    def test_grouped_upload_preserves_ocr_hold_and_does_not_mutate_partial_batch(self):
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            plan_file = root / "ready-upload-plan.csv"
+            text_file = root / "ready.txt"
+            text_file.write_text("ready", encoding="utf-8")
+            plan_file.write_text(
+                "filename,title,docAuthor,description,docSource,chunkSource,text_file\n"
+                f"ready.txt,Ready,,,local-pdf://sha256/ready,ready-p001,{text_file}\n",
+                encoding="utf-8",
+            )
+            ready = {
+                "pdf": str(root / "ready.pdf"),
+                "source_sha256": "ready",
+                "native_upload_plan": str(plan_file),
+                "native_upload_transport": "file_upload",
+            }
+            held = {
+                "pdf": str(root / "held.pdf"),
+                "source_sha256": "held",
+                "batch_upload_blocked_reason": "photographed_spread_requires_manual_review",
+            }
+            with mock.patch.object(app, "maybe_upload_to_anythingllm") as upload:
+                report = app.upload_prepared_automatic_batch(
+                    [ready, held], api_url="http://anythingllm", api_key="key",  # pragma: allowlist secret -- synthetic upload fixture
+                    workspace_slug="workspace", run_root=root / "run",
+                )
+
+        upload.assert_not_called()
+        self.assertEqual(report["status"], "blocked_batch_incomplete")
+        self.assertEqual(held["api_upload_status"], "skipped_needs_ocr_review")
+        self.assertEqual(ready["api_upload_status"], "skipped_batch_incomplete")
+
+    def test_grouped_upload_keeps_custom_record_scope_and_identity_verifier(self):
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            text_files = []
+            for number in range(1, 4):
+                text_file = root / f"page-{number}.txt"
+                text_file.write_text(f"page {number}", encoding="utf-8")
+                text_files.append(text_file)
+            plan_file = root / "range-upload-plan.csv"
+            plan_file.write_text(
+                "filename,title,docAuthor,description,docSource,chunkSource,text_file\n"
+                + "".join(
+                    f"page-{number}.txt,Page {number},,,local-pdf://sha256/range,range-p{number:03d},{text_files[number - 1]}\n"
+                    for number in range(1, 4)
+                ),
+                encoding="utf-8",
+            )
+            summary = {
+                "pdf": str(root / "range.pdf"),
+                "source_sha256": "range",
+                "native_upload_plan": str(plan_file),
+                "native_upload_transport": "file_upload",
+                "batch_upload_indices": [2],
+            }
+            captured = {}
+
+            def fake_upload(*_args, **kwargs):
+                captured.update(kwargs)
+                row = kwargs["upload_plan_rows"][0]
+                verification = kwargs["batch_verifier"]({
+                    "start_index": 0,
+                    "end_index": 1,
+                    "locations": ["custom-documents/page-2.txt.json"],
+                })
+                return {
+                    "status": "complete", "uploaded": 1, "embedded": 1,
+                    "attachment_results": [{
+                        "source_path": row["_automatic_source_path"], "chunk_source": row["chunkSource"],
+                        "location": "custom-documents/page-2.txt.json", "status": "attached", "error": "",
+                    }],
+                    "embedding_update": {"requested": 1, "accepted": 1, "batches": [{
+                        "submission_state": "accepted", "searchability_proven": True,
+                        "locations": ["custom-documents/page-2.txt.json"], "verification": verification,
+                    }]},
+                }
+
+            verifier_calls = []
+            def fake_verify(_storage, _workspace, source_sha, payloads, **kwargs):
+                verifier_calls.append((source_sha, payloads, kwargs))
+                return {
+                    "status": "pass", "matching_vector_rows": 1,
+                    "observed_chunk_sources": [payloads[0]["metadata"]["chunkSource"]],
+                }
+
+            with mock.patch.object(app, "maybe_upload_to_anythingllm", side_effect=fake_upload), mock.patch.object(
+                app, "verify_anythingllm_post_upload", side_effect=fake_verify
+            ):
+                report = app.upload_prepared_automatic_batch(
+                    [summary], api_url="http://anythingllm", api_key="key",  # pragma: allowlist secret -- synthetic upload fixture
+                    workspace_slug="workspace", run_root=root / "run",
+                )
+
+        self.assertEqual(len(captured["upload_plan_rows"]), 1)
+        self.assertEqual(captured["upload_plan_rows"][0]["chunkSource"], "range-p002")
+        self.assertEqual(verifier_calls[0][0], "")
+        self.assertEqual(verifier_calls[0][1][0]["metadata"]["chunkSource"], "range-p002")
+        self.assertEqual(verifier_calls[0][2]["observation_mode"], "identity")
+        self.assertEqual(report["document_results"][str(root / "range.pdf")]["records"], 1)
+
+    def test_grouped_upload_outcome_rewrites_staged_per_document_reports(self):
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "prepared"
+            (output / "inspection").mkdir(parents=True)
+            summary = {"output_root": str(output), "api_upload_status": "skipped_prepare_only"}
+            result = {
+                "status": "complete",
+                "records": 2,
+                "uploaded": 2,
+                "embedded": 2,
+                "post_status": "pass",
+                "post_classification": "batch_exact_vector_evidence",
+                "runtime_status": "deferred_after_exact_vector_proof",
+                "queue_requested": 2,
+                "queue_accepted": 2,
+                "queue_batches": [{"batch": 1, "requested": 2, "accepted": 2}],
+                "ledger_path": str(Path(tmpdir) / "batch-embedding-ledger.json"),
+            }
+            app.persist_grouped_upload_outcome(summary, result)
+            run_summary = json.loads((output / "run-summary.json").read_text(encoding="utf-8"))
+            api_report = json.loads((output / "inspection" / "api-upload-report.json").read_text(encoding="utf-8"))
+            post_report = json.loads((output / "inspection" / "post-upload-verification.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(run_summary["api_upload_status"], "complete")
+        self.assertEqual(api_report["status"], "complete")
+        self.assertEqual(post_report["status"], "pass")
+
+    def test_grouped_upload_attributes_attachment_error_to_its_pdf(self):
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            summaries = []
+            for name in ("first", "second"):
+                text_file = root / f"{name}.txt"
+                text_file.write_text(name, encoding="utf-8")
+                plan_file = root / f"{name}-upload-plan.csv"
+                plan_file.write_text(
+                    "filename,title,docAuthor,description,docSource,chunkSource,text_file\n"
+                    f"{name}.txt,{name},,,local-pdf://sha256/{name},{name}-p001,{text_file}\n",
+                    encoding="utf-8",
+                )
+                summaries.append({
+                    "pdf": str(root / f"{name}.pdf"), "source_sha256": name,
+                    "native_upload_plan": str(plan_file), "native_upload_transport": "file_upload",
+                })
+
+            def fake_upload(*_args, **kwargs):
+                rows = kwargs["upload_plan_rows"]
+                return {
+                    "status": "error", "uploaded": 1, "embedded": 0,
+                    "attachment_results": [
+                        {"source_path": rows[0]["_automatic_source_path"], "chunk_source": rows[0]["chunkSource"],
+                         "location": "custom-documents/first.json", "status": "attached", "error": ""},
+                        {"source_path": rows[1]["_automatic_source_path"], "chunk_source": rows[1]["chunkSource"],
+                         "location": "", "status": "rejected", "error": "HTTP 500"},
+                    ],
+                    "embedding_update": {"requested": 0, "accepted": 0, "batches": [], "errors": []},
+                    "errors": [{"classification": "attachment_batch_incomplete", "error": "No partial workspace queue was submitted."}],
+                }
+
+            with mock.patch.object(app, "maybe_upload_to_anythingllm", side_effect=fake_upload):
+                report = app.upload_prepared_automatic_batch(
+                    summaries, api_url="http://anythingllm", api_key="key",  # pragma: allowlist secret -- synthetic upload fixture
+                    workspace_slug="workspace", run_root=root / "run",
+                )
+
+        first = report["document_results"][str(root / "first.pdf")]
+        second = report["document_results"][str(root / "second.pdf")]
+        self.assertEqual(first["uploaded"], 1)
+        self.assertEqual(first["embedded"], 0)
+        self.assertEqual(second["uploaded"], 0)
+        self.assertEqual(second["error"], "HTTP 500")
+
+    def test_missing_upload_plan_is_a_controlled_batch_error_not_directory_open(self):
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            summary = {
+                "pdf": str(root / "missing-plan.pdf"),
+                "source_sha256": "missing",
+                "native_upload_plan": "",
+                "native_upload_transport": "file_upload",
+            }
+            with mock.patch.object(app, "maybe_upload_to_anythingllm") as upload:
+                report = app.upload_prepared_automatic_batch(
+                    [summary], api_url="http://anythingllm", api_key="key",  # pragma: allowlist secret -- synthetic upload fixture
+                    workspace_slug="workspace", run_root=root / "run",
+                )
+
+        upload.assert_not_called()
+        self.assertEqual(report["status"], "blocked_batch_incomplete")
+        self.assertEqual(summary["api_upload_status"], "error_missing_upload_files")
+
+    def test_invalid_upload_plan_row_blocks_the_entire_batch_before_upload(self):
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            plan_file = root / "invalid-upload-plan.csv"
+            # The plan is nonempty but lacks the required prepared text file.
+            plan_file.write_text(
+                "filename,title,docAuthor,description,docSource,chunkSource,text_file\n"
+                "missing.txt,Missing,,,local-pdf://sha256/missing,missing-p001,\n",
+                encoding="utf-8",
+            )
+            summary = {
+                "pdf": str(root / "missing-text.pdf"),
+                "source_sha256": "missing",
+                "native_upload_plan": str(plan_file),
+                "native_upload_transport": "file_upload",
+            }
+            with mock.patch.object(app, "maybe_upload_to_anythingllm") as upload:
+                report = app.upload_prepared_automatic_batch(
+                    [summary], api_url="http://anythingllm", api_key="key",  # pragma: allowlist secret -- synthetic upload fixture
+                    workspace_slug="workspace", run_root=root / "run",
+                )
+
+        upload.assert_not_called()
+        self.assertEqual(report["status"], "blocked_batch_incomplete")
+        self.assertEqual(summary["api_upload_status"], "error_invalid_upload_plan")
+        self.assertIn("missing text_file", summary["api_upload_error"])
+
+    def test_grouped_upload_rejects_a_plan_filename_that_is_a_path(self):
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            text_file = root / "prepared.txt"
+            text_file.write_text("prepared", encoding="utf-8")
+            plan_file = root / "unsafe-upload-plan.csv"
+            plan_file.write_text(
+                "filename,title,docAuthor,description,docSource,chunkSource,text_file\n"
+                f"..\\outside.txt,Unsafe,,,local-pdf://sha256/unsafe,unsafe-p001,{text_file}\n",
+                encoding="utf-8",
+            )
+            summary = {
+                "pdf": str(root / "unsafe.pdf"),
+                "source_sha256": "unsafe",
+                "native_upload_plan": str(plan_file),
+                "native_upload_transport": "file_upload",
+            }
+            with mock.patch.object(app, "maybe_upload_to_anythingllm") as upload:
+                report = app.upload_prepared_automatic_batch(
+                    [summary], api_url="http://anythingllm", api_key="key",  # pragma: allowlist secret -- synthetic upload fixture
+                    workspace_slug="workspace", run_root=root / "run",
+                )
+
+        upload.assert_not_called()
+        self.assertEqual(report["status"], "blocked_batch_incomplete")
+        self.assertIn("unsafe filename", summary["api_upload_error"])
+
+    def test_grouped_upload_rejects_an_empty_prepared_text_file_before_submission(self):
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            text_file = root / "empty.txt"
+            text_file.write_text("\n\t", encoding="utf-8")
+            plan_file = root / "empty-upload-plan.csv"
+            plan_file.write_text(
+                "filename,title,docAuthor,description,docSource,chunkSource,text_file\n"
+                f"empty.txt,Empty,,,local-pdf://sha256/empty,empty-p001,{text_file}\n",
+                encoding="utf-8",
+            )
+            summary = {
+                "pdf": str(root / "empty.pdf"),
+                "source_sha256": "empty",
+                "native_upload_plan": str(plan_file),
+                "native_upload_transport": "file_upload",
+            }
+            with mock.patch.object(app, "maybe_upload_to_anythingllm") as upload:
+                report = app.upload_prepared_automatic_batch(
+                    [summary], api_url="http://anythingllm", api_key="key",  # pragma: allowlist secret -- synthetic upload fixture
+                    workspace_slug="workspace", run_root=root / "run",
+                )
+
+        upload.assert_not_called()
+        self.assertEqual(report["status"], "blocked_batch_incomplete")
+        self.assertIn("empty prepared text file", summary["api_upload_error"])
+
     def test_notes_and_index_endmatter_are_detected_after_body(self):
         pages = []
         for page in range(1, 21):
@@ -14507,6 +15915,94 @@ class PipelinePdfIntegrationTests(unittest.TestCase):
             self.assertEqual(profile_with_backmatter["boundary_decisions"]["end_matter"]["starts_at_pdf_page"], 10)
             self.assertTrue(profile_with_backmatter["boundary_decisions"]["end_matter"]["included_in_primary_output"])
             self.assertEqual(profile_with_backmatter["boundary_decisions"]["end_matter"]["excluded_end_range"], "none")
+
+            # A deliberate final-page override is more specific than the
+            # inclusive back-matter preference.  It must never be accepted by
+            # the form then silently discarded by the preparation pipeline.
+            args.end_page_override = 4
+            output_with_explicit_end = root / "output-with-explicit-end"
+            summary_with_explicit_end = pipeline.prepare_pdf(
+                pdf_path, output_with_explicit_end, args
+            )
+            profile_with_explicit_end = json.loads(
+                (output_with_explicit_end / "source-profile.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(summary_with_explicit_end["start_page"], 2)
+            self.assertEqual(summary_with_explicit_end["end_page"], 4)
+            self.assertEqual(summary_with_explicit_end["page_parents"], 2)
+            self.assertEqual(
+                profile_with_explicit_end["boundary_decisions"]["end_matter"]["excluded_end_range"],
+                "4-12",
+            )
+
+    def test_deferred_lean_retention_keeps_raw_text_batch_upload_plan_until_shared_submission(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            pdf_path = root / "batch-source.pdf"
+            doc = fitz.open()
+            page = doc.new_page()
+            page.insert_textbox(
+                fitz.Rect(60, 60, 540, 760),
+                "Batch source\n\n" + ("Distinctive text retained for the shared upload plan. " * 35),
+                fontsize=10,
+            )
+            doc.save(pdf_path)
+            doc.close()
+            args = SimpleNamespace(
+                document_label="",
+                document_author="",
+                document_short_label="",
+                use_file_title_fallback=True,
+                deep_extraction=False,
+                include_front_matter=True,
+                include_back_matter=True,
+                backend_mode="pymupdf",
+                first_page_override=0,
+                end_page_override=0,
+                target_passage_length=500,
+                end_section_names=pipeline.DEFAULT_END_SECTION_HEADINGS,
+                validation_phrases=[],
+                unstructured_strategy="fast",
+                marker_style="short",
+                disable_inline_markers=False,
+                lean_retention=True,
+                defer_lean_retention=True,
+                run_vector_eval=False,
+                ollama_model="bge-m3:latest",
+                ollama_url="http://127.0.0.1:11434/api/embed",
+                max_vector_probes=0,
+                max_vector_chunks=0,
+                prepare_and_upload=False,
+                anythingllm_api_url="",
+                anythingllm_api_key="",
+                workspace_slug="",
+                test_workspace_slug="test",
+                upload_limit=0,
+                native_upload_transport="raw_text",
+                native_metadata_upload_mode="native_header",
+                native_upload_representation="page_parents",
+                anythingllm_create_document_folders=False,
+                anythingllm_document_folder_name="",
+                anythingllm_storage_dir=str(root / "missing-storage"),
+                anythingllm_chunk_size=400,
+                anythingllm_chunk_overlap=40,
+                run_author_inference_sample_evaluation=False,
+            )
+
+            summary = pipeline.prepare_pdf(pdf_path, root / "output", args)
+            plan = Path(summary["native_upload_plan"])
+            plan_exists = plan.is_file()
+            plan_rows = pipeline.load_upload_plan_rows(plan)
+            page_parent_files_exist = (plan.parent / "file-upload-page-parents-native-header").is_dir()
+
+        self.assertTrue(plan_exists)
+        self.assertTrue(plan_rows)
+        self.assertTrue(page_parent_files_exist)
+        self.assertEqual(summary["lean_retention"], {
+            "applied": False,
+            "deferred": True,
+            "reason": "awaiting_shared_automatic_batch_upload",
+        })
 
     def test_author_inference_sample_evaluation_writes_reports(self):
         original_samples = pipeline.AUTHOR_INFERENCE_SAMPLE_PAPERS

@@ -47,7 +47,17 @@ def read_env_values(path: Path):
         if "=" not in raw or raw.lstrip().startswith("#"):
             continue
         key, value = raw.split("=", 1)
-        values[key.strip()] = value.strip().strip("'\"")
+        raw_value = value.strip()
+        if len(raw_value) >= 2 and raw_value[0] == "'" and raw_value[-1] == "'":
+            values[key.strip()] = raw_value[1:-1]
+        elif len(raw_value) >= 2 and raw_value[0] == '"' and raw_value[-1] == '"':
+            try:
+                decoded = json.loads(raw_value)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                decoded = raw_value[1:-1]
+            values[key.strip()] = decoded if isinstance(decoded, str) else raw_value[1:-1]
+        else:
+            values[key.strip()] = raw_value
     return values
 
 

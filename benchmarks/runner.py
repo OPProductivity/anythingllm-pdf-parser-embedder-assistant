@@ -210,10 +210,12 @@ def read_progress_trace(path: Path) -> list[dict[str, Any]]:
     for line in path.read_text(encoding="utf-8").splitlines():
         try:
             row = json.loads(line)
+            if not isinstance(row, dict):
+                continue
             elapsed = float(row.get("elapsed_seconds") or 0.0)
         except (json.JSONDecodeError, TypeError, ValueError):
             continue
-        if isinstance(row, dict) and elapsed >= 0.0:
+        if elapsed >= 0.0:
             rows.append(row)
     return sorted(rows, key=lambda row: float(row.get("elapsed_seconds") or 0.0))
 

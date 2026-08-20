@@ -90,6 +90,21 @@ def test_trace_calibration_uses_visible_progress_and_records_eta_separately():
     assert calibration["40"]["eta_error_seconds"] == 20.0
 
 
+def test_progress_trace_reader_ignores_valid_non_object_jsonl_records(tmp_path: Path):
+    trace = tmp_path / "progress-trace.jsonl"
+    trace.write_text(
+        "\n".join([
+            json.dumps(["partial-but-valid-json"]),
+            json.dumps({"elapsed_seconds": 2, "visible_progress_percent": 10}),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+
+    rows = runner.read_progress_trace(trace)
+
+    assert rows == [{"elapsed_seconds": 2, "visible_progress_percent": 10}]
+
+
 def test_trace_calibration_allows_ten_points_only_until_next_queue_vector_evidence():
     rows = [
         {"elapsed_seconds": 10, "visible_progress_percent": 10, "expected_seconds": 100, "state": "running"},

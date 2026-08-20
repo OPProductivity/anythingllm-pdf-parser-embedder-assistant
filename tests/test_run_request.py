@@ -55,6 +55,27 @@ def test_automatic_adapter_normalizes_local_only_native_fields_away():
     assert request.to_legacy_namespace().prepare_and_upload is False
 
 
+def test_automatic_adapter_accepts_the_live_normalized_files_field():
+    request = RunRequest.from_automatic_settings(
+        {
+            "files": ["C:/approved/first.pdf", "C:/approved/second.pdf"],
+            "target_passage_length": 750,
+            "backend_mode": "Automatic",
+        },
+        mode=LOCAL_ONLY,
+        segment_mode="page_limit",
+    )
+
+    assert request.input_paths == ("C:/approved/first.pdf", "C:/approved/second.pdf")
+
+
+def test_default_local_request_is_valid_without_native_folder_intent():
+    request = RunRequest(input_paths=("C:/approved/source.pdf",))
+
+    assert request.mode == LOCAL_ONLY
+    assert request.create_document_folders is False
+
+
 def test_native_automatic_adapter_defaults_to_document_subfolders_when_field_is_missing():
     request = RunRequest.from_automatic_settings(
         {

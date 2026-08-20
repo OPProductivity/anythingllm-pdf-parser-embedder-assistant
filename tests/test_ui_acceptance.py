@@ -109,6 +109,20 @@ def two_pdf_files(tmp_path: Path) -> list[Path]:
     return paths
 
 
+@pytest.fixture
+def six_pdf_files(tmp_path: Path) -> list[Path]:
+    paths = [tmp_path / f"browser-batch-{index}.pdf" for index in range(1, 7)]
+    for index, path in enumerate(paths, start=1):
+        document = fitz.open()
+        try:
+            page = document.new_page()
+            page.insert_text((72, 72), f"Browser six-file batch PDF {index}.")
+            document.save(path)
+        finally:
+            document.close()
+    return paths
+
+
 def test_fresh_file_selection_never_displays_prior_success(page, local_app_url, one_page_pdf):
     page.goto(local_app_url)
     expect(page.get_by_text("Processing successful", exact=False)).to_have_count(0)
@@ -164,6 +178,29 @@ def test_compact_local_only_mode_remains_a_visible_choice(page, local_app_url):
     expect(compact_local_only).to_be_checked()
     expect(page.locator("#native-metadata-upload-section")).to_be_hidden()
     expect(page.get_by_label("AnythingLLM API URL", exact=True)).to_have_count(0)
+
+
+def test_pdf_picker_exposes_only_the_native_pdf_accept_filter(page, local_app_url):
+    """Exercise Gradio's browser-to-native-picker contract, not just source text.
+
+    ``file_types=[".pdf"]`` must render as ``accept=".pdf"`` on the actual
+    browser file input.  The browser uses that attribute to construct the
+    Windows Open-dialog filter; it is also intentionally a multiple-file
+    picker for the batch workflow.
+    """
+    page.goto(local_app_url)
+    upload = page.locator(".pdf-upload-input input[type='file']")
+    expect(upload).to_have_count(1)
+    expect(upload).to_have_attribute("accept", ".pdf")
+    expect(upload).to_have_attribute("multiple", "")
+
+    visible_upload_action = page.locator(
+        ".pdf-upload-input button[aria-label='Click to upload or drop files']"
+    )
+    expect(visible_upload_action).to_have_count(1)
+    with page.expect_file_chooser() as chooser_info:
+        visible_upload_action.click()
+    assert chooser_info.value.is_multiple
 
 
 def test_selecting_a_pdf_resets_a_prior_local_only_choice_to_the_new_run_defaults(
@@ -236,6 +273,37 @@ def test_multiple_pdf_selection_keeps_both_files_in_the_pending_batch(page, loca
     confirm = page.get_by_role("button", name="Confirm and start processing")
     expect(confirm).to_be_enabled(timeout=15000)
     expect(page.get_by_role("button", name="Remove this file")).to_have_count(2)
+
+
+def test_six_pdf_selection_keeps_every_file_in_the_pending_batch(page, local_app_url, six_pdf_files):
+    """The ordinary picker must not truncate a six-file selection before Confirm."""
+    page.goto(local_app_url)
+    upload = page.locator(".pdf-upload-input input[type='file']")
+    expect(upload).to_have_count(1)
+    upload.set_input_files([str(path) for path in six_pdf_files])
+
+    expect(page.get_by_role("button", name="Confirm and start processing")).to_be_enabled(timeout=20000)
+    expect(page.get_by_role("button", name="Remove this file")).to_have_count(6)
+    for path in six_pdf_files:
+        expect(page.locator(f".pdf-upload-input td.filename[aria-label='{path.name}']")).to_have_count(1)
+
+
+def test_six_pdf_local_batch_prepares_every_selected_source(page, local_app_url, six_pdf_files):
+    """Exercise the real batch loop without contacting AnythingLLM Desktop."""
+    page.goto(local_app_url)
+    page.locator(".pdf-upload-input input[type='file']").set_input_files(
+        [str(path) for path in six_pdf_files]
+    )
+    confirm = page.get_by_role("button", name="Confirm and start processing")
+    expect(confirm).to_be_enabled(timeout=20000)
+    page.get_by_role("radio", name="Create local files only").check()
+    confirm.click()
+
+    # The terminal status is outside the collapsed downloads section and is
+    # therefore the durable user-visible completion signal for every source.
+    expect(page.get_by_text(re.compile(r"Batch: 6/6 PDFs finished"))).to_be_visible(
+        timeout=120000
+    )
 
 
 def test_selected_pdf_reuse_action_has_an_icon_not_an_empty_square(page, local_app_url, one_page_pdf):

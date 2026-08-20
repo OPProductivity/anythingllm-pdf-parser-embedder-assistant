@@ -19,6 +19,8 @@ tmp/
 tmp-wheel/
 tmp-pipx-home/
 tmp-pipx-bin/
+# Generated test-home state can contain local paths and run-history evidence.
+tmp-test-home/
 *.log
 
 # Benchmark code, schemas, and anonymised aggregate results are public.  The

@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+import json
+import subprocess
 import tempfile
+import threading
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 import anythingllm_pdf_assistant_cli as cli
+
+
+pytestmark = pytest.mark.offline_deterministic
 
 
 def test_shortcut_arguments_start_the_packaged_module():
@@ -69,6 +77,27 @@ def test_shortcut_writer_uses_module_directory_not_application_data_as_working_d
     )
 
 
+def test_shortcut_writer_reports_a_bounded_powershell_timeout(tmp_path: Path):
+    shortcut = tmp_path / "Start AnythingLLM PDF Assistant.lnk"
+    icon = tmp_path / "start.ico"
+    icon.touch()
+
+    with (
+        mock.patch.object(cli, "_powershell", return_value="powershell.exe"),
+        mock.patch.object(
+            cli.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(["powershell.exe"], cli.POWERSHELL_COMMAND_TIMEOUT_SECONDS),
+        ),
+    ):
+        try:
+            cli._write_windows_shortcut(shortcut, "-Command test", icon, "test")
+        except RuntimeError as exc:
+            assert "timeout" in str(exc).casefold()
+        else:
+            raise AssertionError("A timed-out PowerShell shortcut write must be reported.")
+
+
 def test_stop_refuses_a_recycled_or_unowned_process():
     with tempfile.TemporaryDirectory() as tmpdir:
         marker = Path(tmpdir) / "localhost-server.json"
@@ -105,3 +134,44 @@ def test_stop_queries_the_exact_owned_pid_with_one_wmi_filter_expression():
 
     probe_command = run.call_args_list[0].args[0][-1]
     assert "-Filter ('ProcessId = ' + $env:ANYTHINGLLM_SERVER_PID)" in probe_command
+
+
+def test_stop_keeps_the_marker_when_ownership_probe_times_out(capsys):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        marker = Path(tmpdir) / "localhost-server.json"
+        marker.write_text('{"pid": 42}', encoding="utf-8")
+        with (
+            mock.patch.object(cli.sys, "platform", "win32"),
+            mock.patch.object(cli, "_server_marker_path", return_value=marker),
+            mock.patch.object(cli, "_powershell", return_value="powershell.exe"),
+            mock.patch.object(
+                cli.subprocess,
+                "run",
+                side_effect=subprocess.TimeoutExpired(["powershell.exe"], cli.POWERSHELL_COMMAND_TIMEOUT_SECONDS),
+            ),
+        ):
+            assert cli._stop() == 1
+
+        assert marker.exists()
+    assert "Could not verify" in capsys.readouterr().err
+
+
+def test_server_marker_stays_valid_under_overlapping_start_writes(tmp_path: Path):
+    marker = tmp_path / "localhost-server.json"
+    start = threading.Event()
+    writers = [
+        threading.Thread(target=lambda port=port: (start.wait(), cli._write_server_marker(port)))
+        for port in range(7900, 7912)
+    ]
+    with mock.patch.object(cli, "_server_marker_path", return_value=marker):
+        for writer in writers:
+            writer.start()
+        start.set()
+        for writer in writers:
+            writer.join(timeout=3)
+
+    assert all(not writer.is_alive() for writer in writers)
+    record = json.loads(marker.read_text(encoding="utf-8"))
+    assert record["port"] in range(7900, 7912)
+    assert record["command"] == "anythingllm-pdf-assistant start"
+    assert not list(tmp_path.glob(".localhost-server.json.*.tmp"))
