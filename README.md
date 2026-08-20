@@ -1,20 +1,22 @@
-# AnythingLLM PDF Parser and Embedder Assistant
+# AnythingLLM Assistant - Upload PDFs to AnythingLLM Desktop Workspaces
 
 Turn PDFs into inspectable, page-aware text records for
 [AnythingLLM Desktop](https://anythingllm.com/desktop)—or keep the prepared
-files locally. The assistant is a Windows-local workflow for people who want
-more control than a direct PDF upload gives them: extraction choices, OCR
-decisions, page provenance, local output, and evidence of what reached an
-AnythingLLM workspace.
+files locally. This AnythingLLM assistant lets users upload massive PDF files and gives them: 
+extraction choices, OCR decisions, page settings, local output, and 
+AnythingLLM workspace settings and embedding settings. Parse and upload 400 page PDF documents
+to AnythingLLM Desktop (Windows 11) in 2 minutes. Parser Assistant can be operated
+with graphical user interface (no terminal commands or coding required). Install in one click.
 
-It is deliberately honest about the boundary: an accepted upload is not proof
-that an embedding provider has finished. For ordinary page-aware uploads, the
-assistant waits for exact current-run record/vector evidence before calling the
-workspace ready. See [how readiness is proved](docs/ANYTHINGLLM-INTEGRATION.md).
+The assistant knows when a file has been uploaded and embedded and waits for exact evidence of
+vector embeddings before calling the workspace ready. You will not even have to upload and embed
+the finished PDF file, it is automatically done for you. (Changeable in the settings).
 
-> **Beta software, built with iterative AI assistance.** Review generated text
-> and test with your own AnythingLLM setup before relying on it for important
-> work. This project is independent of Mintplex Labs and AnythingLLM, and is
+AnythingLLM Desktop for Windows is open-source software that allows you to chat with paid, free, and local LLM models and attach text files. PDF files are not directly supported and need to be converted to TXT first, uploaded and embedded to your workspace. That is where this assistant steps in and fully automizes the process and saves significant amounts of time.
+
+> **Beta software, built with generative AI.**
+> Although this software has been debugged and tested over months and should work as expected, test the results in your own AnythingLLM setup before relying
+> on it for business critical work. This project is independent of Mintplex Labs and AnythingLLM, and is
 > provided under the MIT License without warranty.
 
 ## Start here
@@ -27,12 +29,10 @@ workspace ready. See [how readiness is proved](docs/ANYTHINGLLM-INTEGRATION.md).
 4. Open the new **Start AnythingLLM PDF Assistant** desktop shortcut, choose a
    PDF, review the settings, and select **Confirm and start processing**.
 
-You do not need Git, a repository checkout, or a pre-existing Python setup for
-the recommended installation. The installer explains any missing dependency
-and asks before offering an optional Python installation.
+You do not need a git repo, git on your pc, or install dependencies. The installer automatically explains any missing Python dependency
+and asks for confirmation before installing them during setup. You can also copy the repo and let Codex or Claude Cowork or Antigravity Desktop install inspect and install the assistant for you on your pc.
 
-For a complete installation guide, normal workflow, troubleshooting, and the
-meaning of each result, read [Detailed instructions](docs/DETAILED-INSTRUCTIONS.md).
+For a complete installation guide and explanation see [Detailed instructions](docs/DETAILED-INSTRUCTIONS.md).
 
 ## Why use it?
 
@@ -40,10 +40,10 @@ meaning of each result, read [Detailed instructions](docs/DETAILED-INSTRUCTIONS.
   extraction, selective/full OCR, or Unstructured-assisted extraction for
   difficult layouts.
 - **Preserve useful provenance.** Choose whole-page, page-preserving,
-  page-local, or contiguous Custom Range records before AnythingLLM applies
+  page-local, or custom page ranges before AnythingLLM applies
   its own internal splitter.
 - **Process a deliberate batch.** Choose individual PDFs or recursively scan a
-  folder, inspect the selected files, then confirm before any workspace change.
+  folder, inspect the selected files, then confirm which ones you want to parse and upload.
 - **Retain evidence, not just a success toast.** Local outputs and run reports
   distinguish preparation, storage, vector confirmation, and optional live
   retrieval diagnostics.
@@ -67,7 +67,7 @@ flowchart LR
 
 | Mode | Result |
 | --- | --- |
-| **Create local files only** | Creates a compact transcript/segment export directly in one folder named after the selected PDF, or the first and last PDF in a batch. Nothing is submitted to AnythingLLM. |
+| **Create local files only** | Creates a compact transcript/segment export directly in one folder named after the selected PDF, or the first and last PDF when processing a batch. Nothing is submitted to AnythingLLM. |
 | **Create local files with diagnostic logs** | Creates a local transcript, segments, and ordinary run evidence. The transcript and segment files sit directly in the document output folder. Nothing is submitted to AnythingLLM. |
 | **Create local files and upload to AnythingLLM** | Creates local output, with the transcript and segments directly in the document output folder, then submits prepared records to an explicitly selected existing workspace or a newly created workspace after confirmation. |
 
@@ -82,23 +82,20 @@ flowchart LR
 | **Custom Range** | Creates contiguous page-range records. `20` repeats 20-page groups; `20, 30, 20` repeats that sequence for each PDF. |
 
 Custom Range produces a **page-range parent identity**, such as pages 21–50.
-It preserves provenance for that range, not a promise that a downstream
-AnythingLLM citation will identify one individual page within it.
+It preserves a range while conserving original page numbers of the pfd file.
 
 ## Screenshots
 
-The full historical screenshot collection is now versioned in
-[docs/screenshots](docs/screenshots/README.md), rather than being embedded as
-a long, hard-to-navigate README gallery. Images are visual examples of the
-workflow; labels, layouts, and progress values can differ between versions.
+Checkout the full screenshot collection here: [docs/screenshots](docs/screenshots/README.md).
 
-| Automatic setup | Processing evidence |
+| Light Mode | Dark Mode |
 | --- | --- |
 | ![Automatic setup screen](docs/screenshots/01.png) | ![Dark processing screen](docs/screenshots/04.png) |
 
 ## Important limits
 
 - This is Windows software for a locally running AnythingLLM Desktop instance.
+- The assistant automatically parses and embeds PDF files in workspaces that you select (no EPUB or MOBI support available)
 - Your configured embedding provider—not this README—determines provider cost,
   privacy, availability, and much of the upload duration.
 - AnythingLLM owns the global embedding queue and may re-split submitted text.
@@ -111,10 +108,8 @@ workflow; labels, layouts, and progress values can differ between versions.
 
 ## Privacy and local data
 
-PDF extraction, OCR decisions, segmentation, local artifacts, and this app's
-own run reports remain on the machine. Upload mode submits prepared text to
-AnythingLLM Desktop, whose configured embedding provider may be local or
-cloud-hosted. Review that provider's policy before processing sensitive text.
+PDF extraction, OCR text, file segments, metadata remains local. Whenever you let the assistant upload your texts to AnythingLLM it will expose the PDF files to AI models and text embedding providers that you have selected inside AnythingLLM.
+Embedding providers and AI models configured in AnythingLLM may be local or cloud-hosted (OpenRouter). Review the respective provider's policy before processing sensitive text.
 
 By default, generated output, logs, and local configuration are kept under
 `%LOCALAPPDATA%\AnythingLLM PDF Parser Embedder Assistant`. Set
