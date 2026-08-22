@@ -17,14 +17,13 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+from automatic_worker_protocol import AUTOMATIC_WORKER_TRANSPORT_ARTIFACTS
 from auto_anythingllm_pipeline import prepare_pdf
 from orchestration import execute_preparation, legacy_summary_from_run
 
 
 _EVENT_WRITE_LOCK = threading.Lock()
 _RESULT_WRITE_LOCK = threading.Lock()
-
-
 def _write_json(path: Path, payload: dict) -> None:
     # Windows can reject simultaneous replacements of one result path even
     # with separate temporary files. The terminal record is tiny, so this
@@ -132,7 +131,22 @@ def main(config_path: str) -> int:
     result_path = Path(config["result_path"])
     events_path = Path(config["events_path"])
     cancel_marker = run_root / ".cancel-requested.json"
-    args = SimpleNamespace(**dict(config.get("args") or {}))
+    argument_values = dict(config.get("args") or {})
+    # The parent deliberately keeps credentials out of the durable JSON
+    # contract. Consume the one-child environment value before invoking the
+    # pipeline, then remove it from this process environment as well.
+    api_key_env = str(config.get("anythingllm_api_key_env") or "").strip()
+    if api_key_env:
+        argument_values["anythingllm_api_key"] = os.environ.pop(api_key_env, "")
+    else:
+        # Preserve the runner's established namespace contract without
+        # serialising even an empty credential field into run artifacts.
+        argument_values.setdefault("anythingllm_api_key", "")
+    args = SimpleNamespace(**argument_values)
+    # The Gradio parent is still reading these files while this child prepares
+    # the document.  Ask the compact-output routine to leave them alone; the
+    # parent removes them only after this process has exited.
+    args.retain_generated_children_until_worker_exit = AUTOMATIC_WORKER_TRANSPORT_ARTIFACTS
     args.progress_callback = lambda value, stage, desktop_required=False, **metadata: _emit_event(
         events_path, value, stage, desktop_required=desktop_required, **metadata
     )

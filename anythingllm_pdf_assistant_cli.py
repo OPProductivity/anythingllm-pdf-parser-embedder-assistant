@@ -11,6 +11,10 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
+import urllib.error
+import urllib.request
+import webbrowser
 from pathlib import Path
 
 from portable_paths import application_paths, ensure_application_directories, package_resource_path
@@ -21,6 +25,8 @@ START_SHORTCUT_NAME = "Start AnythingLLM PDF Assistant.lnk"
 STOP_SHORTCUT_NAME = "Stop AnythingLLM PDF Assistant.lnk"
 POWERSHELL_COMMAND_TIMEOUT_SECONDS = 15
 BRIDGE_COMMAND_TIMEOUT_SECONDS = 120
+BROWSER_READY_TIMEOUT_SECONDS = 45
+BROWSER_READY_POLL_SECONDS = 0.15
 _SERVER_MARKER_WRITE_LOCK = threading.Lock()
 
 
@@ -30,19 +36,106 @@ def _port_is_available(port: int) -> bool:
         return probe.connect_ex(("127.0.0.1", port)) != 0
 
 
+def _local_app_url(port: int) -> str:
+    return f"http://127.0.0.1:{int(port)}/"
+
+
+def _local_app_is_responding(port: int, *, timeout_seconds: float = 0.75) -> bool:
+    """Return whether the assistant's HTTP endpoint can serve a browser now."""
+    try:
+        with urllib.request.urlopen(_local_app_url(port), timeout=timeout_seconds) as response:
+            return int(getattr(response, "status", response.getcode())) == 200
+    except (OSError, urllib.error.URLError, ValueError):
+        return False
+
+
+def _open_local_app_browser(port: int) -> None:
+    """Open the local URL through the operating system's normal browser route."""
+    url = _local_app_url(port)
+    try:
+        if sys.platform == "win32":
+            os.startfile(url)  # type: ignore[attr-defined]  # Windows ShellExecute
+        else:
+            webbrowser.open_new_tab(url)
+    except OSError:
+        # The server remains usable when the OS has no default browser. The
+        # caller still prints the localhost URL for a manual open.
+        return
+
+
+def _open_browser_when_local_app_is_ready(port: int) -> threading.Thread:
+    """Open one browser tab after the app accepts HTTP, without blocking startup.
+
+    This deliberately lives in the CLI rather than delegating to Gradio's
+    ``inbrowser`` flag. The latter is not reliable from a hidden desktop
+    shortcut and does nothing on a duplicate Start while the current process
+    is still coming up.
+    """
+
+    def wait_and_open() -> None:
+        deadline = time.monotonic() + BROWSER_READY_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            if _local_app_is_responding(port):
+                _open_local_app_browser(port)
+                return
+            time.sleep(BROWSER_READY_POLL_SECONDS)
+
+    watcher = threading.Thread(
+        target=wait_and_open,
+        name=f"anythingllm-pdf-browser-{int(port)}",
+        daemon=True,
+    )
+    watcher.start()
+    return watcher
+
+
 def _print_paths() -> int:
     for name, path in application_paths().items():
         print(f"{name}: {path}")
     return 0
 
 
-def _doctor(port: int) -> int:
+def _recorded_server_is_alive_on_port(port: int) -> bool:
+    """Return whether our current marker still names a live process for ``port``.
+
+    This is a reporting aid only.  Stop independently verifies the process
+    command line before terminating anything, so a stale marker can never
+    broaden the stop target.
+    """
+    try:
+        record = json.loads(_server_marker_path().read_text(encoding="utf-8"))
+        pid = int(record.get("pid") or 0)
+        recorded_port = int(record.get("port") or 0)
+        if pid <= 0 or recorded_port != int(port):
+            return False
+        # Signal 0 is not a portable Windows liveness probe. ``tasklist`` is
+        # available on the supported platform and does not mutate the process.
+        probe = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=POWERSHELL_COMMAND_TIMEOUT_SECONDS,
+            check=False,
+        )
+        if probe.returncode != 0 or str(pid) not in (probe.stdout or ""):
+            return False
+    except (OSError, subprocess.TimeoutExpired, ValueError, TypeError, json.JSONDecodeError):
+        return False
+    return True
+
+
+def _doctor(port: int, *, allow_owned_running_server: bool = True) -> int:
     paths = ensure_application_directories()
     problems: list[str] = []
     for name in ("root", "outputs", "logs", "config"):
         if not os.access(paths[name], os.W_OK):
             problems.append(f"{name} is not writable: {paths[name]}")
     if not _port_is_available(port):
+        if allow_owned_running_server and _recorded_server_is_alive_on_port(port):
+            print("Portable installation is healthy.")
+            print(f"The owned local PDF assistant is already serving on port {port}.")
+            print(f"Data directory: {paths['root']}")
+            return 0
         problems.append(f"port {port} is already in use")
     if problems:
         print("Portable installation needs attention:", file=sys.stderr)
@@ -312,21 +405,44 @@ def _stop() -> int:
 
 
 def _start(port: int, browser: bool) -> int:
-    if _doctor(port) != 0:
-        return 1
-    if sys.platform == "win32":
-        try:
-            install_desktop_shortcuts()
-        except RuntimeError as exc:
-            print(f"Desktop shortcuts were not created: {exc}", file=sys.stderr)
-    os.environ["GRADIO_SERVER_PORT"] = str(port)
-    if not browser:
-        os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
-    from rag_pdf_gradio_app import launch_application
+    # A desktop Start shortcut is an "open the assistant" action, not merely
+    # a process-creation command. If its owned server is already listening or
+    # still completing startup, attach to that one rather than failing in a
+    # hidden process where the person receives no feedback.
+    if _recorded_server_is_alive_on_port(port):
+        if browser:
+            # This short-lived command is itself launched by a desktop
+            # shortcut. Wait for its browser helper here: a daemon watcher
+            # would otherwise be discarded the moment this process returns.
+            watcher = _open_browser_when_local_app_is_ready(port)
+            watcher.join(BROWSER_READY_TIMEOUT_SECONDS + BROWSER_READY_POLL_SECONDS)
+        print(f"The owned local PDF assistant is already starting or serving at {_local_app_url(port)}")
+        return 0
 
+    if _doctor(port, allow_owned_running_server=False) != 0:
+        return 1
+    # Shortcut creation belongs to install/repair, not to every launch. The
+    # old per-start Desktop/PowerShell lookup added avoidable startup work and
+    # could contend with Explorer while the shortcut was itself being opened.
+    # Claim ownership before importing the large Gradio application. A second
+    # Desktop click can otherwise arrive during that import while neither a
+    # listener nor a marker exists, causing two full servers to race for the
+    # same port.
     marker = _write_server_marker(port)
     try:
-        launch_application(port=port, inbrowser=browser)
+        os.environ["GRADIO_SERVER_PORT"] = str(port)
+        # This is a local document assistant.  Opening the browser is only a
+        # UI convenience; it must never decide whether Gradio telemetry is
+        # enabled.
+        os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
+        from rag_pdf_gradio_app import launch_application
+
+        if browser:
+            _open_browser_when_local_app_is_ready(port)
+        # Browser opening is owned by the readiness watcher above. In
+        # particular, do not rely on Gradio to open a tab from a hidden
+        # shortcut process after the relatively heavy app build completes.
+        launch_application(port=port, inbrowser=False)
     finally:
         _remove_own_server_marker(marker)
     return 0

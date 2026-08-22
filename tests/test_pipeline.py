@@ -1556,8 +1556,6 @@ class PipelineCoreTests(unittest.TestCase):
             settings.update({
                 "expected_seconds": 321,
                 "ocr_preflight_manifest": {"status": "ready"},
-                "estimate_range": "04m00s - 06m00s",
-                "estimate_confidence": "medium confidence",
                 "estimate_comparable_runs": 3,
                 "_reserved_run_root": "C:/tmp/app-run-confirmed",
                 "retain_detailed_evidence": True,
@@ -2146,35 +2144,16 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertTrue(stop.stopped)
         self.assertEqual(stop.waits, [0.75, 0.75])
 
-    def test_automatic_timing_html_exposes_range_and_evidence_without_overstating_it(self):
+    def test_automatic_timing_html_shows_one_estimate_without_a_range(self):
         import rag_pdf_gradio_app as app
 
         rendered = app.automatic_run_timing_html(
             expected_seconds=83,
             state="ready",
-            estimate_range="01m05s - 01m55s",
-            confidence_label="medium confidence",
             comparable_runs=4,
         )
         self.assertIn("Est: 01m23s", rendered)
-        self.assertIn("Range 01m05s - 01m55s", rendered)
-        self.assertNotIn("medium confidence", rendered)
-        self.assertNotIn("comparable run", rendered)
-
-    def test_automatic_timing_html_hides_low_confidence_range_and_formats_hours(self):
-        import rag_pdf_gradio_app as app
-
-        rendered = app.automatic_run_timing_html(
-            expected_seconds=4 * 3600,
-            state="ready",
-            estimate_range="03h00m00s - 05h00m00s",
-            confidence_label="low confidence",
-            comparable_runs=0,
-        )
-        self.assertIn("Est: 04h00m00s", rendered)
         self.assertNotIn("Range", rendered)
-        self.assertNotIn("confidence", rendered)
-        self.assertNotIn("comparable", rendered)
 
     def test_fresh_automatic_defaults_only_use_unstructured_after_native_warning_signals(self):
         import rag_pdf_gradio_app as app

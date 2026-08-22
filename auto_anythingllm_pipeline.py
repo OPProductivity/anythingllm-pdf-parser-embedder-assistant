@@ -638,9 +638,14 @@ AUTHOR_ROLE_HINTS = {
     "authors",
     "editor",
     "editors",
+    "writer",
+    "writers",
     "by",
     "written by",
     "edited by",
+    "text by",
+    "article by",
+    "essay by",
 }
 AUTHOR_STOP_TERMS = {
     "chapter",
@@ -675,6 +680,10 @@ AUTHOR_STOP_TERMS = {
     "jstor",
     "terms conditions of use",
     "syllabus",
+    "reviewed work",
+    "creative commons",
+    "noncommercial",
+    "license",
 }
 AUTHOR_BLOCK_STOP_HINTS = {
     "abstract",
@@ -739,11 +748,16 @@ AUTHOR_AFFILIATION_HINTS = {
 AUTHOR_ORGANIZATION_TERMS = {
     "academy",
     "association",
+    "affiliated",
+    "board",
     "center",
     "centre",
+    "church",
     "college",
     "committee",
     "department",
+    "desk",
+    "faculty",
     "foundation",
     "inc",
     "institute",
@@ -752,12 +766,27 @@ AUTHOR_ORGANIZATION_TERMS = {
     "llc",
     "ltd",
     "office",
+    "news",
     "press",
     "publisher",
     "school",
     "society",
     "systems",
     "university",
+}
+
+# These are legitimate visible credits, but they name a publication, desk, or
+# collective rather than a person.  An explicit non-person credit is stronger
+# evidence than a later loose title-block guess, so author inference must
+# abstain instead of scanning a following "Further reading" page for names.
+AUTHOR_NON_PERSON_BYLINE_TERMS = {
+    "editorial board",
+    "newsroom",
+    "the associated press",
+    "associated press",
+    "reuters",
+    "staff report",
+    "staff reports",
 }
 
 
@@ -965,20 +994,49 @@ def pdf_metadata(path: Path, include_page_geometry=False, include_author_samples
 def normalize_author_candidate(value):
     candidate = normalize_text(value or "")
     candidate = re.sub(r"[*†‡§¶∗]+", " ", candidate)
-    candidate = re.sub(r"^(?:by|written by|author(?:\(s\))?|authors?|edited by|instructor|lecturer|professor)\s*[:\-]?\s*", "", candidate, flags=re.I)
+    candidate = re.sub(
+        r"^(?:by|written by|edited by|review(?:ed)? by|text by|article by|essay by|column by|commentary by|analysis by|opinion by|author(?:\(s\))?|authors?|writer(?:s)?|instructor|lecturer|professor)\s*[:\-]?\s*",
+        "",
+        candidate,
+        flags=re.I,
+    )
     candidate = re.sub(r"\b(?:with a foreword by|foreword by)\b.*$", "", candidate, flags=re.I)
     candidate = re.sub(r"\([^)]*(?:@|www\.|http|doi:)[^)]*\)", "", candidate, flags=re.I)
     candidate = re.sub(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", "", candidate, flags=re.I)
     candidate = candidate.strip(" ,;:-")
     if "," in candidate and not re.search(r"\b(?:Jr|Sr|III|IV|V)\b", candidate):
-        parts = [part.strip() for part in candidate.split(",") if part.strip()]
+        parts = [part.strip(" ,;:-") for part in candidate.split(",") if part.strip(" ,;:-")]
         if len(parts) == 2:
             candidate = f"{parts[1]} {parts[0]}".strip()
-    candidate = re.sub(r"\s+", " ", candidate).strip()
+    candidate = re.sub(r"\s+", " ", candidate).strip(" ,;:-—–")
     return candidate
 
 
-def looks_like_person_name(value, title_hint=""):
+def looks_like_non_person_byline(value):
+    """Recognize an explicit collective/outlet credit without inventing a person."""
+    candidate = normalize_author_candidate(value).casefold()
+    if not candidate:
+        return False
+    return any(term in candidate for term in AUTHOR_NON_PERSON_BYLINE_TERMS)
+
+
+def author_phrase_is_title_fragment(candidate, title_hint=""):
+    """Whether a bare candidate is a phrase taken from the document title.
+
+    Letter case and dash glyphs vary heavily across PDF extraction, so compare
+    words rather than raw strings.  This only affects weak bare-name fallback;
+    explicit visible credits remain authoritative.
+    """
+    candidate_words = re.findall(r"[a-z0-9]+", normalize_text(candidate).casefold())
+    title_words = re.findall(r"[a-z0-9]+", normalize_text(title_hint).casefold())
+    if len(candidate_words) < 2 or not title_words:
+        return False
+    candidate_phrase = " ".join(candidate_words)
+    title_phrase = " ".join(title_words)
+    return candidate_phrase in title_phrase
+
+
+def looks_like_person_name(value, title_hint="", *, allow_all_caps=True):
     candidate = normalize_author_candidate(value)
     if not candidate:
         return False
@@ -987,11 +1045,16 @@ def looks_like_person_name(value, title_hint=""):
     lowered = candidate.casefold()
     if any(term in lowered for term in AUTHOR_STOP_TERMS):
         return False
-    normalized_title = normalize_text(title_hint).casefold() if title_hint else ""
-    if normalized_title:
-        if lowered == normalized_title or lowered in normalized_title:
-            return False
+    if author_phrase_is_title_fragment(candidate, title_hint):
+        return False
     if ":" in candidate:
+        return False
+    # Slash-separated strings such as ``Geneva/Addis Ababa`` are publication
+    # datelines, not person names.  Keeping this syntactic rule narrow avoids
+    # guessing a locality from ordinary title text.
+    if "/" in candidate or "|" in candidate or "&" in candidate:
+        return False
+    if looks_like_non_person_byline(candidate):
         return False
     if any(token in lowered for token in {"http", "www.", "@", "doi", "issn", "url"}):
         return False
@@ -1006,6 +1069,12 @@ def looks_like_person_name(value, title_hint=""):
         return False
     if any(word.casefold() in HEADING_STOPWORDS for word in words):
         return False
+    # A strong, explicit byline can legitimately use all caps (for example,
+    # ``BY IAN WARD``). A generic title-block fallback cannot safely make the
+    # same assumption: outlet/topic banners such as ``CATHOLIC NEWS`` were
+    # otherwise appended to a real author in production metadata.
+    if not allow_all_caps and all(word.isupper() for word in words):
+        return False
     capitalized = sum(
         1
         for word in words
@@ -1016,7 +1085,7 @@ def looks_like_person_name(value, title_hint=""):
     return True
 
 
-def split_author_line_candidates(line, title_hint=""):
+def split_author_line_candidates(line, title_hint="", *, allow_all_caps=True):
     raw = re.sub(r"[*†‡§¶∗0-9]+", " ", line or "")
     raw = re.sub(r"\s+", " ", raw).strip(" ,;:-")
     if not raw or "@" in raw:
@@ -1036,12 +1105,12 @@ def split_author_line_candidates(line, title_hint=""):
         return []
     candidates = []
     for piece in pieces:
-        if looks_like_person_name(piece, title_hint=title_hint):
+        if looks_like_person_name(piece, title_hint=title_hint, allow_all_caps=allow_all_caps):
             candidates.append(normalize_author_candidate(piece))
     return candidates if len(candidates) >= 2 else []
 
 
-def extract_adjacent_person_names(line, title_hint=""):
+def extract_adjacent_person_names(line, title_hint="", *, allow_all_caps=True):
     digit_markers = re.findall(r"(?:[*†‡§¶∗]?\s*\d+)", line or "")
     if len(digit_markers) >= 2:
         split_parts = [
@@ -1051,7 +1120,7 @@ def extract_adjacent_person_names(line, title_hint=""):
         ]
         split_candidates = [
             part for part in split_parts
-            if looks_like_person_name(part, title_hint=title_hint)
+            if looks_like_person_name(part, title_hint=title_hint, allow_all_caps=allow_all_caps)
         ]
         if len(split_candidates) >= 2:
             return split_candidates
@@ -1066,7 +1135,10 @@ def extract_adjacent_person_names(line, title_hint=""):
     candidates = []
     for match in matches:
         candidate = normalize_author_candidate(match)
-        if looks_like_person_name(candidate, title_hint=title_hint) and candidate not in candidates:
+        if (
+            looks_like_person_name(candidate, title_hint=title_hint, allow_all_caps=allow_all_caps)
+            and candidate not in candidates
+        ):
             candidates.append(candidate)
     return candidates if len(candidates) >= 2 else []
 
@@ -1076,8 +1148,12 @@ def infer_author_from_text_samples(samples, title_hint=""):
         (r"(?:^|\n)\s*by\s+([A-Z][A-Za-z.,'\- ]{3,70})", "text_byline"),
         (r"(?:^|\n)\s*written by\s+([A-Z][A-Za-z.,'\- ]{3,70})", "text_written_by"),
         (r"(?:^|\n)\s*edited by\s+([A-Z][A-Za-z.,'\- ]{3,70})", "text_edited_by"),
+        (r"(?:^|\n)\s*review(?:ed)?\s+by\s*[:\-]?\s*([A-Z][A-Za-z.,'\- ]{3,70})", "text_review_byline"),
+        (r"(?:^|\n)\s*(?:text|article|essay)\s+by\s+([A-Z][A-Za-z.,'\- ]{3,70})", "text_byline"),
+        (r"(?:^|\n)\s*(?:column|commentary|analysis|opinion)\s+by\s+([A-Z][A-Za-z.,'\- ]{3,70})", "text_column_byline"),
         (r"(?:^|\n)\s*author(?:\(s\))?\s*[:\-]\s*([A-Z][A-Za-z.,'\- &]{3,90})", "text_author_label"),
         (r"(?:^|\n)\s*authors?(?:\(s\))?\s*[:\-]\s*([A-Z][A-Za-z.,'\- &]{3,90})", "text_author_label"),
+        (r"(?:^|\n)\s*writers?\s*[:\-]\s*([A-Z][A-Za-z.,'\- &]{3,90})", "text_writer_label"),
         (r"(?:^|\n)\s*instructor\s*[:\-]\s*([^\n]{3,90})", "text_instructor_label"),
     ]
     for sample in samples:
@@ -1140,6 +1216,16 @@ def infer_author_from_text_samples(samples, title_hint=""):
                     "page": page,
                     "evidence": match.group(0).strip(),
                 }
+            if looks_like_non_person_byline(candidate):
+                # Do not trade an explicit collective credit for a later,
+                # lower-confidence title-block match from a related-links or
+                # publisher page.  The document still gets its title fallback.
+                return {
+                    "author": "",
+                    "source": "text_non_person_byline",
+                    "page": page,
+                    "evidence": match.group(0).strip(),
+                }
             split_candidates = split_author_line_candidates(candidate, title_hint=title_hint)
             if split_candidates:
                 return {
@@ -1176,12 +1262,24 @@ def infer_author_from_text_samples(samples, title_hint=""):
                     "evidence": f"{line} / {top_lines[index + 1]}",
                 }
         detected_names = []
-        allow_generic_top_block = page <= 2 or (page <= 4 and title_matched)
+        # A bare title-case name is weak evidence.  Keep that fallback on the
+        # actual title page (or for documents with no usable title at all),
+        # never on later prose pages where organisations and locations often
+        # happen to look like names.  Explicit ``By …``/role credits above
+        # continue to work on any of the inspected opening pages.
+        allow_generic_top_block = bool(title_matched) or (not normalized_title and page <= 2)
+        reviewed_work_context = False
         for index, line in enumerate(top_lines):
             if index < title_start_index:
                 continue
             lowered = line.casefold().strip()
             if not lowered:
+                continue
+            if lowered.startswith("reviewed work"):
+                # Book-review headers commonly put the reviewed title in the
+                # exact visual slot used by an author line.  A later explicit
+                # credit can still win, but bare-title fallback must abstain.
+                reviewed_work_context = True
                 continue
             if lowered in AUTHOR_BLOCK_STOP_HINTS or re.match(r"^\d+\s+introduction\b", lowered):
                 break
@@ -1189,22 +1287,33 @@ def infer_author_from_text_samples(samples, title_hint=""):
                 continue
             if "@" in line or any(term in lowered for term in AUTHOR_AFFILIATION_HINTS):
                 continue
-            split_candidates = split_author_line_candidates(line, title_hint=title_hint)
+            if not allow_generic_top_block or reviewed_work_context:
+                continue
+            split_candidates = split_author_line_candidates(
+                line,
+                title_hint=title_hint,
+                allow_all_caps=False,
+            )
             if split_candidates:
                 for candidate in split_candidates:
                     if candidate not in detected_names:
                         detected_names.append(candidate)
                 continue
-            adjacent_candidates = extract_adjacent_person_names(line, title_hint=title_hint)
+            adjacent_candidates = extract_adjacent_person_names(
+                line,
+                title_hint=title_hint,
+                allow_all_caps=False,
+            )
             if adjacent_candidates:
                 for candidate in adjacent_candidates:
                     if candidate not in detected_names:
                         detected_names.append(candidate)
                 continue
-            if not allow_generic_top_block:
-                continue
             candidate = normalize_author_candidate(line)
-            if looks_like_person_name(candidate, title_hint=title_hint) and candidate not in detected_names:
+            if (
+                looks_like_person_name(candidate, title_hint=title_hint, allow_all_caps=False)
+                and candidate not in detected_names
+            ):
                 detected_names.append(candidate)
         if detected_names:
             return {
@@ -1219,6 +1328,21 @@ def infer_author_from_text_samples(samples, title_hint=""):
 def infer_author_from_filename(path: Path, title_hint=""):
     stem = normalize_text(path.stem)
     stem = re.sub(r"\[[^\]]+\]$", "", stem).strip()
+    # Browser downloads often preserve an explicit byline as a slug, e.g.
+    # ``article-title-by-First-Last.pdf``.  This is weaker than text on the
+    # page, but much stronger than treating title words as a person.
+    slug_byline = re.search(
+        r"(?:^|[-_\s])(?:written[-_\s]+)?by[-_\s]+([A-Za-z][A-Za-z'.-]*(?:[-_\s]+[A-Za-z][A-Za-z'.-]*){1,4})$",
+        stem,
+        flags=re.I,
+    )
+    if slug_byline:
+        candidate = re.sub(r"[-_]+", " ", slug_byline.group(1))
+        candidate = normalize_author_candidate(candidate)
+        # The filename itself necessarily contains this candidate, so title
+        # fragment protection would reject every explicit ``-by-Name`` slug.
+        if looks_like_person_name(candidate):
+            return {"author": candidate, "source": "filename_explicit_byline", "page": 0, "evidence": path.name}
     parts = [part.strip(" -_,") for part in re.split(r"\s+[-–—]{1,2}\s+|\s{2,}", stem) if part.strip(" -_,")]
     tail_candidates = list(reversed(parts[1:])) if len(parts) >= 2 else []
     for candidate in tail_candidates:
@@ -1232,7 +1356,91 @@ def infer_author_from_filename(path: Path, title_hint=""):
 def infer_author_from_samples_or_filename(samples, path: Path, title_hint=""):
     """Apply the established sample rules, then the existing filename fallback."""
     report = infer_author_from_text_samples(samples, title_hint=title_hint)
+    if report.get("source") == "text_non_person_byline":
+        return report
     return report if report.get("author") else infer_author_from_filename(path, title_hint=title_hint)
+
+
+def normalize_metadata_author(value):
+    """Keep only person-shaped author metadata, normalizing common exports.
+
+    PDF metadata is an uncontrolled field: it frequently contains a login,
+    a publisher, or semicolon-separated surname-first names.  This is a
+    confidence filter, not a source-specific allowlist; collective credits
+    deliberately fall through to stronger visible evidence or a title fallback.
+    """
+    raw = normalize_text(value or "")
+    if not raw:
+        return ""
+    pieces = [piece for piece in re.split(r"\s*[;|]\s*", raw) if piece.strip()]
+    normalized = []
+    for piece in pieces:
+        candidate = normalize_author_candidate(piece)
+        if looks_like_person_name(candidate) and candidate not in normalized:
+            normalized.append(candidate)
+    return ", ".join(normalized)
+
+
+def resolve_author_from_metadata_and_inference(metadata_author, inference, *, author_override=""):
+    """Resolve one document author with the pipeline's established precedence.
+
+    This is deliberately shared by preparation and the lightweight workspace
+    suggestion probe.  A visible affiliation/bibliographic byline can correct
+    stale PDF metadata; other low-confidence text guesses cannot silently
+    replace it.
+    """
+    override = normalize_text(author_override or "")
+    if override:
+        return {"author": override, "source": "user_override"}
+    metadata_value = normalize_metadata_author(metadata_author)
+    report = dict(inference or {})
+    inferred_value = normalize_text(report.get("author") or "")
+    inferred_source = str(report.get("source") or "")
+    if metadata_value:
+        if (
+            inferred_value
+            and inferred_value.casefold() != metadata_value.casefold()
+            and inferred_source in {"text_affiliated_byline", "text_bibliographic_byline"}
+        ):
+            return {
+                "author": inferred_value,
+                "source": f"{inferred_source}_overrode_pdf_metadata",
+            }
+        return {"author": metadata_value, "source": "pdf_metadata"}
+    if inferred_value:
+        return {"author": inferred_value, "source": inferred_source or "text_inference"}
+    return {"author": "", "source": "not_available"}
+
+
+def infer_author_from_initial_pdf_pages(path: Path, title_hint="", *, page_limit=3):
+    """Resolve author evidence from PDF metadata plus a small opening-page sample.
+
+    Workspace naming must stay responsive, so it shares the full pipeline's
+    normalization, confidence rules, and precedence while inspecting only the
+    requested opening text pages. It never invokes OCR and keeps extracted
+    source text transient.
+    """
+    pdf_path = Path(path)
+    try:
+        with fitz.open(pdf_path) as doc:
+            metadata = dict(doc.metadata or {})
+            resolved_title = normalize_text(title_hint or metadata.get("title") or pdf_path.stem)
+            limit = max(1, int(page_limit or 3))
+            samples = []
+            for page_index in range(min(limit, len(doc))):
+                text = doc.load_page(page_index).get_text("text")
+                if text:
+                    samples.append({"page": page_index + 1, "text": text})
+    except Exception as exc:
+        return {"author": "", "source": "error", "page": 0, "evidence": "", "error": type(exc).__name__}
+    inference = infer_author_from_samples_or_filename(samples, pdf_path, title_hint=resolved_title)
+    resolved = resolve_author_from_metadata_and_inference(metadata.get("author") or "", inference)
+    return {
+        "author": resolved["author"],
+        "source": resolved["source"],
+        "page": int(inference.get("page") or 0),
+        "evidence": str(inference.get("evidence") or ""),
+    }
 
 
 def infer_author_from_pdf_text(path: Path, title_hint=""):
@@ -1720,6 +1928,31 @@ def materialize_retained_segments(prepared_text_path: Path, segments_dir: Path, 
     return retained
 
 
+def _best_effort_remove_success_artifact(candidate: Path, deleted: list[str], cleanup_warnings: list[str], out_root: Path) -> None:
+    """Prune one non-retained artifact without changing a proven run outcome.
+
+    Lean retention runs after the transcript and an initial durable summary
+    have been written.  A Windows sharing violation at this point is a cleanup
+    delay, not a preparation or upload failure.  Leave the extra artifact for
+    review/retry and record the exact path in the compact receipt.
+    """
+    try:
+        if candidate.is_dir():
+            shutil.rmtree(candidate)
+        else:
+            candidate.unlink(missing_ok=True)
+        try:
+            deleted.append(str(candidate.relative_to(out_root)))
+        except ValueError:
+            deleted.append(str(candidate))
+    except OSError as exc:
+        try:
+            relative = str(candidate.relative_to(out_root))
+        except ValueError:
+            relative = str(candidate)
+        cleanup_warnings.append(f"{relative}: {type(exc).__name__}: {exc}")
+
+
 def retain_successful_run_leanly(
     out_root: Path,
     summary,
@@ -1729,6 +1962,7 @@ def retain_successful_run_leanly(
     segments=(),
     allow_exact_vector_runtime_deferred=False,
     shared_batch_receipt=None,
+    preserve_generated_children=(),
 ):
     """Replace a successful run's forensic tree with usable text + compact facts.
 
@@ -1814,37 +2048,78 @@ def retain_successful_run_leanly(
     # durable summary still points the UI and recovery tooling to the retained
     # text rather than the selected/ artifact that cleanup may have removed.
     # Extra artifacts are harmless; a missing transcript or plan is not.
-    write_json(
-        out_root / "run-summary.json",
-        {
-            **summary,
-            "lean_retention": {
-                "applied": False,
-                "cleanup_in_progress": True,
-                "prepared_text": str(retained_text_path),
-                "reason": "durable_summary_written_before_cleanup",
+    try:
+        write_json(
+            out_root / "run-summary.json",
+            {
+                **summary,
+                "lean_retention": {
+                    "applied": False,
+                    "cleanup_in_progress": True,
+                    "prepared_text": str(retained_text_path),
+                    "reason": "durable_summary_written_before_cleanup",
+                },
             },
-        },
-    )
+        )
+    except OSError as exc:
+        # Retention is optional presentation cleanup.  Never make an already
+        # prepared/uploaded document fail merely because a compact receipt is
+        # temporarily locked; the detailed successful output remains intact.
+        return {
+            "applied": False,
+            "reason": "compact_summary_write_deferred",
+            "cleanup_pending": True,
+            "error": f"{type(exc).__name__}: {exc}",
+            "prepared_text": str(retained_text_path),
+        }
+    cleanup_warnings = []
     if selected_dir.exists() and selected_dir != out_root:
-        for child in selected_dir.iterdir():
-            if child.is_dir():
-                shutil.rmtree(child, ignore_errors=True)
-            else:
-                child.unlink(missing_ok=True)
-            deleted.append(str(child.relative_to(out_root)))
-        selected_dir.rmdir()
-        deleted.append(str(selected_dir.relative_to(out_root)))
+        for child in list(selected_dir.iterdir()):
+            _best_effort_remove_success_artifact(child, deleted, cleanup_warnings, out_root)
+        if selected_dir.exists():
+            _best_effort_remove_success_artifact(selected_dir, deleted, cleanup_warnings, out_root)
     for name in LEAN_SUCCESS_ARTIFACT_DIRECTORIES:
         candidate = out_root / name
         if candidate.exists():
-            shutil.rmtree(candidate, ignore_errors=True)
-            deleted.append(name)
+            _best_effort_remove_success_artifact(candidate, deleted, cleanup_warnings, out_root)
     for name in LEAN_SUCCESS_ARTIFACT_FILES:
         candidate = out_root / name
         if candidate.exists():
-            candidate.unlink(missing_ok=True)
-            deleted.append(name)
+            _best_effort_remove_success_artifact(candidate, deleted, cleanup_warnings, out_root)
+
+    # A successful automatic batch used to prune only a historical list of
+    # diagnostics.  Newer worker artifacts (checkpoint streams, manifests,
+    # inline upload payloads, and similar implementation evidence) therefore
+    # remained whenever a new artifact was introduced but not added to that
+    # list.  At this point the transcript has been moved, every retained
+    # segment has been materialised, and the compact summary is durable.  The
+    # generated document directory is ours alone, so make that positive
+    # retention contract authoritative: preserve the usable output files and
+    # compact summary; remove every other generated child.  This boundary is
+    # reached only after a ready result (and, for deferred batches, exact
+    # shared-batch vector proof), so no recovery plan is discarded while it
+    # could still be needed.
+    # A standalone pipeline owns its entire output directory. An Automatic
+    # worker does not: its parent tails a small transport set until the child
+    # exits. Keep only explicitly declared direct children here; the parent
+    # owns their final removal after the worker has stopped. Otherwise a
+    # Windows sharing violation can turn a ready PDF into a failed run merely
+    # because cleanup raced the live observer.
+    protected_generated_names = {
+        Path(str(name)).name
+        for name in (preserve_generated_children or ())
+        if str(name).strip() and Path(str(name)).name == str(name)
+    }
+    retained_output_names = {
+        retained_text_path.name,
+        "run-summary.json",
+        *(segment_path.name for segment_path in retained_segments),
+        *protected_generated_names,
+    }
+    for child in list(out_root.iterdir()):
+        if child.name in retained_output_names:
+            continue
+        _best_effort_remove_success_artifact(child, deleted, cleanup_warnings, out_root)
 
     compact = {
         "schema_version": 1,
@@ -1919,9 +2194,9 @@ def retain_successful_run_leanly(
             "segment_file_naming": "{document}-p{page:03d}-s{within_page:02d}.txt",
         },
         "recovery": {
-            "state": "completed",
+            "state": "completed" if not cleanup_warnings else "completed_with_cleanup_pending",
             "resume_required": False,
-            "detailed_evidence_retained": False,
+            "detailed_evidence_retained": bool(cleanup_warnings),
             "note": (
                 "Ready runs retain only parsed text and this compact summary. "
                 "Review-needed or failed runs keep detailed evidence."
@@ -1932,14 +2207,26 @@ def retain_successful_run_leanly(
             ),
         },
         "deleted_artifact_groups": sorted(deleted),
+        "cleanup": {
+            "status": "complete" if not cleanup_warnings else "pending",
+            "warnings": cleanup_warnings,
+        },
     }
-    write_json(out_root / "run-summary.json", compact)
+    try:
+        write_json(out_root / "run-summary.json", compact)
+    except OSError as exc:
+        # The preliminary receipt is already durable.  Keep the run green and
+        # leave the existing artifacts rather than reporting a false pipeline
+        # failure for a post-success filesystem lock.
+        cleanup_warnings.append(f"run-summary.json: {type(exc).__name__}: {exc}")
     return {
         "applied": True,
         "prepared_text": str(retained_text_path),
         "segments_directory": "",
         "retained_segment_files": len(retained_segments),
         "deleted": sorted(deleted),
+        "cleanup_pending": bool(cleanup_warnings),
+        "cleanup_warnings": cleanup_warnings,
     }
 
 
@@ -2051,7 +2338,15 @@ def finalize_deferred_batch_lean_retention(out_root: Path, summary):
     return retained
 
 
-def retain_successful_run_without_logs(out_root: Path, summary, profile, prepared_text_path: Path, *, segments=()):
+def retain_successful_run_without_logs(
+    out_root: Path,
+    summary,
+    profile,
+    prepared_text_path: Path,
+    *,
+    segments=(),
+    preserve_generated_children=(),
+):
     """Keep a successful local run as a flat, text-only export.
 
     This is intentionally a distinct retention policy from ``lean_success_v1``:
@@ -2065,6 +2360,7 @@ def retain_successful_run_without_logs(out_root: Path, summary, profile, prepare
         profile,
         prepared_text_path,
         segments=segments,
+        preserve_generated_children=preserve_generated_children,
     )
     if not retained.get("applied"):
         return retained
@@ -8298,7 +8594,7 @@ def anythingllm_embed_progress_message(event):
     if event_type == "doc_starting":
         if bool((event or {}).get("vector_cache_hit")):
             return (
-                f"AnythingLLM Desktop queue: reusing cached embeddings for record {record_position}; "
+                f"AnythingLLM Desktop queue: record {record_position} is reusing its cached embeddings; "
                 "writing its page-parent record to this workspace"
             )
         return f"AnythingLLM Desktop queue: embedding record {record_position}"
@@ -12011,6 +12307,22 @@ def update_workspace_embeddings_desktop_queue(
         for location in unique_locations
         if _anythingllm_vector_cache_hit(storage_dir, location)
     }
+    prequeue_cache_snapshot_epoch = time.time()
+    if callable(status_callback):
+        status_callback(
+            (
+                f"Confirmed AnythingLLM cache plan before queueing: {len(preexisting_cached_locations)}/"
+                f"{requested} record location(s) are cache-backed; "
+                f"{max(0, requested - len(preexisting_cached_locations))} require normal embedding work"
+            ),
+            {
+                "timing_event": "prequeue_cache_snapshot",
+                "queue_records": requested,
+                "prequeue_cached_records": len(preexisting_cached_locations),
+                "prequeue_fresh_records": max(0, requested - len(preexisting_cached_locations)),
+                "prequeue_cache_snapshot_epoch": prequeue_cache_snapshot_epoch,
+            },
+        )
     queue_state_lock = threading.Lock()
     queue_state = {
         "completed": 0,
@@ -12024,6 +12336,7 @@ def update_workspace_embeddings_desktop_queue(
         "observer_failures": 0,
         "observer_reason": "",
         "first_progress_monotonic": 0.0,
+        "first_progress_epoch": 0.0,
         "first_progress_position": 0,
         "last_progress_monotonic": 0.0,
         "last_progress_position": 0,
@@ -12134,6 +12447,7 @@ def update_workspace_embeddings_desktop_queue(
         event_location = _normalized_anythingllm_document_location(event.get("filename"))
         cache_hit = event_location in preexisting_cached_locations
         event["vector_cache_hit"] = cache_hit
+        first_queue_progress = False
         with queue_state_lock:
             if event_type == "doc_complete":
                 queue_state["completed"] = max(queue_state["completed"], position)
@@ -12151,7 +12465,9 @@ def update_workspace_embeddings_desktop_queue(
                 now = time.monotonic()
                 if not queue_state["first_progress_monotonic"]:
                     queue_state["first_progress_monotonic"] = now
+                    queue_state["first_progress_epoch"] = time.time()
                     queue_state["first_progress_position"] = progress_position
+                    first_queue_progress = True
                 queue_state["last_progress_monotonic"] = now
                 queue_state["last_progress_position"] = progress_position
         snapshot = queue_snapshot()
@@ -12166,8 +12482,8 @@ def update_workspace_embeddings_desktop_queue(
         elif event_type in {"doc_starting", "chunk_progress"}:
             if cache_hit:
                 message = (
-                    f"AnythingLLM Desktop queue: reusing cached embeddings for {current}/{total} "
-                    f"{normalized_record_label}; writing page-parent records to this workspace; "
+                    f"AnythingLLM Desktop queue: record {current}/{total} is reusing cached embeddings; "
+                    f"writing its page-parent record to this workspace; "
                     f"{completed}/{total} completed; searchable-vector confirmation follows"
                 )
             else:
@@ -12188,6 +12504,8 @@ def update_workspace_embeddings_desktop_queue(
                 "timing_event": (
                     "desktop_queue_completed"
                     if event_type == "all_complete"
+                    else "first_queue_progress"
+                    if first_queue_progress
                     else "queue_progress"
                 ),
                 "desktop_queue_event_type": event_type,
@@ -12331,6 +12649,13 @@ def update_workspace_embeddings_desktop_queue(
             "verification determine run success."
         ),
         "final_queue_snapshot": queue_snapshot(),
+    }
+    result["cache_realization"] = {
+        "prequeue_cache_snapshot_epoch": prequeue_cache_snapshot_epoch,
+        "queue_records": requested,
+        "prequeue_cached_records": len(preexisting_cached_locations),
+        "prequeue_fresh_records": max(0, requested - len(preexisting_cached_locations)),
+        "first_queue_progress_epoch": float(queue_state.get("first_progress_epoch") or 0.0),
     }
     return result
 
@@ -12670,6 +12995,21 @@ def maybe_upload_segment_files(
             for row in selected_rows
         ],
     )
+    cache_location_lookup_epoch = time.time()
+    cache_location_lookup = {
+        "cache_location_lookup_epoch": cache_location_lookup_epoch,
+        "selected_records": len(selected_rows),
+        "reusable_locations": sum(1 for location in reusable_locations if location),
+        "fresh_locations": sum(1 for location in reusable_locations if not location),
+    }
+    if callable(status_callback):
+        status_callback(
+            (
+                f"Exact reusable-document lookup complete: {cache_location_lookup['reusable_locations']}/"
+                f"{cache_location_lookup['selected_records']} prepared record(s) have matching cached locations"
+            ),
+            {"timing_event": "cache_location_lookup_complete", **cache_location_lookup},
+        )
     correlation_id = f"upload-{uuid.uuid4().hex}"
     try:
         for row, reusable_location, reusable_payload in zip(
@@ -12886,6 +13226,7 @@ def maybe_upload_segment_files(
         "locations": locations,
         "reused_cached_locations": reused_cached_locations,
         "reused_cached_documents": len(reused_cached_locations),
+        "cache_location_lookup": cache_location_lookup,
         "attachment_results": attachment_results,
         "embedding_update": embedding_update,
         "transport": "file_upload",
@@ -15626,29 +15967,13 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         if author_sample_error
         else infer_author_from_samples_or_filename(author_text_samples, pdf_path, title_hint=title)
     )
-    if args.document_author:
-        author = args.document_author
-        author_source = "user_override"
-    elif pdf_meta.get("author"):
-        metadata_author = normalize_text(pdf_meta.get("author") or "")
-        inferred_source = str(inferred_author.get("source") or "")
-        inferred_value = normalize_text(inferred_author.get("author") or "")
-        if (
-            inferred_value
-            and inferred_value.casefold() != metadata_author.casefold()
-            and inferred_source in {"text_affiliated_byline", "text_bibliographic_byline"}
-        ):
-            author = inferred_value
-            author_source = f"{inferred_source}_overrode_pdf_metadata"
-        else:
-            author = metadata_author
-            author_source = "pdf_metadata"
-    elif inferred_author.get("author"):
-        author = inferred_author.get("author") or ""
-        author_source = inferred_author.get("source") or "text_inference"
-    else:
-        author = ""
-        author_source = "not_available"
+    resolved_author = resolve_author_from_metadata_and_inference(
+        pdf_meta.get("author") or "",
+        inferred_author,
+        author_override=args.document_author,
+    )
+    author = resolved_author["author"]
+    author_source = resolved_author["source"]
     source_meta = {
         "source_id": f"pdf_{source_sha[:16]}",
         "source_title": normalize_text(title),
@@ -19164,6 +19489,14 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         "post_upload_verification": str(inspection_dir / "post-upload-verification.csv"),
     }
     write_json(out_root / "run-summary.json", summary)
+    # The Automatic parent tails these direct transport records until its child
+    # has exited, then removes them at its post-exit cleanup boundary. Ordinary
+    # pipeline callers provide no exclusions and retain the existing policy.
+    active_retention_exclusions = tuple(
+        name
+        for name in (getattr(args, "retain_generated_children_until_worker_exit", ()) or ())
+        if isinstance(name, str) and name and Path(name).name == name
+    )
     if defer_lean_retention and requested_lean_retention:
         summary["lean_retention"] = {
             "applied": False,
@@ -19178,6 +19511,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             profile,
             prepared_text_path,
             segments=selected.get("segments") or (),
+            preserve_generated_children=active_retention_exclusions,
         )
     elif bool(getattr(args, "lean_retention", False)):
         summary["lean_retention"] = retain_successful_run_leanly(
@@ -19186,6 +19520,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             profile,
             prepared_text_path,
             segments=selected.get("segments") or (),
+            preserve_generated_children=active_retention_exclusions,
         )
     if not partial_vector_coverage:
         report_upload_phase(

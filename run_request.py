@@ -1,8 +1,9 @@
-"""Immutable operator intent for a future incremental preparation migration.
+"""Immutable operator intent at the Gradio/CLI validation boundary.
 
-This module is intentionally not wired into the active Gradio or CLI paths
-yet.  It gives those callers a tested compatibility boundary without changing
-the legacy engine's behavior, cleanup policy, or transport decisions.
+The established legacy engine still receives its compatibility namespace at
+execution time.  Both entry points validate their user-controlled settings
+through this module first, keeping credentials, callbacks, timing evidence,
+and transport-side runtime facts outside the immutable request.
 """
 
 from __future__ import annotations
