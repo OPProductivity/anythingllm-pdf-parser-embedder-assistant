@@ -733,31 +733,18 @@ APP_CONNECTION_WATCHDOG_HEAD = """
     const followsSystem = () => {
       try { return localStorage.getItem(followKey) !== "false"; } catch (_) { return true; }
     };
+    // Gradio mounts its custom root after this parser-executed bootstrap. Keep
+    // the requested value separately so a late Gradio default class cannot
+    // temporarily disagree with the document-level theme.
+    let appliedDark = false;
     const isDark = () => document.body.classList.contains("dark")
       || document.documentElement.classList.contains("dark")
       || document.querySelector("gradio-app")?.classList.contains("dark");
-    const styleControls = () => {
-      const palette = isDark()
-        ? { border: "#475569", background: "#111c2e", color: "#e5eefc" }
-        : { border: "#bcc9d8", background: "#f4f7fb", color: "#273449" };
-      for (const root of [
-        document.getElementById("follow-windows-theme"),
-        document.getElementById("theme-toggle-button"),
-      ]) {
-        if (!root) continue;
-        for (const node of [root, ...root.querySelectorAll(".wrap, .form, button")]) {
-          node.style.setProperty("border-color", palette.border, "important");
-          node.style.setProperty("background", palette.background, "important");
-          node.style.setProperty("color", palette.color, "important");
-          node.style.setProperty("box-shadow", "none", "important");
-        }
-      }
-    };
     const apply = (dark) => {
+      appliedDark = Boolean(dark);
       document.documentElement.classList.toggle("dark", dark);
-      document.body.classList.toggle("dark", dark);
+      document.body?.classList.toggle("dark", dark);
       document.querySelector("gradio-app")?.classList.toggle("dark", dark);
-      styleControls();
     };
     const syncCheckbox = () => {
       const checkbox = document.querySelector("#follow-windows-theme input[type='checkbox']");
@@ -765,7 +752,6 @@ APP_CONNECTION_WATCHDOG_HEAD = """
         checkbox.checked = followsSystem();
         checkbox.dataset.ragThemeWired = "true";
       }
-      styleControls();
     };
     const applyStoredTheme = () => {
       if (followsSystem()) {
@@ -821,16 +807,93 @@ APP_CONNECTION_WATCHDOG_HEAD = """
     systemTheme.addEventListener("change", () => {
       if (followsSystem()) apply(systemTheme.matches);
     });
-    const observer = new MutationObserver(syncCheckbox);
+    // Gradio hydrates a large tree in short bursts.  The only thing that must
+    // track those bursts is the mounted root and its preference checkbox;
+    // component appearance remains CSS-owned.  Rewriting inline borders on
+    // every mutation was both redundant and visible as a first-load flash.
+    let controlSyncQueued = false;
+    const scheduleControlSync = () => {
+      if (controlSyncQueued) return;
+      controlSyncQueued = true;
+      requestAnimationFrame(() => {
+        controlSyncQueued = false;
+        document.body?.classList.toggle("dark", appliedDark);
+        document.querySelector("gradio-app")?.classList.toggle("dark", appliedDark);
+        syncCheckbox();
+      });
+    };
+    const observer = new MutationObserver(scheduleControlSync);
     observer.observe(document.documentElement, { childList: true, subtree: true });
     applyStoredTheme();
     syncCheckbox();
+
+    // This parser-executed script runs in <head>, before the body exists.
+    // Give that body the already-decided class at its very first DOM mutation,
+    // before deferred Gradio hydration can paint its default root palette.
+    if (!document.body) {
+      const bodyObserver = new MutationObserver(() => {
+        if (!document.body) return;
+        document.body.classList.toggle("dark", appliedDark);
+        bodyObserver.disconnect();
+      });
+      bodyObserver.observe(document.documentElement, { childList: true });
+    }
+
+    // Gradio dismisses its own loader as soon as its first tab is available,
+    // not when that tab's initial components have finished mounting.  Keep a
+    // compact, theme-aware cover over that short interval so the user never
+    // watches the File picker, batch picker, and output-mode block push one
+    // another down the page.  This guard is initial-page-only: it disconnects
+    // permanently before any PDF interaction can occur.
+    const installInitialShellGuard = () => {
+      const mount = () => {
+        if (!document.body || document.getElementById("rag-initial-ui-overlay")) return;
+        const overlay = document.createElement("div");
+        overlay.id = "rag-initial-ui-overlay";
+        overlay.setAttribute("role", "status");
+        overlay.setAttribute("aria-live", "polite");
+        overlay.innerHTML = '<span aria-hidden="true">◇</span><strong>Loading…</strong>';
+        document.body.appendChild(overlay);
+        document.documentElement.dataset.ragInitialUi = "loading";
+        const shellReady = () => Boolean(
+          document.querySelector(".pdf-upload-input")
+          && document.querySelector(".batch-folder-panel")
+          && document.querySelector("#output-mode-radio")
+        );
+        let revealQueued = false;
+        let finished = false;
+        const finish = (force = false) => {
+          if (finished || (!force && !shellReady())) return;
+          finished = true;
+          observer.disconnect();
+          document.documentElement.dataset.ragInitialUi = "ready";
+          overlay.classList.add("rag-initial-ui-overlay--ready");
+          window.setTimeout(() => overlay.remove(), 120);
+        };
+        const scheduleFinish = () => {
+          if (revealQueued || finished) return;
+          revealQueued = true;
+          requestAnimationFrame(() => {
+            revealQueued = false;
+            // A second frame allows Gradio's final layout work to settle
+            // before the cover fades, avoiding a one-frame content jump.
+            requestAnimationFrame(() => finish());
+          });
+        };
+        const observer = new MutationObserver(scheduleFinish);
+        observer.observe(document.body, { childList: true, subtree: true });
+        scheduleFinish();
+        window.setTimeout(() => finish(true), 8000);
+      };
+      if (document.body) mount();
+      else document.addEventListener("DOMContentLoaded", mount, { once: true });
+    };
+    installInitialShellGuard();
   };
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", install, { once: true });
-  } else {
-    install();
-  }
+  // Theme choice is a first-paint concern.  Unlike the connection watchdog,
+  // it is safe to initialise while the head is parsed: all element lookups
+  // below are optional and the body receives the same decision when created.
+  install();
 })();
 </script>
 """
@@ -838,9 +901,37 @@ APP_CONNECTION_WATCHDOG_HEAD = APP_CONNECTION_WATCHDOG_HEAD.replace(
     "__LOCAL_APP_INSTANCE_ID__",
     LOCAL_APP_INSTANCE_ID,
 )
-APP_BROWSER_THEME_HEAD = APP_CONNECTION_WATCHDOG_HEAD[
-    APP_CONNECTION_WATCHDOG_HEAD.index('<script id="rag-local-theme-controls">'):
-]
+# This has to be a normal parser-time style, not part of Gradio's ``css=``
+# configuration.  It establishes a coherent browser canvas while the client
+# builds the first component tree; the full APP_CSS palette takes over once
+# Gradio mounts.  The adjacent parser-time script immediately applies the
+# saved/system choice to ``html`` before any body content is parsed.
+APP_THEME_FOUNDATION_HEAD = """
+<style id="rag-local-theme-foundation">
+  html { background: #eef2f7; color-scheme: light; }
+  html.dark { background: #0f172a; color-scheme: dark; }
+  html, body { min-height: 100%; }
+  html.dark body { background: #0f172a; color: #e5eefc; }
+  html:not(.dark) body { background: #eef2f7; color: #1e293b; }
+  #rag-initial-ui-overlay {
+    position: fixed; inset: 0; z-index: 2147483000;
+    display: grid; place-content: center; gap: 18px;
+    background: #eef2f7; color: #1e293b;
+    font: 600 16px/1.2 "Aptos", "Segoe UI", system-ui, sans-serif;
+    opacity: 1; transition: opacity 120ms ease;
+  }
+  #rag-initial-ui-overlay span { color: #2563eb; font-size: 28px; line-height: 1; text-align: center; }
+  #rag-initial-ui-overlay strong { font-weight: 600; }
+  html.dark #rag-initial-ui-overlay { background: #0f172a; color: #e5eefc; }
+  #rag-initial-ui-overlay.rag-initial-ui-overlay--ready { opacity: 0; pointer-events: none; }
+</style>
+"""
+APP_BROWSER_THEME_HEAD = (
+    APP_THEME_FOUNDATION_HEAD
+    + APP_CONNECTION_WATCHDOG_HEAD[
+        APP_CONNECTION_WATCHDOG_HEAD.index('<script id="rag-local-theme-controls">'):
+    ]
+)
 
 
 class LocalServerConnectionWatchdogMiddleware(BaseHTTPMiddleware):
@@ -936,151 +1027,84 @@ APP_JS = """
   // initial HTML by LocalServerConnectionWatchdogMiddleware. Gradio renders
   // this configuration JavaScript as DOM content, so keeping a duplicate copy
   // here would make the two paths drift and would not fix a stopped server.
-  const isDarkTheme = () => {
-    return document.body.classList.contains("dark")
-      || document.documentElement.classList.contains("dark")
-      || document.querySelector("gradio-app")?.classList.contains("dark");
+  // Theme ownership is deliberately confined to the parser-executed head
+  // bootstrap above.  Keeping a second controller here caused both scripts
+  // to repaint borders while Gradio hydrated the same controls.
+  let activeThemeDark = null;
+  let refreshFallbackThemeControls = () => {};
+  const syncMountedThemeRoot = () => {
+    if (typeof activeThemeDark !== "boolean") return;
+    document.querySelector("gradio-app")?.classList.toggle("dark", activeThemeDark);
   };
-
-  const applyThemeAwareControlStyles = () => {
-    const dark = isDarkTheme();
-    const setButtonVisual = (button, palette) => {
-      if (!button) return;
-      button.style.borderColor = palette.border;
-      button.style.background = palette.background;
-      button.style.color = palette.color;
-      button.style.boxShadow = "none";
+  // Some Gradio launch paths serve the root document without the custom head
+  // middleware. In that case this is the one and only theme owner. If the
+  // parser-executed bootstrap is present, it has already applied the theme
+  // and this fallback deliberately stays inert.
+  if (!window.ragLocalThemeControlsInstalled) {
+    const systemThemeQuery = window.matchMedia("(prefers-color-scheme: dark)");
+    const themeFollowSystemKey = "rag-pdf-follow-system-theme";
+    const themeOverrideKey = "rag-pdf-theme";
+    const followsSystemTheme = () => {
+      try { return localStorage.getItem(themeFollowSystemKey) !== "false"; } catch (_) { return true; }
     };
-
-    const subtleButton = dark
-      ? { border: "#64748b", background: "#111827", color: "#e5eefc" }
-      : { border: "#94a3b8", background: "transparent", color: "#334155" };
-    const downloadToggle = dark
-      ? { border: "#60a5fa", background: "#172033", color: "#f8fafc" }
-      : { border: "#93c5fd", background: "#dbeafe", color: "#0f172a" };
-    const themeControl = dark
-      ? { border: "#475569", background: "#111c2e", color: "#e5eefc" }
-      : { border: "#bcc9d8", background: "#f4f7fb", color: "#273449" };
-
-    setButtonVisual(document.getElementById("expand-all-accordions-button"), subtleButton);
-
-    // Gradio scopes CSS selectors with its generated container classes. That
-    // can outrank an otherwise correct dark-mode selector for these two
-    // intentionally custom controls, so set the visual contract directly.
-    for (const root of [
-      document.getElementById("follow-windows-theme"),
-      document.getElementById("theme-toggle-button"),
-    ]) {
-      if (!root) continue;
-      for (const node of [root, ...root.querySelectorAll(".wrap, .form, button")]) {
-        node.style.setProperty("border-color", themeControl.border, "important");
-        node.style.setProperty("background", themeControl.background, "important");
-        node.style.setProperty("color", themeControl.color, "important");
-        node.style.setProperty("box-shadow", "none", "important");
-      }
+    const applyTheme = (dark) => {
+      activeThemeDark = Boolean(dark);
+      document.documentElement.classList.toggle("dark", activeThemeDark);
+      document.body.classList.toggle("dark", activeThemeDark);
+      syncMountedThemeRoot();
+    };
+    const applySystemTheme = () => {
+      if (followsSystemTheme()) applyTheme(systemThemeQuery.matches);
+    };
+    const syncFollowSystemControl = () => {
+      const checkbox = document.querySelector("#follow-windows-theme input[type='checkbox']");
+      if (!checkbox) return;
+      checkbox.checked = followsSystemTheme();
+      if (checkbox.dataset.ragThemeWired) return;
+      checkbox.dataset.ragThemeWired = "true";
+      checkbox.addEventListener("change", (event) => {
+        event.stopImmediatePropagation();
+        try {
+          localStorage.setItem(
+            themeFollowSystemKey,
+            checkbox.checked ? "true" : "false"
+          );
+        } catch (_) {}
+        if (checkbox.checked) applyTheme(systemThemeQuery.matches);
+      }, true);
+    };
+    const wireThemeToggleButton = () => {
+      const button = document.querySelector("#theme-toggle-button button")
+        || document.getElementById("theme-toggle-button");
+      if (!button || button.dataset.ragThemeWired) return;
+      button.dataset.ragThemeWired = "true";
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        const nextDark = !activeThemeDark;
+        const followSystem = nextDark === systemThemeQuery.matches;
+        try {
+          localStorage.setItem(themeFollowSystemKey, followSystem ? "true" : "false");
+          localStorage.setItem(themeOverrideKey, nextDark ? "dark" : "light");
+        } catch (_) {}
+        applyTheme(followSystem ? systemThemeQuery.matches : nextDark);
+        syncFollowSystemControl();
+      }, true);
+    };
+    systemThemeQuery.addEventListener("change", applySystemTheme);
+    if (followsSystemTheme()) {
+      applySystemTheme();
+    } else {
+      let storedOverride = null;
+      try { storedOverride = localStorage.getItem(themeOverrideKey); } catch (_) {}
+      applyTheme(storedOverride === "dark");
     }
-
-    const choosePdfFolderRoot = document.getElementById("choose-pdf-folder-button");
-    if (choosePdfFolderRoot) {
-      choosePdfFolderRoot.style.position = "absolute";
-      choosePdfFolderRoot.style.inset = "0";
-      choosePdfFolderRoot.style.minHeight = "100%";
-      choosePdfFolderRoot.style.height = "auto";
-      choosePdfFolderRoot.style.display = "flex";
-      choosePdfFolderRoot.style.alignItems = "center";
-      choosePdfFolderRoot.style.justifyContent = "center";
-      choosePdfFolderRoot.style.padding = "0 16px";
-      choosePdfFolderRoot.style.zIndex = "1";
-      for (const node of choosePdfFolderRoot.querySelectorAll("button, .wrap, .form")) {
-        node.style.minHeight = "100%";
-        node.style.height = "100%";
-        node.style.display = "flex";
-        node.style.alignItems = "center";
-        node.style.justifyContent = "center";
-      }
-    }
-
-    for (const label of document.querySelectorAll(".download-folder-control label")) {
-      label.style.borderColor = downloadToggle.border;
-      label.style.background = downloadToggle.background;
-      label.style.color = downloadToggle.color;
-      label.style.boxShadow = "none";
-    }
-
-    for (const span of document.querySelectorAll(".download-folder-control span")) {
-      span.style.color = downloadToggle.color;
-    }
-
-    for (const title of document.querySelectorAll(".downloads-header-title")) {
-      title.style.background = "transparent";
-      title.style.color = dark ? "#f8fafc" : "var(--body-text-color)";
-      title.style.padding = "0";
-      title.style.borderRadius = "0";
-      title.style.display = "inline-flex";
-      title.style.alignItems = "center";
-      title.style.justifyContent = "flex-start";
-      title.style.fontWeight = "700";
-    }
-  };
-
-  const systemThemeQuery = window.matchMedia("(prefers-color-scheme: dark)");
-  const themeFollowSystemKey = "rag-pdf-follow-system-theme";
-  const themeOverrideKey = "rag-pdf-theme";
-  const followsSystemTheme = () => {
-    try { return localStorage.getItem(themeFollowSystemKey) !== "false"; } catch (_) { return true; }
-  };
-  const applyTheme = (dark) => {
-    document.documentElement.classList.toggle("dark", dark);
-    document.body.classList.toggle("dark", dark);
-    document.querySelector("gradio-app")?.classList.toggle("dark", dark);
-    requestAnimationFrame(applyThemeAwareControlStyles);
-  };
-  const applySystemTheme = () => {
-    if (followsSystemTheme()) applyTheme(systemThemeQuery.matches);
-  };
-  const syncFollowSystemControl = () => {
-    const checkbox = document.querySelector("#follow-windows-theme input[type='checkbox']");
-    if (!checkbox) return;
-    checkbox.checked = followsSystemTheme();
-    if (checkbox.dataset.ragThemeWired) return;
-    checkbox.dataset.ragThemeWired = "true";
-    checkbox.addEventListener("change", (event) => {
-      // This preference is browser-only. Prevent Gradio from creating an
-      // otherwise empty server event for a local visual setting.
-      event.stopImmediatePropagation();
-      setFollowSystem(checkbox.checked);
-    }, true);
-  };
-  const setFollowSystem = (followSystem) => {
-    try { localStorage.setItem(themeFollowSystemKey, followSystem ? "true" : "false"); } catch (_) {}
-    if (followSystem) applyTheme(systemThemeQuery.matches);
-    syncFollowSystemControl();
-  };
-  const toggleTheme = () => {
-    const nextDark = !isDarkTheme();
-    // Match the head bootstrap behaviour: a manual contrast toggle becomes
-    // automatic again when it lands on the current Windows theme.
-    const followSystem = nextDark === systemThemeQuery.matches;
-    try {
-      localStorage.setItem(themeFollowSystemKey, followSystem ? "true" : "false");
-      localStorage.setItem(themeOverrideKey, nextDark ? "dark" : "light");
-    } catch (_) {}
-    applyTheme(followSystem ? systemThemeQuery.matches : nextDark);
-    syncFollowSystemControl();
-  };
-  const wireThemeToggleButton = () => {
-    const button = document.querySelector("#theme-toggle-button button")
-      || document.getElementById("theme-toggle-button");
-    if (!button || button.dataset.ragThemeWired) return;
-    button.dataset.ragThemeWired = "true";
-    button.addEventListener("click", (event) => {
-      // Keep the colour preference out of Gradio's queue entirely. It has no
-      // server state and must remain available during a temporary health miss.
-      event.preventDefault();
-      event.stopImmediatePropagation();
-      toggleTheme();
-    }, true);
-  };
+    refreshFallbackThemeControls = () => {
+      syncMountedThemeRoot();
+      syncFollowSystemControl();
+      wireThemeToggleButton();
+    };
+  }
   // Old query parameters are one-time legacy overrides. Remove them so a
   // current Windows preference, or the explicit override controls, wins.
   const initialUrl = new URL(window.location.href);
@@ -1088,19 +1112,6 @@ APP_JS = """
     initialUrl.searchParams.delete("__theme");
     window.history.replaceState({}, "", initialUrl.toString());
   }
-  systemThemeQuery.addEventListener("change", applySystemTheme);
-  if (followsSystemTheme()) {
-    applySystemTheme();
-  } else {
-    let storedOverride = null;
-    try { storedOverride = localStorage.getItem(themeOverrideKey); } catch (_) {}
-    applyTheme(storedOverride === "dark");
-  }
-  window.setTimeout(() => {
-    applySystemTheme();
-    syncFollowSystemControl();
-    wireThemeToggleButton();
-  }, 0);
   const simulationRefreshCooldownMs = 1500;
 
   // Gradio 6 keeps selected-file actions in a separate top-right container.
@@ -1124,10 +1135,6 @@ APP_JS = """
       }
     }
   };
-  decorateSelectedPdfActions();
-  const selectedPdfActionObserver = new MutationObserver(decorateSelectedPdfActions);
-  selectedPdfActionObserver.observe(document.body, { childList: true, subtree: true });
-
   // Keep the ETA moving without using Gradio's event `js=` preprocessor.
   // That preprocessor can replace the confirmation State input when it does
   // not return a value, which must never be allowed to affect a real run.
@@ -1256,8 +1263,6 @@ APP_JS = """
       ? "Stop this document run now"
       : "Stop request is available; the run is still entering its active worker.";
   };
-
-  applyThemeAwareControlStyles();
 
   const wireDropdownAutoRefresh = (dropdownId, refreshHostId, stampKey) => {
     const dropdown = document.getElementById(dropdownId);
@@ -1390,43 +1395,41 @@ APP_JS = """
     }
   };
 
-  wireRefreshControls();
-  wireExpandAllButton();
-  wireBatchFolderPanel();
-  wireDiagnosticsFolderPicker();
-  wireAutomaticRunTimer();
-  syncAutomaticRunTimer();
-  wireAutomaticRunCancellation();
-  syncAutomaticRunCancellation();
-  updateAutomaticButtonState();
-  applyThemeAwareControlStyles();
-  const refreshObserver = new MutationObserver(wireRefreshControls);
-  refreshObserver.observe(document.body, { childList: true, subtree: true });
-  const expandObserver = new MutationObserver(wireExpandAllButton);
-  expandObserver.observe(document.body, { childList: true, subtree: true });
-  const batchPanelObserver = new MutationObserver(wireBatchFolderPanel);
-  batchPanelObserver.observe(document.body, { childList: true, subtree: true });
-  const diagnosticsFolderPickerObserver = new MutationObserver(wireDiagnosticsFolderPicker);
-  diagnosticsFolderPickerObserver.observe(document.body, { childList: true, subtree: true });
-  const automaticRunTimerObserver = new MutationObserver(() => {
+  const refreshUiBindings = () => {
+    decorateSelectedPdfActions();
+    wireRefreshControls();
+    wireExpandAllButton();
+    wireBatchFolderPanel();
+    wireDiagnosticsFolderPicker();
     wireAutomaticRunTimer();
     syncAutomaticRunTimer();
     wireAutomaticRunCancellation();
     syncAutomaticRunCancellation();
-  });
-  automaticRunTimerObserver.observe(document.body, { childList: true, subtree: true });
-  const automaticButtonObserver = new MutationObserver(updateAutomaticButtonState);
-  automaticButtonObserver.observe(document.body, { childList: true, subtree: true });
-  const themeAwareObserver = new MutationObserver(() => {
-    applyThemeAwareControlStyles();
-    syncFollowSystemControl();
-    wireThemeToggleButton();
-  });
-  themeAwareObserver.observe(document.body, {
-    attributes: true,
+    updateAutomaticButtonState();
+    refreshFallbackThemeControls();
+  };
+  // Gradio emits many individual mutations while it hydrates a page or swaps
+  // a streamed component.  One animation-frame-coalesced child-list observer
+  // preserves every rebind guarantee above without repeatedly repainting
+  // controls in the same frame (the previous eight observers caused visible
+  // thick-border flashes and a slower initial render).  Class changes alone
+  // only express Gradio presentation state; they never introduce a new
+  // element that needs one of these bindings, so observing them made initial
+  // hydration do needless full-document selector passes.
+  let uiBindingRefreshQueued = false;
+  const scheduleUiBindingRefresh = () => {
+    if (uiBindingRefreshQueued) return;
+    uiBindingRefreshQueued = true;
+    requestAnimationFrame(() => {
+      uiBindingRefreshQueued = false;
+      refreshUiBindings();
+    });
+  };
+  refreshUiBindings();
+  const uiBindingObserver = new MutationObserver(scheduleUiBindingRefresh);
+  uiBindingObserver.observe(document.body, {
     childList: true,
     subtree: true,
-    attributeFilter: ["class"],
   });
 }
 """
@@ -1450,6 +1453,25 @@ EXPAND_ALL_CLICK_JS = """
 }
 """
 APP_CSS = """
+:root {
+    /* Custom controls may need bespoke geometry, but their colours remain
+       part of the document theme.  This avoids a separate light palette
+       leaking through a dark Gradio page during or after hydration. */
+    --rag-control-surface: #f4f7fb;
+    --rag-control-border: #bcc9d8;
+    --rag-control-text: #273449;
+    --rag-control-inset: inset 0 0 0 1px rgba(255, 255, 255, 0.45);
+    --rag-batch-label-surface: #dbeafe;
+    --rag-batch-label-text: #2563eb;
+}
+html.dark {
+    --rag-control-surface: #111c2e;
+    --rag-control-border: #475569;
+    --rag-control-text: #e5eefc;
+    --rag-control-inset: inset 0 0 0 1px rgba(148, 163, 184, 0.14);
+    --rag-batch-label-surface: #2563eb;
+    --rag-batch-label-text: #ffffff;
+}
 html,
 body,
 gradio-app,
@@ -1945,16 +1967,12 @@ gradio-app,
     border-color: #dc2626 !important;
     color: #ffffff !important;
 }
-.dark .anythingllm-startup-status-module,
-body.dark .anythingllm-startup-status-module,
-gradio-app.dark .anythingllm-startup-status-module {
+body.dark .anythingllm-startup-status-module {
     border-color: #1d4ed8;
     background: #172554;
     color: #dbeafe;
 }
-.dark .anythingllm-startup-status-module:has(.anythingllm-startup-status--offline),
-body.dark .anythingllm-startup-status-module:has(.anythingllm-startup-status--offline),
-gradio-app.dark .anythingllm-startup-status-module:has(.anythingllm-startup-status--offline) {
+body.dark .anythingllm-startup-status-module:has(.anythingllm-startup-status--offline) {
     border-color: #b91c1c;
     background: #450a0a;
     color: #fee2e2;
@@ -2561,10 +2579,14 @@ body.dark #automatic-process-button[disabled] {
     padding: 0 !important;
     /* Match the native File picker surface instead of introducing a second
        card colour directly below it. */
-    background: #f4f7fb !important;
-    border: 1px solid #bcc9d8 !important;
+    background: var(--rag-control-surface) !important;
+    /* The single-file picker is a continuous drop surface, not an outlined
+       card. Keep the batch equivalent on that same visual contract: its
+       title and contents sit on the shared surface without a second frame. */
+    border: 0 !important;
     border-radius: 8px !important;
-    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.45) !important;
+    box-shadow: none !important;
+    color: var(--rag-control-text) !important;
     position: relative !important;
     min-height: 96px !important;
     overflow: hidden !important;
@@ -2610,7 +2632,7 @@ body.dark #automatic-process-button[disabled] {
     background: transparent !important;
     border: 0 !important;
 }
-.batch-folder-panel .batch-folder-title {
+.gradio-container .batch-folder-panel .batch-folder-title {
     display: inline-flex;
     align-items: center;
     gap: 5px;
@@ -2620,8 +2642,8 @@ body.dark #automatic-process-button[disabled] {
     padding: 4px 6px !important;
     border-radius: 6px;
     /* Same compact label treatment as the native "PDF files" picker label. */
-    background: #dbeafe !important;
-    color: #3b82f6 !important;
+    background: var(--rag-batch-label-surface) !important;
+    color: var(--rag-batch-label-text) !important;
     border: 0 !important;
     box-shadow: none !important;
     font-size: 14px !important;
@@ -2752,26 +2774,7 @@ body.dark #automatic-process-button[disabled] {
     position: relative !important;
     z-index: 5 !important;
 }
-.dark .batch-folder-panel,
-body.dark .batch-folder-panel,
-gradio-app.dark .batch-folder-panel {
-    background: #111c2e !important;
-    /* Match the native File picker: its dark surface has only a restrained
-       inset edge. The page-wide broken lines are owned by the tab wrapper,
-       not this local picker surface. */
-    border: 0 !important;
-    box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.14) !important;
-}
-.dark .batch-folder-panel .batch-folder-title,
-body.dark .batch-folder-panel .batch-folder-title,
-gradio-app.dark .batch-folder-panel .batch-folder-title {
-    background: #2563eb !important;
-    color: #fff !important;
-    box-shadow: none !important;
-}
-.dark .batch-folder-panel .batch-folder-title-icon,
-body.dark .batch-folder-panel .batch-folder-title-icon,
-gradio-app.dark .batch-folder-panel .batch-folder-title-icon {
+html.dark .gradio-container .batch-folder-panel .batch-folder-title-icon {
     color: currentColor !important;
 }
 .extraction-options-row {
@@ -2907,9 +2910,7 @@ gradio-app.dark .batch-folder-panel .batch-folder-title-icon {
     text-overflow: ellipsis !important;
     white-space: nowrap !important;
 }
-body.dark .batch-folder-file-selector .token,
-.dark .batch-folder-file-selector .token,
-gradio-app.dark .batch-folder-file-selector .token {
+body.dark .batch-folder-file-selector .token {
     background: #17263b !important;
     border-color: #29415f !important;
     color: #dbeafe !important;
@@ -3086,12 +3087,10 @@ body.dark .batch-folder-inline-notice {
 .pdf-upload-input:not(:has(.file-preview)) button[aria-label="Use selected files again"] {
     display: none !important;
 }
-gradio-app.dark .pdf-upload-input button[aria-label="Use selected files again"]::after,
-.dark .pdf-upload-input button[aria-label="Use selected files again"]::after {
+body.dark .pdf-upload-input button[aria-label="Use selected files again"]::after {
     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23bfdbfe' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 12a9 9 0 1 0 3-6.7'/%3E%3Cpath d='M3 4v5h5'/%3E%3C/svg%3E") !important;
 }
-gradio-app.dark .pdf-upload-input button[aria-label="common.upload"]::after,
-.dark .pdf-upload-input button[aria-label="common.upload"]::after {
+body.dark .pdf-upload-input button[aria-label="common.upload"]::after {
     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23bfdbfe' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 19V5'/%3E%3Cpath d='m6 11 6-6 6 6'/%3E%3C/svg%3E") !important;
 }
 .copy-storage-path-button {
@@ -3139,10 +3138,11 @@ gradio-app.dark .pdf-upload-input button[aria-label="common.upload"]::after,
     height: 41px !important;
     min-height: 41px !important;
     padding: 10px 12px !important;
-    border: 1px solid #bcc9d8 !important;
+    border: 1px solid var(--rag-control-border) !important;
     border-radius: 8px !important;
-    background: #f4f7fb !important;
-    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.45) !important;
+    background: var(--rag-control-surface) !important;
+    color: var(--rag-control-text) !important;
+    box-shadow: var(--rag-control-inset) !important;
 }
 #follow-windows-theme.auto-margin {
     margin-left: 0 !important;
@@ -3186,10 +3186,11 @@ gradio-app.dark .pdf-upload-input button[aria-label="common.upload"]::after,
     height: 41px !important;
     min-height: 41px !important;
     padding: 10px 12px !important;
-    border: 1px solid #bcc9d8 !important;
+    border: 1px solid var(--rag-control-border) !important;
     border-radius: 8px !important;
-    background: #f4f7fb !important;
-    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.45) !important;
+    background: var(--rag-control-surface) !important;
+    color: var(--rag-control-text) !important;
+    box-shadow: var(--rag-control-inset) !important;
 }
 #theme-toggle-button,
 #theme-toggle-button button {
@@ -3201,15 +3202,12 @@ gradio-app.dark .pdf-upload-input button[aria-label="common.upload"]::after,
     width: 100% !important;
     min-width: 0 !important;
 }
-body.dark #follow-windows-theme,
-body.dark #follow-windows-theme .wrap,
-body.dark #follow-windows-theme .form,
-body.dark #theme-toggle-button,
-body.dark #theme-toggle-button button {
-    border-color: #475569 !important;
-    background: #111c2e !important;
-    color: #e5eefc !important;
-    box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.14) !important;
+#follow-windows-theme .wrap,
+#follow-windows-theme .form,
+#theme-toggle-button button {
+    background: transparent !important;
+    color: inherit !important;
+    box-shadow: none !important;
 }
 .advanced-source-row,
 .advanced-numeric-row {
@@ -3318,8 +3316,7 @@ body.dark #theme-toggle-button button {
     border-radius: 10px !important;
     background: #eff6ff !important;
 }
-body.dark #advanced-prepared-text-file,
-gradio-app.dark #advanced-prepared-text-file {
+body.dark #advanced-prepared-text-file {
     border-color: #60a5fa !important;
     background: #172554 !important;
 }
@@ -3354,77 +3351,21 @@ body.dark .advanced-pdf-warning {
 .gradio-container button:not(.primary) {
     border-radius: 7px !important;
 }
-@media (prefers-color-scheme: light) {
-    body, .gradio-container {
-        background: #eef2f7 !important;
-    }
-    .gradio-container .block,
-    .gradio-container .form,
-    .gradio-container .accordion,
-    .gradio-container .tabitem {
-        background: #f4f7fb !important;
-        border: 1px solid #bcc9d8 !important;
-        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.45) !important;
-    }
-    .gradio-container button.secondary,
-    .gradio-container button:not(.primary) {
-        background: #f2f5f9 !important;
-        border-color: #d2dbe6 !important;
-        color: #273449 !important;
-    }
-    .gradio-container button.secondary:hover,
-    .gradio-container button:not(.primary):hover {
-        background: #e9eef5 !important;
-        border-color: #cdd7e4 !important;
-    }
-    .gradio-container .tabitem {
-        background: transparent !important;
-        border: 0 !important;
-        box-shadow: none !important;
-    }
-    .gradio-container input,
-    .gradio-container textarea,
-    .gradio-container select,
-    .gradio-container [role="combobox"] {
-        background: #fbfcfe !important;
-        border-color: #d7dee8 !important;
-    }
-    .gradio-container [role="listbox"],
-    .gradio-container [role="option"] {
-        background: #eff6ff !important;
-        border-color: #bfdbfe !important;
-        color: #172033 !important;
-    }
-    .gradio-container [role="option"]:hover,
-    .gradio-container [role="option"][aria-selected="true"] {
-        background: #dbeafe !important;
-    }
-    .gradio-container input[type="checkbox"],
-    .gradio-container input[type="radio"] {
-        border-color: #93c5fd !important;
-    }
-    .gradio-container label:has(input[type="radio"]),
-    .gradio-container label:has(input[type="checkbox"]),
-    .gradio-container label[data-testid$="-radio-label"],
-    .gradio-container label[data-testid$="-checkbox-label"] {
-        background: #f3f6fa !important;
-        border-color: #d6e0eb !important;
-    }
-    .gradio-container label:has(input[type="radio"]:hover),
-    .gradio-container label:has(input[type="checkbox"]:hover) {
-        background: #edf2f7 !important;
-        border-color: #cad7e6 !important;
-    }
-    .gradio-container label:has(input[type="radio"]:checked),
-    .gradio-container label:has(input[type="checkbox"]:checked),
-    .gradio-container label[data-testid$="-radio-label"].selected {
-        background: #f4f8ff !important;
-        border-color: #60a5fa !important;
-    }
-}
 body:not(.dark),
 body:not(.dark) .gradio-container {
     background: #eef2f7 !important;
+    color: #1e293b !important;
+}
+/* Gradio initially mounts its own root with a dark class before the local
+   preference adapter runs.  The document body is the app's canonical theme
+   signal, so make the light first paint complete and internally consistent
+   instead of allowing that transient root class to leak white text or dark
+   child surfaces into the light palette. */
+body:not(.dark) .gradio-container input,
+body:not(.dark) .gradio-container textarea,
+body:not(.dark) .gradio-container select,
+body:not(.dark) .gradio-container [role="combobox"] {
+    color: #1e293b !important;
 }
 /* The browser's Windows-backed colour-scheme preference controls the dark
    class. Gradio's bundled Soft theme supplies light variables, so explicit
@@ -3570,6 +3511,24 @@ body:not(.dark) .gradio-container label[data-testid$="-radio-label"].selected {
     background: #f4f8ff !important;
     border-color: #60a5fa !important;
 }
+/* Gradio's accordion component ships a root-dark fallback with a more
+   specific selector than its generic Block surface. Pin the shell, header,
+   and opened content to the document-level light palette until an explicit
+   body.dark state is applied, preventing a dark card from flashing among
+   light controls during initial hydration. */
+body:not(.dark) .gradio-container .top-level-accordion,
+body:not(.dark) .gradio-container .native-upload-subaccordion,
+body:not(.dark) .gradio-container .output-downloads-accordion,
+body:not(.dark) .gradio-container .top-level-accordion > button.label-wrap,
+body:not(.dark) .gradio-container .native-upload-subaccordion > button.label-wrap,
+body:not(.dark) .gradio-container .output-downloads-accordion > button.label-wrap,
+body:not(.dark) .gradio-container .top-level-accordion > [data-testid="accordion-content"],
+body:not(.dark) .gradio-container .native-upload-subaccordion > [data-testid="accordion-content"],
+body:not(.dark) .gradio-container .output-downloads-accordion > [data-testid="accordion-content"] {
+    background: #f4f7fb !important;
+    border-color: #bcc9d8 !important;
+    color: #1e293b !important;
+}
 /* A vertical Gradio Form already has an outline.  Giving every direct child
    another full border plus an inset highlight creates a visible ``====`` at
    each shared edge.  Treat these as continuous control groups instead: the
@@ -3599,58 +3558,6 @@ body:not(.dark) .gradio-container label[data-testid$="-radio-label"].selected {
 .gradio-container .tabitem > .column > .form:not(.row):has(> .block + .block) > .block:last-child {
     border-bottom: 0 !important;
 }
-@media (prefers-color-scheme: dark) {
-    body, .gradio-container {
-        background: #0f172a !important;
-    }
-    .gradio-container .block,
-    .gradio-container .form,
-    .gradio-container .accordion,
-    .gradio-container .tabitem {
-        background: #111827 !important;
-        border-color: #273449 !important;
-    }
-    .gradio-container input,
-    .gradio-container textarea,
-    .gradio-container select,
-    .gradio-container [role="combobox"] {
-        background: #0b1220 !important;
-        border-color: #334155 !important;
-    }
-    .gradio-container [role="listbox"],
-    .gradio-container [role="option"] {
-        background: #132037 !important;
-        border-color: #334155 !important;
-    }
-    .gradio-container label:has(input[type="radio"]),
-    .gradio-container label:has(input[type="checkbox"]),
-    .gradio-container label[data-testid$="-radio-label"],
-    .gradio-container label[data-testid$="-checkbox-label"] {
-        background: #121c2f !important;
-        border-color: #26344b !important;
-    }
-    .gradio-container label:has(input[type="radio"]:hover),
-    .gradio-container label:has(input[type="checkbox"]:hover) {
-        background: #17243b !important;
-        border-color: #3b4b65 !important;
-    }
-    .gradio-container label:has(input[type="radio"]:checked),
-    .gradio-container label:has(input[type="checkbox"]:checked),
-    .gradio-container label[data-testid$="-radio-label"].selected {
-        background: #1a2a44 !important;
-        border-color: #60a5fa !important;
-    }
-    .gradio-container input[type="radio"]:checked,
-    .gradio-container input[type="checkbox"]:checked {
-        background: #0f172a !important;
-        border-color: #60a5fa !important;
-    }
-    .gradio-container input[type="radio"]::before,
-    .gradio-container input[type="checkbox"]::before {
-        background: #93c5fd !important;
-    }
-}
-
 /* Final radio treatment: subdued tiles with checkmark boxes instead of blue dot controls. */
 .gradio-container label:has(input[type="radio"]),
 .gradio-container label[data-testid$="-radio-label"] {
@@ -3717,41 +3624,37 @@ body:not(.dark) .gradio-container label[data-testid$="-radio-label"].selected {
     color: transparent !important;
     opacity: 1 !important;
 }
-@media (prefers-color-scheme: light) {
-    .gradio-container label:has(input[type="radio"]),
-    .gradio-container label[data-testid$="-radio-label"] {
+body:not(.dark) .gradio-container label:has(input[type="radio"]),
+body:not(.dark) .gradio-container label[data-testid$="-radio-label"] {
         background: #f8fbff !important;
         border-color: #e3ebf4 !important;
     }
-    .gradio-container label:has(input[type="radio"]):hover,
-    .gradio-container label[data-testid$="-radio-label"]:hover {
+body:not(.dark) .gradio-container label:has(input[type="radio"]):hover,
+body:not(.dark) .gradio-container label[data-testid$="-radio-label"]:hover {
         background: #f0fdf4 !important;
         border-color: #86efac !important;
     }
-    .gradio-container label:has(input[type="radio"]:checked),
-    .gradio-container label[data-testid$="-radio-label"].selected {
+body:not(.dark) .gradio-container label:has(input[type="radio"]:checked),
+body:not(.dark) .gradio-container label[data-testid$="-radio-label"].selected {
         background: #ecfdf5 !important;
         border-color: #22c55e !important;
         color: #14532d !important;
-    }
 }
-@media (prefers-color-scheme: dark) {
-    .gradio-container label:has(input[type="radio"]),
-    .gradio-container label[data-testid$="-radio-label"] {
+body.dark .gradio-container label:has(input[type="radio"]),
+body.dark .gradio-container label[data-testid$="-radio-label"] {
         background: #223044 !important;
         border-color: #334155 !important;
     }
-    .gradio-container label:has(input[type="radio"]):hover,
-    .gradio-container label[data-testid$="-radio-label"]:hover {
+body.dark .gradio-container label:has(input[type="radio"]):hover,
+body.dark .gradio-container label[data-testid$="-radio-label"]:hover {
         background: #183627 !important;
         border-color: #4ade80 !important;
     }
-    .gradio-container label:has(input[type="radio"]:checked),
-    .gradio-container label[data-testid$="-radio-label"].selected {
+body.dark .gradio-container label:has(input[type="radio"]:checked),
+body.dark .gradio-container label[data-testid$="-radio-label"].selected {
         background: #163321 !important;
         border-color: #22c55e !important;
         color: #f8fafc !important;
-    }
 }
 
 /* Match checkbox controls to the compact green check treatment used by the mode selector. */
@@ -3824,41 +3727,37 @@ body:not(.dark) .gradio-container label[data-testid$="-radio-label"].selected {
     color: transparent !important;
     opacity: 1 !important;
 }
-@media (prefers-color-scheme: light) {
-    .gradio-container label:has(input[type="checkbox"]),
-    .gradio-container label[data-testid$="-checkbox-label"] {
+body:not(.dark) .gradio-container label:has(input[type="checkbox"]),
+body:not(.dark) .gradio-container label[data-testid$="-checkbox-label"] {
         background: #f8fbff !important;
         border-color: #e3ebf4 !important;
     }
-    .gradio-container label:has(input[type="checkbox"]):hover,
-    .gradio-container label[data-testid$="-checkbox-label"]:hover {
+body:not(.dark) .gradio-container label:has(input[type="checkbox"]):hover,
+body:not(.dark) .gradio-container label[data-testid$="-checkbox-label"]:hover {
         background: #f0fdf4 !important;
         border-color: #86efac !important;
     }
-    .gradio-container label:has(input[type="checkbox"]:checked),
-    .gradio-container label[data-testid$="-checkbox-label"].selected {
+body:not(.dark) .gradio-container label:has(input[type="checkbox"]:checked),
+body:not(.dark) .gradio-container label[data-testid$="-checkbox-label"].selected {
         background: #ecfdf5 !important;
         border-color: #22c55e !important;
         color: #14532d !important;
-    }
 }
-@media (prefers-color-scheme: dark) {
-    .gradio-container label:has(input[type="checkbox"]),
-    .gradio-container label[data-testid$="-checkbox-label"] {
+body.dark .gradio-container label:has(input[type="checkbox"]),
+body.dark .gradio-container label[data-testid$="-checkbox-label"] {
         background: #223044 !important;
         border-color: #334155 !important;
     }
-    .gradio-container label:has(input[type="checkbox"]):hover,
-    .gradio-container label[data-testid$="-checkbox-label"]:hover {
+body.dark .gradio-container label:has(input[type="checkbox"]):hover,
+body.dark .gradio-container label[data-testid$="-checkbox-label"]:hover {
         background: #183627 !important;
         border-color: #4ade80 !important;
     }
-    .gradio-container label:has(input[type="checkbox"]:checked),
-    .gradio-container label[data-testid$="-checkbox-label"].selected {
+body.dark .gradio-container label:has(input[type="checkbox"]:checked),
+body.dark .gradio-container label[data-testid$="-checkbox-label"].selected {
         background: #163321 !important;
         border-color: #22c55e !important;
         color: #f8fafc !important;
-    }
 }
 /* Gradio 6 renders the control inputs themselves reliably.  Older card-style
    rules above predate that markup and still set a 24px custom indicator late
@@ -4107,9 +4006,7 @@ body:not(.dark) .gradio-container label[data-testid$="-checkbox-label"] {
     color: var(--body-text-color-subdued, #64748b);
     font-size: .92em;
 }
-.dark .automatic-run-activity.warning,
 body.dark .automatic-run-activity.warning { color: #fcd34d; }
-.dark .automatic-run-activity.failed,
 body.dark .automatic-run-activity.failed { color: #fca5a5; }
 #automatic-run-failure,
 #automatic-run-failure > div,
@@ -4125,9 +4022,7 @@ body.dark .automatic-run-activity.failed { color: #fca5a5; }
     font-size: 0.88em;
     line-height: 1.3;
 }
-.dark .automatic-run-failure,
-body.dark .automatic-run-failure,
-gradio-app.dark .automatic-run-failure {
+body.dark .automatic-run-failure {
     color: #fca5a5;
 }
 .automatic-confirmation-title {
@@ -4213,9 +4108,7 @@ body.dark #cancel-automatic-run-button button.rag-cancel-deferred:disabled {
     border-color: #64748b !important;
     color: #e2e8f0 !important;
 }
-.dark .automatic-run-timing,
-body.dark .automatic-run-timing,
-gradio-app.dark .automatic-run-timing {
+body.dark .automatic-run-timing {
     background: transparent !important;
     border: 0 !important;
 }
