@@ -2756,9 +2756,9 @@ body.dark #automatic-process-button[disabled] {
 body.dark .batch-folder-panel,
 gradio-app.dark .batch-folder-panel {
     background: #111c2e !important;
-    /* The native File picker uses only its inset edge in dark mode. Removing
-       this extra outer stroke also removes the vertical connector lines that
-       appeared between the two picker surfaces. */
+    /* Match the native File picker: its dark surface has only a restrained
+       inset edge. The page-wide broken lines are owned by the tab wrapper,
+       not this local picker surface. */
     border: 0 !important;
     box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.14) !important;
 }
@@ -3442,6 +3442,16 @@ body.dark .gradio-container .tabitem {
     border-color: #475569 !important;
     color: #e5eefc !important;
     box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.14) !important;
+}
+/* A tab page is a transparent layout wrapper, not a visible card.  Its
+   inset shadow spans the entire page, then becomes intermittently exposed
+   wherever nested cards or same-row controls do not cover the edge.  That is
+   the source of the broken vertical connector lines in dark mode.  Match the
+   light-mode contract: cards own their outlines; the tab page owns none. */
+body.dark .gradio-container .tabitem {
+    background: transparent !important;
+    border: 0 !important;
+    box-shadow: none !important;
 }
 body.dark .gradio-container button.secondary,
 body.dark .gradio-container button:not(.primary) {
