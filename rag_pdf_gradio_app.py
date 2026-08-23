@@ -18,6 +18,7 @@ are deliberately different actions with different safety rules.
 import csv
 from collections import OrderedDict
 from functools import wraps
+import ctypes
 import json
 import html
 import hashlib
@@ -519,6 +520,17 @@ AUTOMATIC_RUN_JSON_WRITE_LOCK = threading.Lock()
 # it can still reach the active worker immediately.
 AUTOMATIC_RUN_CONCURRENCY_ID = "automatic-run"
 AUTOMATIC_RUN_CONCURRENCY_LIMIT = 1
+# Gradio's concurrency limit is intentionally process-local.  A second app
+# process can be started directly during development, though, and AnythingLLM
+# Desktop is still one shared local queue.  Hold a Windows named mutex only
+# while this assistant is about to mutate that queue.  Windows releases the
+# kernel object if a server crashes, avoiding a stale-file recovery hazard.
+AUTOMATIC_ANYTHINGLLM_MUTATION_MUTEX_NAME = (
+    r"Local\AnythingLLMPdfParserEmbedderAssistant-AutomaticMutation-v1"  # pragma: allowlist secret
+)
+AUTOMATIC_ANYTHINGLLM_MUTATION_MUTEX_LOCK = threading.RLock()
+AUTOMATIC_ANYTHINGLLM_MUTATION_MUTEX_HANDLE = None
+AUTOMATIC_ANYTHINGLLM_MUTATION_OWNER = ""
 
 
 def automatic_confirmation_in_flight(record=None):
@@ -531,6 +543,70 @@ def automatic_lifecycle_busy(record=None):
     """Whether confirmation or the one owned Automatic run controls the UI."""
     status = LIVE_AUTOMATIC_RUN_STATUS if record is None else record
     return automatic_confirmation_in_flight(status) or str((status or {}).get("state") or "") == "running"
+
+
+def acquire_automatic_anythingllm_mutation_lease(owner):
+    """Reserve the one Desktop-mutating lane across assistant processes.
+
+    This is intentionally narrower than a server singleton: two local app
+    windows may inspect files or prepare metadata concurrently, but only one
+    may submit/update AnythingLLM at a time.  The in-process status lock still
+    owns normal UI transitions; this mutex covers the separate-process gap.
+    """
+    global AUTOMATIC_ANYTHINGLLM_MUTATION_MUTEX_HANDLE
+    global AUTOMATIC_ANYTHINGLLM_MUTATION_OWNER
+    requested_owner = str(owner or "automatic mutation")
+    with AUTOMATIC_ANYTHINGLLM_MUTATION_MUTEX_LOCK:
+        if AUTOMATIC_ANYTHINGLLM_MUTATION_MUTEX_HANDLE is not None:
+            return {
+                "acquired": False,
+                "reason": "owned_by_this_process",
+                "owner": AUTOMATIC_ANYTHINGLLM_MUTATION_OWNER,
+            }
+        if os.name != "nt":
+            # The distributed desktop app is Windows-only.  Keep non-Windows
+            # developer imports predictable without pretending to create an
+            # OS-level lock they cannot exercise here.
+            AUTOMATIC_ANYTHINGLLM_MUTATION_MUTEX_HANDLE = object()
+            AUTOMATIC_ANYTHINGLLM_MUTATION_OWNER = requested_owner
+            return {"acquired": True, "owner": requested_owner, "scope": "process-fallback"}
+        try:
+            kernel32 = ctypes.windll.kernel32
+            # Keep a handle open rather than taking mutex ownership. A
+            # streaming Gradio callback can resume on a different worker
+            # thread after yielding; Windows mutex ownership is thread-bound,
+            # whereas handle lifetime is the process-safe lease we need here.
+            handle = kernel32.CreateMutexW(None, False, AUTOMATIC_ANYTHINGLLM_MUTATION_MUTEX_NAME)
+            already_exists = int(kernel32.GetLastError()) == 183  # ERROR_ALREADY_EXISTS
+        except Exception as exc:
+            return {"acquired": False, "reason": "mutex_unavailable", "error": str(exc)}
+        if not handle:
+            return {"acquired": False, "reason": "mutex_unavailable"}
+        if already_exists:
+            kernel32.CloseHandle(handle)
+            return {"acquired": False, "reason": "owned_by_other_process"}
+        AUTOMATIC_ANYTHINGLLM_MUTATION_MUTEX_HANDLE = handle
+        AUTOMATIC_ANYTHINGLLM_MUTATION_OWNER = requested_owner
+        return {"acquired": True, "owner": requested_owner, "scope": "windows-named-mutex"}
+
+
+def release_automatic_anythingllm_mutation_lease():
+    """Release the cross-process mutation lease after terminal handling."""
+    global AUTOMATIC_ANYTHINGLLM_MUTATION_MUTEX_HANDLE
+    global AUTOMATIC_ANYTHINGLLM_MUTATION_OWNER
+    with AUTOMATIC_ANYTHINGLLM_MUTATION_MUTEX_LOCK:
+        handle = AUTOMATIC_ANYTHINGLLM_MUTATION_MUTEX_HANDLE
+        AUTOMATIC_ANYTHINGLLM_MUTATION_MUTEX_HANDLE = None
+        AUTOMATIC_ANYTHINGLLM_MUTATION_OWNER = ""
+        if handle is None:
+            return
+        if os.name == "nt":
+            # The lightweight non-Windows fallback is unreachable here, so
+            # this is the real Windows kernel handle returned by CreateMutex.
+            try:
+                ctypes.windll.kernel32.CloseHandle(handle)
+            except Exception:
+                pass
 
 
 def automatic_next_run_noop(output_count, record=None):
@@ -4028,18 +4104,47 @@ body:not(.dark) .gradio-container label[data-testid$="-checkbox-label"] {
 .automatic-run-activity.failed .automatic-run-progress-fill { background: #dc2626; }
 .automatic-run-activity.ready .automatic-run-progress-fill { background: #64748b; }
 .automatic-run-progress-label {
-    display: flex;
-    flex-wrap: wrap;
+    /* This is intentionally a small grid instead of a wrapping flex row.
+       The running queue report and terminal receipt have different content
+       shapes; mixing their bare text nodes into a flex row lets Chromium make
+       different anonymous flex items at 100%, which visibly reflows the card
+       just as success arrives.  Named, reserved rows let the text change
+       without negotiating new geometry for the controls around it. */
+    display: grid;
+    grid-template-columns: max-content minmax(0, 1fr);
+    align-content: start;
     align-items: baseline;
     column-gap: 5px;
     row-gap: 0;
     min-height: 1.25em;
     padding-top: 3px;
 }
-/* Running status and its terminal receipt occupy the same visual lane. A
-   concise terminal result can still be one wrapped line longer than the live
-   queue message; reserve that line before completion so controls below this
-   card do not jump vertically at 100%. */
+.automatic-run-progress-overall {
+    grid-column: 1;
+    min-width: 0;
+}
+.automatic-run-progress-phase {
+    grid-column: 2;
+    min-width: 0;
+}
+.automatic-run-progress-details,
+.automatic-run-batch-count,
+.automatic-run-progress-timing {
+    grid-column: 1 / -1;
+    min-width: 0;
+}
+.automatic-run-progress-details {
+    /* A live card is a status summary, not the full terminal report.  Two
+       lines preserve the useful explanation while keeping the terminal
+       receipt inside the same stable lane as an active queue update.  The
+       complete, unabridged outcome remains in Run output and downloads. */
+    display: -webkit-box;
+    min-height: 1.25em;
+    overflow: hidden;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+}
+/* Running status and its terminal receipt occupy the same visual lane. */
 .automatic-run-activity.running .automatic-run-progress-label,
 .automatic-run-activity.successful .automatic-run-progress-label,
 .automatic-run-activity.warning .automatic-run-progress-label,
@@ -4049,7 +4154,7 @@ body:not(.dark) .gradio-container label[data-testid$="-checkbox-label"] {
 }
 .automatic-run-progress-label span { font-variant-numeric: tabular-nums; }
 .automatic-run-batch-count {
-    flex-basis: 100%;
+    min-height: 1.25em;
     color: var(--body-text-color-subdued, #94a3b8);
     font-size: 0.92em;
 }
@@ -4072,7 +4177,7 @@ body:not(.dark) .gradio-container label[data-testid$="-checkbox-label"] {
     /* The duration is deliberately a compact second line. It must never
        move horizontally when a variable-length activity description wraps. */
     display: block;
-    flex-basis: 100%;
+    min-height: 1.15em;
     margin-left: 0;
     margin-top: -1px;
     line-height: 1.15;
@@ -5897,7 +6002,28 @@ def numeric_dropdown_update(value, base_choices, interactive=True):
     )
 
 
+def anythingllm_settings_mutation_blocked_response():
+    """Preserve the browser's configuration form while an Automatic run owns Desktop.
+
+    Returning no-op updates is deliberate: a queued background refresh must
+    not replace values an operator has just typed, and no persisted setting is
+    allowed to change the semantics of a confirmed run.
+    """
+    return (
+        gr.update(),
+        gr.update(),
+        gr.update(),
+        gr.update(),
+        gr.update(),
+        gr.update(),
+        gr.update(),
+        "AnythingLLM configuration was left unchanged because an Automatic PDF run is active. Save these settings after the run reaches a terminal result.",
+    )
+
+
 def apply_tested_retrieval_preset_ui(inherit_enabled, current_embedder_max_chunk=0):
+    if automatic_lifecycle_busy():
+        return anythingllm_settings_mutation_blocked_response()
     persisted = persist_anythingllm_chunk_settings(
         default_anythingllm_storage_dir(),
         TESTED_RETRIEVAL_CHUNK_SIZE,
@@ -5926,6 +6052,8 @@ def apply_tested_retrieval_preset_ui(inherit_enabled, current_embedder_max_chunk
 
 
 def save_anythingllm_chunk_settings(chunk_size_value, chunk_overlap_value, inherit_enabled, current_embedder_max_chunk=0):
+    if automatic_lifecycle_busy():
+        return anythingllm_settings_mutation_blocked_response()
     try:
         chunk_size = int(chunk_size_value or 0)
         chunk_overlap = int(chunk_overlap_value or 0)
@@ -5976,6 +6104,8 @@ def save_anythingllm_chunk_settings(chunk_size_value, chunk_overlap_value, inher
 
 
 def apply_recommended_anythingllm_settings_ui(inherit_enabled):
+    if automatic_lifecycle_busy():
+        return anythingllm_settings_mutation_blocked_response()
     result = apply_recommended_anythingllm_settings(default_anythingllm_storage_dir())
     html_value, chunk_update, overlap_update, embedder_update, recommended_update, engine_update, model_update = refresh_anythingllm_settings(
         inherit_enabled,
@@ -5996,6 +6126,8 @@ def apply_recommended_anythingllm_settings_ui(inherit_enabled):
 
 
 def save_anythingllm_embedder_engine_model(engine_value, model_value, inherit_enabled, current_chunk_size=0, current_chunk_overlap=-1, current_embedder_max_chunk=0):
+    if automatic_lifecycle_busy():
+        return anythingllm_settings_mutation_blocked_response()
     engine = (engine_value or "").strip()
     model = (model_value or "").strip()
     if not engine:
@@ -6031,6 +6163,8 @@ def save_anythingllm_embedder_engine_model(engine_value, model_value, inherit_en
 
 
 def save_anythingllm_embedder_max_chunk_limit(limit_value, inherit_enabled, current_chunk_size=0, current_chunk_overlap=-1):
+    if automatic_lifecycle_busy():
+        return anythingllm_settings_mutation_blocked_response()
     try:
         limit = int(limit_value or 0)
     except (TypeError, ValueError):
@@ -7310,6 +7444,64 @@ def submit_embedding_resume_manifest(
         secret, temporary_key_id = temporary["secret"], temporary["id"]
         authentication_mode = "temporary_desktop_api_key"
     try:
+        # A recovery manifest records what this assistant may *consider* for
+        # resubmission; it is not proof that Desktop has stopped processing a
+        # prior request. Observe immediately before the only mutation, then
+        # reconcile the exact locations again. An observed owned or unrelated
+        # queue is a hard stop. SSE silence stays labelled as uncertainty, not
+        # as an invented "queue idle" fact, but an explicit manual resume may
+        # proceed only after this second exact reconciliation.
+        activity = observe_workspace_embedding_queue_activity(
+            resolved_api,
+            secret,
+            slug,
+            locations,
+            observation_seconds=2.0,
+        )
+        result["queue_observation"] = activity
+        activity_status = str(activity.get("status") or "")
+        if activity_status == "owned_activity_observed":
+            result.update(
+                status="resume_blocked_owned_queue_active",
+                reconciled_locations=reconciled_count,
+                message="AnythingLLM is still processing this recovery manifest's locations; no duplicate resume was submitted.",
+            )
+            return result
+        if activity_status == "non_owned_activity_observed":
+            result.update(
+                status="resume_blocked_other_queue_active",
+                reconciled_locations=reconciled_count,
+                message="AnythingLLM is processing unrelated workspace activity; the recovery resume was left unchanged.",
+            )
+            return result
+        if activity_status == "stream_unavailable_uncertain":
+            result.update(
+                status="resume_blocked_queue_unavailable",
+                reconciled_locations=reconciled_count,
+                message="AnythingLLM queue activity could not be observed safely; no recovery resume was submitted.",
+            )
+            return result
+        locations, late_reconciliation = persist_reconciled_resume_manifest(path, manifest)
+        reconciled_count += int(late_reconciliation.get("reconciled_locations") or 0)
+        result["final_reconciliation"] = {
+            "status": late_reconciliation.get("status"),
+            "reconciled_locations": int(late_reconciliation.get("reconciled_locations") or 0),
+        }
+        if not locations:
+            result.update(
+                status="nothing_to_resume",
+                reconciled_locations=reconciled_count,
+                message="Exact attachment-to-vector reconciliation completed while recovery was being checked; no prepared locations remain.",
+            )
+            return result
+        lease = acquire_automatic_anythingllm_mutation_lease("manual recovery resume")
+        if not lease.get("acquired"):
+            result.update(
+                status="resume_blocked_assistant_mutation_active",
+                reconciled_locations=reconciled_count,
+                message="Another PDF Assistant process currently owns the AnythingLLM mutation lane; no recovery resume was submitted.",
+            )
+            return result
         resume_parallelism = max(
             1,
             min(
@@ -7317,19 +7509,22 @@ def submit_embedding_resume_manifest(
                 ANYTHINGLLM_EMBEDDING_MAX_CONCURRENT_BATCHES,
             ),
         )
-        report = update_workspace_embeddings_batched(
-            resolved_api,
-            secret,
-            slug,
-            locations,
-            batch_size=manifest.get("batch_size") or ANYTHINGLLM_EMBEDDING_UPDATE_BATCH_SIZE,
-            # The recovery manifest is the durable proof of what may be
-            # resumed.  Do not let a new transport attempt overwrite it.
-            ledger_path=path.with_name("resume-embedding-attempt-ledger.json"),
-            concurrent_batch_limit=resume_parallelism,
-            initial_concurrent_batches=resume_parallelism,
-            status_callback=status_callback,
-        )
+        try:
+            report = update_workspace_embeddings_batched(
+                resolved_api,
+                secret,
+                slug,
+                locations,
+                batch_size=manifest.get("batch_size") or ANYTHINGLLM_EMBEDDING_UPDATE_BATCH_SIZE,
+                # The recovery manifest is the durable proof of what may be
+                # resumed.  Do not let a new transport attempt overwrite it.
+                ledger_path=path.with_name("resume-embedding-attempt-ledger.json"),
+                concurrent_batch_limit=resume_parallelism,
+                initial_concurrent_batches=resume_parallelism,
+                status_callback=status_callback,
+            )
+        finally:
+            release_automatic_anythingllm_mutation_lease()
     finally:
         if temporary_key_id:
             delete_temporary_desktop_api_key(resolved_api, temporary_key_id)
@@ -7358,6 +7553,14 @@ def resume_latest_embedding_manifest(api_url, api_key, workspace_slug):
         return '<div class="artifact-placeholder"><strong>Recovery manifest has no pending locations.</strong></div>', gr.update(value="Nothing to resume", variant="secondary")
     if result.get("status") in {"authorization_failed", "no_existing_local_api_key"}:
         return latest_resume_manifest_html(workspace_slug), gr.update(value="Resume needs API authorization", variant="stop")
+    if result.get("status") in {
+        "resume_blocked_owned_queue_active",
+        "resume_blocked_other_queue_active",
+        "resume_blocked_queue_unavailable",
+        "resume_blocked_assistant_mutation_active",
+    }:
+        message = str(result.get("message") or "Recovery resume was left unchanged for queue safety.")
+        return latest_resume_manifest_html(workspace_slug), gr.update(value=message, variant="stop")
     if result.get("status") != "submitted":
         return latest_resume_manifest_html(workspace_slug), gr.update(value="Resume stopped — review recovery manifest", variant="stop")
     return (
@@ -8201,7 +8404,17 @@ def refresh_background_reconciliation(
         status,
         readiness,
         background_reconciliation_html(resolved_workspace, snapshot),
-        *settings,
+        # A periodic observer may finish after a person edits an AnythingLLM
+        # form control.  Its snapshot remains useful, but passive refresh is
+        # not allowed to write those browser-owned values back from an older
+        # request. Use the explicit Save/Refresh actions to apply settings.
+        settings[0],
+        gr.update(),
+        gr.update(),
+        gr.update(),
+        gr.update(),
+        gr.update(),
+        gr.update(),
         anythingllm_settings_reference_html(),
     )
 
@@ -9253,7 +9466,10 @@ def choose_pdf_input_directory_for_scan(current_value=""):
             value='<div class="artifact-placeholder batch-folder-scanning"><strong>Preparing folder scan…</strong><br>The selected folder will be searched recursively for PDFs.</div>',
             visible=True,
         ),
-        gr.update(visible=True),
+        # The status panel is the single source of scan progress. Keeping the
+        # disabled chooser mounted here makes Gradio render its button label as
+        # a second, centred “Scanning/Validating” message above that status.
+        gr.update(visible=False),
         gr.update(value="Scanning PDF folder…", interactive=False),
     )
 
@@ -9288,7 +9504,7 @@ def stream_selected_pdf_directory(path_text="", scan_requested=False):
                 gr.update(),
                 gr.update(),
                 gr.update(value=folder_scan_progress_html(scan), visible=True),
-                gr.update(visible=True),
+                gr.update(visible=False),
                 gr.update(value="Scanning PDF folder…", interactive=False),
             )
     manifest = dict(final_scan or {})
@@ -9304,7 +9520,7 @@ def stream_selected_pdf_directory(path_text="", scan_requested=False):
                 gr.update(),
                 gr.update(),
                 gr.update(value=folder_validation_progress_html(payload), visible=True),
-                gr.update(visible=True),
+                gr.update(visible=False),
                 gr.update(value="Validating PDF files…", interactive=False),
             )
         else:
@@ -10329,16 +10545,24 @@ def automatic_process_button_state(pdf_files=None, folder_pdf_files=None, folder
     )
 
 
-def automatic_selection_action_states(pdf_files=None, folder_pdf_files=None, folder_manifest=None):
+def automatic_selection_action_states(
+    pdf_files=None,
+    folder_pdf_files=None,
+    folder_manifest=None,
+    selection_state=None,
+):
     """Keep the visibly inert Cancel control synchronized with selection.
 
     Gradio's File.change callback can run before its temporary path has fully
     propagated to an earlier reset handler. Pairing this with the final
     readiness callback keeps Confirm and Cancel visually consistent.
     """
-    # Check and clear the pending-picker state as one transition.  A separate
-    # check followed by ``clear_live...`` let a concurrently accepted Confirm
-    # be overwritten by a late File.change callback.
+    # ``automatic_selection_state`` is browser-owned and is the only status
+    # authority while a picker chain is settling.  Do not borrow the
+    # process-wide run-status record for that transient state: its one-second
+    # observer can otherwise repaint a finished selection as a disabled,
+    # fictitious in-progress run.
+    selection_pending = str((selection_state or {}).get("state") or "") == "pending"
     global LIVE_AUTOMATIC_RUN_STATUS
     with LIVE_AUTOMATIC_RUN_STATUS_LOCK:
         status = dict(LIVE_AUTOMATIC_RUN_STATUS or {})
@@ -10347,14 +10571,14 @@ def automatic_selection_action_states(pdf_files=None, folder_pdf_files=None, fol
             # selection that was just confirmed. It must not repaint
             # Confirm/Ready after the confirmation stream has acknowledged it.
             return gr.update(), gr.update(), gr.update()
-        if str(status.get("state") or "") == "preparing":
-            # The selection transaction owns this transient state.  Its final
-            # acknowledgement enables Confirm only after the visible form is
-            # coherent; an intermediate callback must not do so early.
+        if selection_pending:
+            # Metadata and workspace-name callbacks still own a coherent
+            # selection snapshot.  The final acknowledgement enables Confirm;
+            # this callback must not authorize an early click.
             return (
                 gr.update(value="Confirm and start processing", interactive=False, variant="primary"),
                 gr.update(value="Cancel", interactive=False, visible=True),
-                gr.update(value=automatic_live_status_html(status), visible=True),
+                gr.update(value=automatic_live_status_html({"state": "ready"}), visible=True),
             )
     return (
         automatic_process_button_state(pdf_files, folder_pdf_files, folder_manifest),
@@ -11051,7 +11275,6 @@ def automatic_live_status_html(status=None):
     raw_phase = str(record.get("phase") or "Working")
     phase = html.escape(raw_phase)
     details = html.escape(str(record.get("details") or ""))
-    suffix = f" — {details}" if details else ""
     try:
         batch_total = max(0, int(record.get("batch_total_files") or 0))
         batch_completed = max(0, int(record.get("batch_completed_files") or 0))
@@ -11094,7 +11317,10 @@ def automatic_live_status_html(status=None):
             "</span>"
         )
     else:
-        batch_suffix = ""
+        # Keep the batch-status row mounted for a one-PDF run too.  A later
+        # terminal report must not insert or remove a line inside the live
+        # status card merely because its batch counter is absent.
+        batch_suffix = '<span class="automatic-run-batch-count" aria-hidden="true"></span>'
     percent = paced_progress_percent(record)
     percent_text = f"{percent:d}%"
     now = time.time()
@@ -11126,6 +11352,11 @@ def automatic_live_status_html(status=None):
             f"{terminal_label} {format_estimate_clock(actual)}"
             "</span>"
         )
+    details_suffix = (
+        f'<span class="automatic-run-progress-details">— {details}</span>'
+        if details
+        else '<span class="automatic-run-progress-details" aria-hidden="true"></span>'
+    )
     return (
         f'<div class="automatic-run-activity {html.escape(state)}" '
         f'data-run-state="{html.escape(state)}" '
@@ -11134,8 +11365,10 @@ def automatic_live_status_html(status=None):
         f'<div class="automatic-run-progress" role="progressbar" aria-label="Overall run progress" '
         f'aria-valuemin="0" aria-valuemax="100" aria-valuenow="{percent:d}">'
         f'<div class="automatic-run-progress-fill" style="width: {percent:d}%"></div></div>'
-        f'<div class="automatic-run-progress-label"><strong>Overall progress: {percent_text}</strong> '
-        f'<span>{phase}</span>{suffix}{batch_suffix}{timing_text}</div></div>'
+        f'<div class="automatic-run-progress-label">'
+        f'<strong class="automatic-run-progress-overall">Overall progress: {percent_text}</strong>'
+        f'<span class="automatic-run-progress-phase">{phase}</span>'
+        f'{details_suffix}{batch_suffix}{timing_text}</div></div>'
     )
 
 
@@ -11192,6 +11425,16 @@ def refresh_live_automatic_run_ui(viewed_run_root=None):
     # old idle activity otherwise remained visibly "Ready" beside a disabled
     # Confirm button until the worker reached ``running``.
     if state == "":
+        return tuple(gr.update() for _ in range(10))
+    # Older in-memory records can still contain the retired selection-only
+    # ``preparing`` state after a hot reload.  It is neither a reserved run
+    # nor a confirmation acknowledgement, so the periodic observer must not
+    # overwrite the browser-owned picker completion with disabled controls.
+    if (
+        state == "preparing"
+        and not str(record.get("run_root") or "").strip()
+        and not automatic_confirmation_in_flight(record)
+    ):
         return tuple(gr.update() for _ in range(10))
     rendered = automatic_live_status_html(record)
     activity = gr.update(value=rendered, visible=bool(rendered))
@@ -11317,15 +11560,13 @@ def reset_automatic_run_presentation(pdf_files=None, folder_pdf_files=None):
         # or make a completed batch look like a fresh idle state. The selected
         # files are still preserved by Gradio for the next explicit run.
         return tuple(gr.update() for _ in range(19))
-    has_input = bool(normalize_file_list(pdf_files) or normalize_file_list(folder_pdf_files))
-    LIVE_AUTOMATIC_RUN_STATUS = (
-        {"state": "preparing", "phase": "Finishing preparation"} if has_input else {}
-    )
+    # Selection preparation belongs exclusively to the browser-owned
+    # ``automatic_selection_state``.  Leaving the global run record empty
+    # prevents the independent status timer from mistaking an ordinary file
+    # selection for a confirmed run and permanently disabling Confirm.
+    LIVE_AUTOMATIC_RUN_STATUS = {}
     return (
-        gr.update(
-            value=automatic_live_status_html(LIVE_AUTOMATIC_RUN_STATUS or {"state": "ready"}),
-            visible=True,
-        ),
+        gr.update(value=automatic_live_status_html({"state": "ready"}), visible=True),
         gr.update(value=automatic_run_timing_html(state="ready")),
         # The retired review control stays mounted but invisible to preserve
         # the long-lived Gradio output contract without a second action.
@@ -16854,6 +17095,27 @@ def run_automatic_from_confirmation_stream(*values, progress=gr.Progress(track_t
         settings.get("workspace_slug") or "not-selected",
         len(settings.get("files") or []),
     )
+    lease = acquire_automatic_anythingllm_mutation_lease("Automatic PDF run")
+    if not lease.get("acquired"):
+        final = automatic_confirmation_failure_response(
+            "AUTO-CONFIRM-LEASE-001",
+            "Another PDF Assistant process is using AnythingLLM",
+            [
+                "This app process did not start a second queue. Wait for the other PDF Assistant run to finish, then confirm again."
+            ],
+            ["The current PDF selection and settings remain unchanged."],
+            timing_html=automatic_run_timing_html(
+                state="failed",
+                message="Nothing was submitted because another local assistant process owns the AnythingLLM mutation lane.",
+            ),
+        )
+        yield (
+            *final,
+            confirm_button_completion_update(final),
+            gr.update(value="Cancel", interactive=False),
+            gr.update(visible=False, interactive=False),
+        )
+        return
     # Reserve the durable run folder before any post-confirmation workspace
     # action.  Cancel can now reach the same marker even while a new AnythingLLM
     # workspace is being created, rather than being blind during "preparing".
@@ -16889,7 +17151,13 @@ def run_automatic_from_confirmation_stream(*values, progress=gr.Progress(track_t
     # Reuse the exact validated snapshot which produced the visible start
     # acknowledgement. Revalidating the same browser payload here could race
     # a settings refresh and start with a different ETA than was displayed.
-    final = run_automatic_from_confirmation(settings, progress=progress)
+    try:
+        final = run_automatic_from_confirmation(settings, progress=progress)
+    finally:
+        # The worker has returned a terminal result (or raised into the
+        # existing error path). Only then may another direct app process
+        # mutate AnythingLLM through this assistant.
+        release_automatic_anythingllm_mutation_lease()
     yield (
         *final,
         confirm_button_completion_update(final),
@@ -17217,8 +17485,16 @@ def automatic_custom_page_group_sizes_validation(
     pdf_files=None,
     folder_pdf_files=None,
     folder_manifest=None,
+    selection_state=None,
 ):
     """Keep Confirm disabled while a visible Custom Range value is invalid."""
+    if str((selection_state or {}).get("state") or "") == "pending":
+        # Selection metadata and the derived workspace name still own the
+        # snapshot. A range keystroke must not re-enable Confirm first.
+        return (
+            gr.update(),
+            gr.update(value="Confirm and start processing", interactive=False, variant="primary"),
+        )
     if not is_custom_page_range_segment_mode(segment_mode_value):
         return gr.update(value="", visible=False), automatic_process_button_state(
             pdf_files, folder_pdf_files, folder_manifest
@@ -22645,7 +22921,15 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                         optional_live_retrieval_status = gr.HTML(
                             value='<div class="artifact-placeholder">Optional live retrieval has not been run. Indexing success does not require this diagnostic.</div>'
                         )
-                    with gr.Accordion("AnythingLLM native metadata contract", open=False, elem_classes=["native-upload-subaccordion"]):
+                    # Retained invisibly for existing status-refresh outputs;
+                    # the raw metadata-contract reference is no longer part of
+                    # the normal PDF preparation workflow.
+                    with gr.Accordion(
+                        "AnythingLLM native metadata contract",
+                        open=False,
+                        visible=False,
+                        elem_classes=["native-upload-subaccordion"],
+                    ):
                         metadata_schema_status = gr.Textbox(
                             label="AnythingLLM native metadata contract",
                             value=metadata_contract_text(),
@@ -22702,11 +22986,27 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                             label="I understand that restarting AnythingLLM can interrupt other Desktop work",
                         )
                         apply_recovery_policy_button = gr.Button("Apply recovery action", variant="secondary")
-                    with gr.Accordion("ETA model and timing diagnostics", open=False, elem_classes=["native-upload-subaccordion"]):
+                    # Timing remains active in the Automatic status card. The
+                    # diagnostic inspector is intentionally kept off the
+                    # ordinary interface while preserving its refresh callback.
+                    with gr.Accordion(
+                        "ETA model and timing diagnostics",
+                        open=False,
+                        visible=False,
+                        elem_classes=["native-upload-subaccordion"],
+                    ):
                         refresh_timing_model_button = gr.Button("Refresh ETA model")
                         timing_model_status = gr.HTML(value=timing_model_html())
 
-            with gr.Accordion("Retrieval simulation", open=False, elem_classes=["top-level-accordion"]) as retrieval_simulation_section:
+            # This optional diagnostic is not a normal processing setting.
+            # Keep its mounted controls for the canonical request contract,
+            # but remove the complete section from the visible UI.
+            with gr.Accordion(
+                "Retrieval simulation",
+                open=False,
+                visible=False,
+                elem_classes=["top-level-accordion"],
+            ) as retrieval_simulation_section:
                 with gr.Row(elem_classes=["control-row"]):
                     ollama_url = gr.Textbox(
                         label="Ollama URL",
@@ -23028,6 +23328,13 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
             with gr.Accordion(
                 "Run output and downloads",
                 open=False,
+                # Durable run folders remain available on disk, but the
+                # detailed-output accordion made the ordinary run flow harder
+                # to read and could participate in terminal focus/layout
+                # transitions. Keep its mounted outputs solely for the
+                # established stream contract while removing the entire
+                # section from the visible interface.
+                visible=False,
                 elem_id="run-output-downloads",
                 elem_classes=["top-level-accordion", "output-downloads-accordion"],
             ) as run_output_downloads_section:
@@ -23520,6 +23827,11 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 outputs=[new_workspace_name, new_workspace_name_auto_state],
                 show_progress="hidden",
                 queue=False,
+                # Workspace changes can arrive in quick succession while a
+                # user switches between New and an existing workspace. Keep
+                # only the last browser value; an older response must not
+                # resurrect the New-workspace name field.
+                trigger_mode="always_last",
             )
             auto_label.change(
                 fn=update_new_workspace_name_control,
@@ -23527,6 +23839,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 outputs=[new_workspace_name, new_workspace_name_auto_state],
                 show_progress="hidden",
                 queue=False,
+                trigger_mode="always_last",
             )
             api_url.change(
                 fn=lambda api_url, api_key, workspace_slug: refresh_native_upload_readiness(
@@ -23638,7 +23951,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=automatic_selection_action_states,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state],
                 outputs=[
                     confirm_automatic_run_button,
                     cancel_automatic_run_button,
@@ -23665,7 +23978,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=automatic_selection_action_states,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state],
                 outputs=[
                     confirm_automatic_run_button,
                     cancel_automatic_run_button,
@@ -23774,7 +24087,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 # ready action state first so a late metadata callback cannot
                 # leave Cancel interactive while Confirm is already enabled.
                 fn=automatic_selection_action_states,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state],
                 outputs=[
                     confirm_automatic_run_button,
                     cancel_automatic_run_button,
@@ -23804,7 +24117,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 # derived workspace name have settled. Otherwise an operator
                 # can submit a transient blank/default snapshot.
                 fn=automatic_selection_action_states,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state],
                 outputs=[
                     confirm_automatic_run_button,
                     cancel_automatic_run_button,
@@ -23932,7 +24245,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=automatic_selection_action_states,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state],
                 outputs=[
                     confirm_automatic_run_button,
                     cancel_automatic_run_button,
@@ -24042,7 +24355,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=automatic_selection_action_states,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state],
                 outputs=[
                     confirm_automatic_run_button,
                     cancel_automatic_run_button,
@@ -24098,7 +24411,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=automatic_selection_action_states,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state],
                 outputs=[
                     confirm_automatic_run_button,
                     cancel_automatic_run_button,
@@ -24151,7 +24464,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=automatic_selection_action_states,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state],
                 outputs=[
                     confirm_automatic_run_button,
                     cancel_automatic_run_button,
@@ -24522,8 +24835,13 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     open_generated_output_button,
                     automatic_viewed_run_root,
                 ],
-                show_progress="full",
-                show_progress_on=auto_summary,
+                # The live Automatic status card already acknowledges Confirm
+                # immediately and owns all visible progress.  Targeting
+                # Gradio's generic progress overlay at ``auto_summary`` made
+                # the browser scroll toward that lower, closed accordion when
+                # the stream completed, which looked like an upper section had
+                # disappeared at the 100% transition.
+                show_progress="hidden",
                 concurrency_limit=AUTOMATIC_RUN_CONCURRENCY_LIMIT,
                 concurrency_id=AUTOMATIC_RUN_CONCURRENCY_ID,
             ).then(
@@ -24644,7 +24962,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
             for custom_range_input in [segment_mode, custom_page_group_sizes]:
                 custom_range_input.input(
                     fn=automatic_custom_page_group_sizes_validation,
-                    inputs=[segment_mode, custom_page_group_sizes, auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
+                    inputs=[segment_mode, custom_page_group_sizes, auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state],
                     outputs=[custom_page_group_sizes_error, confirm_automatic_run_button],
                     show_progress="hidden",
                     queue=False,
