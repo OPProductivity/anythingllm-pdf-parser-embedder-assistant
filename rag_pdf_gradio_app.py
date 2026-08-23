@@ -338,6 +338,16 @@ TIMING_MODEL_CACHE_DOMINANT_REUSE_FRACTION = 0.25
 TIMING_MODEL_DESKTOP_CADENCE_MIN_FRESH_RECORDS = 100
 TIMING_MODEL_DESKTOP_CADENCE_FULL_CONFIDENCE_RECORDS = 4000
 TIMING_MODEL_DESKTOP_CADENCE_MIN_SECONDS = 1.5
+# A large Desktop batch is a different physical queue shape from a one-off
+# PDF: provider work is still page-parent based, but completion is pipelined.
+# Keep that lane deliberately narrow and do not allow a couple of large runs
+# to rewrite the longstanding short-run allowance.
+TIMING_MODEL_LARGE_BATCH_MIN_DOCUMENTS = 10
+TIMING_MODEL_LARGE_BATCH_MIN_RECORDS = 100
+TIMING_MODEL_LARGE_BATCH_MIN_MATCHING_RUNS = 3
+TIMING_MODEL_LARGE_BATCH_MIN_FRESH_RECORDS = 3000
+TIMING_MODEL_LARGE_BATCH_FULL_CONFIDENCE_RECORDS = 6000
+TIMING_MODEL_LARGE_BATCH_MIN_SECONDS = 1.25
 # A timing row may be useful only when it uses this exact Desktop queue
 # protocol. The provider allowance is separately recorded on every row: v3
 # used the fixed first-run allowance and v4 can apply a bounded lane prior.
@@ -9123,6 +9133,26 @@ def folder_validation_progress_html(progress):
     )
 
 
+def folder_page_preview_progress_html(progress):
+    """Explain the read-only preview work that follows fast header checks."""
+    completed = int((progress or {}).get("completed") or 0)
+    total = int((progress or {}).get("total") or 0)
+    pages = int((progress or {}).get("pages") or 0)
+    likely_ocr = int((progress or {}).get("likely_ocr_pages") or 0)
+    ocr_detail = (
+        "no likely OCR pages found so far"
+        if likely_ocr == 0
+        else f"{likely_ocr} likely OCR page{'s' if likely_ocr != 1 else ''} found so far"
+    )
+    return (
+        '<div class="artifact-placeholder batch-folder-scanning"><strong>'
+        "Header check complete — inspecting pages for the preview…</strong>"
+        f"<br>Previewed {completed} of {total} PDF file{'s' if total != 1 else ''}; "
+        f"{pages} page{'s' if pages != 1 else ''} checked; {ocr_detail}. "
+        "This read-only scan is cached, so Confirm does not repeat it.</div>"
+    )
+
+
 def folder_scan_status_html(manifest):
     """Return the compact, factual completion summary for a folder scan."""
     manifest = dict(manifest or {})
@@ -9239,6 +9269,42 @@ def pdf_picker_native_inspection(path):
     return result
 
 
+def iter_pdf_picker_page_details(paths=None):
+    """Yield cached native page-preview details after each selected PDF.
+
+    Folder selection deliberately performs this up-front so the preview is
+    honest about page counts and likely OCR pages, and later confirmation can
+    reuse the exact source-version result instead of rescanning the folder.
+    """
+    details = {}
+    paths = clean_downloadable_paths(paths or [])
+    total = len(paths)
+    for completed, raw_path in enumerate(paths, start=1):
+        path = Path(raw_path)
+        try:
+            details[str(path)] = dict(pdf_picker_native_inspection(path)["detail"])
+        except Exception as exc:
+            APP_LOGGER.info("PDF picker page inspection skipped for %s: %s", path, exc)
+            details[str(path)] = {"pages": "?", "ocr_pages": "?"}
+        page_total = sum(
+            max(0, int(detail.get("pages") or 0))
+            for detail in details.values()
+            if str(detail.get("pages") or "").isdigit()
+        )
+        ocr_total = sum(
+            max(0, int(detail.get("ocr_pages") or 0))
+            for detail in details.values()
+            if str(detail.get("ocr_pages") or "").isdigit()
+        )
+        yield {
+            "completed": completed,
+            "total": total,
+            "pages": page_total,
+            "likely_ocr_pages": ocr_total,
+            "details": dict(details),
+        }
+
+
 def pdf_picker_page_details(paths=None):
     """Return page totals and likely OCR/Unstructured candidate counts per PDF.
 
@@ -9249,13 +9315,8 @@ def pdf_picker_page_details(paths=None):
     through an OCR backend.
     """
     details = {}
-    for raw_path in clean_downloadable_paths(paths or []):
-        path = Path(raw_path)
-        try:
-            details[str(path)] = dict(pdf_picker_native_inspection(path)["detail"])
-        except Exception as exc:
-            APP_LOGGER.info("PDF picker page inspection skipped for %s: %s", path, exc)
-            details[str(path)] = {"pages": "?", "ocr_pages": "?"}
+    for progress in iter_pdf_picker_page_details(paths):
+        details = dict(progress.get("details") or {})
     return details
 
 
@@ -9528,7 +9589,43 @@ def stream_selected_pdf_directory(path_text="", scan_requested=False):
     inspection = inspection or inspect_uploaded_pdf_candidates([])
     manifest.update(inspection)
     manifest["pdf_candidates"] = inspection["pdf_candidates"]
-    manifest["picker_page_details"] = pdf_picker_page_details(manifest["pdf_candidates"])
+    page_details = {}
+    candidates_for_preview = manifest["pdf_candidates"]
+    # Header validation is intentionally quick. The visibly longer part for a
+    # large folder is the all-page, read-only preview that establishes page
+    # counts and likely OCR candidates. Stream that separate stage so a
+    # completed 34/34 header check is never displayed as inexplicably stuck.
+    if candidates_for_preview:
+        yield (
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(
+                value=folder_page_preview_progress_html({
+                    "completed": 0,
+                    "total": len(candidates_for_preview),
+                }),
+                visible=True,
+            ),
+            gr.update(visible=False),
+            gr.update(value="Inspecting PDF pages…", interactive=False),
+        )
+    for preview_progress in iter_pdf_picker_page_details(candidates_for_preview):
+        if automatic_lifecycle_busy():
+            yield tuple(gr.update() for _ in range(7))
+            return
+        page_details = dict(preview_progress.get("details") or {})
+        yield (
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(value=folder_page_preview_progress_html(preview_progress), visible=True),
+            gr.update(visible=False),
+            gr.update(value="Inspecting PDF pages…", interactive=False),
+        )
+    manifest["picker_page_details"] = page_details
     manifest["schema_version"] = 1
     APP_LOGGER.info(
         "PDF folder scan completed",
@@ -14143,10 +14240,24 @@ def timing_model_desktop_queue_cadence(row):
             requested = int(batch.get("requested") or 0)
         except (TypeError, ValueError):
             continue
+        # A short reconnect after the terminal ``all_complete`` event is not a
+        # loss of evidence. The observer often tears its stream down only
+        # after it has seen the final queue position, leaving the final stored
+        # state as ``reconnecting``. Accept that completed terminal receipt,
+        # but never accept a merely silent or incomplete observer.
+        terminal_completion_observed = (
+            str(observer.get("desktop_queue_last_event_type") or "").casefold()
+            == "all_complete"
+        )
+        observer_connected = (
+            str(observer.get("desktop_queue_observer_state") or "").casefold()
+            == "connected"
+        )
         if (
             rate > 0
-            and str(observer.get("desktop_queue_observer_state") or "").casefold() == "connected"
+            and (observer_connected or terminal_completion_observed)
             and completed >= requested > 0
+            and bool(batch.get("searchability_proven"))
         ):
             rates.append(rate)
             observed_records += requested
@@ -14169,6 +14280,87 @@ def timing_model_desktop_queue_cadence(row):
         "seconds_per_record": 60.0 / records_per_minute,
         "receipts": len(rates),
     }
+
+
+def timing_model_large_batch_queue_eligible(features):
+    """Return whether the guarded throughput lane may apply to this selection.
+
+    This is intentionally based on the actual selected workload, not which
+    picker supplied it: selecting ten files through the ordinary picker and
+    selecting ten through the folder picker must receive the same ETA policy.
+    """
+    return (
+        str((features or {}).get("mode") or "") == MODE_NATIVE_UPLOAD_LABEL
+        and str((features or {}).get("embedding_submission_strategy") or "").casefold()
+        == "desktop_queue"
+        and int((features or {}).get("document_count") or 0)
+        >= TIMING_MODEL_LARGE_BATCH_MIN_DOCUMENTS
+        and int((features or {}).get("estimated_embedding_provider_requests") or 0)
+        >= TIMING_MODEL_LARGE_BATCH_MIN_RECORDS
+    )
+
+
+def timing_model_large_batch_provider_request_prior_seconds(features, history, baseline_prior):
+    """Refine only the existing Desktop queue term for well-supported batches.
+
+    The classic phase formula remains the owner of the ETA. This lane supplies
+    a bounded throughput allowance only after three *fresh*, comparable
+    10+-PDF batches provide durable terminal queue evidence. Mixed/cache-heavy
+    batches stay in the audit trail but cannot make a future fresh batch look
+    artificially fast.
+    """
+    baseline = max(1.0, float(baseline_prior or DESKTOP_SERIAL_PROVIDER_REQUEST_PRIOR_SECONDS))
+    if not timing_model_large_batch_queue_eligible(features):
+        return baseline, 0, "not a 10+ PDF Desktop batch"
+    lane = str(features.get("embedding_timing_lane") or "")
+    samples = []
+    support_records = 0
+    for row in history or []:
+        if (
+            not timing_model_observation_usable(row)
+            or str(row.get("mode") or "") != MODE_NATIVE_UPLOAD_LABEL
+            or str(row.get("embedding_submission_strategy") or "").casefold() != "desktop_queue"
+            or int(row.get("document_count") or 0) < TIMING_MODEL_LARGE_BATCH_MIN_DOCUMENTS
+            or timing_model_cached_attachment_reuse_count(row) != 0
+            or str(row.get("native_upload_scope") or "") != str(features.get("native_upload_scope") or "")
+            or str(row.get("native_upload_transport") or "") != str(features.get("native_upload_transport") or "")
+            or str(row.get("native_upload_representation") or "") != str(features.get("native_upload_representation") or "")
+            or str(row.get("segment_mode") or "") != str(features.get("segment_mode") or "")
+            or str(row.get("embedding_timing_lane") or "") != lane
+        ):
+            continue
+        cadence = dict(row.get("desktop_queue_cadence") or {})
+        fresh_records = int(cadence.get("fresh_records") or 0)
+        seconds_per_record = float(cadence.get("seconds_per_record") or 0.0)
+        if fresh_records < TIMING_MODEL_LARGE_BATCH_MIN_RECORDS or seconds_per_record <= 0.0:
+            continue
+        samples.append(seconds_per_record)
+        support_records += fresh_records
+    if (
+        len(samples) < TIMING_MODEL_LARGE_BATCH_MIN_MATCHING_RUNS
+        or support_records < TIMING_MODEL_LARGE_BATCH_MIN_FRESH_RECORDS
+    ):
+        return baseline, len(samples), (
+            f"large-batch queue lane collecting evidence ({len(samples)}/"
+            f"{TIMING_MODEL_LARGE_BATCH_MIN_MATCHING_RUNS} matching fresh batch(es); "
+            f"{support_records}/{TIMING_MODEL_LARGE_BATCH_MIN_FRESH_RECORDS} fresh records)"
+        )
+    observed = max(
+        TIMING_MODEL_LARGE_BATCH_MIN_SECONDS,
+        min(
+            DESKTOP_SERIAL_PROVIDER_REQUEST_PRIOR_SECONDS,
+            float(_timing_percentile(samples, .75) or baseline) * 1.25,
+        ),
+    )
+    # This intentionally makes the mature batch rate only gradually more
+    # influential. Its maximum 50% influence cannot overwrite the already
+    # conservative classic prior with one favourable queue cohort.
+    confidence = min(.50, support_records / TIMING_MODEL_LARGE_BATCH_FULL_CONFIDENCE_RECORDS)
+    prior = baseline * (1.0 - confidence) + observed * confidence
+    return prior, len(samples), (
+        f"bounded 10+ PDF Desktop queue throughput from {len(samples)} matching fresh batch(es) "
+        f"/{support_records} fresh records"
+    )
 
 
 def timing_model_observation_usable(row):
@@ -15207,9 +15399,26 @@ def estimate_automatic_run(
         provider_request_prior, provider_request_samples, provider_request_source = (
             timing_model_desktop_provider_request_prior_seconds(features, history)
         )
+        (
+            provider_request_prior,
+            large_batch_queue_samples,
+            large_batch_queue_source,
+        ) = timing_model_large_batch_provider_request_prior_seconds(
+            features,
+            history,
+            provider_request_prior,
+        )
         features["embedding_provider_request_seconds_prior"] = round(provider_request_prior, 3)
         features["embedding_provider_request_prior_samples"] = provider_request_samples
-        features["embedding_provider_request_prior_source"] = provider_request_source
+        features["embedding_provider_request_prior_source"] = (
+            large_batch_queue_source
+            if timing_model_large_batch_queue_eligible(features)
+            else provider_request_source
+        )
+        features["large_batch_queue_throughput_samples"] = large_batch_queue_samples
+        features["large_batch_queue_throughput_eligible"] = (
+            timing_model_large_batch_queue_eligible(features)
+        )
     local_embedding_prior, local_embedding_samples, local_embedding_source = timing_local_embedding_prior(features, history)
     if local_embedding_prior > 0:
         features["local_embedding_seconds_per_record"] = round(local_embedding_prior, 3)
@@ -15496,9 +15705,19 @@ def record_timing_model_run(
             "actual_seconds": round(float(actual_seconds or 0), 3),
             "wall_clock_seconds": round(float(wall_clock_seconds or actual_seconds or 0), 3),
             "duration_provenance": "active_observation_window",
-            "expected_seconds": int(estimate.get("expected_seconds") or 0),
+            # Keep the reviewed opening estimate separate from later evidence
+            # reprices. A terminal row must never pair a pre-run formula with a
+            # post-cache or live-queue total and make future diagnosis guess.
+            "expected_seconds": int(
+                estimate.get("initial_expected_seconds")
+                or estimate.get("expected_seconds")
+                or 0
+            ),
+            "final_expected_seconds": int(estimate.get("expected_seconds") or 0),
             "estimate_source": estimate.get("source", ""),
-            "estimate_formula": estimate.get("formula", ""),
+            "estimate_formula": estimate.get("initial_estimate_formula") or estimate.get("formula", ""),
+            "final_estimate_formula": estimate.get("formula", ""),
+            "initial_estimate_features": dict(estimate.get("initial_estimate_features") or features),
             "actual_records": actual_records,
             "submitted_records": submitted_records,
             "existing_workspace_records": existing_workspace_records,
@@ -16802,6 +17021,7 @@ def dispatch_confirmed_automatic_run(settings, *, progress):
     run_kwargs = {field: settings.get(field) for field in AUTOMATIC_RUN_FIELDS}
     run_kwargs.update(
         expected_seconds=settings.get("expected_seconds", 0),
+        reviewed_timing_estimate=settings.get("timing_estimate"),
         ocr_preflight_manifest=settings.get("ocr_preflight_manifest"),
         estimate_comparable_runs=settings.get("estimate_comparable_runs"),
         run_root_override=str(settings.get("_reserved_run_root") or "") or None,
@@ -19931,6 +20151,7 @@ def run_automatic(
     download_segments_folder,
     custom_page_group_sizes="",
     expected_seconds=0,
+    reviewed_timing_estimate=None,
     ocr_preflight_manifest=None,
     estimate_comparable_runs=None,
     run_root_override=None,
@@ -19995,22 +20216,33 @@ def run_automatic(
             automatic_run_timing_html(state="failed", message="Choose a readable PDF before confirming."),
         )
 
-    run_timing_estimate = estimate_automatic_run(
-        files,
-        mode,
-        native_upload_scope,
-        segment_mode=segment_mode,
-        chunk_size=anythingllm_chunk_size,
-        chunk_overlap=anythingllm_chunk_overlap,
-        target_passage_length=target_passage_length,
-        backend_mode=backend_mode,
-        unstructured_strategy=unstructured_strategy,
-        api_url=api_url,
-        inherit_anythingllm_settings=inherit_anythingllm_settings,
-        local_check_mode=local_check_mode,
-        profile_document_limit=automatic_timing_profile_document_limit(files),
-        ocr_preflight_manifest=ocr_preflight_manifest,
-    )
+    # The operator reviewed one specific estimate on the confirmation screen.
+    # Carry that immutable snapshot into the worker rather than recalculating
+    # it after another run has appended timing history. Recalculation here was
+    # the source of terminal records whose displayed estimate and explanatory
+    # formula came from different moments in history.
+    reviewed = dict(reviewed_timing_estimate or {})
+    if reviewed.get("features") and reviewed.get("formula"):
+        run_timing_estimate = reviewed
+        run_timing_estimate["features"] = dict(reviewed.get("features") or {})
+        run_timing_estimate["profile"] = dict(reviewed.get("profile") or {})
+    else:
+        run_timing_estimate = estimate_automatic_run(
+            files,
+            mode,
+            native_upload_scope,
+            segment_mode=segment_mode,
+            chunk_size=anythingllm_chunk_size,
+            chunk_overlap=anythingllm_chunk_overlap,
+            target_passage_length=target_passage_length,
+            backend_mode=backend_mode,
+            unstructured_strategy=unstructured_strategy,
+            api_url=api_url,
+            inherit_anythingllm_settings=inherit_anythingllm_settings,
+            local_check_mode=local_check_mode,
+            profile_document_limit=automatic_timing_profile_document_limit(files),
+            ocr_preflight_manifest=ocr_preflight_manifest,
+        )
     # The reviewed estimate is authoritative for this visible run. Preserve its
     # formula/profile for terminal learning even if a concurrent prior run adds
     # history while this one is working.
@@ -20019,6 +20251,9 @@ def run_automatic(
     # callers may omit it, in which case the freshly calculated estimate must
     # drive the same status timer rather than rendering an empty 00m00s clock.
     expected_seconds = int(run_timing_estimate["expected_seconds"])
+    run_timing_estimate["initial_expected_seconds"] = expected_seconds
+    run_timing_estimate["initial_estimate_formula"] = str(run_timing_estimate.get("formula") or "")
+    run_timing_estimate["initial_estimate_features"] = dict(run_timing_estimate.get("features") or {})
 
     try:
         progress(0.025, desc="Creating output folder")
@@ -20613,6 +20848,9 @@ def run_automatic(
     desktop_serial_queue = (
         str(timing_features.get("embedding_submission_strategy") or "").casefold()
         == "desktop_queue"
+    )
+    batch_queue_throughput_eligible = timing_model_large_batch_queue_eligible(
+        timing_features
     )
     # The Desktop receipt is one outer request, but the stock Desktop server
     # invokes the provider once per page parent.  Keep all later exact-count
@@ -21651,6 +21889,7 @@ def run_automatic(
             if (
                 timing_event == "prequeue_cache_snapshot"
                 and desktop_serial_queue
+                and batch_queue_throughput_eligible
                 and not cache_realization_eta_applied
             ):
                 queue_records = max(0, int(report.get("queue_records") or 0))
