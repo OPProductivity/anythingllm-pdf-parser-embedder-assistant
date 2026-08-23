@@ -1239,7 +1239,7 @@ APP_JS = """
       }
       timer.dataset.runState = "running";
       timer.className = "automatic-run-timing running";
-      timer.innerHTML = `<strong>Est: ${expected > 0 ? formatEstimate(window.ragAutomaticRunDisplayedRemaining) : "00m00s"}</strong>`;
+      timer.innerHTML = `<strong>${expected > 0 ? `Est: ${formatEstimate(window.ragAutomaticRunDisplayedRemaining)}` : "Est: calculating…"}</strong>`;
       const catchUp = window.ragAutomaticRunDisplayedRemaining > targetRemaining;
       const untilNextSecond = Math.max(20, 1000 - (elapsedMs % 1000));
       window.ragAutomaticRunTimerInterval = window.setTimeout(render, catchUp ? 110 : untilNextSecond);
@@ -4035,6 +4035,17 @@ body:not(.dark) .gradio-container label[data-testid$="-checkbox-label"] {
     row-gap: 0;
     min-height: 1.25em;
     padding-top: 3px;
+}
+/* Running status and its terminal receipt occupy the same visual lane. A
+   concise terminal result can still be one wrapped line longer than the live
+   queue message; reserve that line before completion so controls below this
+   card do not jump vertically at 100%. */
+.automatic-run-activity.running .automatic-run-progress-label,
+.automatic-run-activity.successful .automatic-run-progress-label,
+.automatic-run-activity.warning .automatic-run-progress-label,
+.automatic-run-activity.failed .automatic-run-progress-label,
+.automatic-run-activity.cancelled .automatic-run-progress-label {
+    min-height: 6.25em;
 }
 .automatic-run-progress-label span { font-variant-numeric: tabular-nums; }
 .automatic-run-batch-count {
@@ -8128,14 +8139,18 @@ def background_reconciliation_html(workspace_slug, snapshot):
 
 
 def _background_workspace_update(selected_workspace):
-    """Refresh local workspace choices without replacing a valid user selection."""
-    choices, local_status = local_workspace_choices()
-    choices = workspace_choices_with_new_document(choices)
-    valid_values = {value for _label, value in choices}
-    selected = (selected_workspace or "").strip()
-    if selected not in valid_values:
-        selected = NEW_DOCUMENT_WORKSPACE_VALUE
-    return gr.update(choices=choices, value=selected), local_status
+    """Observe local workspace state without ever taking ownership of selection.
+
+    A timer callback receives the value that existed when its tick started. A
+    slow tick can therefore finish after a person has chosen a different
+    workspace. Updating either the value or the choices from that stale
+    snapshot lets Gradio replace the newer choice, often with the saved
+    ``New workspace`` default. Workspace discovery remains available through
+    the explicit Refresh action and normal app load; this passive observer
+    returns only its status.
+    """
+    _choices, local_status = local_workspace_choices()
+    return gr.update(), local_status
 
 
 @automatic_next_run_callback(12)
@@ -8158,7 +8173,10 @@ def refresh_background_reconciliation(
     selected = (workspace_slug or "").strip()
     snapshot = workspace_ingestion_observer_snapshot(selected, api_url)
     workspace_update, local_status = _background_workspace_update(selected)
-    resolved_workspace = workspace_update.get("value") or ""
+    # The selected value is form state owned by the browser. The background
+    # timer is diagnostic-only and must not use a stale update response as a
+    # substitute for that current selection.
+    resolved_workspace = selected
     readiness = native_upload_readiness_html(
         native_upload_readiness_report(
             api_url,
@@ -11043,20 +11061,27 @@ def automatic_live_status_html(status=None):
     if batch_total:
         batch_completed = min(batch_completed, batch_total)
         batch_current = min(batch_current, batch_total)
-        # ``batch_*_files`` describes local PDF preparation, not the later
-        # AnythingLLM record queue.  Keep that distinction visible once the
-        # prepared files are being attached to a workspace: a completed
-        # preparation batch is necessary, but does not prove upload success.
+        # ``batch_*_files`` counts PDFs that have reached a safe decision in
+        # this batch. A PDF can be safely skipped before parsing, so calling
+        # the counter "prepared" overstates the local work that occurred.
+        # Keep the later AnythingLLM record queue separate from this count.
         is_submission_phase = "submitting" in str(record.get("phase") or "").casefold()
+        terminal_state = state.casefold() in {"successful", "warning", "failed", "cancelled"}
         if is_submission_phase:
-            batch_label = f"Documents prepared: {batch_completed}/{batch_total}"
+            batch_label = f"PDF preparation: {batch_completed}/{batch_total} ready for submission"
+        elif terminal_state:
+            # This counter covers local preparation decisions.  A terminal
+            # partial upload can therefore legitimately show 2/2 here while
+            # only a subset of its vectors is searchable; never label that
+            # as completed PDFs at the terminal state.
+            batch_label = f"PDF preparation finished: {batch_completed}/{batch_total}"
         else:
             page_match = re.search(
                 r":\s*(\d+)\s*/\s*(\d+)\s+pages?\s+processed\b",
                 raw_phase,
                 flags=re.I,
             )
-            batch_label = f"Documents prepared: {batch_completed}/{batch_total}"
+            batch_label = f"PDFs completed: {batch_completed}/{batch_total}"
             if batch_current and batch_completed < batch_total:
                 batch_label += f" · Current PDF: {batch_current}/{batch_total}"
             if page_match:
@@ -11118,6 +11143,26 @@ def refresh_live_automatic_run_status():
     """Read-only UI poller; never changes AnythingLLM or retries work."""
     rendered = automatic_live_status_html()
     return gr.update(value=rendered, visible=True)
+
+
+def automatic_completion_from_durable_record(record):
+    """Recover the structured terminal outcome from durable run status.
+
+    ``run-progress.json`` intentionally stores a human-readable ``details``
+    string so it remains useful outside the browser.  The live UI, however,
+    still needs the machine-readable completion code to choose the accurate
+    terminal control and alert.  Keep the recovery deliberately narrow: a
+    known code is extracted from the durable message, while unknown legacy
+    records retain their state and readable message without inventing a code.
+    """
+    record = record if isinstance(record, dict) else {}
+    message = str(record.get("details") or record.get("message") or "Run completed.")
+    code_match = re.search(r"\b([A-Z][A-Z0-9-]*-\d{3})\b", message)
+    return {
+        "state": str(record.get("state") or ""),
+        "message": message,
+        "code": code_match.group(1) if code_match else "",
+    }
 
 
 def refresh_live_automatic_run_ui(viewed_run_root=None):
@@ -11200,8 +11245,8 @@ def refresh_live_automatic_run_ui(viewed_run_root=None):
         float(record.get("last_activity_epoch") or record.get("updated_epoch") or time.time())
         - float(record.get("started_epoch") or time.time()),
     )
-    message = str(record.get("details") or "Run completed.")
-    completion = {"state": state, "message": message}
+    completion = automatic_completion_from_durable_record(record)
+    message = completion["message"]
     timing = automatic_run_timing_html(
         record.get("expected_seconds", 0),
         "durable run status",
@@ -11213,8 +11258,7 @@ def refresh_live_automatic_run_ui(viewed_run_root=None):
         value=run_summary_html(f"Status: {state}\nCompletion assessment: {message}"),
         visible=True,
     )
-    failure_code_match = re.search(r"\b([A-Z][A-Z0-9-]*-\d{3})\b", message)
-    failure_code = failure_code_match.group(1) if failure_code_match else "AUTO-RUN-RECONCILED-001"
+    failure_code = completion.get("code") or "AUTO-RUN-RECONCILED-001"
     reconciliation_attention = (
         state == "warning"
         and "AUTO-EMBEDDING-RECONCILE-001" in message
@@ -11306,7 +11350,7 @@ def reset_automatic_run_presentation(pdf_files=None, folder_pdf_files=None):
 
 
 @_synchronized_live_automatic_status
-def reset_automatic_run_settings_to_defaults():
+def reset_automatic_run_settings_to_defaults(selected_workspace=""):
     """Restore controls to saved future-run defaults for a fresh selection.
 
     Persisted AnythingLLM engine/model settings are intentionally not changed:
@@ -11325,6 +11369,20 @@ def reset_automatic_run_settings_to_defaults():
     ):
         return tuple(gr.update() for _ in range(45))
     defaults = fresh_automatic_run_setting_values()
+    # File inspection can take long enough for a person to choose a target
+    # workspace while its selection chain is still finishing. Defaults should
+    # reset metadata and processing options for that fresh file set, but they
+    # must not replace a deliberate, currently valid existing workspace with
+    # the saved ``New workspace`` default.
+    selected_workspace = str(selected_workspace or "").strip()
+    known_workspace_slugs = {slug for _label, slug in local_workspace_choices()[0]}
+    workspace_default = defaults["workspace_slug"]
+    if (
+        selected_workspace
+        and not is_new_document_workspace_choice(selected_workspace)
+        and selected_workspace in known_workspace_slugs
+    ):
+        workspace_default = selected_workspace
     # ``reset_automatic_run_presentation`` marks a selected but not-yet-ready
     # form as ``preparing``.  Keep the mode locked until the final selection
     # callback has populated all visible settings and metadata.
@@ -11344,7 +11402,7 @@ def reset_automatic_run_settings_to_defaults():
         gr.update(value=defaults["output_root_override"]),
         gr.update(value=defaults["api_url"]),
         gr.update(value=defaults["api_key"]),
-        gr.update(value=defaults["workspace_slug"]),
+        gr.update(value=workspace_default),
         gr.update(value="", visible=True),
         "",
         gr.update(value=defaults["native_upload_scope"]),
@@ -12823,11 +12881,17 @@ def automatic_run_timing_html(
         # evidence produces a trustworthy replacement. Completion duration is
         # shown separately at the terminal state, where it is factual.
         remaining = max(0, expected - elapsed - acceleration)
-        label = (
-            "Est: recalculating from Desktop queue…"
-            if expected > 0 and remaining == 0
-            else f"Est: {format_estimate_clock(remaining)}"
-        )
+        if expected <= 0 and str(source or "").casefold() == "pre-processing":
+            # Confirmation has been accepted, but the canonical preflight has
+            # not produced an ETA yet.  ``0m00s`` reads as a failed or
+            # completed timer; make the temporary unknown explicit instead.
+            label = "Est: calculating…"
+        else:
+            label = (
+                "Est: recalculating from Desktop queue…"
+                if expected > 0 and remaining == 0
+                else f"Est: {format_estimate_clock(remaining)}"
+            )
     elif state == "cancelled" and actual is not None:
         label = f"Stopped: {format_estimate_clock(actual)}"
     elif actual is not None and state in {"successful", "warning", "failed"}:
@@ -15449,22 +15513,16 @@ def automatic_extraction_method_summary(summaries):
         elif backend:
             counts["layout"] += 1
 
-    def phrase(count, singular, plural):
-        return f"{count} {singular if count == 1 else plural}"
-
     parts = []
     if counts["native"]:
-        parts.append(phrase(counts["native"], "PDF used native text", "PDFs used native text"))
+        parts.append(f"{counts['native']} native")
     if counts["layout"]:
-        parts.append(phrase(counts["layout"], "PDF used layout comparison", "PDFs used layout comparison"))
+        parts.append(f"{counts['layout']} layout")
     if counts["targeted_ocr"]:
-        pages = phrase(counts["targeted_pages"], "page", "pages")
-        parts.append(
-            f"{phrase(counts['targeted_ocr'], 'PDF used targeted OCR', 'PDFs used targeted OCR')} ({pages})"
-        )
+        parts.append(f"{counts['targeted_ocr']} targeted OCR ({counts['targeted_pages']} pages)")
     if counts["full_ocr"]:
-        parts.append(phrase(counts["full_ocr"], "PDF used full-document OCR", "PDFs used full-document OCR"))
-    return "Extraction summary: " + " · ".join(parts) + "." if parts else ""
+        parts.append(f"{counts['full_ocr']} full OCR")
+    return "Extraction: " + " · ".join(parts) + "." if parts else ""
 
 
 def automatic_completion_success_message(summaries, *, include_runtime_note=True):
@@ -15473,32 +15531,50 @@ def automatic_completion_success_message(summaries, *, include_runtime_note=True
         0,
         receipt["confirmed_records"] - receipt["newly_linked_records"],
     )
-    lead = (
-        f"{receipt['pdfs']} PDF(s) are ready in AnythingLLM. Of "
-        f"{receipt['planned_records']} prepared page record(s), "
-        f"{existing_records} were already indexed and re-verified in this workspace; "
-    )
-    if receipt["cached_attachment_reused_records"]:
+    planned_records = receipt["planned_records"]
+    newly_linked = receipt["newly_linked_records"]
+    cached_linked = min(receipt["cached_attachment_reused_records"], newly_linked)
+    fresh_linked = max(0, newly_linked - cached_linked)
+    # This text sits directly beneath the progress bar. Keep one concise,
+    # non-overlapping statement per outcome so it remains readable without
+    # obscuring the final state with repeated record totals.
+    lead = f"{receipt['pdfs']} PDF(s) ready"
+    if newly_linked and cached_linked == newly_linked:
+        if existing_records:
+            lead += f": {existing_records} records re-verified; "
+        else:
+            lead += ": "
         lead += (
-            f"{receipt['newly_linked_records']} were newly linked to this workspace, with exact cached "
-            f"document locations reused for {receipt['cached_attachment_reused_records']}. "
+            f"{newly_linked} records cache-linked and confirmed; no new embedding needed."
         )
-    else:
-        lead += f"{receipt['newly_linked_records']} were newly sent for embedding. "
-    lead += (
-        f"{receipt['confirmed_records']} record(s) are confirmed; "
-        f"{receipt['failed_pdfs']} PDF(s) failed."
-    )
+    elif newly_linked and cached_linked:
+        if existing_records:
+            lead += f": {existing_records} records re-verified; "
+        else:
+            lead += ": "
+        lead += (
+            f"{newly_linked} added and confirmed ({cached_linked} cache-linked; {fresh_linked} embedded)."
+        )
+    elif newly_linked:
+        if existing_records:
+            lead += f": {existing_records} records re-verified; "
+        else:
+            lead += ": "
+        lead += f"{newly_linked} records embedded and confirmed."
+    elif planned_records:
+        lead += (
+            f": all {planned_records} records already indexed and re-verified; no upload needed."
+        )
+    elif receipt["confirmed_records"]:
+        lead += f": {receipt['confirmed_records']} records confirmed."
     if receipt["existing_pdfs_skipped"]:
         if receipt["newly_linked_records"]:
             lead += (
-                f" {receipt['existing_pdfs_skipped']} fully indexed PDF(s) were safely skipped; "
-                "only records missing from this workspace were sent."
+                f" {receipt['existing_pdfs_skipped']} fully indexed PDF(s) safely skipped."
             )
         else:
             lead += (
-                f" All {receipt['existing_pdfs_skipped']} fully indexed PDF(s) were safely skipped; "
-                "no records needed to be sent for embedding."
+                f" {receipt['existing_pdfs_skipped']} PDF(s) safely skipped."
             )
     if receipt["partially_reconciled_pdfs"]:
         lead += (
@@ -15506,17 +15582,32 @@ def automatic_completion_success_message(summaries, *, include_runtime_note=True
             f"{receipt['partially_reconciled_pdfs']} partially indexed PDF(s) were safely reused."
         )
     extraction_summary = automatic_extraction_method_summary(summaries)
-    body = (
-        f" {extraction_summary}" if extraction_summary else ""
-    ) + " Your document(s) are indexed and ready to use in AnythingLLM."
+    body = f" {extraction_summary}" if extraction_summary else ""
     if include_runtime_note and receipt["runtime_retrieval_deferred"]:
-        body += " Optional live retrieval checking was not run; use Workspace verification when you want that separate diagnostic."
+        body += " Retrieval check deferred."
     return lead + body
 
 
 def automatic_completion(summaries, prepare_and_upload):
-    if any(summary.get("app_error_code") for summary in summaries):
-        return {"state": "failed", "message": "Preparation failed; inspect the generated failure report."}
+    preparation_failures = [summary for summary in summaries if summary.get("app_error_code")]
+    if preparation_failures:
+        first = preparation_failures[0]
+        names = ", ".join(
+            Path(str(summary.get("pdf") or "document")).name
+            for summary in preparation_failures[:3]
+        )
+        suffix = "" if len(preparation_failures) <= 3 else f" (+{len(preparation_failures) - 3} more)"
+        code = str(first.get("app_error_code") or "AUTO-PREPARATION-FAILED-001")
+        title = str(first.get("app_error_title") or "Local PDF preparation failed")
+        return {
+            "state": "failed",
+            "code": code,
+            "message": (
+                f"Local preparation failed for {names}{suffix}: {title}. "
+                "The per-PDF failure package and the batch run report retain the exact cause; "
+                "do not treat this terminal state as proof that every selected PDF reached AnythingLLM."
+            ),
+        }
     if not prepare_and_upload:
         return {
             "state": "successful",
@@ -15734,23 +15825,42 @@ def automatic_completion(summaries, prepare_and_upload):
         }
     partial = [summary for summary in summaries if str(summary.get("post_upload_verification_status") or "") == "partial_vector_coverage"]
     if partial:
-        first = partial[0]
+        # A shared Desktop queue can finish one PDF (or a prefix of one PDF)
+        # before its provider connection fails.  Report the selected batch as
+        # a whole: choosing the first partial PDF here previously hid every
+        # later PDF that had zero completed records and made the terminal
+        # warning read like a total failure.
+        partial_scope = [
+            summary for summary in summaries
+            if int(summary.get("post_upload_expected_payloads") or 0) > 0
+            and str(summary.get("api_upload_status") or "")
+            not in {"complete", "complete_with_key_cleanup_warning"}
+        ] or partial
         partial_names = ", ".join(
-            Path(str(summary.get("pdf") or "document")).name for summary in partial[:3]
+            Path(str(summary.get("pdf") or "document")).name for summary in partial_scope[:3]
         )
-        partial_suffix = "" if len(partial) <= 3 else f" (+{len(partial) - 3} more)"
-        observed = int(first.get("post_upload_matching_vectors") or 0)
-        expected = int(first.get("post_upload_expected_payloads") or 0)
+        partial_suffix = "" if len(partial_scope) <= 3 else f" (+{len(partial_scope) - 3} more)"
+        observed = sum(
+            max(0, int(summary.get("post_upload_matching_vectors") or 0))
+            for summary in partial_scope
+        )
+        expected = sum(
+            max(0, int(summary.get("post_upload_expected_payloads") or 0))
+            for summary in partial_scope
+        )
         remaining = max(0, expected - observed)
-        representation = str(first.get("native_upload_representation") or "").casefold()
+        representation = str(partial_scope[0].get("native_upload_representation") or "").casefold()
         record_label = "page-parent vectors" if representation == "page_parents" else "segment vectors"
         coverage = f" ({observed / expected:.0%} confirmed)" if expected else ""
         counts = (
-            f"{observed} of {expected} planned {record_label} were confirmed searchable{coverage}"
+            f"{observed} of {expected} selected {record_label} are searchable{coverage}"
             if expected else "Only part of the prepared document was indexed"
         )
-        recovery = f"; {remaining} remain unconfirmed and require reconciliation before any resubmission" if expected else ""
-        cap_classification = str(first.get("post_upload_reconciliation_cap_classification") or "")
+        recovery = (
+            f"; {remaining} remain unconfirmed and the saved recovery manifest contains only those exact records"
+            if expected else ""
+        )
+        cap_classification = str(partial_scope[0].get("post_upload_reconciliation_cap_classification") or "")
         cap_detail = {
             "reconciliation_cap_partial_vector_progress": " Exact-vector progress was still arriving during the shared 480-second observation window.",
             "reconciliation_cap_queue_heartbeat": " Desktop was still emitting queue activity near the shared 480-second observation cap.",
@@ -15760,7 +15870,12 @@ def automatic_completion(summaries, prepare_and_upload):
         return {
             "state": "failed",
             "code": "AUTO-EMBEDDING-PARTIAL-001",
-            "message": f"AnythingLLM indexing stalled for {partial_names}{partial_suffix}: {counts}{recovery}.{cap_detail} The original Desktop queue was not replayed automatically because its remaining outcome is ambiguous; the saved recovery manifest limits any later resume to this run's exact missing records.",
+            "confirmed_fraction": (observed / expected if expected else None),
+            "message": (
+                f"Partial embedding completed for {partial_names}{partial_suffix}: {counts}{recovery}."
+                f"{cap_detail} The original Desktop queue was not replayed automatically; already searchable records "
+                "are excluded from a later explicit recovery."
+            ),
         }
     reconciliation_pending = [
         summary for summary in summaries
@@ -15842,6 +15957,8 @@ def automatic_completion_phase(completion, prepare_and_upload):
         return "Document(s) ready in AnythingLLM"
     if code == "AUTO-EMBEDDING-RECONCILE-001":
         return "Preparation complete — AnythingLLM verification pending"
+    if code == "AUTO-EMBEDDING-PARTIAL-001":
+        return "Partial embedding completed — recovery available"
     if code == "AUTO-OCR-REVIEW-001":
         return "Local preparation complete — upload withheld for OCR review"
     if code == "AUTO-LAYOUT-REVIEW-001":
@@ -15894,6 +16011,8 @@ def automatic_completion_button_state(completion):
         if (completion or {}).get("code") == "AUTO-EMBEDDING-RECONCILE-001":
             return gr.update(value="Preparation complete — check AnythingLLM", interactive=False, variant="secondary")
         return gr.update(value="Completed — upload checks need review", interactive=False, variant="secondary")
+    if (completion or {}).get("code") == "AUTO-EMBEDDING-PARTIAL-001":
+        return gr.update(value="Partial embedding — recovery available", interactive=False, variant="stop")
     if state == "cancelled":
         return gr.update(value="Processing stopped", interactive=False, variant="secondary")
     return gr.update(value="Processing failed — review report", interactive=False, variant="stop")
@@ -16006,11 +16125,12 @@ def automatic_action_row_updates():
     bars. The retired review control stays hidden; Confirm owns the visible
     terminal state.
     """
-    terminal_state = str((LIVE_AUTOMATIC_RUN_STATUS or {}).get("state") or "")
+    terminal_record = dict(LIVE_AUTOMATIC_RUN_STATUS or {})
+    terminal_state = str(terminal_record.get("state") or "")
     if terminal_state in {"successful", "warning", "failed", "cancelled"}:
         return (
             gr.update(),
-            automatic_completion_button_state({"state": terminal_state}),
+            automatic_completion_button_state(automatic_completion_from_durable_record(terminal_record)),
             gr.update(value="Cancel", interactive=False),
         )
     return (
@@ -16021,10 +16141,24 @@ def automatic_action_row_updates():
 
 
 def automatic_run_failure_banner_html(code, message):
+    # Durable status records include ``CODE: message`` so they remain useful
+    # outside the rendered alert.  The alert already has a dedicated code
+    # label; remove only that leading duplicate rather than showing the same
+    # code twice in the browser.
+    rendered_message = safe_user_error_text(message)
+    normalized_code = str(code or "").strip()
+    if normalized_code:
+        rendered_message = re.sub(
+            rf"^\s*{re.escape(normalized_code)}\s*:\s*",
+            "",
+            rendered_message,
+            count=1,
+            flags=re.I,
+        )
     return (
         '<div class="automatic-run-failure" role="alert">'
         f'<strong>Run needs attention ({html.escape(str(code))}).</strong> '
-        f'{html.escape(safe_user_error_text(message))} Open <em>Run output and downloads</em> for the full report.'
+        f'{html.escape(rendered_message)} Open <em>Run output and downloads</em> for the full report.'
         '</div>'
     )
 
@@ -16038,6 +16172,14 @@ def automatic_run_failure_banner_update(code, message):
 
 def automatic_run_result_failure_banner(run_outputs):
     """Expose handled pipeline failures outside the collapsed output accordion."""
+    durable_completion = automatic_completion_from_durable_record(
+        dict(LIVE_AUTOMATIC_RUN_STATUS or {})
+    )
+    if durable_completion.get("state") == "failed":
+        return automatic_run_failure_banner_update(
+            durable_completion.get("code") or "AUTO-RUN-RESULT-001",
+            durable_completion.get("message") or "The run returned a failure report instead of a successful result.",
+        )
     summary_update = run_outputs[0] if isinstance(run_outputs, (tuple, list)) and run_outputs else {}
     rendered = str((summary_update or {}).get("value") or "") if isinstance(summary_update, dict) else ""
     if 'summary-status error' in rendered:
@@ -16071,12 +16213,22 @@ def completed_native_upload_requires_desktop_refresh(run_outputs):
     # class. Accept both renderings so a completed warning run (which may have
     # attached documents before a later retrieval check failed) is still able
     # to notify the guarded Desktop bridge. Never refresh a failed run.
-    return bool(re.search(
+    terminal_state = bool(re.search(
         r'(?:data-run-state|summary-status)\s*=\s*["\']?(?:successful|warning|completed)["\']?'
         r'|summary-status\s+(?:successful|warning|completed)',
         rendered,
         re.I,
     ))
+    # A partial result is not a successful run, but exact vector evidence
+    # proves that Desktop storage changed.  Its sidebar needs the same
+    # best-effort notification as a completed mutation; this is only a UI
+    # refresh and never a retry or a claim that the remaining records worked.
+    durable_details = str((LIVE_AUTOMATIC_RUN_STATUS or {}).get("details") or "")
+    partial_mutation = (
+        "AUTO-EMBEDDING-PARTIAL-001" in rendered
+        or "AUTO-EMBEDDING-PARTIAL-001" in durable_details
+    )
+    return terminal_state or partial_mutation
 
 
 def automatic_confirmation_failure_response(code, title, details, next_steps=None, timing_html=None):
@@ -16572,7 +16724,7 @@ def automatic_run_started_response(settings):
         ),
         gr.update(),
         gr.update(value="", visible=False),
-        gr.update(value="Starting processing…", interactive=False, variant="primary"),
+        gr.update(value="Processing…", interactive=False, variant="primary"),
         gr.update(value="Cancel", interactive=True, visible=True),
         gr.update(visible=False, interactive=False),
     )
@@ -16589,24 +16741,23 @@ def automatic_preprocessing_started_response():
         gr.update(
             value=run_summary_html(
                 "Status: preparing\n"
-                "Settings are confirmed. Starting the run: validating selected files, verifying native text coverage, and checking OCR risk where needed."
+                "Preparing selected PDFs. Checking files and AnythingLLM readiness."
             ),
             visible=True,
         ),
         gr.update(),
         gr.update(),
         gr.update(),
-        gr.update(value="Preparing…", interactive=False, variant="primary"),
+        gr.update(value="Processing…", interactive=False, variant="primary"),
         gr.update(),
         automatic_run_timing_html(0, "pre-processing", state="running", server_driven=True),
         gr.update(),
         gr.update(value="", visible=False),
         # This is the visible acknowledgement immediately after the user
-        # commits the settings. Keep it distinct from the later processing
-        # state: validation and run-folder reservation can take a moment,
-        # and a static "Confirm and start processing" button made that pause
-        # look like a missed click.
-        gr.update(value="Starting confirmed run…", interactive=False, variant="primary"),
+        # commits the settings.  Keep the same steady Processing label used by
+        # the worker instead of narrating internal confirmation mechanics.
+        # The durable status trace still records validation and reservation.
+        gr.update(value="Processing…", interactive=False, variant="primary"),
         gr.update(value="Cancel", interactive=False, visible=True),
         gr.update(visible=False, interactive=False),
     )
@@ -16637,9 +16788,9 @@ def run_automatic_from_confirmation_stream(*values, progress=gr.Progress(track_t
         if not already_owned:
             update_live_automatic_run_status(
                 state="preparing",
-                phase="Pre-processing: validating selected files",
+                phase="Preparing selected PDFs",
                 expected_seconds=0,
-                details="Verifying native text coverage and OCR risk where needed.",
+                details="Checking files and AnythingLLM readiness.",
                 confirmed_fraction=0.0,
                 cancel_available=False,
                 confirmation_in_flight=True,
@@ -19239,6 +19390,21 @@ def upload_prepared_automatic_batch(
         for chunk_source in ((batch.get("verification") or {}).get("observed_chunk_sources") or [])
         if str(chunk_source).strip()
     }
+    # A live ``fast`` observer intentionally avoids materialising every
+    # chunkSource on every poll.  When an unresolved Desktop receipt reaches
+    # its boundary, however, it *does* retain the exact newly-attached
+    # locations that already own vectors.  Use those locations for the
+    # per-PDF result below.  Falling back to an empty identity set used to
+    # report a 289/322 partial success as though both PDFs had wholly failed.
+    # The locations are UUID-suffixed per submission, so they are stronger
+    # evidence than a stable source identity and cannot be confused with an
+    # earlier duplicate in the selected workspace.
+    observed_vector_locations = {
+        str(location or "").replace("\\", "/").lstrip("/")
+        for batch in batch_reports
+        for location in ((batch.get("verification") or {}).get("current_upload_locations_with_vectors") or [])
+        if str(location or "").strip()
+    }
     global_errors = [
         str(error.get("error") or error.get("details") or error.get("response") or "").strip()
         for error in (report.get("errors") or [])
@@ -19286,7 +19452,22 @@ def upload_prepared_automatic_batch(
             if str(attachment.get("status") or "") == "reused_cached_location"
         )
         expected_sources = {str(row.get("chunkSource") or "").strip() for row in rows if str(row.get("chunkSource") or "").strip()}
-        matched_sources = expected_sources if searchable else expected_sources & observed_sources
+        # Preserve the legacy identity-set route for a complete success, but
+        # attribute an incomplete shared queue by its exact current upload
+        # locations.  This produces a truthful source-local partial receipt
+        # even when the lightweight observer deliberately omitted the full
+        # chunkSource materialisation.
+        source_confirmed_sources = {
+            str(attachment.get("chunk_source") or "").strip()
+            for attachment in source_attachments
+            if str(attachment.get("location") or "").replace("\\", "/").lstrip("/")
+            in observed_vector_locations
+        }
+        matched_sources = (
+            expected_sources
+            if searchable
+            else (expected_sources & (observed_sources | source_confirmed_sources))
+        )
         attached_complete = len(source_attachments) == len(rows) and all(
             str(attachment.get("status") or "") in {"attached", "reused_cached_location"}
             for attachment in source_attachments
@@ -19415,6 +19596,15 @@ def upload_prepared_automatic_batch(
         1
         for attachment in (report.get("attachment_results") or [])
         if str((attachment or {}).get("status") or "") in {"attached", "reused_cached_location"}
+    )
+    # ``maybe_upload_to_anythingllm`` can only call its request accepted once
+    # the full Desktop queue returns.  For a timed-out queue that value is
+    # necessarily zero even when exact vector evidence proves that a prefix
+    # completed.  The source-local results above are the authoritative
+    # post-observation count used by the terminal receipt.
+    report["embedded"] = sum(
+        max(0, int(result.get("embedded") or 0))
+        for result in document_results.values()
     )
     report["cache_reuse_explanation"] = (
         "Exact cached AnythingLLM document locations were linked to this workspace; this is distinct from records already indexed in the workspace."
@@ -20128,6 +20318,20 @@ def run_automatic(
     active_file_index = 0
     planned_batch_adjustments = {}
     cache_realization_eta_applied = False
+    # The Desktop observer currently reports one combined queue rate.  Once a
+    # read-only snapshot proves that a queue contains cache-backed records,
+    # that rate is not a provider-only measurement: cache attachments can
+    # finish immediately while fresh records still wait on the embedding
+    # provider.  Keep the exact snapshot here so the observer can continue to
+    # report progress without using that mixed rate to reprice the ETA.
+    cache_plan_context = {
+        "exact_snapshot_observed": False,
+        "suppress_combined_queue_rate": False,
+        "queue_records": 0,
+        "cached_records": 0,
+        "fresh_records": 0,
+        "rate_guard_recorded": False,
+    }
     initial_expected_seconds = expected_seconds
     timing_features = dict(run_timing_estimate.get("features") or {})
     desktop_serial_queue = (
@@ -20238,21 +20442,40 @@ def run_automatic(
             queue_event_samples = max(0, int(report.get("desktop_queue_events_observed") or 0))
         except (TypeError, ValueError):
             queue_event_samples = 0
-        # Require a material part of a long queue, while still allowing a
-        # small document to learn after at least three completed records.
-        required_queue_samples = min(
-            QUEUE_ETA_MIN_COMPLETED_RECORDS,
-            max(3, int(math.ceil(queue_total * .02))) if queue_total else QUEUE_ETA_MIN_COMPLETED_RECORDS,
+        # A handful of early records is not a representative provider rate on
+        # a long Desktop queue.  Preserve the classic bounded live reprice,
+        # but wait for its established completion threshold (or the whole
+        # queue when it is smaller) before treating the observer as mature.
+        required_queue_samples = (
+            min(QUEUE_ETA_MIN_COMPLETED_RECORDS, queue_total)
+            if queue_total
+            else QUEUE_ETA_MIN_COMPLETED_RECORDS
         )
         queue_rate_is_mature = (
             queue_completed >= required_queue_samples
             and queue_event_samples >= min(QUEUE_ETA_MIN_EVENT_SAMPLES, required_queue_samples)
         )
+        combined_queue_rate_is_safe = not bool(
+            cache_plan_context.get("suppress_combined_queue_rate")
+        )
+        if (
+            not combined_queue_rate_is_safe
+            and not cache_plan_context.get("rate_guard_recorded")
+        ):
+            cache_plan_context["rate_guard_recorded"] = True
+            run_timing_estimate["queue_rate_repricing_guard"] = {
+                "reason": "combined_cache_and_provider_queue_rate",
+                "queue_records": int(cache_plan_context.get("queue_records") or 0),
+                "cached_records": int(cache_plan_context.get("cached_records") or 0),
+                "fresh_records": int(cache_plan_context.get("fresh_records") or 0),
+                "action": "preserved_confirmed_prequeue_cache_plan",
+            }
         if (
             live.get("run_root") == str(run_root)
             and queue_rate > 0.0
             and queue_remaining is not None
             and queue_rate_is_mature
+            and combined_queue_rate_is_safe
         ):
             try:
                 remaining_seconds = max(0.0, float(queue_remaining))
@@ -21174,6 +21397,13 @@ def run_automatic(
                 # A zero-cache snapshot is still a completed observation, but
                 # it must leave the classic estimate wholly untouched.
                 if queue_records and cached_records:
+                    cache_plan_context.update({
+                        "exact_snapshot_observed": True,
+                        "suppress_combined_queue_rate": True,
+                        "queue_records": queue_records,
+                        "cached_records": cached_records,
+                        "fresh_records": fresh_records,
+                    })
                     elapsed = max(0.0, time.perf_counter() - started_at)
                     repriced_expected = confirmed_prequeue_cache_eta_seconds(
                         expected_seconds,
@@ -21231,6 +21461,19 @@ def run_automatic(
                     f"{prepared_skip_count} confirmed after exact record reconciliation; "
                     f"{reconciled_count} partially indexed PDF(s); {len(report.get('remaining_documents') or []) if isinstance(report.get('remaining_documents'), list) else max(0, int(report.get('remaining_documents') or 0))} PDF(s) / "
                     f"{remaining_records} page record(s) remain for submission"
+                )
+            # The native queue event already names cached reuse when it is
+            # actually attaching one. Repeat the compact plan only for the
+            # surrounding receipt and verification messages, where it adds
+            # context instead of making every live line longer.
+            if (
+                cache_plan_context.get("exact_snapshot_observed")
+                and "cache" not in stage_text.casefold()
+            ):
+                stage_text = (
+                    f"{stage_text} — Cache plan: "
+                    f"{int(cache_plan_context['cached_records'])} cached / "
+                    f"{int(cache_plan_context['fresh_records'])} require normal embedding."
                 )
             update_live_automatic_run_status(
                 run_root,
@@ -21860,7 +22103,13 @@ def run_automatic(
             if completion.get("code")
             else completion["message"]
         ),
-        confirmed_fraction=1.0 if completion["state"] == "successful" else None,
+        # A partial terminal result owns an exact selected-record coverage
+        # fraction. Preserve it instead of leaving the previous phase-budget
+        # percentage on screen (for example, 80% beside a proven 289/322).
+        confirmed_fraction=(
+            1.0 if completion["state"] == "successful"
+            else completion.get("confirmed_fraction")
+        ),
         # A terminal record must never advertise a still-actionable Cancel
         # control. The streamed completion response disables it too, but the
         # durable one-second status poll is an independent UI path.
@@ -22775,13 +23024,6 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     visible=False,
                     elem_id="automatic-run-failure",
                 )
-            with gr.Row():
-                open_generated_output_button = gr.Button(
-                    "Open Generated Output Folder",
-                    interactive=False,
-                    visible=False,
-                    elem_id="open-generated-output-button",
-                )
             auto_download_state = gr.State([])
             with gr.Accordion(
                 "Run output and downloads",
@@ -22790,6 +23032,18 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 elem_classes=["top-level-accordion", "output-downloads-accordion"],
             ) as run_output_downloads_section:
                 auto_summary = gr.HTML(value="", visible=False, elem_classes=["automatic-run-summary"])
+                # This action becomes available only after a terminal run.
+                # Keeping it inside the already-mounted output accordion
+                # avoids creating a new top-level row at completion, which
+                # previously made the page visibly jump just as the success
+                # state arrived.
+                with gr.Row():
+                    open_generated_output_button = gr.Button(
+                        "Open Generated Output Folder",
+                        interactive=False,
+                        visible=False,
+                        elem_id="open-generated-output-button",
+                    )
                 with gr.Group(elem_id="automatic-download-section", elem_classes=["automatic-download-section"]):
                     with gr.Row(elem_classes=["downloads-header-row"]):
                         gr.HTML('<div class="downloads-header-title">Prepared text files</div>')
@@ -23354,7 +23608,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=reset_automatic_run_settings_to_defaults,
-                inputs=None,
+                inputs=[workspace_slug],
                 outputs=fresh_run_settings_outputs,
                 show_progress="hidden",
                 queue=False,
@@ -23487,7 +23741,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=reset_automatic_run_settings_to_defaults,
-                inputs=None,
+                inputs=[workspace_slug],
                 outputs=fresh_run_settings_outputs,
                 show_progress="hidden",
                 queue=False,
@@ -23631,7 +23885,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=reset_automatic_run_settings_to_defaults,
-                inputs=None,
+                inputs=[workspace_slug],
                 outputs=fresh_run_settings_outputs,
                 show_progress="hidden",
                 queue=False,
@@ -23741,7 +23995,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=reset_automatic_run_settings_to_defaults,
-                inputs=None,
+                inputs=[workspace_slug],
                 outputs=fresh_run_settings_outputs,
                 show_progress="hidden",
                 queue=False,
@@ -23838,6 +24092,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=reset_automatic_run_settings_to_defaults,
+                inputs=[workspace_slug],
                 outputs=fresh_run_settings_outputs,
                 show_progress="hidden",
                 queue=False,

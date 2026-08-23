@@ -161,7 +161,7 @@ def main(config_path: str) -> int:
     _emit_event(
         events_path,
         0.0,
-        "Worker started",
+        "Preparing PDF",
         phase="worker_lifecycle",
         evidence_kind="worker_started",
     )
@@ -188,7 +188,7 @@ def main(config_path: str) -> int:
         _emit_event(
             events_path,
             1.0,
-            "Worker finished",
+            "PDF preparation finished",
             phase="worker_lifecycle",
             completed_units=1,
             total_units=1,
