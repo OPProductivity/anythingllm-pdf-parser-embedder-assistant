@@ -48,17 +48,17 @@ def test_renders_a_cache_reuse_status_only_for_explicit_cache_evidence(tmp_path)
 
     assert _anythingllm_vector_cache_hit(tmp_path, location)
     assert not _anythingllm_vector_cache_hit(tmp_path, "custom-documents/other.txt")
-    assert anythingllm_embed_progress_message(
+    message = anythingllm_embed_progress_message(
         {
             "type": "doc_starting",
             "docIndex": 0,
             "totalDocs": 1,
             "vector_cache_hit": True,
         }
-    ) == (
-        "AnythingLLM Desktop queue: reusing cached embeddings for record 1/1; "
-        "writing its page-parent record to this workspace"
     )
+    assert "record 1/1" in message
+    assert "reusing its cached embeddings" in message
+    assert "page-parent record" in message
 
 
 def test_reuses_only_an_exact_cached_page_parent_document(tmp_path):

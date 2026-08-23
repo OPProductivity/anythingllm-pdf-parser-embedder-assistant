@@ -16,6 +16,7 @@ does not prove a later one.
 import argparse
 import csv
 import concurrent.futures
+from difflib import SequenceMatcher
 import hashlib
 import html
 import io
@@ -736,6 +737,7 @@ AUTHOR_AFFILIATION_HINTS = {
     "laboratory",
     "lab",
     "research",
+    "researcher",
     "google",
     "facebook",
     "microsoft",
@@ -743,6 +745,23 @@ AUTHOR_AFFILIATION_HINTS = {
     "anthropic",
     "amazon",
     "meta",
+}
+
+POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES = {
+    "text_byline",
+    "text_written_by",
+    "text_edited_by",
+    "text_review_byline",
+    "text_column_byline",
+    "text_author_label",
+    "text_writer_label",
+    "text_bibliographic_author_label",
+    "text_instructor_label",
+    "text_affiliated_byline",
+    "text_adjacent_affiliated_byline",
+    "text_stacked_affiliated_byline",
+    "text_bibliographic_byline",
+    "text_compact_caps_byline",
 }
 
 AUTHOR_ORGANIZATION_TERMS = {
@@ -1000,6 +1019,10 @@ def normalize_author_candidate(value):
         candidate,
         flags=re.I,
     )
+    # OCR title pages sometimes join a single-letter middle initial to an
+    # all-caps surname (``WARREN I.SUSMAN``). This is a spacing repair, not a
+    # name guess: keep the original letters and only restore the separator.
+    candidate = re.sub(r"\b([A-Z])\.([A-Z]{2,})\b", r"\1. \2", candidate)
     candidate = re.sub(r"\b(?:with a foreword by|foreword by)\b.*$", "", candidate, flags=re.I)
     candidate = re.sub(r"\([^)]*(?:@|www\.|http|doi:)[^)]*\)", "", candidate, flags=re.I)
     candidate = re.sub(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", "", candidate, flags=re.I)
@@ -1007,7 +1030,27 @@ def normalize_author_candidate(value):
     if "," in candidate and not re.search(r"\b(?:Jr|Sr|III|IV|V)\b", candidate):
         parts = [part.strip(" ,;:-") for part in candidate.split(",") if part.strip(" ,;:-")]
         if len(parts) == 2:
-            candidate = f"{parts[1]} {parts[0]}".strip()
+            # Library and inter-library-loan exports commonly carry
+            # ``Surname, First (First M.)``. The parenthetical is a fuller
+            # given name, not a second author.
+            surname, given = parts
+            expanded_given = re.fullmatch(r"\s*([^()]+?)\s*\(([^()]+)\)\s*", given)
+            if expanded_given:
+                alternate = expanded_given.group(2).strip()
+                if re.fullmatch(r"[A-Za-zÀ-ÖØ-öø-ÿ.' -]{2,50}", alternate):
+                    given = alternate
+                else:
+                    given = expanded_given.group(1)
+            candidate = f"{given} {surname}".strip()
+    # Parenthetical contact/affiliation material is not part of a person's
+    # name. Keep a name-only parenthetical above (the catalog case), but drop
+    # common institutional addenda in ordinary visible bylines.
+    candidate = re.sub(
+        r"\s*\((?:[^)]*\b(?:university|department|college|school|institute|press|email|@|www\.|doi:)\b[^)]*)\)",
+        "",
+        candidate,
+        flags=re.I,
+    )
     candidate = re.sub(r"\s+", " ", candidate).strip(" ,;:-—–")
     return candidate
 
@@ -1056,13 +1099,19 @@ def looks_like_person_name(value, title_hint="", *, allow_all_caps=True):
         return False
     if looks_like_non_person_byline(candidate):
         return False
-    if any(token in lowered for token in {"http", "www.", "@", "doi", "issn", "url"}):
+    # These are lexical markers, not arbitrary substrings: ``Fleissner``
+    # contains the character sequence ``issn`` and is a perfectly valid
+    # surname.  Require a standalone protocol/identifier marker instead.
+    if re.search(r"(?:https?://|\bwww\.|@|\b(?:doi|issn|url)\b)", lowered):
         return False
     if re.search(r"\d", candidate):
         return False
     if candidate.count(" ") > 5:
         return False
-    words = re.findall(r"[A-Za-z][A-Za-z'.-]*", candidate)
+    # ``\w`` in Unicode mode includes letters such as Ł, É, and Ø. Exclude
+    # digits/underscores explicitly so author validation remains strict while
+    # not silently dropping legitimate non-ASCII personal names.
+    words = re.findall(r"[^\W\d_][\w'.-]*", candidate, flags=re.UNICODE)
     if len(words) < 2 or len(words) > 5:
         return False
     if any(word.casefold().rstrip(".") in AUTHOR_ORGANIZATION_TERMS for word in words):
@@ -1085,12 +1134,161 @@ def looks_like_person_name(value, title_hint="", *, allow_all_caps=True):
     return True
 
 
+def looks_like_publisher_imprint_line(value):
+    """Whether a single neighboring line is a plausible publisher imprint."""
+    line = normalize_text(value or "").casefold()
+    if not line or len(line) > 160:
+        return False
+    return bool(
+        re.search(
+            r"\b(?:press|publisher(?:s)?|university\s+press|institution\s+press|"
+            r"academic\s+press|scholarly\s+press)\b",
+            line,
+        )
+    )
+
+
+def strip_known_extraction_structure_labels(text):
+    """Remove parser classification prefixes, never source bracket text broadly.
+
+    Unstructured may emit its own labels at the start of a recovered line.
+    They are not source wording and can make ``[NarrativeText] More recently``
+    appear to be a capitalized personal name. Restrict removal to this small,
+    known set rather than stripping arbitrary bracketed source content.
+    """
+    labels = (
+        "NarrativeText|UncategorizedText|Title|ListItem|Header|Footer|"
+        "Caption|FigureCaption|Table|Address|EmailAddress|Image|Formula"
+    )
+    return re.sub(rf"(?mi)^\s*\[(?:{labels})\]\s*", "", str(text or ""))
+
+
+def has_author_affiliation_hint(value, *, max_chars=180):
+    """Recognize a compact affiliation tail without treating prose as one."""
+    normalized = normalize_text(value or "")
+    if not normalized or len(normalized) > max(40, int(max_chars or 180)):
+        return False
+    lowered = normalized.casefold()
+    return any(re.search(rf"\b{re.escape(hint)}\b", lowered) for hint in AUTHOR_AFFILIATION_HINTS)
+
+
+def extract_adjacent_affiliated_name_pairs(line, title_hint=""):
+    """Recover a compact multi-author line followed by an affiliation/email.
+
+    This handles common scholarly title pages where names are adjacent instead
+    of comma-separated (``Jane Doe John Roe ... University {emails}``). It
+    requires at least two independently person-shaped name pairs before a
+    compact affiliation/email marker, so ordinary prose is not promoted.
+    """
+    raw = normalize_text(line or "")
+    if not raw:
+        return []
+    email_or_affiliation = bool(re.search(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b", raw)) or has_author_affiliation_hint(raw)
+    if not email_or_affiliation:
+        return []
+    match = re.search(
+        r"\b(?:university|institute|school|department|college|laboratory|lab|research|google|facebook|microsoft|openai|anthropic|amazon|meta)\b|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}",
+        raw,
+        flags=re.I,
+    )
+    prefix = raw[: match.start()] if match else raw.split("{")[0]
+    tokens = re.findall(r"[A-Z][A-Za-z'.-]*", prefix)
+    if len(tokens) < 4 or len(tokens) % 2:
+        return []
+    candidates = []
+    for index in range(0, len(tokens), 2):
+        candidate = normalize_author_candidate(" ".join(tokens[index:index + 2]))
+        if not looks_like_person_name(candidate, title_hint=title_hint, allow_all_caps=True):
+            return []
+        if candidate not in candidates:
+            candidates.append(candidate)
+    return candidates if len(candidates) >= 2 else []
+
+
+def extract_stacked_affiliated_names(lines, title_hint=""):
+    """Recover title-page names stacked above affiliation/email lines.
+
+    Scholarly PDFs commonly render each author on one line and put their
+    shared affiliation/email block immediately below. Accept a run of two or
+    more person-shaped lines before that block, or a single name only when a
+    direct email follows. This is deliberately constrained to the opening
+    title block supplied by the caller.
+    """
+    values = [normalize_text(line) for line in (lines or []) if normalize_text(line)]
+    recovered = []
+    index = 0
+    while index < len(values):
+        line = values[index]
+        if has_author_affiliation_hint(line) or "@" in line:
+            index += 1
+            continue
+        candidate = normalize_author_candidate(line)
+        if not looks_like_person_name(candidate, title_hint=title_hint, allow_all_caps=False):
+            index += 1
+            continue
+        group = [candidate]
+        cursor = index + 1
+        while cursor < len(values):
+            next_line = values[cursor]
+            if has_author_affiliation_hint(next_line) or "@" in next_line:
+                break
+            next_candidate = normalize_author_candidate(next_line)
+            if not looks_like_person_name(next_candidate, title_hint=title_hint, allow_all_caps=False):
+                break
+            group.append(next_candidate)
+            cursor += 1
+        # A wrapped title can end with a connector (for example ``... for``)
+        # immediately above its final title words. If that phrase is then
+        # followed by a real multi-author block, do not make the wrapped
+        # title tail its first author. Restrict this correction to a multi-
+        # name group; a single author directly below a long title remains a
+        # valid common layout.
+        previous = values[index - 1] if index else ""
+        if (
+            len(group) >= 2
+            and re.search(r"\b(?:for|of|and|the|in|on|to|with|from)\s*$", previous, flags=re.I)
+        ):
+            group = group[1:]
+        context = values[cursor: cursor + 3]
+        context_has_email = any("@" in value for value in context)
+        context_has_affiliation = any(has_author_affiliation_hint(value) for value in context)
+        if context_has_email or (context_has_affiliation and len(group) >= 2):
+            for name in group:
+                if name not in recovered:
+                    recovered.append(name)
+            index = max(cursor, index + 1)
+        else:
+            index += 1
+    return recovered
+
+
+def is_high_confidence_all_caps_titlepage_author(candidate, following_line, title_hint=""):
+    """Accept an ambiguous all-caps title-page name only with two signals.
+
+    A publisher line by itself does not establish that the line above it is a
+    person: book titles and subtitles commonly occupy exactly that position.
+    Outside an explicit ``By``/``Author`` label, require both an immediate
+    imprint and a separated one-letter middle initial. This is intentionally
+    precision-first. A bare ``JOHN DOE`` title page may remain unresolved,
+    whereas a phrase such as ``TWENTIETH CENTURY`` can never become metadata.
+    """
+    normalized = normalize_author_candidate(candidate)
+    words = re.findall(r"[A-Za-z][A-Za-z'.-]*", normalized)
+    has_middle_initial = any(re.fullmatch(r"[A-Z]\.", word) for word in words)
+    return bool(
+        3 <= len(words) <= 4
+        and has_middle_initial
+        and looks_like_person_name(normalized, title_hint=title_hint, allow_all_caps=True)
+        and looks_like_publisher_imprint_line(following_line)
+    )
+
+
 def split_author_line_candidates(line, title_hint="", *, allow_all_caps=True):
     raw = re.sub(r"[*†‡§¶∗0-9]+", " ", line or "")
     raw = re.sub(r"\s+", " ", raw).strip(" ,;:-")
     if not raw or "@" in raw:
         return []
-    if any(term in raw.casefold() for term in AUTHOR_AFFILIATION_HINTS):
+    if has_author_affiliation_hint(raw):
         return []
     pieces = [
         piece.strip(" ,;:-")
@@ -1129,7 +1327,14 @@ def extract_adjacent_person_names(line, title_hint="", *, allow_all_caps=True):
     raw = re.sub(r"\s+", " ", raw).strip(" ,;:-")
     if not raw or "@" in raw:
         return []
-    if any(term in raw.casefold() for term in AUTHOR_AFFILIATION_HINTS):
+    if has_author_affiliation_hint(raw):
+        return []
+    # Pulling capitalized pairs out of an arbitrary title line is exactly how
+    # a subtitle such as ``Feminist Video Revolution`` became an "author".
+    # Use this recovery only when the line structurally advertises a list of
+    # people (footnote markers or explicit list separators). Ordinary bare
+    # title-block names remain handled by the direct candidate path below.
+    if not re.search(r"(?:[*†‡§¶∗]\s*\d|[;·&]|\band\b)", raw, flags=re.I):
         return []
     matches = re.findall(r"\b(?:[A-Z][A-Za-z'.-]*\s+){1,3}[A-Z][A-Za-z'.-]*\b", raw)
     candidates = []
@@ -1154,10 +1359,13 @@ def infer_author_from_text_samples(samples, title_hint=""):
         (r"(?:^|\n)\s*author(?:\(s\))?\s*[:\-]\s*([A-Z][A-Za-z.,'\- &]{3,90})", "text_author_label"),
         (r"(?:^|\n)\s*authors?(?:\(s\))?\s*[:\-]\s*([A-Z][A-Za-z.,'\- &]{3,90})", "text_author_label"),
         (r"(?:^|\n)\s*writers?\s*[:\-]\s*([A-Z][A-Za-z.,'\- &]{3,90})", "text_writer_label"),
+        (r"(?:^|\n)\s*(?:book|chapter|article|document)\s+author\s*[:\-]\s*([^\n]{3,90})", "text_bibliographic_author_label"),
         (r"(?:^|\n)\s*instructor\s*[:\-]\s*([^\n]{3,90})", "text_instructor_label"),
     ]
     for sample in samples:
-        raw_text = str(sample.get("text") or "").replace("\r\n", "\n").replace("\r", "\n")
+        raw_text = strip_known_extraction_structure_labels(
+            str(sample.get("text") or "").replace("\r\n", "\n").replace("\r", "\n")
+        )
         text = normalize_text(raw_text)
         page = int(sample.get("page") or 0)
         if not text:
@@ -1172,14 +1380,14 @@ def infer_author_from_text_samples(samples, title_hint=""):
         for line in lines[:24]:
             candidate = ""
             comma_match = re.match(r"^(.{3,80}?),\s*(.+)$", line)
-            if comma_match and any(
-                hint in comma_match.group(2).casefold() for hint in AUTHOR_AFFILIATION_HINTS
+            if (
+                comma_match
+                and has_author_affiliation_hint(comma_match.group(2), max_chars=180)
+                and len(comma_match.group(2).split()) <= 18
             ):
                 candidate = comma_match.group(1)
             parenthetical_match = re.match(r"^(.{3,80}?)\s*\(([^)]{3,100})\)\s*$", line)
-            if parenthetical_match and any(
-                hint in parenthetical_match.group(2).casefold() for hint in AUTHOR_AFFILIATION_HINTS
-            ):
+            if parenthetical_match and has_author_affiliation_hint(parenthetical_match.group(2), max_chars=120):
                 candidate = parenthetical_match.group(1)
             candidate = normalize_author_candidate(candidate)
             if candidate and looks_like_person_name(candidate, title_hint=title_hint):
@@ -1192,6 +1400,18 @@ def infer_author_from_text_samples(samples, title_hint=""):
                 "page": page,
                 "evidence": " / ".join(affiliated_names[:4]),
             }
+        for line in lines[:16]:
+            adjacent_affiliated_names = extract_adjacent_affiliated_name_pairs(
+                line,
+                title_hint=title_hint,
+            )
+            if adjacent_affiliated_names:
+                return {
+                    "author": ", ".join(adjacent_affiliated_names[:12]),
+                    "source": "text_adjacent_affiliated_byline",
+                    "page": page,
+                    "evidence": " / ".join(adjacent_affiliated_names[:4]),
+                }
         for index, line in enumerate(lines[:12]):
             candidate = normalize_author_candidate(line)
             if not looks_like_person_name(candidate, title_hint=title_hint):
@@ -1235,7 +1455,85 @@ def infer_author_from_text_samples(samples, title_hint=""):
                     "evidence": match.group(0).strip(),
                 }
 
+        # Explicit ``By``/``Author``/``Instructor`` labels above are more
+        # reliable than title-block geometry. Only then consider the compact
+        # stacked-name layout used by scholarly title pages.
+        stacked_affiliated_names = extract_stacked_affiliated_names(
+            lines[:40],
+            title_hint=title_hint,
+        )
+        if stacked_affiliated_names:
+            return {
+                "author": ", ".join(stacked_affiliated_names[:12]),
+                "source": "text_stacked_affiliated_byline",
+                "page": page,
+                "evidence": " / ".join(stacked_affiliated_names[:4]),
+            }
+
         top_lines = lines[:18]
+        # Title pages frequently place a single ordinary-cased author line
+        # immediately beside a publisher imprint. That is strong enough to
+        # accept without mistaking preceding title fragments for a byline.
+        # Restrict the search to the opening page and a short window so a
+        # later citation/reference cannot leak into document metadata.
+        if page == 1:
+            for index, line in enumerate(top_lines[:12]):
+                candidate = normalize_author_candidate(line)
+                if not looks_like_person_name(candidate, title_hint=title_hint, allow_all_caps=False):
+                    continue
+                nearby = " ".join(top_lines[max(0, index - 2): min(len(top_lines), index + 4)])
+                if re.search(r"\b(?:university\s+press|press|publisher|published\s+by)\b", nearby, flags=re.I):
+                    return {
+                        "author": candidate,
+                        "source": "text_titlepage_publisher_byline",
+                        "page": page,
+                        "evidence": f"{line} / publisher-imprint-nearby",
+                    }
+            # Some scanned articles split a compact all-caps byline over the
+            # first two visual lines. Only consider that exact position: a
+            # wider scan would turn a stacked book title into a person's name.
+            if len(top_lines) >= 2:
+                stacked = normalize_author_candidate(f"{top_lines[0]} {top_lines[1]}")
+                if (
+                    re.fullmatch(r"(?:[A-Z][A-Z'.-]*\s+){1,3}[A-Z][A-Z'.-]*", stacked)
+                    # The filename/title hint can itself contain an explicit
+                    # ``-first-last`` credit. Here the first-two-lines layout
+                    # is independent author evidence, so do not reject the
+                    # name merely because that same credit also appears in a
+                    # machine-generated filename.
+                    and looks_like_person_name(stacked, title_hint="", allow_all_caps=True)
+                ):
+                    return {
+                        "author": stacked,
+                        "source": "text_first_lines_stacked_byline",
+                        "page": page,
+                        "evidence": f"{top_lines[0]} / {top_lines[1]}",
+                    }
+            # A one-line all-caps byline is accepted only when followed
+            # immediately by an imprint *and* it has a structural personal
+            # name cue. A publisher alone is not enough: a title or subtitle
+            # can sit directly above an imprint in the same layout position.
+            for index, line in enumerate(top_lines[:8]):
+                candidate = normalize_author_candidate(line)
+                # Require the *immediate* next non-empty line to be the
+                # imprint. Looking across two lines lets an all-caps subtitle
+                # borrow the real author line's following publisher and turn
+                # the subtitle into a false author.
+                following = top_lines[index + 1] if index + 1 < len(top_lines) else ""
+                if (
+                    re.fullmatch(r"(?:[A-Z][A-Z'.-]*\s+){1,3}[A-Z][A-Z'.-]*", candidate)
+                    and is_high_confidence_all_caps_titlepage_author(
+                        candidate,
+                        following,
+                        title_hint=title_hint,
+                    )
+                ):
+                    return {
+                        "author": candidate,
+                        "source": "text_compact_caps_byline",
+                        "page": page,
+                        "evidence": f"{line} / publication-metadata-nearby",
+                    }
         title_start_index = 0
         title_matched = False
         normalized_title = normalize_text(title_hint).casefold() if title_hint else ""
@@ -1285,7 +1583,7 @@ def infer_author_from_text_samples(samples, title_hint=""):
                 break
             if index > generic_fallback_last_index:
                 continue
-            if "@" in line or any(term in lowered for term in AUTHOR_AFFILIATION_HINTS):
+            if "@" in line or has_author_affiliation_hint(line):
                 continue
             if not allow_generic_top_block or reviewed_work_context:
                 continue
@@ -1343,6 +1641,23 @@ def infer_author_from_filename(path: Path, title_hint=""):
         # fragment protection would reject every explicit ``-by-Name`` slug.
         if looks_like_person_name(candidate):
             return {"author": candidate, "source": "filename_explicit_byline", "page": 0, "evidence": path.name}
+    # Some course/archive filenames preserve a terminal ``-first-last``
+    # credit after an underscore-delimited title slug. This is deliberately
+    # narrower than treating the last two words of every dashed title as a
+    # person (``The-Yellow-Wall-Paper`` must never become ``Wall Paper``).
+    terminal_slug_name = re.search(
+        r".+_.+?-([A-Za-z][A-Za-z'.-]*)-([A-Za-z][A-Za-z'.-]*)$",
+        stem,
+    )
+    if terminal_slug_name:
+        candidate = " ".join(part.capitalize() for part in terminal_slug_name.groups())
+        if looks_like_person_name(candidate):
+            return {
+                "author": candidate,
+                "source": "filename_terminal_name_slug",
+                "page": 0,
+                "evidence": path.name,
+            }
     parts = [part.strip(" -_,") for part in re.split(r"\s+[-–—]{1,2}\s+|\s{2,}", stem) if part.strip(" -_,")]
     tail_candidates = list(reversed(parts[1:])) if len(parts) >= 2 else []
     for candidate in tail_candidates:
@@ -1359,6 +1674,82 @@ def infer_author_from_samples_or_filename(samples, path: Path, title_hint=""):
     if report.get("source") == "text_non_person_byline":
         return report
     return report if report.get("author") else infer_author_from_filename(path, title_hint=title_hint)
+
+
+def selected_extraction_author_samples(pages, *, page_limit=4):
+    """Return a small, transient opening-page sample from selected text.
+
+    This is deliberately post-selection: a scan has no usable native text at
+    metadata preflight, but the selected OCR candidate can later contain an
+    explicit title-page byline. Only the first non-empty physical pages are
+    considered, no raw text is persisted by this helper, and malformed page
+    records are skipped rather than changing an otherwise successful run.
+    """
+    limit = max(1, min(6, int(page_limit or 4)))
+    selected = []
+    seen_pages = set()
+    for row in pages or []:
+        if not isinstance(row, dict):
+            continue
+        try:
+            page = int(row.get("page") or 0)
+        except (TypeError, ValueError):
+            continue
+        text = str(row.get("text") or "")
+        if page <= 0 or page in seen_pages or not normalize_text(text):
+            continue
+        seen_pages.add(page)
+        selected.append({"page": page, "text": text})
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def recover_author_from_selected_extraction(pages, *, title_hint="", page_limit=4):
+    """Use the established author heuristics on the selected OCR text.
+
+    The result is evidence only. Callers must apply it solely when the earlier
+    metadata/native-text stage has no resolved author, preserving explicit
+    user entries and PDF metadata precedence.
+    """
+    samples = selected_extraction_author_samples(pages, page_limit=page_limit)
+    if not samples:
+        return {
+            "author": "",
+            "source": "not_assessed_no_selected_opening_text",
+            "page": 0,
+            "evidence": "",
+            "sample_pages": [],
+        }
+    report = dict(infer_author_from_text_samples(samples, title_hint=title_hint))
+    report["sample_pages"] = [row["page"] for row in samples]
+    base_source = str(report.get("source") or "not_found")
+    if report.get("author") and base_source not in POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES:
+        # Bare title-block names are useful interactive suggestions when a
+        # person can review them, but insufficient to mutate durable metadata
+        # after OCR. Keep the abstention auditable without retaining text.
+        report.update({
+            "author": "",
+            "source": f"selected_extraction_rejected_weak_{base_source}",
+            "evidence": "",
+        })
+        return report
+    report["source"] = f"selected_extraction_{base_source}"
+    return report
+
+
+def apply_source_identity_to_segments(segments, source_meta):
+    """Synchronize recovered source identity into already-built records."""
+    for segment in segments or []:
+        if not isinstance(segment, dict):
+            continue
+        segment["source_author"] = source_meta.get("source_author") or ""
+        segment["source_short_label"] = (
+            source_meta.get("source_short_label")
+            or source_meta.get("source_title")
+            or ""
+        )
+        segment["metadata_provenance"] = dict(source_meta.get("metadata_provenance") or {})
 
 
 def normalize_metadata_author(value):
@@ -1379,6 +1770,50 @@ def normalize_metadata_author(value):
         if looks_like_person_name(candidate) and candidate not in normalized:
             normalized.append(candidate)
     return ", ".join(normalized)
+
+
+def normalize_metadata_title(value):
+    """Accept a human-facing PDF title, rejecting common producer leftovers.
+
+    PDF title metadata is often a publishing-workstation filename rather than
+    a document title (for example ``32(8) Theobald.indd``).  Keeping such a
+    value is worse than a clean selected filename: it pollutes the editable UI
+    title, short label, and automatic workspace suggestion.  This is a narrow
+    quality filter, not a title inference system; readable metadata remains
+    preferred whenever it is plausibly intended for people.
+    """
+    title = normalize_text(value or "")
+    if len(title) < 3 or len(title) > 300 or any(ord(character) < 32 for character in title):
+        return ""
+    lowered = title.casefold().strip()
+    if re.fullmatch(r"(?:untitled(?: document)?|new document|document(?: \d+)?|scan(?: \d+)?)", lowered):
+        return ""
+    # A source-layout/office extension in Title metadata is a strong sign of
+    # an internal production filename, including short names such as
+    # ``article.indd`` that would otherwise look superficially harmless.
+    if re.search(r"\.(?:pdf|indd|indb|idml|docx?|pptx?|xlsx?|txt|rtf|html?|xml)$", title, flags=re.I):
+        return ""
+    return title
+
+
+def resolve_title_from_metadata_or_filename(
+    metadata_title,
+    path: Path,
+    *,
+    title_override="",
+    use_file_title_fallback=True,
+):
+    """Resolve one display title using the same rule in UI and preparation."""
+    override = normalize_text(title_override or "")
+    if override:
+        return {"title": override, "source": "user_override"}
+    metadata_value = normalize_metadata_title(metadata_title)
+    if metadata_value:
+        return {"title": metadata_value, "source": "pdf_metadata"}
+    filename_value = normalize_text(Path(path).stem)
+    if use_file_title_fallback and filename_value:
+        return {"title": filename_value, "source": "filename_fallback"}
+    return {"title": "Untitled PDF", "source": "generated_placeholder"}
 
 
 def resolve_author_from_metadata_and_inference(metadata_author, inference, *, author_override=""):
@@ -1424,7 +1859,10 @@ def infer_author_from_initial_pdf_pages(path: Path, title_hint="", *, page_limit
     try:
         with fitz.open(pdf_path) as doc:
             metadata = dict(doc.metadata or {})
-            resolved_title = normalize_text(title_hint or metadata.get("title") or pdf_path.stem)
+            resolved_title = normalize_text(
+                title_hint
+                or resolve_title_from_metadata_or_filename(metadata.get("title") or "", pdf_path)["title"]
+            )
             limit = max(1, int(page_limit or 3))
             samples = []
             for page_index in range(min(limit, len(doc))):
@@ -1872,6 +2310,7 @@ LEAN_SUCCESS_NONRETAINED_SUMMARY_PATH_FIELDS = (
     "page_parent_manifest",
     "child_parent_map",
     "layout_region_review",
+    "visual_text_review_artifact",
     "retrieval_lane_review",
     "supplementary_lane_candidates",
     "provenance_review_manifest",
@@ -1972,8 +2411,6 @@ def retain_successful_run_leanly(
     and one self-contained summary/recovery record. The caller still receives
     the rich in-memory summary for the live UI.
     """
-    if str(summary.get("readiness_status") or "") != "ready":
-        return {"applied": False, "reason": "run_needs_review"}
     upload_status = str(summary.get("api_upload_status") or "").casefold()
     post_status = str(summary.get("post_upload_verification_status") or "").casefold()
     runtime_status = str(summary.get("anythingllm_runtime_validation_status") or "").casefold()
@@ -1991,6 +2428,17 @@ def retain_successful_run_leanly(
         and post_status == "pass"
         and runtime_verified
     )
+    # Source readiness is a preparation-quality advisory. Once this exact
+    # source has independently passed upload and vector verification, it must
+    # not turn an otherwise successful shared batch into a spurious terminal
+    # warning solely because optional local diagnostics were retained. Keep
+    # the old conservative guard for local-only runs, where no independent
+    # AnythingLLM proof exists.
+    if (
+        str(summary.get("readiness_status") or "") != "ready"
+        and not fully_verified_upload
+    ):
+        return {"applied": False, "reason": "run_needs_review"}
     if not (local_only_complete or fully_verified_upload):
         # Do not shrink evidence merely because extraction itself was ready.
         # An accepted-but-ambiguous upload, incomplete vector coverage, or
@@ -2010,32 +2458,60 @@ def retain_successful_run_leanly(
 
     deleted = []
     selected_dir = prepared_text_path.parent
+    # A caller can select an existing output directory. Lean retention owns
+    # the generated run artefacts, not every sibling a user already had in
+    # that directory. Record its original children before staging any compact
+    # output so the later cleanup cannot mistake a pre-existing export for a
+    # disposable worker artefact.
+    try:
+        preexisting_root_children = {child.name for child in out_root.iterdir()}
+    except OSError:
+        preexisting_root_children = set()
     retained_text_path = out_root / prepared_text_path.name
     if prepared_text_path != retained_text_path:
         if retained_text_path.exists():
             raise FileExistsError(
                 f"Refusing to overwrite existing retained text: {retained_text_path}"
             )
-        shutil.move(str(prepared_text_path), str(retained_text_path))
-    retained_segments = materialize_retained_segments(
-        retained_text_path,
-        out_root / "segments",
-        segments,
-    )
+    # Materialise segments in a uniquely owned staging directory first.  The
+    # previous fixed ``out_root/segments`` staging path could erase an
+    # unrelated directory before collision checks had even run.
+    stage_parent = selected_dir if selected_dir.is_dir() else out_root
+    stage_dir = Path(tempfile.mkdtemp(prefix=".retained-segments-", dir=stage_parent))
+    try:
+        staged_segments = materialize_retained_segments(
+            prepared_text_path,
+            stage_dir,
+            segments,
+        )
+        planned_direct_segments = [out_root / segment_path.name for segment_path in staged_segments]
+        planned_targets = [retained_text_path, *planned_direct_segments]
+        if len({str(path).casefold() for path in planned_targets}) != len(planned_targets):
+            raise FileExistsError("Lean retention would create duplicate output filenames.")
+        existing_target = next(
+            (
+                path
+                for path in planned_targets
+                if path.exists() and path != prepared_text_path
+            ),
+            None,
+        )
+        if existing_target:
+            raise FileExistsError(f"Refusing to overwrite existing retained output: {existing_target}")
+        if prepared_text_path != retained_text_path:
+            shutil.move(str(prepared_text_path), str(retained_text_path))
+        retained_segments = []
+        for segment_path, direct_path in zip(staged_segments, planned_direct_segments):
+            shutil.move(str(segment_path), str(direct_path))
+            retained_segments.append(direct_path)
+    finally:
+        # The directory is private to this call, even when an exception stops
+        # retention before the transcript is moved. Its removal cannot affect
+        # a user-created ``segments`` directory.
+        shutil.rmtree(stage_dir, ignore_errors=True)
     # Segment records are useful output, not a diagnostic category. Keep them
     # beside the prepared transcript so successful upload and diagnostic runs
     # do not force an operator through a second ``segments`` folder.
-    direct_segments = []
-    for segment_path in retained_segments:
-        direct_path = out_root / segment_path.name
-        if direct_path.exists():
-            raise FileExistsError(f"Refusing to overwrite retained segment: {direct_path}")
-        shutil.move(str(segment_path), str(direct_path))
-        direct_segments.append(direct_path)
-    segment_directory = out_root / "segments"
-    if segment_directory.is_dir():
-        segment_directory.rmdir()
-    retained_segments = direct_segments
     # The live Gradio result is built from this same mutable summary.  Rewrite
     # its paths before returning so downloads and output links never point to
     # the selected/ files we are about to remove.
@@ -2117,10 +2593,27 @@ def retain_successful_run_leanly(
         *protected_generated_names,
     }
     for child in list(out_root.iterdir()):
-        if child.name in retained_output_names:
+        if child.name in retained_output_names or child.name in preexisting_root_children:
             continue
         _best_effort_remove_success_artifact(child, deleted, cleanup_warnings, out_root)
 
+    visual_text_review = summary.get("visual_text_review")
+    if not isinstance(visual_text_review, dict):
+        visual_text_review = {}
+    try:
+        compact_visual_unresolved_count = max(0, int(visual_text_review.get("unresolved_page_count") or 0))
+    except (TypeError, ValueError):
+        compact_visual_unresolved_count = 0
+    compact_visual_pages = [
+        # The guard deliberately validates a string representation because
+        # JSON evidence can contain an int, a numeric string, or null.
+        int(str(row.get("pdf_page") or ""))
+        for row in (visual_text_review.get("pages") or [])
+        if isinstance(row, dict) and str(row.get("pdf_page") or "").isdigit()
+    ]
+    compact_visual_warnings = visual_text_review.get("assessment_warnings") or []
+    if not isinstance(compact_visual_warnings, (list, tuple)):
+        compact_visual_warnings = []
     compact = {
         "schema_version": 1,
         "retention_policy": "lean_success_v1",
@@ -2185,6 +2678,16 @@ def retain_successful_run_leanly(
             "segments": summary.get("segments"),
             "chunk_size": summary.get("chunk_size"),
             "chunk_overlap": summary.get("chunk_overlap"),
+            # The detailed review artifact is intentionally pruned for a
+            # lean success, so retain just the non-content integrity facts.
+            # This keeps a warning durable without retaining OCR previews or
+            # source text in the compact receipt.
+            "visual_text_review": {
+                "status": visual_text_review.get("status", "not_assessed"),
+                "unresolved_page_count": compact_visual_unresolved_count,
+                "pages": compact_visual_pages,
+                "assessment_warnings": list(compact_visual_warnings),
+            },
         },
         "artifacts": {
             "parsed_text": retained_text_path.relative_to(out_root).as_posix(),
@@ -4444,6 +4947,540 @@ def simulated_chunks(text, chunk_size=1000, overlap=140):
     return chunks
 
 
+def text_integrity_metrics(text):
+    """Detect sustained broken-word fragments without penalising normal prose.
+
+    A PDF can expose a nominal text layer while its positioned glyphs are
+    unusable for retrieval (``t o``, ``m y``, ``b e`` across many lines). A
+    few one-letter tokens are normal in prose, verse, variables, and names;
+    this reports only a sustained pattern across a substantial text sample.
+    """
+    tokens = re.findall(r"[A-Za-z]+(?:['\u2019][A-Za-z]+)?", str(text or ""))
+    suspicious = [
+        token for token in tokens
+        if len(token) == 1 and token.casefold() not in {"a", "i"}
+    ]
+    total = len(tokens)
+    count = len(suspicious)
+    return {
+        "word_tokens": total,
+        "fragmented_single_letter_token_count": count,
+        "fragmented_single_letter_token_ratio": round(count / max(total, 1), 4),
+    }
+
+
+def _reconciliation_text_tokens(text):
+    """Return lexical tokens without treating Unstructured category labels as prose."""
+    content = re.sub(r"(?m)^\[[A-Za-z][A-Za-z0-9_]*\]\s*", "", str(text or ""))
+    return re.findall(
+        r"[A-Za-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u00ff]+(?:['\u2019-][A-Za-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u00ff]+)?",
+        content.casefold(),
+    )
+
+
+def _reconciliation_token_key(value):
+    return re.sub(r"[^a-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u00ff]", "", str(value or "").casefold())
+
+
+def _reconciliation_case_like(replacement, source):
+    if str(source).isupper():
+        return str(replacement).upper()
+    if str(source).istitle():
+        return str(replacement).title()
+    return str(replacement).lower() if str(source).islower() else str(replacement)
+
+
+def _reconciliation_mask_category_labels(text):
+    """Blank category labels without moving text offsets used for repairs."""
+    return re.sub(
+        r"(?m)^\[[A-Za-z][A-Za-z0-9_]*\]\s*",
+        lambda match: " " * len(match.group(0)),
+        str(text or ""),
+    )
+
+
+def _reconciliation_word_spans(text):
+    """Return OCR word spans after excluding Unstructured category labels."""
+    masked = _reconciliation_mask_category_labels(text)
+    return [
+        {
+            "start": match.start(),
+            "end": match.end(),
+            "word": match.group(0),
+            "key": _reconciliation_token_key(match.group(0)),
+        }
+        for match in re.finditer(
+            r"[A-Za-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u00ff]+(?:['\u2019-][A-Za-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u00ff]+)?",
+            masked,
+        )
+    ]
+
+
+def _native_raw_reconciliation_text(native_page, fallback_text=""):
+    """Use the original positioned native text when it is available.
+
+    Native semantic cleanup can deliberately re-order lines for ordinary PDF
+    prose.  The unmodified positioned text is more useful for corroborating a
+    local OCR substitution because it retains the source's visual sequence.
+    """
+    if isinstance(native_page, dict):
+        raw = str(native_page.get("raw_text") or "").strip()
+        if raw:
+            return raw
+    return str(fallback_text or "")
+
+
+def _native_page_heading_candidate(native_page, fallback_text=""):
+    """Return a short all-caps opening heading, never a later page label."""
+    raw = _native_raw_reconciliation_text(native_page, fallback_text)
+    lines = [normalize_text(line) for line in raw.splitlines() if normalize_text(line)]
+    heading_lines = []
+    for line in lines[:4]:
+        words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+(?:['’-][A-Za-zÀ-ÖØ-öø-ÿ]+)?", line)
+        letters = "".join(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]", line))
+        if (
+            not words
+            or len(words) > 3
+            or len(line) > 56
+            or not letters
+            or letters != letters.upper()
+        ):
+            break
+        heading_lines.append(line)
+    heading = normalize_text(" ".join(heading_lines))
+    return heading if heading else ""
+
+
+def recover_native_page_heading(native_page, ocr_text, fallback_native_text=""):
+    """Restore a uniquely isolated native opening heading to OCR text.
+
+    A one-to-three-word all-caps line at the top of a native page is stable
+    visual evidence.  OCR occasionally omits it or reads it as a short noise
+    label.  Replace only that first short label, or prefix a missing heading;
+    never search later lines for a possible heading.
+    """
+    heading = _native_page_heading_candidate(native_page, fallback_native_text)
+    if not heading:
+        return str(ocr_text or ""), None
+    heading_keys = _reconciliation_text_tokens(heading)
+    ocr_keys = _reconciliation_text_tokens(ocr_text)
+    if heading_keys and all(key in ocr_keys for key in heading_keys):
+        return str(ocr_text or ""), None
+    text = str(ocr_text or "")
+    first = re.search(
+        r"(?m)^(?P<prefix>\[[A-Za-z][A-Za-z0-9_]*\]\s*)?(?P<content>\S[^\r\n]*)$",
+        text,
+    )
+    if first:
+        content = first.group("content").strip()
+        content_words = _reconciliation_text_tokens(content)
+        category = str(first.group("prefix") or "").casefold()
+        alpha = "".join(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]", content))
+        heading_like_ocr_label = (
+            len(content_words) <= 3
+            and len(content) <= 56
+            and bool(alpha)
+            and alpha == alpha.upper()
+        ) or "[title]" in category
+        if heading_like_ocr_label:
+            replacement = f"{first.group('prefix') or '[Title] '}{heading}"
+            return (
+                text[:first.start()] + replacement + text[first.end():],
+                {"action": "replaced_short_ocr_label", "from": content, "to": heading},
+            )
+    prefix = f"[Title] {heading}"
+    return f"{prefix}\n\n{text}".strip(), {"action": "prefixed_missing_heading", "to": heading}
+
+
+def correct_ocr_words_from_native_page(native_text, ocr_text, native_raw_text=""):
+    """Correct only uniquely corroborated OCR words, preserving OCR layout.
+
+    A native layer may preserve a word that OCR almost recognises, even if its
+    reading order is poor. This function intentionally does not use a spelling
+    dictionary or invent missing prose. It replaces an OCR token only where a
+    unique native token on that same physical page is a very close match with
+    a shared initial and a substantial shared ending. Those anchors admit
+    ``seqtuesque`` -> ``statuesque`` while rejecting broad semantic guesses.
+    """
+    native_evidence_text = str(native_raw_text or native_text or "")
+    native_words = re.findall(
+        r"[A-Za-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u00ff]+(?:['\u2019-][A-Za-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u00ff]+)?",
+        native_evidence_text,
+    )
+    native_by_key = {}
+    for word in native_words:
+        key = _reconciliation_token_key(word)
+        if len(key) >= 5:
+            native_by_key.setdefault(key, []).append(word)
+    unique_native = {
+        key: values[0]
+        for key, values in native_by_key.items()
+        if len(values) == 1
+    }
+    replacements_by_span = {}
+
+    def add_replacement(start, end, source, replacement, similarity, method):
+        if start in replacements_by_span or replacement.casefold() == source.casefold():
+            return
+        replacements_by_span[start] = {
+            "start": start,
+            "end": end,
+            "from": source,
+            "to": replacement,
+            "similarity": round(similarity, 4),
+            "method": method,
+        }
+
+    ocr_words = _reconciliation_word_spans(ocr_text)
+    safe_unpunctuated_contractions = {
+        "ive", "youre", "youll", "theyre", "theyll", "weve", "dont", "cant",
+        "wont", "isnt", "arent",
+        "wasnt", "werent", "havent", "hasnt", "hadnt", "didnt", "doesnt",
+        "couldnt", "wouldnt", "shouldnt", "theres", "whos", "whats",
+    }
+    for word_row in ocr_words:
+        source = word_row["word"]
+        source_key = word_row["key"]
+        native_same_key = unique_native.get(source_key)
+        if (
+            native_same_key
+            and source_key in safe_unpunctuated_contractions
+            and re.search(r"['\u2019-]", native_same_key)
+            and not re.search(r"['\u2019-]", source)
+        ):
+            add_replacement(
+                word_row["start"], word_row["end"], source,
+                _reconciliation_case_like(native_same_key, source), 1.0,
+                "native_contraction_surface",
+            )
+        if len(source_key) < 5 or source_key in unique_native:
+            continue
+        candidates = []
+        for candidate_key, candidate_word in unique_native.items():
+            if abs(len(candidate_key) - len(source_key)) > 2:
+                continue
+            similarity = SequenceMatcher(None, source_key, candidate_key, autojunk=False).ratio()
+            common_suffix = 0
+            for left, right in zip(reversed(source_key), reversed(candidate_key)):
+                if left != right:
+                    break
+                common_suffix += 1
+            if (
+                similarity >= 0.80
+                and source_key[:1] == candidate_key[:1]
+                and common_suffix >= 3
+            ):
+                candidates.append((similarity, candidate_word, candidate_key))
+        if len(candidates) != 1:
+            continue
+        similarity, candidate_word, _ = candidates[0]
+        replacement = _reconciliation_case_like(candidate_word, source)
+        if replacement.casefold() == source.casefold():
+            continue
+        add_replacement(
+            word_row["start"], word_row["end"], source, replacement,
+            similarity, "unique_native_fuzzy_word",
+        )
+
+    # The original native text can be visually ordered even when its prepared
+    # semantic transcript is not.  Use SequenceMatcher only for a one-word
+    # replacement bracketed by a matching local anchor, then retain a native
+    # word only when it is at least as complete and unique on that page.  This
+    # fixes e.g. ``put -> but`` and ``aside -> inside`` without a dictionary
+    # or a semantic-language guess.
+    native_ordered_words = [
+        {
+            "word": word,
+            "key": _reconciliation_token_key(word),
+        }
+        for word in native_words
+        if _reconciliation_token_key(word)
+    ]
+    ocr_keys = [row["key"] for row in ocr_words]
+    native_keys = [row["key"] for row in native_ordered_words]
+    opcodes = SequenceMatcher(None, ocr_keys, native_keys, autojunk=False).get_opcodes()
+    for opcode_index, (tag, i1, i2, j1, j2) in enumerate(opcodes):
+        if tag != "replace" or i2 - i1 != 1 or j2 - j1 != 1:
+            continue
+        previous_equal = opcode_index > 0 and opcodes[opcode_index - 1][0] == "equal"
+        following_equal = opcode_index + 1 < len(opcodes) and opcodes[opcode_index + 1][0] == "equal"
+        if not (previous_equal or following_equal):
+            continue
+        source_row = ocr_words[i1]
+        source_key = source_row["key"]
+        candidate_word = native_ordered_words[j1]["word"]
+        candidate_key = native_ordered_words[j1]["key"]
+        if (
+            len(source_key) < 3
+            or len(candidate_key) < len(source_key)
+            or len(candidate_key) > len(source_key) + 2
+            or len(native_by_key.get(candidate_key, [])) != 1
+        ):
+            continue
+        similarity = SequenceMatcher(None, source_key, candidate_key, autojunk=False).ratio()
+        if similarity < 0.65:
+            continue
+        add_replacement(
+            source_row["start"], source_row["end"], source_row["word"],
+            _reconciliation_case_like(candidate_word, source_row["word"]),
+            similarity, "ordered_native_anchor",
+        )
+    replacements = list(replacements_by_span.values())
+    corrected = str(ocr_text or "")
+    for replacement in reversed(replacements):
+        corrected = (
+            corrected[:replacement["start"]]
+            + replacement["to"]
+            + corrected[replacement["end"]:]
+        )
+    return corrected, replacements
+
+
+def reconcile_native_ocr_pages(native_pages, ocr_pages):
+    """Make one non-duplicated, page-local native/OCR transcript.
+
+    Neither engine is treated as the permanent authority: scan quality and PDF
+    text layers vary from page to page. Never concatenate both versions, as
+    that would create duplicate retrieval passages. Select native when its
+    page-local evidence decisively beats fragmented OCR; select OCR when
+    native is absent; otherwise preserve the observed OCR line/category
+    structure as a conservative tie-breaker, applying only uniquely
+    corroborated native word repairs.
+    """
+    native_by_page = {
+        int(page.get("page") or 0): page
+        for page in native_pages or []
+        if isinstance(page, dict) and int(page.get("page") or 0) > 0
+    }
+    ocr_by_page = {
+        int(page.get("page") or 0): page
+        for page in ocr_pages or []
+        if isinstance(page, dict) and int(page.get("page") or 0) > 0
+    }
+    reconciled = []
+    decisions = []
+    for page_number in sorted(set(native_by_page) | set(ocr_by_page)):
+        native = native_by_page.get(page_number)
+        ocr = ocr_by_page.get(page_number)
+        native_text = str((native or {}).get("text") or "")
+        ocr_text = str((ocr or {}).get("text") or "")
+        native_raw_text = _native_raw_reconciliation_text(native, native_text)
+        corrected_ocr_text, heading_recovery = recover_native_page_heading(
+            native, ocr_text, native_text
+        )
+        corrected_ocr_text, lexical_corrections = correct_ocr_words_from_native_page(
+            native_text, corrected_ocr_text, native_raw_text
+        )
+        if ocr and corrected_ocr_text != ocr_text:
+            ocr = {**ocr, "text": corrected_ocr_text}
+            ocr_text = corrected_ocr_text
+        native_tokens = _reconciliation_text_tokens(native_text)
+        ocr_tokens = _reconciliation_text_tokens(ocr_text)
+        native_integrity = text_integrity_metrics(native_text)
+        ocr_integrity = text_integrity_metrics(ocr_text)
+        similarity = (
+            SequenceMatcher(None, native_tokens, ocr_tokens, autojunk=False).ratio()
+            if native_tokens and ocr_tokens
+            else 0.0
+        )
+        # This is an evidence tie-breaker, rather than a claim that OCR is
+        # generally more accurate. Keeping its recorded line/category layout
+        # is safer than inventing a reordered hybrid when neither page has a
+        # decisive integrity advantage.
+        decision = "ocr_structure_preserved_tie_break"
+        selected_page = ocr
+        if not ocr_text and native_text:
+            decision = "native_used_ocr_page_missing"
+            selected_page = native
+        elif not native_text and ocr_text:
+            decision = "ocr_used_native_page_missing"
+        elif native_text and ocr_text:
+            native_words = len(native_tokens)
+            ocr_words = len(ocr_tokens)
+            native_fragments = int(native_integrity["fragmented_single_letter_token_count"])
+            ocr_fragments = int(ocr_integrity["fragmented_single_letter_token_count"])
+            # Do not switch merely because two clean versions differ in a few
+            # words. A native replacement requires comparable coverage, a
+            # material mismatch, and at least three fewer broken fragments.
+            native_is_clearly_better = (
+                native_words >= max(20, int(ocr_words * 0.65))
+                and similarity < 0.55
+                and native_fragments + 3 <= ocr_fragments
+            )
+            if native_is_clearly_better:
+                decision = "native_used_ocr_page_fragmented"
+                selected_page = native
+        if not selected_page:
+            continue
+        page_row = dict(selected_page)
+        page_row["native_ocr_reconciliation"] = {
+            "decision": decision,
+            "native_word_count": len(native_tokens),
+            "ocr_word_count": len(ocr_tokens),
+            "token_sequence_similarity": round(similarity, 4),
+            "native_fragment_count": int(native_integrity["fragmented_single_letter_token_count"]),
+            "ocr_fragment_count": int(ocr_integrity["fragmented_single_letter_token_count"]),
+            "native_heading_recovery": heading_recovery,
+            "native_word_corrections": lexical_corrections,
+        }
+        reconciled.append(page_row)
+        decisions.append({"page": page_number, **page_row["native_ocr_reconciliation"]})
+    return reconciled, {
+        "status": "applied" if decisions else "not_available",
+        "method": "page_local_evidence_reconciliation_v2",
+        "selection_policy": (
+            "page-local evidence; preserve OCR structure only as the "
+            "conservative tie-breaker"
+        ),
+        "pages": decisions,
+        "native_selected_pages": [
+            row["page"] for row in decisions
+            if row["decision"].startswith("native_used")
+        ],
+    }
+
+
+def visual_text_coverage_review(pages, page_count, page_geometry, *, start_page=1, end_page=None):
+    """Expose image-page text that neither extractor recovered reliably.
+
+    This is intentionally a warning-only guard. A faint label in a scanned
+    artwork can be meaningful, but inserting a plausible title from noisy OCR
+    would be worse than reporting its uncertainty. The review is page-local,
+    non-blocking, and leaves the selected transcript untouched.
+    """
+    def positive_integer(value):
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return 0
+        return number if number > 0 else 0
+
+    total_pages = positive_integer(page_count)
+    scope_start = positive_integer(start_page) or 1
+    scope_end = positive_integer(end_page)
+    if total_pages <= 0:
+        return {
+            "status": "not_assessed",
+            "method": "image_page_low_signal_text_guard_v2",
+            "unresolved_page_count": 0,
+            "message": "Visual-text coverage could not be assessed because the physical PDF page count was unavailable.",
+            "scope": {"start_page": scope_start, "end_page": scope_end or None},
+            "assessment_warnings": ["physical_page_count_unavailable"],
+            "pages": [],
+        }
+    scope_start = min(scope_start, total_pages)
+    scope_last = min(total_pages, scope_end - 1) if scope_end else total_pages
+    if scope_last < scope_start:
+        return {
+            "status": "not_assessed",
+            "method": "image_page_low_signal_text_guard_v2",
+            "unresolved_page_count": 0,
+            "message": "Visual-text coverage was not assessed because the selected page range is empty.",
+            "scope": {"start_page": scope_start, "end_page": scope_end or None},
+            "assessment_warnings": ["selected_page_range_empty"],
+            "pages": [],
+        }
+
+    page_texts = {}
+    duplicate_page_records = []
+    invalid_page_records = 0
+    for page in pages or []:
+        if not isinstance(page, dict):
+            invalid_page_records += 1
+            continue
+        page_number = positive_integer(page.get("page"))
+        if not page_number:
+            invalid_page_records += 1
+            continue
+        if page_number in page_texts:
+            duplicate_page_records.append(page_number)
+        page_texts.setdefault(page_number, []).append(str(page.get("text") or ""))
+
+    geometry_rows = page_geometry.values() if isinstance(page_geometry, dict) else (page_geometry or [])
+    geometry_by_page = {}
+    invalid_geometry_records = 0
+    for row in geometry_rows:
+        if not isinstance(row, dict):
+            invalid_geometry_records += 1
+            continue
+        page_number = positive_integer(row.get("pdf_page") or row.get("page"))
+        if not page_number:
+            invalid_geometry_records += 1
+            continue
+        image_count = positive_integer(row.get("image_count"))
+        existing = geometry_by_page.get(page_number)
+        if existing is None or image_count > int(existing.get("image_count") or 0):
+            geometry_by_page[page_number] = {**row, "image_count": image_count}
+
+    assessment_warnings = []
+    if invalid_page_records:
+        assessment_warnings.append("invalid_extractor_page_records")
+    if invalid_geometry_records:
+        assessment_warnings.append("invalid_page_geometry_records")
+    if duplicate_page_records:
+        assessment_warnings.append("duplicate_extractor_page_records")
+    missing_geometry_pages = [
+        page_number
+        for page_number in range(scope_start, scope_last + 1)
+        if page_number not in geometry_by_page
+    ]
+    if missing_geometry_pages:
+        assessment_warnings.append("page_geometry_missing_for_selected_scope")
+    unresolved = []
+    for page_number in range(scope_start, scope_last + 1):
+        geometry = geometry_by_page.get(page_number) or {}
+        if int(geometry.get("image_count") or 0) <= 0:
+            continue
+        # Multiple regional records may legitimately describe one physical
+        # page. Combine them for review rather than silently overwriting the
+        # earlier region and falsely calling the page empty.
+        page_text = "\n\n".join(page_texts.get(page_number) or [])
+        words = _reconciliation_text_tokens(page_text)
+        short_words = sum(1 for word in words if len(word) <= 2)
+        mostly_fragments = bool(words) and (
+            len(words) <= 28
+            and short_words / max(len(words), 1) >= 0.45
+        )
+        if words and not mostly_fragments:
+            continue
+        unresolved.append({
+            "pdf_page": page_number,
+            "image_count": int(geometry.get("image_count") or 0),
+            "recovered_word_count": len(words),
+            "short_fragment_count": short_words,
+            "reason": "no_text_recovered" if not words else "low_signal_ocr_fragments",
+            "preview": normalize_text(page_text)[:180],
+        })
+    status = (
+        "review_needed" if unresolved
+        else "assessment_incomplete" if assessment_warnings
+        else "not_flagged"
+    )
+    return {
+        "status": status,
+        "method": "image_page_low_signal_text_guard_v2",
+        "unresolved_page_count": len(unresolved),
+        "message": (
+            "Image-dominant page(s) yielded no reliable text. No label was guessed or added to the retrieval payload."
+            if unresolved else (
+                "Visual-text coverage was only partially assessed because page/extractor metadata was incomplete."
+                if assessment_warnings else "No image-dominant low-signal text pages were detected."
+            )
+        ),
+        "scope": {"start_page": scope_start, "end_page": scope_end or None},
+        "assessment": {
+            "physical_page_count": total_pages,
+            "selected_page_count": scope_last - scope_start + 1,
+            "extractor_page_records": len(page_texts),
+            "geometry_page_records": len(geometry_by_page),
+            "duplicate_page_records": sorted(set(duplicate_page_records)),
+            "missing_geometry_pages": missing_geometry_pages,
+        },
+        "assessment_warnings": assessment_warnings,
+        "pages": unresolved,
+    }
+
+
 def extraction_quality(pages, stats, start_page, end_page):
     included = [s for s in stats if s.pdf_page >= start_page and (not end_page or s.pdf_page < end_page)]
     included_page_numbers = {int(stat.pdf_page) for stat in included}
@@ -4451,6 +5488,13 @@ def extraction_quality(pages, stats, start_page, end_page):
         str(page.get("text") or "")
         for page in pages
         if int(page.get("page") or 0) in included_page_numbers
+    )
+    integrity = text_integrity_metrics(included_text)
+    fragmented_page_count = sum(
+        1
+        for page in pages
+        if int(page.get("page") or 0) in included_page_numbers
+        and text_integrity_metrics(page.get("text") or "").get("fragmented_single_letter_token_count", 0) >= 3
     )
     chars = sum(s.chars for s in included)
     words = sum(s.words for s in included)
@@ -4487,6 +5531,11 @@ def extraction_quality(pages, stats, start_page, end_page):
         if included and (empty + image_heavy_low_text_pages) / len(included) >= 0.2
         else "low"
     )
+    fragmented_text = (
+        int(integrity["fragmented_single_letter_token_count"]) >= max(18, int(integrity["word_tokens"]) // 30)
+        and float(integrity["fragmented_single_letter_token_ratio"]) >= 0.035
+        and fragmented_page_count >= 2
+    )
     return {
         "included_pages": len(included),
         "included_chars": chars,
@@ -4503,6 +5552,13 @@ def extraction_quality(pages, stats, start_page, end_page):
         "average_words_per_page": avg_words_per_page,
         "ocr_layout_artifact_count": ocr_layout_artifact_count,
         "ocr_layout_artifact_ratio": ocr_layout_artifact_ratio,
+        "fragmented_single_letter_token_count": integrity["fragmented_single_letter_token_count"],
+        "fragmented_single_letter_token_ratio": integrity["fragmented_single_letter_token_ratio"],
+        "fragmented_page_count": fragmented_page_count,
+        # This is a review signal, not a proof that OCR will be better. Verse,
+        # art catalogues, and low-quality embedded OCR can benefit from a
+        # comparison while still having a more useful native result.
+        "text_integrity_status": "review" if fragmented_text else "not_flagged",
         "scanned_likelihood": scanned_likelihood,
     }
 
@@ -4580,6 +5636,7 @@ def has_complete_native_text_candidate(candidates, pdf_page_count, ocr_preflight
             and len(candidate.get("segments") or []) > 0
             and int(quality.get("included_pages") or 0) >= material_pages
             and int(quality.get("included_words") or 0) >= minimum_words
+            and str(quality.get("text_integrity_status") or "not_flagged") != "review"
             and (
                 str(quality.get("scanned_likelihood") or "").casefold() == "low"
                 # The all-page preflight distinguishes a handful of
@@ -4651,7 +5708,72 @@ def embedding_observation_progress(start_fraction, end_fraction, observed_vector
     return start + (end - start) * coverage
 
 
-def has_document_wide_ocr_evidence(candidates):
+def automatic_visual_text_ocr_targets(ocr_preflight_hint, pdf_page_count=0):
+    """Return high-confidence image pages suitable for targeted OCR recovery.
+
+    The picker performs a cheap all-page inspection before confirmation.  Its
+    result is useful only when it identifies a page that is both materially
+    raster-backed and effectively empty in the native text layer.  A normal
+    sparse title leaf, blank verso, or incidental illustration must not cause
+    expensive OCR.  The returned page list is deliberately page-local so the
+    mature native candidate and its boundaries remain the authority elsewhere.
+    """
+    coverage = dict((ocr_preflight_hint or {}).get("full_native_text_coverage") or {})
+    if str(coverage.get("status") or "").casefold() != "verified":
+        return {
+            "status": "not_available",
+            "page_numbers": [],
+            "reason": "all_page_native_coverage_not_verified",
+        }
+    try:
+        physical_page_count = int(coverage.get("page_count") or pdf_page_count or 0)
+    except (TypeError, ValueError):
+        physical_page_count = 0
+    page_numbers = []
+    evidence = []
+    for row in coverage.get("image_backed_low_text_pages") or []:
+        if not isinstance(row, dict):
+            continue
+        try:
+            page_number = int(row.get("page") or 0)
+            native_characters = int(row.get("native_text_characters") or 0)
+            image_count = int(row.get("image_count") or 0)
+        except (TypeError, ValueError):
+            continue
+        if page_number < 1 or (physical_page_count and page_number > physical_page_count):
+            continue
+        # Native text that is merely short can be a caption or a title leaf;
+        # target only a practical empty layer.  Existing preflights without
+        # geometry remain usable, but a supplied geometry value must confirm
+        # that the embedded image materially occupies the source page.
+        if image_count < 1 or native_characters > 24:
+            continue
+        area_value = row.get("largest_image_area_ratio")
+        try:
+            material_raster = area_value is None or float(area_value) >= 0.28
+        except (TypeError, ValueError):
+            material_raster = False
+        if not material_raster or page_number in page_numbers:
+            continue
+        page_numbers.append(page_number)
+        evidence.append({
+            "page": page_number,
+            "native_text_characters": native_characters,
+            "image_count": image_count,
+            "largest_image_area_ratio": area_value,
+        })
+    return {
+        "status": "targeted_ocr_recommended" if page_numbers else "not_indicated",
+        "page_numbers": sorted(page_numbers),
+        "reason": (
+            "image_backed_effectively_empty_native_pages"
+            if page_numbers else "no_high_confidence_visual_text_gap"
+        ),
+        "pages": evidence,
+    }
+
+
+def has_document_wide_ocr_evidence(candidates, ocr_preflight_hint=None, pdf_page_count=0):
     """Whether candidate evidence warrants OCRing an entire PDF.
 
     ``possible`` deliberately is not enough.  A mostly text-native book can
@@ -4661,6 +5783,8 @@ def has_document_wide_ocr_evidence(candidates):
     sparse pages for review.  ``high`` remains the conservative signal for a
     document-wide OCR fallback.
     """
+    # Targeted recovery is intentionally not promoted to whole-document OCR.
+    # The separate evidence object tells the runner to OCR only these pages.
     return any(
         str((candidate.get("quality") or {}).get("scanned_likelihood") or "").casefold()
         == "high"
@@ -4669,13 +5793,24 @@ def has_document_wide_ocr_evidence(candidates):
     )
 
 
-def resolve_unstructured_strategy(requested_strategy, prior_candidates=None, runtime_probe=None):
+def resolve_unstructured_strategy(
+    requested_strategy,
+    prior_candidates=None,
+    runtime_probe=None,
+    ocr_preflight_hint=None,
+    pdf_page_count=0,
+):
     requested = (requested_strategy or "auto").strip().casefold()
     runtime_probe = dict(
         unstructured_runtime_status("hi_res") if runtime_probe is None else runtime_probe
     )
     prior_candidates = prior_candidates or []
-    scanned_like = has_document_wide_ocr_evidence(prior_candidates)
+    scanned_like = has_document_wide_ocr_evidence(
+        prior_candidates, ocr_preflight_hint, pdf_page_count
+    )
+    targeted_visual_text = automatic_visual_text_ocr_targets(
+        ocr_preflight_hint, pdf_page_count)
+    targeted_ocr_needed = bool(targeted_visual_text.get("page_numbers"))
     backend_failed = any(bool(candidate.get("error")) for candidate in prior_candidates)
     coverage_disagreement = False
     word_counts = [
@@ -4698,12 +5833,18 @@ def resolve_unstructured_strategy(requested_strategy, prior_candidates=None, run
             "reason": "explicit_strategy",
         }
 
-    if runtime_probe.get("tesseract_available") and (scanned_like or backend_failed or coverage_disagreement):
+    if runtime_probe.get("tesseract_available") and (
+        scanned_like or targeted_ocr_needed or backend_failed or coverage_disagreement
+    ):
         return {
             "requested": requested,
             "resolved": "hi_res",
             "runtime": {**runtime_probe, "ocr_required": True},
-            "reason": "ocr_enabled_for_difficult_pdf",
+            "reason": (
+                "ocr_enabled_for_targeted_visual_text_pages"
+                if targeted_ocr_needed and not (scanned_like or backend_failed or coverage_disagreement)
+                else "ocr_enabled_for_difficult_pdf"
+            ),
         }
     return {
         "requested": requested,
@@ -4902,6 +6043,90 @@ def explainable_ocr_coverage_disagreement(selected, candidates, profile, ocr_evi
         "checks": base_checks,
         "materially_shorter_peers": materially_shorter_peers,
         "weak_shorter_peers": weak_shorter_peers,
+    }
+
+
+def explainable_layout_artifact_coverage_disagreement(selected, candidates, profile):
+    """Recognize a clean selected text layer against only noisier, longer peers.
+
+    This is intentionally separate from the OCR-recovery exception above.
+    Poetry, art catalogues, and other sparse-layout PDFs can have authentic
+    low word density and blank image pages. A layout extractor may report much
+    more text by duplicating page content or turning decorative images into
+    garbage. Do not turn that word-count difference into a review gate when
+    the selected candidate covers every physical page, has clean provenance,
+    and every materially longer peer has objective layout-artifact evidence
+    and a lower candidate score.
+    """
+    selected = selected or {}
+    candidates = candidates or []
+    profile = profile or {}
+    selected_quality = selected.get("quality") or {}
+    page_count = max(1, int(profile.get("pdf_page_count") or 0))
+    selected_words = int(selected_quality.get("included_words") or 0)
+    selected_pages = int(selected_quality.get("included_pages") or 0)
+    selected_artifact_ratio = float(selected_quality.get("ocr_layout_artifact_ratio") or 0.0)
+    selected_replacements = int(selected_quality.get("replacement_chars") or 0)
+    selected_chars = int(selected_quality.get("included_chars") or 0)
+    selected_score = float(selected.get("score") or 0)
+
+    base_checks = {
+        "all_pdf_pages_covered": selected_pages >= page_count,
+        # A sparse text source is still meaningful at this conservative floor
+        # when it covers every page. This is not an OCR promotion path.
+        "minimum_selected_text_for_sparse_layout": selected_words >= max(120, page_count * 40),
+        "selected_layout_artifacts_low": selected_artifact_ratio <= 0.005,
+        "selected_replacement_characters_low": (
+            selected_replacements <= max(20, int(selected_chars * 0.005))
+        ),
+        "native_chunk_provenance_passes": (
+            str((selected.get("native_chunk_eval") or {}).get("status") or "").casefold()
+            == "pass"
+        ),
+    }
+
+    materially_longer_peers = []
+    noisy_longer_peers = []
+    for candidate in candidates:
+        if candidate is selected or candidate.get("error") or not candidate.get("segments"):
+            continue
+        quality = candidate.get("quality") or {}
+        peer_words = int(quality.get("included_words") or 0)
+        if peer_words <= 0 or selected_words <= 0:
+            continue
+        disagreement = (peer_words - selected_words) / peer_words
+        if disagreement <= 0.35:
+            continue
+        peer = {
+            "backend": str(candidate.get("backend") or ""),
+            "included_words": peer_words,
+            "disagreement": round(disagreement, 4),
+            "score": float(candidate.get("score") or 0),
+            "ocr_layout_artifact_count": int(quality.get("ocr_layout_artifact_count") or 0),
+            "ocr_layout_artifact_ratio": float(quality.get("ocr_layout_artifact_ratio") or 0.0),
+        }
+        materially_longer_peers.append(peer)
+        if (
+            peer["ocr_layout_artifact_ratio"] >= 0.01
+            and peer["ocr_layout_artifact_count"] >= 20
+            and selected_score > peer["score"]
+        ):
+            noisy_longer_peers.append(peer)
+
+    base_checks["all_longer_peers_have_objective_layout_weakness"] = bool(materially_longer_peers) and (
+        len(noisy_longer_peers) == len(materially_longer_peers)
+    )
+    accepted = all(base_checks.values())
+    return {
+        "accepted": accepted,
+        "reason": (
+            "clean_selected_text_beats_artifact_heavy_peer"
+            if accepted
+            else "coverage_disagreement_requires_review"
+        ),
+        "checks": base_checks,
+        "materially_longer_peers": materially_longer_peers,
+        "noisy_longer_peers": noisy_longer_peers,
     }
 
 
@@ -5265,11 +6490,7 @@ def build_run_diagnostics(
 
     quality = selected.get("quality", {})
     outline_reliability = selected.get("outline_validation", {}).get("reliability")
-    ocr_assisted_selection = (
-        selected.get("backend") == "unstructured"
-        and str(selected.get("unstructured_strategy") or "").casefold() in {"hi_res", "ocr_only"}
-        and int(quality.get("included_words") or 0) > 0
-    )
+    ocr_assisted_selection = bool(selected.get("ocr_assistance_observed"))
     if profile.get("needs_password"):
         add("PDF_ENCRYPTED_PASSWORD_REQUIRED", "error", "inspection", "The PDF requires a password.", "Export an unlocked copy before extraction.")
     if quality.get("scanned_likelihood") == "high":
@@ -5277,16 +6498,45 @@ def build_run_diagnostics(
             add("PDF_IMAGE_HEAVY_OCR_USED", "info", "extraction", "Most included pages appear image-heavy, and the selected OCR-assisted extraction path was used.", "Review the OCR output on difficult pages, but no extra OCR pass is required before upload.")
         else:
             add("PDF_OCR_REQUIRED", "error", "extraction", "Most included pages have little text and appear image-heavy.", "Run page-aware OCR, then prepare the OCRed PDF.")
+    if quality.get("text_integrity_status") == "review":
+        add(
+            "PDF_TEXT_LAYER_FRAGMENTED",
+            "warning",
+            "extraction",
+            (
+                "The nominal text layer contains "
+                f"{quality.get('fragmented_single_letter_token_count', 0)} broken one-letter fragments "
+                f"across {quality.get('fragmented_page_count', 0)} page(s)."
+            ),
+            "Automatic will compare OCR when available. Keep the native output if OCR adds more errors than it resolves.",
+        )
     elif quality.get("scanned_likelihood") == "possible":
+        material_pages = max(
+            1,
+            int(profile.get("pdf_page_count") or 0) - int(quality.get("empty_pages") or 0),
+        )
+        native_text_was_complete = (
+            not ocr_assisted_selection
+            and int(quality.get("included_pages") or 0) >= material_pages
+            and str((selected.get("native_chunk_eval") or {}).get("status") or "").casefold() == "pass"
+        )
         add(
             "PDF_MIXED_TEXT_AND_SCAN",
             "info" if ocr_assisted_selection else "warning",
             "extraction",
-            "Some pages may be scanned or have a weak text layer.",
+            (
+                "Some pages are image-backed or have a weak text layer; the selected native extraction still covered every material page with valid provenance."
+                if native_text_was_complete
+                else "Some pages may be scanned or have a weak text layer."
+            ),
             (
                 "Review low-text pages in extraction-report.csv to confirm OCR quality."
                 if ocr_assisted_selection
-                else "Review low-text pages in extraction-report.csv."
+                else (
+                    "No OCR retry is needed unless those specific image pages contain text you expect to retrieve."
+                    if native_text_was_complete
+                    else "Review low-text pages in extraction-report.csv."
+                )
             ),
         )
     if outline_reliability == "missing":
@@ -5345,6 +6595,44 @@ def build_run_diagnostics(
             f"Excluded {layout['excluded_footnote_count']} high-confidence lower-page footnote group(s).",
             "Review selected/layout-region-review.json before relying on content-quality retrieval evidence.",
         )
+    visual_text = selected.get("visual_text_review") or {}
+    if int(visual_text.get("unresolved_page_count") or 0):
+        pages = ", ".join(
+            str(row.get("pdf_page"))
+            for row in (visual_text.get("pages") or [])[:8]
+        )
+        add(
+            "PDF_VISUAL_TEXT_UNRESOLVED",
+            "warning",
+            "extraction",
+            (
+                f"{visual_text.get('unresolved_page_count')} image-dominant page(s) produced only low-signal or no text"
+                + (f" (PDF page(s): {pages})." if pages else ".")
+            ),
+            "No text was guessed or added. Review visual-text-review.json and the original PDF page if an image caption or label matters for retrieval.",
+        )
+    elif str(visual_text.get("status") or "") == "assessment_incomplete":
+        assessment = visual_text.get("assessment") or {}
+        missing = ", ".join(
+            str(page)
+            for page in (assessment.get("missing_geometry_pages") or [])[:8]
+        )
+        add(
+            "PDF_VISUAL_TEXT_ASSESSMENT_INCOMPLETE",
+            "warning",
+            "extraction",
+            "Image-page visual-text coverage could not be fully assessed because page or extractor metadata was incomplete."
+            + (f" Missing geometry for PDF page(s): {missing}." if missing else ""),
+            "No text was changed. Inspect the original PDF and visual-text-review.json before relying on image-page labels for retrieval.",
+        )
+    elif str(visual_text.get("status") or "") == "not_assessed":
+        add(
+            "PDF_VISUAL_TEXT_NOT_ASSESSED",
+            "warning",
+            "extraction",
+            "Image-page visual-text coverage was not assessed because the selected physical page scope could not be established.",
+            "No text was changed. Check PDF page metadata and rerun before relying on image-page labels for retrieval.",
+        )
     lane_review = selected.get("lane_review") or {}
     if int(lane_review.get("proposed_supplementary_count") or 0):
         if lane_review.get("primary_payload_changed"):
@@ -5366,16 +6654,35 @@ def build_run_diagnostics(
     if selected.get("backend_word_disagreement", 0) > 0.35:
         disagreement_resolution = selected.get("backend_word_disagreement_resolution") or {}
         if disagreement_resolution.get("accepted"):
+            resolution_reason = str(disagreement_resolution.get("reason") or "")
+            if resolution_reason == "clean_selected_text_beats_artifact_heavy_peer":
+                peers = list(disagreement_resolution.get("noisy_longer_peers") or [])
+                peer_detail = ""
+                if peers:
+                    first_peer = peers[0]
+                    peer_detail = (
+                        f" The longer {first_peer.get('backend') or 'alternative'} output had "
+                        f"{int(first_peer.get('ocr_layout_artifact_count') or 0)} layout artefact(s)."
+                    )
+                message = (
+                    f"Backend word counts differ by {selected['backend_word_disagreement']:.1%}, "
+                    "but the selected text covers the physical PDF pages with low artefacts and passed provenance checks."
+                    + peer_detail
+                )
+                action = "No retry is needed; the retained resolution evidence records the selected and rejected candidate metrics."
+            else:
+                message = (
+                    f"Backend word counts differ by {selected['backend_word_disagreement']:.1%}, "
+                    "but the shorter extraction carried objective weakness while the complete "
+                    "OCR recovery passed the independent quality and provenance checks."
+                )
+                action = "The retained resolution evidence records every check and peer metric."
             add(
                 "BACKEND_TEXT_COVERAGE_DISAGREEMENT_EXPLAINED",
                 "info",
                 "backend_selection",
-                (
-                    f"Backend word counts differ by {selected['backend_word_disagreement']:.1%}, "
-                    "but the shorter extraction carried objective weakness while the complete "
-                    "OCR recovery passed the independent quality and provenance checks."
-                ),
-                "The retained resolution evidence records every check and peer metric.",
+                message,
+                action,
             )
         else:
             add("BACKEND_TEXT_COVERAGE_DISAGREEMENT", "error", "backend_selection", f"Backend word counts differ by {selected['backend_word_disagreement']:.1%}.", "Compare candidate extraction reports before upload.")
@@ -7339,6 +8646,11 @@ def score_candidate(candidate):
         score += 8
     else:
         reasons.append(f"scanned_likelihood_{q.get('scanned_likelihood', 'unknown')}")
+    if q.get("text_integrity_status") == "review":
+        # Keep native text viable: this signal asks Automatic to compare an
+        # OCR candidate, rather than declaring that OCR must be better.
+        score -= 3
+        reasons.append("fragmented_text_integrity_review")
     if float(q.get("ocr_layout_artifact_ratio") or 0) >= 0.005:
         # A small count is expected in source material.  At this density the
         # candidate visibly contains extractor noise and must not win merely
@@ -7367,7 +8679,21 @@ def score_candidate(candidate):
     if candidate["backend"] == "pymupdf":
         score += 3
     if candidate["backend"] == "unstructured":
-        score -= 4
+        reconciliation = candidate.get("native_ocr_reconciliation") or {}
+        native_selected_pages = reconciliation.get("native_selected_pages") or []
+        if reconciliation.get("status") == "applied" and native_selected_pages:
+            # A reconciled candidate keeps OCR's verified local structure
+            # while substituting native text only where it is page-locally
+            # clearer. The former generic OCR penalty would otherwise select
+            # the weaker native-only candidate after reconciliation succeeded.
+            score += 4
+            reasons.append("native_ocr_page_reconciliation")
+        else:
+            # ``applied`` can also mean every page retained the extractor's
+            # text by a tie-break. That is not hybrid evidence and must not
+            # outrank a clean native candidate merely because a reconciliation
+            # report exists.
+            score -= 4
     return score, reasons
 
 
@@ -8335,69 +9661,26 @@ def read_validation_workspace_template(storage_dir: Path):
 
 
 def update_workspace_runtime_template_sqlite(storage_dir: Path, workspace_slug: str, template: dict):
+    """Reject the retired direct-SQLite workspace-template shortcut.
+
+    Workspace creation and configuration must use an observed AnythingLLM API
+    contract.  Writing a freshly-created row through SQLite looked harmless,
+    but it bypassed Desktop validation and became version-dependent without a
+    reliable recovery path.  Keep this compatibility seam as an explicit
+    refusal so older callers cannot silently revive the behavior.
+    """
     result = {
-        "status": "not_attempted",
-        "write_method": "sqlite",
+        "status": "blocked",
+        "write_method": "none",
         "workspace_slug": workspace_slug,
         "verified": False,
         "applied": {},
-        "error": "",
-        "message": "",
+        "error": "direct_workspace_sqlite_writes_retired",
+        "message": (
+            "Workspace template copying is not applied because direct SQLite writes are retired. "
+            "The API-created workspace keeps AnythingLLM's own settings."
+        ),
     }
-    db_path = storage_dir / "anythingllm.db"
-    if not db_path.exists():
-        result["status"] = "missing_db"
-        result["error"] = f"AnythingLLM SQLite database was not found at {db_path}"
-        return result
-    con = sqlite3.connect(db_path)
-    try:
-        cur = con.cursor()
-        row = cur.execute(
-            "select id from workspaces where slug = ?",
-            (workspace_slug,),
-        ).fetchone()
-        if not row:
-            result["status"] = "workspace_missing"
-            result["error"] = f"Workspace `{workspace_slug}` was not found in AnythingLLM SQLite data."
-            return result
-        applied = {
-            "chatProvider": str(template.get("chat_provider") or ""),
-            "chatModel": str(template.get("chat_model") or ""),
-            "topN": int(template.get("top_n") or 8),
-            "similarityThreshold": template.get("similarity_threshold") if template.get("similarity_threshold") is not None else 0.25,
-            "vectorSearchMode": str(template.get("vector_search_mode") or "default"),
-            "chatMode": str(template.get("chat_mode") or "query"),
-        }
-        cur.execute(
-            """
-            update workspaces
-            set chatProvider = ?, chatModel = ?, topN = ?, similarityThreshold = ?, vectorSearchMode = ?, chatMode = ?
-            where slug = ?
-            """,
-            (
-                applied["chatProvider"],
-                applied["chatModel"],
-                applied["topN"],
-                applied["similarityThreshold"],
-                applied["vectorSearchMode"],
-                applied["chatMode"],
-                workspace_slug,
-            ),
-        )
-        con.commit()
-        verified = read_workspace_model_configuration(storage_dir, workspace_slug)
-        result["verified"] = verified.get("chat_provider") == applied["chatProvider"] and verified.get("chat_model") == applied["chatModel"]
-        result["status"] = "pass" if result["verified"] else "persisted_but_runtime_unverified"
-        result["applied"] = applied
-        result["message"] = (
-            f"Validation workspace `{workspace_slug}` was seeded from workspace template "
-            f"`{template.get('source_workspace_slug') or 'manual-template'}`."
-        )
-    except Exception as exc:
-        result["status"] = "error"
-        result["error"] = str(exc)
-    finally:
-        con.close()
     return result
 
 
@@ -8650,7 +9933,7 @@ def listen_for_anythingllm_embed_progress(
     connected_event=None,
     include_unmatched_events=False,
 ):
-    """Read Desktop's SSE queue feed while a single update request is active.
+    """Read Desktop's advisory SSE queue feed while a single update request is active.
 
     The feed is observational: failed or unavailable SSE must never fail an
     embedding request.  A short socket timeout lets the daemon listener stop
@@ -8660,8 +9943,10 @@ def listen_for_anythingllm_embed_progress(
     """
     # Desktop builds have shipped both route mounts.  The ordinary API calls
     # accept ``/api/v1`` on this installation, while the live progress stream
-    # is mounted under ``/api``.  Try the documented v1 form first, then make
-    # one explicit 404-only fallback instead of treating the stream as absent.
+    # is mounted under ``/api``.  The current public OpenAPI document does not
+    # promise either stream mount, so this observer is intentionally advisory:
+    # try the v1 shape first, then one 404-only fallback; never make progress
+    # availability a condition for submission, confirmation, or success.
     endpoint_candidates = [
         api_url.rstrip("/") + f"/api/v1/workspace/{workspace_slug}/embed-progress",
         api_url.rstrip("/") + f"/api/workspace/{workspace_slug}/embed-progress",
@@ -8857,6 +10142,7 @@ def start_anythingllm_embed_progress_listener(
         "events": observed_events,
         "errors": observed_errors,
         "health": observer_health,
+        "contract": "advisory_undocumented_progress_observer",
     }
 
 
@@ -9081,9 +10367,10 @@ def remove_confirmed_workspace_queue_entries(
     initial_workers=2,
     max_workers=4,
 ):
-    """Bounded cleanup for confirmed app submissions after positive ownership evidence.
+    """Bounded recovery-only cleanup after positive ownership evidence.
 
-    This helper will not run from a quiet or unavailable stream: those states
+    This helper targets an undocumented Desktop queue route and is never part
+    of normal submission or completion.  It will not run from a quiet or unavailable stream: those states
     cannot establish that a manual queue is absent.  It permits at most one
     retry per record and returns at its total deadline even if Desktop has
     stopped responding.
@@ -10058,13 +11345,15 @@ def create_validation_workspace(
                     + (f" Cleanup error: {cleanup_error}" if cleanup_error else "")
                 ),
             }
-        template_apply = {"status": "not_attempted", "message": "", "error": ""}
-        if 200 <= status < 300 and workspace_slug and storage_dir and workspace_template.get("status") == "pass":
-            template_apply = update_workspace_runtime_template_sqlite(
-                Path(storage_dir),
-                workspace_slug,
-                workspace_template,
-            )
+        template_apply = {
+            "status": "not_applied",
+            "write_method": "none",
+            "message": (
+                "The validation workspace retains AnythingLLM's API-created settings; "
+                "the assistant does not copy settings through SQLite."
+            ),
+            "error": "",
+        }
         return {
             "status": "created" if 200 <= status < 300 and workspace_slug else "error",
             "workspace_slug": workspace_slug,
@@ -10545,6 +11834,64 @@ def upload_block_reason_for_readiness(selected: dict) -> str:
     if "backend_text_coverage_disagreement" in reasons and ocr_assisted:
         return "ocr_backend_text_coverage_disagreement"
     return ""
+
+
+def ocr_upload_hold_guidance(block_reason: str, readiness_reasons=()):
+    """Return a specific, non-destructive explanation for an OCR upload hold.
+
+    The hold is an integrity guard: preparation evidence remains on disk and
+    no AnythingLLM upload is attempted. Keeping the message here makes the
+    per-PDF report and Automatic batch terminal use the same explanation.
+    """
+    reason = str(block_reason or "").strip()
+    reasons = {str(item).strip() for item in (readiness_reasons or ()) if str(item).strip()}
+    if reason == "photographed_spread_requires_manual_review":
+        return {
+            "code": "AUTO-LAYOUT-REVIEW-001",
+            "message": (
+                "AnythingLLM upload was withheld: repeated photographed spreads can hide or reorder text at the page fold. "
+                "No upload was sent. Inspect the prepared text and layout-region review before retrying."
+            ),
+            "next_steps": [
+                "Open the readiness report and layout-region review.",
+                "Confirm the reading order at the photographed-page folds before retrying.",
+            ],
+        }
+    if reason == "ocr_backend_text_coverage_disagreement":
+        return {
+            "code": "AUTO-OCR-REVIEW-001",
+            "message": (
+                "AnythingLLM upload was withheld: two credible OCR-capable extractors disagree materially about recoverable text. "
+                "No upload was sent. Compare the candidate extraction reports before choosing a retry strategy."
+            ),
+            "next_steps": [
+                "Open the readiness report and compare the candidate extraction reports.",
+                "Use an explicit OCR strategy only after confirming which output preserves the source correctly.",
+            ],
+        }
+    if "ocr_attempt_failed" in reasons:
+        return {
+            "code": "AUTO-OCR-ATTEMPT-FAILED-001",
+            "message": (
+                "AnythingLLM upload was withheld: full extraction showed that OCR is needed, but the available OCR attempt failed. "
+                "No upload was sent; inspect the saved readiness report before retrying."
+            ),
+            "next_steps": [
+                "Open the readiness report to see the failed OCR backend and affected pages.",
+                "Repair the OCR dependency or use a verified OCRed copy of the PDF, then retry.",
+            ],
+        }
+    return {
+        "code": "AUTO-OCR-UNAVAILABLE-001",
+        "message": (
+            "AnythingLLM upload was withheld: full extraction showed that reliable OCR is required, but the OCR runtime is unavailable. "
+            "No upload was sent and the prepared evidence was retained."
+        ),
+        "next_steps": [
+            "Install or repair both Unstructured and Tesseract, then retry.",
+            "Alternatively, provide a verified OCRed PDF copy.",
+        ],
+    }
 
 
 def get_anythingllm_metadata_schema(api_url, api_key=None):
@@ -14560,7 +15907,10 @@ def full_post_upload_observation_is_required(
     )
 
 
-def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha, payloads, upload_locations=None, observation_mode="full", frontend_api_url=""):
+# Pyright's flow analyzer cannot traverse this deliberately comprehensive,
+# read-only evidence coordinator. Keep the narrow analyzer-limit suppression on
+# its definition; individual type errors elsewhere in the module still fail.
+def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha, payloads, upload_locations=None, observation_mode="full", frontend_api_url=""):  # pyright: ignore[reportGeneralTypeIssues]
     result = {
         "status": "not_checked",
         "workspace_slug": workspace_slug,
@@ -14602,6 +15952,12 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
         "current_upload_workspace_document_count": 0,
         "current_upload_document_vector_count": 0,
         "current_upload_documents_with_vectors": 0,
+        # Exact raw-document locations from this submission whose own
+        # workspace-document record has at least one vector.  Counts alone
+        # cannot safely narrow a mixed-PDF recovery manifest: one completed
+        # page parent must never stand in for another merely because their
+        # source hash or chunk identity is shared.
+        "current_upload_locations_with_vectors": [],
         "current_upload_vector_evidence_complete": None,
         "current_upload_vector_expanded": False,
         "chunk_survival_ratio": 0.0,
@@ -14636,7 +15992,8 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
         result["workspace_found"] = True
         workspace_id = workspace["id"]
         normalized_observation_mode = str(observation_mode or "full").casefold()
-        if normalized_observation_mode in {"fast", "identity"}:
+        attachment_only_observation = normalized_observation_mode == "current_upload"
+        if normalized_observation_mode in {"fast", "identity", "current_upload"}:
             # The five-second observer needs only a bounded health signal.
             # Pulling every workspace-document JSON blob on every poll caused
             # a batch-global cost once per PDF, and it could race Desktop
@@ -14671,10 +16028,29 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
             for payload in expected_payloads
             if isinstance(payload, dict)
         ]
-        location_report = inspect_uploaded_location_files(
-            storage_dir,
-            upload_locations,
-            expected_needles=expected_needles,
+        # Recovery already has durable locations from its ledger.  It only
+        # needs to know which exact workspace-document paths own vectors; a
+        # second filesystem scan plus LanceDB materialisation once per source
+        # makes a large mixed-PDF resume both slower and less reliable while
+        # Desktop may still be writing.
+        location_report = (
+            {
+                "existing_files": 0,
+                "matching_files": 0,
+                "metadata_visible": False,
+                "sample_path": "",
+                "reported_locations": len(upload_locations or []),
+                "missing_locations": 0,
+                "rejected_locations": 0,
+                "desktop_drawer_root_locations": 0,
+                "desktop_drawer_nested_locations": 0,
+            }
+            if attachment_only_observation
+            else inspect_uploaded_location_files(
+                storage_dir,
+                upload_locations,
+                expected_needles=expected_needles,
+            )
         )
         result["upload_location_existing_files"] = location_report.get("existing_files", 0)
         result["upload_location_matching_files"] = location_report.get("matching_files", 0)
@@ -14739,18 +16115,35 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
                 ).fetchall()
             )
         result["current_upload_document_vector_count"] = len(current_upload_vector_doc_ids)
-        result["current_upload_documents_with_vectors"] = len(set(current_upload_vector_doc_ids))
+        current_upload_vector_doc_id_set = set(current_upload_vector_doc_ids)
+        result["current_upload_documents_with_vectors"] = len(current_upload_vector_doc_id_set)
+        result["current_upload_locations_with_vectors"] = sorted({
+            str(row.get("docpath") or "").replace("\\", "/").lstrip("/")
+            for row in current_upload_docs
+            if row.get("docId") in current_upload_vector_doc_id_set
+            and str(row.get("docpath") or "").strip()
+        })
         if normalized_upload_locations:
             expected_count = result["expected_payload_count"]
             current_raw_documents_complete = bool(
                 expected_count
-                and result["upload_location_matching_files"] == expected_count
+                and (
+                    attachment_only_observation
+                    or result["upload_location_matching_files"] == expected_count
+                )
                 and result["current_upload_workspace_document_count"] == expected_count
                 and result["current_upload_documents_with_vectors"] == expected_count
             )
+            # AnythingLLM is allowed to split one attached native document
+            # into several internal embedding vectors.  That is expected for
+            # a long all-in-one source and does not mean that the assistant
+            # submitted a duplicate.  The exact attachment locations prove
+            # which documents came from *this* submission; completion is
+            # therefore one or more vectors for every one of those attached
+            # documents, not an artificial 1:1 raw-document/vector ratio.
             result["current_upload_vector_evidence_complete"] = bool(
                 current_raw_documents_complete
-                and result["current_upload_document_vector_count"] == expected_count
+                and result["current_upload_document_vector_count"] >= expected_count
             )
             result["current_upload_vector_expanded"] = bool(
                 current_raw_documents_complete
@@ -14811,6 +16204,9 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
                 ]
                 result["matching_vector_rows"] = len(vector_ids)
         native_rows = (
+            {}
+            if attachment_only_observation
+            else
             inspect_native_metadata_count(
                 storage_dir,
                 source_sha,
@@ -14883,14 +16279,21 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
         elif result["uploaded_payload_count"] > 0:
             result["chunk_survival_flag"] = "missing_after_upload"
         if result["current_upload_vector_evidence_complete"]:
-            # This attempt's raw documents each have exactly one linked
-            # document-vector row. Older vectors with the same stable
-            # chunkSource remain useful workspace-cleanup evidence, but must
-            # not be misreported as this upload being re-chunked.
-            result["chunk_survival_ratio"] = 1.0
+            # The current submission has an exact attachment chain and every
+            # newly attached document has searchable-vector evidence.  Keep
+            # the raw internal-vector count for diagnostics, but do not call
+            # normal provider-side re-chunking a failed source chunk.
+            result["chunk_survival_ratio"] = round(
+                float(result["current_upload_document_vector_count"])
+                / float(result["expected_payload_count"]),
+                4,
+            )
             result["chunk_survival_flag"] = (
-                "preserved_current_submission_with_workspace_duplicates"
-                if result["duplicate_chunk_source_count"] else "preserved"
+                "provider_rechunked_current_submission_with_workspace_duplicates"
+                if result["duplicate_chunk_source_count"]
+                else "provider_rechunked_current_submission"
+                if result["current_upload_vector_expanded"]
+                else "preserved"
             )
         identity_provenance_evidence = bool(
             result["identity_set_checked"] and result["identity_set_complete"]
@@ -14910,19 +16313,42 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
         # cancelled/failed embedding batch can leave genuinely retrievable
         # vectors behind.  Report that honestly instead of letting the later
         # document/vector branches call the upload a pass.
-        if (
-            result["current_upload_vector_evidence_complete"]
-            and result["identity_set_checked"]
-            and not result["identity_set_complete"]
-        ):
-            result["status"] = "pass_with_review"
-            result["classification"] = "current_batch_exact_workspace_duplicate_identities"
-            result["message"] = (
-                f"This submission indexed {result['current_upload_document_vector_count']}/"
-                f"{result['expected_payload_count']} planned records exactly. The workspace also contains "
-                f"{result['duplicate_chunk_source_count']} older duplicate vector row(s) with the same "
-                "source identities; they are not counted as new progress."
+        if result["current_upload_vector_evidence_complete"]:
+            # The submitted attachment paths identify this attempt's raw
+            # documents independently of the provider's internal chunk rows.
+            # A repeated chunkSource in LanceDB is normal when AnythingLLM
+            # re-chunks a long document, so it cannot by itself be called an
+            # older workspace duplicate. Genuine prior-document duplicates
+            # are handled earlier by the workspace duplicate preflight, where
+            # the assistant can compare document ownership before submission.
+            result["status"] = "pass"
+            result["classification"] = (
+                "current_submission_provider_rechunked"
+                if result["current_upload_vector_expanded"]
+                else "current_submission_exact_vector_coverage"
             )
+            result["message"] = (
+                f"This submission attached {result['expected_payload_count']}/"
+                f"{result['expected_payload_count']} planned record(s) and confirmed searchable-vector evidence "
+                f"for every attached document ({result['current_upload_document_vector_count']} internal vector row(s))."
+            )
+        elif attachment_only_observation:
+            if result["current_upload_locations_with_vectors"]:
+                result["status"] = "partial_vector_coverage"
+                result["classification"] = "current_submission_partial_exact_location_coverage"
+                result["message"] = (
+                    "Exact workspace attachment paths show vectors for only "
+                    f"{result['current_upload_documents_with_vectors']}/{result['expected_payload_count']} "
+                    "prepared record(s). Only those exact locations may be removed from recovery."
+                )
+            elif result["current_upload_workspace_document_count"]:
+                result["status"] = "docs_without_vectors"
+                result["classification"] = "current_submission_attachments_not_embedded"
+                result["message"] = "Exact workspace attachment paths exist, but none has vector evidence yet."
+            else:
+                result["status"] = "no_matching_native_docs"
+                result["classification"] = "current_submission_attachment_not_observed"
+                result["message"] = "No exact workspace attachment paths were observed for this recovery group."
         elif result["identity_set_checked"] and not result["identity_set_complete"]:
             result["status"] = "partial_vector_coverage"
             result["classification"] = "page_parent_identity_set_mismatch"
@@ -15950,18 +17376,14 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     author_text_samples = pdf_meta.pop("_author_text_samples", [])
     author_sample_error = str(pdf_meta.pop("_author_sample_error", "") or "")
     use_file_title_fallback = getattr(args, "use_file_title_fallback", True)
-    if args.document_label:
-        title = args.document_label
-        title_source = "user_override"
-    elif pdf_meta.get("title"):
-        title = pdf_meta["title"]
-        title_source = "pdf_metadata"
-    elif use_file_title_fallback:
-        title = pdf_path.stem
-        title_source = "filename_fallback"
-    else:
-        title = "Untitled PDF"
-        title_source = "generated_placeholder"
+    resolved_title = resolve_title_from_metadata_or_filename(
+        pdf_meta.get("title") or "",
+        pdf_path,
+        title_override=args.document_label,
+        use_file_title_fallback=use_file_title_fallback,
+    )
+    title = resolved_title["title"]
+    title_source = resolved_title["source"]
     inferred_author = (
         {"author": "", "source": "error", "page": 0, "evidence": author_sample_error}
         if author_sample_error
@@ -16121,16 +17543,27 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         if isinstance(shared_runtime_context, dict)
         else None
     )
-    unstructured_runtime_probe = dict(
-        supplied_runtime_probe
+    # ``None`` means "probe now". An empty dictionary used to be passed to
+    # ``resolve_unstructured_strategy`` as if it were a completed negative
+    # probe, so explicit OCR modes falsely reported Tesseract missing even
+    # when the installed executable was resolvable.
+    unstructured_runtime_probe = (
+        dict(supplied_runtime_probe)
         if isinstance(supplied_runtime_probe, dict) and supplied_runtime_probe
-        else shared_unstructured_probe
+        else dict(shared_unstructured_probe)
         if isinstance(shared_unstructured_probe, dict) and shared_unstructured_probe
-        else {}
+        else None
+    )
+    ocr_preflight_hint = getattr(args, "ocr_preflight_hint", None)
+    preflight_visual_text_targets = automatic_visual_text_ocr_targets(
+        ocr_preflight_hint,
+        profile.get("pdf_page_count"),
     )
     resolved_unstructured = resolve_unstructured_strategy(
         requested_unstructured_strategy,
         runtime_probe=unstructured_runtime_probe,
+        ocr_preflight_hint=ocr_preflight_hint,
+        pdf_page_count=profile.get("pdf_page_count"),
     )
     profile["unstructured_runtime"] = {
         **resolved_unstructured["runtime"],
@@ -16154,19 +17587,24 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     auto_unstructured_reasons = []
     auto_unstructured_suppressed_reasons = []
     automatic_candidate_shortcuts = []
+    automatic_targeted_ocr_pages = []
     shared_boundary_reference = None
 
     candidates = []
     for backend_index, backend in enumerate(backend_names):
+        complete_native_candidate = has_complete_native_text_candidate(
+            candidates,
+            profile.get("pdf_page_count"),
+            ocr_preflight_hint,
+        )
+        targeted_visual_text_recovery = bool(
+            preflight_visual_text_targets.get("page_numbers")
+        )
         if (
             backend_mode == "automatic"
             and backend == "pymupdf4llm"
             and not bool(args.deep_extraction)
-            and has_complete_native_text_candidate(
-                candidates,
-                profile.get("pdf_page_count"),
-                getattr(args, "ocr_preflight_hint", None),
-            )
+            and (complete_native_candidate or targeted_visual_text_recovery)
         ):
             # PyMuPDF4LLM's layout path can re-run Tesseract on every image
             # page even when the preceding native candidate already has
@@ -16174,8 +17612,23 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             # deep-extraction modes available; this is only an Automatic-mode
             # shortcut with a recorded, auditable basis.
             automatic_candidate_shortcuts.append(
-                "pymupdf4llm_ocr_candidate_skipped_due_to_complete_native_text"
+                "pymupdf4llm_ocr_candidate_skipped_due_to_targeted_visual_text_recovery"
+                if targeted_visual_text_recovery
+                else "pymupdf4llm_ocr_candidate_skipped_due_to_complete_native_text"
             )
+            if targeted_visual_text_recovery:
+                # Skipping the broad layout/OCR candidate must not also skip
+                # the narrow recovery it was replaced with.  Append the OCR
+                # backend here because this loop iteration intentionally
+                # bypasses the normal post-PyMuPDF4LLM escalation block.
+                automatic_targeted_ocr_pages = list(
+                    preflight_visual_text_targets["page_numbers"]
+                )
+                auto_unstructured_reasons.append(
+                    "preflight_visual_text_gap_requires_targeted_ocr"
+                )
+                if "unstructured" not in backend_names:
+                    backend_names.append("unstructured")
             continue
         if backend == "unstructured" and not unstructured_runtime_probe:
             with measured_pipeline_phase(args, "unstructured_runtime_capability_probe"):
@@ -16188,6 +17641,8 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             requested_unstructured_strategy,
             prior_candidates=candidates,
             runtime_probe=unstructured_runtime_probe,
+            ocr_preflight_hint=ocr_preflight_hint,
+            pdf_page_count=profile.get("pdf_page_count"),
         )
         profile["unstructured_runtime"] = {
             **active_unstructured["runtime"],
@@ -16236,6 +17691,10 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             continue
         backend_started = time.perf_counter()
         try:
+            unstructured_effective_strategy = (
+                active_unstructured["resolved"] if backend == "unstructured" else ""
+            )
+
             def report_backend_page_progress(completed, total):
                 page_total = max(1, int(total or known_pages))
                 aggregate_total = max(1, page_total * max(1, len(backend_names)))
@@ -16252,7 +17711,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             pages, page_count, element_rows = get_backend_pages(
                 pdf_path,
                 backend,
-                active_unstructured["resolved"] if backend == "unstructured" else requested_unstructured_strategy,
+                unstructured_effective_strategy if backend == "unstructured" else requested_unstructured_strategy,
                 unstructured_runtime_probe=active_unstructured["runtime"] if backend == "unstructured" else None,
                 unstructured_cache_dir=(
                     getattr(args, "unstructured_ocr_cache_dir", "")
@@ -16260,16 +17719,45 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                     else None
                 ),
                 progress_callback=report_backend_page_progress,
+                unstructured_page_numbers=(
+                    automatic_targeted_ocr_pages
+                    if backend == "unstructured" and automatic_targeted_ocr_pages
+                    else None
+                ),
             )
             layout_evidence = {
                 "status": "not_applied",
                 "reason": "Positioned native-line cleanup is currently limited to the native PyMuPDF backend.",
             }
+            native_ocr_reconciliation = {
+                "status": "not_applicable",
+                "reason": "This extraction is not an OCR candidate with a prepared native peer.",
+            }
             if backend == "pymupdf":
                 pages, layout_evidence = apply_region_aware_native_layout(pdf_path, pages)
             elif backend == "unstructured":
                 pages, layout_evidence = remove_verified_photographed_ocr_running_headers(pages)
+                native_peer = next(
+                    (
+                        candidate for candidate in candidates
+                        if str(candidate.get("backend") or "").casefold() == "pymupdf"
+                        and not candidate.get("error")
+                        and candidate.get("pages")
+                    ),
+                    None,
+                )
+                if native_peer:
+                    pages, native_ocr_reconciliation = reconcile_native_ocr_pages(
+                        native_peer["pages"], pages
+                    )
+                else:
+                    native_ocr_reconciliation = {
+                        "status": "not_available",
+                        "reason": "No prepared PyMuPDF candidate was available for page-local reconciliation.",
+                    }
             write_json(candidate_dir / "layout-region-review.json", layout_evidence)
+            if backend == "unstructured":
+                write_json(candidate_dir / "native-ocr-reconciliation.json", native_ocr_reconciliation)
             pymupdf4llm_execution = (
                 pymupdf4llm_execution_evidence(pages)
                 if backend == "pymupdf4llm"
@@ -16467,9 +17955,17 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             )
             native_chunk_eval = native_header_chunk_eval(native_retrieval_units)
             quality = extraction_quality(pages, stats, start_page, end_page)
+            visual_text_review = visual_text_coverage_review(
+                pages,
+                page_count,
+                profile.get("page_geometry") or [],
+                start_page=start_page,
+                end_page=end_page,
+            )
 
             (candidate_dir / "anythingllm-upload.txt").write_text(upload_text, encoding="utf-8")
             write_json(candidate_dir / "retrieval-lane-review.json", lane_review)
+            write_json(candidate_dir / "visual-text-review.json", visual_text_review)
             write_supplementary_lane_candidate_text(
                 candidate_dir / "supplementary-content-candidates.txt", lane_review
             )
@@ -16594,11 +18090,17 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 "backend": backend,
                 "pymupdf4llm_execution": pymupdf4llm_execution,
                 "unstructured_execution": unstructured_execution,
-                "unstructured_strategy": active_unstructured["resolved"] if backend == "unstructured" else "",
+                "unstructured_strategy": unstructured_effective_strategy,
                 "unstructured_strategy_reason": active_unstructured["reason"] if backend == "unstructured" else "",
                 "page_count": page_count,
+                # Retained only for the current preparation call so a later
+                # OCR candidate can reconcile the same physical pages. It is
+                # deliberately excluded from persisted candidate summaries.
+                "pages": pages,
                 "page_stats": [asdict(s) for s in stats],
                 "layout_evidence": layout_evidence,
+                "native_ocr_reconciliation": native_ocr_reconciliation,
+                "visual_text_review": visual_text_review,
                 "lane_review": lane_review,
                 "start_page": start_page,
                 "start_reason": start_reason,
@@ -16740,6 +18242,12 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                     auto_unstructured_reasons.append("default_backends_disagree_on_text_coverage")
             if has_document_wide_ocr_evidence(evaluated):
                 auto_unstructured_reasons.append("default_backends_show_low_text_or_image_heavy_pages")
+            if any(
+                str((candidate.get("quality") or {}).get("text_integrity_status") or "").casefold()
+                == "review"
+                for candidate in evaluated
+            ):
+                auto_unstructured_reasons.append("default_backends_show_fragmented_text_integrity")
             elif any(
                 str((candidate.get("quality") or {}).get("scanned_likelihood") or "").casefold()
                 == "possible"
@@ -16756,6 +18264,26 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 for candidate in evaluated
             ):
                 auto_unstructured_reasons.append("outline_and_extracted_headings_disagree")
+            if preflight_visual_text_targets.get("page_numbers"):
+                # The UI's all-page inspection found a real visual-text gap:
+                # a materially raster-backed page whose native text layer is
+                # effectively empty.  Do not wait for the aggregate candidate
+                # score to become ``high``—one lost scanned appendix or poem
+                # page is still lost retrieval content.  When this is the only
+                # reason, OCR only these exact pages and reconcile them into
+                # the established native candidate below.
+                auto_unstructured_reasons.append(
+                    "preflight_visual_text_gap_requires_targeted_ocr"
+                )
+            if preflight_visual_text_targets.get("page_numbers"):
+                # Page-local physical evidence is stronger than aggregate
+                # candidate disagreement for this purpose.  Preserve native
+                # word identity on every healthy page, OCR only the known
+                # visual-text gaps, then let the established reconciliation
+                # produce the candidate that contains their union.
+                automatic_targeted_ocr_pages = list(
+                    preflight_visual_text_targets["page_numbers"]
+                )
             if auto_unstructured_reasons:
                 backend_names.append("unstructured")
 
@@ -16763,10 +18291,103 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     if not viable:
         raise RuntimeError("No extraction backend produced usable segments.")
     selected = sorted(viable, key=lambda c: c["score"], reverse=True)[0]
+    automatic_targeted_ocr_selection = {
+        "applied": False,
+        "recovered_page_numbers": [],
+        "reason": "not_applicable",
+    }
+    target_page_numbers = set(automatic_targeted_ocr_pages)
+    if target_page_numbers:
+        def candidate_page_number(row):
+            try:
+                return int((row or {}).get("page") or 0)
+            except (AttributeError, TypeError, ValueError):
+                return 0
+
+        recovered_candidates = []
+        for candidate in viable:
+            if str(candidate.get("backend") or "").casefold() != "unstructured":
+                continue
+            page_text_by_number = {
+                candidate_page_number(row): str(row.get("text") or "").strip()
+                for row in candidate.get("pages") or []
+                if isinstance(row, dict) and candidate_page_number(row) > 0
+            }
+            recovered_page_numbers = sorted(
+                candidate_page_number(row)
+                for row in (candidate.get("native_ocr_reconciliation") or {}).get("pages") or []
+                if isinstance(row, dict)
+                and candidate_page_number(row) in target_page_numbers
+                and str(row.get("decision") or "") == "ocr_used_native_page_missing"
+                and page_text_by_number.get(candidate_page_number(row), "")
+            )
+            if recovered_page_numbers:
+                recovered_candidates.append((candidate, recovered_page_numbers))
+        if recovered_candidates:
+            selected, recovered_page_numbers = sorted(
+                recovered_candidates,
+                key=lambda item: item[0].get("score", -999),
+                reverse=True,
+            )[0]
+            automatic_targeted_ocr_selection = {
+                "applied": True,
+                "recovered_page_numbers": recovered_page_numbers,
+                "reason": "verified_targeted_visual_text_recovery_supersedes_incomplete_native_candidate",
+            }
+        else:
+            automatic_targeted_ocr_selection["reason"] = (
+                "targeted_ocr_did_not_recover_nonempty_text"
+            )
     # This evidence is only available after the candidate has actually run.
     # Emit it before the upload phase so an outer progress UI can adjust the
     # remaining estimate without charging OCR to text-only PDFs in advance.
     ocr_evidence = ocr_assistance_evidence(selected, candidates, profile)
+    selected["ocr_assistance_observed"] = bool(ocr_evidence.get("used"))
+    selected["ocr_assistance_evidence"] = str(ocr_evidence.get("evidence") or "not_observed")
+    post_extraction_author_recovery = {
+        "author": "",
+        "source": "not_needed_author_already_resolved",
+        "page": 0,
+        "evidence": "",
+        "sample_pages": [],
+        "status": "not_needed",
+    }
+    # Native metadata and its first-page sample deliberately happen before
+    # backend selection. For scans, that first sample can be empty even when
+    # the selected OCR text later contains a plainly visible author line.
+    # Recover only an unresolved author from the chosen OCR/unstructured
+    # candidate; never replace an operator value or existing PDF metadata.
+    if not source_meta.get("source_author") and (
+        bool(ocr_evidence.get("used"))
+        or str(selected.get("backend") or "").casefold() == "unstructured"
+    ):
+        post_extraction_author_recovery = recover_author_from_selected_extraction(
+            selected.get("pages") or [],
+            title_hint=source_meta.get("source_title") or "",
+        )
+        recovered_author = normalize_text(post_extraction_author_recovery.get("author") or "")
+        if recovered_author:
+            recovered_source = str(post_extraction_author_recovery.get("source") or "selected_extraction_text")
+            source_meta["source_author"] = recovered_author
+            source_meta["metadata_provenance"] = {
+                **dict(source_meta.get("metadata_provenance") or {}),
+                "source_author": recovered_source,
+            }
+            source_meta["author_inference"] = dict(post_extraction_author_recovery)
+            source_meta["source_short_label"] = normalize_text(
+                args.document_short_label
+                or default_short_label(source_meta["source_title"], source_meta["source_author"])
+            )
+            profile["detected_author"] = recovered_author
+            profile["source_short_label"] = source_meta["source_short_label"]
+            profile["metadata_provenance"] = dict(source_meta["metadata_provenance"])
+            profile["author_inference"] = dict(post_extraction_author_recovery)
+            apply_source_identity_to_segments(selected.get("segments") or [], source_meta)
+            post_extraction_author_recovery["status"] = "recovered"
+        else:
+            post_extraction_author_recovery["status"] = "not_recovered"
+    selected["post_extraction_author_recovery"] = dict(post_extraction_author_recovery)
+    profile["post_extraction_author_recovery"] = dict(post_extraction_author_recovery)
     selection_stage = f"Selected {selected['backend']} and writing output variants"
     if ocr_evidence["used"]:
         selection_stage += " — OCR-assisted extraction observed"
@@ -16832,9 +18453,10 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             shared_runtime_context["unstructured_runtime_probe"] = dict(
                 unstructured_runtime_probe
             )
+    runtime_probe_evidence = unstructured_runtime_probe or {}
     ocr_runtime_available = bool(
-        unstructured_runtime_probe.get("backend_available")
-        and unstructured_runtime_probe.get("tesseract_available")
+        runtime_probe_evidence.get("backend_available")
+        and runtime_probe_evidence.get("tesseract_available")
     )
     unstructured_candidate_errors = [
         str(candidate.get("error") or "")
@@ -16874,6 +18496,12 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 ocr_evidence,
             )
             if not backend_word_disagreement_resolution["accepted"]:
+                backend_word_disagreement_resolution = explainable_layout_artifact_coverage_disagreement(
+                    selected,
+                    candidates,
+                    profile,
+                )
+            if not backend_word_disagreement_resolution["accepted"]:
                 readiness_reasons.append("backend_text_coverage_disagreement")
 
     selected["readiness_status"] = "needs_review" if readiness_reasons else "ready"
@@ -16907,7 +18535,10 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             candidate_fallback,
             selected_dir / "anythingllm-upload-inline-metadata-fallback.txt",
         )
-    shutil.copy2(src_candidate_dir / "segment-manifest.jsonl", selected_dir / "segment-manifest.jsonl")
+    # Candidate manifests are written before final candidate selection. Write
+    # the selected records instead so a post-selection OCR author recovery is
+    # reflected consistently in the public manifest and upload plans.
+    append_jsonl(selected_dir / "segment-manifest.jsonl", selected["segments"])
     transition_rows = []
     page_text_by_number = {}
     for segment in selected["segments"]:
@@ -16942,7 +18573,14 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     layout_review = src_candidate_dir / "layout-region-review.json"
     if layout_review.exists():
         shutil.copy2(layout_review, selected_dir / "layout-region-review.json")
-    for filename in ("retrieval-lane-review.json", "supplementary-content-candidates.txt"):
+    reconciliation_review = src_candidate_dir / "native-ocr-reconciliation.json"
+    if reconciliation_review.exists():
+        shutil.copy2(reconciliation_review, selected_dir / "native-ocr-reconciliation.json")
+    for filename in (
+        "retrieval-lane-review.json",
+        "supplementary-content-candidates.txt",
+        "visual-text-review.json",
+    ):
         source_path = src_candidate_dir / filename
         if source_path.exists():
             shutil.copy2(source_path, selected_dir / filename)
@@ -16998,7 +18636,26 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             source_path = Path(variant[key])
             target_path = selected_dir / filename
             if source_path.exists():
-                shutil.copy2(source_path, target_path)
+                if key == "manifest":
+                    variant_rows_for_identity = []
+                    for raw_line in source_path.read_text(encoding="utf-8").splitlines():
+                        if not raw_line.strip():
+                            continue
+                        try:
+                            variant_rows_for_identity.append(json.loads(raw_line))
+                        except json.JSONDecodeError:
+                            # The candidate artifact remains available for
+                            # diagnostics; do not convert a malformed optional
+                            # variant manifest into a preparation failure.
+                            variant_rows_for_identity = []
+                            break
+                    if variant_rows_for_identity:
+                        apply_source_identity_to_segments(variant_rows_for_identity, source_meta)
+                        append_jsonl(target_path, variant_rows_for_identity)
+                    else:
+                        shutil.copy2(source_path, target_path)
+                else:
+                    shutil.copy2(source_path, target_path)
                 copied[key] = str(target_path)
         if variant.get("fallback_upload_file"):
             source_path = Path(variant["fallback_upload_file"])
@@ -17535,6 +19192,29 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 cached_records = raw.get("cached_records")
             if cached_records is None and isinstance(raw_cached_positions, (set, list, tuple)):
                 cached_records = len(raw_cached_positions)
+            first_progress_at = float(raw.get("first_progress_monotonic") or 0.0)
+            last_progress_at = float(raw.get("last_progress_monotonic") or 0.0)
+            first_progress_position = int(raw.get("first_progress_position") or 0)
+            last_progress_position = int(raw.get("last_progress_position") or 0)
+            queue_records = max(0, int(raw.get("queue_records") or len(expected_batch)))
+            records_per_second = 0.0
+            if (
+                last_progress_at > first_progress_at
+                and last_progress_position > first_progress_position
+            ):
+                records_per_second = (
+                    (last_progress_position - first_progress_position)
+                    / (last_progress_at - first_progress_at)
+                )
+            queue_position = max(
+                int(raw.get("completed") or 0),
+                int(raw.get("current") or 0),
+            )
+            queue_remaining_seconds = (
+                round(max(0, queue_records - queue_position) / records_per_second, 3)
+                if records_per_second > 0.0 and queue_position < queue_records
+                else None
+            )
             return {
                 "desktop_queue_completed": max(0, int(raw.get("completed") or 0)),
                 "desktop_queue_current": max(0, int(raw.get("current") or 0)),
@@ -17544,7 +19224,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                     round(max(0.0, time.monotonic() - last_event), 3)
                     if last_event else None
                 ),
-                "queue_records": max(0, int(raw.get("queue_records") or len(expected_batch))),
+                "queue_records": queue_records,
                 "desktop_queue_observer_state": str(raw.get("observer_state") or "unknown"),
                 "desktop_queue_observer_failures": max(0, int(raw.get("observer_failures") or 0)),
                 "desktop_queue_observer_reason": str(raw.get("observer_reason") or ""),
@@ -17554,6 +19234,14 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 # report can correctly record cache reuse while the live
                 # progress line falls back to generic “embedding” wording.
                 "desktop_queue_cached_records": max(0, int(cached_records or 0)),
+                # Keep the locally owned queue forecast available to the
+                # timeout reconciler.  The outer Desktop wrapper has the
+                # same calculation for the UI, but this inner verifier runs
+                # before that wrapper attaches its final snapshot.
+                "desktop_queue_records_per_minute": (
+                    round(records_per_second * 60.0, 3) if records_per_second else None
+                ),
+                "desktop_queue_estimated_remaining_seconds": queue_remaining_seconds,
             }
 
         def healthy_owned_queue_active(queue=None):
@@ -17651,6 +19339,22 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             })
             return evidence
 
+        # ``poll_post_upload`` measures its deadline from the first
+        # reconciliation observation, whereas the durable receipt timestamp
+        # predates that observation by a small amount.  Keep those clocks
+        # explicit.  Comparing the receipt-relative value with the poller's
+        # deadline can miss the only extension opportunity by milliseconds at
+        # the boundary, which is exactly what happened in the 2,010-record
+        # Desktop queue: it was visibly advancing, yet ended at 480 seconds.
+        reconciliation_poll_started_elapsed = max(
+            0.0, time.time() - reconciliation_started_at
+        )
+        reconciliation_poll_hard_cap_seconds = max(
+            0.0,
+            float(ANYTHINGLLM_EMBEDDING_RECONCILIATION_ACTIVE_CAP_SECONDS)
+            - reconciliation_poll_started_elapsed,
+        )
+
         def extend_reconciliation_deadline(evidence, poll_elapsed, current_deadline):
             """Extend only while this run's owned Desktop queue proves movement.
 
@@ -17661,8 +19365,16 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             wait if Desktop stops reporting entirely.
             """
             evidence = dict(evidence or {})
-            elapsed = float(evidence.get("reconciliation_elapsed_seconds") or poll_elapsed or 0.0)
-            if elapsed < reconciliation_deadline:
+            receipt_elapsed = float(
+                evidence.get("reconciliation_elapsed_seconds")
+                or reconciliation_poll_started_elapsed + float(poll_elapsed or 0.0)
+            )
+            poll_elapsed = max(0.0, float(poll_elapsed or 0.0))
+            # ``current_deadline`` is poll-relative, so the comparison must
+            # use poll-relative elapsed time too.  A small tolerance makes the
+            # boundary deterministic when ``time.time`` and ``monotonic`` are
+            # sampled on opposite sides of a scheduler tick.
+            if poll_elapsed + 0.01 < float(current_deadline or 0.0):
                 return None
             queue_total = int(evidence.get("queue_records") or len(expected_batch))
             queue_position = max(
@@ -17673,11 +19385,11 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             last_vector_progress = reconciliation_tracker["last_vector_progress_elapsed_seconds"]
             recent_queue_progress = (
                 last_queue_progress is not None
-                and elapsed - float(last_queue_progress) <= ANYTHINGLLM_EMBEDDING_RECONCILIATION_STALL_SECONDS
+                and receipt_elapsed - float(last_queue_progress) <= ANYTHINGLLM_EMBEDDING_RECONCILIATION_STALL_SECONDS
             )
             recent_vector_progress = (
                 last_vector_progress is not None
-                and elapsed - float(last_vector_progress) <= ANYTHINGLLM_EMBEDDING_RECONCILIATION_STALL_SECONDS
+                and receipt_elapsed - float(last_vector_progress) <= ANYTHINGLLM_EMBEDDING_RECONCILIATION_STALL_SECONDS
             )
             owned_queue_active = (
                 queue_total > 0
@@ -17698,14 +19410,14 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             except (TypeError, ValueError):
                 queue_remaining_seconds = None
             forecast_deadline = (
-                elapsed
+                poll_elapsed
                 + queue_remaining_seconds
                 + max(30.0, min(180.0, queue_remaining_seconds * 0.25))
                 if queue_remaining_seconds is not None else
-                elapsed + ANYTHINGLLM_EMBEDDING_RECONCILIATION_PROGRESS_GRACE_SECONDS
+                poll_elapsed + ANYTHINGLLM_EMBEDDING_RECONCILIATION_PROGRESS_GRACE_SECONDS
             )
             extended = min(
-                ANYTHINGLLM_EMBEDDING_RECONCILIATION_ACTIVE_CAP_SECONDS,
+                reconciliation_poll_hard_cap_seconds,
                 max(
                     float(current_deadline),
                     forecast_deadline,
@@ -17713,9 +19425,16 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             )
             if extended > float(current_deadline):
                 reconciliation_tracker["deadline_extensions"] += 1
-                reconciliation_tracker["effective_deadline_seconds"] = extended
+                reconciliation_tracker["effective_deadline_seconds"] = (
+                    reconciliation_poll_started_elapsed + extended
+                )
                 evidence["reconciliation_deadline_extensions"] = int(reconciliation_tracker["deadline_extensions"])
-                evidence["reconciliation_effective_deadline_seconds"] = round(extended, 3)
+                evidence["reconciliation_effective_deadline_seconds"] = round(
+                    reconciliation_tracker["effective_deadline_seconds"], 3
+                )
+                evidence["reconciliation_remaining_seconds"] = round(
+                    max(0.0, extended - poll_elapsed), 3
+                )
                 evidence["reconciliation_deadline_forecast_from_queue_seconds"] = (
                     round(float(queue_remaining_seconds), 3)
                     if queue_remaining_seconds is not None else None
@@ -17971,7 +19690,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             # batches. Successful observations still return immediately; the
             # longer cap is paid only by the exceptional timeout path.
             timeout_seconds=observation_timeout,
-            hard_cap_seconds=ANYTHINGLLM_EMBEDDING_RECONCILIATION_ACTIVE_CAP_SECONDS,
+            hard_cap_seconds=reconciliation_poll_hard_cap_seconds,
             observation_callback=report_batch_observation,
             retryable_evidence_codes={"partial_vector_coverage"},
             deadline_extension=extend_reconciliation_deadline,
@@ -18123,16 +19842,11 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         )
         if selected.get("upload_blocked_reason"):
             block_reason = str(selected["upload_blocked_reason"])
-            if block_reason == "ocr_backend_text_coverage_disagreement":
-                withheld_message = (
-                    "AnythingLLM upload was withheld because OCR extractors materially disagree about text coverage."
-                )
-            elif block_reason == "photographed_spread_requires_manual_review":
-                withheld_message = (
-                    "AnythingLLM upload was withheld because photographed spreads require visual review."
-                )
-            else:
-                withheld_message = "AnythingLLM upload was withheld because reliable OCR is required but unavailable."
+            hold_guidance = ocr_upload_hold_guidance(
+                block_reason,
+                selected.get("readiness_reasons") or (),
+            )
+            withheld_message = hold_guidance["message"]
             upload_report = {
                 "status": "skipped_needs_ocr_review",
                 "uploaded": 0,
@@ -18141,6 +19855,8 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 "warnings": [{
                     "warning": withheld_message,
                     "reasons": selected["readiness_reasons"],
+                    "guidance_code": hold_guidance["code"],
+                    "next_steps": hold_guidance["next_steps"],
                 }],
             }
             expected_upload_payloads = []
@@ -18991,6 +20707,8 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             "outline_validation": c.get("outline_validation", {}),
             "variant_outputs": c.get("variant_outputs", {}),
             "unstructured_execution": c.get("unstructured_execution", {}),
+            "unstructured_strategy": c.get("unstructured_strategy", ""),
+            "native_ocr_reconciliation": c.get("native_ocr_reconciliation", {}),
             "score_reasons": c.get("score_reasons", []),
         }
         for c in candidates
@@ -19011,9 +20729,15 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         "triggered": "unstructured" in backend_names and not bool(args.deep_extraction),
         "reasons": sorted(set(auto_unstructured_reasons)),
         "suppressed_reasons": sorted(set(auto_unstructured_suppressed_reasons)),
+        "visual_text_target_evidence": dict(preflight_visual_text_targets),
+        "targeted_page_numbers": list(automatic_targeted_ocr_pages),
+        "targeted_selection": dict(automatic_targeted_ocr_selection),
         "user_requested": bool(args.deep_extraction),
     }
     profile["automatic_candidate_shortcuts"] = sorted(set(automatic_candidate_shortcuts))
+    profile["native_ocr_reconciliation"] = dict(
+        selected.get("native_ocr_reconciliation") or {}
+    )
     profile["readiness_status"] = selected["readiness_status"]
     profile["readiness_reasons"] = selected["readiness_reasons"]
     profile["backend_word_disagreement"] = selected["backend_word_disagreement"]
@@ -19085,6 +20809,8 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         selected_dir / "page-parent-manifest.jsonl",
         selected_dir / "child-parent-map.csv",
         selected_dir / "layout-region-review.json",
+        selected_dir / "native-ocr-reconciliation.json",
+        selected_dir / "visual-text-review.json",
         selected_dir / "retrieval-lane-review.json",
         selected_dir / "supplementary-content-candidates.txt",
         provenance_review_manifest,
@@ -19150,6 +20876,22 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         if isinstance(sample_lancedb_row, dict)
         else ""
     )
+    unstructured_candidates = [
+        candidate for candidate in candidates
+        if str(candidate.get("backend") or "").casefold() == "unstructured"
+    ]
+    unstructured_errors = [
+        str(candidate.get("error") or "")
+        for candidate in unstructured_candidates
+        if str(candidate.get("error") or "").strip()
+    ]
+    ocr_comparison = {
+        "triggered": bool(profile.get("unstructured_auto_trigger", {}).get("triggered")),
+        "reasons": list(profile.get("unstructured_auto_trigger", {}).get("reasons") or []),
+        "attempted": bool(unstructured_candidates),
+        "completed": any(not candidate.get("error") for candidate in unstructured_candidates),
+        "errors": unstructured_errors,
+    }
     summary = {
         "output_root": str(out_root),
         "source_sha256": profile.get("source_sha256", ""),
@@ -19197,6 +20939,14 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         "unstructured_selected_strategy": profile["unstructured_runtime"].get("selected_strategy"),
         "ocr_assisted_extraction_used": bool(ocr_evidence["used"]),
         "ocr_assisted_extraction_evidence": ocr_evidence["evidence"],
+        # Completion UI needs this exact already-observed scope to explain
+        # targeted OCR without inferring it from a backend name.
+        "automatic_targeted_ocr_pages": list(
+            profile.get("unstructured_auto_trigger", {}).get("targeted_page_numbers") or []
+        ),
+        "ocr_comparison": ocr_comparison,
+        "native_ocr_reconciliation": dict(selected.get("native_ocr_reconciliation") or {}),
+        "visual_text_review": dict(selected.get("visual_text_review") or {}),
         "pdf_page_count": profile["pdf_page_count"],
         "start_page": selected["start_page"],
         "end_page": selected["end_page"],
@@ -19272,6 +21022,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         "page_parent_manifest": str(selected_dir / "page-parent-manifest.jsonl"),
         "child_parent_map": str(selected_dir / "child-parent-map.csv"),
         "layout_region_review": str(selected_dir / "layout-region-review.json"),
+        "visual_text_review_artifact": str(selected_dir / "visual-text-review.json"),
         "retrieval_lane_review": str(selected_dir / "retrieval-lane-review.json"),
         "supplementary_lane_candidates": str(selected_dir / "supplementary-content-candidates.txt"),
         "provenance_review_manifest": str(provenance_review_manifest),

@@ -51,7 +51,10 @@ UNSTRUCTURED_OCR_PAGE_WORKERS_MAX = 4
 UNSTRUCTURED_OCR_PAGE_TIMEOUT_SECONDS_DEFAULT = 240
 UNSTRUCTURED_OCR_PAGE_TIMEOUT_SECONDS_MIN = 30
 UNSTRUCTURED_OCR_PAGE_TIMEOUT_SECONDS_MAX = 1800
-UNSTRUCTURED_OCR_CACHE_SCHEMA_VERSION = 14
+# The cache contains prepared element text, including the conservative
+# category cleanup below. Increment this whenever prepared text changes so an
+# older noisy OCR cache is never silently reused as current output.
+UNSTRUCTURED_OCR_CACHE_SCHEMA_VERSION = 19
 # A photographed page benefits from a small, deterministic outer-margin crop
 # before OCR.  It removes scanner borders and handwritten marginalia without
 # changing the source-page identity or trying to reconstruct a new PDF.
@@ -556,7 +559,31 @@ def _unstructured_package_version() -> str:
         return "unknown"
 
 
-def _unstructured_ocr_cache_identity(pdf_path: Path, strategy: str, runtime: dict) -> dict:
+def _normalized_ocr_page_numbers(page_numbers, source_page_count=None):
+    """Return ordered, unique one-based page numbers, or ``None`` for all pages.
+
+    A targeted OCR cache must never be mistaken for a whole-document OCR cache.
+    Keeping this normalization adjacent to cache identity also makes direct and
+    worker-process callers agree about the exact requested scope.
+    """
+    if page_numbers is None:
+        return None
+    normalized = []
+    for raw_page in page_numbers:
+        try:
+            page_number = int(raw_page)
+        except (TypeError, ValueError):
+            continue
+        if page_number < 1:
+            continue
+        if source_page_count is not None and page_number > int(source_page_count):
+            continue
+        if page_number not in normalized:
+            normalized.append(page_number)
+    return sorted(normalized)
+
+
+def _unstructured_ocr_cache_identity(pdf_path: Path, strategy: str, runtime: dict, page_numbers=None) -> dict:
     """Return only stable, non-sensitive cache identity fields.
 
     A cache hit must never cross a source change, strategy change, package
@@ -581,6 +608,9 @@ def _unstructured_ocr_cache_identity(pdf_path: Path, strategy: str, runtime: dic
         "unstructured_version": _unstructured_package_version(),
         "backend_module_origin": str((runtime or {}).get("backend_module_origin") or ""),
         "tesseract": tesseract_identity,
+        # ``all`` is explicit so the identity is self-describing and a future
+        # partial result can never satisfy a request for the whole document.
+        "page_numbers": _normalized_ocr_page_numbers(page_numbers) or "all",
     }
 
 
@@ -596,7 +626,7 @@ def _unstructured_ocr_cache_path(cache_dir, identity: dict) -> Path | None:
         return None
 
 
-def load_unstructured_ocr_cache(pdf_path: Path, strategy: str, runtime: dict, cache_dir=None):
+def load_unstructured_ocr_cache(pdf_path: Path, strategy: str, runtime: dict, cache_dir=None, page_numbers=None):
     """Load a validated local OCR cache entry, or return ``None``.
 
     Corrupt/incomplete cache files are ignored rather than turning an ordinary
@@ -606,7 +636,8 @@ def load_unstructured_ocr_cache(pdf_path: Path, strategy: str, runtime: dict, ca
     if not cache_dir:
         return None
     try:
-        identity = _unstructured_ocr_cache_identity(pdf_path, strategy, runtime)
+        requested_pages = _normalized_ocr_page_numbers(page_numbers)
+        identity = _unstructured_ocr_cache_identity(pdf_path, strategy, runtime, requested_pages)
         path = _unstructured_ocr_cache_path(cache_dir, identity)
         if not path or not path.is_file():
             return None
@@ -619,7 +650,8 @@ def load_unstructured_ocr_cache(pdf_path: Path, strategy: str, runtime: dict, ca
         if not isinstance(pages, list) or not isinstance(element_rows, list) or page_count <= 0:
             return None
         observed_pages = [int(row.get("page") or 0) for row in pages if isinstance(row, dict)]
-        if observed_pages != list(range(1, page_count + 1)):
+        expected_pages = requested_pages or list(range(1, page_count + 1))
+        if observed_pages != expected_pages:
             return None
         for page in pages:
             page["unstructured_execution"] = {
@@ -628,18 +660,34 @@ def load_unstructured_ocr_cache(pdf_path: Path, strategy: str, runtime: dict, ca
                 "actual_workers": 0,
                 "strategy": str(strategy or "").casefold(),
                 "cache_path": str(path),
+                "page_scope": "targeted_visual_text_pages" if requested_pages else "whole_document",
+                "targeted_page_numbers": requested_pages or [],
             }
         return pages, page_count, element_rows
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return None
 
 
-def save_unstructured_ocr_cache(pdf_path: Path, strategy: str, runtime: dict, cache_dir, pages, page_count, element_rows):
+def save_unstructured_ocr_cache(
+    pdf_path: Path,
+    strategy: str,
+    runtime: dict,
+    cache_dir,
+    pages,
+    page_count,
+    element_rows,
+    page_numbers=None,
+):
     """Persist a complete OCR result atomically and return its local path."""
     if not cache_dir or not pages or int(page_count or 0) <= 0:
         return ""
     try:
-        identity = _unstructured_ocr_cache_identity(pdf_path, strategy, runtime)
+        requested_pages = _normalized_ocr_page_numbers(page_numbers, page_count)
+        observed_pages = [int(row.get("page") or 0) for row in pages if isinstance(row, dict)]
+        expected_pages = requested_pages or list(range(1, int(page_count) + 1))
+        if observed_pages != expected_pages:
+            return ""
+        identity = _unstructured_ocr_cache_identity(pdf_path, strategy, runtime, requested_pages)
         path = _unstructured_ocr_cache_path(cache_dir, identity)
         if not path:
             return ""
@@ -852,6 +900,124 @@ def _unstructured_partition_elements(pdf_path: Path, resolved_strategy: str, run
     )
 
 
+def _unstructured_is_symbol_noise(text):
+    """Identify only OCR fragments that carry virtually no recoverable text.
+
+    ``UncategorizedText`` is a layout bucket, not a quality grade. It can
+    contain damaged but useful language, so its category alone must never
+    discard it. This deliberately narrow test drops fragments such as
+    ``\u201c4 \u2018cu: \u2122`` and ``{7`` while retaining imperfect phrases with several
+    word-like pieces.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return True
+    letters = re.findall(r"[A-Za-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u00ff]", raw)
+    wordlike = re.findall(r"[A-Za-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u00ff]{3,}", raw)
+    nonspace = re.sub(r"\s+", "", raw)
+    non_letter_or_space = re.findall(r"[^A-Za-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u00ff\s]", raw)
+    # A readable word-like run is enough to preserve the raw OCR. Do not make
+    # an English-dictionary judgment on damaged scholarship, names, poetry,
+    # or non-English material.
+    if wordlike:
+        return False
+    if not letters:
+        return True
+    # Two-letter scraps with several digits or symbols have no usable context.
+    return len(letters) <= 2 and len(non_letter_or_space) >= 2 and len(nonspace) <= 12
+
+
+def _unstructured_title_looks_like_heading(text):
+    """Return whether a raw Unstructured Title looks like a real heading.
+
+    Layout models commonly misclassify indented verse and prose continuations
+    as titles. We retain the structural label only for compact, standalone,
+    non-sentence-like text. Rejected titles remain in the transcript as
+    NarrativeText; no substantive characters are discarded.
+    """
+    raw = str(text or "").strip()
+    compact = normalize_text(raw)
+    if not compact or _unstructured_is_symbol_noise(raw):
+        return False
+    words = re.findall(
+        r"[A-Za-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u00ff]+(?:['\u2019-][A-Za-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u00ff]+)?",
+        compact,
+    )
+    if not words or len(words) > 14 or len(compact) > 110:
+        return False
+    # Short genuine headings can be a name, a place, or a poem title, but a
+    # run of two-character scraps or internally scrambled casing is not a
+    # reliable structural title. Keep the characters as narrative text rather
+    # than letting a weak layout prediction create a false heading boundary.
+    if not any(len(word) >= 3 for word in words):
+        return False
+    if any(
+        len(word) >= 3
+        and not (word.islower() or word.isupper() or (word[:1].isupper() and word[1:].islower()))
+        for word in words
+    ):
+        return False
+    word_styles = {
+        "upper" if word.isupper() else "lower" if word.islower() else "title"
+        for word in words
+        if len(word) >= 2
+    }
+    # OCR debris often has an implausible mixture such as ``av TINNY`` or
+    # ``MATT pes``. A real mixed-case title is still retained as content, but
+    # it does not receive a structural heading label without stronger evidence.
+    if "upper" in word_styles and ("lower" in word_styles or "title" in word_styles):
+        return False
+    # Sentence punctuation anywhere is stronger evidence of prose or verse
+    # than a layout label. A legitimate title with punctuation is retained as
+    # text but conservatively loses its structural ``Title`` label; that is a
+    # safer error than promoting a sentence into a heading.
+    if any(mark in compact for mark in (".", "!", "?", ",", ";")):
+        return False
+    lowered = f" {compact.casefold()} "
+    sentence_markers = (
+        " i ", " i've ", " i'm ", " i'd ", " i'll ", " you ", " you're ",
+        " my ", " your ", " our ", " their ", " we ", " we're ", " he ",
+        " she's ", " they ", " they're ",
+    )
+    if any(marker in lowered for marker in sentence_markers):
+        return False
+    # More than one physical line is usually an OCR paragraph/verse fragment,
+    # not a title. Keep line-break-free literary headings such as "LULA BELL".
+    return len([line for line in raw.splitlines() if line.strip()]) <= 1
+
+
+def _unstructured_prepared_category(source_category, text):
+    if str(source_category or "").casefold() == "title" and not _unstructured_title_looks_like_heading(text):
+        return "NarrativeText", "title_reclassified_as_narrative"
+    return str(source_category or "UncategorizedText"), "retained"
+
+
+def _unstructured_element_text(element):
+    """Read vendor element text without letting one malformed element abort OCR.
+
+    Some Unstructured element implementations expose a ``text`` value while
+    their ``__str__`` implementation returns ``None`` for an empty visual
+    region.  ``str(element)`` then raises ``TypeError``.  Empty OCR elements
+    carry no retrieval text, so normalize that narrow vendor defect to an
+    empty element and retain the rest of the source page/document.
+    """
+    try:
+        raw_text = getattr(element, "text", None)
+    except Exception:
+        raw_text = None
+    if isinstance(raw_text, str):
+        return raw_text.strip()
+    if raw_text is not None:
+        try:
+            return str(raw_text).strip()
+        except (TypeError, ValueError):
+            return ""
+    try:
+        return str(element).strip()
+    except (TypeError, ValueError, AttributeError):
+        return ""
+
+
 def _unstructured_elements_to_pages(elements, *, page_offset=0, expected_page=None):
     by_page = defaultdict(list)
     element_rows = []
@@ -859,15 +1025,21 @@ def _unstructured_elements_to_pages(elements, *, page_offset=0, expected_page=No
         metadata = getattr(element, "metadata", None)
         page_num = getattr(metadata, "page_number", None) or 1
         page_num = int(page_num) + int(page_offset or 0)
-        category = getattr(element, "category", None) or element.__class__.__name__
-        text = str(element).strip()
-        if text:
+        source_category = getattr(element, "category", None) or element.__class__.__name__
+        text = _unstructured_element_text(element)
+        if _unstructured_is_symbol_noise(text):
+            category = "DroppedOCRNoise"
+            decision = "dropped_symbol_noise"
+        else:
+            category, decision = _unstructured_prepared_category(source_category, text)
             by_page[page_num].append(f"[{category}] {text}")
         element_rows.append(
             {
                 "element_index": element_index,
                 "pdf_page": page_num,
                 "category": category,
+                "source_category": source_category,
+                "content_decision": decision,
                 "chars": len(text),
                 "preview": normalize_text(text)[:250],
             }
@@ -1314,6 +1486,7 @@ def _parallel_unstructured_ocr_pages(
     strategy: str,
     worker_count: int,
     runtime_probe,
+    page_numbers=None,
     page_timeout_seconds=None,
     progress_callback=None,
 ):
@@ -1324,13 +1497,17 @@ def _parallel_unstructured_ocr_pages(
     hang is unsafe, and partial page output must not be silently assembled.
     """
     timeout_seconds = int(page_timeout_seconds or unstructured_ocr_page_timeout_seconds())
+    requested_pages = _normalized_ocr_page_numbers(page_numbers, page_count)
+    expected_pages = requested_pages or list(range(1, page_count + 1))
+    if not expected_pages:
+        raise RuntimeError("Unstructured OCR received no valid source pages.")
     with tempfile.TemporaryDirectory(prefix="rag-unstructured-ocr-") as scratch_dir:
         pages = []
         element_rows = []
         # Explicit ``spawn`` avoids inheriting a partially initialized ONNX or
         # Tesseract runtime. It is Windows' default and is safer cross-platform
         # for optional native OCR dependencies.
-        active_worker_count = min(worker_count, page_count)
+        active_worker_count = min(worker_count, len(expected_pages))
         executor = ProcessPoolExecutor(
             max_workers=active_worker_count,
             mp_context=get_context("spawn"),
@@ -1347,23 +1524,25 @@ def _parallel_unstructured_ocr_pages(
             # heartbeat for the parent process.
             pending = {}
             submitted_at = {}
-            next_page_index = 0
+            next_page_position = 0
 
             def submit_next_page():
-                nonlocal next_page_index
+                nonlocal next_page_position
+                source_page_number = expected_pages[next_page_position]
+                source_page_index = source_page_number - 1
                 future = executor.submit(
                     _unstructured_one_page,
                     str(pdf_path),
-                    next_page_index,
+                    source_page_index,
                     strategy,
                     scratch_dir,
                     dict(runtime_probe),
                 )
-                pending[future] = next_page_index
+                pending[future] = source_page_index
                 submitted_at[future] = time.monotonic()
-                next_page_index += 1
+                next_page_position += 1
 
-            while len(pending) < active_worker_count and next_page_index < page_count:
+            while len(pending) < active_worker_count and next_page_position < len(expected_pages):
                 submit_next_page()
             while pending:
                 done, _ = wait(set(pending), timeout=0.25, return_when=FIRST_COMPLETED)
@@ -1388,8 +1567,8 @@ def _parallel_unstructured_ocr_pages(
                     pages.append(result["page_row"])
                     element_rows.extend(result["element_rows"])
                     if callable(progress_callback):
-                        progress_callback(len(pages), page_count)
-                    while len(pending) < active_worker_count and next_page_index < page_count:
+                        progress_callback(len(pages), len(expected_pages))
+                    while len(pending) < active_worker_count and next_page_position < len(expected_pages):
                         submit_next_page()
                 timed_out = [
                     pending[future] + 1
@@ -1409,7 +1588,6 @@ def _parallel_unstructured_ocr_pages(
                 executor.shutdown(wait=True, cancel_futures=True)
     pages.sort(key=lambda row: int(row["page"]))
     element_rows.sort(key=lambda row: (int(row["pdf_page"]), int(row["element_index"])))
-    expected_pages = list(range(1, page_count + 1))
     observed_pages = [int(row["page"]) for row in pages]
     if observed_pages != expected_pages:
         raise RuntimeError(
@@ -1420,8 +1598,10 @@ def _parallel_unstructured_ocr_pages(
         page["unstructured_execution"] = {
             "mode": "isolated_parallel_pages",
             "requested_workers": int(worker_count),
-            "actual_workers": min(int(worker_count), page_count),
+            "actual_workers": min(int(worker_count), len(expected_pages)),
             "strategy": strategy,
+            "page_scope": "targeted_visual_text_pages" if requested_pages else "whole_document",
+            "targeted_page_numbers": requested_pages or [],
         }
     return pages, page_count, element_rows
 
@@ -1440,7 +1620,14 @@ def unstructured_execution_evidence(pages):
     }
 
 
-def get_pages_with_unstructured(pdf_path: Path, strategy: str, runtime_probe=None, cache_dir=None, progress_callback=None):
+def get_pages_with_unstructured(
+    pdf_path: Path,
+    strategy: str,
+    runtime_probe=None,
+    cache_dir=None,
+    progress_callback=None,
+    page_numbers=None,
+):
     requested_strategy = (strategy or "auto").strip().casefold()
     resolved_strategy = "fast" if requested_strategy == "auto" else requested_strategy
     runtime = dict(
@@ -1452,16 +1639,26 @@ def get_pages_with_unstructured(pdf_path: Path, strategy: str, runtime_probe=Non
     # strategies receive the bounded per-page process lane. The parent still
     # owns candidate scoring, artifacts, AnythingLLM mutation, and progress.
     if resolved_strategy in {"hi_res", "ocr_only"} and pdf_path.exists():
-        cached = load_unstructured_ocr_cache(pdf_path, resolved_strategy, runtime, cache_dir)
+        cached = load_unstructured_ocr_cache(
+            pdf_path,
+            resolved_strategy,
+            runtime,
+            cache_dir,
+            page_numbers=page_numbers,
+        )
         if cached is not None:
             if callable(progress_callback):
-                progress_callback(int(cached[1]), int(cached[1]))
+                completed_pages = len(cached[0]) if page_numbers is not None else int(cached[1])
+                progress_callback(completed_pages, completed_pages)
             return cached
         with fitz.open(pdf_path) as document:
             source_page_count = len(document)
+            target_page_numbers = _normalized_ocr_page_numbers(page_numbers, source_page_count)
+            if page_numbers is not None and not target_page_numbers:
+                raise RuntimeError("Unstructured OCR received no valid source pages.")
             photographed_result = (
                 _photographed_page_result(document, 0, runtime)
-                if source_page_count == 1
+                if source_page_count == 1 and target_page_numbers in (None, [1])
                 else None
             )
         if photographed_result is not None:
@@ -1476,7 +1673,14 @@ def get_pages_with_unstructured(pdf_path: Path, strategy: str, runtime_probe=Non
                 "strategy": resolved_strategy,
             }
             cache_path = save_unstructured_ocr_cache(
-                pdf_path, resolved_strategy, runtime, cache_dir, pages, page_count, element_rows
+                pdf_path,
+                resolved_strategy,
+                runtime,
+                cache_dir,
+                pages,
+                page_count,
+                element_rows,
+                page_numbers=target_page_numbers,
             )
             if cache_path:
                 pages[0]["unstructured_execution"]["cache_path"] = cache_path
@@ -1491,10 +1695,18 @@ def get_pages_with_unstructured(pdf_path: Path, strategy: str, runtime_probe=Non
                 resolved_strategy,
                 workers,
                 runtime,
+                page_numbers=target_page_numbers,
                 progress_callback=progress_callback,
             )
             cache_path = save_unstructured_ocr_cache(
-                pdf_path, resolved_strategy, runtime, cache_dir, pages, page_count, element_rows
+                pdf_path,
+                resolved_strategy,
+                runtime,
+                cache_dir,
+                pages,
+                page_count,
+                element_rows,
+                page_numbers=target_page_numbers,
             )
             if cache_path:
                 for page in pages:
@@ -1533,6 +1745,7 @@ def get_backend_pages(
     unstructured_runtime_probe=None,
     unstructured_cache_dir=None,
     progress_callback=None,
+    unstructured_page_numbers=None,
 ):
     backend_key = backend.lower()
     if backend_key == "pymupdf":
@@ -1548,6 +1761,7 @@ def get_backend_pages(
             runtime_probe=unstructured_runtime_probe,
             cache_dir=unstructured_cache_dir,
             progress_callback=progress_callback,
+            page_numbers=unstructured_page_numbers,
         )
         return result
     raise ValueError(f"Unsupported backend: {backend}")
@@ -1609,7 +1823,10 @@ def extract_pdf(args):
         with element_report.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(
                 handle,
-                fieldnames=["element_index", "pdf_page", "category", "chars", "preview"],
+                fieldnames=[
+                    "element_index", "pdf_page", "category", "source_category",
+                    "content_decision", "chars", "preview",
+                ],
             )
             writer.writeheader()
             writer.writerows(element_rows)

@@ -21,6 +21,7 @@ from portable_paths import application_paths, ensure_application_directories, pa
 
 
 SERVER_MARKER_NAME = "localhost-server.json"
+SERVER_ROOT_PID_ENV = "ANYTHINGLLM_PDF_ASSISTANT_SERVER_ROOT_PID"
 START_SHORTCUT_NAME = "Start AnythingLLM PDF Assistant.lnk"
 STOP_SHORTCUT_NAME = "Stop AnythingLLM PDF Assistant.lnk"
 POWERSHELL_COMMAND_TIMEOUT_SECONDS = 15
@@ -95,33 +96,106 @@ def _print_paths() -> int:
     return 0
 
 
-def _recorded_server_is_alive_on_port(port: int) -> bool:
-    """Return whether our current marker still names a live process for ``port``.
-
-    This is a reporting aid only.  Stop independently verifies the process
-    command line before terminating anything, so a stale marker can never
-    broaden the stop target.
-    """
+def _marker_root_pid(record: dict) -> int:
+    """Read the launch-root PID, accepting a marker written by an older build."""
     try:
-        record = json.loads(_server_marker_path().read_text(encoding="utf-8"))
-        pid = int(record.get("pid") or 0)
-        recorded_port = int(record.get("port") or 0)
-        if pid <= 0 or recorded_port != int(port):
-            return False
-        # Signal 0 is not a portable Windows liveness probe. ``tasklist`` is
-        # available on the supported platform and does not mutate the process.
-        probe = subprocess.run(
-            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+        return int(record.get("root_pid") or record.get("pid") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _owned_server_process_command(pid: int) -> str:
+    """Return a PID's command line on Windows, without trusting a recycled PID."""
+    powershell = _powershell()
+    if sys.platform != "win32" or not powershell or int(pid) <= 0:
+        return ""
+    environment = os.environ.copy()
+    environment["ANYTHINGLLM_SERVER_PID"] = str(int(pid))
+    try:
+        observed = subprocess.run(
+            [
+                powershell,
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "(Get-CimInstance Win32_Process -Filter ('ProcessId = ' + $env:ANYTHINGLLM_SERVER_PID)).CommandLine",
+            ],
+            env=environment,
             capture_output=True,
             text=True,
             timeout=POWERSHELL_COMMAND_TIMEOUT_SECONDS,
             check=False,
         )
-        if probe.returncode != 0 or str(pid) not in (probe.stdout or ""):
-            return False
-    except (OSError, subprocess.TimeoutExpired, ValueError, TypeError, json.JSONDecodeError):
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return observed.stdout or ""
+
+
+def _listener_belongs_to_server_root(port: int, root_pid: int) -> bool | None:
+    """Return whether the listener is the owned root or its child.
+
+    ``None`` means that no listener exists yet.  This is intentionally a
+    read-only check: marker ownership must never authorize a broad kill based
+    on a port alone.
+    """
+    powershell = _powershell()
+    if sys.platform != "win32" or not powershell or int(root_pid) <= 0:
         return False
-    return True
+    environment = os.environ.copy()
+    environment.update({"ANYTHINGLLM_SERVER_PORT": str(int(port)), "ANYTHINGLLM_SERVER_ROOT_PID": str(int(root_pid))})
+    script = """
+$listener = Get-NetTCPConnection -LocalPort ([int]$env:ANYTHINGLLM_SERVER_PORT) -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($null -eq $listener) { exit 2 }
+$listenerPid = [int]$listener.OwningProcess
+$candidate = $listenerPid
+$seen = @{}
+while ($candidate -gt 0 -and -not $seen.ContainsKey($candidate)) {
+  if ($candidate -eq [int]$env:ANYTHINGLLM_SERVER_ROOT_PID) { Write-Output 'owned'; exit 0 }
+  $seen[$candidate] = $true
+  $process = Get-CimInstance Win32_Process -Filter ('ProcessId = ' + $candidate) -ErrorAction SilentlyContinue
+  if ($null -eq $process) { break }
+  $candidate = [int]$process.ParentProcessId
+}
+Write-Output 'foreign'
+exit 1
+"""
+    try:
+        result = subprocess.run(
+            [powershell, "-NoProfile", "-NonInteractive", "-Command", script],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=POWERSHELL_COMMAND_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if result.returncode == 2:
+        return None
+    return result.returncode == 0 and "owned" in (result.stdout or "").casefold()
+
+
+def _recorded_server_is_alive_on_port(port: int) -> bool:
+    """Return whether the marker names the owned server starting or serving ``port``.
+
+    Gradio can create a listener child on Windows.  The marker therefore
+    identifies the launch root, while the port is accepted only when that
+    listener belongs to its process tree.  A brief no-listener interval is a
+    legitimate owned start-up state and prevents duplicate Start shortcuts.
+    """
+    try:
+        record = json.loads(_server_marker_path().read_text(encoding="utf-8"))
+        pid = _marker_root_pid(record)
+        recorded_port = int(record.get("port") or 0)
+        if pid <= 0 or recorded_port != int(port):
+            return False
+        command_line = _owned_server_process_command(pid).casefold()
+        if not any(token in command_line for token in ("anythingllm_pdf_assistant_cli", "anythingllm-pdf-assistant")):
+            return False
+        listener_owned = _listener_belongs_to_server_root(port, pid)
+        return listener_owned is not False
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
 
 
 def _doctor(port: int, *, allow_owned_running_server: bool = True) -> int:
@@ -154,11 +228,17 @@ def _server_marker_path() -> Path:
 
 def _write_server_marker(port: int) -> Path:
     marker = _server_marker_path()
+    root_pid = int(os.environ.get(SERVER_ROOT_PID_ENV) or os.getpid())
+    # A Windows child used by Gradio inherits this value.  It must never take
+    # over Stop ownership merely because it is the process that binds the port.
+    os.environ.setdefault(SERVER_ROOT_PID_ENV, str(root_pid))
     payload = {
-        "pid": os.getpid(),
+        "pid": root_pid,
+        "root_pid": root_pid,
         "port": int(port),
         "executable": str(Path(sys.executable).resolve()),
         "command": "anythingllm-pdf-assistant start",
+        "started_at": time.time(),
     }
     # A fixed ``.tmp`` name allowed two shortcut launches to clobber each
     # other's marker staging file. The marker is the ownership boundary for
@@ -195,7 +275,7 @@ def _remove_own_server_marker(marker: Path) -> None:
         record = json.loads(marker.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return
-    if int(record.get("pid") or 0) == os.getpid():
+    if _marker_root_pid(record) == os.getpid():
         marker.unlink(missing_ok=True)
 
 
@@ -346,44 +426,21 @@ def _stop() -> int:
     marker = _server_marker_path()
     try:
         record = json.loads(marker.read_text(encoding="utf-8"))
-        pid = int(record.get("pid") or 0)
+        pid = _marker_root_pid(record)
+        port = int(record.get("port") or 0)
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         print("No owned local PDF assistant server is recorded.", file=sys.stderr)
         return 1
-    if pid <= 0:
+    if pid <= 0 or port <= 0:
         print("The local server marker is invalid; refusing to stop an unknown process.", file=sys.stderr)
         return 1
-    powershell = _powershell()
-    if not powershell:
-        print("PowerShell is required to verify the owned server process.", file=sys.stderr)
-        return 1
-    environment = os.environ.copy()
-    environment["ANYTHINGLLM_SERVER_PID"] = str(pid)
-    # Parenthesise the complete WMI filter expression.  Without it PowerShell
-    # can pass the string literal and ``+ $env:...`` as separate arguments,
-    # making the owned-server check falsely reject the very CLI process that
-    # wrote the marker.
-    try:
-        observed = subprocess.run(
-            [
-                powershell,
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "(Get-CimInstance Win32_Process -Filter ('ProcessId = ' + $env:ANYTHINGLLM_SERVER_PID)).CommandLine",
-            ],
-            env=environment,
-            capture_output=True,
-            text=True,
-            timeout=POWERSHELL_COMMAND_TIMEOUT_SECONDS,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        print(f"Could not verify the owned local PDF assistant server: {exc}", file=sys.stderr)
-        return 1
-    command_line = observed.stdout.casefold()
+    command_line = _owned_server_process_command(pid).casefold()
     if not any(token in command_line for token in ("anythingllm_pdf_assistant_cli", "anythingllm-pdf-assistant")):
         print("The recorded process is no longer the owned PDF assistant server; refusing to stop it.", file=sys.stderr)
+        return 1
+    listener_owned = _listener_belongs_to_server_root(port, pid)
+    if listener_owned is False:
+        print("Port ownership does not match the recorded local PDF assistant; refusing to stop it.", file=sys.stderr)
         return 1
     try:
         stopped = subprocess.run(
@@ -399,9 +456,15 @@ def _stop() -> int:
     if stopped.returncode != 0:
         print((stopped.stderr or stopped.stdout or "Could not stop the local server.").strip(), file=sys.stderr)
         return 1
-    marker.unlink(missing_ok=True)
-    print("Stopped the owned local PDF assistant server.")
-    return 0
+    deadline = time.monotonic() + 12
+    while time.monotonic() < deadline:
+        if _port_is_available(port):
+            marker.unlink(missing_ok=True)
+            print("Stopped the owned local PDF assistant server.")
+            return 0
+        time.sleep(0.15)
+    print("The owned server process stopped, but port %s is still in use; keeping the marker for diagnosis." % port, file=sys.stderr)
+    return 1
 
 
 def _start(port: int, browser: bool) -> int:
@@ -428,6 +491,7 @@ def _start(port: int, browser: bool) -> int:
     # Desktop click can otherwise arrive during that import while neither a
     # listener nor a marker exists, causing two full servers to race for the
     # same port.
+    os.environ.setdefault(SERVER_ROOT_PID_ENV, str(os.getpid()))
     marker = _write_server_marker(port)
     try:
         os.environ["GRADIO_SERVER_PORT"] = str(port)
@@ -475,6 +539,47 @@ def _bridge(action: str, resources_path: str) -> int:
         return 1
 
 
+def _compatibility_inspect(
+    storage_dir: str,
+    include_package_fingerprint: bool,
+    emit_json: bool,
+    api_url: str = "",
+) -> int:
+    """Run the read-only Desktop compatibility discovery from the public CLI."""
+    from anythingllm_compatibility import characterize
+
+    result = characterize(
+        storage_dir or None,
+        include_package_fingerprint=include_package_fingerprint,
+        api_url=api_url,
+    )
+    if emit_json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    print(f"Desktop version: {result['desktop_version'] or 'unavailable'}")
+    print(f"Normalized version: {result['desktop_version_normalized'] or 'unavailable'}")
+    print(f"Desktop release status: {result['desktop_release_status']}")
+    print(f"Storage schema status: {result['storage_schema_status']}")
+    print(f"Guarded settings profile: {result['matched_profile'] or 'not qualified'}")
+    print(f"Package fingerprint: {result['desktop_package']['fingerprint_status']}")
+    for name in (
+        "can_read_sqlite_state",
+        "can_write_sqlite_settings",
+        "can_upload_native_metadata",
+    ):
+        capability = result["capabilities"][name]
+        print(f"{name}: {capability['status']} - {capability['message']}")
+    if result.get("api_contract"):
+        api_contract = result["api_contract"]
+        print(f"API documentation contract: {api_contract['status']}")
+        if api_contract["missing_core_routes"]:
+            print("Missing documented core routes: " + ", ".join(api_contract["missing_core_routes"]))
+        else:
+            print("Documented core routes: " + ", ".join(api_contract["documented_core_routes"]))
+        print("API contract does not grant write authority.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="AnythingLLM PDF Parser Embedder Assistant")
     subcommands = parser.add_subparsers(dest="command")
@@ -496,6 +601,24 @@ def build_parser() -> argparse.ArgumentParser:
     bridge = subcommands.add_parser("bridge", help="manage the optional AnythingLLM Desktop refresh bridge")
     bridge.add_argument("action", choices=("install", "validate", "upgrade", "uninstall"))
     bridge.add_argument("--resources-path", default="", help="non-standard AnythingLLM Desktop resources directory")
+
+    compatibility = subcommands.add_parser(
+        "compatibility",
+        help="inspect local AnythingLLM Desktop compatibility without changing Desktop",
+    )
+    compatibility.add_argument("action", choices=("inspect",), nargs="?", default="inspect")
+    compatibility.add_argument("--storage-dir", default="", help="optional AnythingLLM Desktop storage directory")
+    compatibility.add_argument(
+        "--api-url",
+        default="",
+        help="optional loopback API root; reads Swagger documentation only and never grants write authority",
+    )
+    compatibility.add_argument(
+        "--package-fingerprint",
+        action="store_true",
+        help="also hash app.asar; this is slower and intended for compatibility audits",
+    )
+    compatibility.add_argument("--json", action="store_true", help="emit the full redacted evidence record")
     return parser
 
 
@@ -521,6 +644,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if command == "bridge":
         return _bridge(args.action, args.resources_path)
+    if command == "compatibility":
+        return _compatibility_inspect(args.storage_dir, args.package_fingerprint, args.json, args.api_url)
     raise AssertionError(f"unexpected command: {command}")
 
 

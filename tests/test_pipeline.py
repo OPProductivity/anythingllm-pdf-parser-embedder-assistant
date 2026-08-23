@@ -188,6 +188,63 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(pages[0]["text"], "[NarrativeText] Recovered OCR text.")
         self.assertEqual(elements[0]["pdf_page"], 1)
 
+    def test_unstructured_cleanup_drops_only_symbol_noise_and_preserves_damaged_language(self):
+        import rag_pdf_tools
+
+        class FakeElement:
+            def __init__(self, category, text):
+                self.category = category
+                self.metadata = SimpleNamespace(page_number=1)
+                self.text = text
+
+            def __str__(self):
+                return self.text
+
+        pages, rows = rag_pdf_tools._unstructured_elements_to_pages([
+            FakeElement("UncategorizedText", "\u201c4 \u2018cu: \u2122"),
+            FakeElement("UncategorizedText", "iron-wi to aim ard and cross, perha nets"),
+            FakeElement("UncategorizedText", "{7"),
+        ])
+
+        self.assertNotIn("\u201c4 \u2018cu: \u2122", pages[0]["text"])
+        self.assertNotIn("{7", pages[0]["text"])
+        self.assertIn("iron-wi to aim ard and cross, perha nets", pages[0]["text"])
+        self.assertEqual(
+            [row["content_decision"] for row in rows],
+            ["dropped_symbol_noise", "retained", "dropped_symbol_noise"],
+        )
+
+    def test_unstructured_cleanup_demotes_sentence_and_verse_title_false_positives(self):
+        import rag_pdf_tools
+
+        class FakeElement:
+            category = "Title"
+            metadata = SimpleNamespace(page_number=1)
+
+            def __init__(self, text):
+                self.text = text
+
+            def __str__(self):
+                return self.text
+
+        pages, rows = rag_pdf_tools._unstructured_elements_to_pages([
+            FakeElement("aglow with grace i've learned only"),
+            FakeElement("now to interpret. adding abundance."),
+            FakeElement("signs of identity, fluidity. majesty,"),
+            FakeElement("drown me in your midnight reign."),
+            FakeElement("aVA PNRY"),
+            FakeElement("QE re tg SS"),
+            FakeElement("av TINNY"),
+            FakeElement("LULA BELL"),
+        ])
+
+        self.assertEqual(pages[0]["text"].count("[NarrativeText]"), 7)
+        self.assertIn("[Title] LULA BELL", pages[0]["text"])
+        self.assertEqual(
+            [row["content_decision"] for row in rows[:7]],
+            ["title_reclassified_as_narrative"] * 7,
+        )
+
     def test_unstructured_ocr_page_workers_are_conservatively_bounded(self):
         import rag_pdf_tools
 
@@ -809,6 +866,199 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(manifest["runtime"]["status"], "deferred_native_text_clear")
         self.assertEqual(calls, [])
 
+    def test_automatic_ocr_preflight_explains_sparse_and_blank_pages_without_claiming_ocr(self):
+        import rag_pdf_gradio_app as app
+
+        original_profile = app.automatic_timing_document_profile
+        original_coverage = app.automatic_full_native_text_coverage
+        try:
+            app.automatic_timing_document_profile = lambda files, **_kwargs: {
+                "page_count": 8, "sampled_pages": 3, "mean_chars_per_page": 500,
+                "image_density": 0, "sparse_fraction": 0, "ocr_risk_bucket": "low",
+            }
+            app.automatic_full_native_text_coverage = lambda _path: {
+                "status": "verified",
+                "low_text_pages": [
+                    {"page": 2, "native_text_characters": 0, "image_count": 0},
+                    {"page": 6, "native_text_characters": 50, "image_count": 0},
+                ],
+                "image_backed_low_text_pages": [],
+                "blank_pages": [{"page": 2, "native_text_characters": 0, "image_count": 0}],
+                "sparse_native_text_pages": [{"page": 6, "native_text_characters": 50, "image_count": 0}],
+            }
+            manifest = app.automatic_ocr_preflight_manifest(["verse.pdf"], backend_mode="Automatic")
+        finally:
+            app.automatic_timing_document_profile = original_profile
+            app.automatic_full_native_text_coverage = original_coverage
+
+        self.assertEqual(manifest["files"][0]["risk"], "possible")
+        self.assertEqual(manifest["files"][0]["ocr_plan"], "Use native text first; sparse or image-backed pages are checked during full extraction")
+        guidance = " ".join(manifest["guidance"])
+        self.assertIn("blank page(s), which are not OCR failures", guidance)
+        self.assertIn("does not OCR, alter the PDF", guidance)
+
+    def test_ocr_upload_hold_guidance_never_implies_an_upload_was_sent(self):
+        guidance = pipeline.ocr_upload_hold_guidance(
+            "needs_unstructured_or_ocr",
+            ["needs_unstructured_or_ocr", "ocr_attempt_failed"],
+        )
+        self.assertEqual(guidance["code"], "AUTO-OCR-ATTEMPT-FAILED-001")
+        self.assertIn("No upload was sent", guidance["message"])
+        self.assertTrue(guidance["next_steps"])
+
+    def test_automatic_ocr_outcome_line_explains_a_clean_native_selection(self):
+        import rag_pdf_gradio_app as app
+
+        line = app.automatic_ocr_outcome_line({
+            "ocr_assisted_extraction_used": False,
+            "backend_word_disagreement_resolution": {
+                "reason": "clean_selected_text_beats_artifact_heavy_peer",
+            },
+        })
+        self.assertIn("OCR was not used", line)
+        self.assertIn("low-artifact native extraction", line)
+
+    def test_automatic_ocr_outcome_line_makes_a_withheld_upload_explicit(self):
+        import rag_pdf_gradio_app as app
+
+        line = app.automatic_ocr_outcome_line({
+            "batch_upload_blocked_reason": "needs_unstructured_or_ocr",
+            "readiness_reasons": ["needs_unstructured_or_ocr", "ocr_runtime_unavailable"],
+        })
+        self.assertIn("AUTO-OCR-UNAVAILABLE-001", line)
+        self.assertIn("No upload was sent", line)
+
+    def test_automatic_ocr_outcome_line_explains_a_failed_comparison_without_claiming_ocr_was_used(self):
+        import rag_pdf_gradio_app as app
+
+        line = app.automatic_ocr_outcome_line({
+            "ocr_assisted_extraction_used": False,
+            "ocr_comparison": {
+                "attempted": True,
+                "errors": ["RuntimeError: page-specific OCR failure"],
+            },
+        })
+        self.assertIn("native-text extraction was retained", line)
+        self.assertIn("could not complete", line)
+
+    def test_fragmented_native_text_is_not_treated_as_retrieval_ready(self):
+        broken = ("the body is present but i t is mechanically fragmented " * 18) + "a i"
+        metrics = pipeline.text_integrity_metrics(broken)
+        self.assertGreater(metrics["fragmented_single_letter_token_ratio"], 0.035)
+        self.assertGreaterEqual(metrics["fragmented_single_letter_token_count"], 18)
+
+    def test_native_ocr_reconciliation_keeps_ocr_structure_unless_native_is_clearly_better(self):
+        native_pages = [
+            {"page": 1, "text": "A coherent native reading preserves the full scholarly passage with reliable words and maintains page meaning context citation and ordered prose without needless fragment errors."},
+            {"page": 2, "text": ""},
+            {"page": 3, "text": "The same clean wording appears here with a modest native layout."},
+        ]
+        ocr_pages = [
+            {"page": 1, "text": "[NarrativeText] a b c d e f g h i j k l m n o p q r s t"},
+            {"page": 2, "text": "[NarrativeText] OCR recovered an otherwise missing source page."},
+            {"page": 3, "text": "[NarrativeText] The same clean wording appears here with a modest OCR layout."},
+        ]
+
+        pages, report = pipeline.reconcile_native_ocr_pages(native_pages, ocr_pages)
+        by_page = {row["page"]: row for row in pages}
+
+        self.assertEqual(by_page[1]["text"], native_pages[0]["text"])
+        self.assertEqual(by_page[1]["native_ocr_reconciliation"]["decision"], "native_used_ocr_page_fragmented")
+        self.assertEqual(by_page[2]["text"], ocr_pages[1]["text"])
+        self.assertEqual(by_page[2]["native_ocr_reconciliation"]["decision"], "ocr_used_native_page_missing")
+        self.assertEqual(by_page[3]["text"], ocr_pages[2]["text"])
+        self.assertEqual(
+            by_page[3]["native_ocr_reconciliation"]["decision"],
+            "ocr_structure_preserved_tie_break",
+        )
+        self.assertEqual(report["native_selected_pages"], [1])
+
+    def test_native_ocr_word_correction_requires_unique_high_confidence_page_evidence(self):
+        corrected, corrections = pipeline.correct_ocr_words_from_native_page(
+            "The native layer includes statuesque but does not establish its reading order.",
+            "[NarrativeText] seqtuesque enrobed, you command attention.",
+        )
+        self.assertIn("statuesque enrobed", corrected)
+        self.assertEqual(corrections[0]["from"], "seqtuesque")
+        self.assertEqual(corrections[0]["to"], "statuesque")
+
+        uncorrected, weak_corrections = pipeline.correct_ocr_words_from_native_page(
+            "The native layer mentions inside once.",
+            "[NarrativeText] aside its folds.",
+        )
+        self.assertEqual(uncorrected, "[NarrativeText] aside its folds.")
+        self.assertEqual(weak_corrections, [])
+
+    def test_native_ocr_ordered_anchor_repairs_only_a_locally_corroborated_word(self):
+        corrected, corrections = pipeline.correct_ocr_words_from_native_page(
+            "prepared native text is intentionally not used for this ordering check",
+            "[NarrativeText] hood and cape do not hide, put frame your glory. "
+            "are those stars aside its folds?",
+            "hood and cape do not hide,\nbut frame your\nglory. are those stars\ninside its folds?",
+        )
+        self.assertIn("but frame your glory", corrected)
+        self.assertIn("stars inside its folds", corrected)
+        self.assertEqual(
+            {(item["from"], item["to"], item["method"]) for item in corrections},
+            {
+                ("put", "but", "ordered_native_anchor"),
+                ("aside", "inside", "ordered_native_anchor"),
+            },
+        )
+
+    def test_native_ocr_reconciliation_restores_only_an_isolated_opening_heading(self):
+        pages, _report = pipeline.reconcile_native_ocr_pages(
+            [{
+                "page": 1,
+                "text": "QUEEN statuesque enrobed you command attention.",
+                "raw_text": "QUEEN\nstatuesque, enrobed, you command attention.",
+            }],
+            [{
+                "page": 1,
+                "text": "[NarrativeText] statuesque enrobed, you command attention.",
+            }],
+        )
+        self.assertTrue(pages[0]["text"].startswith("[Title] QUEEN"))
+        self.assertEqual(
+            pages[0]["native_ocr_reconciliation"]["native_heading_recovery"]["action"],
+            "prefixed_missing_heading",
+        )
+
+    def test_visual_text_coverage_review_warns_without_inventing_image_caption_text(self):
+        review = pipeline.visual_text_coverage_review(
+            [{"page": 1, "text": "[NarrativeText] aVA PNRY av TINNY ow AYANYAYS QE re tg SS"}],
+            2,
+            [{"pdf_page": 1, "image_count": 1}, {"pdf_page": 2, "image_count": 1}],
+        )
+        self.assertEqual(review["status"], "review_needed")
+        self.assertEqual([row["pdf_page"] for row in review["pages"]], [1, 2])
+        self.assertIn("No label was guessed", review["message"])
+
+    def test_visual_text_coverage_review_honors_selected_scope_and_handles_bad_metadata(self):
+        scoped = pipeline.visual_text_coverage_review(
+            [
+                {"page": "bad", "text": "ignored"},
+                {"page": 1, "text": ""},
+                {"page": 2, "text": "[NarrativeText] complete readable page text with enough ordinary words."},
+            ],
+            "2",
+            [{"pdf_page": 1, "image_count": 1}, {"pdf_page": 2, "image_count": 1}],
+            start_page=2,
+            end_page=3,
+        )
+        self.assertEqual(scoped["status"], "assessment_incomplete")
+        self.assertEqual(scoped["pages"], [])
+        self.assertIn("invalid_extractor_page_records", scoped["assessment_warnings"])
+
+        incomplete = pipeline.visual_text_coverage_review(
+            [{"page": 1, "text": ""}],
+            2,
+            [{"pdf_page": 1, "image_count": 1}],
+        )
+        self.assertEqual(incomplete["status"], "review_needed")
+        self.assertIn("page_geometry_missing_for_selected_scope", incomplete["assessment_warnings"])
+        self.assertEqual([row["pdf_page"] for row in incomplete["pages"]], [1])
+
     def test_automatic_confirmation_renders_ocr_preflight_warning(self):
         import rag_pdf_gradio_app as app
 
@@ -1174,7 +1424,9 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn("$versionText -match '^[vV]?1\\.15\\.0(?:-r\\d+)?$'", source)
         self.assertIn("$packedBridgeEntries.Count -ne 1", source)
         self.assertIn("-Validate is read-only", source)
-        self.assertIn('const BRIDGE_REVISION = "drawer-audit-v2"', source)
+        self.assertIn('const BRIDGE_REVISION = "drawer-audit-v3"', source)
+        import rag_pdf_gradio_app as app
+        self.assertEqual(app.DESKTOP_REFRESH_BRIDGE_CURRENT_REVISION, "drawer-audit-v3")
         self.assertIn("BridgeDiagnosticsPresent", source)
         self.assertIn("CurrentBridgeRevision", source)
 
@@ -1208,7 +1460,7 @@ class PipelineCoreTests(unittest.TestCase):
         chat_timeout = dict(successful_upload, anythingllm_runtime_validation_status="pass_with_chat_timeout")
         timeout_completion = app.automatic_completion([chat_timeout], True)
         self.assertEqual(timeout_completion["state"], "successful")
-        self.assertIn("All page-parent vectors were confirmed", timeout_completion["message"])
+        self.assertIn("record(s) are confirmed", timeout_completion["message"])
         self.assertEqual(timeout_completion["diagnostic_code"], "AUTO-RETRIEVAL-RUNTIME-001")
         vector_timeout = dict(successful_upload, anythingllm_runtime_validation_status="vector_runtime_timeout")
         vector_timeout_completion = app.automatic_completion([vector_timeout], True)
@@ -1239,6 +1491,29 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(pending_reconciliation["state"], "warning")
         self.assertEqual(pending_reconciliation["code"], "AUTO-EMBEDDING-RECONCILE-001")
         self.assertIn("Local preparation is complete", pending_reconciliation["message"])
+
+    def test_automatic_extraction_summary_reports_selected_lanes_and_exact_targeted_pages(self):
+        import rag_pdf_gradio_app as app
+
+        rendered = app.automatic_extraction_method_summary([
+            {"selected_backend": "pymupdf"},
+            {"selected_backend": "pymupdf"},
+            {"selected_backend": "pymupdf4llm"},
+            {
+                "selected_backend": "unstructured",
+                "ocr_assisted_extraction_used": True,
+                "automatic_targeted_ocr_pages": [2, 6, 6],
+            },
+            {
+                "selected_backend": "unstructured",
+                "ocr_assisted_extraction_used": True,
+            },
+        ])
+
+        self.assertIn("2 PDFs used native text", rendered)
+        self.assertIn("1 PDF used layout comparison", rendered)
+        self.assertIn("1 PDF used targeted OCR (2 pages)", rendered)
+        self.assertIn("1 PDF used full-document OCR", rendered)
 
     def test_ocr_withheld_terminal_phase_never_claims_searchable_vectors(self):
         import rag_pdf_gradio_app as app
@@ -1807,7 +2082,7 @@ class PipelineCoreTests(unittest.TestCase):
                 )
             )
 
-    def test_runtime_recovery_resumes_only_the_current_manifest_missing_locations(self):
+    def test_runtime_recovery_preserves_current_manifest_for_explicit_resume(self):
         import rag_pdf_gradio_app as app
 
         original_latest = app._is_most_recent_recovery_run
@@ -1838,10 +2113,9 @@ class PipelineCoreTests(unittest.TestCase):
                 app._is_most_recent_recovery_run = original_latest
                 app.submit_embedding_resume_manifest = original_submit
 
-        self.assertEqual(result["status"], "submitted")
-        self.assertEqual(len(calls), 1)
-        self.assertTrue(calls[0][1]["automatic"])
-        self.assertEqual(calls[0][1]["expected_run_root"], root)
+        self.assertEqual(result["status"], "automatic_resume_disabled")
+        self.assertEqual(result["manifest_path"], str(manifest_path))
+        self.assertEqual(calls, [])
 
     def test_automatic_recovery_is_durably_limited_to_one_attempt_per_run(self):
         import rag_pdf_gradio_app as app
@@ -2193,6 +2467,8 @@ class PipelineCoreTests(unittest.TestCase):
             lane_review.write_text('{"status": "review_only"}', encoding="utf-8")
             supplementary_candidates = selected / "supplementary-content-candidates.txt"
             supplementary_candidates.write_text("[SUPPLEMENTARY CANDIDATE]", encoding="utf-8")
+            visual_review = selected / "visual-text-review.json"
+            visual_review.write_text('{"status": "review_needed"}', encoding="utf-8")
             (selected / "anythingllm-upload.txt").write_text("internal copy", encoding="utf-8")
             (root / "metadata-api").mkdir()
             (root / "metadata-api" / "payload.jsonl").write_text("{}\n", encoding="utf-8")
@@ -2210,6 +2486,12 @@ class PipelineCoreTests(unittest.TestCase):
                 "upload_file": str(parsed),
                 "manifest": str(selected / "segment-manifest.jsonl"),
                 "variant_outputs": {"full-document": {"upload_file": "stale.txt"}},
+                "visual_text_review": {
+                    "status": "review_needed",
+                    "unresolved_page_count": 2,
+                    "pages": [{"pdf_page": 2}, {"pdf_page": 7}],
+                    "assessment_warnings": [],
+                },
             }
             result = pipeline.retain_successful_run_leanly(
                 root,
@@ -2229,6 +2511,7 @@ class PipelineCoreTests(unittest.TestCase):
             self.assertFalse(layout_review.exists())
             self.assertFalse(lane_review.exists())
             self.assertFalse(supplementary_candidates.exists())
+            self.assertFalse(visual_review.exists())
             self.assertTrue((root / "Example-pdf-parsed.txt").exists())
             self.assertEqual((root / "Example-p001-s01.txt").read_text(encoding="utf-8"), "First page, first chunk.")
             self.assertEqual((root / "Example-p001-s02.txt").read_text(encoding="utf-8"), "First page, second chunk.")
@@ -2241,6 +2524,12 @@ class PipelineCoreTests(unittest.TestCase):
             self.assertEqual(compact["artifacts"]["parsed_text"], "Example-pdf-parsed.txt")
             self.assertEqual(compact["artifacts"]["segments_directory"], "")
             self.assertEqual(compact["artifacts"]["retained_segment_files"], 3)
+            self.assertEqual(compact["preparation"]["visual_text_review"], {
+                "status": "review_needed",
+                "unresolved_page_count": 2,
+                "pages": [2, 7],
+                "assessment_warnings": [],
+            })
             self.assertEqual(summary["upload_file"], str(root / "Example-pdf-parsed.txt"))
             self.assertEqual(summary["manifest"], "")
             self.assertEqual(summary["variant_outputs"], {})
@@ -2329,6 +2618,72 @@ class PipelineCoreTests(unittest.TestCase):
             self.assertTrue((root / "Example-p001-s01.txt").is_file())
             self.assertEqual(compact["verification_receipt"]["shared_batch"]["expected_records"], 2)
             self.assertEqual(compact["verification_receipt"]["shared_batch"]["confirmed_vectors"], 2)
+
+    def test_deferred_batch_lean_retention_allows_exact_proof_despite_quality_advisory(self):
+        """A local extraction advisory must not falsely downgrade proven upload success."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            selected = root / "selected"
+            selected.mkdir()
+            parsed = selected / "Example-pdf-parsed.txt"
+            parsed.write_text("prepared text", encoding="utf-8")
+            manifest = selected / "segment-manifest.jsonl"
+            manifest.write_text(json.dumps({"pdf_page": 1, "text": "Selected segment."}) + "\n", encoding="utf-8")
+            summary = {
+                "output_root": str(root),
+                "readiness_status": "needs_review",
+                "segments": 1,
+                "upload_file": str(parsed),
+                "manifest": str(manifest),
+                "api_upload_status": "complete",
+                "post_upload_verification_status": "pass",
+                "post_upload_expected_payloads": 1,
+                "post_upload_matching_vectors": 1,
+                "anythingllm_runtime_validation_status": "deferred_after_exact_vector_proof",
+                "batch_upload_result": {"searchability_proven": True, "locations": ["custom-documents/example.txt"]},
+                "lean_retention": {"deferred": True, "reason": "awaiting_shared_automatic_batch_upload"},
+            }
+
+            result = pipeline.finalize_deferred_batch_lean_retention(root, summary)
+
+            self.assertTrue(result["applied"])
+            self.assertFalse(selected.exists())
+
+    def test_layout_artifact_disagreement_accepts_clean_complete_sparse_text(self):
+        selected = {
+            "backend": "pymupdf",
+            "score": 63,
+            "segments": [{"pdf_page": 1}],
+            "quality": {
+                "included_pages": 14,
+                "included_words": 1030,
+                "included_chars": 5673,
+                "replacement_chars": 0,
+                "ocr_layout_artifact_count": 0,
+                "ocr_layout_artifact_ratio": 0.0,
+            },
+            "native_chunk_eval": {"status": "pass"},
+        }
+        noisy_peer = {
+            "backend": "pymupdf4llm",
+            "score": 48,
+            "segments": [{"pdf_page": 1}],
+            "quality": {
+                "included_words": 2348,
+                "ocr_layout_artifact_count": 305,
+                "ocr_layout_artifact_ratio": 0.0235,
+            },
+        }
+
+        result = pipeline.explainable_layout_artifact_coverage_disagreement(
+            selected,
+            [selected, noisy_peer],
+            {"pdf_page_count": 14},
+        )
+
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["reason"], "clean_selected_text_beats_artifact_heavy_peer")
+
 
     def test_deferred_batch_lean_retention_keeps_all_artifacts_without_exact_vector_proof(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2659,7 +3014,7 @@ class PipelineCoreTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            for name in app.AUTOMATIC_SUCCESS_WORKER_ARTIFACTS:
+            for name in app.AUTOMATIC_WORKER_TRANSPORT_ARTIFACTS:
                 (root / name).write_text("transport receipt", encoding="utf-8")
             retained = root / "run-summary.json"
             retained.write_text("{}", encoding="utf-8")
@@ -2669,7 +3024,7 @@ class PipelineCoreTests(unittest.TestCase):
                 {"lean_retention": {"applied": True}},
             )
 
-            self.assertEqual(removed, list(app.AUTOMATIC_SUCCESS_WORKER_ARTIFACTS))
+            self.assertEqual(removed, list(app.AUTOMATIC_WORKER_TRANSPORT_ARTIFACTS))
             self.assertTrue(retained.exists())
             self.assertTrue(all(not (root / name).exists() for name in removed))
 
@@ -2945,7 +3300,7 @@ class PipelineCoreTests(unittest.TestCase):
             "",
         )
         self.assertTrue(generated["visible"])
-        self.assertTrue(generated["value"].startswith("PDF Sample Authors Boundary Study "))
+        self.assertTrue(generated["value"].startswith("Sample Authors Boundary Study "))
         preserved, _marker = app.update_new_workspace_name_control(
             app.NEW_DOCUMENT_WORKSPACE_VALUE,
             "Changed detected title",
@@ -2954,6 +3309,109 @@ class PipelineCoreTests(unittest.TestCase):
             marker,
         )
         self.assertEqual(preserved["value"], "My Sample Author comparison")
+
+    def test_workspace_filename_never_turns_a_title_fragment_into_an_author_label(self):
+        import rag_pdf_gradio_app as app
+
+        # A filename is useful for display and manual editing, but it cannot
+        # establish person or institution provenance by itself.
+        for filename in (
+            "About That Disappearing Middle Class - WSJ.pdf",
+            "From the Archive - Magazine.pdf",
+            "Because We Can - Article.pdf",
+            "By the River - Journal.pdf",
+            "Nuclear Power in the Netherlands.pdf",
+            "WHO and Africa CDC welcome vaccines.pdf",
+            "Shockley Poems.pdf",
+            "Vaswani-2017-attention-is-all-you-need.pdf",
+            "Berlant - Intimate Public Sphere.pdf",
+        ):
+            self.assertEqual(app.workspace_title_fallback_label(filename), "", filename)
+
+    def test_workspace_institutional_labels_require_document_evidence(self):
+        import rag_pdf_gradio_app as app
+
+        self.assertEqual(
+            app.workspace_institutional_name_from_value("University of California Press"),
+            "University of California Press",
+        )
+        self.assertEqual(
+            app.workspace_institutional_label_from_text_samples([{
+                "page": 17,
+                "text": "© 2016-2026 World Nuclear Association, registered in England and Wales.",
+            }]),
+            "World Nuclear Association",
+        )
+        self.assertEqual(
+            app.workspace_institutional_label_from_text_samples([{
+                "page": 17,
+                "text": (
+                    "© 2016-2026 Example International Research Association. "
+                    "Example International Research Association (EIRA) publishes this report."
+                ),
+            }]),
+            "EIRA",
+        )
+        self.assertEqual(
+            app.workspace_institutional_label_from_text_samples([{
+                "page": 1,
+                "text": "WHO and Africa CDC welcome vaccine allocation. 20 August 2026 | News release | Geneva",
+            }]),
+            "WHO",
+        )
+        self.assertEqual(
+            app.workspace_institutional_label_from_text_samples([{
+                "page": 1,
+                "text": "WHO made this decision? A regular article asks a question.",
+            }]),
+            "",
+        )
+        self.assertEqual(
+            app.workspace_institutional_label_from_text_samples([{
+                "page": 1,
+                "text": "Opinion\nBy The Editorial Board\nJan. 11, 2026",
+            }]),
+            "Editorial Board",
+        )
+
+    def test_workspace_identity_plan_keeps_provenance_and_unknown_order(self):
+        import rag_pdf_gradio_app as app
+
+        identities = [
+            {
+                "filename": "known.pdf", "label": "Example University", "kind": "institution",
+                "provenance": "embedded PDF organization metadata", "evidence": "Example University",
+            },
+            {
+                "filename": "unresolved.pdf", "label": "Unknown", "kind": "unknown",
+                "provenance": "no defensible person or institutional evidence", "evidence": "",
+            },
+        ]
+        with mock.patch.object(app, "workspace_source_identity_plan", return_value=identities):
+            rendered = app.workspace_source_identity_plan_html(["known.pdf", "unresolved.pdf"])
+        self.assertIn("1. known.pdf", rendered)
+        self.assertIn("2. unresolved.pdf", rendered)
+        self.assertIn("Example University", rendered)
+        self.assertIn("Unknown means the app did not find enough evidence", rendered)
+
+    def test_workspace_batch_labels_retain_source_order_and_unknown_placeholders(self):
+        import rag_pdf_gradio_app as app
+
+        identities = {
+            "one.pdf": {"label": "Berlant"},
+            "two.pdf": {"label": "WHO"},
+            "three.pdf": {"label": "Berlant"},
+            "four.pdf": {"label": "Unknown"},
+        }
+        with mock.patch.object(
+            app,
+            "workspace_source_identity_from_pdf",
+            side_effect=lambda path: identities[Path(path).name],
+        ):
+            self.assertEqual(
+                app.batch_workspace_author_labels(["one.pdf", "two.pdf", "three.pdf", "four.pdf"]),
+                ["Berlant", "WHO", "Berlant", "Unknown"],
+            )
 
     def test_live_run_progress_is_whole_percent_rounded_and_capped_when_a_phase_is_slow(self):
         import rag_pdf_gradio_app as app
@@ -3020,9 +3478,24 @@ class PipelineCoreTests(unittest.TestCase):
             "batch_current_file_index": 8,
         })
         self.assertIn("Current PDF reconciliation window: 0/480s.", rendered)
-        self.assertIn("Batch: 7/8 PDFs finished", rendered)
+        self.assertIn("Documents prepared: 7/8", rendered)
         self.assertIn("Current PDF: 8/8", rendered)
         self.assertEqual(rendered.count('role="progressbar"'), 1)
+
+    def test_live_run_status_distinguishes_document_and_page_progress(self):
+        import rag_pdf_gradio_app as app
+
+        rendered = app.automatic_live_status_html({
+            "state": "running",
+            "phase": "Extracting and evaluating with pymupdf4llm: 3/7 pages processed",
+            "batch_completed_files": 0,
+            "batch_total_files": 16,
+            "batch_current_file_index": 1,
+        })
+
+        self.assertIn("Documents prepared: 0/16", rendered)
+        self.assertIn("Current PDF: 1/16", rendered)
+        self.assertIn("Current extraction: 3/7 pages", rendered)
 
     def test_batch_completion_count_never_regresses_on_later_pdf_callbacks(self):
         import rag_pdf_gradio_app as app
@@ -4591,6 +5064,39 @@ class PipelineCoreTests(unittest.TestCase):
                 self.assertFalse(app.terminate_automatic_run_worker(run_root))
             taskkill.assert_not_called()
 
+    def test_recent_recovery_progress_without_a_live_owned_worker_is_not_an_active_run(self):
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_root = Path(tmpdir)
+            run_root = output_root / "r-recovery-only"
+            run_root.mkdir()
+            (run_root / "run-progress.json").write_text(
+                json.dumps({"state": "preparing", "run_root": str(run_root)}),
+                encoding="utf-8",
+            )
+            original_output_root = app.AUTO_OUTPUT_DIR
+            original_live = app.LIVE_AUTOMATIC_RUN_STATUS
+            try:
+                app.AUTO_OUTPUT_DIR = output_root
+                app.LIVE_AUTOMATIC_RUN_STATUS = {}
+                self.assertIsNone(app.active_automatic_run_root())
+            finally:
+                app.AUTO_OUTPUT_DIR = original_output_root
+                app.LIVE_AUTOMATIC_RUN_STATUS = original_live
+
+    def test_current_process_live_status_remains_authoritative_before_worker_launch(self):
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_root = Path(tmpdir) / "r-current-confirmation"
+            original_live = app.LIVE_AUTOMATIC_RUN_STATUS
+            try:
+                app.LIVE_AUTOMATIC_RUN_STATUS = {"state": "preparing", "run_root": str(run_root)}
+                self.assertEqual(app.active_automatic_run_root(), run_root)
+            finally:
+                app.LIVE_AUTOMATIC_RUN_STATUS = original_live
+
     def test_old_worker_cleanup_preserves_a_replacement_worker_marker(self):
         import rag_pdf_gradio_app as app
 
@@ -4788,7 +5294,7 @@ class PipelineCoreTests(unittest.TestCase):
             )
         self.assertEqual(result["status"], "restart_confirmation_required")
 
-    def test_automatic_recovery_resumes_only_after_confirmed_owned_cleanup(self):
+    def test_automatic_recovery_observes_owned_queue_without_cleanup_or_resume(self):
         import rag_pdf_gradio_app as app
 
         original_resolve = app.resolve_anythingllm_api_key
@@ -4800,8 +5306,9 @@ class PipelineCoreTests(unittest.TestCase):
         try:
             app.resolve_anythingllm_api_key = lambda *_args, **_kwargs: ("managed-key", "managed_desktop_key")
             app.observe_workspace_embedding_queue_activity = lambda *_args, **_kwargs: {"status": "owned_activity_observed"}
-            app.remove_confirmed_workspace_queue_entries = lambda *_args, **_kwargs: {"status": "complete", "removed": 1}
-            app.detect_anythingllm_api_url = lambda *_args, **_kwargs: {"status": "reachable"}
+            cleanup_calls = []
+            app.remove_confirmed_workspace_queue_entries = lambda *_args, **_kwargs: cleanup_calls.append(True)
+            app.detect_anythingllm_api_url = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("automatic observation must not restart or probe for resume"))
             app._is_most_recent_recovery_run = lambda _root: True
             submissions = []
             app.submit_embedding_resume_manifest = lambda *args, **kwargs: (submissions.append((args, kwargs)) or {"status": "submitted"})
@@ -4831,9 +5338,10 @@ class PipelineCoreTests(unittest.TestCase):
             app.detect_anythingllm_api_url = original_detect
             app.submit_embedding_resume_manifest = original_submit
             app._is_most_recent_recovery_run = original_latest
-        self.assertEqual(len(submissions), 1)
-        self.assertEqual(result["groups"][0]["action"], "reconcile_missing_and_resume")
-        self.assertEqual(result["groups"][0]["resume"]["status"], "submitted")
+        self.assertEqual(submissions, [])
+        self.assertEqual(cleanup_calls, [])
+        self.assertEqual(result["groups"][0]["action"], "none")
+        self.assertEqual(result["groups"][0]["status"], "observed_owned_queue_left_running")
 
     def test_terminal_run_status_reconciles_the_full_ui_after_a_lost_stream(self):
         import rag_pdf_gradio_app as app
@@ -5600,7 +6108,7 @@ class PipelineCoreTests(unittest.TestCase):
             self.assertEqual(template["source_workspace_slug"], "qwen-main")
             self.assertEqual(template["chat_model"], "qwen3-8-max")
 
-    def test_update_workspace_runtime_template_sqlite_applies_chat_model_configuration(self):
+    def test_update_workspace_runtime_template_sqlite_refuses_direct_workspace_mutation(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             storage = Path(tmpdir)
             db_path = storage / "anythingllm.db"
@@ -5642,10 +6150,11 @@ class PipelineCoreTests(unittest.TestCase):
                 },
             )
             configuration = pipeline.read_workspace_model_configuration(storage, "validation-1")
-            self.assertEqual(result["status"], "pass")
-            self.assertTrue(result["verified"])
-            self.assertEqual(configuration["chat_provider"], "openrouter")
-            self.assertEqual(configuration["chat_model"], "deepseek-v4-pro")
+            self.assertEqual(result["status"], "blocked")
+            self.assertFalse(result["verified"])
+            self.assertEqual(result["write_method"], "none")
+            self.assertEqual(configuration["chat_provider"], "ollama")
+            self.assertEqual(configuration["chat_model"], "llama3")
 
     def test_workspace_model_configuration_is_provider_neutral(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -6548,7 +7057,7 @@ class PipelineCoreTests(unittest.TestCase):
 
         original_validate = app.validated_automatic_run_settings
         original_run = app.run_automatic_from_confirmation
-        settings = {"expected_seconds": 194, "files": ["C:/test.pdf"], "mode": app.MODE_LOCAL_ONLY_LABEL}
+        original_live_status = dict(app.LIVE_AUTOMATIC_RUN_STATUS)
         terminal = (
             {"value": "completed"},
             [],
@@ -6560,27 +7069,44 @@ class PipelineCoreTests(unittest.TestCase):
             {"value": "workspace"},
             {"visible": False},
         )
-        try:
-            app.validated_automatic_run_settings = lambda values: (settings, None, [], True)
-            app.run_automatic_from_confirmation = lambda *args, **kwargs: terminal
-            stream = app.run_automatic_from_confirmation_stream(*([None] * len(app.AUTOMATIC_RUN_FIELDS)))
-            preprocessing = next(stream)
-            started = next(stream)
-            observed_state = dict(app.LIVE_AUTOMATIC_RUN_STATUS)
-            completed = next(stream)
-        finally:
-            app.validated_automatic_run_settings = original_validate
-            app.run_automatic_from_confirmation = original_run
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = {
+                "expected_seconds": 194,
+                "files": ["C:/test.pdf"],
+                "mode": app.MODE_LOCAL_ONLY_LABEL,
+                # The production handler reserves a run folder before its
+                # worker starts. Keep that intentional behavior inside this
+                # test's private directory so a mocked terminal worker cannot
+                # leave a false active run in the user's app output.
+                "output_root_override": temp_dir,
+            }
+            try:
+                app.validated_automatic_run_settings = lambda values: (settings, None, [], True)
+                app.run_automatic_from_confirmation = lambda *args, **kwargs: terminal
+                stream = app.run_automatic_from_confirmation_stream(*([None] * len(app.AUTOMATIC_RUN_FIELDS)))
+                preprocessing = next(stream)
+                started = next(stream)
+                observed_state = dict(app.LIVE_AUTOMATIC_RUN_STATUS)
+                completed = next(stream)
+            finally:
+                app.validated_automatic_run_settings = original_validate
+                app.run_automatic_from_confirmation = original_run
+                # The stream intentionally publishes a live preparing state.
+                # Restore it for later picker tests in this module.
+                app.LIVE_AUTOMATIC_RUN_STATUS.clear()
+                app.LIVE_AUTOMATIC_RUN_STATUS.update(original_live_status)
 
         self.assertEqual(len(preprocessing), 12)
         self.assertIn(">preparing<", preprocessing[0]["value"])
-        self.assertEqual(preprocessing[9]["value"], "Confirming…")
+        self.assertEqual(preprocessing[9]["value"], "Starting confirmed run…")
         self.assertFalse(preprocessing[10]["interactive"])
         self.assertFalse(preprocessing[11]["visible"])
         self.assertEqual(len(started), 12)
-        self.assertIn(">running<", started[0]["value"])
+        self.assertIn(">starting<", started[0]["value"])
+        # The summary deliberately says "starting" while the server timer is
+        # already active; that split avoids a dead-looking Confirm state.
         self.assertIn('data-run-state="running"', started[6])
-        self.assertEqual(started[9]["value"], "Processing started")
+        self.assertIn("Starting processing", started[9]["value"])
         self.assertTrue(started[10]["interactive"])
         self.assertFalse(started[11]["visible"])
         self.assertEqual(observed_state["state"], "preparing")
@@ -6681,7 +7207,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(len(selection_dependencies), 1)
         self.assertTrue(
             str(selection_dependencies[0].get("api_name") or "").startswith(
-                "merge_uploaded_pdfs_into_folder_batch"
+                "automatic_selection_begin_state"
             )
         )
 
@@ -6847,7 +7373,7 @@ class PipelineCoreTests(unittest.TestCase):
 
         self.assertEqual(result[:3], ("", [], {}))
         self.assertFalse(result[3]["visible"])
-        self.assertFalse(result[4]["visible"])
+        self.assertEqual(result[4].get("__type__"), "update")
         self.assertFalse(result[5]["visible"])
         self.assertTrue(result[6]["visible"])
         self.assertEqual(result[7]["value"], "Select PDF Folder Here")
@@ -6860,7 +7386,8 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(result[:4], ("", [], {}, False))
         self.assertEqual(result[4]["choices"], [])
         self.assertFalse(result[4]["visible"])
-        self.assertFalse(result[5]["visible"])
+        # This output intentionally leaves the deprecated selector unchanged.
+        self.assertEqual(result[5].get("__type__"), "update")
         self.assertFalse(result[6]["visible"])
         self.assertTrue(result[7]["visible"])
         self.assertEqual(result[8]["value"], "Select PDF Folder Here")
@@ -6877,7 +7404,7 @@ class PipelineCoreTests(unittest.TestCase):
 
         self.assertEqual(result[:4], ("", False, [], {}))
         self.assertFalse(result[4]["visible"])
-        self.assertFalse(result[5]["visible"])
+        self.assertEqual(result[5].get("__type__"), "update")
         self.assertFalse(result[6]["visible"])
         self.assertTrue(result[7]["visible"])
         self.assertEqual(result[8]["value"], "Select PDF Folder Here")
@@ -8741,6 +9268,83 @@ class PipelineCoreTests(unittest.TestCase):
 
             self.assertEqual(backend_calls[:2], ["pymupdf", "pymupdf4llm"])
             self.assertIn("unstructured", backend_calls)
+        finally:
+            pipeline.get_backend_pages = original_get_backend_pages
+
+    def test_automatic_targeted_visual_text_ocr_skips_full_layout_candidate_and_keeps_native_pages(self):
+        """A verified image-backed native gap must recover only that page.
+
+        The test deliberately keeps the normal preparation path: it verifies
+        that the OCR scope reaches the backend, PyMuPDF4LLM is not needlessly
+        invoked, and page-local reconciliation yields one complete candidate.
+        """
+        original_get_backend_pages = pipeline.get_backend_pages
+        try:
+            backend_calls = []
+            body = "Native prose with reliable word identity. " * 150
+
+            def fake_get_backend_pages(pdf_path, backend, unstructured_strategy, **kwargs):
+                backend_calls.append((backend, tuple(kwargs.get("unstructured_page_numbers") or ())))
+                if backend == "pymupdf":
+                    return (
+                        [
+                            {"page": 1, "text": "Introduction\n\n" + body, "kind": "page"},
+                            {"page": 2, "text": "", "kind": "page"},
+                            {"page": 3, "text": body, "kind": "page"},
+                        ],
+                        3,
+                        [],
+                    )
+                if backend == "pymupdf4llm":
+                    self.fail("targeted visual-text recovery should bypass a full layout OCR candidate")
+                if backend == "unstructured":
+                    self.assertEqual(kwargs.get("unstructured_page_numbers"), [2])
+                    return (
+                        [{"page": 2, "text": "[NarrativeText] Recovered visual page text. " * 40, "kind": "unstructured_elements"}],
+                        3,
+                        [{"element_index": 1, "pdf_page": 2, "category": "NarrativeText", "chars": 1600, "preview": "Recovered visual page"}],
+                    )
+                raise AssertionError(f"unexpected backend {backend}")
+
+            pipeline.get_backend_pages = fake_get_backend_pages
+            with tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                pdf_path = root / "targeted.pdf"
+                document = fitz.open()
+                for _index in range(3):
+                    document.new_page()
+                document.save(pdf_path)
+                document.close()
+                args = SimpleNamespace(
+                    document_label="", document_author="", document_short_label="",
+                    use_file_title_fallback=True, deep_extraction=False,
+                    include_front_matter=True, include_back_matter=True,
+                    backend_mode="automatic", first_page_override=0, end_page_override=0,
+                    target_passage_length=500, segment_mode="page_limit",
+                    end_section_names=pipeline.DEFAULT_END_SECTION_HEADINGS,
+                    validation_phrases=[], unstructured_strategy="auto", marker_style="short",
+                    disable_inline_markers=False, run_vector_eval=False,
+                    ollama_model="", ollama_url="", max_vector_probes=0,
+                    prepare_and_upload=False, anythingllm_api_url="", anythingllm_api_key="",
+                    workspace_slug="", test_workspace_slug="test", upload_limit=0,
+                    anythingllm_storage_dir=str(root / "missing-storage"),
+                    anythingllm_chunk_size=400, anythingllm_chunk_overlap=40,
+                    ocr_preflight_hint={"full_native_text_coverage": {
+                        "status": "verified", "page_count": 3,
+                        "image_backed_low_text_pages": [{
+                            "page": 2, "native_text_characters": 0, "image_count": 1,
+                            "largest_image_area_ratio": 0.95,
+                        }],
+                    }},
+                    unstructured_runtime_probe={"backend_available": True, "tesseract_available": True},
+                )
+                result = pipeline.prepare_pdf(pdf_path, root / "output", args)
+                rows = [json.loads(line) for line in (root / "output" / "segment-manifest.jsonl").read_text(encoding="utf-8").splitlines()]
+                profile = json.loads((root / "output" / "source-profile.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["selected_backend"], "unstructured", profile.get("backends"))
+            self.assertEqual([call[0] for call in backend_calls], ["pymupdf", "unstructured"])
+            self.assertEqual(sorted({int(row["pdf_page"]) for row in rows}), [1, 2, 3])
         finally:
             pipeline.get_backend_pages = original_get_backend_pages
 
@@ -11675,7 +12279,43 @@ class PipelineCoreTests(unittest.TestCase):
         )
         self.assertIn("Jacob Devlin", report["author"])
         self.assertIn("Kristina Toutanova", report["author"])
-        self.assertEqual(report["source"], "text_top_block_names")
+        self.assertEqual(report["source"], "text_stacked_affiliated_byline")
+
+    def test_author_inference_recovers_stacked_names_above_shared_affiliation_and_email(self):
+        report = pipeline.infer_author_from_text_samples(
+            [{
+                "page": 1,
+                "text": (
+                    "BERT: Example Title\n"
+                    "Jacob Devlin\nMing-Wei Chang\nKenton Lee\nKristina Toutanova\n"
+                    "Google AI Language\n{jacobdevlin,mingweichang}@google.com\nAbstract\n"
+                ),
+            }],
+            title_hint="BERT: Example Title",
+        )
+        self.assertEqual(
+            report["author"],
+            "Jacob Devlin, Ming-Wei Chang, Kenton Lee, Kristina Toutanova",
+        )
+        self.assertEqual(report["source"], "text_stacked_affiliated_byline")
+
+    def test_stacked_author_recovery_drops_a_wrapped_title_tail_before_name_group(self):
+        report = pipeline.infer_author_from_text_samples(
+            [{
+                "page": 1,
+                "text": (
+                    "BERT: Pre-training of Deep Bidirectional Transformers for\n"
+                    "Language Understanding\n"
+                    "Jacob Devlin\nMing-Wei Chang\nKenton Lee\nKristina Toutanova\n"
+                    "Google AI Language\n{jacobdevlin,mingweichang}@google.com\n"
+                ),
+            }],
+            title_hint="bert-pretraining",
+        )
+        self.assertEqual(
+            report["author"],
+            "Jacob Devlin, Ming-Wei Chang, Kenton Lee, Kristina Toutanova",
+        )
 
     def test_author_inference_finds_comma_separated_academic_names(self):
         report = pipeline.infer_author_from_text_samples(
@@ -11755,6 +12395,22 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn("Maria de la Cruz", report["author"])
         self.assertEqual(report["source"], "text_top_block_names")
 
+    def test_author_inference_accepts_unicode_letter_names(self):
+        self.assertTrue(
+            pipeline.looks_like_person_name(
+                "Łukasz Kaiser",
+                title_hint="Attention Is All You Need",
+            )
+        )
+
+    def test_author_inference_accepts_stacked_name_with_direct_email_without_affiliation(self):
+        report = pipeline.infer_author_from_text_samples(
+            [{"page": 1, "text": "Example Paper\nIllia Polosukhin\nillia@example.com\nAbstract\n"}],
+            title_hint="Example Paper",
+        )
+        self.assertEqual(report["author"], "Illia Polosukhin")
+        self.assertEqual(report["source"], "text_stacked_affiliated_byline")
+
     def test_author_inference_finds_edited_by_pattern(self):
         report = pipeline.infer_author_from_text_samples(
             [
@@ -11828,6 +12484,17 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn("Jordan Lee", report["author"])
         self.assertEqual(report["source"], "text_author_label")
 
+    def test_author_inference_reads_catalog_author_and_does_not_reject_issn_surnames(self):
+        report = pipeline.infer_author_from_text_samples(
+            [{
+                "page": 1,
+                "text": "BOOK AUTHOR: Fleissner, Jennifer (Jennifer L.)\nCHAPTER TITLE: Example Chapter",
+            }],
+            title_hint="Example Chapter",
+        )
+        self.assertEqual(report["author"], "Jennifer L. Fleissner")
+        self.assertEqual(report["source"], "text_bibliographic_author_label")
+
     def test_author_inference_can_fallback_to_filename(self):
         report = pipeline.infer_author_from_filename(
             Path("Example Document - Sample Author.pdf"),
@@ -11864,6 +12531,100 @@ class PipelineCoreTests(unittest.TestCase):
         )
         self.assertEqual(report["author"], "Sample Author")
         self.assertEqual(report["source"], "text_top_block_names")
+
+    def test_author_inference_recovers_all_caps_titlepage_name_above_plain_press_imprint(self):
+        report = pipeline.infer_author_from_text_samples(
+            [{
+                "page": 1,
+                "text": (
+                    "CULTURE\n"
+                    "THE TRANSFORMATION OF AMERICAN SOCIETY\n"
+                    "IN THE TWENTIETH CENTURY\n"
+                    "WARREN I.SUSMAN\n"
+                    "SMITHSONIAN INSTITUTION PRESS WASHINGTON AND LONDON\n"
+                ),
+            }],
+            title_hint="Susman-Twenties",
+        )
+        self.assertEqual(report["author"], "WARREN I. SUSMAN")
+        self.assertEqual(report["source"], "text_compact_caps_byline")
+
+    def test_all_caps_titlepage_fallback_abstains_for_title_phrase_above_press(self):
+        self.assertFalse(
+            pipeline.is_high_confidence_all_caps_titlepage_author(
+                "TWENTIETH CENTURY",
+                "Example Academic Press",
+                title_hint="generic-file-name",
+            )
+        )
+        report = pipeline.infer_author_from_text_samples(
+            [{
+                "page": 1,
+                "text": "TWENTIETH CENTURY\nExample Academic Press\n",
+            }],
+            title_hint="generic-file-name",
+        )
+        self.assertEqual(report["author"], "")
+
+    def test_selected_ocr_author_recovery_reuses_author_rules_and_limits_opening_pages(self):
+        report = pipeline.recover_author_from_selected_extraction(
+            [
+                {"page": 1, "text": "Example Scan\nBY JANE DOE\nExample Press"},
+                {"page": 2, "text": "Ordinary body text."},
+                {"page": "bad", "text": "Ignored malformed record."},
+                {"page": 3, "text": "More body text."},
+                {"page": 4, "text": "More body text."},
+                {"page": 5, "text": "By Late Citation Author"},
+            ],
+            title_hint="Example Scan",
+        )
+        self.assertEqual(report["author"], "JANE DOE")
+        self.assertEqual(report["source"], "selected_extraction_text_byline")
+        self.assertEqual(report["page"], 1)
+        self.assertEqual(report["sample_pages"], [1, 2, 3, 4])
+
+    def test_selected_ocr_author_recovery_strips_structure_tags_and_reads_adjacent_affiliated_names(self):
+        report = pipeline.recover_author_from_selected_extraction(
+            [{
+                "page": 1,
+                "text": (
+                    "[NarrativeText] BERT: Example Title\n"
+                    "[NarrativeText] Jacob Devlin Ming-Wei Chang Kenton Lee Kristina Toutanova "
+                    "Google AI Language {jacobdevlin@example.com}\n"
+                    "[NarrativeText] More recently, sentence encoders improved research systems.\n"
+                ),
+            }],
+            title_hint="BERT: Example Title",
+        )
+        self.assertEqual(
+            report["author"],
+            "Jacob Devlin, Ming-Wei Chang, Kenton Lee, Kristina Toutanova",
+        )
+        self.assertEqual(report["source"], "selected_extraction_text_adjacent_affiliated_byline")
+
+    def test_selected_ocr_author_recovery_rejects_weak_bare_title_block_name(self):
+        report = pipeline.recover_author_from_selected_extraction(
+            [{"page": 1, "text": "Example Article\nSample Author\nOrdinary introductory text."}],
+            title_hint="Example Article",
+        )
+        self.assertEqual(report["author"], "")
+        self.assertEqual(report["source"], "selected_extraction_rejected_weak_text_top_block_names")
+
+    def test_apply_source_identity_to_segments_updates_only_identity_fields(self):
+        rows = [{"source_author": "", "source_short_label": "Old", "metadata_provenance": {}, "text": "body"}]
+        pipeline.apply_source_identity_to_segments(
+            rows,
+            {
+                "source_title": "Example Scan",
+                "source_author": "Jane Doe",
+                "source_short_label": "Jane Doe",
+                "metadata_provenance": {"source_author": "selected_extraction_text_byline"},
+            },
+        )
+        self.assertEqual(rows[0]["source_author"], "Jane Doe")
+        self.assertEqual(rows[0]["source_short_label"], "Jane Doe")
+        self.assertEqual(rows[0]["metadata_provenance"]["source_author"], "selected_extraction_text_byline")
+        self.assertEqual(rows[0]["text"], "body")
 
     def test_organization_byline_is_not_treated_as_person_name(self):
         self.assertFalse(
@@ -13841,6 +14602,7 @@ class PipelineCoreTests(unittest.TestCase):
                 app.verify_anythingllm_post_upload = lambda *_args, **_kwargs: {
                     "status": "pass",
                     "lancedb_matching_rows": 2,
+                    "current_upload_locations_with_vectors": relative_locations,
                 }
                 remaining, report = app.reconcile_resume_manifest_late_vectors(manifest)
             finally:
@@ -13850,6 +14612,69 @@ class PipelineCoreTests(unittest.TestCase):
 
         self.assertEqual(report["reconciled_locations"], 2)
         self.assertEqual(remaining, ["custom-documents/never-submitted.json"])
+
+    def test_resume_reconciliation_removes_only_exact_completed_locations_across_pdfs(self):
+        import rag_pdf_gradio_app as app
+
+        original_documents_dir = app.default_anythingllm_documents_dir
+        original_storage_dir = app.default_anythingllm_storage_dir
+        original_verify = app.verify_anythingllm_post_upload
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            documents = root / "documents"
+            sources = {
+                "custom-documents/a-1.json": "a" * 64,
+                "custom-documents/a-2.json": "a" * 64,
+                "custom-documents/b-1.json": "b" * 64,
+            }
+            for location, source_hash in sources.items():
+                target = documents / location
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(json.dumps({
+                    "title": Path(location).stem,
+                    "docSource": f"local-pdf://sha256/{source_hash}",
+                    "chunkSource": f"page-parent://{Path(location).stem}",
+                }), encoding="utf-8")
+            manifest = {
+                "workspace_slug": "safe-workspace",
+                "batches": [{
+                    "batch": 1,
+                    "submission_state": "unresolved",
+                    "locations": list(sources),
+                }],
+                "recovery": {
+                    "state": "resume_available",
+                    "remaining_locations": [*sources, "custom-documents/not-attempted.json"],
+                },
+            }
+            calls = []
+            try:
+                app.default_anythingllm_documents_dir = lambda: documents
+                app.default_anythingllm_storage_dir = lambda: root
+
+                def verify(_storage, _workspace, source_hash, _payloads, *, upload_locations, **_kwargs):
+                    calls.append((source_hash, list(upload_locations)))
+                    return {
+                        "status": "partial_vector_coverage",
+                        "current_upload_locations_with_vectors": [
+                            "custom-documents/a-1.json",
+                            "custom-documents/b-1.json",
+                        ],
+                    }
+
+                app.verify_anythingllm_post_upload = verify
+                remaining, report = app.reconcile_resume_manifest_late_vectors(manifest)
+            finally:
+                app.default_anythingllm_documents_dir = original_documents_dir
+                app.default_anythingllm_storage_dir = original_storage_dir
+                app.verify_anythingllm_post_upload = original_verify
+
+        self.assertEqual(calls, [("", list(sources))])
+        self.assertEqual(report["reconciled_locations"], 2)
+        self.assertEqual(
+            remaining,
+            ["custom-documents/a-2.json", "custom-documents/not-attempted.json"],
+        )
 
     def test_file_upload_transport_uses_segment_files_and_embed_step(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -15396,6 +16221,111 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(verifier_calls[0][2]["observation_mode"], "identity")
         self.assertEqual(report["document_results"][str(root / "range.pdf")]["records"], 1)
 
+    def test_grouped_batch_verifier_extends_only_for_a_live_owned_queue(self):
+        """A long Desktop queue must not lose its receipt at the 480s boundary."""
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            text_file = root / "prepared.txt"
+            text_file.write_text("prepared", encoding="utf-8")
+            plan_file = root / "upload-plan.csv"
+            rows = [
+                "filename,title,docAuthor,description,docSource,chunkSource,text_file"
+            ]
+            rows.extend(
+                f"page-{index}.txt,Page {index},,,local-pdf://sha256/queue,queue-p{index:04d},{text_file}"
+                for index in range(1, 1001)
+            )
+            plan_file.write_text("\n".join(rows) + "\n", encoding="utf-8")
+            summary = {
+                "pdf": str(root / "queue.pdf"),
+                "source_sha256": "queue",
+                "native_upload_plan": str(plan_file),
+                "native_upload_transport": "file_upload",
+            }
+            clock = [0.0]
+            verify_calls = [0]
+            statuses = []
+            queue = {
+                "queue_records": 1000,
+                "completed": 0,
+                "current": 1,
+                "events_observed": 1,
+                "last_event_monotonic": 0.0,
+                "first_progress_monotonic": 0.0,
+                "last_progress_monotonic": 0.0,
+                "first_progress_position": 1,
+                "last_progress_position": 1,
+                "observer_state": "connected",
+            }
+
+            def fake_verify(_storage, _workspace, _source_sha, payloads, **_kwargs):
+                verify_calls[0] += 1
+                if verify_calls[0] == 2:
+                    queue.update({
+                        "current": 2,
+                        "events_observed": 2,
+                        "last_event_monotonic": clock[0],
+                        "last_progress_monotonic": clock[0],
+                        "last_progress_position": 2,
+                    })
+                if verify_calls[0] >= 4:
+                    return {
+                        "status": "pass",
+                        "matching_vector_rows": len(payloads),
+                        "observed_chunk_sources": [
+                            payload["metadata"]["chunkSource"] for payload in payloads
+                        ],
+                    }
+                return {"status": "partial_vector_coverage", "matching_vector_rows": 1}
+
+            def fake_upload(*_args, **kwargs):
+                verifier = kwargs["batch_verifier"]
+                verification = verifier({
+                    "start_index": 0,
+                    "end_index": 1000,
+                    "locations": [f"custom-documents/page-{index}.json" for index in range(1, 1001)],
+                    "desktop_queue_observer": queue,
+                })
+                return {
+                    "status": "complete", "uploaded": 1000, "embedded": 1000,
+                    "attachment_results": [{
+                        "source_path": str(root / "queue.pdf"),
+                        "chunk_source": f"queue-p{index:04d}",
+                        "location": f"custom-documents/page-{index}.json",
+                        "status": "attached", "error": "",
+                    } for index in range(1, 1001)],
+                    "embedding_update": {"requested": 1000, "accepted": 1000, "batches": [{
+                        "submission_state": "accepted", "searchability_proven": True,
+                        "locations": [f"custom-documents/page-{index}.json" for index in range(1, 1001)],
+                        "verification": verification,
+                    }]},
+                }
+
+            def fake_sleep(_seconds):
+                # Reach the original boundary in one observation interval;
+                # then permit one ordinary update after its earned extension.
+                clock[0] = 480.0 if clock[0] == 0.0 else clock[0] + 2.0
+
+            with mock.patch.object(app, "maybe_upload_to_anythingllm", side_effect=fake_upload), mock.patch.object(
+                app, "verify_anythingllm_post_upload", side_effect=fake_verify
+            ), mock.patch.object(app.time, "monotonic", side_effect=lambda: clock[0]), mock.patch.object(
+                app.time, "sleep", side_effect=fake_sleep
+            ):
+                report = app.upload_prepared_automatic_batch(
+                    [summary], api_url="http://anythingllm", api_key="key",  # pragma: allowlist secret -- synthetic upload fixture
+                    workspace_slug="workspace", run_root=root / "run",
+                    status_callback=lambda _message, detail: statuses.append(detail),
+                )
+
+        self.assertEqual(report["status"], "complete")
+        self.assertGreaterEqual(verify_calls[0], 4)
+        self.assertTrue(any(
+            int(detail.get("reconciliation_deadline_extensions") or 0) >= 1
+            for detail in statuses
+        ))
+
     def test_grouped_upload_outcome_rewrites_staged_per_document_reports(self):
         import rag_pdf_gradio_app as app
 
@@ -15634,6 +16564,34 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertGreater(clean_score, noisy_score)
         self.assertIn("high_ocr_layout_artifact_ratio", noisy_reasons)
 
+    def test_unstructured_reconciliation_bonus_requires_an_actual_native_page_substitution(self):
+        pages = [{"page": 1, "text": "Readable historical prose. " * 60}]
+        quality = pipeline.extraction_quality(
+            pages,
+            [pipeline.page_stats_for(page, {"image_count": 0, "rotation": 0}) for page in pages],
+            1,
+            None,
+        )
+
+        def candidate(native_selected_pages):
+            return {
+                "backend": "unstructured",
+                "quality": quality,
+                "chunk_eval": {"suspicious_chunks": 0},
+                "literal_results": [],
+                "native_chunk_eval": {"status": "pass"},
+                "native_ocr_reconciliation": {
+                    "status": "applied",
+                    "native_selected_pages": native_selected_pages,
+                },
+            }
+
+        tie_break_score, tie_break_reasons = pipeline.score_candidate(candidate([]))
+        hybrid_score, hybrid_reasons = pipeline.score_candidate(candidate([2]))
+        self.assertNotIn("native_ocr_page_reconciliation", tie_break_reasons)
+        self.assertIn("native_ocr_page_reconciliation", hybrid_reasons)
+        self.assertEqual(hybrid_score - tie_break_score, 8)
+
     def test_untrusted_outline_is_warning_not_edge_failure(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             selected_dir = Path(temp_dir)
@@ -15701,6 +16659,20 @@ class PipelineCoreTests(unittest.TestCase):
 
 
 class PipelinePdfIntegrationTests(unittest.TestCase):
+    def test_production_filename_title_metadata_falls_back_to_the_selected_filename(self):
+        resolved = pipeline.resolve_title_from_metadata_or_filename(
+            "32(8) Theobald.indd",
+            Path("book review theobald.pdf"),
+        )
+        self.assertEqual(resolved, {"title": "book review theobald", "source": "filename_fallback"})
+
+    def test_readable_embedded_title_remains_preferred_to_filename(self):
+        resolved = pipeline.resolve_title_from_metadata_or_filename(
+            "A Readable Scholarly Title",
+            Path("downloaded-source.pdf"),
+        )
+        self.assertEqual(resolved, {"title": "A Readable Scholarly Title", "source": "pdf_metadata"})
+
     def test_pdf_metadata_and_page_profile(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             pdf_path = Path(temp_dir) / "profile.pdf"

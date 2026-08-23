@@ -25,7 +25,7 @@ const http = require("http");
 const path = require("path");
 
 const BRIDGE_MARKER = "anythingllm-pdf-prep-refresh-bridge-v1";
-const BRIDGE_REVISION = "drawer-audit-v2";
+const BRIDGE_REVISION = "drawer-audit-v3";
 const BRIDGE_FILE_NAME = "anythingllm-pdf-prep-refresh-bridge.json";
 const DRAFT_GUARD_VERSION = 2;
 const REFRESH_SCRIPT = 'window.dispatchEvent(new Event("refresh-workspaces")); ({ refreshed: true })';
@@ -357,6 +357,8 @@ try {
     $legacyStartAnchor = '}}),Wn(he.app,vZ);const t=process.env.VITE_DEV_SERVER_URL||null;'
     $r2ImportAnchor = 'const ZX=Ee.join(__dirname,"../preload/index.js");'
     $r2StartAnchor = 'he.app.whenReady().then(XX).catch(e=>{'
+    $v116ImportAnchor = 'const ZX=Ee.join(__dirname,"../preload/index.js");'
+    $v116StartAnchor = 'he.app.whenReady().then(XX).catch(e=>{'
 
     # An AnythingLLM release label is not a compatibility guarantee.  The
     # profile below first narrows the intended release family, then demands
@@ -378,6 +380,17 @@ try {
         $main.Contains('const __pdfPrepRefreshBridge=require("./pdf-prep-refresh-bridge.cjs");' + $r2ImportAnchor) -and
         $main.Contains('he.app.whenReady().then(XX).then(()=>__pdfPrepRefreshBridge.startPdfPrepRefreshBridge({app:he.app,getMainWindow:()=>$X})).catch(e=>{')
     )
+    $v116AnchorMatch = (
+        $versionText -match '^[vV]?1\.16\.0(?:[-+].*)?$' -and
+        [regex]::Matches($main, [regex]::Escape($v116ImportAnchor)).Count -eq 1 -and
+        [regex]::Matches($main, [regex]::Escape($v116StartAnchor)).Count -eq 1
+    )
+    $patchedV116AnchorMatch = (
+        $versionText -match '^[vV]?1\.16\.0(?:[-+].*)?$' -and
+        $bridgeModulePresent -and
+        $main.Contains('const __pdfPrepRefreshBridge=require("./pdf-prep-refresh-bridge.cjs");' + $v116ImportAnchor) -and
+        $main.Contains('he.app.whenReady().then(XX).then(()=>__pdfPrepRefreshBridge.startPdfPrepRefreshBridge({app:he.app,getMainWindow:()=>$X})).catch(e=>{')
+    )
     $anchorProfile = if ($legacyAnchorMatch) {
         "legacy-main-window-v1"
     }
@@ -386,6 +399,12 @@ try {
     }
     elseif ($patchedR2AnchorMatch) {
         "anythingllm-1.15-main-window-x-installed"
+    }
+    elseif ($v116AnchorMatch) {
+        "anythingllm-1.16-main-window-x"
+    }
+    elseif ($patchedV116AnchorMatch) {
+        "anythingllm-1.16-main-window-x-installed"
     }
     else {
         "unsupported"
@@ -398,7 +417,7 @@ try {
             BridgeModulePresent = $bridgeModulePresent
             BridgeRevision = $bridgeRevision
             BridgeDiagnosticsPresent = $bridgeDiagnosticsPresent
-            CurrentBridgeRevision = ($bridgeRevision -eq "drawer-audit-v2")
+            CurrentBridgeRevision = ($bridgeRevision -eq "drawer-audit-v3")
             SafeAnchorProfile = $anchorProfile
             CanInstallOrUpgrade = (($alreadyInstalled -and $bridgeModulePresent) -or $anchorProfile -ne "unsupported")
             AppAsar = $asarPath
@@ -426,6 +445,14 @@ try {
             # BrowserWindow before the bridge can ever service a request.
             $importAnchor = $r2ImportAnchor
             $startAnchor = $r2StartAnchor
+            $startReplacement = 'he.app.whenReady().then(XX).then(()=>__pdfPrepRefreshBridge.startPdfPrepRefreshBridge({app:he.app,getMainWindow:()=>$X})).catch(e=>{'
+        }
+        elseif ($v116AnchorMatch) {
+            # v1.16 retains the audited 1.15 window-creation seams. The exact
+            # version and one-occurrence anchors still gate this path, so no
+            # future release is accepted merely because its minified names match.
+            $importAnchor = $v116ImportAnchor
+            $startAnchor = $v116StartAnchor
             $startReplacement = 'he.app.whenReady().then(XX).then(()=>__pdfPrepRefreshBridge.startPdfPrepRefreshBridge({app:he.app,getMainWindow:()=>$X})).catch(e=>{'
         }
         else {

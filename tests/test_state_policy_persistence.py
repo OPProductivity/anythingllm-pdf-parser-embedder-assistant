@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+import anythingllm_persistence
 from anythingllm_persistence import AnythingLLMPersistenceAdapter, _env_value
 from anythingllm_state import read_env_values, resolve_state, sanitized_json
 from segmentation_policy import (
@@ -35,6 +36,29 @@ def create_storage(path):
     con.execute("insert into system_settings values ('text_splitter_chunk_overlap','128')")
     con.commit()
     con.close()
+
+
+def guarded_mutation_adapter(storage, run_id, snapshot_dir, monkeypatch):
+    """Build a fixture with explicit mutation authority for write-mechanism tests.
+
+    These tests exercise snapshot/write/restore mechanics, not Desktop version
+    discovery. Injecting the capability prevents a temporary SQLite fixture
+    without a Desktop executable from weakening the production profile gate.
+    """
+    supported = {"status": "supported", "message": "test capability"}
+    monkeypatch.setattr(
+        anythingllm_persistence,
+        "characterize",
+        lambda _storage: {
+            "matched_profile": "test-recognized-mutation-profile",
+            "capabilities": {
+                "can_write_env_settings": dict(supported),
+                "can_write_sqlite_settings": dict(supported),
+                "can_restore_snapshotted_settings": dict(supported),
+            },
+        },
+    )
+    return AnythingLLMPersistenceAdapter(storage, run_id, snapshot_dir)
 
 
 def test_resolver_preserves_conflict_and_does_not_claim_precedence(tmp_path):
@@ -111,12 +135,12 @@ def test_source_span_identity_is_stable_and_version_sensitive():
     assert first != changed
 
 
-def test_guarded_sqlite_write_snapshots_and_restores(tmp_path):
+def test_guarded_sqlite_write_snapshots_and_restores(tmp_path, monkeypatch):
     storage = tmp_path / "storage"
     storage.mkdir()
     create_storage(storage)
     (storage / ".env").write_text("EMBEDDING_ENGINE='openrouter'\n", encoding="utf-8")
-    adapter = AnythingLLMPersistenceAdapter(storage, "run-1", tmp_path / "snapshots")
+    adapter = guarded_mutation_adapter(storage, "run-1", tmp_path / "snapshots", monkeypatch)
 
     result = adapter.write_sqlite_setting("text_splitter_chunk_size", 900)
     snapshot = json.loads(Path(result["snapshot"]).read_text())
@@ -154,13 +178,13 @@ def test_env_snapshot_redacts_secret_and_restore_skips_unrecoverable_secret(tmp_
     assert payload["env"]["EMBEDDING_ENGINE"]["value"] == "openrouter"
 
 
-def test_guarded_env_write_rejects_multiline_or_malformed_assignments(tmp_path):
+def test_guarded_env_write_rejects_multiline_or_malformed_assignments(tmp_path, monkeypatch):
     storage = tmp_path / "storage"
     storage.mkdir()
     create_storage(storage)
     env_path = storage / ".env"
     env_path.write_text("EMBEDDING_ENGINE='openrouter'\n", encoding="utf-8")
-    adapter = AnythingLLMPersistenceAdapter(storage, "run-3", tmp_path / "snapshots")
+    adapter = guarded_mutation_adapter(storage, "run-3", tmp_path / "snapshots", monkeypatch)
 
     with pytest.raises(ValueError, match="Unsupported environment setting name"):
         adapter.write_env_setting("EMBEDDING_ENGINE\nOTHER_SETTING", "ollama")
@@ -170,13 +194,13 @@ def test_guarded_env_write_rejects_multiline_or_malformed_assignments(tmp_path):
     assert env_path.read_text(encoding="utf-8") == "EMBEDDING_ENGINE='openrouter'\n"
 
 
-def test_guarded_env_write_round_trips_quotes_and_keeps_each_snapshot(tmp_path):
+def test_guarded_env_write_round_trips_quotes_and_keeps_each_snapshot(tmp_path, monkeypatch):
     storage = tmp_path / "storage"
     storage.mkdir()
     create_storage(storage)
     env_path = storage / ".env"
     env_path.write_text("EMBEDDING_ENGINE='openrouter'\n", encoding="utf-8")
-    adapter = AnythingLLMPersistenceAdapter(storage, "run-4", tmp_path / "snapshots")
+    adapter = guarded_mutation_adapter(storage, "run-4", tmp_path / "snapshots", monkeypatch)
     expected = 'provider with "quotes", apostrophe\'s, and \\slashes'
 
     first = adapter.write_env_setting("EMBEDDING_ENGINE", expected)
@@ -194,13 +218,13 @@ def test_guarded_env_write_round_trips_quotes_and_keeps_each_snapshot(tmp_path):
     assert _env_value(env_path.read_text(encoding="utf-8"), "EMBEDDING_ENGINE") == "openrouter"
 
 
-def test_env_restore_removes_a_setting_that_was_absent_in_the_snapshot(tmp_path):
+def test_env_restore_removes_a_setting_that_was_absent_in_the_snapshot(tmp_path, monkeypatch):
     storage = tmp_path / "storage"
     storage.mkdir()
     create_storage(storage)
     env_path = storage / ".env"
     env_path.write_text("EMBEDDING_ENGINE='openrouter'\n", encoding="utf-8")
-    adapter = AnythingLLMPersistenceAdapter(storage, "run-absent-env", tmp_path / "snapshots")
+    adapter = guarded_mutation_adapter(storage, "run-absent-env", tmp_path / "snapshots", monkeypatch)
 
     write = adapter.write_env_setting("LLM_PROVIDER", "openrouter")
     assert _env_value(env_path.read_text(encoding="utf-8"), "LLM_PROVIDER") == "openrouter"
