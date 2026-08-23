@@ -153,7 +153,6 @@ from auto_anythingllm_pipeline import (
 from validation_contract import REVIEWABLE_POST_UPLOAD_STATUSES
 from rag_pdf_tools import (
     DEFAULT_END_SECTION_HEADINGS,
-    get_backend_pages,
     unstructured_runtime_status,
 )
 from orchestration import execute_preparation, legacy_summary_from_run
@@ -196,15 +195,23 @@ TIMING_MODEL_BACKFILL_CUTOVER_PATH = TIMING_MODEL_DIR / "timing-history-cutover.
 # read/prune/append sequence serial in this process so retention never races
 # an append and a partial malformed line does not poison future audits.
 PERSISTED_HISTORY_LOCK = threading.RLock()
+# Retention is intentionally outside the timing-event hot path. Desktop can
+# emit an observation every couple of seconds during a large queue; parsing a
+# growing year of JSONL before every append would turn harmless audit history
+# into run-time I/O and lock contention. The timestamp is process-local only:
+# the normal retention calculation remains authoritative whenever it runs.
+BACKGROUND_HISTORY_PRUNE_SCHEDULE_LOCK = threading.Lock()
+BACKGROUND_HISTORY_LAST_PRUNE_EPOCH = {}
+BACKGROUND_HISTORY_PRUNE_INTERVAL_SECONDS = 24 * 60 * 60
 # Backfilling older run summaries is a read-then-append import. It needs its
 # own reservation lock so two initial UI callbacks cannot learn the same run
 # twice before either append becomes visible in the shared history.
 TIMING_MODEL_BACKFILL_LOCK = threading.RLock()
-# Version 3 distinguishes a single Desktop-style workspace queue from the
-# retired client-side two-record batch scheduler and records the stock
-# per-page-parent provider-request cadence. Earlier rows remain auditable,
-# but cannot teach a timing formula for a different provider-request cadence.
-TIMING_MODEL_VERSION = 3
+# Version 4 retains the single Desktop-style workspace queue contract while
+# allowing a bounded historical refinement of its existing per-page provider
+# allowance. Earlier rows remain append-only audit evidence and are admitted
+# only through the compatibility rules below.
+TIMING_MODEL_VERSION = 4
 BACKGROUND_LOG_RETENTION_DAYS = 365
 # Bump this only when the meaning of the repeat-run processing identity
 # changes. Historical settings receipts remain harmless, but are no longer
@@ -318,13 +325,30 @@ DESKTOP_SERIAL_PROVIDER_REQUEST_PROTOCOL_REVISION = "desktop-page-parent-serial-
 # provider-tail variance. Use a small conservative first-run allowance until a
 # matching current-protocol cohort is available; queue evidence reprices it.
 DESKTOP_SERIAL_PROVIDER_REQUEST_PRIOR_SECONDS = 3.0
-# A timing row may be useful only when it was priced with the same pre-run
-# provider cadence.  This is deliberately separate from the schema version:
-# schemas can gain audit fields while an ETA formula changes, as happened in
-# the short-lived 0.15-second experiment.
-TIMING_MODEL_FORMULA_REVISION = (
+# A partially cached upload can still measure the normal Desktop queue when
+# the overwhelming majority of records were freshly embedded.  Conversely,
+# a mostly cached attachment run is not capacity evidence for a future fresh
+# upload.  Keep that distinction explicit rather than treating one reused
+# page as grounds to discard an otherwise large production observation.
+TIMING_MODEL_CACHE_DOMINANT_REUSE_FRACTION = 0.25
+# Historic Desktop cadence may refine the existing per-page provider-request
+# term only after a materially sized fresh queue has been observed.  The
+# classic 3-second prior remains the starting point and the hard ceiling.
+TIMING_MODEL_DESKTOP_CADENCE_MIN_FRESH_RECORDS = 100
+TIMING_MODEL_DESKTOP_CADENCE_FULL_CONFIDENCE_RECORDS = 4000
+TIMING_MODEL_DESKTOP_CADENCE_MIN_SECONDS = 1.5
+# A timing row may be useful only when it uses this exact Desktop queue
+# protocol. The provider allowance is separately recorded on every row: v3
+# used the fixed first-run allowance and v4 can apply a bounded lane prior.
+# This remains separate from schema version so audit fields can evolve without
+# silently admitting a retired submission protocol.
+TIMING_MODEL_LEGACY_FIXED_PROVIDER_FORMULA_REVISION = (
     f"{DESKTOP_SERIAL_PROVIDER_REQUEST_PROTOCOL_REVISION}|"
     f"provider-prior={DESKTOP_SERIAL_PROVIDER_REQUEST_PRIOR_SECONDS:.3f}"
+)
+TIMING_MODEL_FORMULA_REVISION = (
+    f"{DESKTOP_SERIAL_PROVIDER_REQUEST_PROTOCOL_REVISION}|"
+    "provider-prior=bounded-history-v1"
 )
 # Passage lengths and AnythingLLM's text splitter are measured in characters.
 # Embedder capability limits are tokens, so this deliberately conservative
@@ -374,6 +398,10 @@ LIVE_AUTOMATIC_RUN_STATUS = {}
 # signature for each active root; terminal and material checkpoints always win.
 AUTOMATIC_RUN_PROGRESS_TRACE_STATE = {}
 AUTOMATIC_RUN_PROGRESS_TRACE_MIN_INTERVAL_SECONDS = 1.0
+# Unlike run-progress.json, the trace is a best-effort chronological audit
+# file. Serialize its signature/read/append transition so two overlapping
+# callbacks cannot emit duplicate or out-of-order checkpoint lines.
+AUTOMATIC_RUN_PROGRESS_TRACE_LOCK = threading.Lock()
 # Gradio progress/status callbacks can overlap in one process.  The durable
 # JSON writer alone cannot prevent two callbacks from deriving records from
 # the same stale in-memory checkpoint, so protect the whole transition.
@@ -4500,8 +4528,12 @@ def describe_api_exception(exc, service_name):
         }
         label = status_labels.get(exc.code, "unexpected HTTP response")
         detail = f"{service_name} API returned HTTP {exc.code}: {label}."
-        if body:
-            detail += f" Response body: {body[:700]}"
+        # An endpoint can legally echo arbitrary diagnostics. Keep the useful
+        # short explanation while applying the same credential redaction used
+        # by other user-visible failure paths before it reaches the UI.
+        safe_body = safe_user_error_text(body, fallback="", limit=700)
+        if safe_body:
+            detail += f" Response body: {safe_body}"
         return detail
     if isinstance(exc, urllib.error.URLError):
         reason = getattr(exc, "reason", exc)
@@ -10221,16 +10253,36 @@ def automatic_detected_metadata_preview(
     apply_batch_metadata_overrides=False,
     folder_manifest=None,
 ):
-    """Inspect the batch when present, otherwise the ordinary picker files."""
+    """Inspect the batch when present, otherwise the ordinary picker files.
+
+    Metadata is supporting UI evidence, never a prerequisite for a valid PDF
+    selection.  Keep an unexpected per-file inspection failure from aborting
+    the selection transaction after it has placed the form in its guarded
+    ``Finishing preparation`` state.
+    """
     folder_candidates, _manifest_reused = folder_manifest_candidates(folder_files, folder_manifest)
-    return detected_metadata_preview(
-        folder_candidates or normalize_file_list(pdf_files),
-        current_title=current_title,
-        current_author=current_author,
-        current_short_label=current_short_label,
-        use_file_title_fallback=use_file_title_fallback,
-        apply_batch_metadata_overrides=apply_batch_metadata_overrides,
-    )
+    files = folder_candidates or normalize_file_list(pdf_files)
+    try:
+        return detected_metadata_preview(
+            files,
+            current_title=current_title,
+            current_author=current_author,
+            current_short_label=current_short_label,
+            use_file_title_fallback=use_file_title_fallback,
+            apply_batch_metadata_overrides=apply_batch_metadata_overrides,
+        )
+    except Exception as exc:
+        APP_LOGGER.exception("automatic metadata preview failed")
+        detail = html.escape(safe_user_error_text(exc, fallback="an unexpected inspection error"))
+        return (
+            gr.update(value=current_title or ""),
+            gr.update(value=current_author or ""),
+            gr.update(value=current_short_label or ""),
+            '<div class="metadata-summary"><div class="metadata-file"><div class="metadata-status">'
+            f'Metadata preview could not be completed ({detail}). The selected PDF files remain valid and can still be confirmed.'
+            "</div></div></div>",
+            gr.update(open=True),
+        )
 
 
 @automatic_next_run_callback(1)
@@ -10856,43 +10908,44 @@ def update_live_automatic_run_status(
                 "expected_seconds": expected,
             }
             trace_key = str(record["run_root"])
-            prior_trace = AUTOMATIC_RUN_PROGRESS_TRACE_STATE.get(trace_key, {})
-            visible_percent = int(trace_entry["visible_progress_percent"])
-            # Worker lifecycle callbacks carry their detailed stage in
-            # ``phase`` (for example, one string per extracted page) while
-            # ``progress_phase`` remains the stable ownership label.  Treat
-            # that stable label as the trace phase so page/cache churn cannot
-            # defeat coalescing. The two user-meaningful reconciliation steps
-            # deliberately receive their own markers even when they happen at
-            # the same percent in the same second.
-            trace_phase_marker = str(trace_entry["progress_phase"] or trace_entry["phase"])
-            trace_details = str(trace_entry["details"] or "")
-            if "Checking workspace attachment (step 1 of 2)" in trace_details:
-                trace_phase_marker = "workspace_attachment_step_1"
-            elif "Confirming exact workspace vectors (step 2 of 2)" in trace_details:
-                trace_phase_marker = "workspace_vector_confirmation_step_2"
-            trace_signature = (
-                trace_entry["state"],
-                trace_phase_marker,
-                trace_entry["eta_reprice_reason"],
-                visible_percent,
-            )
-            terminal_trace = trace_entry["state"] in {"successful", "warning", "failed", "cancelled"}
-            material_checkpoint = trace_signature != prior_trace.get("signature") or terminal_trace
-            due_for_heartbeat = (
-                now - float(prior_trace.get("written_epoch") or 0.0)
-                >= AUTOMATIC_RUN_PROGRESS_TRACE_MIN_INTERVAL_SECONDS
-            )
-            if material_checkpoint or due_for_heartbeat:
-                with trace_path.open("a", encoding="utf-8") as handle:
-                    handle.write(json.dumps(trace_entry, ensure_ascii=False) + "\n")
-                AUTOMATIC_RUN_PROGRESS_TRACE_STATE[trace_key] = {
-                    "signature": trace_signature,
-                    "written_epoch": now,
-                }
-            if terminal_trace:
-                # Do not retain historical run roots in a long-lived server.
-                AUTOMATIC_RUN_PROGRESS_TRACE_STATE.pop(trace_key, None)
+            with AUTOMATIC_RUN_PROGRESS_TRACE_LOCK:
+                prior_trace = AUTOMATIC_RUN_PROGRESS_TRACE_STATE.get(trace_key, {})
+                visible_percent = int(trace_entry["visible_progress_percent"])
+                # Worker lifecycle callbacks carry their detailed stage in
+                # ``phase`` (for example, one string per extracted page) while
+                # ``progress_phase`` remains the stable ownership label. Treat
+                # that stable label as the trace phase so page/cache churn cannot
+                # defeat coalescing. The two user-meaningful reconciliation steps
+                # deliberately receive their own markers even when they happen at
+                # the same percent in the same second.
+                trace_phase_marker = str(trace_entry["progress_phase"] or trace_entry["phase"])
+                trace_details = str(trace_entry["details"] or "")
+                if "Checking workspace attachment (step 1 of 2)" in trace_details:
+                    trace_phase_marker = "workspace_attachment_step_1"
+                elif "Confirming exact workspace vectors (step 2 of 2)" in trace_details:
+                    trace_phase_marker = "workspace_vector_confirmation_step_2"
+                trace_signature = (
+                    trace_entry["state"],
+                    trace_phase_marker,
+                    trace_entry["eta_reprice_reason"],
+                    visible_percent,
+                )
+                terminal_trace = trace_entry["state"] in {"successful", "warning", "failed", "cancelled"}
+                material_checkpoint = trace_signature != prior_trace.get("signature") or terminal_trace
+                due_for_heartbeat = (
+                    now - float(prior_trace.get("written_epoch") or 0.0)
+                    >= AUTOMATIC_RUN_PROGRESS_TRACE_MIN_INTERVAL_SECONDS
+                )
+                if material_checkpoint or due_for_heartbeat:
+                    with trace_path.open("a", encoding="utf-8") as handle:
+                        handle.write(json.dumps(trace_entry, ensure_ascii=False) + "\n")
+                    AUTOMATIC_RUN_PROGRESS_TRACE_STATE[trace_key] = {
+                        "signature": trace_signature,
+                        "written_epoch": now,
+                    }
+                if terminal_trace:
+                    # Do not retain historical run roots in a long-lived server.
+                    AUTOMATIC_RUN_PROGRESS_TRACE_STATE.pop(trace_key, None)
         except OSError as exc:
             APP_LOGGER.warning("could not append automatic run progress trace: %s", exc)
     return record
@@ -12797,12 +12850,39 @@ def _append_timing_jsonl(path, record):
     try:
         with PERSISTED_HISTORY_LOCK:
             TIMING_MODEL_DIR.mkdir(parents=True, exist_ok=True)
-            prune_background_jsonl(path)
+            _maybe_prune_background_jsonl(path)
             with Path(path).open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
                 handle.flush()
     except OSError as exc:
         APP_LOGGER.warning("could not persist timing-model record: %s", exc)
+
+
+def _maybe_prune_background_jsonl(path, *, now=None):
+    """Run retention once per path per day, never once per queue observation."""
+    timestamp = time.time() if now is None else float(now)
+    history_path = Path(path)
+    try:
+        schedule_key = str(history_path.resolve()).casefold()
+    except OSError:
+        schedule_key = str(history_path.absolute()).casefold()
+    with BACKGROUND_HISTORY_PRUNE_SCHEDULE_LOCK:
+        previous = BACKGROUND_HISTORY_LAST_PRUNE_EPOCH.get(schedule_key)
+        if (
+            previous is not None
+            and timestamp - float(previous) < BACKGROUND_HISTORY_PRUNE_INTERVAL_SECONDS
+        ):
+            return {"status": "deferred", "kept": 0, "removed": 0}
+        # Reserve the attempt before acquiring the history lock below. This
+        # prevents simultaneous callbacks from rescanning the same file;
+        # failure clears the reservation so the next append may retry.
+        BACKGROUND_HISTORY_LAST_PRUNE_EPOCH[schedule_key] = timestamp
+    result = prune_background_jsonl(history_path)
+    if result.get("status") == "error":
+        with BACKGROUND_HISTORY_PRUNE_SCHEDULE_LOCK:
+            if BACKGROUND_HISTORY_LAST_PRUNE_EPOCH.get(schedule_key) == timestamp:
+                BACKGROUND_HISTORY_LAST_PRUNE_EPOCH.pop(schedule_key, None)
+    return result
 
 
 def _read_timing_jsonl(path, limit=240):
@@ -13620,10 +13700,12 @@ def timing_model_formula_compatible(row):
     """Return whether a timing observation used the active ETA formula.
 
     Timing schema versions are intentionally forward-compatible for storage,
-    but that must not make a row calibrated with a different provider cadence
-    eligible for learning.  Legacy Desktop rows without the explicit formula
-    revision are accepted only when their recorded prior proves the current
-    classic 3-second cadence.
+    but that must not make a row from a retired submission protocol eligible
+    for learning.  The fixed-cadence v3 revision and the bounded-history v4
+    revision share the same serial Desktop protocol; their explicit stored
+    provider allowances keep their historical bases interpretable. Legacy
+    rows without a revision remain eligible only when they prove the classic
+    3-second allowance.
     """
     is_desktop_native = (
         str(row.get("mode") or "") == MODE_NATIVE_UPLOAD_LABEL
@@ -13633,7 +13715,10 @@ def timing_model_formula_compatible(row):
         return True
     revision = str(row.get("timing_formula_revision") or "").strip()
     if revision:
-        return revision == TIMING_MODEL_FORMULA_REVISION
+        return revision in {
+            TIMING_MODEL_FORMULA_REVISION,
+            TIMING_MODEL_LEGACY_FIXED_PROVIDER_FORMULA_REVISION,
+        }
     protocol = str(row.get("desktop_embedding_batch_protocol") or "").strip()
     if protocol and protocol != DESKTOP_SERIAL_PROVIDER_REQUEST_PROTOCOL_REVISION:
         return False
@@ -13692,12 +13777,93 @@ def timing_model_cached_attachment_reuse_count(row):
         return 0
 
 
+def timing_model_cache_reuse_fraction(row):
+    """Return the observed cached-location share for one native upload row."""
+    cached = timing_model_cached_attachment_reuse_count(row)
+    try:
+        total = max(
+            int(row.get("actual_records") or 0),
+            int(row.get("submitted_records") or 0),
+            int(row.get("estimated_records") or 0),
+        )
+    except (TypeError, ValueError):
+        total = 0
+    return min(1.0, cached / max(1, total))
+
+
 def timing_model_is_cache_accelerated_submission(row):
-    """Identify a native run whose observed attachment cache changed cadence."""
+    """Identify a native run whose cache materially changed queue cadence.
+
+    A cache hit for a handful of records in a long queue is not a different
+    timing regime.  Cache-dominated runs are still retained for audit, but do
+    not teach the fresh-upload ETA.
+    """
     return (
         str(row.get("mode") or "") == MODE_NATIVE_UPLOAD_LABEL
         and timing_model_cached_attachment_reuse_count(row) > 0
+        and timing_model_cache_reuse_fraction(row) >= TIMING_MODEL_CACHE_DOMINANT_REUSE_FRACTION
     )
+
+
+def timing_model_desktop_queue_cadence(row):
+    """Read one completed Desktop queue's fresh-record cadence, if durable.
+
+    The terminal timing row deliberately stays compact.  The matching ledger
+    contains the exact queue observer rate and is consulted read-only only
+    for a completed, non-cache-dominated run.  This is phase evidence, not a
+    filename- or workspace-specific prediction.
+    """
+    if (
+        str(row.get("mode") or "") != MODE_NATIVE_UPLOAD_LABEL
+        or str(row.get("embedding_submission_strategy") or "").casefold() != "desktop_queue"
+        or timing_model_is_all_existing_recheck(row)
+        or timing_model_is_cache_accelerated_submission(row)
+    ):
+        return {}
+    try:
+        run_root = Path(str(row.get("run_key") or ""))
+        ledger_path = run_root / "batch-embedding-ledger.json"
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        batches = list(ledger.get("batches") or [])
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    rates = []
+    observed_records = 0
+    for batch in batches:
+        verification = dict(batch.get("verification") or {})
+        observer = dict(verification.get("desktop_queue_observer") or {})
+        try:
+            rate = float(observer.get("desktop_queue_records_per_minute") or 0)
+            completed = int(observer.get("desktop_queue_completed") or 0)
+            requested = int(batch.get("requested") or 0)
+        except (TypeError, ValueError):
+            continue
+        if (
+            rate > 0
+            and str(observer.get("desktop_queue_observer_state") or "").casefold() == "connected"
+            and completed >= requested > 0
+        ):
+            rates.append(rate)
+            observed_records += requested
+    if not rates:
+        return {}
+    fresh_records = max(
+        0,
+        int(row.get("actual_records") or observed_records)
+        - timing_model_cached_attachment_reuse_count(row),
+    )
+    if fresh_records < TIMING_MODEL_DESKTOP_CADENCE_MIN_FRESH_RECORDS:
+        return {}
+    # The lower observed rate is the conservative rate when one run contains
+    # several receipts.  It prevents a short warm/cache-adjacent receipt from
+    # making the historical lane unrealistically optimistic.
+    records_per_minute = min(rates)
+    return {
+        "fresh_records": fresh_records,
+        "records_per_minute": records_per_minute,
+        "seconds_per_record": 60.0 / records_per_minute,
+        "receipts": len(rates),
+    }
 
 
 def timing_model_observation_usable(row):
@@ -13950,6 +14116,77 @@ def timing_model_batch_prior_seconds(features, history):
     if lane.startswith("local:"):
         return 10.0, 0, f"conservative unmeasured {lane} prior"
     return 6.0, 0, f"conservative unmeasured {lane} prior"
+
+
+def timing_model_desktop_provider_request_prior_seconds(features, history):
+    """Return a guarded historical prior for the existing Desktop queue term.
+
+    This does not add a second ETA model or replace the classic phase formula.
+    It only refines that formula's existing per-page provider-request allowance
+    when a matching lane has durable exact-vector queue evidence at meaningful
+    scale.  The result is blended back toward the classic first-run allowance
+    and cannot be more optimistic than the configured floor.
+    """
+    if (
+        str(features.get("mode") or "") != MODE_NATIVE_UPLOAD_LABEL
+        or str(features.get("embedding_submission_strategy") or "").casefold() != "desktop_queue"
+    ):
+        return DESKTOP_SERIAL_PROVIDER_REQUEST_PRIOR_SECONDS, 0, "not applicable outside the Desktop queue"
+    requested_records = max(0, int(features.get("estimated_embedding_provider_requests") or 0))
+    # A long queue's steady per-record cadence is not evidence for a tiny
+    # queue, where Desktop setup, first-provider wake-up, and final observer
+    # handoff are a much larger share. Retain the classic conservative prior
+    # for short selections instead of making their first estimate optimistic.
+    if requested_records < TIMING_MODEL_DESKTOP_CADENCE_MIN_FRESH_RECORDS:
+        return (
+            DESKTOP_SERIAL_PROVIDER_REQUEST_PRIOR_SECONDS,
+            0,
+            "classic short-queue Desktop prior",
+        )
+    minimum_scale = max(
+        TIMING_MODEL_DESKTOP_CADENCE_MIN_FRESH_RECORDS,
+        min(300, int(math.ceil(requested_records * 0.20))),
+    )
+    lane = str(features.get("embedding_timing_lane") or "")
+    samples = []
+    support_records = 0
+    for row in history or []:
+        if (
+            not timing_model_observation_usable(row)
+            or str(row.get("mode") or "") != MODE_NATIVE_UPLOAD_LABEL
+            or str(row.get("embedding_submission_strategy") or "").casefold() != "desktop_queue"
+            or str(row.get("native_upload_scope") or "") != str(features.get("native_upload_scope") or "")
+            or str(row.get("native_upload_transport") or "") != str(features.get("native_upload_transport") or "")
+            or str(row.get("native_upload_representation") or "") != str(features.get("native_upload_representation") or "")
+            or str(row.get("segment_mode") or "") != str(features.get("segment_mode") or "")
+            or str(row.get("embedding_timing_lane") or "") != lane
+        ):
+            continue
+        cadence = dict(row.get("desktop_queue_cadence") or {})
+        fresh_records = int(cadence.get("fresh_records") or 0)
+        seconds_per_record = float(cadence.get("seconds_per_record") or 0)
+        if fresh_records < minimum_scale or seconds_per_record <= 0:
+            continue
+        samples.append(seconds_per_record)
+        support_records += fresh_records
+    if not samples:
+        return DESKTOP_SERIAL_PROVIDER_REQUEST_PRIOR_SECONDS, 0, "classic first-run Desktop queue prior"
+    conservative_observed = max(
+        TIMING_MODEL_DESKTOP_CADENCE_MIN_SECONDS,
+        min(
+            DESKTOP_SERIAL_PROVIDER_REQUEST_PRIOR_SECONDS,
+            float(_timing_percentile(samples, .75) or DESKTOP_SERIAL_PROVIDER_REQUEST_PRIOR_SECONDS) * 1.20,
+        ),
+    )
+    confidence = min(.50, support_records / TIMING_MODEL_DESKTOP_CADENCE_FULL_CONFIDENCE_RECORDS)
+    prior = (
+        DESKTOP_SERIAL_PROVIDER_REQUEST_PRIOR_SECONDS * (1.0 - confidence)
+        + conservative_observed * confidence
+    )
+    return prior, len(samples), (
+        f"bounded Desktop queue cadence from {len(samples)} matching large run(s) "
+        f"/{support_records} fresh records"
+    )
 
 
 def timing_model_base_seconds(features, *, batch_seconds_prior=6.0):
@@ -14549,6 +14786,13 @@ def hydrated_timing_model_history():
                         ]
             except (OSError, StopIteration, TypeError, ValueError, json.JSONDecodeError):
                 pass
+        # The queue cadence is stored in the durable per-run ledger rather
+        # than copied into JSONL.  Hydrate it read-only so historical learning
+        # can use exact-vector evidence without widening the private timing
+        # record or preserving more operational detail than necessary.
+        cadence = timing_model_desktop_queue_cadence(row)
+        if cadence:
+            row["desktop_queue_cadence"] = cadence
         hydrated.append(row)
     return hydrated
 
@@ -14655,8 +14899,12 @@ def estimate_automatic_run(
     features["batch_prior_source"] = batch_source
     features["batch_prior_samples"] = batch_samples
     if str(features.get("embedding_submission_strategy") or "").casefold() == "desktop_queue":
-        features["embedding_provider_request_seconds_prior"] = DESKTOP_SERIAL_PROVIDER_REQUEST_PRIOR_SECONDS
-        features["embedding_provider_request_prior_source"] = "measured Desktop serial page-parent first-run prior"
+        provider_request_prior, provider_request_samples, provider_request_source = (
+            timing_model_desktop_provider_request_prior_seconds(features, history)
+        )
+        features["embedding_provider_request_seconds_prior"] = round(provider_request_prior, 3)
+        features["embedding_provider_request_prior_samples"] = provider_request_samples
+        features["embedding_provider_request_prior_source"] = provider_request_source
     local_embedding_prior, local_embedding_samples, local_embedding_source = timing_local_embedding_prior(features, history)
     if local_embedding_prior > 0:
         features["local_embedding_seconds_per_record"] = round(local_embedding_prior, 3)
@@ -14916,12 +15164,19 @@ def record_timing_model_run(
         )
         if all_selected_records_already_indexed:
             timing_cache_outcome = "all_selected_records_already_indexed"
-        elif cached_attachment_reused_records:
+        elif timing_model_is_cache_accelerated_submission({
+            "mode": features.get("mode"),
+            "actual_records": actual_records,
+            "submitted_records": submitted_records,
+            "cached_attachment_reused_records": cached_attachment_reused_records,
+        }):
             # This is a genuine successful workspace attachment run, but its
-            # elapsed duration does not measure fresh provider embedding.
-            # Preserve it for audit while keeping the normal first-run lane
-            # pure for a later uncached selection.
+            # cache-dominated elapsed duration does not measure a fresh
+            # provider queue. Preserve it for audit while keeping the normal
+            # first-run lane pure for a later uncached selection.
             timing_cache_outcome = "cached_attachment_accelerated_submission"
+        elif cached_attachment_reused_records:
+            timing_cache_outcome = "mixed_cached_and_fresh_submission"
         elif existing_workspace_documents:
             timing_cache_outcome = "mixed_workspace_existing_and_submission"
         else:
@@ -15769,7 +16024,7 @@ def automatic_run_failure_banner_html(code, message):
     return (
         '<div class="automatic-run-failure" role="alert">'
         f'<strong>Run needs attention ({html.escape(str(code))}).</strong> '
-        f'{html.escape(str(message))} Open <em>Run output and downloads</em> for the full report.'
+        f'{html.escape(safe_user_error_text(message))} Open <em>Run output and downloads</em> for the full report.'
         '</div>'
     )
 
@@ -16559,12 +16814,63 @@ def run_automatic_for_browser_stream(
         yield (*outputs, owned_root)
 
 
+METADATA_PREVIEW_TEXT_LAYER_PAGE_LIMIT = 3
+
+
+def safe_user_error_text(value, *, fallback="The operation could not be completed.", limit=700):
+    """Retain actionable local diagnostics without echoing credentials to the UI."""
+    message = str(value or "").strip()
+    if not message:
+        return fallback
+    message = re.sub(r"(?i)(bearer\s+)[^\s,;]+", r"\1[redacted]", message)
+    message = re.sub(
+        r"(?i)([?&](?:api[_-]?key|token|secret|password)=)[^&\s]+",
+        r"\1[redacted]",
+        message,
+    )
+    message = re.sub(r"(https?://[^\s/@:]+:)[^@\s/]+@", r"\1[redacted]@", message)
+    message = " ".join(message.split())
+    return message[:limit] or fallback
+
+
 def metadata_text_layer_preview(pdf_path: Path):
+    """Return a bounded native-text sample for the editable metadata preview.
+
+    The preview is an early, non-blocking convenience check.  It must not run
+    full-document extraction for each of the first five files in a batch: the
+    actual Automatic preflight and worker already perform the complete
+    page-level analysis before a run can start.  Sampling the first pages is
+    enough to show whether the visible metadata/title-page material has a text
+    layer, while keeping large selections responsive.
+    """
     try:
-        pages, _page_count, _element_rows = get_backend_pages(pdf_path, "pymupdf", "fast")
+        with fitz.open(pdf_path) as document:
+            page_count = len(document)
+            sampled_count = min(page_count, METADATA_PREVIEW_TEXT_LAYER_PAGE_LIMIT)
+            pages = []
+            geometry = []
+            for page_index in range(sampled_count):
+                page = document.load_page(page_index)
+                pages.append(
+                    {
+                        "page": page_index + 1,
+                        "text": page.get_text("text"),
+                        "kind": "native_text",
+                    }
+                )
+                geometry.append(
+                    {
+                        "pdf_page": page_index + 1,
+                        "image_count": len(page.get_images(full=True)),
+                        "rotation": int(page.rotation or 0),
+                    }
+                )
         stats = enrich_page_stats(
             pages,
-            [page_stats_for(page) for page in pages],
+            [
+                page_stats_for(page, geometry[index])
+                for index, page in enumerate(pages)
+            ],
         )
         quality = extraction_quality(pages, stats, 1, 0)
         sample = ""
@@ -16580,11 +16886,13 @@ def metadata_text_layer_preview(pdf_path: Path):
             "quality": quality,
             "sample": sample,
             "sample_page": sample_page,
+            "sampled_pages": sampled_count,
+            "page_count": page_count,
         }
     except Exception as exc:
         return {
             "status": "error",
-            "error": str(exc),
+            "error": safe_user_error_text(exc),
         }
 
 
@@ -17141,7 +17449,7 @@ def detected_metadata_preview(
         except Exception as exc:
             previews.append(
                 f'<section class="metadata-file"><div class="metadata-file-name">{html.escape(pdf_path.name)}</div>'
-                f'<div class="metadata-status">Metadata inspection failed: {html.escape(str(exc))}</div></section>'
+                f'<div class="metadata-status">Metadata inspection failed: {html.escape(safe_user_error_text(exc))}</div></section>'
             )
             continue
 
@@ -17185,8 +17493,15 @@ def detected_metadata_preview(
                 text_layer_status = "Possible scanned or low-text PDF"
             else:
                 text_layer_status = "Likely scanned or OCR-needed PDF"
+            profiled_pages = int(text_layer.get("sampled_pages") or quality.get("included_pages") or 0)
+            total_pages = int(text_layer.get("page_count") or profiled_pages)
+            scope = (
+                f"first {profiled_pages} of {total_pages} page(s)"
+                if total_pages > profiled_pages else
+                f"{profiled_pages} page(s)"
+            )
             text_layer_detail = (
-                f"{quality.get('included_words', 0)} words across {quality.get('included_pages', 0)} profiled page(s); "
+                f"{quality.get('included_words', 0)} words across sampled {scope}; "
                 f"empty pages {quality.get('empty_pages', 0)}, image-heavy low-text pages {quality.get('image_heavy_low_text_pages', 0)}"
             )
             sample_text = text_layer.get("sample") or "No text layer sample was extracted from the profiled pages."
@@ -17282,7 +17597,7 @@ def app_error_report(code, title, details, next_steps=None, context=None):
         "Details:",
     ]
     for detail in details:
-        lines.append(f"- {detail}")
+        lines.append(f"- {safe_user_error_text(detail)}")
     if next_steps:
         lines.extend(["", "Next steps:"])
         for step in next_steps:
@@ -18266,7 +18581,8 @@ def upload_prepared_automatic_batch(
                 )
                 break
             try:
-                prepared_text = Path(str(row["text_file"])).read_text(encoding="utf-8")
+                prepared_bytes = Path(str(row["text_file"])).read_bytes()
+                prepared_text = prepared_bytes.decode("utf-8")
             except (OSError, UnicodeDecodeError) as exc:
                 invalid_row_reason = (
                     f"upload-plan row {position} has an unreadable prepared text file: {exc}."
@@ -18278,10 +18594,11 @@ def upload_prepared_automatic_batch(
                 )
                 break
             # Avoid re-reading every selected record solely to make the
-            # expected-payload verifier. The transport still uses the durable
-            # staged file, but the validated snapshot makes an empty fallback
-            # impossible at the verification boundary.
+            # expected-payload verifier or cache lookup. The transport later
+            # hashes and sends one byte snapshot, rejecting any file that
+            # changed since this preparation-time validation.
             row["_validated_text_content"] = prepared_text
+            row["_validated_prepared_file_sha256"] = hashlib.sha256(prepared_bytes).hexdigest()
         if invalid_row_reason:
             ineligible.append((summary, source_path, "error_invalid_upload_plan", invalid_row_reason))
             continue
@@ -18655,10 +18972,12 @@ def upload_prepared_automatic_batch(
                 "",
                 expected_batch,
                 upload_locations=list(batch_report.get("locations") or []),
-                # ``chunkSource`` is a globally unique source/page-parent identity
-                # in the generated plan. Identity mode returns that exact set so a
-                # mixed-source batch can be partitioned truthfully afterwards.
-                observation_mode="identity",
+                # A live batch observer needs count progress while Desktop is
+                # writing. ``fast`` retains the exact chunkSource set check at
+                # completion, without materialising that complete identity set
+                # every two seconds. Recovery and diagnostic callers retain
+                # their always-identity mode.
+                observation_mode="fast",
                 frontend_api_url=api_url,
             )
             observed = max(
@@ -20787,6 +21106,14 @@ def run_automatic(
             nonlocal expected_seconds, cache_realization_eta_applied
             report = report or {}
             stage_text = str(stage or "Submitting the selected PDF batch to AnythingLLM")
+            # The grouped Desktop route owns the live queue observer.  Feed
+            # each of its evidence-bearing callbacks through the established
+            # timing recorder before rendering the status, so the classic ETA
+            # can make its already-bounded, 30-second queue-rate reprice.
+            # Previously this callback updated the visible counter directly
+            # but skipped ``record_pipeline_timing`` altogether, leaving a
+            # healthy fast queue anchored to its conservative first-run prior.
+            record_pipeline_timing(stage_text, report)
             timing_event = str(report.get("timing_event") or "")
             queue_total = max(
                 0,
@@ -23122,6 +23449,11 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 ],
                 show_progress="hidden",
                 queue=False,
+                # A file row removal emits the same change event as a fresh
+                # picker selection. Coalesce rapid add/remove edits so a
+                # stale inspection chain cannot finish after the newest
+                # selection and leave its pending presentation mounted.
+                trigger_mode="always_last",
             ).then(
                 # A file selection has exactly one direct event owner. The
                 # batch merge must run after the lock/reset boundary, rather

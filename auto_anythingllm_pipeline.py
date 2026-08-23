@@ -907,14 +907,30 @@ def append_jsonl(path: Path, rows):
     )
 
 
-def append_jsonl_receipt(path: Path, row):
-    """Append one small, fsync'd recovery receipt; never retain source text."""
+def append_jsonl_receipts(path: Path, rows, *, durable=True):
+    """Append recovery receipts in one bounded write.
+
+    A durable intent is required before an externally mutating request. A
+    post-success acknowledgement, or a local cache-location selection before
+    the later durable embedding ledger, is safely recoverable from that intent
+    and therefore need not impose one physical flush per page-parent record.
+    """
+    normalized_rows = [row for row in (rows or []) if isinstance(row, dict)]
+    if not normalized_rows:
+        return 0
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        handle.writelines(json.dumps(row, ensure_ascii=False) + "\n" for row in normalized_rows)
         handle.flush()
-        os.fsync(handle.fileno())
+        if durable:
+            os.fsync(handle.fileno())
+    return len(normalized_rows)
+
+
+def append_jsonl_receipt(path: Path, row, *, durable=True):
+    """Append one recovery receipt; fsync only when it guards ambiguity."""
+    return append_jsonl_receipts(path, [row], durable=durable)
 
 
 def write_csv(path: Path, rows, fieldnames=None):
@@ -9763,7 +9779,12 @@ def _page_parent_payload_reuse_key(payload):
     ).hexdigest()
 
 
-def find_reusable_cached_document_locations(storage_dir, payloads, *, folder_names=None):
+def find_reusable_cached_document_locations(
+    storage_dir,
+    payloads,
+    *,
+    folder_names=None,
+):
     """Find exact existing raw-text documents with reusable vector-cache entries.
 
     Automatic runs normally receive new UUID-suffixed raw-document locations
@@ -9825,9 +9846,10 @@ def find_reusable_cached_document_locations(storage_dir, payloads, *, folder_nam
                         separators=(",", ":"),
                     ).encode("utf-8")
                 ).hexdigest()
+                relative_folder = Path(relative).parent.as_posix().casefold()
                 if existing_key in requested_keys:
                     candidates_by_key.setdefault(existing_key, []).append(
-                        (relative, Path(relative).parent.as_posix().casefold())
+                        (relative, relative_folder)
                     )
             except (OSError, TypeError, ValueError, json.JSONDecodeError):
                 continue
@@ -10240,7 +10262,22 @@ def confirmed_submission_locations_from_ledger(ledger):
     return locations
 
 
-def post_multipart_form(url, fields, file_field_name, file_path, api_key=None, timeout=120):
+def post_multipart_form(
+    url,
+    fields,
+    file_field_name,
+    file_path,
+    api_key=None,
+    timeout=120,
+    file_bytes=None,
+):
+    """POST one multipart file without reopening a validated staged file.
+
+    ``file_bytes`` is deliberately optional for legacy callers. The Automatic
+    file transport supplies the exact bytes it has just hashed and checked
+    against its preparation-time digest, so the request cannot silently send a
+    different on-disk revision after validation.
+    """
     boundary = f"----CodexBoundary{int(time.time() * 1000)}"
     body = bytearray()
 
@@ -10259,7 +10296,10 @@ def post_multipart_form(url, fields, file_field_name, file_path, api_key=None, t
 
     mime_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
     filename = Path(file_path).name
-    file_bytes = Path(file_path).read_bytes()
+    if file_bytes is None:
+        file_bytes = Path(file_path).read_bytes()
+    else:
+        file_bytes = bytes(file_bytes)
     body.extend(f"--{boundary}\r\n".encode("utf-8"))
     body.extend(
         (
@@ -12039,13 +12079,20 @@ def upload_plan_rows_to_expected_payloads(upload_rows):
                 "filename": filename,
                 "textContent": text_content,
                 "metadata": {
-                    "title": filename or row.get("title") or "",
-                    "docAuthor": row.get("docAuthor") or "",
-                    "description": " | ".join(
-                        value
-                        for value in [row.get("title") or "", row.get("description") or ""]
-                        if value
-                    ),
+                    # AnythingLLM's multipart file route persists a text-file
+                    # title without its ``.txt`` suffix.  Model that stable
+                    # storage identity here rather than comparing future cache
+                    # candidates with the transient upload filename.
+                    "title": Path(filename).stem or row.get("title") or "",
+                    # Desktop writes an empty multipart author as ``Unknown``.
+                    # Preserve that explicit stored value for a stable cache
+                    # identity; this does not infer an author from the PDF.
+                    "docAuthor": row.get("docAuthor") or "Unknown",
+                    # The multipart request forwards this field unchanged.
+                    # Do not fold the display title into it: doing so creates
+                    # a different persisted identity from the raw document
+                    # Desktop actually writes.
+                    "description": row.get("description") or "",
                     "docSource": row.get("docSource") or "",
                     "chunkSource": row.get("chunkSource") or "",
                 }
@@ -12205,11 +12252,14 @@ def submission_receipt_for_payload(
     }
 
 
-def record_submission_receipt(receipt_path, payload, **kwargs):
+def record_submission_receipt(receipt_path, payload, *, durable=True, receipt_buffer=None, **kwargs):
     if not receipt_path:
         return {}
     receipt = submission_receipt_for_payload(payload, **kwargs)
-    append_jsonl_receipt(Path(receipt_path), receipt)
+    if isinstance(receipt_buffer, list):
+        receipt_buffer.append(receipt)
+    else:
+        append_jsonl_receipt(Path(receipt_path), receipt, durable=durable)
     return receipt
 
 
@@ -14281,15 +14331,20 @@ def maybe_upload_segment_files(
     run_id="",
     record_label="uploaded files",
 ):
+    auth_resolution_started = time.monotonic()
     if not api_url:
         return {"status": "error_missing_api_url", "uploaded": 0, "embedded": 0, "errors": [{"error": "Missing AnythingLLM API URL."}]}
     if not workspace_slug:
         return {"status": "error_missing_workspace", "uploaded": 0, "embedded": 0, "errors": [{"error": "Native metadata upload requires a selected workspace slug."}]}
     api_key, authentication_mode = resolve_anythingllm_api_key(api_url, api_key, storage_dir)
+    auth_resolution_seconds = time.monotonic() - auth_resolution_started
     temporary_key_id = None
     temporary_key_cleanup = {"status": "not_applicable", "error": ""}
+    temporary_key_seconds = 0.0
     if not api_key:
+        temporary_key_started = time.monotonic()
         temporary_key = create_temporary_desktop_api_key(api_url)
+        temporary_key_seconds = time.monotonic() - temporary_key_started
         if temporary_key["status"] != "created":
             return {
                 "status": "error_authentication_required",
@@ -14318,22 +14373,20 @@ def maybe_upload_segment_files(
     locations = []
     reused_cached_locations = []
     attachment_results = []
+    deferred_receipts = []
+    deferred_receipt_write_status = "not_needed"
     embedding_update = {"accepted": 0, "requested": 0, "batch_size": ANYTHINGLLM_EMBEDDING_UPDATE_BATCH_SIZE, "batches": [], "errors": []}
     selected_rows = select_upload_payloads(upload_rows, upload_limit, upload_indices)
-    reusable_payloads = []
-    for row in selected_rows:
-        metadata = {
-            "title": row.get("title") or row.get("filename") or "",
-            "docAuthor": row.get("docAuthor") or "",
-            "description": row.get("description") or "",
-            "docSource": row.get("docSource") or "",
-            "chunkSource": row.get("chunkSource") or "",
-        }
-        try:
-            text_content = Path(row.get("text_file") or "").read_text(encoding="utf-8")
-        except OSError:
-            text_content = ""
-        reusable_payloads.append({"metadata": metadata, "textContent": text_content})
+    payload_materialization_started = time.monotonic()
+    # Build cache identities through the same canonical helper used for the
+    # expected-batch verifier.  Desktop stores the staged filename as the raw
+    # document title, while a plan's human-facing ``title`` can differ.  Using
+    # two constructions made a safe cache hit depend on that presentation-only
+    # distinction.  The helper reuses the validation-time text snapshot, so it
+    # preserves the single-read upload path as well.
+    reusable_payloads = upload_plan_rows_to_expected_payloads(selected_rows)
+    payload_materialization_seconds = time.monotonic() - payload_materialization_started
+    cache_lookup_started = time.monotonic()
     reusable_locations = find_reusable_cached_document_locations(
         storage_dir,
         reusable_payloads,
@@ -14342,12 +14395,17 @@ def maybe_upload_segment_files(
             for row in selected_rows
         ],
     )
+    cache_lookup_seconds = time.monotonic() - cache_lookup_started
     cache_location_lookup_epoch = time.time()
     cache_location_lookup = {
         "cache_location_lookup_epoch": cache_location_lookup_epoch,
         "selected_records": len(selected_rows),
         "reusable_locations": sum(1 for location in reusable_locations if location),
         "fresh_locations": sum(1 for location in reusable_locations if not location),
+        "api_key_resolution_seconds": round(auth_resolution_seconds, 3),
+        "temporary_key_creation_seconds": round(temporary_key_seconds, 3),
+        "prepared_payload_materialization_seconds": round(payload_materialization_seconds, 3),
+        "cache_location_lookup_seconds": round(cache_lookup_seconds, 3),
     }
     if callable(status_callback):
         status_callback(
@@ -14378,21 +14436,36 @@ def maybe_upload_segment_files(
                 break
             metadata = reusable_payload["metadata"]
             receipt_payload = {"metadata": metadata, "textContent": ""}
-            # The file-upload receipt hashes only the prepared file bytes;
-            # unlike raw-text transport it never loads the full text into the
-            # receipt or JSONL evidence stream.
+            # Read the staged file once for transport, hash those exact bytes,
+            # and fail closed if they changed after preparation-time plan
+            # validation. This avoids a redundant pre-request read while
+            # retaining a stronger TOCTOU guard than the former arrangement.
             try:
-                prepared_file_hash = hashlib.sha256(text_file.read_bytes()).hexdigest()
-            except OSError:
-                prepared_file_hash = hashlib.sha256(str(text_file).encode("utf-8")).hexdigest()
-            record_submission_receipt(
-                submission_receipt_path, receipt_payload,
-                run_id=run_id, workspace_slug=workspace_slug, transport="file_upload",
-                state="submitted", correlation_id=correlation_id,
-                prepared_payload_hash=prepared_file_hash,
-                next_check="Reconcile document location, workspace attachment, and targeted vector evidence before any resubmission.",
-            )
+                prepared_file_bytes = text_file.read_bytes()
+            except OSError as exc:
+                attachment.update(status="unreadable_upload_file", error=f"Could not read upload file: {exc}")
+                attachment_results.append(attachment)
+                errors.append({"error": attachment["error"], "segment": row.get("chunkSource", "")})
+                break
+            prepared_file_hash = hashlib.sha256(prepared_file_bytes).hexdigest()
+            validated_hash = str(row.get("_validated_prepared_file_sha256") or "").strip()
+            if validated_hash and prepared_file_hash != validated_hash:
+                attachment.update(
+                    status="prepared_file_changed_after_validation",
+                    error=(
+                        "The staged upload file changed after preparation validation. "
+                        "Nothing was submitted; rerun preparation before upload."
+                    ),
+                )
+                attachment_results.append(attachment)
+                errors.append({"error": attachment["error"], "segment": row.get("chunkSource", "")})
+                break
             if reusable_location:
+                # Selecting an already verified local cache location has not
+                # mutated AnythingLLM. The exact batch locations are durably
+                # recorded by the embedding ledger immediately before its one
+                # update-embeddings request, so this acknowledgement can be
+                # buffered without weakening crash recovery.
                 uploaded += 1
                 locations.append(reusable_location)
                 reused_cached_locations.append(reusable_location)
@@ -14405,6 +14478,7 @@ def maybe_upload_segment_files(
                     location=reusable_location,
                     prepared_payload_hash=prepared_file_hash,
                     next_check="Attach the exact existing document location to the target workspace and verify its page-parent vectors.",
+                    receipt_buffer=deferred_receipts,
                 )
                 if callable(status_callback):
                     status_callback(
@@ -14417,6 +14491,16 @@ def maybe_upload_segment_files(
                         },
                     )
                 continue
+            # A real multipart POST can succeed after its client connection
+            # fails. Persist this exact intent before sending it so recovery
+            # always reconciles rather than blindly replaying the request.
+            record_submission_receipt(
+                submission_receipt_path, receipt_payload,
+                run_id=run_id, workspace_slug=workspace_slug, transport="file_upload",
+                state="submitted", correlation_id=correlation_id,
+                prepared_payload_hash=prepared_file_hash,
+                next_check="Reconcile document location, workspace attachment, and targeted vector evidence before any resubmission.",
+            )
             try:
                 status, response_text = post_multipart_form(
                     endpoint,
@@ -14424,6 +14508,7 @@ def maybe_upload_segment_files(
                     file_field_name="file",
                     file_path=text_file,
                     api_key=api_key,
+                    file_bytes=prepared_file_bytes,
                 )
                 if 200 <= status < 300:
                     uploaded += 1
@@ -14438,6 +14523,10 @@ def maybe_upload_segment_files(
                             "Submit the recorded location to the workspace embedding update."
                             if location else "Read the upload response and reconcile the native document before retrying."
                         ),
+                        # The durable pre-request intent above makes a crash
+                        # here recoverable by reconciliation. Do not force a
+                        # separate physical flush for every ordinary success.
+                        receipt_buffer=deferred_receipts,
                     )
                     if location:
                         if storage_dir:
@@ -14503,6 +14592,22 @@ def maybe_upload_segment_files(
                     next_check="Reconcile document location, workspace attachment, and targeted vector evidence; do not replay this POST automatically.",
                 )
                 break
+
+        if deferred_receipts and submission_receipt_path:
+            try:
+                flushed = append_jsonl_receipts(
+                    Path(submission_receipt_path), deferred_receipts, durable=False
+                )
+                deferred_receipt_write_status = f"buffered_{flushed}_acknowledgements"
+            except OSError as exc:
+                # These records do not protect an ambiguous mutation: cache
+                # selection is local, and successful POSTs retain a durable
+                # pre-request intent. Preserve the upload's actual outcome,
+                # surface the reporting limitation separately, and never turn
+                # a completed exact-vector proof into a false failure.
+                deferred_receipt_write_status = f"acknowledgement_write_failed: {exc}"
+        elif deferred_receipts:
+            deferred_receipt_write_status = "acknowledgements_not_persisted_no_receipt_path"
 
         if errors and uploaded > 0:
             errors.append(
@@ -14587,6 +14692,7 @@ def maybe_upload_segment_files(
         "submission_receipt_path": str(submission_receipt_path or ""),
         "correlation_id": correlation_id,
         "temporary_key_cleanup": temporary_key_cleanup,
+        "deferred_receipt_write_status": deferred_receipt_write_status,
         "errors": errors or ([] if uploaded else [{"error": "No files were uploaded."}]),
     }
 
