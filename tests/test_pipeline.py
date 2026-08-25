@@ -3200,6 +3200,68 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertTrue(pipeline.is_lancedb_safe_namespace("pdf-example-book-example-authors-views-2026"))
         self.assertFalse(pipeline.is_lancedb_safe_namespace("pdf-example-author's-views"))
 
+    def test_manual_workspace_name_uses_the_same_120_character_creation_contract(self):
+        import rag_pdf_gradio_app as app
+
+        requested = "Author's unsafe workspace / " + ("x" * 160)
+        canonical = app.canonical_new_workspace_name(requested)
+
+        self.assertEqual(canonical, pipeline.lancedb_safe_workspace_name(requested))
+        self.assertEqual(len(canonical), pipeline.LANCEDB_WORKSPACE_NAME_LIMIT)
+        self.assertNotIn("'", canonical)
+        self.assertNotIn("/", canonical)
+
+    def test_confirm_canonicalizes_an_edited_workspace_name_before_the_run_is_reserved(self):
+        import rag_pdf_gradio_app as app
+
+        values = app.fresh_automatic_run_setting_values(["C:/tmp/example.pdf"], [])
+        values["mode"] = app.MODE_LOCAL_ONLY_LABEL
+        requested = "Edited Author's Workspace / " + ("z" * 160)
+        ordered = [values[field] for field in app.AUTOMATIC_RUN_FIELDS] + [requested]
+        original_validate = app.validate_pdf_inputs
+        original_estimate = app.estimate_automatic_run
+        try:
+            app.validate_pdf_inputs = lambda _files: (["C:/tmp/example.pdf"], None)
+            app.estimate_automatic_run = lambda *_args, **_kwargs: {
+                "expected_seconds": 12,
+                "source": "test",
+            }
+            settings, report, _warnings, allowed = app.validated_automatic_run_settings(ordered)
+        finally:
+            app.validate_pdf_inputs = original_validate
+            app.estimate_automatic_run = original_estimate
+
+        self.assertIsNone(report)
+        self.assertTrue(allowed)
+        self.assertEqual(settings["new_workspace_name"], pipeline.lancedb_safe_workspace_name(requested))
+        self.assertEqual(len(settings["new_workspace_name"]), pipeline.LANCEDB_WORKSPACE_NAME_LIMIT)
+
+    def test_cache_plan_progress_text_never_reuses_a_prior_sources_counts(self):
+        import rag_pdf_gradio_app as app
+
+        first_snapshot = {
+            "timing_event": "prequeue_cache_snapshot",
+            "queue_records": 11,
+            "prequeue_cached_records": 11,
+            "prequeue_fresh_records": 0,
+        }
+        self.assertEqual(
+            app.current_cache_plan_progress_text("Queue plan ready", first_snapshot),
+            "Queue plan ready — Cache plan: 11 cached / 0 require normal embedding.",
+        )
+
+        later_source_event = {
+            "timing_event": "exact_vector_observation",
+            "queue_records": 410,
+        }
+        self.assertEqual(
+            app.current_cache_plan_progress_text(
+                "410/410 selected records linked and verified",
+                later_source_event,
+            ),
+            "410/410 selected records linked and verified",
+        )
+
     def test_new_workspace_name_collision_uses_a_visible_numeric_suffix(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "anythingllm.db"

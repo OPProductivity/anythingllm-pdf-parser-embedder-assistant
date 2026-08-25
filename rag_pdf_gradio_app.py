@@ -111,6 +111,7 @@ from auto_anythingllm_pipeline import (
     infer_author_from_initial_pdf_pages,
     is_local_anythingllm_url,
     is_lancedb_safe_namespace,
+    LANCEDB_WORKSPACE_NAME_LIMIT,
     lancedb_safe_workspace_name,
     load_upload_plan_rows,
     managed_anythingllm_upload_folder_name,
@@ -4876,7 +4877,7 @@ def refresh_workspaces_with_readiness(api_url, api_key, workspace_slug):
 # This matches the visible-name guard in ``lancedb_safe_workspace_name``.
 # Keep suggestion assembly within that boundary rather than building a longer
 # string and relying on the final safety helper to cut an author in half.
-WORKSPACE_NAME_SOURCE_LABEL_LIMIT = 120
+WORKSPACE_NAME_SOURCE_LABEL_LIMIT = LANCEDB_WORKSPACE_NAME_LIMIT
 WORKSPACE_SOURCE_IDENTITY_CACHE_LIMIT = 96
 WORKSPACE_SOURCE_IDENTITY_CACHE = OrderedDict()
 WORKSPACE_SOURCE_IDENTITY_CACHE_LOCK = threading.Lock()
@@ -5346,6 +5347,12 @@ def suggested_document_workspace_name(document_label, pdf_files):
     return lancedb_safe_workspace_name(document_workspace_name(document_label, pdf_files))
 
 
+def canonical_new_workspace_name(value):
+    """Apply the creation-boundary workspace-name contract without inventing a name."""
+    value = str(value or "").strip()
+    return lancedb_safe_workspace_name(value) if value else ""
+
+
 def workspace_name_auto_state(value=None):
     """Normalize the small browser-local state behind the editable suggestion."""
     if isinstance(value, dict):
@@ -5427,7 +5434,9 @@ def update_new_workspace_name_control(
 
 
 def create_new_document_workspace(api_url, api_key, document_label, pdf_files, workspace_name_override=""):
-    workspace_name = str(workspace_name_override or "").strip() or document_workspace_name(document_label, pdf_files)
+    workspace_name = canonical_new_workspace_name(workspace_name_override) or suggested_document_workspace_name(
+        document_label, pdf_files
+    )
     if not workspace_name:
         return {
             "status": "missing_document_name",
@@ -5485,7 +5494,9 @@ def create_new_document_workspace(api_url, api_key, document_label, pdf_files, w
 
 
 def create_document_workspace_for_upload(api_url, api_key, document_label, pdf_files, workspace_name_override=""):
-    workspace_name = str(workspace_name_override or "").strip() or document_workspace_name(document_label, pdf_files)
+    workspace_name = canonical_new_workspace_name(workspace_name_override) or suggested_document_workspace_name(
+        document_label, pdf_files
+    )
     result = create_new_document_workspace(api_url, api_key, document_label, pdf_files, workspace_name_override)
     if result.get("status") != "created" or not result.get("workspace_slug"):
         return (
@@ -15996,6 +16007,44 @@ def confirmed_prequeue_cache_eta_seconds(
     return int(math.ceil(min(current, max(elapsed + 8.0, candidate))))
 
 
+def current_cache_plan_progress_text(stage_text, report):
+    """Append only the cache plan proved by this exact progress event.
+
+    The ETA keeps the first exact pre-queue snapshot as batch-level timing
+    context.  That snapshot must never be reused as per-source UI text: later
+    source windows can have entirely different record counts.
+    """
+    stage_text = str(stage_text or "")
+    report = report if isinstance(report, dict) else {}
+    if (
+        str(report.get("timing_event") or "") != "prequeue_cache_snapshot"
+        or "cache" in stage_text.casefold()
+    ):
+        return stage_text
+    queue_records = max(0, int(report.get("queue_records") or 0))
+    if not queue_records:
+        return stage_text
+    cached_records = min(
+        queue_records,
+        max(0, int(report.get("prequeue_cached_records") or 0)),
+    )
+    fresh_records = min(
+        queue_records - cached_records,
+        max(
+            0,
+            int(
+                report.get("prequeue_fresh_records")
+                if report.get("prequeue_fresh_records") is not None
+                else queue_records - cached_records
+            ),
+        ),
+    )
+    return (
+        f"{stage_text} — Cache plan: {cached_records} cached / "
+        f"{fresh_records} require normal embedding."
+    )
+
+
 def timing_model_similarity(features, historical):
     score = 0.0
     for key, weight in (("timing_formula_lane", 7), ("mode", 5), ("segment_mode", 4), ("custom_page_group_sizes", 3), ("page_preserve_text_lane", 3), ("native_upload_scope", 3), ("native_upload_transport", 2), ("native_upload_representation", 3), ("chunk_size", 3), ("chunk_overlap", 2), ("effective_segment_target", 3), ("target_passage_length", 1), ("backend_mode", 1), ("unstructured_strategy", 2), ("embedding_engine", 3), ("embedding_model", 4), ("text_density_bucket", 2), ("layout_bucket", 2), ("ocr_risk_bucket", 2), ("line_density_bucket", 1), ("page_variability_bucket", 1), ("file_size_bucket", 1)):
@@ -17841,11 +17890,12 @@ def validated_automatic_run_settings(values):
     """
     core_values = tuple(values[: len(AUTOMATIC_RUN_FIELDS)])
     settings = dict(zip(AUTOMATIC_RUN_FIELDS, core_values, strict=True))
-    settings["new_workspace_name"] = (
+    requested_workspace_name = (
         str(values[len(AUTOMATIC_RUN_FIELDS)] or "").strip()
         if len(values) > len(AUTOMATIC_RUN_FIELDS)
         else ""
     )
+    settings["new_workspace_name"] = canonical_new_workspace_name(requested_workspace_name)
     folder_inspection = inspect_uploaded_pdf_candidates(settings["folder_pdf_files"])
     files, validation_report = validate_pdf_inputs(
         unique_local_path_strings(normalize_file_list(settings["pdf_files"]) + folder_inspection["pdf_candidates"])
@@ -23589,19 +23639,10 @@ def run_automatic(
                     f"{reconciled_count} partially indexed PDF(s); {len(report.get('remaining_documents') or []) if isinstance(report.get('remaining_documents'), list) else max(0, int(report.get('remaining_documents') or 0))} PDF(s) / "
                     f"{remaining_records} page record(s) remain for submission"
                 )
-            # The native queue event already names cached reuse when it is
-            # actually attaching one. Repeat the compact plan only for the
-            # surrounding receipt and verification messages, where it adds
-            # context instead of making every live line longer.
-            if (
-                cache_plan_context.get("exact_snapshot_observed")
-                and "cache" not in stage_text.casefold()
-            ):
-                stage_text = (
-                    f"{stage_text} — Cache plan: "
-                    f"{int(cache_plan_context['cached_records'])} cached / "
-                    f"{int(cache_plan_context['fresh_records'])} require normal embedding."
-                )
+            # Keep the first exact cache snapshot as ETA evidence, but render
+            # only counts owned by the current event. Reusing the first
+            # source's plan here made every later source display its counts.
+            stage_text = current_cache_plan_progress_text(stage_text, report)
             update_live_automatic_run_status(
                 run_root,
                 state="running",
@@ -24659,8 +24700,9 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                             placeholder="Choose a PDF to derive a safe name, or type your own",
                             lines=1,
                             max_lines=1,
+                            max_length=LANCEDB_WORKSPACE_NAME_LIMIT,
                             visible=True,
-                            info="Used only for New workspace for this document. Unsafe characters are normalized; an existing name becomes Name 2, Name 3, and so on.",
+                            info="120 characters maximum. Unsafe characters are normalized; duplicates become Name 2, Name 3, and so on.",
                         )
                         new_workspace_name_auto_state = gr.State({})
                         with gr.Accordion("Workspace query status", open=False, elem_classes=["native-upload-subaccordion"]):

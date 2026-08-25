@@ -209,6 +209,18 @@ def test_pdf_picker_exposes_only_the_native_pdf_accept_filter(page, local_app_ur
     assert chooser_info.value.is_multiple
 
 
+def test_new_workspace_name_field_enforces_the_creation_length_limit(page, local_app_url):
+    page.goto(local_app_url)
+    workspace_name = page.get_by_placeholder(
+        "Choose a PDF to derive a safe name, or type your own",
+        exact=True,
+    )
+
+    expect(workspace_name).to_have_attribute("maxlength", "120")
+    workspace_name.press_sequentially("W" * 125)
+    expect(workspace_name).to_have_value("W" * 120)
+
+
 def test_selecting_a_pdf_resets_a_prior_local_only_choice_to_the_new_run_defaults(
     page, local_app_url, one_page_pdf
 ):

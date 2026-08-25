@@ -12865,6 +12865,7 @@ ANYTHINGLLM_EMBEDDING_VERIFICATION_CHECKPOINT_INTERVAL = 10
 # on AnythingLLM's display-name slugifier: it has allowed apostrophes through,
 # while LanceDB rejects them after documents have already been queued.
 LANCEDB_NAMESPACE_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
+LANCEDB_WORKSPACE_NAME_LIMIT = 120
 
 
 def lancedb_safe_workspace_name(value, fallback="PDF workspace"):
@@ -12877,7 +12878,7 @@ def lancedb_safe_workspace_name(value, fallback="PDF workspace"):
     ascii_value = ascii_value.replace("'", "")
     safe = re.sub(r"[^A-Za-z0-9._ -]+", " ", ascii_value)
     safe = re.sub(r"\s+", " ", safe).strip(" .-")
-    return safe[:120] or fallback
+    return safe[:LANCEDB_WORKSPACE_NAME_LIMIT] or fallback
 
 
 def is_lancedb_safe_namespace(value):
