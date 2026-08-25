@@ -26,7 +26,11 @@ from typing import Iterable
 # not conflate it with the much smaller read-only storage contract.  In
 # particular, a new Desktop version may retain all of the tables required for
 # inspection while its settings-write behavior remains unqualified.
+# Legacy releases have the earlier version-only observed mutation profile.
+# Desktop 1.16 is deliberately separate: it is qualified only when the exact
+# official app.asar fingerprint and the current settings schema both match.
 PROFILE_ID = "anythingllm-desktop-1.14.2-through-1.15.0-r2-observed-profile-2"
+V116_PROFILE_ID = "anythingllm-desktop-1.16.0-fingerprinted-settings-profile-1"
 OBSERVED_COMPATIBLE_DESKTOP_VERSIONS = ("1.14.2", "1.15.0-r2")
 OBSERVED_CANDIDATE_DESKTOP_VERSIONS = ("1.16.0",)
 OBSERVED_CANDIDATE_PACKAGE_FINGERPRINTS = {
@@ -245,10 +249,10 @@ def _normalized_desktop_version(version: str) -> str:
 def _desktop_release_status(version: str, package_sha256: str = "") -> tuple[str, str]:
     """Classify the release without upgrading a capability by implication.
 
-    ``observed_candidate`` means that a release has an end-to-end evidence
-    record for a narrow native upload contract, but not yet the broader
-    guarded-settings mutation contract.  It is intentionally distinct from a
-    recognized mutation profile.
+    A 1.16 release is eligible for guarded-settings writes only when its exact
+    package fingerprint matches the observed official build.  A version label
+    alone remains a read-only candidate because Electron applications can be
+    locally repackaged without changing that label.
     """
     if version in OBSERVED_COMPATIBLE_DESKTOP_VERSIONS:
         return "recognized_mutation_profile", PROFILE_ID
@@ -258,7 +262,7 @@ def _desktop_release_status(version: str, package_sha256: str = "") -> tuple[str
             return "candidate_version_requires_package_fingerprint", ""
         if package_sha256 != expected_fingerprint:
             return "unprofiled_package_fingerprint", ""
-        return "observed_candidate", "anythingllm-desktop-1.16.0-observed-candidate-1"
+        return "recognized_mutation_profile", V116_PROFILE_ID
     if version:
         return "unprofiled", ""
     return "unidentified", ""
@@ -434,7 +438,7 @@ def characterize(
         and env_path.exists()
         and desktop_release_status == "recognized_mutation_profile"
     )
-    profile = PROFILE_ID if mutation_profile_match else ""
+    profile = desktop_candidate_profile if mutation_profile_match else ""
 
     env_evidence = [_evidence("filesystem", ".env", "present")] if env_path.exists() else []
     db_evidence = [_evidence("filesystem", "anythingllm.db", "present"), *schema_evidence] if db_path.exists() else []

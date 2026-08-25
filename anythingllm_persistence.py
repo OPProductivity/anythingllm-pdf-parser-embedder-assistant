@@ -7,6 +7,7 @@ import os
 import re
 import sqlite3
 import tempfile
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +18,10 @@ from anythingllm_compatibility import characterize
 ENV_SECRET_MARKERS = ("KEY", "SECRET", "TOKEN", "PASSWORD")
 SQLITE_SETTINGS = {"text_splitter_chunk_size", "text_splitter_chunk_overlap"}
 ENVIRONMENT_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# The Gradio settings controls may invoke independent callbacks at nearly the
+# same time.  Keep the whole read/replace/verify sequence serial, rather than
+# merely making the final replacement atomic.
+PERSISTENCE_WRITE_LOCK = threading.RLock()
 
 
 def _now():
@@ -104,7 +109,10 @@ class AnythingLLMPersistenceAdapter:
         self.storage = Path(storage_dir)
         self.run_id = str(run_id)
         self.snapshot_dir = Path(snapshot_dir)
-        self.compatibility = characterize(self.storage)
+        # A settings write is rare and operator-requested, so it may afford
+        # the package fingerprint needed to qualify Desktop 1.16. Ordinary
+        # read-only status rendering stays fast and does not hash app.asar.
+        self.compatibility = characterize(self.storage, include_package_fingerprint=True)
 
     def _require(self, capability):
         state = self.compatibility["capabilities"][capability]
@@ -145,38 +153,90 @@ class AnythingLLMPersistenceAdapter:
         return path
 
     def write_env_setting(self, key, value, reason="operator_requested_change"):
+        result = self.write_env_settings({key: value}, reason=reason)
+        return {
+            **result,
+            "key": next(iter(result["values"])),
+            "restart_likely_required": True,
+        }
+
+    def write_env_settings(self, values, reason="operator_requested_change"):
+        """Atomically write one related .env group under the qualified profile.
+
+        A related engine/model change must never leave the Desktop with only
+        half its preference keys changed.  One redacted snapshot therefore
+        covers the complete group before its single durable replacement.
+        """
+        updates = [_validated_environment_assignment(key, value) for key, value in dict(values or {}).items()]
+        if not updates:
+            raise ValueError("At least one environment setting is required.")
         self._require("can_write_env_settings")
-        key, value = _validated_environment_assignment(key, value)
-        snapshot = self.snapshot(env_keys=[key], reason=reason)
         path = self.storage / ".env"
-        original = _read_env_lines(path)
-        replacement = _environment_assignment_line(key, value)
-        pattern = re.compile(rf"^\s*{re.escape(key)}\s*=.*$", re.MULTILINE)
-        updated = pattern.sub(lambda _match: replacement, original, count=1) if pattern.search(original) else original.rstrip() + "\n" + replacement + "\n"
-        _atomic_write_text(path, updated)
-        if _env_value(_read_env_lines(path), key) != value:
-            raise RuntimeError(f"Write verification failed for {key}")
-        return {"status": "verified", "snapshot": str(snapshot), "key": key, "restart_likely_required": True}
+        if not path.is_file():
+            raise FileNotFoundError(f"AnythingLLM .env was not found at {path}")
+        with PERSISTENCE_WRITE_LOCK:
+            snapshot = self.snapshot(env_keys=[key for key, _value in updates], reason=reason)
+            original = _read_env_lines(path)
+            updated = original
+            for key, value in updates:
+                replacement = _environment_assignment_line(key, value)
+                pattern = re.compile(rf"^\s*{re.escape(key)}\s*=.*$", re.MULTILINE)
+                updated = (
+                    pattern.sub(lambda _match: replacement, updated, count=1)
+                    if pattern.search(updated)
+                    else updated.rstrip() + "\n" + replacement + "\n"
+                )
+            _atomic_write_text(path, updated)
+            persisted = _read_env_lines(path)
+            for key, value in updates:
+                if _env_value(persisted, key) != value:
+                    raise RuntimeError(f"Write verification failed for {key}")
+        return {
+            "status": "verified",
+            "snapshot": str(snapshot),
+            "values": {key: value for key, value in updates},
+            "restart_likely_required": True,
+        }
 
     def write_sqlite_setting(self, label, value, reason="operator_requested_change"):
-        if label not in SQLITE_SETTINGS:
-            raise ValueError(f"Unsupported guarded SQLite setting: {label}")
+        result = self.write_sqlite_settings({label: value}, reason=reason)
+        normalized_label = next(iter(result["values"]))
+        return {
+            **result,
+            "label": normalized_label,
+            "value": result["values"][normalized_label],
+        }
+
+    def write_sqlite_settings(self, values, reason="operator_requested_change"):
+        """Commit a guarded group of SQLite settings as one verified transaction."""
+        updates = {str(label): str(value) for label, value in dict(values or {}).items()}
+        if not updates:
+            raise ValueError("At least one SQLite setting is required.")
+        unsupported = sorted(set(updates) - SQLITE_SETTINGS)
+        if unsupported:
+            raise ValueError(f"Unsupported guarded SQLite setting: {', '.join(unsupported)}")
         self._require("can_write_sqlite_settings")
-        snapshot = self.snapshot(sqlite_labels=[label], reason=reason)
-        con = sqlite3.connect(self.storage / "anythingllm.db", timeout=1.0)
-        try:
-            row = con.execute("select value from system_settings where label=?", (label,)).fetchone()
-            if row:
-                con.execute("update system_settings set value=? where label=?", (str(value), label))
-            else:
-                con.execute("insert into system_settings(label,value) values(?,?)", (label, str(value)))
-            con.commit()
-            verified = con.execute("select value from system_settings where label=?", (label,)).fetchone()
-        finally:
-            con.close()
-        if not verified or verified[0] != str(value):
-            raise RuntimeError(f"Write verification failed for {label}")
-        return {"status": "verified", "snapshot": str(snapshot), "label": label, "value": str(value)}
+        db_path = self.storage / "anythingllm.db"
+        if not db_path.is_file():
+            raise FileNotFoundError(f"AnythingLLM SQLite database was not found at {db_path}")
+        with PERSISTENCE_WRITE_LOCK:
+            snapshot = self.snapshot(sqlite_labels=updates.keys(), reason=reason)
+            con = sqlite3.connect(db_path, timeout=5.0)
+            try:
+                with con:
+                    for label, value in updates.items():
+                        row = con.execute("select value from system_settings where label=?", (label,)).fetchone()
+                        if row:
+                            con.execute("update system_settings set value=? where label=?", (value, label))
+                        else:
+                            con.execute("insert into system_settings(label,value) values(?,?)", (label, value))
+                for label, value in updates.items():
+                    verified = con.execute("select value from system_settings where label=?", (label,)).fetchone()
+                    if not verified or verified[0] != value:
+                        raise RuntimeError(f"Write verification failed for {label}")
+            finally:
+                con.close()
+        return {"status": "verified", "snapshot": str(snapshot), "values": updates}
 
     def restore(self, snapshot_path):
         self._require("can_restore_snapshotted_settings")

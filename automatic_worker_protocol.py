@@ -53,6 +53,8 @@ AUTOMATIC_WORKER_ARGUMENT_FIELDS = frozenset({
     "ocr_preflight_hint",
     "ollama_model",
     "ollama_url",
+    "precomputed_source_fingerprint",
+    "precomputed_source_sha256",
     "prepare_and_upload",
     "run_vector_eval",
     "segment_mode",

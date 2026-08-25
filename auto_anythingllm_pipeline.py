@@ -45,6 +45,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from portable_paths import application_paths
+from anythingllm_persistence import AnythingLLMPersistenceAdapter
 from typing import Any, cast
 
 import fitz
@@ -5880,7 +5881,6 @@ def is_unstructured_runtime_failure(error):
     return any(token in text for token in (
         "tesseract", "unstructured pdf support is not available",
         "unstructured-inference", "onnxruntime", "detectron2", "no module named",
-        "unstructured ocr timed out",
     ))
 
 
@@ -8999,45 +8999,28 @@ def provider_model_key_for_engine(engine: str):
     return "EMBEDDING_MODEL_PREF"
 
 
-ENVIRONMENT_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-# The settings UI can invoke two callbacks in parallel. Atomic replacement
-# alone cannot protect their read-modify-write transaction from a lost update.
-ANYTHINGLLM_ENV_WRITE_LOCK = threading.RLock()
+def _guarded_anythingllm_persistence_adapter(storage_dir: Path, *, reason: str):
+    """Return the sole supported mutation path for Desktop settings.
 
-
-def _validated_environment_value(key: str, value) -> tuple[str, str]:
-    normalized_key = str(key or "").strip()
-    normalized_value = str(value)
-    if not ENVIRONMENT_KEY_PATTERN.fullmatch(normalized_key):
-        raise ValueError(f"Unsupported environment setting name: {key!r}")
-    if "\r" in normalized_value or "\n" in normalized_value:
-        raise ValueError("Environment setting values must be single-line.")
-    return normalized_key, normalized_value
+    Read-only inspection deliberately supports a wider range of local
+    installations.  A mutation is different: it must be qualified against an
+    exact Desktop profile and leave a redacted restoration point outside the
+    user's output folders.
+    """
+    safe_reason = re.sub(r"[^a-z0-9-]+", "-", str(reason or "manual-settings").casefold()).strip("-")
+    run_id = f"{safe_reason or 'manual-settings'}-{uuid.uuid4().hex[:12]}"
+    snapshot_dir = application_paths()["config"] / "anythingllm-settings-recovery"
+    return AnythingLLMPersistenceAdapter(Path(storage_dir), run_id, snapshot_dir)
 
 
 def write_anythingllm_env_values(storage_dir: Path, values: dict[str, object]):
-    """Atomically update and verify one related group of AnythingLLM .env values."""
-    env_path = Path(storage_dir) / ".env"
-    updates = [_validated_environment_value(key, value) for key, value in values.items()]
-    with ANYTHINGLLM_ENV_WRITE_LOCK:
-        if not env_path.exists():
-            raise FileNotFoundError(f"AnythingLLM .env was not found at {env_path}")
-        original = env_path.read_text(encoding="utf-8", errors="replace")
-        updated = original
-        for key, value in updates:
-            pattern = re.compile(rf"^\s*{re.escape(key)}\s*=.*$", re.MULTILINE)
-            replacement = f"{key}={json.dumps(value, ensure_ascii=False)}"
-            if pattern.search(updated):
-                updated = pattern.sub(lambda _match: replacement, updated, count=1)
-            else:
-                newline = "" if not updated or updated.endswith("\n") else "\n"
-                updated = updated + newline + replacement + "\n"
-        atomic_write_text(env_path, updated)
-        persisted = read_env_file_values(env_path)
-        for key, value in updates:
-            if persisted.get(key) != value:
-                raise RuntimeError(f"Write verification failed for {key}")
-    return env_path
+    """Atomically update guarded .env settings through the qualified adapter."""
+    storage = Path(storage_dir)
+    _guarded_anythingllm_persistence_adapter(storage, reason="pipeline-env-settings").write_env_settings(
+        values,
+        reason="pipeline_env_settings",
+    )
+    return storage / ".env"
 
 
 def write_anythingllm_env_value(storage_dir: Path, key: str, value):
@@ -9045,27 +9028,13 @@ def write_anythingllm_env_value(storage_dir: Path, key: str, value):
 
 
 def write_anythingllm_sqlite_settings(storage_dir: Path, values: dict[str, object]):
-    """Commit a related group of system settings as one verified transaction."""
-    db_path = Path(storage_dir) / "anythingllm.db"
-    if not db_path.exists():
-        raise FileNotFoundError(f"AnythingLLM SQLite database was not found at {db_path}")
-    updates = [(str(label), str(value)) for label, value in values.items()]
-    con = sqlite3.connect(db_path, timeout=5.0)
-    try:
-        with con:
-            for label, value in updates:
-                existing = con.execute("select value from system_settings where label = ?", (label,)).fetchone()
-                if existing:
-                    con.execute("update system_settings set value = ? where label = ?", (value, label))
-                else:
-                    con.execute("insert into system_settings(label, value) values (?, ?)", (label, value))
-        for label, value in updates:
-            verified = con.execute("select value from system_settings where label = ?", (label,)).fetchone()
-            if not verified or verified[0] != value:
-                raise RuntimeError(f"Write verification failed for {label}")
-    finally:
-        con.close()
-    return db_path
+    """Commit guarded system settings through the qualified adapter."""
+    storage = Path(storage_dir)
+    _guarded_anythingllm_persistence_adapter(storage, reason="pipeline-sqlite-settings").write_sqlite_settings(
+        values,
+        reason="pipeline_sqlite_settings",
+    )
+    return storage / "anythingllm.db"
 
 
 def write_anythingllm_sqlite_setting(storage_dir: Path, label: str, value):
@@ -9820,14 +9789,57 @@ def find_reusable_cached_document_locations(
         if not custom_documents.is_dir() or not custom_documents.is_relative_to(documents_root):
             return reusable
         requested_keys = {_page_parent_payload_reuse_key(payload) for payload in rows}
+        # Cache reuse needs an exact content-and-provenance match, but the
+        # former implementation eagerly parsed every custom-document JSON
+        # file before it could reject most of them.  On established Desktop
+        # stores that can mean thousands of unrelated files and a multi-minute
+        # pre-submit pause on a cold Windows file cache.  The vector-cache
+        # filenames are UUID-v5 values of the queued relative locations, so
+        # use their names as a cheap first filter.  A page-parent ``chunkSource``
+        # is then a stable, source-specific second filter.  We still parse and
+        # hash every candidate that reaches the final comparison, so neither
+        # filter itself is treated as evidence that reuse is safe.
+        expected_chunk_sources = {
+            str((payload.get("metadata") or {}).get("chunkSource") or "").strip()
+            for payload in rows
+            if isinstance(payload, dict)
+        }
+        expected_chunk_source_tokens = {
+            value.encode("utf-8") for value in expected_chunk_sources if value
+        }
+        cache_dir = storage / "vector-cache"
+        cache_entry_names = {
+            path.stem for path in cache_dir.glob("*.json") if path.is_file()
+        }
+        if not cache_entry_names:
+            return reusable
+        allowed_folders = set(expected_folders or []) if expected_folders is not None else None
         candidates_by_key = {}
         for candidate in custom_documents.rglob("*.json"):
             try:
-                resolved = candidate.resolve()
-                relative = resolved.relative_to(documents_root).as_posix()
-                if not _anythingllm_vector_cache_hit(storage, relative):
+                # The search root is already under ``documents_root``.  Do not
+                # resolve every normal local file: Windows path resolution was
+                # the dominant cold-cache cost in this read-only lookup.  A
+                # symlink is skipped rather than followed, preserving the
+                # original root-containment safety property.
+                if candidate.is_symlink():
                     continue
-                raw = json.loads(resolved.read_text(encoding="utf-8"))
+                relative = candidate.relative_to(documents_root).as_posix()
+                relative_folder = Path(relative).parent.as_posix().casefold()
+                if allowed_folders is not None and relative_folder not in allowed_folders:
+                    continue
+                if str(uuid.uuid5(uuid.NAMESPACE_URL, relative)) not in cache_entry_names:
+                    continue
+                raw_bytes = candidate.read_bytes()
+                # ``chunkSource`` is part of the final hash below.  Checking
+                # for its stable value first avoids JSON decoding unrelated
+                # cached records; a coincidental text match only causes an
+                # extra exact comparison, never a false cache reuse.
+                if expected_chunk_source_tokens and not any(
+                    token in raw_bytes for token in expected_chunk_source_tokens
+                ):
+                    continue
+                raw = json.loads(raw_bytes)
                 if not isinstance(raw, dict):
                     continue
                 raw_document = dict(raw)
@@ -9846,7 +9858,6 @@ def find_reusable_cached_document_locations(
                         separators=(",", ":"),
                     ).encode("utf-8")
                 ).hexdigest()
-                relative_folder = Path(relative).parent.as_posix().casefold()
                 if existing_key in requested_keys:
                     candidates_by_key.setdefault(existing_key, []).append(
                         (relative, relative_folder)
@@ -9866,6 +9877,109 @@ def find_reusable_cached_document_locations(
     except (OSError, TypeError, ValueError):
         return reusable
     return reusable
+
+
+def find_exact_staged_document_candidates(storage_dir, payload, *, excluded_locations=None):
+    """Find exact raw documents without requiring a vector-cache entry.
+
+    This read-only path is intentionally reserved for ambiguous attachment
+    receipts. A newly staged document has not been queued yet and therefore
+    often has no vector-cache file. Exact text plus all citation/provenance
+    fields are required; zero or multiple candidates remain ambiguous.
+    """
+    if not storage_dir or not isinstance(payload, dict):
+        return []
+    excluded = {
+        _normalized_anythingllm_document_location(location)
+        for location in (excluded_locations or [])
+        if str(location or "").strip()
+    }
+    expected_key = _page_parent_payload_reuse_key(payload)
+    expected_chunk_source = str((payload.get("metadata") or {}).get("chunkSource") or "").strip()
+    chunk_token = expected_chunk_source.encode("utf-8") if expected_chunk_source else b""
+    try:
+        documents_root = (Path(storage_dir) / "documents").resolve()
+        custom_documents = (documents_root / "custom-documents").resolve()
+        if not custom_documents.is_dir() or not custom_documents.is_relative_to(documents_root):
+            return []
+        matches = []
+        for candidate in custom_documents.rglob("*.json"):
+            try:
+                if candidate.is_symlink():
+                    continue
+                relative = candidate.relative_to(documents_root).as_posix()
+                if _normalized_anythingllm_document_location(relative) in excluded:
+                    continue
+                raw_bytes = candidate.read_bytes()
+                if chunk_token and chunk_token not in raw_bytes:
+                    continue
+                raw = json.loads(raw_bytes)
+                if not isinstance(raw, dict):
+                    continue
+                existing_payload = {
+                    "textContent": str(raw.get("pageContent") or ""),
+                    "metadata": {
+                        "title": str(raw.get("title") or ""),
+                        "docAuthor": str(raw.get("docAuthor") or ""),
+                        "description": str(raw.get("description") or ""),
+                        "docSource": str(raw.get("docSource") or ""),
+                        "chunkSource": str(raw.get("chunkSource") or ""),
+                    },
+                }
+                if _page_parent_payload_reuse_key(existing_payload) == expected_key:
+                    matches.append(relative)
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+        return sorted(set(matches))
+    except (OSError, TypeError, ValueError):
+        return []
+
+
+def snapshot_staged_document_locations(storage_dir):
+    """Take a cheap path-only snapshot before any attachment mutation."""
+    if not storage_dir:
+        return []
+    try:
+        documents_root = (Path(storage_dir) / "documents").resolve()
+        custom_documents = (documents_root / "custom-documents").resolve()
+        if not custom_documents.is_dir() or not custom_documents.is_relative_to(documents_root):
+            return []
+        return sorted(
+            candidate.relative_to(documents_root).as_posix()
+            for candidate in custom_documents.rglob("*.json")
+            if not candidate.is_symlink()
+        )
+    except (OSError, TypeError, ValueError):
+        return []
+
+
+def reconcile_ambiguous_attachment_location(
+    storage_dir,
+    payload,
+    *,
+    excluded_locations=None,
+    attempts=5,
+    poll_seconds=0.20,
+):
+    """Return one exact new location or a durable non-guessing outcome."""
+    evidence = {"status": "not_found", "candidates": [], "attempts": 0}
+    for attempt in range(1, max(1, int(attempts or 1)) + 1):
+        candidates = find_exact_staged_document_candidates(
+            storage_dir,
+            payload,
+            excluded_locations=excluded_locations,
+        )
+        evidence = {
+            "status": "exact_location_recovered" if len(candidates) == 1 else (
+                "multiple_exact_candidates" if len(candidates) > 1 else "not_found"
+            ),
+            "candidates": candidates,
+            "attempts": attempt,
+        }
+        if candidates or attempt >= max(1, int(attempts or 1)):
+            return evidence
+        time.sleep(max(0.0, float(poll_seconds or 0.0)))
+    return evidence
 
 
 def parse_anythingllm_embed_progress_event(payload):
@@ -10909,6 +11023,98 @@ def describe_api_exception(exc, service_name):
         return f"{service} network error: {reason}."
     message = re.sub(r"Bearer\s+[A-Za-z0-9._\-]+", "Bearer [redacted]", str(exc))
     return f"{service} request failed: {message[:400]}"
+
+
+def _read_http_error_body(exc):
+    """Consume an HTTPError body once and return a bounded, secret-safe value."""
+    if not isinstance(exc, urllib.error.HTTPError):
+        return ""
+    try:
+        body = exc.read().decode("utf-8", errors="replace")
+    except Exception:
+        body = ""
+    finally:
+        try:
+            exc.close()
+        except Exception:
+            pass
+    return re.sub(r"Bearer\s+[A-Za-z0-9._\-]+", "Bearer [redacted]", body)[:2000]
+
+
+def classify_anythingllm_mutation_outcome(*, stage, status=None, response_text="", exception=None):
+    """Classify whether a failed write can safely release the next PDF.
+
+    The category is deliberately about mutation certainty, not merely HTTP
+    success.  Only an explicit client-side refusal proves that the current
+    PDF was not admitted and can therefore release the following source
+    transaction. Authentication/workspace failures apply to the run, while a
+    timeout, connection loss, or server error can hide a completed mutation
+    and must hold the lane for reconciliation.
+    """
+    normalized_stage = str(stage or "mutation").strip() or "mutation"
+    body = str(response_text or "")
+    if isinstance(exception, urllib.error.HTTPError):
+        status = int(getattr(exception, "code", 0) or 0)
+        body = _read_http_error_body(exception)
+    elif exception is not None:
+        return {
+            "category": "ambiguous_external_mutation",
+            "classification": "client_transport_submission_unknown",
+            "scope": "current_mutation_lane",
+            "may_continue_later_sources": False,
+            "http_status": None,
+            "response": "",
+            "error": describe_api_exception(exception, "AnythingLLM"),
+            "stage": normalized_stage,
+        }
+    try:
+        code = int(status or 0)
+    except (TypeError, ValueError):
+        code = 0
+    if 200 <= code < 300:
+        category = "accepted"
+        classification = "http_acceptance"
+        scope = "current_source"
+        may_continue = True
+    elif code in {413, 415, 422}:
+        category = "explicit_source_rejection"
+        classification = "http_source_validation_rejected"
+        scope = "current_source"
+        may_continue = True
+    elif code in {401, 403, 404}:
+        category = "global_configuration_rejection"
+        classification = "http_run_configuration_rejected"
+        scope = "remaining_run"
+        may_continue = False
+    elif code == 429:
+        category = "temporary_global_hold"
+        classification = "http_rate_limited"
+        scope = "remaining_run"
+        may_continue = False
+    elif code:
+        category = "ambiguous_external_mutation"
+        classification = (
+            "http_rejection_semantics_unverified"
+            if code in {400, 409}
+            else "http_server_submission_unknown"
+        )
+        scope = "current_mutation_lane"
+        may_continue = False
+    else:
+        category = "ambiguous_external_mutation"
+        classification = "client_transport_submission_unknown"
+        scope = "current_mutation_lane"
+        may_continue = False
+    return {
+        "category": category,
+        "classification": classification,
+        "scope": scope,
+        "may_continue_later_sources": may_continue,
+        "http_status": code or None,
+        "response": body[:2000],
+        "error": (f"AnythingLLM returned HTTP {code}." if code else "AnythingLLM write outcome is unknown."),
+        "stage": normalized_stage,
+    }
 
 
 def verify_anythingllm_upload_auth(api_url, api_key=None):
@@ -12368,11 +12574,10 @@ ANYTHINGLLM_DESKTOP_QUEUE_RECEIPT_TIMEOUT_SECONDS = 20.0
 # reconciler enough time to observe slow sequential provider work, while still
 # retaining a finite circuit-breaker boundary.
 ANYTHINGLLM_EMBEDDING_RECONCILIATION_TIMEOUT_SECONDS = 480.0
-# The first reconciliation window is finite, but a locally owned Desktop queue
-# that is still proving forward progress must not be declared failed merely
-# because its provider is slower than the original observation estimate. Every
-# extension is evidence-backed and the whole run stays bounded by this cap.
-ANYTHINGLLM_EMBEDDING_RECONCILIATION_ACTIVE_CAP_SECONDS = 3600.0
+# The initial reconciliation window is finite. It is not a failure ceiling for
+# a locally owned queue that is still advancing: a moving queue is observed
+# until it completes or stalls. The stall interval below remains the safety
+# boundary for an unobservable or stopped queue.
 ANYTHINGLLM_EMBEDDING_RECONCILIATION_PROGRESS_GRACE_SECONDS = 90.0
 ANYTHINGLLM_EMBEDDING_RECONCILIATION_STALL_SECONDS = 90.0
 # A connected, owned Desktop queue is the primary source of truth while it is
@@ -12380,6 +12585,11 @@ ANYTHINGLLM_EMBEDDING_RECONCILIATION_STALL_SECONDS = 90.0
 # needless reader pressure.  Inspect on a new owned queue position, with this
 # sparse safety cadence to retain vector evidence if an event is delayed.
 ANYTHINGLLM_HEALTHY_QUEUE_STORAGE_OBSERVATION_INTERVAL_SECONDS = 20.0
+# Keep the durable ledger useful for recovery without making every historical
+# Desktop SSE event part of an ever-growing JSON document rewritten after each
+# source window. The count preserves audit scale; the tail preserves the most
+# recent diagnostic context.
+ANYTHINGLLM_EMBEDDING_RUNTIME_EVENT_TAIL_LIMIT = 96
 
 
 def healthy_owned_desktop_queue(queue, expected_records=0, *, poll_interval_seconds=2.0):
@@ -12401,6 +12611,60 @@ def healthy_owned_desktop_queue(queue, expected_records=0, *, poll_interval_seco
         and event_age is not None
         and event_age <= max(15.0, float(poll_interval_seconds or 2.0) * 3.0)
     )
+
+
+def active_reconciliation_deadline(
+    current_deadline_seconds,
+    elapsed_seconds,
+    *,
+    owned_queue_active=False,
+    recent_vector_progress=False,
+    queue_remaining_seconds=None,
+):
+    """Return a later observation deadline only for live, owned work.
+
+    A fixed wall-clock cap cannot distinguish a 3,777-record queue that is
+    making steady progress from a queue that stopped. This policy instead uses
+    ownership, a recent queue-position/vector advance, and, when sampled, the
+    actual remaining queue duration. A quiet or unobservable queue earns no
+    extension and remains bounded by the normal timeout/stall contract.
+    """
+    current = max(0.0, float(current_deadline_seconds or 0.0))
+    elapsed = max(0.0, float(elapsed_seconds or 0.0))
+    if not (owned_queue_active or recent_vector_progress):
+        return None
+    remaining = None
+    try:
+        parsed = float(str(queue_remaining_seconds))
+        if math.isfinite(parsed):
+            remaining = max(0.0, parsed)
+    except (TypeError, ValueError):
+        pass
+    if owned_queue_active and remaining is not None:
+        # Recalculate at each boundary. The settling allowance covers the
+        # final queue/vector hand-off without making long queues subject to an
+        # arbitrary global duration cap.
+        settling = max(30.0, min(180.0, remaining * 0.25))
+        proposed = elapsed + remaining + settling
+        basis = "owned_queue_remaining_forecast"
+    elif owned_queue_active:
+        # A fresh queue may not have enough movement for a rate yet. Its next
+        # position advance renews this short liveness window.
+        proposed = elapsed + ANYTHINGLLM_EMBEDDING_RECONCILIATION_PROGRESS_GRACE_SECONDS
+        basis = "owned_queue_recent_progress"
+    else:
+        # After Desktop reports queue completion, vector persistence can lag.
+        # Continue only while exact vector evidence itself is still advancing.
+        proposed = elapsed + ANYTHINGLLM_EMBEDDING_RECONCILIATION_PROGRESS_GRACE_SECONDS
+        basis = "recent_exact_vector_progress"
+    deadline = max(current, proposed)
+    if deadline <= current:
+        return None
+    return {
+        "deadline_seconds": deadline,
+        "basis": basis,
+        "queue_remaining_seconds": remaining,
+    }
 
 
 def storage_observation_due_for_queue(
@@ -12585,6 +12849,12 @@ def _write_embedding_batch_ledger(ledger_path, workspace_slug, result):
     if not ledger_path:
         return
     ledger_path = Path(ledger_path)
+    runtime_events = list(result.get("runtime_events") or [])
+    runtime_event_count = max(
+        len(runtime_events),
+        int(result.get("runtime_event_count") or 0),
+    )
+    runtime_event_tail = runtime_events[-ANYTHINGLLM_EMBEDDING_RUNTIME_EVENT_TAIL_LIMIT:]
     payload = {
             "updated_at": datetime.now().isoformat(timespec="seconds"),
             "workspace_slug": workspace_slug,
@@ -12603,8 +12873,20 @@ def _write_embedding_batch_ledger(ledger_path, workspace_slug, result):
         "final_verification_required": bool(result.get("final_verification_required")),
         "batches": result.get("batches", []),
         "inflight_batch": result.get("inflight_batch"),
-        "runtime_events": result.get("runtime_events", []),
+        # Full SSE transcripts are diagnostic noise once a source window is
+        # terminal. Retaining all of them made this ledger grow with every PDF
+        # and then rewrote that growth after every later source. Keep a fixed
+        # tail plus an honest total so recovery state remains compact and
+        # operators can still see the immediately preceding events.
+        "runtime_events": runtime_event_tail,
+        "runtime_event_count": runtime_event_count,
+        "runtime_events_truncated": runtime_event_count > len(runtime_event_tail),
         "errors": result.get("errors", []),
+        # Keep the prepared location's originating PDF beside the recovery
+        # plan.  Locations are the only authority for resubmission, while the
+        # source label makes a later skip/review decision understandable to a
+        # human without weakening that exact identity boundary.
+        "location_sources": result.get("location_sources", []),
     }
     # Keep a recovery artifact beside the ordinary ledger.  It is deliberately
     # only a plan: no automatic retry is ever attempted after an ambiguous
@@ -12651,10 +12933,41 @@ def _write_embedding_batch_ledger(ledger_path, workspace_slug, result):
         }
         if confirmed_locations:
             pending = [location for location in pending if str(location) not in confirmed_locations]
+        source_by_location = {
+            str(item.get("location") or ""): item
+            for item in (payload.get("location_sources") or [])
+            if isinstance(item, dict) and str(item.get("location") or "")
+        }
+        remaining_sources = []
+        grouped_remaining_sources = {}
+        for location in pending:
+            source = source_by_location.get(str(location), {})
+            source_path = str(source.get("source_path") or "")
+            filename = str(source.get("filename") or "")
+            group_key = source_path or filename or str(location)
+            group = grouped_remaining_sources.setdefault(
+                group_key,
+                {
+                    "source_path": source_path,
+                    "filename": filename,
+                    "locations": [],
+                },
+            )
+            group["locations"].append(str(location))
+        for group in grouped_remaining_sources.values():
+            remaining_sources.append({
+                "source_key": group_key,
+                "source_path": group["source_path"],
+                "filename": group["filename"],
+                "record_count": len(group["locations"]),
+                "locations": group["locations"],
+            })
         payload["recovery"] = {
             "state": "resume_available",
             "from_batch": failed_batch.get("batch"),
             "remaining_locations": pending,
+            "remaining_sources": remaining_sources,
+            "skipped_sources": list((payload.get("recovery") or {}).get("skipped_sources") or []),
             "accepted_concurrent_locations": sorted(accepted_after_failure),
             "operator_note": "Review the failed batch before explicitly resuming. The original run was not retried automatically.",
         }
@@ -12685,6 +12998,7 @@ def _update_workspace_embeddings_batched_serial(
     verification_interval=ANYTHINGLLM_EMBEDDING_VERIFICATION_CHECKPOINT_INTERVAL,
     adaptive_single_record_threshold_seconds=60.0,
     submission_timeout_override=None,
+    location_sources=None,
 ):
     """Submit a bounded sequence of embedding updates and retain partial progress.
 
@@ -12735,6 +13049,14 @@ def _update_workspace_embeddings_batched_serial(
     if normalized_warmup_size >= normalized_batch_size:
         normalized_warmup_size = 0
         normalized_warmup_count = 0
+    source_by_location = {
+        str(item.get("location") or ""): {
+            "source_path": str(item.get("source_path") or ""),
+            "filename": str(item.get("filename") or ""),
+        }
+        for item in (location_sources or [])
+        if isinstance(item, dict) and str(item.get("location") or "")
+    }
     result = {
         "accepted": 0,
         "requested": len(unique_locations),
@@ -12756,6 +13078,11 @@ def _update_workspace_embeddings_batched_serial(
         "batches": [],
         "runtime_events": [],
         "errors": [],
+        "location_sources": [
+            {"location": location, **source_by_location.get(location, {})}
+            for location in unique_locations
+            if source_by_location.get(location)
+        ],
     }
     _write_embedding_batch_ledger(ledger_path, workspace_slug, result)
     endpoint = api_url.rstrip("/") + f"/api/v1/workspace/{workspace_slug}/update-embeddings"
@@ -12874,12 +13201,20 @@ def _update_workspace_embeddings_batched_serial(
             submission_started = time.perf_counter()
             rate_limit_retries = 0
             while True:
-                status, response_text = post_json(
-                    endpoint,
-                    {"adds": batch, "deletes": []},
-                    api_key=api_key,
-                    timeout=max(1, int(math.ceil(submission_timeout_seconds))),
-                )
+                try:
+                    status, response_text = post_json(
+                        endpoint,
+                        {"adds": batch, "deletes": []},
+                        api_key=api_key,
+                        timeout=max(1, int(math.ceil(submission_timeout_seconds))),
+                    )
+                except urllib.error.HTTPError as exc:
+                    # urllib raises for every non-2xx response. Convert the
+                    # server's explicit refusal into the same typed path as a
+                    # test double returning a status, while leaving transport
+                    # failures and 5xx mutation ambiguity to the classifier.
+                    status = int(getattr(exc, "code", 0) or 0)
+                    response_text = _read_http_error_body(exc)
                 if (
                     status != 429
                     or rate_limit_retries >= ANYTHINGLLM_EMBEDDING_RATE_LIMIT_MAX_RETRIES
@@ -12949,25 +13284,49 @@ def _update_workspace_embeddings_batched_serial(
                     "AnythingLLM accepted the request; attachment and retrieval are still being observed.",
                 )
             else:
+                outcome = classify_anythingllm_mutation_outcome(
+                    stage="workspace_queue",
+                    status=status,
+                    response_text=response_text,
+                )
                 error = {
                     "status": status,
                     "endpoint": "update-embeddings",
                     "batch": batch_number,
                     "response": response_text[:500],
+                    **outcome,
                 }
                 batch_report["error"] = error["response"] or f"HTTP {status}"
-                batch_report["submission_state"] = "rejected"
+                batch_report["submission_state"] = (
+                    "rejected"
+                    if outcome["category"] in {
+                        "explicit_source_rejection",
+                        "global_configuration_rejection",
+                        "temporary_global_hold",
+                    }
+                    else "unresolved"
+                )
+                batch_report["mutation_outcome"] = outcome
                 result["errors"].append(error)
-                set_embedding_batch_lifecycle(batch_report, "rejected", batch_report["error"])
+                set_embedding_batch_lifecycle(
+                    batch_report,
+                    "rejected" if batch_report["submission_state"] == "rejected" else "reconciliation_pending",
+                    batch_report["error"],
+                )
             batch_report["submission_seconds"] = round(time.perf_counter() - submission_started, 4)
         except Exception as exc:
-            exception_text = str(exc)
+            outcome = classify_anythingllm_mutation_outcome(
+                stage="workspace_queue",
+                exception=exc,
+            )
+            exception_text = outcome.get("error") or str(exc)
             timeout_like = "timed out" in exception_text.casefold() or "timeout" in exception_text.casefold()
             error = {
                 "error": exception_text,
                 "endpoint": "update-embeddings",
                 "batch": batch_number,
                 "classification": "client_timeout_submission_unknown" if timeout_like else "client_transport_submission_unknown",
+                **outcome,
             }
             batch_report["error"] = error["error"]
             # A client timeout does not prove that Desktop rejected the work.
@@ -13277,6 +13636,7 @@ def update_workspace_embeddings_batched(
     concurrent_batch_limit=1,
     initial_concurrent_batches=ANYTHINGLLM_EMBEDDING_INITIAL_CONCURRENT_BATCHES,
     submission_timeout_override=None,
+    location_sources=None,
 ):
     """Submit bounded embedding requests.
 
@@ -13303,6 +13663,7 @@ def update_workspace_embeddings_batched(
             verification_interval=verification_interval,
             adaptive_single_record_threshold_seconds=adaptive_single_record_threshold_seconds,
             submission_timeout_override=submission_timeout_override,
+            location_sources=location_sources,
         )
 
     unique_locations = list(dict.fromkeys(str(location) for location in locations if location))
@@ -13664,21 +14025,17 @@ def update_workspace_embeddings_desktop_queue(
     cancel_callback=None,
     record_label="uploaded files",
     storage_dir=None,
+    location_sources=None,
+    _source_window_execution=False,
 ):
-    """Mirror AnythingLLM Desktop's one-submit, sequential queue contract.
+    """Queue known locations with durable, source-scoped Desktop windows.
 
-    Desktop's Documents dialog sends every selected document path in one
-    ``POST /workspace/:slug/update-embeddings`` call and separately listens to
-    ``/embed-progress``.  With non-native embedders (including OpenRouter),
-    Desktop processes the submitted list one file at a time inside that one
-    request.  Submitting one or two paths per request from this app adds costly
-    request boundaries without adding safety.
-
-    This wrapper deliberately retains the existing durable ledger, timeout
-    reconciliation, exact-vector verification, and no-speculative-retry
-    policy.  It only changes the submission boundary to the full workspace
-    queue.  A cancellation request can prevent submission, but cannot safely
-    abort a queue that Desktop has already accepted.
+    Desktop serializes all locations within one update request. For a
+    multi-PDF assistant run, this wrapper deliberately keeps that FIFO within
+    a PDF but submits eligible PDFs as sequential source windows. The durable
+    ledger, exact-vector verification, and no-speculative-retry rules remain
+    unchanged: an explicit rejection can advance to the next source, while an
+    ambiguous remote mutation holds later queue windows for reconciliation.
     """
     unique_locations = list(dict.fromkeys(str(location) for location in locations if location))
     requested = len(unique_locations)
@@ -13693,6 +14050,172 @@ def update_workspace_embeddings_desktop_queue(
             "runtime_events": [],
             "errors": [],
         }
+
+    # A single Desktop queue provides no source boundary: when its receipt is
+    # ambiguous, one problematic PDF holds every later PDF behind the same
+    # unknown write.  For a multi-PDF assistant run, preserve Desktop's FIFO
+    # behavior *within* a PDF but make each PDF its own sequential window.
+    # Each window must prove exact vectors before the next write begins.
+    # An explicit HTTP rejection is the narrow exception: Desktop did not
+    # accept that source, so later independent sources can continue safely.
+    # ``_source_window_execution`` prevents recursive scheduling for each
+    # concrete window and keeps single-PDF behavior unchanged.
+    source_by_location = {}
+    for item in location_sources or []:
+        if not isinstance(item, dict):
+            continue
+        location = str(item.get("location") or "").strip()
+        source_path = str(item.get("source_path") or "").strip()
+        if location and source_path:
+            source_by_location[_normalized_anythingllm_document_location(location)] = source_path
+    source_windows = []
+    window_by_source = {}
+    for location in unique_locations:
+        normalized_location = _normalized_anythingllm_document_location(location)
+        source_path = source_by_location.get(normalized_location, "")
+        # Missing attribution must never be silently discarded or made
+        # individually skippable. It remains one explicit, conservative window.
+        source_key = source_path or "__unattributed_prepared_records__"
+        window = window_by_source.get(source_key)
+        if window is None:
+            window = {
+                "source_path": source_path,
+                "locations": [],
+            }
+            window_by_source[source_key] = window
+            source_windows.append(window)
+        window["locations"].append(location)
+    if not _source_window_execution and len(source_windows) > 1:
+        aggregate = {
+            "accepted": 0,
+            "requested": requested,
+            "planned_locations": unique_locations,
+            "batch_size": None,
+            "submission_strategy": "desktop_source_windows",
+            "queue_records": requested,
+            "source_window_count": len(source_windows),
+            "location_sources": [
+                {"location": location, "source_path": source_by_location.get(_normalized_anythingllm_document_location(location), "")}
+                for location in unique_locations
+                if source_by_location.get(_normalized_anythingllm_document_location(location), "")
+            ],
+            "batches": [],
+            "runtime_events": [],
+            "errors": [],
+        }
+        _write_embedding_batch_ledger(ledger_path, workspace_slug, aggregate)
+        for window_index, window in enumerate(source_windows, start=1):
+            source_path = str(window.get("source_path") or "")
+            display_name = Path(source_path).name if source_path else "unattributed prepared records"
+            window_locations = list(window.get("locations") or [])
+
+            def source_window_status(
+                message,
+                report,
+                *,
+                _index=window_index,
+                _total=len(source_windows),
+                _name=display_name,
+                _source_path=source_path,
+                _locations=tuple(window_locations),
+            ):
+                if not callable(status_callback):
+                    return
+                contextual = dict(report or {})
+                contextual.update({
+                    "batch": _index,
+                    "total_batches": _total,
+                    "source_window_index": _index,
+                    "source_window_total": _total,
+                    "source_path": _source_path,
+                    "source_filename": _name,
+                    "locations": list(_locations),
+                })
+                status_callback(f"AnythingLLM PDF {_index} of {_total} ({_name}): {message}", contextual)
+
+            def source_window_callback(callback, report, *, _source_path=source_path, _source_name=display_name):
+                """Preserve source identity through a child window verifier.
+
+                Child queue batches are deliberately indexed from zero inside
+                each PDF window. A verifier that owns a larger selection needs
+                the source identity as well as those local indices; otherwise a
+                later window can slice the first PDF's expected payloads.
+                """
+                contextual = dict(report or {})
+                contextual.update({
+                    "source_path": _source_path,
+                    "source_filename": _source_name,
+                })
+                return callback(contextual)
+
+            child = update_workspace_embeddings_desktop_queue(
+                api_url,
+                api_key,
+                workspace_slug,
+                window_locations,
+                ledger_path=None,
+                status_callback=source_window_status,
+                batch_verifier=(
+                    (lambda report, _callback=batch_verifier: source_window_callback(_callback, report))
+                    if callable(batch_verifier) else None
+                ),
+                batch_inspector=(
+                    (lambda report, _callback=batch_inspector: source_window_callback(_callback, report))
+                    if callable(batch_inspector) else None
+                ),
+                cancel_callback=cancel_callback,
+                record_label=f"page-parent record(s) for {display_name}",
+                storage_dir=storage_dir,
+                location_sources=[
+                    {"location": location, "source_path": source_path}
+                    for location in window_locations if source_path
+                ],
+                _source_window_execution=True,
+            )
+            child_batch = dict((child.get("batches") or [{}])[-1])
+            child_batch.update({
+                "batch": window_index,
+                "total_batches": len(source_windows),
+                "source_window_index": window_index,
+                "source_window_total": len(source_windows),
+                "source_path": source_path,
+                "source_filename": display_name,
+                "locations": window_locations,
+            })
+            aggregate["batches"].append(child_batch)
+            aggregate["accepted"] += int(child.get("accepted") or 0)
+            child_runtime_events = list(child.get("runtime_events") or [])
+            aggregate["runtime_event_count"] = (
+                int(aggregate.get("runtime_event_count") or 0)
+                + max(
+                    len(child_runtime_events),
+                    int(child.get("runtime_event_count") or 0),
+                )
+            )
+            # Do not retain every earlier source's raw SSE transcript in the
+            # aggregate. The counter above remains complete; this bounded
+            # diagnostic tail prevents O(n²) ledger rewrites for large runs.
+            aggregate["runtime_events"] = (
+                list(aggregate.get("runtime_events") or []) + child_runtime_events
+            )[-ANYTHINGLLM_EMBEDDING_RUNTIME_EVENT_TAIL_LIMIT:]
+            child_errors = list(child.get("errors") or [])
+            for error in child_errors:
+                aggregate["errors"].append({**dict(error), "source_path": source_path, "batch": window_index})
+            _write_embedding_batch_ledger(ledger_path, workspace_slug, aggregate)
+            state = str(child_batch.get("submission_state") or "")
+            # Only a receipt that explicitly proves no queue admission can
+            # allow the following source. An accepted but not-yet-searchable
+            # source remains an unresolved remote mutation and stops here.
+            if state == "rejected":
+                continue
+            if state != "accepted" or not bool(child_batch.get("searchability_proven")):
+                aggregate["stopped_after_source_window"] = window_index
+                aggregate["stop_reason"] = (
+                    "source_window_unresolved_after_exact_verification"
+                )
+                _write_embedding_batch_ledger(ledger_path, workspace_slug, aggregate)
+                break
+        return aggregate
 
     normalized_record_label = str(record_label or "uploaded files").strip() or "uploaded files"
     # AnythingLLM's vector cache key is the exact queued document location.
@@ -14015,6 +14538,7 @@ def update_workspace_embeddings_desktop_queue(
             verification_mode="checkpoint",
             concurrent_batch_limit=1,
             submission_timeout_override=ANYTHINGLLM_DESKTOP_QUEUE_RECEIPT_TIMEOUT_SECONDS,
+            location_sources=location_sources,
         )
     finally:
         progress_listener["stop_event"].set()
@@ -14121,7 +14645,7 @@ def maybe_upload_payloads(
     try:
         for payload, reusable_location in zip(upload_rows, reusable_locations):
             metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
-            attachment = {
+            attachment: dict[str, Any] = {
                 "filename": str(payload.get("filename") or ""),
                 "chunk_source": str(metadata.get("chunkSource") or ""),
                 "source_path": str(payload.get("_automatic_source_path") or ""),
@@ -14194,6 +14718,26 @@ def maybe_upload_payloads(
                             error="AnythingLLM accepted the raw-text record but did not report its document location.",
                         )
                     attachment_results.append(attachment)
+                    if not location:
+                        # A successful response without a durable native
+                        # location is an ambiguous external mutation.  Do
+                        # not attach a later source or queue the subset whose
+                        # locations happened to be returned: that could make
+                        # the run look complete while this source was never
+                        # proved attached, queued, or vectorized.  The
+                        # pre-request receipt remains the recovery evidence.
+                        errors.append(
+                            {
+                                "category": "ambiguous_external_mutation",
+                                "classification": "attachment_location_unknown",
+                                "scope": "current_mutation_lane",
+                                "may_continue_later_sources": False,
+                                "error": attachment["error"],
+                                "segment": payload.get("metadata", {}).get("chunkSource", ""),
+                                "source_path": str(payload.get("_automatic_source_path") or ""),
+                            }
+                        )
+                        break
                     if callable(status_callback):
                         status_callback(
                             f"Attaching prepared records to AnythingLLM: {uploaded}/{len(upload_rows)} accepted",
@@ -14247,6 +14791,15 @@ def maybe_upload_payloads(
                 cancel_callback=cancel_callback,
                 record_label=record_label,
                 storage_dir=storage_dir,
+                location_sources=[
+                    {
+                        "location": str(attachment.get("location") or ""),
+                        "source_path": str(attachment.get("source_path") or ""),
+                        "filename": str(attachment.get("filename") or ""),
+                    }
+                    for attachment in attachment_results
+                    if str(attachment.get("location") or "")
+                ],
             )
             embedded = embedding_update["accepted"]
             errors.extend(embedding_update["errors"])
@@ -14386,15 +14939,33 @@ def maybe_upload_segment_files(
     # preserves the single-read upload path as well.
     reusable_payloads = upload_plan_rows_to_expected_payloads(selected_rows)
     payload_materialization_seconds = time.monotonic() - payload_materialization_started
+    if callable(status_callback):
+        status_callback(
+            f"Checking {len(selected_rows)} page record(s) for exact reusable pages",
+            {
+                "timing_event": "cache_location_lookup_started",
+                "selected_records": len(selected_rows),
+            },
+        )
     cache_lookup_started = time.monotonic()
-    reusable_locations = find_reusable_cached_document_locations(
-        storage_dir,
-        reusable_payloads,
-        folder_names=[
-            row.get("_anythingllm_folder_name") or folder_name
+    if selected_rows and all("_reusable_location_override" in row for row in selected_rows):
+        # The multi-source coordinator performs one shared storage scan before
+        # opening any source transaction. Reusing its aligned result prevents
+        # a 367-PDF run from rescanning the same established Desktop document
+        # store 367 times while preserving the exact same identity proof.
+        reusable_locations = [
+            str(row.get("_reusable_location_override") or "")
             for row in selected_rows
-        ],
-    )
+        ]
+    else:
+        reusable_locations = find_reusable_cached_document_locations(
+            storage_dir,
+            reusable_payloads,
+            folder_names=[
+                row.get("_anythingllm_folder_name") or folder_name
+                for row in selected_rows
+            ],
+        )
     cache_lookup_seconds = time.monotonic() - cache_lookup_started
     cache_location_lookup_epoch = time.time()
     cache_location_lookup = {
@@ -14410,17 +14981,26 @@ def maybe_upload_segment_files(
     if callable(status_callback):
         status_callback(
             (
-                f"Exact reusable-document lookup complete: {cache_location_lookup['reusable_locations']}/"
-                f"{cache_location_lookup['selected_records']} prepared record(s) have matching cached locations"
+                f"Reusable-page check: {cache_location_lookup['reusable_locations']}/"
+                f"{cache_location_lookup['selected_records']} exact cached record(s)"
             ),
             {"timing_event": "cache_location_lookup_complete", **cache_location_lookup},
         )
+    if selected_rows and all(
+        "_attachment_preexisting_locations_override" in row for row in selected_rows
+    ):
+        pre_attachment_locations = set(
+            str(location)
+            for location in (selected_rows[0].get("_attachment_preexisting_locations_override") or [])
+        )
+    else:
+        pre_attachment_locations = set(snapshot_staged_document_locations(storage_dir))
     correlation_id = f"upload-{uuid.uuid4().hex}"
     try:
         for row, reusable_location, reusable_payload in zip(
             selected_rows, reusable_locations, reusable_payloads
         ):
-            attachment = {
+            attachment: dict[str, Any] = {
                 "filename": str(row.get("filename") or ""),
                 "chunk_source": str(row.get("chunkSource") or ""),
                 "source_path": str(row.get("_automatic_source_path") or ""),
@@ -14432,7 +15012,14 @@ def maybe_upload_segment_files(
             if not text_file.exists():
                 attachment.update(status="missing_upload_file", error=f"Missing upload file: {text_file}")
                 attachment_results.append(attachment)
-                errors.append({"error": f"Missing upload file: {text_file}", "segment": row.get("chunkSource", "")})
+                errors.append({
+                    "error": f"Missing upload file: {text_file}",
+                    "segment": row.get("chunkSource", ""),
+                    "source_path": attachment["source_path"],
+                    "category": "source_local_pre_mutation",
+                    "classification": "prepared_upload_file_missing",
+                    "may_continue_later_sources": True,
+                })
                 break
             metadata = reusable_payload["metadata"]
             receipt_payload = {"metadata": metadata, "textContent": ""}
@@ -14445,7 +15032,14 @@ def maybe_upload_segment_files(
             except OSError as exc:
                 attachment.update(status="unreadable_upload_file", error=f"Could not read upload file: {exc}")
                 attachment_results.append(attachment)
-                errors.append({"error": attachment["error"], "segment": row.get("chunkSource", "")})
+                errors.append({
+                    "error": attachment["error"],
+                    "segment": row.get("chunkSource", ""),
+                    "source_path": attachment["source_path"],
+                    "category": "source_local_pre_mutation",
+                    "classification": "prepared_upload_file_unreadable",
+                    "may_continue_later_sources": True,
+                })
                 break
             prepared_file_hash = hashlib.sha256(prepared_file_bytes).hexdigest()
             validated_hash = str(row.get("_validated_prepared_file_sha256") or "").strip()
@@ -14458,7 +15052,14 @@ def maybe_upload_segment_files(
                     ),
                 )
                 attachment_results.append(attachment)
-                errors.append({"error": attachment["error"], "segment": row.get("chunkSource", "")})
+                errors.append({
+                    "error": attachment["error"],
+                    "segment": row.get("chunkSource", ""),
+                    "source_path": attachment["source_path"],
+                    "category": "source_local_pre_mutation",
+                    "classification": "prepared_upload_file_changed",
+                    "may_continue_later_sources": True,
+                })
                 break
             if reusable_location:
                 # Selecting an already verified local cache location has not
@@ -14513,10 +15114,21 @@ def maybe_upload_segment_files(
                 if 200 <= status < 300:
                     uploaded += 1
                     location = extract_document_location(response_text)
+                    attachment_reconciliation = None
+                    if not location:
+                        attachment_reconciliation = reconcile_ambiguous_attachment_location(
+                            storage_dir,
+                            reusable_payload,
+                            excluded_locations=pre_attachment_locations | set(locations),
+                        )
+                        if attachment_reconciliation.get("status") == "exact_location_recovered":
+                            location = str(attachment_reconciliation["candidates"][0])
                     record_submission_receipt(
                         submission_receipt_path, receipt_payload,
                         run_id=run_id, workspace_slug=workspace_slug, transport="file_upload",
-                        state="attached" if location else "submitted",
+                        state="attached_reconciled" if attachment_reconciliation and location else (
+                            "attached" if location else "submitted"
+                        ),
                         correlation_id=correlation_id, http_status=status, location=location,
                         prepared_payload_hash=prepared_file_hash,
                         next_check=(
@@ -14529,6 +15141,7 @@ def maybe_upload_segment_files(
                         receipt_buffer=deferred_receipts,
                     )
                     if location:
+                        pre_attachment_locations.add(location)
                         if storage_dir:
                             # A grouped Automatic run can carry page-parent
                             # files from several PDFs.  Keep the destination
@@ -14552,13 +15165,42 @@ def maybe_upload_segment_files(
                                 )
                                 break
                         locations.append(location)
-                        attachment.update(status="attached", location=location)
+                        attachment.update(
+                            status=(
+                                "attached_reconciled"
+                                if attachment_reconciliation else "attached"
+                            ),
+                            location=location,
+                            attachment_reconciliation=attachment_reconciliation,
+                        )
                     else:
                         attachment.update(
                             status="attached_location_unknown",
                             error="AnythingLLM accepted the file but did not report its document location.",
+                            attachment_reconciliation=attachment_reconciliation,
                         )
                     attachment_results.append(attachment)
+                    if not location:
+                        # This has the same ambiguity boundary as the raw
+                        # route above.  A later attachment cannot safely be
+                        # queued by itself, because a completed 2xx response
+                        # without a location may already have created this
+                        # source in Desktop.  Stop before any further
+                        # AnythingLLM mutation and retain the pre-request
+                        # receipt for a source-aware recovery path.
+                        errors.append(
+                            {
+                                "category": "ambiguous_external_mutation",
+                                "classification": "attachment_location_unknown",
+                                "scope": "current_mutation_lane",
+                                "may_continue_later_sources": False,
+                                "error": attachment["error"],
+                                "segment": row.get("chunkSource", ""),
+                                "filename": row.get("filename", ""),
+                                "source_path": str(row.get("_automatic_source_path") or ""),
+                            }
+                        )
+                        break
                     if callable(status_callback):
                         status_callback(
                             f"Attaching page-parent files to AnythingLLM: {uploaded}/{len(selected_rows)} accepted",
@@ -14569,9 +15211,57 @@ def maybe_upload_segment_files(
                             },
                         )
                 else:
-                    attachment.update(status="rejected", error=f"HTTP {status}")
+                    outcome = classify_anythingllm_mutation_outcome(
+                        stage="document_attachment",
+                        status=status,
+                        response_text=response_text,
+                    )
+                    attachment_reconciliation = None
+                    if outcome["category"] == "ambiguous_external_mutation":
+                        attachment_reconciliation = reconcile_ambiguous_attachment_location(
+                            storage_dir,
+                            reusable_payload,
+                            excluded_locations=pre_attachment_locations | set(locations),
+                        )
+                    if attachment_reconciliation and attachment_reconciliation.get("status") == "exact_location_recovered":
+                        location = str(attachment_reconciliation["candidates"][0])
+                        pre_attachment_locations.add(location)
+                        locations.append(location)
+                        uploaded += 1
+                        attachment.update(
+                            status="attached_reconciled",
+                            location=location,
+                            attachment_reconciliation=attachment_reconciliation,
+                            mutation_outcome=outcome,
+                        )
+                        attachment_results.append(attachment)
+                        record_submission_receipt(
+                            submission_receipt_path, receipt_payload,
+                            run_id=run_id, workspace_slug=workspace_slug, transport="file_upload",
+                            state="attached_reconciled", correlation_id=correlation_id,
+                            http_status=status, location=location,
+                            prepared_payload_hash=prepared_file_hash,
+                            next_check="Submit the exactly reconciled staged location to the workspace queue.",
+                        )
+                        continue
+                    attachment.update(
+                        status=(
+                            "rejected"
+                            if outcome["category"] == "explicit_source_rejection"
+                            else "submission_unknown"
+                        ),
+                        error=f"HTTP {status}",
+                        mutation_outcome=outcome,
+                        attachment_reconciliation=attachment_reconciliation,
+                    )
                     attachment_results.append(attachment)
-                    errors.append({"status": status, "segment": row.get("chunkSource", ""), "filename": row.get("filename", "")})
+                    errors.append({
+                        **outcome,
+                        "status": status,
+                        "segment": row.get("chunkSource", ""),
+                        "filename": row.get("filename", ""),
+                        "source_path": attachment["source_path"],
+                    })
                     record_submission_receipt(
                         submission_receipt_path, receipt_payload,
                         run_id=run_id, workspace_slug=workspace_slug, transport="file_upload",
@@ -14581,9 +15271,46 @@ def maybe_upload_segment_files(
                         next_check="Inspect the server response and correct the request before an explicit resubmission.",
                     )
             except Exception as exc:
-                attachment.update(status="submission_unknown", error=str(exc))
+                outcome = classify_anythingllm_mutation_outcome(
+                    stage="document_attachment",
+                    exception=exc,
+                )
+                attachment_reconciliation = reconcile_ambiguous_attachment_location(
+                    storage_dir,
+                    reusable_payload,
+                    excluded_locations=pre_attachment_locations | set(locations),
+                )
+                if attachment_reconciliation.get("status") == "exact_location_recovered":
+                    location = str(attachment_reconciliation["candidates"][0])
+                    pre_attachment_locations.add(location)
+                    locations.append(location)
+                    uploaded += 1
+                    attachment.update(
+                        status="attached_reconciled",
+                        location=location,
+                        attachment_reconciliation=attachment_reconciliation,
+                        mutation_outcome=outcome,
+                    )
+                    attachment_results.append(attachment)
+                    record_submission_receipt(
+                        submission_receipt_path, receipt_payload,
+                        run_id=run_id, workspace_slug=workspace_slug, transport="file_upload",
+                        state="attached_reconciled", correlation_id=correlation_id,
+                        location=location, prepared_payload_hash=prepared_file_hash,
+                        error=outcome["error"],
+                        next_check="Submit the exactly reconciled staged location to the workspace queue.",
+                    )
+                    continue
+                attachment.update(status="submission_unknown", error=outcome["error"], mutation_outcome=outcome)
+                attachment["attachment_reconciliation"] = attachment_reconciliation
                 attachment_results.append(attachment)
-                errors.append({"error": str(exc), "segment": row.get("chunkSource", ""), "filename": row.get("filename", "")})
+                errors.append({
+                    **outcome,
+                    "error": outcome["error"],
+                    "segment": row.get("chunkSource", ""),
+                    "filename": row.get("filename", ""),
+                    "source_path": attachment["source_path"],
+                })
                 record_submission_receipt(
                     submission_receipt_path, receipt_payload,
                     run_id=run_id, workspace_slug=workspace_slug, transport="file_upload",
@@ -14630,6 +15357,15 @@ def maybe_upload_segment_files(
                 cancel_callback=cancel_callback,
                 record_label=record_label,
                 storage_dir=storage_dir,
+                location_sources=[
+                    {
+                        "location": str(attachment.get("location") or ""),
+                        "source_path": str(attachment.get("source_path") or ""),
+                        "filename": str(attachment.get("filename") or ""),
+                    }
+                    for attachment in attachment_results
+                    if str(attachment.get("location") or "")
+                ],
             )
             embedded = embedding_update["accepted"]
             errors.extend(embedding_update["errors"])
@@ -14697,6 +15433,312 @@ def maybe_upload_segment_files(
     }
 
 
+def maybe_upload_segment_files_source_transactions(
+    api_url,
+    api_key,
+    upload_rows,
+    *,
+    workspace_slug,
+    folder_name="custom-documents",
+    storage_dir=None,
+    embedding_ledger_path=None,
+    status_callback=None,
+    batch_verifier=None,
+    batch_inspector=None,
+    cancel_callback=None,
+    submission_receipt_path=None,
+    run_id="",
+    record_label="uploaded files",
+):
+    """Attach and prove each selected PDF as one durable source transaction.
+
+    Cache discovery and authentication remain batch-scoped. Every external
+    mutation after that is source-scoped: a definite local refusal can release
+    the next PDF, while an unknown write outcome stops the mutation lane. This
+    is the boundary needed for large runs to retain earlier success without
+    allowing a problematic source to erase or silently reorder later work.
+    """
+    rows = list(upload_rows or [])
+    grouped = []
+    by_source = {}
+    for position, row in enumerate(rows):
+        source_path = str(row.get("_automatic_source_path") or "").strip()
+        source_key = source_path or f"__unattributed_source_{position + 1}__"
+        group = by_source.get(source_key)
+        if group is None:
+            group = {"source_key": source_key, "source_path": source_path, "rows": []}
+            by_source[source_key] = group
+            grouped.append(group)
+        group["rows"].append(dict(row))
+    if len(grouped) <= 1:
+        return maybe_upload_segment_files(
+            api_url,
+            api_key,
+            rows,
+            workspace_slug=workspace_slug,
+            folder_name=folder_name,
+            storage_dir=storage_dir,
+            embedding_ledger_path=embedding_ledger_path,
+            status_callback=status_callback,
+            batch_verifier=batch_verifier,
+            batch_inspector=batch_inspector,
+            cancel_callback=cancel_callback,
+            submission_receipt_path=submission_receipt_path,
+            run_id=run_id,
+            record_label=record_label,
+        )
+
+    resolved_key, authentication_mode = resolve_anythingllm_api_key(api_url, api_key, storage_dir)
+    temporary_key_id = None
+    temporary_key_cleanup = {"status": "not_applicable", "error": ""}
+    if not resolved_key:
+        temporary_key = create_temporary_desktop_api_key(api_url)
+        if temporary_key.get("status") != "created":
+            return {
+                "status": "error_authentication_required",
+                "uploaded": 0,
+                "embedded": 0,
+                "authentication_mode": "unavailable",
+                "temporary_key_cleanup": temporary_key_cleanup,
+                "source_transactions": [],
+                "errors": [{
+                    "category": "global_configuration_rejection",
+                    "classification": "authentication_unavailable",
+                    "may_continue_later_sources": False,
+                    "error": "AnythingLLM Desktop API authentication is unavailable.",
+                }],
+            }
+        resolved_key = temporary_key["secret"]
+        temporary_key_id = temporary_key["id"]
+        authentication_mode = "temporary_desktop_api_key"
+
+    reusable_payloads = upload_plan_rows_to_expected_payloads(rows)
+    reusable_locations = find_reusable_cached_document_locations(
+        storage_dir,
+        reusable_payloads,
+        folder_names=[row.get("_anythingllm_folder_name") or folder_name for row in rows],
+    )
+    reusable_by_identity = {
+        (str(row.get("_automatic_source_path") or ""), str(row.get("chunkSource") or "")): location
+        for row, location in zip(rows, reusable_locations)
+    }
+    pre_attachment_locations = snapshot_staged_document_locations(storage_dir)
+    aggregate = {
+        "status": "complete",
+        "uploaded": 0,
+        "embedded": 0,
+        "locations": [],
+        "reused_cached_locations": [],
+        "reused_cached_documents": 0,
+        "attachment_results": [],
+        "embedding_update": {
+            "accepted": 0,
+            "requested": 0,
+            "planned_locations": [],
+            "submission_strategy": "durable_pdf_source_transactions",
+            "queue_records": 0,
+            "source_window_count": len(grouped),
+            "batches": [],
+            "runtime_events": [],
+            "errors": [],
+        },
+        "source_transactions": [],
+        "errors": [],
+        "authentication_mode": authentication_mode,
+        "submission_receipt_path": str(submission_receipt_path or ""),
+        "transport": "file_upload",
+    }
+    transaction_ledger_path = (
+        Path(embedding_ledger_path).with_name("source-transaction-ledger.json")
+        if embedding_ledger_path else None
+    )
+
+    def persist_transactions():
+        if transaction_ledger_path:
+            write_json(transaction_ledger_path, {
+                "workspace_slug": workspace_slug,
+                "run_id": run_id,
+                "transaction_count": len(grouped),
+                "transactions": aggregate["source_transactions"],
+                "stopped_after_source_transaction": aggregate.get("stopped_after_source_transaction"),
+                "stop_reason": aggregate.get("stop_reason", ""),
+            })
+        _write_embedding_batch_ledger(
+            embedding_ledger_path,
+            workspace_slug,
+            aggregate["embedding_update"],
+        )
+
+    try:
+        for source_index, group in enumerate(grouped, start=1):
+            source_path = str(group["source_path"] or "")
+            source_name = Path(source_path).name if source_path else f"PDF {source_index}"
+            source_rows = []
+            for row in group["rows"]:
+                source_row = dict(row)
+                source_row["_reusable_location_override"] = reusable_by_identity.get(
+                    (source_path, str(row.get("chunkSource") or "")),
+                    "",
+                )
+                source_row["_attachment_preexisting_locations_override"] = pre_attachment_locations
+                source_rows.append(source_row)
+            transaction = {
+                "source_index": source_index,
+                "source_count": len(grouped),
+                "source_key": group["source_key"],
+                "source_path": source_path,
+                "source_filename": source_name,
+                "planned_records": len(source_rows),
+                "state": "prepared",
+                "mutation_scope": "current_source",
+            }
+            aggregate["source_transactions"].append(transaction)
+            persist_transactions()
+
+            def source_status(message, report, *, _index=source_index, _name=source_name):
+                if callable(status_callback):
+                    contextual = dict(report or {})
+                    contextual.update({
+                        "source_window_index": _index,
+                        "source_window_total": len(grouped),
+                        "source_path": source_path,
+                        "source_filename": _name,
+                    })
+                    status_callback(
+                        f"AnythingLLM PDF {_index} of {len(grouped)} ({_name}): {message}",
+                        contextual,
+                    )
+
+            transaction["state"] = "attachment_intent_durable"
+            persist_transactions()
+            source_ledger = (
+                Path(embedding_ledger_path).parent
+                / "source-transactions"
+                / f"{source_index:04d}-embedding-ledger.json"
+                if embedding_ledger_path else None
+            )
+
+            def source_callback(callback, report):
+                contextual = dict(report or {})
+                contextual.update({
+                    "source_path": source_path,
+                    "source_filename": source_name,
+                })
+                return callback(contextual)
+
+            child = maybe_upload_segment_files(
+                api_url,
+                resolved_key,
+                source_rows,
+                workspace_slug=workspace_slug,
+                folder_name=folder_name,
+                storage_dir=storage_dir,
+                embedding_ledger_path=source_ledger,
+                status_callback=source_status,
+                batch_verifier=(
+                    (lambda report, _callback=batch_verifier: source_callback(_callback, report))
+                    if callable(batch_verifier) else None
+                ),
+                batch_inspector=(
+                    (lambda report, _callback=batch_inspector: source_callback(_callback, report))
+                    if callable(batch_inspector) else None
+                ),
+                cancel_callback=cancel_callback,
+                submission_receipt_path=submission_receipt_path,
+                run_id=run_id,
+                record_label=f"page-parent record(s) for {source_name}",
+            )
+            transaction.update({
+                "state": str(child.get("status") or "error"),
+                "uploaded": int(child.get("uploaded") or 0),
+                "embedded": int(child.get("embedded") or 0),
+                "locations": list(child.get("locations") or []),
+                "errors": list(child.get("errors") or []),
+            })
+            aggregate["uploaded"] += transaction["uploaded"]
+            aggregate["embedded"] += transaction["embedded"]
+            aggregate["locations"].extend(child.get("locations") or [])
+            aggregate["reused_cached_locations"].extend(child.get("reused_cached_locations") or [])
+            aggregate["attachment_results"].extend(child.get("attachment_results") or [])
+            child_update = dict(child.get("embedding_update") or {})
+            aggregate["embedding_update"]["accepted"] += int(child_update.get("accepted") or 0)
+            aggregate["embedding_update"]["requested"] += int(child_update.get("requested") or 0)
+            aggregate["embedding_update"]["queue_records"] += int(child_update.get("queue_records") or child_update.get("requested") or 0)
+            aggregate["embedding_update"]["planned_locations"].extend(child_update.get("planned_locations") or child.get("locations") or [])
+            for batch in child_update.get("batches") or []:
+                batch_copy = dict(batch)
+                batch_copy.update({
+                    "batch": source_index,
+                    "total_batches": len(grouped),
+                    "source_window_index": source_index,
+                    "source_window_total": len(grouped),
+                    "source_path": source_path,
+                    "source_filename": source_name,
+                })
+                aggregate["embedding_update"]["batches"].append(batch_copy)
+            for error in child.get("errors") or []:
+                error_copy = dict(error) if isinstance(error, dict) else {"error": str(error)}
+                error_copy.setdefault("source_path", source_path)
+                aggregate["errors"].append(error_copy)
+            for error in child_update.get("errors") or []:
+                error_copy = dict(error) if isinstance(error, dict) else {"error": str(error)}
+                error_copy.setdefault("source_path", source_path)
+                aggregate["embedding_update"]["errors"].append(error_copy)
+            aggregate["embedding_update"]["runtime_events"] = (
+                aggregate["embedding_update"]["runtime_events"]
+                + list(child_update.get("runtime_events") or [])
+            )[-ANYTHINGLLM_EMBEDDING_RUNTIME_EVENT_TAIL_LIMIT:]
+
+            child_status = str(child.get("status") or "error")
+            primary_errors = [
+                error for error in (child.get("errors") or [])
+                if isinstance(error, dict)
+                and str(error.get("classification") or "") not in {
+                    "attachment_batch_incomplete",
+                    "embedding_update_incomplete",
+                }
+            ]
+            may_continue = bool(primary_errors) and all(
+                bool(error.get("may_continue_later_sources")) for error in primary_errors
+            )
+            if child_status in {"complete", "complete_with_key_cleanup_warning"}:
+                transaction["state"] = "exact_vectors_proven"
+                persist_transactions()
+                continue
+            if may_continue:
+                transaction["state"] = "source_rejected_without_remote_mutation"
+                transaction["later_sources_released"] = True
+                persist_transactions()
+                continue
+            transaction["state"] = (
+                "ambiguous_external_mutation_held"
+                if any(str(error.get("category") or "") == "ambiguous_external_mutation" for error in primary_errors)
+                else "global_run_hold"
+            )
+            transaction["later_sources_released"] = False
+            aggregate["stopped_after_source_transaction"] = source_index
+            aggregate["stop_reason"] = transaction["state"]
+            persist_transactions()
+            break
+    finally:
+        if temporary_key_id:
+            temporary_key_cleanup = cleanup_temporary_desktop_api_key(api_url, temporary_key_id)
+
+    aggregate["temporary_key_cleanup"] = temporary_key_cleanup
+    aggregate["reused_cached_documents"] = len(aggregate["reused_cached_locations"])
+    states = [str(item.get("state") or "") for item in aggregate["source_transactions"]]
+    if any(state == "ambiguous_external_mutation_held" for state in states):
+        aggregate["status"] = "reconciliation_pending"
+    elif aggregate["errors"]:
+        aggregate["status"] = "error"
+    elif temporary_key_cleanup.get("status") == "delete_failed":
+        aggregate["status"] = "complete_with_key_cleanup_warning"
+    else:
+        aggregate["status"] = "complete"
+    persist_transactions()
+    return aggregate
+
+
 def maybe_upload_to_anythingllm(
     api_url,
     api_key,
@@ -14737,12 +15779,33 @@ def maybe_upload_to_anythingllm(
                     }
                 ],
             }
+        selected_rows = select_upload_payloads(upload_plan_rows or [], upload_limit, upload_indices)
+        source_keys = {
+            str(row.get("_automatic_source_path") or "").strip()
+            for row in selected_rows
+            if str(row.get("_automatic_source_path") or "").strip()
+        }
+        if len(source_keys) > 1:
+            return maybe_upload_segment_files_source_transactions(
+                api_url,
+                api_key,
+                selected_rows,
+                workspace_slug=workspace_slug,
+                folder_name=folder_name,
+                storage_dir=storage_dir,
+                embedding_ledger_path=embedding_ledger_path,
+                status_callback=status_callback,
+                batch_verifier=batch_verifier,
+                batch_inspector=batch_inspector,
+                cancel_callback=cancel_callback,
+                submission_receipt_path=submission_receipt_path,
+                run_id=run_id,
+                record_label=record_label,
+            )
         return maybe_upload_segment_files(
             api_url,
             api_key,
-            upload_plan_rows or [],
-            upload_limit=upload_limit,
-            upload_indices=upload_indices,
+            selected_rows,
             workspace_slug=workspace_slug,
             folder_name=folder_name,
             storage_dir=storage_dir,
@@ -15870,7 +16933,7 @@ def inspect_lancedb_workspace_table(storage_dir: Path, workspace_slug: str, samp
     return result
 
 
-def inspect_uploaded_location_files(storage_dir, upload_locations, expected_needles=None):
+def inspect_uploaded_location_files(storage_dir, upload_locations, expected_needles=None, expected_payloads=None):
     result = {
         "status": "not_checked",
         "existing_files": 0,
@@ -15885,6 +16948,7 @@ def inspect_uploaded_location_files(storage_dir, upload_locations, expected_need
         "rejected_locations": 0,
         "desktop_drawer_root_locations": 0,
         "desktop_drawer_nested_locations": 0,
+        "identity_mismatched_locations": 0,
     }
     documents_root = (Path(storage_dir) / "documents").resolve()
     reported_locations = [str(location) for location in (upload_locations or []) if location]
@@ -15915,8 +16979,10 @@ def inspect_uploaded_location_files(storage_dir, upload_locations, expected_need
     if not locations:
         result["status"] = "no_locations"
         return result
+    expected_payloads = list(expected_payloads or [])
+    use_exact_chunk_sources = bool(expected_payloads) and len(expected_payloads) == len(locations)
     try:
-        for path in locations:
+        for index, path in enumerate(locations):
             if not path.exists():
                 result["missing_locations"] += 1
                 continue
@@ -15932,7 +16998,26 @@ def inspect_uploaded_location_files(storage_dir, upload_locations, expected_need
                 result["sample_record"] = record
             if text_contains_page_or_segment_metadata(haystack):
                 result["metadata_visible"] = True
-            if not needles or any(needle in haystack for needle in needles):
+            expected_metadata = (
+                expected_payloads[index].get("metadata", {})
+                if use_exact_chunk_sources and isinstance(expected_payloads[index], dict)
+                else {}
+            )
+            expected_chunk_source = str(expected_metadata.get("chunkSource") or "").strip()
+            stored_chunk_source = str(
+                record.get("chunkSource")
+                or (record.get("metadata") or {}).get("chunkSource")
+                or ""
+            ).strip() if isinstance(record, dict) else ""
+            if expected_chunk_source:
+                # A generic title/page-number search can make another PDF's
+                # page 1 look like this PDF's page 1. Current native uploads
+                # carry a stable chunkSource, so require that exact identity.
+                if stored_chunk_source == expected_chunk_source:
+                    result["matching_files"] += 1
+                else:
+                    result["identity_mismatched_locations"] += 1
+            elif not needles or any(needle in haystack for needle in needles):
                 result["matching_files"] += 1
         result["status"] = "complete"
     except Exception as exc:
@@ -16040,6 +17125,7 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
         "upload_location_matching_files": 0,
         "upload_location_metadata_visible": False,
         "upload_location_sample_path": "",
+        "identity_mismatched_locations": 0,
         "desktop_drawer_root_locations": 0,
         "desktop_drawer_nested_locations": 0,
         "desktop_drawer_layout": "not_checked",
@@ -16156,6 +17242,7 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
                 storage_dir,
                 upload_locations,
                 expected_needles=expected_needles,
+                expected_payloads=expected_payloads,
             )
         )
         result["upload_location_existing_files"] = location_report.get("existing_files", 0)
@@ -16165,6 +17252,9 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
         result["upload_location_reported_count"] = location_report.get("reported_locations", 0)
         result["upload_location_missing_count"] = location_report.get("missing_locations", 0)
         result["upload_location_rejected_count"] = location_report.get("rejected_locations", 0)
+        result["identity_mismatched_locations"] = int(
+            location_report.get("identity_mismatched_locations", 0) or 0
+        )
         result["desktop_drawer_root_locations"] = location_report.get("desktop_drawer_root_locations", 0)
         result["desktop_drawer_nested_locations"] = location_report.get("desktop_drawer_nested_locations", 0)
         if result["desktop_drawer_nested_locations"]:
@@ -16455,6 +17545,22 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
                 result["status"] = "no_matching_native_docs"
                 result["classification"] = "current_submission_attachment_not_observed"
                 result["message"] = "No exact workspace attachment paths were observed for this recovery group."
+        elif normalized_upload_locations and result["expected_payload_count"] and (
+            result["upload_location_matching_files"] < result["expected_payload_count"]
+            or result["identity_mismatched_locations"]
+        ):
+            # Exact locations are an ownership boundary only if their stored
+            # native identity still matches the record we prepared. A vector
+            # for an older PDF with the same page number is not evidence that
+            # this submission became searchable. Do not let a workspace-wide
+            # chunkSource match override that contradiction.
+            result["status"] = "partial_vector_coverage"
+            result["classification"] = "current_submission_attachment_identity_mismatch"
+            result["message"] = (
+                "A current submission location did not retain the exact prepared chunk identity "
+                f"({result['upload_location_matching_files']}/{result['expected_payload_count']} matched; "
+                f"{result['identity_mismatched_locations']} mismatched). No record was retried automatically."
+            )
         elif result["identity_set_checked"] and not result["identity_set_complete"]:
             result["status"] = "partial_vector_coverage"
             result["classification"] = "page_parent_identity_set_mismatch"
@@ -17449,7 +18555,34 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             evidence_kind="source_hash_progress",
         )
 
-    source_sha = sha256_file(pdf_path, progress_callback=report_hash_progress)
+    # The Automatic batch runner may have just calculated this identity while
+    # checking whether a later selected path is byte-identical to an earlier
+    # one.  Reuse it only when the source still has the exact same inexpensive
+    # filesystem fingerprint.  A changed file falls back to the established
+    # streaming hash rather than trusting a stale parent-process value.
+    supplied_sha = str(getattr(args, "precomputed_source_sha256", "") or "").strip().lower()
+    supplied_fingerprint = getattr(args, "precomputed_source_fingerprint", {}) or {}
+    try:
+        current_stat = pdf_path.stat()
+        source_unchanged = (
+            isinstance(supplied_fingerprint, dict)
+            and int(supplied_fingerprint.get("size") or -1) == int(current_stat.st_size)
+            and int(supplied_fingerprint.get("mtime_ns") or -1) == int(current_stat.st_mtime_ns)
+        )
+    except OSError:
+        source_unchanged = False
+    if re.fullmatch(r"[0-9a-f]{64}", supplied_sha) and source_unchanged:
+        source_sha = supplied_sha
+        report_upload_phase(
+            "metadata",
+            "Source identity already verified for this run",
+            completed_units=0,
+            total_units=1,
+            fallback_fraction=0.0,
+            evidence_kind="source_hash_reused",
+        )
+    else:
+        source_sha = sha256_file(pdf_path, progress_callback=report_hash_progress)
     def report_metadata_progress(step, completed, total):
         detail = (
             "Profiling PDF page geometry"
@@ -19455,11 +20588,6 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         reconciliation_poll_started_elapsed = max(
             0.0, time.time() - reconciliation_started_at
         )
-        reconciliation_poll_hard_cap_seconds = max(
-            0.0,
-            float(ANYTHINGLLM_EMBEDDING_RECONCILIATION_ACTIVE_CAP_SECONDS)
-            - reconciliation_poll_started_elapsed,
-        )
 
         def extend_reconciliation_deadline(evidence, poll_elapsed, current_deadline):
             """Extend only while this run's owned Desktop queue proves movement.
@@ -19467,8 +20595,9 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             The receipt POST is intentionally never replayed.  Once it has
             timed out, fresh SSE queue progress or exact-vector progress is
             the only basis for continued observation.  A quiet/reconnecting
-            stream cannot prolong the run, and a hard cap prevents an endless
-            wait if Desktop stops reporting entirely.
+            stream cannot prolong the run. A 90-second liveness/stall rule,
+            rather than a global elapsed-time ceiling, ends observation if
+            Desktop stops reporting real progress.
             """
             evidence = dict(evidence or {})
             receipt_elapsed = float(
@@ -19505,30 +20634,17 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             )
             if not (owned_queue_active or recent_vector_progress):
                 return None
-            # Use the owned SSE cadence when it is available.  A fixed grace
-            # period repeatedly rewards a slow queue with arbitrary waits;
-            # this forecast says how long the remaining queue itself needs,
-            # plus a bounded settling margin for the last vectors.  The hard
-            # cap still protects a stream that keeps reconnecting forever.
             queue_remaining_seconds = evidence.get("desktop_queue_estimated_remaining_seconds")
-            try:
-                queue_remaining_seconds = max(0.0, float(queue_remaining_seconds))
-            except (TypeError, ValueError):
-                queue_remaining_seconds = None
-            forecast_deadline = (
-                poll_elapsed
-                + queue_remaining_seconds
-                + max(30.0, min(180.0, queue_remaining_seconds * 0.25))
-                if queue_remaining_seconds is not None else
-                poll_elapsed + ANYTHINGLLM_EMBEDDING_RECONCILIATION_PROGRESS_GRACE_SECONDS
+            extension = active_reconciliation_deadline(
+                current_deadline,
+                poll_elapsed,
+                owned_queue_active=owned_queue_active,
+                recent_vector_progress=recent_vector_progress,
+                queue_remaining_seconds=queue_remaining_seconds,
             )
-            extended = min(
-                reconciliation_poll_hard_cap_seconds,
-                max(
-                    float(current_deadline),
-                    forecast_deadline,
-                ),
-            )
+            if extension is None:
+                return None
+            extended = float(extension["deadline_seconds"])
             if extended > float(current_deadline):
                 reconciliation_tracker["deadline_extensions"] += 1
                 reconciliation_tracker["effective_deadline_seconds"] = (
@@ -19541,10 +20657,10 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 evidence["reconciliation_remaining_seconds"] = round(
                     max(0.0, extended - poll_elapsed), 3
                 )
-                evidence["reconciliation_deadline_forecast_from_queue_seconds"] = (
-                    round(float(queue_remaining_seconds), 3)
-                    if queue_remaining_seconds is not None else None
-                )
+                evidence["reconciliation_deadline_policy"] = str(extension["basis"])
+                evidence["reconciliation_deadline_forecast_from_queue_seconds"] = extension[
+                    "queue_remaining_seconds"
+                ]
                 return extended
             return None
 
@@ -19796,10 +20912,14 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             # batches. Successful observations still return immediately; the
             # longer cap is paid only by the exceptional timeout path.
             timeout_seconds=observation_timeout,
-            hard_cap_seconds=reconciliation_poll_hard_cap_seconds,
+            # A live owned queue has its own finite stall boundary. Do not
+            # silently reintroduce a global duration cap inside the generic
+            # poller after this evidence policy has granted an extension.
+            hard_cap_seconds=observation_timeout,
             observation_callback=report_batch_observation,
             retryable_evidence_codes={"partial_vector_coverage"},
             deadline_extension=extend_reconciliation_deadline,
+            allow_active_deadline_extension_beyond_hard_cap=True,
         )
         evidence = dict(polling.final_evidence)
         evidence.update(
@@ -19812,20 +20932,19 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         )
         if polling.status == "timeout":
             cap_classification = (
-                "reconciliation_cap_partial_vector_progress"
+                "reconciliation_stall_after_partial_vector_progress"
                 if int(reconciliation_tracker["highest_observed"]) > 0
-                else "reconciliation_cap_queue_heartbeat"
+                else "reconciliation_stall_after_queue_progress"
                 if int(evidence.get("desktop_queue_events_observed") or 0) > 0
                 and float(evidence.get("desktop_queue_last_event_age_seconds") or 10**9) <= 30.0
-                else "reconciliation_cap_storage_busy"
+                else "reconciliation_stall_with_storage_busy"
                 if reconciliation_tracker["storage_busy_observed"]
-                else "reconciliation_cap_no_new_evidence"
+                else "reconciliation_no_live_evidence"
             )
-            evidence["reconciliation_cap_classification"] = cap_classification
-            evidence["reconciliation_outcome"] = "bounded_window_exhausted"
+            evidence["reconciliation_stall_classification"] = cap_classification
+            evidence["reconciliation_outcome"] = "observation_stalled"
             evidence["message"] = (
-                f"AnythingLLM reconciliation reached its {float(evidence.get('reconciliation_effective_deadline_seconds') or reconciliation_deadline):.0f}-second "
-                "evidence-backed observation cap: "
+                "AnythingLLM reconciliation stopped receiving owned progress before exact vectors were confirmed: "
                 f"{int(evidence.get('matching_vector_rows') or evidence.get('lancedb_matching_rows') or 0)}/"
                 f"{len(expected_batch)} exact page-parent vectors were observed ({cap_classification})."
             )

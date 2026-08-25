@@ -29,6 +29,59 @@ def test_worker_contract_keeps_key_ephemeral_and_rejects_new_durable_fields():
         )
 
 
+def test_worker_contract_allows_a_verified_source_identity_snapshot():
+    payload, key = serializable_automatic_worker_arguments(
+        SimpleNamespace(
+            precomputed_source_sha256="a" * 64,
+            precomputed_source_fingerprint={"size": 123, "mtime_ns": 456},
+        )
+    )
+
+    assert key == ""
+    assert payload == {
+        "precomputed_source_sha256": "a" * 64,
+        "precomputed_source_fingerprint": {"size": 123, "mtime_ns": 456},
+    }
+
+
+def test_selected_input_duplicate_receipt_is_not_a_workspace_duplicate(tmp_path):
+    import rag_pdf_gradio_app as app
+
+    canonical = tmp_path / "canonical.pdf"
+    duplicate = tmp_path / "copy.pdf"
+    summary = app.selected_input_exact_duplicate_summary(
+        duplicate,
+        tmp_path / "output",
+        canonical_path=canonical,
+        source_sha256="b" * 64,
+    )
+
+    assert summary["post_upload_classification"] == "selected_input_exact_duplicate_skipped"
+    assert summary["api_upload_status"] == "skipped_exact_duplicate"
+    assert summary["selected_input_duplicate_of"] == str(canonical)
+    assert "workspace_duplicate_preflight" not in summary
+    assert (tmp_path / "output" / "selected-input-duplicate.json").is_file()
+
+
+def test_exact_selected_duplicate_is_a_successful_non_upload_completion():
+    import rag_pdf_gradio_app as app
+
+    summary = {
+        "pdf": "C:/copy.pdf",
+        "api_upload_status": "skipped_exact_duplicate",
+        "post_upload_verification_status": "pass",
+        "post_upload_classification": "selected_input_exact_duplicate_skipped",
+        "anythingllm_runtime_validation_status": "not_required_exact_selection_duplicate",
+    }
+
+    completion = app.automatic_completion([summary], prepare_and_upload=True)
+    receipt = app.automatic_completion_receipt([summary])
+
+    assert completion["state"] == "successful"
+    assert receipt["failed_pdfs"] == 0
+    assert receipt["selected_input_exact_duplicates"] == 1
+
+
 def test_selection_acknowledgement_only_becomes_ready_after_a_file_snapshot():
     import rag_pdf_gradio_app as app
 

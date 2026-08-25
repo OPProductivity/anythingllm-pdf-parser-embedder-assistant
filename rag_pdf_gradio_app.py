@@ -69,18 +69,15 @@ from embedder_capabilities import (
 
 from auto_anythingllm_pipeline import (
     AUTOMATIC_UPLOAD_PHASE_RANGES,
-    ANYTHINGLLM_EMBEDDING_RECONCILIATION_ACTIVE_CAP_SECONDS,
-    ANYTHINGLLM_EMBEDDING_RECONCILIATION_PROGRESS_GRACE_SECONDS,
     ANYTHINGLLM_EMBEDDING_RECONCILIATION_STALL_SECONDS,
     ANYTHINGLLM_EMBEDDING_RECONCILIATION_TIMEOUT_SECONDS,
-    ANYTHINGLLM_EMBEDDING_FAILURE_FALLBACK_CONCURRENT_BATCHES,
-    ANYTHINGLLM_EMBEDDING_MAX_CONCURRENT_BATCHES,
     ANYTHINGLLM_EMBEDDING_SUBMISSION_STRATEGY,
     ANYTHINGLLM_EMBEDDING_UPDATE_BATCH_SIZE,
     ANYTHINGLLM_EMBEDDING_VERIFICATION_CHECKPOINT_INTERVAL,
     ANYTHINGLLM_RAW_TEXT_METADATA_FIELDS,
     ANYTHINGLLM_SOURCE_CONTRACT,
     apply_recommended_anythingllm_settings,
+    active_reconciliation_deadline,
     atomic_write_text,
     anythingllm_desktop_process_running,
     anythingllm_storage_audit,
@@ -137,8 +134,9 @@ from auto_anythingllm_pipeline import (
     select_upload_payloads,
     simulation_app_config,
     simulation_preflight,
+    storage_observation_due_for_queue,
     verify_anythingllm_upload_auth,
-    update_workspace_embeddings_batched,
+    update_workspace_embeddings_desktop_queue,
     upload_plan_rows_to_expected_payloads,
     verify_anythingllm_post_upload,
     validate_anythingllm_native_runtime,
@@ -223,11 +221,19 @@ GRADIO_DOWNLOAD_CACHE_DIR = Path(tempfile.gettempdir()) / "anythingllm-pdf-prep-
 # Folder selection is an interactive UI operation, not a bulk-ingestion API.
 # Keep its browser payload and preflight work bounded; a user can select a
 # narrower subfolder when a library exceeds this deliberately generous limit.
-BATCH_FOLDER_MAX_DOCUMENTS = 750
-BATCH_FOLDER_VISIBLE_FILE_LIMIT = 60
+# The interactive picker deliberately stays bounded: it retains a live
+# browser selection plus complete read-only preview evidence for every PDF.
+# Upload processing itself is already source-windowed, so a 1,000-file
+# selection is sequentially handed to Desktop one source at a time without
+# turning the picker into an unbounded browser-payload queue.
+BATCH_FOLDER_MAX_DOCUMENTS = 1000
 BATCH_FOLDER_INITIAL_PROFILE_DOCUMENT_LIMIT = 12
 BATCH_FOLDER_FULL_PROFILE_DOCUMENT_LIMIT = 24
 BATCH_FOLDER_SCAN_PROGRESS_INTERVAL = 128
+# A streamed browser update is materially more expensive than the small
+# counter change it carries. Four-file milestones keep a large folder visibly
+# alive without adding dozens of Gradio round-trips to the inspection itself.
+BATCH_FOLDER_PAGE_PREVIEW_PROGRESS_INTERVAL = 4
 APP_VERSION = package_resource_path("VERSION").read_text(encoding="utf-8").strip()
 # Last committed base checkpoint for the 0.5.0 release line.
 APP_BASE_COMMIT = "portable-package"
@@ -4871,6 +4877,31 @@ WORKSPACE_SOURCE_IDENTITY_CACHE_LOCK = threading.Lock()
 _WORKSPACE_AUTHOR_STOP_WORDS = {
     "a", "an", "and", "by", "for", "from", "in", "of", "on", "the", "to", "with",
 }
+# A workspace name is a compact, user-facing mnemonic, so it must be more
+# precision-oriented than the pipeline's broader metadata record.  The full
+# pipeline may retain a weak opening-page name for review, but a title-shaped
+# line must never silently become a surname in a workspace suggestion.
+_WORKSPACE_PERSON_EVIDENCE_SOURCES = frozenset({
+    "pdf_metadata",
+    "text_byline",
+    "text_written_by",
+    "text_edited_by",
+    "text_review_byline",
+    "text_column_byline",
+    "text_author_label",
+    "text_writer_label",
+    "text_bibliographic_author_label",
+    "text_instructor_label",
+    "text_affiliated_byline",
+    "text_adjacent_affiliated_byline",
+    "text_stacked_affiliated_byline",
+    "text_bibliographic_byline",
+    "text_compact_caps_byline",
+    "text_titlepage_publisher_byline",
+    "text_first_lines_stacked_byline",
+    "text_role_followup",
+    "filename_explicit_byline",
+})
 WORKSPACE_UNKNOWN_SOURCE_LABEL = "Unknown"
 _WORKSPACE_INSTITUTIONAL_SUFFIXES = (
     "Association", "Organization", "Agency", "Centre", "Center", "Institute",
@@ -5046,18 +5077,34 @@ def workspace_person_identity_from_pdf(pdf_file):
                 author_report = {**author_report, "source": "pdf_metadata"}
     except Exception:
         return {}
+    source = str(author_report.get("source") or "")
+    # The shared pipeline intentionally retains a weak title-block result in
+    # its reviewable metadata when no stronger signal exists. That preserves
+    # useful evidence for a human, but it is not adequate to name a workspace.
+    # In particular, a two-word title fragment can look person-shaped once the
+    # PDF's title metadata is missing or unrelated. Require an explicit credit,
+    # verified PDF author metadata, or a structurally constrained title-page
+    # form before deriving a compact surname. This is evidence-based rather
+    # than a blacklist of incidental words such as "Bold" or "Edition".
+    if source not in _WORKSPACE_PERSON_EVIDENCE_SOURCES:
+        return {}
     # The shared inference result can contain multiple authors. A workspace
     # needs one compact label per selected PDF, so retain the first resolved
     # person rather than treating an outlet/topic tail as another label.
     first_author = re.split(r"\s*(?:,|;|\band\b|&)\s*", author, maxsplit=1, flags=re.I)[0]
-    words = re.findall(r"[^\W\d_][\w'’-]*", first_author, flags=re.UNICODE)
-    if not words or ({word.casefold() for word in words} & _WORKSPACE_AUTHOR_STOP_WORDS):
+    # Reapply the canonical person-shape validation to the complete first
+    # credit. ``infer_author_from_initial_pdf_pages`` normally does this, but
+    # PDF metadata and legacy report shapes are external inputs. Validating the
+    # full credit (rather than only its last token) prevents a bare ``Bold``,
+    # ``Edition``, or similar title/publisher remnant from becoming a label.
+    person_author = normalize_metadata_author(first_author)
+    words = re.findall(r"[^\W\d_][\w'’-]*", person_author, flags=re.UNICODE)
+    if len(words) < 2 or ({word.casefold() for word in words} & _WORKSPACE_AUTHOR_STOP_WORDS):
         return {}
     result = words[-1]
     if result.isupper():
         result = result.capitalize()
     label = result[:1].upper() + result[1:]
-    source = str(author_report.get("source") or "")
     if source == "pdf_metadata":
         provenance = "embedded PDF author metadata"
     elif source == "not_available":
@@ -5110,7 +5157,7 @@ def workspace_source_identity_from_pdf(pdf_file):
         return fallback
     try:
         inspection_key = pdf_picker_native_inspection_key(path)
-        cache_key = ("workspace-source-identity-v1", *inspection_key)
+        cache_key = ("workspace-source-identity-v2", *inspection_key)
     except OSError:
         cache_key = None
     if cache_key is not None:
@@ -5185,12 +5232,45 @@ def workspace_source_identity_plan_html(pdf_files):
     )
 
 
+WORKSPACE_NAME_IDENTITY_LOOKAHEAD_LIMIT = 12
+WORKSPACE_NAME_IDENTITY_LOOKAHEAD_SECONDS = 3.0
+
+
 def batch_workspace_author_labels(pdf_files):
-    """Compatibility helper returning ordered workspace source-identity labels."""
+    """Compatibility helper returning ordered workspace source-identity labels.
+
+    This historical helper deliberately retains its complete-list contract for
+    callers that explicitly need a full source-identity plan.  The editable
+    workspace-name suggestion below uses the bounded companion instead: a
+    376-file folder must not wait for 376 title-page reads before its valid
+    selection can be confirmed.
+    """
     return [identity["label"] for identity in workspace_source_identity_plan(pdf_files)]
 
 
-def workspace_name_from_batch_labels(labels, *, date_stamp=None):
+def batch_workspace_author_labels_for_suggestion(pdf_files):
+    """Return the useful leading identity labels without blocking a batch.
+
+    A workspace mnemonic has a fixed visible length, so source identities
+    beyond its usable prefix cannot affect the editable suggestion.  Resolve
+    only that prefix and mark any unexamined tail with ``-etc``.  This is a
+    presentation optimisation only: full per-PDF metadata remains part of the
+    ordinary preparation pipeline, and every selected PDF remains in the run.
+    """
+    files = normalize_file_list(pdf_files)
+    labels = []
+    started = time.monotonic()
+    for index, pdf_file in enumerate(files):
+        if index >= WORKSPACE_NAME_IDENTITY_LOOKAHEAD_LIMIT:
+            return labels, True
+        if index and time.monotonic() - started >= WORKSPACE_NAME_IDENTITY_LOOKAHEAD_SECONDS:
+            return labels, True
+        identity = workspace_source_identity_from_pdf(pdf_file)
+        labels.append(str(identity.get("label") or WORKSPACE_UNKNOWN_SOURCE_LABEL))
+    return labels, False
+
+
+def workspace_name_from_batch_labels(labels, *, date_stamp=None, has_unexamined_tail=False):
     """Build a compact, whole-label batch name within the visible name limit.
 
     Retain the date only when it does not displace another selected source.
@@ -5205,7 +5285,7 @@ def workspace_name_from_batch_labels(labels, *, date_stamp=None):
     def best_candidate(include_date):
         date_suffix = f" {date_stamp}" if include_date else ""
         for count in range(len(labels), 0, -1):
-            omitted = count < len(labels)
+            omitted = count < len(labels) or bool(has_unexamined_tail)
             source = "-".join(labels[:count]) + ("-etc" if omitted else "")
             candidate = source + date_suffix
             if len(candidate) <= WORKSPACE_NAME_SOURCE_LABEL_LIMIT:
@@ -5235,8 +5315,11 @@ def document_workspace_name(document_label, pdf_files):
         # A batch needs a useful, editable mnemonic rather than inheriting the
         # first selected filename. Keep the labels visually separable and make
         # any omitted tail explicit rather than stopping at a long fallback.
-        labels = batch_workspace_author_labels(files)
-        source_name = workspace_name_from_batch_labels(labels)
+        labels, has_unexamined_tail = batch_workspace_author_labels_for_suggestion(files)
+        source_name = workspace_name_from_batch_labels(
+            labels,
+            has_unexamined_tail=has_unexamined_tail,
+        )
         batch_name_generated = bool(source_name)
     if not source_name and files:
         source_name = Path(files[0]).stem
@@ -5257,6 +5340,41 @@ def suggested_document_workspace_name(document_label, pdf_files):
     return lancedb_safe_workspace_name(document_workspace_name(document_label, pdf_files))
 
 
+def workspace_name_auto_state(value=None):
+    """Normalize the small browser-local state behind the editable suggestion."""
+    if isinstance(value, dict):
+        return {
+            "suggestion": str(value.get("suggestion") or ""),
+            "selection_signature": str(value.get("selection_signature") or ""),
+            "user_edited": bool(value.get("user_edited")),
+        }
+    # Older browser tabs can still send the former string marker after a
+    # server refresh. Treat it as an automatic suggestion, never as a manual
+    # edit, so the first settled selection can safely replace it.
+    return {
+        "suggestion": str(value or ""),
+        "selection_signature": "",
+        "user_edited": False,
+    }
+
+
+def workspace_name_selection_signature(pdf_files, folder_pdf_files=None):
+    """Return a compact, deterministic identity for the selected PDF set."""
+    selected_files = list(dict.fromkeys(
+        normalize_file_list(pdf_files) + normalize_file_list(folder_pdf_files)
+    ))
+    encoded = "\0".join(str(path) for path in selected_files).encode("utf-8", "surrogatepass")
+    return hashlib.sha256(encoded).hexdigest() if selected_files else ""
+
+
+def mark_new_workspace_name_manual_edit(current_name, last_suggestion=None):
+    """Record a user edit without confusing a prior automatic value for one."""
+    state = workspace_name_auto_state(last_suggestion)
+    current = str(current_name or "").strip()
+    state["user_edited"] = bool(current and current != state["suggestion"])
+    return state
+
+
 @automatic_next_run_callback(2)
 def update_new_workspace_name_control(
     workspace_slug,
@@ -5270,21 +5388,36 @@ def update_new_workspace_name_control(
     # Keep the callable backward-compatible for non-UI integrations that
     # supplied the former five positional arguments before folder batches had
     # their own workspace-label input.
+    legacy_call = last_suggestion is None
     if last_suggestion is None:
         last_suggestion = current_name
         current_name = folder_pdf_files
         folder_pdf_files = []
     if not is_new_document_workspace_choice(workspace_slug):
-        return gr.update(visible=False), last_suggestion or ""
+        return gr.update(visible=False), workspace_name_auto_state(last_suggestion)
     selected_files = list(dict.fromkeys(
         normalize_file_list(pdf_files) + normalize_file_list(folder_pdf_files)
     ))
     suggestion = suggested_document_workspace_name(document_label, selected_files)
     current = str(current_name or "").strip()
-    # Preserve a deliberate edit. Metadata refreshes may happen after upload,
-    # so only replace an empty field or the previous automatic suggestion.
-    value = suggestion if not current or current == str(last_suggestion or "") else current
-    return gr.update(value=value, visible=True, interactive=True), suggestion
+    state = workspace_name_auto_state(last_suggestion)
+    if legacy_call and current and current != state["suggestion"]:
+        # Direct callers of the former signature have no browser ``input``
+        # event. Preserve its established behavior by treating a different
+        # supplied value as an intentional edit.
+        state["user_edited"] = True
+    # A selection-driven refresh and its derived metadata callbacks can arrive
+    # in different orders. Previously a newer marker could make the old
+    # automatic value look user-authored, leaving the wrong source mnemonic in
+    # the field. Only a browser-originated text edit sets ``user_edited``;
+    # otherwise this control always follows the latest settled selection.
+    value = current if state["user_edited"] and current else suggestion
+    next_state = {
+        "suggestion": suggestion,
+        "selection_signature": workspace_name_selection_signature(pdf_files, folder_pdf_files),
+        "user_edited": bool(state["user_edited"] and value == current),
+    }
+    return gr.update(value=value, visible=True, interactive=True), next_state
 
 
 def create_new_document_workspace(api_url, api_key, document_label, pdf_files, workspace_name_override=""):
@@ -7264,14 +7397,222 @@ def latest_resume_manifest_html(workspace_slug):
     path, manifest = latest_resume_manifest(workspace_slug)
     if path and manifest:
         recovery = manifest.get("recovery") or {}
+        rows = recovery_remaining_source_rows(manifest, manifest_path=path)
+        remaining_locations = len(recovery.get("remaining_locations") or [])
+        source_summary = (
+            f" across {len(rows)} PDF(s)" if rows else ""
+        )
         return (
-                '<div class="metadata-summary"><section class="metadata-file"><div class="metadata-file-name">Interrupted embedding recovery available</div>'
-                f'<div class="metadata-status">Resume from batch {html.escape(str(recovery.get("from_batch")))} with '
-                f'{html.escape(str(len(recovery.get("remaining_locations") or [])))} prepared locations. '
-                'The manifest is an audit artifact only; resuming remains an explicit operator action.</div>'
+                '<div class="metadata-summary"><section class="metadata-file"><div class="metadata-file-name">Embedding recovery ready</div>'
+                f'<div class="metadata-status">{html.escape(str(remaining_locations))} prepared page record(s){source_summary} remain unresolved. '
+                'Resume submits only those records. Skip marks selected PDFs out of this recovery plan and keeps their local evidence.</div>'
                 f'<div class="metadata-status"><code>{html.escape(str(path))}</code></div></section></div>'
             )
     return '<div class="artifact-placeholder">No interrupted embedding recovery manifest was found for this workspace.</div>'
+
+
+def recovery_remaining_source_rows(manifest, *, manifest_path=None):
+    """Return durable, source-local pending work from one recovery manifest.
+
+    The location list remains the only resubmission authority.  These rows are
+    a human-facing grouping of those same locations so Skip can isolate one
+    prepared PDF without deleting its evidence or silently dropping siblings.
+    """
+    recovery = dict((manifest or {}).get("recovery") or {})
+    remaining = {str(location) for location in recovery.get("remaining_locations") or [] if str(location).strip()}
+    rows = []
+    for item in recovery.get("remaining_sources") or []:
+        if not isinstance(item, dict):
+            continue
+        locations = [str(location) for location in item.get("locations") or [] if str(location) in remaining]
+        if not locations:
+            continue
+        source_path = str(item.get("source_path") or "")
+        filename = str(Path(source_path).name or item.get("filename") or "Prepared PDF")
+        source_key = str(item.get("source_key") or source_path or filename)
+        rows.append({
+            "source_key": source_key,
+            "source_path": source_path,
+            "filename": filename,
+            "locations": locations,
+            "record_count": len(locations),
+        })
+    if rows or not manifest_path:
+        return rows
+    # Recovery manifests created before source-local planning still have a
+    # complete attachment receipt. Reconstruct labels from that immutable
+    # receipt so the new UI can help the current interrupted run too. The
+    # exact remaining locations remain authoritative; this fallback never
+    # guesses from display names or filename stems.
+    try:
+        report = _read_automatic_run_json(Path(manifest_path).parent / "batch-native-upload-report.json")
+    except (OSError, TypeError, ValueError):
+        report = {}
+    by_source = {}
+    for attachment in (report.get("attachment_results") or []):
+        if not isinstance(attachment, dict):
+            continue
+        location = str(attachment.get("location") or "")
+        if location not in remaining:
+            continue
+        source_path = str(attachment.get("source_path") or "")
+        filename = str(Path(source_path).name or attachment.get("filename") or "Prepared PDF")
+        source_key = source_path or filename
+        group = by_source.setdefault(source_key, {
+            "source_key": source_key,
+            "source_path": source_path,
+            "filename": filename,
+            "locations": [],
+        })
+        group["locations"].append(location)
+    for group in by_source.values():
+        group["record_count"] = len(group["locations"])
+        rows.append(group)
+    return rows
+
+
+def latest_resume_manifest_controls(workspace_slug):
+    """Render recovery status and safe source-local Skip choices together."""
+    path, manifest = latest_resume_manifest(workspace_slug)
+    rows = recovery_remaining_source_rows(manifest, manifest_path=path) if manifest else []
+    choices = [
+        (f"{row['filename']} — {row['record_count']} unresolved page record(s)", row["source_key"])
+        for row in rows
+    ]
+    visible = bool(choices)
+    return (
+        latest_resume_manifest_html(workspace_slug),
+        gr.update(choices=choices, value=[], visible=visible),
+        # Keep the component mounted while hidden. Its handler still validates
+        # the selection and queue state immediately before any manifest change.
+        gr.update(visible=visible, interactive=visible, value="Skip selected PDFs"),
+        gr.update(interactive=bool(path and manifest)),
+    )
+
+
+def skip_pending_recovery_sources(api_url, api_key, workspace_slug, selected_source_keys):
+    """Mark selected pending PDFs skipped without touching AnythingLLM data."""
+    path, manifest = latest_resume_manifest(workspace_slug)
+    if not path or not manifest:
+        return (
+            '<div class="artifact-placeholder"><strong>No pending recovery was found.</strong></div>',
+            gr.update(choices=[], value=[], visible=False),
+            gr.update(visible=False),
+            gr.update(),
+        )
+    selected = {str(value) for value in (selected_source_keys or []) if str(value).strip()}
+    rows = recovery_remaining_source_rows(manifest, manifest_path=path)
+    by_key = {row["source_key"]: row for row in rows}
+    if not selected or not selected.issubset(by_key):
+        return (
+            latest_resume_manifest_html(workspace_slug),
+            gr.update(choices=[(f"{row['filename']} — {row['record_count']} unresolved page record(s)", row["source_key"]) for row in rows], value=[], visible=bool(rows)),
+            gr.update(visible=bool(rows), interactive=bool(rows), value="Skip selected PDFs"),
+            gr.update(value="Choose at least one pending PDF", variant="secondary"),
+        )
+    # A client timeout never proves AnythingLLM stopped working. Before a user
+    # can classify records as skipped, reconcile exact late vectors and refuse
+    # the classification if the queue is active or cannot be observed. This is
+    # deliberately the same boundary used before an explicit recovery submit.
+    remaining, reconciliation = persist_reconciled_resume_manifest(path, manifest)
+    if not remaining:
+        return (
+            '<div class="artifact-placeholder"><strong>No pending recovery remains.</strong> Exact vector reconciliation completed it.</div>',
+            gr.update(choices=[], value=[], visible=False),
+            gr.update(visible=False),
+            gr.update(value="Nothing to skip", variant="secondary"),
+        )
+    # Re-read the manifest after reconciliation, because it may have removed
+    # individual locations while retaining siblings from the same PDF.
+    manifest = _read_automatic_run_json(path)
+    rows = recovery_remaining_source_rows(manifest, manifest_path=path)
+    by_key = {row["source_key"]: row for row in rows}
+    selected = {key for key in selected if key in by_key}
+    if not selected:
+        return (
+            latest_resume_manifest_html(workspace_slug),
+            gr.update(choices=[(f"{row['filename']} — {row['record_count']} unresolved page record(s)", row["source_key"]) for row in rows], value=[], visible=bool(rows)),
+            gr.update(visible=bool(rows), interactive=bool(rows), value="Skip selected PDFs"),
+            gr.update(value="Pending locations changed — choose again", variant="secondary"),
+        )
+    resolved_api = (api_url or DEFAULT_ANYTHINGLLM_API_URL).strip()
+    secret = (api_key or "").strip()
+    if not secret:
+        secret, _authentication_mode = resolve_anythingllm_api_key(resolved_api)
+    if not secret:
+        return (
+            latest_resume_manifest_html(workspace_slug),
+            gr.update(choices=[(f"{row['filename']} — {row['record_count']} unresolved page record(s)", row["source_key"]) for row in rows], value=[], visible=bool(rows)),
+            gr.update(visible=bool(rows), interactive=bool(rows), value="Skip selected PDFs"),
+            gr.update(value="Skip needs AnythingLLM API authorization", variant="stop"),
+        )
+    activity = observe_workspace_embedding_queue_activity(
+        resolved_api,
+        secret,
+        str(manifest.get("workspace_slug") or ""),
+        [location for row in rows for location in row["locations"]],
+        observation_seconds=2.0,
+    )
+    activity_status = str(activity.get("status") or "")
+    if activity_status != "idle":
+        message = {
+            "owned_activity_observed": "AnythingLLM is still processing these records; no PDF was skipped.",
+            "non_owned_activity_observed": "AnythingLLM is processing other workspace activity; no PDF was skipped.",
+            "stream_unavailable_uncertain": "AnythingLLM queue activity could not be observed safely; no PDF was skipped.",
+        }.get(activity_status, "AnythingLLM queue state is not proven idle; no PDF was skipped.")
+        return (
+            latest_resume_manifest_html(workspace_slug),
+            gr.update(choices=[(f"{row['filename']} — {row['record_count']} unresolved page record(s)", row["source_key"]) for row in rows], value=[], visible=bool(rows)),
+            gr.update(visible=bool(rows), interactive=bool(rows), value="Skip selected PDFs"),
+            gr.update(value=message, variant="stop"),
+        )
+    skipped_rows = [by_key[key] for key in selected]
+    skipped_locations = {location for row in skipped_rows for location in row["locations"]}
+    recovery = dict(manifest.get("recovery") or {})
+    recovery["remaining_locations"] = [
+        str(location) for location in recovery.get("remaining_locations") or []
+        if str(location) not in skipped_locations
+    ]
+    recovery["remaining_sources"] = [row for row in rows if row["source_key"] not in selected]
+    prior_skips = [item for item in recovery.get("skipped_sources") or [] if isinstance(item, dict)]
+    skip_epoch = datetime.now().isoformat(timespec="seconds")
+    recovery["skipped_sources"] = prior_skips + [
+        {
+            "source_key": row["source_key"],
+            "source_path": row["source_path"],
+            "filename": row["filename"],
+            "record_count": row["record_count"],
+            "skipped_at": skip_epoch,
+            "reason": "operator_selected_skip",
+        }
+        for row in skipped_rows
+    ]
+    if recovery["remaining_locations"]:
+        recovery["state"] = "resume_available"
+        recovery["operator_note"] = "Selected PDFs were skipped locally; only the remaining prepared locations may be resumed."
+    else:
+        recovery["state"] = "skipped"
+        recovery["operator_note"] = "All unresolved prepared PDFs were explicitly skipped. Their local evidence was retained."
+    manifest["recovery"] = recovery
+    _write_automatic_run_json(path, manifest)
+    remaining_rows = recovery_remaining_source_rows(manifest, manifest_path=path)
+    remaining_count = len(recovery["remaining_locations"])
+    skipped_count = len(recovery["skipped_sources"])
+    message = (
+        f'<div class="metadata-summary"><section class="metadata-file"><div class="metadata-file-name">Recovery selection updated</div>'
+        f'<div class="metadata-status">{len(skipped_rows)} PDF(s) skipped; {remaining_count} prepared page record(s) remain across {len(remaining_rows)} PDF(s). '
+        f'Local files and recovery evidence were retained. {skipped_count} PDF(s) are now marked skipped.</div></section></div>'
+    )
+    choices = [
+        (f"{row['filename']} — {row['record_count']} unresolved page record(s)", row["source_key"])
+        for row in remaining_rows
+    ]
+    return (
+        message,
+        gr.update(choices=choices, value=[], visible=bool(choices)),
+        gr.update(visible=bool(choices), interactive=bool(choices), value="Skip selected PDFs"),
+        gr.update(value="Resume pending embedding batches", variant="secondary", interactive=bool(remaining_count)),
+    )
 
 
 def reconcile_resume_manifest_late_vectors(manifest):
@@ -7396,6 +7737,114 @@ def persist_reconciled_resume_manifest(path, manifest):
     return locations, reconciliation
 
 
+def recovery_payloads_by_location(locations):
+    """Rebuild only the metadata needed for exact recovery observation.
+
+    A recovery manifest is intentionally location-authoritative.  The native
+    documents at those locations retain the metadata needed to prove that a
+    newly resumed source window has attached and become searchable, without
+    turning a stable source hash into proof for a newer submission.
+    """
+    documents_root = default_anythingllm_documents_dir().resolve()
+    payloads = {}
+    errors = []
+    for raw_location in locations or []:
+        location = str(raw_location or "").replace("\\", "/").lstrip("/")
+        if not location:
+            continue
+        candidate = (documents_root / Path(location.replace("/", os.sep))).resolve()
+        try:
+            candidate.relative_to(documents_root)
+        except ValueError:
+            errors.append({"location": location, "error": "unsafe_location"})
+            continue
+        try:
+            native_document = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            errors.append({"location": location, "error": f"document_unavailable: {exc}"})
+            continue
+        metadata = {
+            key: native_document.get(key)
+            for key in ANYTHINGLLM_RAW_TEXT_METADATA_FIELDS
+            if native_document.get(key) not in {None, ""}
+        }
+        payloads[location] = {"metadata": metadata}
+    return payloads, errors
+
+
+def recovery_source_window_verifier(storage_dir, workspace_slug, payloads_by_location, *, status_callback=None):
+    """Return an exact, source-local verifier for explicit recovery submits.
+
+    Recovery used to submit all pending raw locations through the generic
+    batch updater.  That collapsed the normal per-PDF source-window boundary
+    and let a single ambiguous receipt re-create a broad unknown queue.  This
+    verifier keeps the existing exact raw-location-to-vector proof for each
+    resumed PDF before its later sibling may be submitted.
+    """
+    def verify(batch_report):
+        locations = [
+            str(location or "").replace("\\", "/").lstrip("/")
+            for location in (batch_report.get("locations") or [])
+            if str(location or "").strip()
+        ]
+        payloads = [payloads_by_location[location] for location in locations if location in payloads_by_location]
+        if len(payloads) != len(locations):
+            return {
+                "status": "error",
+                "classification": "recovery_payload_unavailable",
+                "message": "One or more prepared recovery documents could not be read safely; no later source was submitted.",
+            }
+        started = time.monotonic()
+        last_report = {}
+        while True:
+            last_report = verify_anythingllm_post_upload(
+                storage_dir,
+                workspace_slug,
+                "",
+                payloads,
+                upload_locations=locations,
+                observation_mode="current_upload",
+            )
+            if bool(last_report.get("current_upload_vector_evidence_complete")):
+                vector_count = int(last_report.get("current_upload_document_vector_count") or 0)
+                return {
+                    **last_report,
+                    "status": "pass",
+                    # The lower-level scheduler uses this count only as an
+                    # additional guard; it remains scoped to these exact raw
+                    # locations, never to a historical source identity.
+                    "lancedb_matching_rows": max(
+                        int(last_report.get("lancedb_matching_rows") or 0),
+                        vector_count,
+                    ),
+                }
+            elapsed = time.monotonic() - started
+            if elapsed >= ANYTHINGLLM_EMBEDDING_RECONCILIATION_TIMEOUT_SECONDS:
+                return {
+                    **last_report,
+                    "status": "timeout",
+                    "classification": "recovery_source_window_exact_vector_timeout",
+                    "message": (
+                        "AnythingLLM accepted or may have accepted this recovery source, but exact vectors were not "
+                        "observed before the source-window boundary. Later PDFs remain held."
+                    ),
+                    "reconciliation_elapsed_seconds": round(elapsed, 3),
+                    "reconciliation_effective_deadline_seconds": ANYTHINGLLM_EMBEDDING_RECONCILIATION_TIMEOUT_SECONDS,
+                }
+            if callable(status_callback):
+                observed = int(last_report.get("current_upload_document_vector_count") or 0)
+                status_callback(
+                    f"Checking resumed source vectors: {observed}/{len(locations)} prepared record(s) confirmed",
+                    {
+                        "timing_event": "recovery_source_window_observation",
+                        "requested": len(locations),
+                        "matching_vectors": observed,
+                    },
+                )
+            time.sleep(2.0)
+    return verify
+
+
 def submit_embedding_resume_manifest(
     path,
     manifest,
@@ -7512,32 +7961,82 @@ def submit_embedding_resume_manifest(
                 message="Another PDF Assistant process currently owns the AnythingLLM mutation lane; no recovery resume was submitted.",
             )
             return result
-        resume_parallelism = max(
-            1,
-            min(
-                int(manifest.get("recommended_resume_parallelism") or ANYTHINGLLM_EMBEDDING_FAILURE_FALLBACK_CONCURRENT_BATCHES),
-                ANYTHINGLLM_EMBEDDING_MAX_CONCURRENT_BATCHES,
-            ),
-        )
+        source_rows = recovery_remaining_source_rows(manifest, manifest_path=path)
+        source_by_location = {
+            str(location or "").replace("\\", "/").lstrip("/"): row
+            for row in source_rows
+            for location in (row.get("locations") or [])
+            if str(location or "").strip()
+        }
+        payloads_by_location, payload_errors = recovery_payloads_by_location(locations)
+        if payload_errors or len(payloads_by_location) != len(locations):
+            result.update(
+                status="resume_recovery_documents_unavailable",
+                reconciled_locations=reconciled_count,
+                message="One or more retained recovery documents could not be read safely; no recovery source was submitted.",
+                payload_errors=payload_errors,
+            )
+            return result
+        unattributed = [
+            location for location in locations
+            if (
+                str(location or "").replace("\\", "/").lstrip("/") not in source_by_location
+                or not str(
+                    source_by_location.get(
+                        str(location or "").replace("\\", "/").lstrip("/"), {}
+                    ).get("source_path") or ""
+                ).strip()
+            )
+        ]
+        if unattributed:
+            result.update(
+                status="resume_source_attribution_unavailable",
+                reconciled_locations=reconciled_count,
+                message="Recovery cannot safely reconstruct per-PDF source windows for every remaining record; no broad fallback batch was submitted.",
+            )
+            return result
+        location_sources = [
+            {
+                "location": str(location or "").replace("\\", "/").lstrip("/"),
+                "source_path": str(source_by_location[str(location or "").replace("\\", "/").lstrip("/")].get("source_path") or ""),
+            }
+            for location in locations
+        ]
         try:
-            report = update_workspace_embeddings_batched(
+            report = update_workspace_embeddings_desktop_queue(
                 resolved_api,
                 secret,
                 slug,
                 locations,
-                batch_size=manifest.get("batch_size") or ANYTHINGLLM_EMBEDDING_UPDATE_BATCH_SIZE,
                 # The recovery manifest is the durable proof of what may be
-                # resumed.  Do not let a new transport attempt overwrite it.
-                ledger_path=path.with_name("resume-embedding-attempt-ledger.json"),
-                concurrent_batch_limit=resume_parallelism,
-                initial_concurrent_batches=resume_parallelism,
+                # resumed.  Keep its source boundaries intact: a recovered
+                # PDF is one sequential Desktop window, and the next source
+                # is not submitted until this source has exact vector proof.
+                ledger_path=path.with_name("resume-source-window-attempt-ledger.json"),
                 status_callback=status_callback,
+                batch_verifier=recovery_source_window_verifier(
+                    default_anythingllm_storage_dir(),
+                    slug,
+                    payloads_by_location,
+                    status_callback=status_callback,
+                ),
+                location_sources=location_sources,
             )
         finally:
             release_automatic_anythingllm_mutation_lease()
     finally:
         if temporary_key_id:
             delete_temporary_desktop_api_key(resolved_api, temporary_key_id)
+    if report.get("stopped_after_source_window"):
+        result.update(
+            status="resume_source_window_held",
+            reconciled_locations=reconciled_count,
+            accepted=int(report.get("accepted") or 0),
+            message=(
+                "A resumed PDF did not reach exact vector confirmation; later recovery PDFs were held and no broad fallback batch was submitted."
+            ),
+        )
+        return result
     if report.get("errors"):
         result.update(status="resume_failed", reconciled_locations=reconciled_count, message="Resume stopped; review the recovery manifest.")
         return result
@@ -7568,6 +8067,9 @@ def resume_latest_embedding_manifest(api_url, api_key, workspace_slug):
         "resume_blocked_other_queue_active",
         "resume_blocked_queue_unavailable",
         "resume_blocked_assistant_mutation_active",
+        "resume_source_window_held",
+        "resume_source_attribution_unavailable",
+        "resume_recovery_documents_unavailable",
     }:
         message = str(result.get("message") or "Recovery resume was left unchanged for queue safety.")
         return latest_resume_manifest_html(workspace_slug), gr.update(value=message, variant="stop")
@@ -7581,6 +8083,17 @@ def resume_latest_embedding_manifest(api_url, api_key, workspace_slug):
         'acceptance alone is not a retrieval-success claim.</div></section></div>',
         gr.update(value="Resume submitted — verify workspace", variant="secondary"),
     )
+
+
+def resume_latest_embedding_manifest_controls(api_url, api_key, workspace_slug):
+    """Keep the source-local recovery controls synchronized after Resume."""
+    status_html, resume_update = resume_latest_embedding_manifest(api_url, api_key, workspace_slug)
+    _current_html, choices_update, skip_update, manifest_resume_update = latest_resume_manifest_controls(workspace_slug)
+    # The resume result is the useful immediate feedback; the manifest helper
+    # only supplies the current source choices and default enabled state.
+    if isinstance(resume_update, dict):
+        manifest_resume_update.update(resume_update)
+    return status_html, choices_update, skip_update, manifest_resume_update
 
 
 RECOVERY_POLICY_LABELS = {
@@ -8606,6 +9119,47 @@ def batch_folder_notice_html(paths=None):
     )
 
 
+def local_path_identity_key(value):
+    """Return a stable local-path identity without changing display spelling.
+
+    Windows filesystems are normally case-insensitive, and a file can also be
+    reached through a junction or symlink.  UI selections must not make the
+    same physical source look like two documents merely because the browser
+    supplied a different spelling.  This is deliberately *path* identity,
+    not content identity: two distinct files with the same bytes remain two
+    explicit user selections.
+    """
+    path = Path(str(value or "").strip())
+    try:
+        normalized = str(path.resolve())
+    except (OSError, RuntimeError):
+        normalized = str(path.absolute())
+    return os.path.normcase(os.path.normpath(normalized))
+
+
+def unique_local_path_strings(values):
+    """De-duplicate local paths by identity while preserving first display path."""
+    result = []
+    seen = set()
+    for value in values or []:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        identity = local_path_identity_key(text)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        result.append(text)
+    return result
+
+
+def same_local_path_sequence(left, right):
+    """Compare selections by physical-path identity, including their order."""
+    return [local_path_identity_key(value) for value in unique_local_path_strings(left)] == [
+        local_path_identity_key(value) for value in unique_local_path_strings(right)
+    ]
+
+
 def clean_downloadable_paths(paths):
     clean_paths = []
     seen = set()
@@ -8615,10 +9169,10 @@ def clean_downloadable_paths(paths):
         path = Path(str(item))
         if not path.exists() or not path.is_file():
             continue
-        path_text = str(path)
-        if path_text in seen:
+        identity = local_path_identity_key(path)
+        if identity in seen:
             continue
-        seen.add(path_text)
+        seen.add(identity)
         clean_paths.append(path)
     return clean_paths
 
@@ -8632,10 +9186,10 @@ def clean_existing_paths(paths):
         path = Path(str(item))
         if not path.exists():
             continue
-        path_text = str(path)
-        if path_text in seen:
+        identity = local_path_identity_key(path)
+        if identity in seen:
             continue
-        seen.add(path_text)
+        seen.add(identity)
         clean_paths.append(path)
     return clean_paths
 
@@ -9003,6 +9557,53 @@ def reset_output_directory():
     return str(AUTO_OUTPUT_DIR)
 
 
+def automatic_batch_output_capacity_preflight(files, output_root, *, safety_reserve_bytes=256 * 1024 * 1024):
+    """Check whole-batch artifact capacity before staging begins.
+
+    Per-PDF capacity checks protect an individual writer, but staged native
+    uploads intentionally retain every prepared package until the shared
+    upload stage.  A large batch can therefore pass each local check and still
+    exhaust the output volume halfway through.  The temporary-write allowance
+    is one maximum rather than a sum because preparation is serial.
+    """
+    artifact_total = 0
+    temporary_peak = 0
+    unreadable = []
+    for raw_path in files or []:
+        source = Path(raw_path)
+        try:
+            source_bytes = max(0, int(source.stat().st_size))
+        except OSError:
+            unreadable.append(str(source))
+            continue
+        projected_artifacts = max(16 * 1024 * 1024, source_bytes * 2)
+        artifact_total += projected_artifacts
+        temporary_peak = max(temporary_peak, max(8 * 1024 * 1024, projected_artifacts // 2))
+    target = Path(output_root)
+    usage = shutil.disk_usage(target)
+    required = artifact_total + temporary_peak + max(0, int(safety_reserve_bytes))
+    return {
+        "status": "pass" if not unreadable and usage.free >= required else "insufficient_space",
+        "selected_pdfs": len(files or []),
+        "projected_artifact_bytes": artifact_total,
+        "temporary_peak_bytes": temporary_peak,
+        "safety_reserve_bytes": int(safety_reserve_bytes),
+        "required_free_bytes": required,
+        "available_free_bytes": int(usage.free),
+        "unreadable_sources": unreadable,
+        "output_root": str(target),
+        "message": (
+            "Output volume has enough free space for the staged batch."
+            if not unreadable and usage.free >= required
+            else (
+                "One or more selected PDFs could no longer be read before preparation."
+                if unreadable
+                else f"Insufficient free space for the staged batch at {target}: need {required:,} bytes, found {usage.free:,} bytes."
+            )
+        ),
+    }
+
+
 def directory_scan_entries(path_text=""):
     target = Path((path_text or "").strip())
     if not path_text:
@@ -9054,29 +9655,39 @@ def iter_recursive_pdf_folder_scan(path_text="", *, max_documents=BATCH_FOLDER_M
         seen_directories.add(directory_key)
         stats["directories_scanned"] += 1
         try:
-            with os.scandir(current) as entries:
-                for entry in entries:
-                    stats["files_seen"] += 1
-                    try:
-                        if entry.is_dir(follow_symlinks=False):
-                            pending.append(Path(entry.path))
-                        elif entry.is_file(follow_symlinks=False):
-                            if Path(entry.name).suffix.casefold() == ".pdf":
-                                stats["pdf_paths"].append(entry.path)
-                                if len(stats["pdf_paths"]) >= stats["max_documents"]:
-                                    stats["truncated"] = True
-                                    break
-                            else:
-                                stats["non_pdf_files"] += 1
-                    except OSError as exc:
-                        if len(stats["scan_errors"]) < 5:
-                            stats["scan_errors"].append(f"{entry.path}: {exc}")
-                    if (
-                        stats["files_seen"] - last_reported_entries
-                        >= BATCH_FOLDER_SCAN_PROGRESS_INTERVAL
-                    ):
-                        last_reported_entries = stats["files_seen"]
-                        yield "progress", dict(stats, pdf_paths=list(stats["pdf_paths"]))
+            # A bounded recursive selection must be repeatable.  Filesystem
+            # enumeration order is not a contract (and can differ between
+            # local drives, cloud folders, and repeat scans), so sort each
+            # directory before applying the 1,000-document interactive cap.
+            with os.scandir(current) as scanner:
+                entries = sorted(scanner, key=lambda entry: (entry.name.casefold(), entry.name))
+            discovered_directories = []
+            for entry in entries:
+                stats["files_seen"] += 1
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        discovered_directories.append(Path(entry.path))
+                    elif entry.is_file(follow_symlinks=False):
+                        if Path(entry.name).suffix.casefold() == ".pdf":
+                            stats["pdf_paths"].append(entry.path)
+                            if len(stats["pdf_paths"]) >= stats["max_documents"]:
+                                stats["truncated"] = True
+                                break
+                        else:
+                            stats["non_pdf_files"] += 1
+                except OSError as exc:
+                    if len(stats["scan_errors"]) < 5:
+                        stats["scan_errors"].append(f"{entry.path}: {exc}")
+                if (
+                    stats["files_seen"] - last_reported_entries
+                    >= BATCH_FOLDER_SCAN_PROGRESS_INTERVAL
+                ):
+                    last_reported_entries = stats["files_seen"]
+                    yield "progress", dict(stats, pdf_paths=list(stats["pdf_paths"]))
+            # ``pending`` is a stack. Add reverse lexical order so the next
+            # directory popped is the lexical first one, preserving a stable
+            # depth-first traversal without following directory symlinks.
+            pending.extend(reversed(discovered_directories))
         except OSError as exc:
             if len(stats["scan_errors"]) < 5:
                 stats["scan_errors"].append(f"{current}: {exc}")
@@ -9146,10 +9757,9 @@ def folder_page_preview_progress_html(progress):
     )
     return (
         '<div class="artifact-placeholder batch-folder-scanning"><strong>'
-        "Header check complete — inspecting pages for the preview…</strong>"
+        "Inspecting pages for the preview…</strong>"
         f"<br>Previewed {completed} of {total} PDF file{'s' if total != 1 else ''}; "
-        f"{pages} page{'s' if pages != 1 else ''} checked; {ocr_detail}. "
-        "This read-only scan is cached, so Confirm does not repeat it.</div>"
+        f"{pages} page{'s' if pages != 1 else ''} checked; {ocr_detail}.</div>"
     )
 
 
@@ -9190,7 +9800,9 @@ def scan_pdf_folder_manifest(path_text=""):
     inspection = inspect_uploaded_pdf_candidates(manifest.get("pdf_paths") or [])
     manifest.update(inspection)
     manifest["pdf_candidates"] = inspection["pdf_candidates"]
-    manifest["picker_page_details"] = pdf_picker_page_details(manifest["pdf_candidates"])
+    manifest["picker_page_details"] = pdf_picker_page_details(
+        manifest["pdf_candidates"], retain_for_batch=True
+    )
     manifest["schema_version"] = 1
     APP_LOGGER.info(
         "PDF folder scan completed",
@@ -9208,17 +9820,17 @@ def scan_pdf_folder_manifest(path_text=""):
 
 def folder_manifest_candidates(folder_pdf_files=None, folder_manifest=None):
     """Reuse a just-validated picker manifest for UI-only follow-up callbacks."""
-    expected = list(dict.fromkeys(normalize_file_list(folder_pdf_files)))
+    expected = unique_local_path_strings(normalize_file_list(folder_pdf_files))
     manifest = dict(folder_manifest or {}) if isinstance(folder_manifest, dict) else {}
     # ``pdf_candidates`` remains the complete, validated discovery set. A
     # batch can subsequently be narrowed through the individual-file picker,
     # so prefer its explicit selection when present.
-    candidates = list(dict.fromkeys(normalize_file_list(
+    candidates = unique_local_path_strings(normalize_file_list(
         manifest.get("selected_pdf_candidates")
         if "selected_pdf_candidates" in manifest
         else manifest.get("pdf_candidates")
-    )))
-    if expected and candidates == expected and not manifest.get("invalid_root"):
+    ))
+    if expected and same_local_path_sequence(candidates, expected) and not manifest.get("invalid_root"):
         return candidates, True
     return inspect_uploaded_pdf_candidates(folder_pdf_files).get("pdf_candidates", []), False
 
@@ -9229,6 +9841,15 @@ def folder_manifest_candidates(folder_pdf_files=None, folder_manifest=None):
 PDF_PICKER_NATIVE_INSPECTION_CACHE_LIMIT = 96
 PDF_PICKER_NATIVE_INSPECTION_CACHE = OrderedDict()
 PDF_PICKER_NATIVE_INSPECTION_CACHE_LOCK = threading.Lock()
+# A folder may intentionally contain up to 1,000 PDFs, so the ordinary 96-item
+# convenience LRU cannot be the only source of truth between folder preview
+# and Confirm.  Retain exact *source-version* coverage briefly in-process.
+# Its sole effect is to avoid repeating read-only native inspection; eviction
+# or expiry falls back to a safe rescan and can never reuse an old PDF state.
+BATCH_NATIVE_INSPECTION_SNAPSHOT_LIMIT = BATCH_FOLDER_MAX_DOCUMENTS * 2
+BATCH_NATIVE_INSPECTION_SNAPSHOT_TTL_SECONDS = 60 * 60
+BATCH_NATIVE_INSPECTION_SNAPSHOTS = OrderedDict()
+BATCH_NATIVE_INSPECTION_SNAPSHOTS_LOCK = threading.Lock()
 
 
 def pdf_picker_native_inspection_key(path):
@@ -9239,7 +9860,60 @@ def pdf_picker_native_inspection_key(path):
         resolved = str(source.resolve())
     except OSError:
         resolved = str(source.absolute())
-    return resolved, int(stat.st_size), int(stat.st_mtime_ns)
+    # Size and mtime are normally sufficient, but Windows tooling can preserve
+    # both while replacing a file. Creation/change time supplies a cheap
+    # additional source-version boundary without hashing every PDF merely to
+    # reuse a read-only preview scan.
+    return resolved, int(stat.st_size), int(stat.st_mtime_ns), int(stat.st_ctime_ns)
+
+
+def _prune_batch_native_inspection_snapshots(now=None):
+    """Drop expired selection coverage while the caller holds the cache lock."""
+    current = time.monotonic() if now is None else float(now)
+    expired = [
+        key
+        for key, entry in BATCH_NATIVE_INSPECTION_SNAPSHOTS.items()
+        if current - float(entry.get("stored_at") or 0.0) > BATCH_NATIVE_INSPECTION_SNAPSHOT_TTL_SECONDS
+    ]
+    for key in expired:
+        BATCH_NATIVE_INSPECTION_SNAPSHOTS.pop(key, None)
+
+
+def retain_batch_native_inspection(coverage_by_key):
+    """Retain preview coverage for the matching folder-confirmation event.
+
+    ``coverage_by_key`` is accumulated while the preview is already opening
+    each PDF.  Storing it here avoids a second full-page pass after the small
+    ordinary-picker LRU naturally evicts early files from a large folder.
+    """
+    if not coverage_by_key:
+        return
+    now = time.monotonic()
+    with BATCH_NATIVE_INSPECTION_SNAPSHOTS_LOCK:
+        _prune_batch_native_inspection_snapshots(now)
+        for key, coverage in coverage_by_key.items():
+            if not isinstance(coverage, dict):
+                continue
+            BATCH_NATIVE_INSPECTION_SNAPSHOTS[key] = {
+                "stored_at": now,
+                "coverage": coverage,
+            }
+            BATCH_NATIVE_INSPECTION_SNAPSHOTS.move_to_end(key)
+        while len(BATCH_NATIVE_INSPECTION_SNAPSHOTS) > BATCH_NATIVE_INSPECTION_SNAPSHOT_LIMIT:
+            BATCH_NATIVE_INSPECTION_SNAPSHOTS.popitem(last=False)
+
+
+def batch_native_inspection_coverage(path):
+    """Return exact preview coverage when this source version is still retained."""
+    key = pdf_picker_native_inspection_key(path)
+    now = time.monotonic()
+    with BATCH_NATIVE_INSPECTION_SNAPSHOTS_LOCK:
+        _prune_batch_native_inspection_snapshots(now)
+        entry = BATCH_NATIVE_INSPECTION_SNAPSHOTS.get(key)
+        if not entry:
+            return None
+        BATCH_NATIVE_INSPECTION_SNAPSHOTS.move_to_end(key)
+        return entry.get("coverage") if isinstance(entry.get("coverage"), dict) else None
 
 
 def pdf_picker_native_inspection(path):
@@ -9277,12 +9951,15 @@ def iter_pdf_picker_page_details(paths=None):
     reuse the exact source-version result instead of rescanning the folder.
     """
     details = {}
+    coverage_by_key = {}
     paths = clean_downloadable_paths(paths or [])
     total = len(paths)
     for completed, raw_path in enumerate(paths, start=1):
         path = Path(raw_path)
         try:
-            details[str(path)] = dict(pdf_picker_native_inspection(path)["detail"])
+            inspection = pdf_picker_native_inspection(path)
+            details[str(path)] = dict(inspection["detail"])
+            coverage_by_key[pdf_picker_native_inspection_key(path)] = inspection["coverage"]
         except Exception as exc:
             APP_LOGGER.info("PDF picker page inspection skipped for %s: %s", path, exc)
             details[str(path)] = {"pages": "?", "ocr_pages": "?"}
@@ -9302,10 +9979,14 @@ def iter_pdf_picker_page_details(paths=None):
             "pages": page_total,
             "likely_ocr_pages": ocr_total,
             "details": dict(details),
+            # This value stays server-side while the folder scan streams. The
+            # final callback stores it in the short-lived version-keyed
+            # snapshot; it is never rendered as browser-visible PDF content.
+            "coverage_by_key": dict(coverage_by_key),
         }
 
 
-def pdf_picker_page_details(paths=None):
+def pdf_picker_page_details(paths=None, *, retain_for_batch=False):
     """Return page totals and likely OCR/Unstructured candidate counts per PDF.
 
     This checks every physical page's native text and embedded-image count,
@@ -9315,8 +9996,12 @@ def pdf_picker_page_details(paths=None):
     through an OCR backend.
     """
     details = {}
+    coverage_by_key = {}
     for progress in iter_pdf_picker_page_details(paths):
         details = dict(progress.get("details") or {})
+        coverage_by_key = dict(progress.get("coverage_by_key") or {})
+    if retain_for_batch:
+        retain_batch_native_inspection(coverage_by_key)
     return details
 
 
@@ -9336,15 +10021,15 @@ def merge_uploaded_pdfs_into_folder_batch(pdf_files=None, folder_manifest=None):
             gr.update(visible=bool(direct_paths)),
         )
 
-    candidates = list(dict.fromkeys([*folder_paths, *direct_paths]))
+    candidates = unique_local_path_strings([*folder_paths, *direct_paths])
     selected_before = [str(path) for path in clean_downloadable_paths(
         manifest.get("selected_pdf_candidates")
         if "selected_pdf_candidates" in manifest
         else folder_paths
     )]
-    selected = list(dict.fromkeys([*selected_before, *direct_paths]))
+    selected = unique_local_path_strings([*selected_before, *direct_paths])
     page_details = dict(manifest.get("picker_page_details") or {})
-    page_details.update(pdf_picker_page_details(direct_paths))
+    page_details.update(pdf_picker_page_details(direct_paths, retain_for_batch=True))
     manifest["pdf_candidates"] = candidates
     manifest["selected_pdf_candidates"] = selected
     manifest["picker_page_details"] = page_details
@@ -9388,7 +10073,7 @@ def reuse_selected_pdf_batch(manifest=None, selected_paths=None):
     selected = [str(path) for path in inspection.get("pdf_candidates") or []]
     updated["selected_pdf_candidates"] = selected
     details = dict(updated.get("picker_page_details") or {})
-    details.update(pdf_picker_page_details(selected))
+    details.update(pdf_picker_page_details(selected, retain_for_batch=True))
     updated["picker_page_details"] = details
     return (
         selected,
@@ -9473,9 +10158,9 @@ def batch_folder_file_list_update(manifest=None, selected_paths=None, *, visible
 def update_batch_folder_selection(manifest=None, selected_paths=None):
     """Keep a reversible subset selection without rescanning the directory."""
     updated = dict(manifest or {}) if isinstance(manifest, dict) else {}
-    all_candidates = list(dict.fromkeys(normalize_file_list(updated.get("pdf_candidates"))))
-    requested = set(normalize_file_list(selected_paths))
-    selected = [path for path in all_candidates if path in requested]
+    all_candidates = unique_local_path_strings(normalize_file_list(updated.get("pdf_candidates")))
+    requested = {local_path_identity_key(path) for path in normalize_file_list(selected_paths)}
+    selected = [path for path in all_candidates if local_path_identity_key(path) in requested]
     updated["selected_pdf_candidates"] = selected
     return updated, selected
 
@@ -9590,6 +10275,7 @@ def stream_selected_pdf_directory(path_text="", scan_requested=False):
     manifest.update(inspection)
     manifest["pdf_candidates"] = inspection["pdf_candidates"]
     page_details = {}
+    coverage_by_key = {}
     candidates_for_preview = manifest["pdf_candidates"]
     # Header validation is intentionally quick. The visibly longer part for a
     # large folder is the all-page, read-only preview that establishes page
@@ -9616,6 +10302,14 @@ def stream_selected_pdf_directory(path_text="", scan_requested=False):
             yield tuple(gr.update() for _ in range(7))
             return
         page_details = dict(preview_progress.get("details") or {})
+        coverage_by_key = dict(preview_progress.get("coverage_by_key") or {})
+        completed_preview_files = int(preview_progress.get("completed") or 0)
+        total_preview_files = int(preview_progress.get("total") or 0)
+        if (
+            completed_preview_files % BATCH_FOLDER_PAGE_PREVIEW_PROGRESS_INTERVAL
+            and completed_preview_files != total_preview_files
+        ):
+            continue
         yield (
             gr.update(),
             gr.update(),
@@ -9626,6 +10320,7 @@ def stream_selected_pdf_directory(path_text="", scan_requested=False):
             gr.update(value="Inspecting PDF pages…", interactive=False),
         )
     manifest["picker_page_details"] = page_details
+    retain_batch_native_inspection(coverage_by_key)
     manifest["schema_version"] = 1
     APP_LOGGER.info(
         "PDF folder scan completed",
@@ -10357,8 +11052,8 @@ def normalize_file_list(pdf_files):
     if not pdf_files:
         return []
     if isinstance(pdf_files, (str, Path)):
-        return [str(pdf_files)]
-    return [str(item) for item in pdf_files if item]
+        return unique_local_path_strings([pdf_files])
+    return unique_local_path_strings(pdf_files)
 
 
 def iter_uploaded_pdf_candidate_inspection(files, *, progress_interval=32):
@@ -11805,17 +12500,26 @@ def active_automatic_run_root():
     )
     for progress_path in candidates:
         try:
-            if time.time() - progress_path.stat().st_mtime > AUTOMATIC_RUN_PROGRESS_STALE_SECONDS:
-                continue
+            progress_age_seconds = time.time() - progress_path.stat().st_mtime
             record = json.loads(progress_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
         run_root = Path(str(record.get("run_root") or progress_path.parent))
-        if (
-            str(record.get("state") or "") in {"running", "preparing"}
-            and automatic_worker_is_live(run_root)
-        ):
+        if str(record.get("state") or "") not in {"running", "preparing"}:
+            continue
+        # A quiet OCR/layout subprocess can exceed the ordinary UI-progress
+        # freshness window.  Check durable process ownership *before*
+        # dismissing a stale-looking record, otherwise a reload/server restart
+        # loses Cancel and can admit a conflicting run while work is still
+        # alive.  A dead worker still follows the former 180-second stale
+        # policy, so old abandoned folders do not become permanent locks.
+        if automatic_worker_is_live(run_root):
             return run_root
+        if progress_age_seconds <= AUTOMATIC_RUN_PROGRESS_STALE_SECONDS:
+            # A fresh record without an owned child is not sufficient
+            # authority to block a new run; this preserves the former safe
+            # handling of a server that died before worker launch.
+            continue
     return None
 
 
@@ -12173,6 +12877,54 @@ def active_automatic_run_worker(run_root):
     return {"pid": pid, "marker": str(marker), **record}
 
 
+def windows_process_creation_token(pid):
+    """Return a PID-reuse-safe Windows creation token using the kernel API."""
+    if os.name != "nt":
+        return None
+
+    class FileTime(ctypes.Structure):
+        _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
+
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        open_process.restype = ctypes.c_void_p
+        get_process_times = kernel32.GetProcessTimes
+        get_process_times.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(FileTime),
+            ctypes.POINTER(FileTime),
+            ctypes.POINTER(FileTime),
+            ctypes.POINTER(FileTime),
+        ]
+        get_process_times.restype = ctypes.c_int
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [ctypes.c_void_p]
+        close_handle.restype = ctypes.c_int
+        handle = open_process(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return None
+        creation = FileTime()
+        exit_time = FileTime()
+        kernel_time = FileTime()
+        user_time = FileTime()
+        try:
+            if not get_process_times(
+                handle,
+                ctypes.byref(creation),
+                ctypes.byref(exit_time),
+                ctypes.byref(kernel_time),
+                ctypes.byref(user_time),
+            ):
+                return None
+            return (int(creation.high) << 32) | int(creation.low)
+        finally:
+            close_handle(handle)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
 def automatic_worker_is_live(run_root):
     """Verify that a retained worker marker still names this run's worker.
 
@@ -12211,12 +12963,27 @@ def automatic_worker_is_live(run_root):
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return False
-    command_line = (observed.stdout or "").casefold()
-    return (
-        observed.returncode == 0
-        and "cancellable_preparation_worker.py" in command_line
-        and any(config_path in command_line for config_path in expected_config_paths)
+        observed = None
+    if observed is not None:
+        command_line = (observed.stdout or "").casefold()
+        if (
+            observed.returncode == 0
+            and "cancellable_preparation_worker.py" in command_line
+            and any(config_path in command_line for config_path in expected_config_paths)
+        ):
+            return True
+    # CIM can be unavailable, slow, or temporarily denied on otherwise
+    # healthy Windows systems. The marker records the creation token obtained
+    # from the exact Popen child at launch. Matching both PID and token proves
+    # this is still the same process instance without trusting a reusable PID
+    # or granting restart-time termination authority.
+    try:
+        expected_creation_token = int(worker.get("process_creation_token") or 0)
+    except (TypeError, ValueError):
+        expected_creation_token = 0
+    return bool(
+        expected_creation_token
+        and windows_process_creation_token(worker["pid"]) == expected_creation_token
     )
 
 
@@ -12808,6 +13575,7 @@ def execute_automatic_preparation_in_worker(
                 {
                     "kind": "automatic-preparation-worker",
                     "pid": process.pid,
+                    "process_creation_token": windows_process_creation_token(process.pid),
                     "run_root": str(root),
                     "pdf_path": str(pdf_path),
                     "started_at": datetime.now().isoformat(),
@@ -13483,6 +14251,7 @@ def automatic_full_native_text_coverage(path):
         "image_backed_low_text_pages": [],
         "blank_pages": [],
         "sparse_native_text_pages": [],
+        "visible_vector_low_text_pages": [],
     }
     try:
         with fitz.open(pdf_path) as document:
@@ -13490,23 +14259,34 @@ def automatic_full_native_text_coverage(path):
             for index in range(result["page_count"]):
                 page = document.load_page(index)
                 text_characters = len((page.get_text("text") or "").strip())
-                image_records = page.get_images(full=True)
-                image_count = len(image_records)
-                page_area = max(float(page.rect.width * page.rect.height), 1.0)
-                image_area_ratios = []
-                for image_record in image_records:
-                    try:
-                        image_rectangles = page.get_image_rects(image_record[0])
-                    except (RuntimeError, ValueError, TypeError):
-                        continue
-                    for rectangle in image_rectangles:
-                        image_area_ratios.append(
-                            round(
-                                max(0.0, float(rectangle.width * rectangle.height)) / page_area,
-                                4,
-                            )
-                        )
                 if text_characters < 160:
+                    # A full image-resource walk is expensive on a long
+                    # text-first PDF and does not influence its OCR decision:
+                    # image evidence matters only after native text is
+                    # already sparse.  Keeping this inside the sparse branch
+                    # preserves every low-text/OCR decision while avoiding
+                    # thousands of unused nested-resource traversals during a
+                    # large-folder preview.
+                    image_records = page.get_images(full=True)
+                    image_count = len(image_records)
+                    # The precise image footprint is evidence only for a
+                    # low-text page. Computing image rectangles on every
+                    # image-rich, healthy text page made large folder previews
+                    # needlessly slow without changing any OCR decision.
+                    page_area = max(float(page.rect.width * page.rect.height), 1.0)
+                    image_area_ratios = []
+                    for image_record in image_records:
+                        try:
+                            image_rectangles = page.get_image_rects(image_record[0])
+                        except (RuntimeError, ValueError, TypeError):
+                            continue
+                        for rectangle in image_rectangles:
+                            image_area_ratios.append(
+                                round(
+                                    max(0.0, float(rectangle.width * rectangle.height)) / page_area,
+                                    4,
+                                )
+                            )
                     row = {
                         "page": index + 1,
                         "native_text_characters": text_characters,
@@ -13521,10 +14301,34 @@ def automatic_full_native_text_coverage(path):
                     if image_count:
                         result["image_backed_low_text_pages"].append(row)
                     elif text_characters == 0:
-                        # A blank verso or separator is not failed OCR. Keep
-                        # the fact separate so the confirmation UI does not
-                        # imply that blank pages must be OCRed.
-                        result["blank_pages"].append(row)
+                        # Most no-text/no-image pages really are blank versos.
+                        # A few unusual PDFs instead paint outlined glyphs or
+                        # Form-XObject/vector content that ``get_images`` does
+                        # not expose.  Check only this narrow branch before
+                        # calling a page blank; healthy text pages do not pay
+                        # for drawing enumeration or a thumbnail render.
+                        try:
+                            drawing_count = len(page.get_drawings())
+                            preview = page.get_pixmap(
+                                matrix=fitz.Matrix(0.25, 0.25),
+                                colorspace=fitz.csGRAY,
+                                alpha=False,
+                            )
+                            sample = bytes(preview.samples)
+                            ink_ratio = (
+                                sum(1 for value in sample if value < 235) / max(1, len(sample))
+                            )
+                        except (RuntimeError, ValueError, MemoryError):
+                            drawing_count, ink_ratio = 0, 0.0
+                        row["drawing_count"] = drawing_count
+                        row["thumbnail_ink_ratio"] = round(ink_ratio, 5)
+                        if drawing_count >= 3 and ink_ratio >= 0.0025:
+                            result["visible_vector_low_text_pages"].append(row)
+                        else:
+                            # A blank verso or separator is not failed OCR.
+                            # Keep the fact separate so the confirmation UI
+                            # does not imply that blank pages must be OCRed.
+                            result["blank_pages"].append(row)
                     else:
                         # Verse, title leaves, and short catalogue labels can
                         # have little native text without being scans. They
@@ -13557,13 +14361,20 @@ def automatic_ocr_preflight_manifest(files, *, backend_mode="Automatic", unstruc
         profile = automatic_timing_document_profile([path], page_sample_limit=3)
         risk = automatic_ocr_preflight_risk(profile)
         try:
-            coverage = pdf_picker_native_inspection(path)["coverage"]
+            # A large folder preview already read every physical page. Its
+            # short-lived exact-version snapshot is independent of the small
+            # ordinary-picker LRU, so Confirm never repeats that work merely
+            # because the selection contains more than 96 PDFs.
+            coverage = batch_native_inspection_coverage(path)
+            if coverage is None:
+                coverage = pdf_picker_native_inspection(path)["coverage"]
         except Exception:
             coverage = automatic_full_native_text_coverage(path)
         low_text_pages = list(coverage.get("low_text_pages") or [])
         image_backed_low_text_pages = list(coverage.get("image_backed_low_text_pages") or [])
         blank_pages = list(coverage.get("blank_pages") or [])
         sparse_native_text_pages = list(coverage.get("sparse_native_text_pages") or [])
+        visible_vector_low_text_pages = list(coverage.get("visible_vector_low_text_pages") or [])
         targeted_visual_text_pages = []
         for row in image_backed_low_text_pages:
             if not isinstance(row, dict):
@@ -13611,6 +14422,7 @@ def automatic_ocr_preflight_manifest(files, *, backend_mode="Automatic", unstruc
             "image_backed_low_text_page_count": len(image_backed_low_text_pages),
             "blank_page_count": len(blank_pages),
             "sparse_native_text_page_count": len(sparse_native_text_pages),
+            "visible_vector_low_text_page_count": len(visible_vector_low_text_pages),
             "targeted_visual_text_pages": targeted_visual_text_pages,
             "ocr_plan": (
                 "OCR required before upload if full extraction confirms inadequate native text"
@@ -13685,6 +14497,7 @@ def automatic_ocr_preflight_manifest(files, *, backend_mode="Automatic", unstruc
         image_pages = sum(int(row.get("image_backed_low_text_page_count") or 0) for row in possible)
         blank_pages = sum(int(row.get("blank_page_count") or 0) for row in possible)
         sparse_pages = sum(int(row.get("sparse_native_text_page_count") or 0) for row in possible)
+        vector_pages = sum(int(row.get("visible_vector_low_text_page_count") or 0) for row in possible)
         warnings.append(
             f"{len(possible)} PDF(s) have limited-page native-text signals; Automatic will use native extraction first and escalate only if full extraction proves it inadequate."
         )
@@ -13695,6 +14508,8 @@ def automatic_ocr_preflight_manifest(files, *, backend_mode="Automatic", unstruc
             details.append(f"{blank_pages} blank page(s), which are not OCR failures")
         if sparse_pages:
             details.append(f"{sparse_pages} sparse native-text page(s), such as title or verse pages")
+        if vector_pages:
+            details.append(f"{vector_pages} visible vector page(s) without native text")
         if details:
             guidance.append("Observed: " + "; ".join(details) + ".")
         guidance.append(
@@ -15839,13 +16654,13 @@ def refresh_automatic_run_estimate(
             validated_direct, validation_report = validate_pdf_inputs(direct_inputs)
             if validation_report:
                 return automatic_run_timing_html(state="ready")
-            files = list(dict.fromkeys((validated_direct or []) + folder_candidates))
+            files = unique_local_path_strings((validated_direct or []) + folder_candidates)
         else:
             files = folder_candidates
             validation_report = None
     else:
         files, validation_report = validate_pdf_inputs(
-            list(dict.fromkeys(direct_inputs + folder_candidates))
+            unique_local_path_strings(direct_inputs + folder_candidates)
         )
     if validation_report:
         return automatic_run_timing_html(state="ready")
@@ -15900,6 +16715,10 @@ def automatic_completion_receipt(summaries):
         1 for summary in rows
         if str(summary.get("post_upload_classification") or "") == "workspace_existing_content_skipped"
     )
+    selected_input_duplicates = sum(
+        1 for summary in rows
+        if str(summary.get("post_upload_classification") or "") == "selected_input_exact_duplicate_skipped"
+    )
     existing_records_reused = sum(
         positive_int(summary.get("workspace_existing_records"))
         for summary in rows
@@ -15916,7 +16735,7 @@ def automatic_completion_receipt(summaries):
     failures = sum(
         1 for summary in rows
         if str(summary.get("api_upload_status") or "") not in {
-            "complete", "complete_with_key_cleanup_warning", "", "not_requested"
+            "complete", "complete_with_key_cleanup_warning", "skipped_exact_duplicate", "", "not_requested"
         }
     )
     runtime_deferred = any(
@@ -15930,6 +16749,7 @@ def automatic_completion_receipt(summaries):
         "newly_linked_records": newly_linked,
         "confirmed_records": confirmed,
         "existing_pdfs_skipped": existing_skipped,
+        "selected_input_exact_duplicates": selected_input_duplicates,
         "existing_records_reused": existing_records_reused,
         "cached_attachment_reused_records": cached_attachment_reused_records,
         "partially_reconciled_pdfs": partially_reconciled_pdfs,
@@ -16036,6 +16856,10 @@ def automatic_completion_success_message(summaries, *, include_runtime_note=True
             lead += (
                 f" {receipt['existing_pdfs_skipped']} PDF(s) safely skipped."
             )
+    if receipt["selected_input_exact_duplicates"]:
+        lead += (
+            f" {receipt['selected_input_exact_duplicates']} byte-identical selected PDF(s) skipped."
+        )
     if receipt["partially_reconciled_pdfs"]:
         lead += (
             f" {receipt['existing_records_reused']} existing record(s) across "
@@ -16044,31 +16868,30 @@ def automatic_completion_success_message(summaries, *, include_runtime_note=True
     extraction_summary = automatic_extraction_method_summary(summaries)
     body = f" {extraction_summary}" if extraction_summary else ""
     if include_runtime_note and receipt["runtime_retrieval_deferred"]:
-        body += " Retrieval check deferred."
+        body += " Vectors confirmed; live retrieval test skipped."
     return lead + body
 
 
 def automatic_completion(summaries, prepare_and_upload):
     preparation_failures = [summary for summary in summaries if summary.get("app_error_code")]
-    if preparation_failures:
-        first = preparation_failures[0]
-        names = ", ".join(
-            Path(str(summary.get("pdf") or "document")).name
-            for summary in preparation_failures[:3]
-        )
-        suffix = "" if len(preparation_failures) <= 3 else f" (+{len(preparation_failures) - 3} more)"
-        code = str(first.get("app_error_code") or "AUTO-PREPARATION-FAILED-001")
-        title = str(first.get("app_error_title") or "Local PDF preparation failed")
-        return {
-            "state": "failed",
-            "code": code,
-            "message": (
-                f"Local preparation failed for {names}{suffix}: {title}. "
-                "The per-PDF failure package and the batch run report retain the exact cause; "
-                "do not treat this terminal state as proof that every selected PDF reached AnythingLLM."
-            ),
-        }
     if not prepare_and_upload:
+        if preparation_failures:
+            first = preparation_failures[0]
+            names = ", ".join(
+                Path(str(summary.get("pdf") or "document")).name
+                for summary in preparation_failures[:3]
+            )
+            suffix = "" if len(preparation_failures) <= 3 else f" (+{len(preparation_failures) - 3} more)"
+            code = str(first.get("app_error_code") or "AUTO-PREPARATION-FAILED-001")
+            title = str(first.get("app_error_title") or "Local PDF preparation failed")
+            return {
+                "state": "failed",
+                "code": code,
+                "message": (
+                    f"Local preparation failed for {names}{suffix}: {title}. "
+                    "The per-PDF failure package retains the exact cause."
+                ),
+            }
         return {
             "state": "successful",
             "message": "Your document is ready to use. Prepared files and reports are available below.",
@@ -16077,9 +16900,16 @@ def automatic_completion(summaries, prepare_and_upload):
         summary for summary in summaries
         if summary.get("api_upload_status") == "skipped_needs_ocr_review"
     ]
-    batch_incomplete = [
+    preparation_withheld = [
         summary for summary in summaries
-        if summary.get("api_upload_status") == "skipped_batch_incomplete"
+        if summary.get("app_error_code")
+        or str(summary.get("api_upload_status") or "") in {
+            "preparation_failed",
+            "error_invalid_upload_scope",
+            "error_missing_upload_files",
+            "error_invalid_upload_plan",
+            "error_duplicate_reconciliation",
+        }
     ]
     # A review hold is intentionally non-destructive, but it must not mask a
     # separate failed submission in the same run.  This can happen after an
@@ -16092,8 +16922,14 @@ def automatic_completion(summaries, prepare_and_upload):
             None,
             "complete",
             "complete_with_key_cleanup_warning",
+            "skipped_exact_duplicate",
             "skipped_needs_ocr_review",
             "skipped_batch_incomplete",
+            "preparation_failed",
+            "error_invalid_upload_scope",
+            "error_missing_upload_files",
+            "error_invalid_upload_plan",
+            "error_duplicate_reconciliation",
             "reconciliation_pending",
         }:
             continue
@@ -16129,36 +16965,6 @@ def automatic_completion(summaries, prepare_and_upload):
                 "Prepared files and recovery evidence were retained; no failed request was retried automatically."
             ),
         }
-    if ocr_withheld:
-        names = ", ".join(Path(str(summary.get("pdf") or "document")).name for summary in ocr_withheld[:3])
-        suffix = "" if len(ocr_withheld) <= 3 else f" (+{len(ocr_withheld) - 3} more)"
-        first_warning = str(ocr_withheld[0].get("api_upload_warning") or "").strip()
-        photographed_spread_hold = "photographed spread" in first_warning.casefold()
-        warning_detail = first_warning.removeprefix(
-            "AnythingLLM upload was withheld because "
-        ).removeprefix("AnythingLLM upload was withheld ").strip()
-        return {
-            "state": "warning",
-            "code": (
-                "AUTO-LAYOUT-REVIEW-001"
-                if photographed_spread_hold
-                else "AUTO-OCR-REVIEW-001"
-            ),
-            "message": (
-                f"Local preparation completed, but AnythingLLM upload was withheld for {names}{suffix}. "
-                + (
-                    "No other selected PDF was queued, so the existing workspace was not partially mutated. "
-                    if batch_incomplete else ""
-                )
-                + (
-                    f"because {warning_detail[0].lower() + warning_detail[1:]} "
-                    "Review the saved readiness report."
-                    if warning_detail
-                    else "because reliable OCR is required and unavailable. "
-                    "Review the saved OCR/readiness report."
-                )
-            ),
-        }
     credential_reverification = [
         summary for summary in summaries
         if summary.get("anythingllm_embedder_warning_code") == "AUTO-OPENROUTER-KEY-REVERIFY-001"
@@ -16177,7 +16983,10 @@ def automatic_completion(summaries, prepare_and_upload):
     # page-parent vector evidence is sufficient to complete an upload. A
     # timed-out optional probe is retained for diagnostics, but must never
     # make already-searchable documents unusable or block the run.
-    runtime_ok = all(status == "pass" for status in runtime_statuses)
+    runtime_ok = all(
+        status in {"pass", "not_required_exact_selection_duplicate"}
+        for status in runtime_statuses
+    )
     runtime_transient_timeout = all(
         status in {
             "pass",
@@ -16186,10 +16995,20 @@ def automatic_completion(summaries, prepare_and_upload):
             "pass_with_chat_timeout",
             "pass_with_vector_timeout",
             "deferred_after_exact_vector_proof",
+            # Exact duplicates in the current selection deliberately inherit
+            # their canonical PDF's proven vectors. They require no separate
+            # live retrieval probe and must not turn a mixed otherwise-green
+            # batch into AUTO-RETRIEVAL-UNVERIFIED-001.
+            "not_required_exact_selection_duplicate",
         }
         for status in runtime_statuses
     )
-    upload_ok = all(summary.get("api_upload_status") in {"complete", "complete_with_key_cleanup_warning"} for summary in summaries)
+    upload_ok = all(
+        summary.get("api_upload_status") in {
+            "complete", "complete_with_key_cleanup_warning", "skipped_exact_duplicate",
+        }
+        for summary in summaries
+    )
     workspace_duplicate_advisory = any(
         str(summary.get("post_upload_classification") or "")
         == "batch_exact_current_submission_with_workspace_duplicate_advisory"
@@ -16322,19 +17141,30 @@ def automatic_completion(summaries, prepare_and_upload):
         )
         cap_classification = str(partial_scope[0].get("post_upload_reconciliation_cap_classification") or "")
         cap_detail = {
-            "reconciliation_cap_partial_vector_progress": " Exact-vector progress was still arriving during the shared 480-second observation window.",
-            "reconciliation_cap_queue_heartbeat": " Desktop was still emitting queue activity near the shared 480-second observation cap.",
-            "reconciliation_cap_storage_busy": " Local storage was busy during the shared 480-second observation window.",
-            "reconciliation_cap_no_new_evidence": " No new Desktop or exact-vector evidence arrived before the shared 480-second observation cap.",
+            "reconciliation_cap_partial_vector_progress": " Exact-vector progress was still arriving when the bounded observation window ended.",
+            "reconciliation_cap_queue_heartbeat": " Desktop was still emitting queue activity when the bounded observation window ended.",
+            "reconciliation_cap_storage_busy": " Local storage remained busy through the bounded observation window.",
+            "reconciliation_cap_no_new_evidence": " No new Desktop or exact-vector evidence arrived before the bounded observation window ended.",
         }.get(cap_classification, "")
+        complete_pdf_count = sum(
+            str(summary.get("api_upload_status") or "") in {"complete", "complete_with_key_cleanup_warning"}
+            for summary in summaries
+        )
+        partial_pdf_count = len(partial)
+        awaiting_pdf_count = max(0, len(partial_scope) - partial_pdf_count)
+        source_outcome = (
+            f"{complete_pdf_count} PDF(s) complete · {partial_pdf_count} partly complete"
+            + (f" · {awaiting_pdf_count} awaiting review" if awaiting_pdf_count else "")
+            + "."
+        )
         return {
             "state": "failed",
             "code": "AUTO-EMBEDDING-PARTIAL-001",
             "confirmed_fraction": (observed / expected if expected else None),
             "message": (
-                f"Partial embedding completed for {partial_names}{partial_suffix}: {counts}{recovery}."
-                f"{cap_detail} The original Desktop queue was not replayed automatically; already searchable records "
-                "are excluded from a later explicit recovery."
+                f"{source_outcome} Affected: {partial_names}{partial_suffix}. {counts}{recovery}."
+                f"{cap_detail} No PDF was skipped or retried automatically. Open Advanced → Run history to resume "
+                "or skip only unresolved PDFs."
             ),
         }
     reconciliation_pending = [
@@ -16342,14 +17172,83 @@ def automatic_completion(summaries, prepare_and_upload):
         if summary.get("api_upload_status") == "reconciliation_pending"
     ]
     if reconciliation_pending:
+        complete_pdf_count = sum(
+            str(summary.get("api_upload_status") or "") in {"complete", "complete_with_key_cleanup_warning"}
+            for summary in summaries
+        )
         return {
             "state": "warning",
             "code": "AUTO-EMBEDDING-RECONCILE-001",
             "message": (
-                "Local preparation is complete: prepared text and segments complete, but please check AnythingLLM. "
-                "AnythingLLM attached the submitted document, but complete vector evidence was not observed "
-                "within the bounded reconciliation window. The outcome remains unknown, not rejected; "
-                "use the saved recovery manifest to reconcile late vectors before submitting only confirmed-missing records."
+                f"{complete_pdf_count} PDF(s) complete · {len(reconciliation_pending)} awaiting review. "
+                "AnythingLLM attached the prepared records, but exact vector evidence was not complete within the "
+                "bounded reconciliation window. No PDF was skipped or retried automatically. Open Advanced → Run "
+                "history to reconcile, resume, or skip only unresolved PDFs."
+            ),
+        }
+    if ocr_withheld or preparation_withheld:
+        withheld = []
+        withheld_ids = set()
+        for summary in [*ocr_withheld, *preparation_withheld]:
+            summary_id = id(summary)
+            if summary_id not in withheld_ids:
+                withheld_ids.add(summary_id)
+                withheld.append(summary)
+        ready_count = sum(
+            str(summary.get("api_upload_status") or "")
+            in {"complete", "complete_with_key_cleanup_warning", "skipped_exact_duplicate"}
+            for summary in summaries
+        )
+        if preparation_withheld and not ocr_withheld and not ready_count:
+            first = preparation_withheld[0]
+            title = str(first.get("app_error_title") or "Local PDF preparation failed")
+            detail = str(first.get("api_upload_error") or title)
+            return {
+                "state": "failed",
+                "code": str(first.get("app_error_code") or "AUTO-PREPARATION-FAILED-001"),
+                "message": (
+                    f"Local preparation failed for {len(preparation_withheld)} selected PDF(s): {detail} "
+                    "No eligible PDF records were submitted."
+                ),
+            }
+        names = ", ".join(
+            Path(str(summary.get("pdf") or "document")).name for summary in withheld[:3]
+        )
+        suffix = "" if len(withheld) <= 3 else f" (+{len(withheld) - 3} more)"
+        first_warning = str(ocr_withheld[0].get("api_upload_warning") or "").strip() if ocr_withheld else ""
+        photographed_spread_hold = "photographed spread" in first_warning.casefold()
+        warning_detail = first_warning.removeprefix(
+            "AnythingLLM upload was withheld because "
+        ).removeprefix("AnythingLLM upload was withheld:").removeprefix(
+            "AnythingLLM upload was withheld "
+        ).strip()
+        ready_detail = (
+            f" {ready_count} other PDF(s) were submitted and confirmed in AnythingLLM."
+            if ready_count else " No eligible PDF records were submitted."
+        )
+        local_detail = (
+            f" {len(preparation_withheld)} PDF(s) also need local preparation review."
+            if preparation_withheld else ""
+        )
+        return {
+            "state": "warning",
+            "code": (
+                "AUTO-LAYOUT-REVIEW-001"
+                if photographed_spread_hold and not preparation_withheld
+                else "AUTO-OCR-REVIEW-001"
+                if ocr_withheld and not preparation_withheld and not ready_count
+                else "AUTO-OCR-REVIEW-PARTIAL-001"
+                if ocr_withheld and not preparation_withheld
+                else "AUTO-PDF-REVIEW-001"
+            ),
+            "message": (
+                f"{len(withheld)} PDF(s) need review: {names}{suffix}."
+                + ready_detail
+                + local_detail
+                + (
+                    f" OCR hold: {warning_detail[0].lower() + warning_detail[1:]}"
+                    if warning_detail else ""
+                )
             ),
         }
     failed_uploads = [summary for summary in summaries if summary.get("api_upload_status") not in {"complete", "complete_with_key_cleanup_warning"}]
@@ -16419,12 +17318,27 @@ def automatic_completion_phase(completion, prepare_and_upload):
         return "Preparation complete — AnythingLLM verification pending"
     if code == "AUTO-EMBEDDING-PARTIAL-001":
         return "Partial embedding completed — recovery available"
+    if code == "AUTO-OCR-REVIEW-PARTIAL-001":
+        return "Eligible PDFs ready — OCR review required for the remainder"
     if code == "AUTO-OCR-REVIEW-001":
         return "Local preparation complete — upload withheld for OCR review"
     if code == "AUTO-LAYOUT-REVIEW-001":
         return "Local preparation complete — upload withheld for layout review"
     if state == "warning" and prepare_and_upload:
-        return "Searchable vectors verified; document-list observation needs review"
+        # A warning is not proof of a document-list problem. Authentication,
+        # OCR review, live retrieval, reconciliation, and drawer visibility
+        # are distinct outcomes; the former generic label falsely attributed
+        # every warning to the Desktop Documents list.
+        message = str(completion.get("message") or "").casefold()
+        if "document-list" in message or "document list" in message:
+            return "Searchable vectors verified — document list needs review"
+        if code in {"AUTO-RETRIEVAL-VERIFY-001", "AUTO-RETRIEVAL-CHAT-001"}:
+            return "Vectors stored — live retrieval needs review"
+        if code == "AUTO-RETRIEVAL-AUTH-001":
+            return "Vectors stored — retrieval credential needs attention"
+        if code == "AUTO-RETRIEVAL-UNVERIFIED-001":
+            return "Vectors stored — live retrieval not verified"
+        return "Run completed with a review item"
     if state == "successful":
         return "Document(s) ready to go"
     return "Run needs attention"
@@ -16618,7 +17532,7 @@ def automatic_run_failure_banner_html(code, message):
     return (
         '<div class="automatic-run-failure" role="alert">'
         f'<strong>Run needs attention ({html.escape(str(code))}).</strong> '
-        f'{html.escape(rendered_message)} Open <em>Run output and downloads</em> for the full report.'
+        f'{html.escape(rendered_message)} Open <em>Advanced → Run history</em> for the retained recovery details.'
         '</div>'
     )
 
@@ -16736,7 +17650,7 @@ def validated_automatic_run_settings(values):
     )
     folder_inspection = inspect_uploaded_pdf_candidates(settings["folder_pdf_files"])
     files, validation_report = validate_pdf_inputs(
-        list(dict.fromkeys(normalize_file_list(settings["pdf_files"]) + folder_inspection["pdf_candidates"]))
+        unique_local_path_strings(normalize_file_list(settings["pdf_files"]) + folder_inspection["pdf_candidates"])
     )
     if validation_report:
         return settings, validation_report, [], False
@@ -19141,6 +20055,50 @@ def page_parent_duplicate_shortcut_summary(pdf_path, out_dir, source_record, pre
     return summary
 
 
+def selected_input_exact_duplicate_summary(pdf_path, out_dir, *, canonical_path, source_sha256):
+    """Record a later selected path whose bytes exactly match an earlier path.
+
+    This is intentionally distinct from a workspace-duplicate skip.  The
+    canonical selected PDF still follows the normal preparation and exact
+    AnythingLLM verification path; this later path is omitted only because it
+    would produce the same source identity and payloads.  Keeping a small,
+    per-source receipt prevents an invisible selection change while avoiding a
+    needless extraction pass.
+    """
+    source = Path(pdf_path)
+    canonical = Path(canonical_path)
+    output_root = Path(out_dir)
+    summary = {
+        "pdf": str(source),
+        "source_sha256": str(source_sha256 or ""),
+        "output_root": str(output_root),
+        "segments": 0,
+        "native_upload_plan": "",
+        "api_upload_status": "skipped_exact_duplicate",
+        "api_uploaded": 0,
+        "api_embedded": 0,
+        "api_upload_error": "",
+        "api_upload_warning": (
+            f"Skipped before parsing: this selected path is byte-identical to {canonical.name}, "
+            "which remains the canonical source for this run."
+        ),
+        "api_embedding_update_requested": 0,
+        "api_embedding_update_accepted": 0,
+        "api_embedding_update_batches": [],
+        "post_upload_verification_status": "pass",
+        "post_upload_classification": "selected_input_exact_duplicate_skipped",
+        "anythingllm_runtime_validation_status": "not_required_exact_selection_duplicate",
+        "selected_input_duplicate_of": str(canonical),
+        "selected_input_duplicate_reason": "byte_identical_sha256",
+    }
+    try:
+        output_root.mkdir(parents=True, exist_ok=True)
+        _write_automatic_run_json(output_root / "selected-input-duplicate.json", summary)
+    except OSError as exc:
+        APP_LOGGER.warning("could not persist exact selected-input duplicate receipt: %s", exc)
+    return summary
+
+
 def upload_prepared_automatic_batch(
     summaries,
     *,
@@ -19154,30 +20112,61 @@ def upload_prepared_automatic_batch(
     status_callback=None,
     cancel_callback=None,
 ):
-    """Submit all staged Automatic-run records through one Desktop queue call.
+    """Attach staged records, then queue each eligible PDF in source order.
 
-    PDF extraction remains isolated per source, but AnythingLLM receives the
-    selected sources as one ordered submission.  This preserves each generated
-    page-parent identity while avoiding the former N independent queue updates
-    that could leave a pre-existing workspace in a partly-mutated state.
+    Local preparation remains isolated per source. Attachment is still one
+    shared compatibility lane; once locations are known, the Desktop queue
+    uses one sequential source window per PDF so an explicit rejection does
+    not force later sources to be replayed.
     """
     storage_dir = default_anythingllm_storage_dir()
     all_rows = []
     grouped_rows = []
     document_results = {}
-    ineligible = []
+    # A source can be locally unsuitable for automatic upload without making
+    # the other selected PDFs unsafe to submit.  Keep its receipt separate
+    # from the eligible source windows below.  Shared failures (for example a
+    # mixed transport or an unavailable workspace) are still handled as
+    # batch-wide failures at their own decision points.
+    withheld_sources = []
     already_completed = []
+    selected_input_duplicates = []
     for summary in summaries:
         plan_path = str(summary.get("native_upload_plan") or "").strip()
         source_path = str(summary.get("pdf") or "")
         source_sha = str(summary.get("source_sha256") or "")
         source_name = Path(source_path or "document").name
+        if str(summary.get("post_upload_classification") or "") == "selected_input_exact_duplicate_skipped":
+            canonical_path = str(summary.get("selected_input_duplicate_of") or "")
+            result = {
+                "status": "skipped_exact_duplicate",
+                "records": 0,
+                "uploaded": 0,
+                "embedded": 0,
+                "error": "",
+                "warning": str(summary.get("api_upload_warning") or ""),
+                "post_status": "pass",
+                "post_classification": "selected_input_exact_duplicate_skipped",
+                "runtime_status": "not_required_exact_selection_duplicate",
+                "queue_requested": 0,
+                "queue_accepted": 0,
+                "queue_batches": [],
+                "canonical_source_path": canonical_path,
+                "searchability_proven": False,
+            }
+            document_results[source_path] = result
+            selected_input_duplicates.append({
+                "source_path": source_path,
+                "canonical_source_path": canonical_path,
+                "source_sha256": source_sha,
+            })
+            continue
         if summary.get("app_error_code"):
-            ineligible.append((summary, source_path, "preparation_failed", "Preparation failed before this PDF could enter the shared upload batch."))
+            withheld_sources.append((summary, source_path, "preparation_failed", "Preparation failed before this PDF could enter the AnythingLLM queue."))
             continue
         block_reason = str(summary.get("batch_upload_blocked_reason") or "").strip()
         if block_reason:
-            ineligible.append((
+            withheld_sources.append((
                 summary,
                 source_path,
                 "skipped_needs_ocr_review",
@@ -19192,7 +20181,7 @@ def upload_prepared_automatic_batch(
                 tuple(summary.get("batch_upload_indices") or ()),
             )
         except (TypeError, ValueError) as exc:
-            ineligible.append((summary, source_path, "error_invalid_upload_scope", str(exc)))
+            withheld_sources.append((summary, source_path, "error_invalid_upload_scope", str(exc)))
             continue
         if not rows:
             if (
@@ -19201,7 +20190,7 @@ def upload_prepared_automatic_batch(
             ):
                 already_completed.append((summary, source_path))
                 continue
-            ineligible.append((summary, source_path, "error_missing_upload_files", f"{source_name} produced no selected native upload records."))
+            withheld_sources.append((summary, source_path, "error_missing_upload_files", f"{source_name} produced no selected native upload records."))
             continue
         invalid_row_reason = ""
         for position, row in enumerate(rows, start=1):
@@ -19247,7 +20236,7 @@ def upload_prepared_automatic_batch(
             row["_validated_text_content"] = prepared_text
             row["_validated_prepared_file_sha256"] = hashlib.sha256(prepared_bytes).hexdigest()
         if invalid_row_reason:
-            ineligible.append((summary, source_path, "error_invalid_upload_plan", invalid_row_reason))
+            withheld_sources.append((summary, source_path, "error_invalid_upload_plan", invalid_row_reason))
             continue
         folder_name = managed_anythingllm_upload_folder_name(
             workspace_slug=workspace_slug,
@@ -19396,7 +20385,7 @@ def upload_prepared_automatic_batch(
                             # This cannot normally happen because the complete
                             # branch above owns it, but refusing a zero-record
                             # partial queue is safer than silently losing it.
-                            ineligible.append((summary, source_path, "error_duplicate_reconciliation", "Duplicate reconciliation found no missing records to submit but could not establish a complete selected-PDF proof."))
+                            withheld_sources.append((summary, source_path, "error_duplicate_reconciliation", "Duplicate reconciliation found no missing records to submit but could not establish a complete selected-PDF proof."))
                     else:
                         remaining_groups.append((summary, rows, source_sha, source_path))
             grouped_rows = remaining_groups
@@ -19428,10 +20417,8 @@ def upload_prepared_automatic_batch(
 
     filename_disambiguations = disambiguate_batch_upload_filenames(all_rows)
 
-    if ineligible:
-        blocked_names = ", ".join(Path(path or "document").name for _summary, path, _status, _message in ineligible[:3])
-        suffix = "" if len(ineligible) <= 3 else f" (+{len(ineligible) - 3} more)"
-        for summary, source_path, status, message in ineligible:
+    if withheld_sources:
+        for summary, source_path, status, message in withheld_sources:
             result = {
                 "status": status,
                 "records": 0,
@@ -19440,43 +20427,20 @@ def upload_prepared_automatic_batch(
                 "error": "" if status == "skipped_needs_ocr_review" else message,
                 "warning": message if status == "skipped_needs_ocr_review" else "",
                 "post_status": "not_checked_no_upload",
-                "post_classification": "batch_not_submitted",
-                "runtime_status": "not_checked_no_upload",
-                "queue_requested": 0,
-                "queue_accepted": 0,
-                "queue_batches": [],
-            }
-            document_results[source_path] = result
-            persist_grouped_upload_outcome(summary, result)
-        for summary, rows, _source_sha, source_path in grouped_rows:
-            result = {
-                "status": "skipped_batch_incomplete",
-                "records": max(
-                    len(rows),
-                    int(summary.get("_workspace_total_selected_records") or 0),
+                "post_classification": (
+                    "ocr_review_hold"
+                    if status == "skipped_needs_ocr_review"
+                    else "local_preparation_hold"
                 ),
-                "uploaded": 0,
-                "embedded": 0,
-                "error": "",
-                "warning": f"No PDF was uploaded because the selected batch is incomplete: {blocked_names}{suffix} needs attention.",
-                "post_status": "not_checked_no_upload",
-                "post_classification": "batch_not_submitted",
-                "runtime_status": "not_checked_no_upload",
+                "runtime_status": "not_required_local_review_hold",
                 "queue_requested": 0,
                 "queue_accepted": 0,
                 "queue_batches": [],
             }
             document_results[source_path] = result
             persist_grouped_upload_outcome(summary, result)
-        return {
-            "status": "blocked_batch_incomplete",
-            "uploaded": 0,
-            "embedded": 0,
-            "errors": [{"error": f"No AnythingLLM queue request was submitted because {blocked_names}{suffix} needs attention."}],
-            "document_results": document_results,
-        }
 
-    if already_completed and not grouped_rows:
+    if not grouped_rows and (already_completed or document_results):
         for summary, source_path in already_completed:
             if source_path in document_results:
                 continue
@@ -19496,12 +20460,15 @@ def upload_prepared_automatic_batch(
                 "searchability_proven": True,
             }
         return {
-            "status": "complete",
+            "status": "complete_with_review_holds" if withheld_sources else "complete",
             "uploaded": sum(int(result.get("uploaded") or 0) for result in document_results.values()),
             "embedded": sum(int(result.get("embedded") or 0) for result in document_results.values()),
-            "errors": [],
+            "errors": [
+                {"error": f"{len(withheld_sources)} selected PDF(s) were withheld for local review; no eligible PDF records remained to submit."}
+            ] if withheld_sources else [],
             "document_results": document_results,
             "duplicate_preflight": duplicate_preflight,
+            "selected_input_exact_duplicates": selected_input_duplicates,
         }
 
     if not all_rows:
@@ -19548,11 +20515,23 @@ def upload_prepared_automatic_batch(
     expected_payloads = upload_plan_rows_to_expected_payloads(all_rows)
     for payload, row in zip(expected_payloads, all_rows):
         payload["_automatic_source_path"] = row.get("_automatic_source_path") or ""
+    expected_payloads_by_source = {}
+    for payload in expected_payloads:
+        source_path = str(payload.get("_automatic_source_path") or "").strip()
+        if source_path:
+            expected_payloads_by_source.setdefault(source_path, []).append(payload)
 
     def verify_batch(batch_report):
-        start = max(0, int(batch_report.get("start_index") or 0))
-        end = max(start, int(batch_report.get("end_index") or start))
-        expected_batch = expected_payloads[start:end]
+        source_path = str(batch_report.get("source_path") or "").strip()
+        expected_batch = list(expected_payloads_by_source.get(source_path) or [])
+        if not expected_batch:
+            # A single-PDF/legacy route has no source-window annotation, so
+            # retain its established global-index behavior. Source windows
+            # prefer their explicit source identity because each child window
+            # resets its own start_index to zero.
+            start = max(0, int(batch_report.get("start_index") or 0))
+            end = max(start, int(batch_report.get("end_index") or start))
+            expected_batch = expected_payloads[start:end]
         # This verifier partitions a shared workspace queue back into the
         # selected PDFs.  It must retain the pipeline's reconciliation
         # contract: a lost HTTP receipt is not a rejection, and an actively
@@ -19567,6 +20546,9 @@ def upload_prepared_automatic_batch(
         last_queue_progress_elapsed = None
         last_vector_count = 0
         last_vector_progress_elapsed = None
+        last_storage_observation_position = -1
+        last_storage_observation_elapsed = None
+        cached_storage_report = None
         started = time.monotonic()
         last_report = {}
 
@@ -19613,20 +20595,43 @@ def upload_prepared_automatic_batch(
             }
 
         while True:
-            last_report = verify_anythingllm_post_upload(
-                storage_dir,
-                workspace_slug,
-                "",
-                expected_batch,
-                upload_locations=list(batch_report.get("locations") or []),
-                # A live batch observer needs count progress while Desktop is
-                # writing. ``fast`` retains the exact chunkSource set check at
-                # completion, without materialising that complete identity set
-                # every two seconds. Recovery and diagnostic callers retain
-                # their always-identity mode.
-                observation_mode="fast",
-                frontend_api_url=api_url,
+            elapsed = time.monotonic() - started
+            queue = owned_queue_snapshot()
+            queue_position = max(
+                int(queue.get("desktop_queue_completed") or 0),
+                int(queue.get("desktop_queue_current") or 0),
             )
+            should_read_storage = storage_observation_due_for_queue(
+                queue,
+                len(expected_batch),
+                has_cached_evidence=cached_storage_report is not None,
+                last_observation_position=last_storage_observation_position,
+                elapsed_seconds=elapsed,
+                last_observation_elapsed_seconds=last_storage_observation_elapsed,
+                poll_interval_seconds=2.0,
+            )
+            if should_read_storage:
+                last_report = verify_anythingllm_post_upload(
+                    storage_dir,
+                    workspace_slug,
+                    "",
+                    expected_batch,
+                    upload_locations=list(batch_report.get("locations") or []),
+                    # A live batch observer needs count progress while Desktop
+                    # is writing. This is still exact evidence, but a healthy
+                    # owned queue is not forced to reopen SQLite/LanceDB every
+                    # two seconds when its position has not changed.
+                    observation_mode="fast",
+                    frontend_api_url=api_url,
+                )
+                cached_storage_report = dict(last_report)
+                last_storage_observation_position = queue_position
+                last_storage_observation_elapsed = elapsed
+            else:
+                last_report = {
+                    **dict(cached_storage_report or {}),
+                    "storage_observation_deferred": True,
+                }
             observed = max(
                 int(last_report.get("matching_vector_rows") or 0),
                 int(last_report.get("lancedb_matching_rows") or 0),
@@ -19642,12 +20647,6 @@ def upload_prepared_automatic_batch(
             )
             unique_identities = int(last_report.get("observed_chunk_source_count") or 0)
             duplicate_identities = int(last_report.get("duplicate_chunk_source_count") or 0)
-            elapsed = time.monotonic() - started
-            queue = owned_queue_snapshot()
-            queue_position = max(
-                int(queue.get("desktop_queue_completed") or 0),
-                int(queue.get("desktop_queue_current") or 0),
-            )
             if queue_position > last_queue_position:
                 last_queue_position = queue_position
                 last_queue_progress_elapsed = elapsed
@@ -19766,27 +20765,23 @@ def upload_prepared_automatic_batch(
                         queue_remaining = max(0.0, float(queue_remaining))
                     except (TypeError, ValueError):
                         queue_remaining = None
-                    proposed_deadline = (
-                        elapsed
-                        + queue_remaining
-                        + max(30.0, min(180.0, queue_remaining * 0.25))
-                        if queue_remaining is not None else
-                        elapsed + ANYTHINGLLM_EMBEDDING_RECONCILIATION_PROGRESS_GRACE_SECONDS
+                    extension = active_reconciliation_deadline(
+                        effective_deadline_seconds,
+                        elapsed,
+                        owned_queue_active=owned_queue_active,
+                        recent_vector_progress=recent_vector_progress,
+                        queue_remaining_seconds=queue_remaining,
                     )
-                    bounded_deadline = min(
-                        float(ANYTHINGLLM_EMBEDDING_RECONCILIATION_ACTIVE_CAP_SECONDS),
-                        max(effective_deadline_seconds, proposed_deadline),
-                    )
-                    if bounded_deadline > effective_deadline_seconds:
-                        effective_deadline_seconds = bounded_deadline
+                    if extension is not None:
+                        effective_deadline_seconds = float(extension["deadline_seconds"])
                         deadline_extensions += 1
                         extension_granted = True
                 if not extension_granted:
                     progress_basis = (
                         "the owned Desktop queue stopped providing recent progress"
                         if not (owned_queue_active or recent_vector_progress) and queue_total
-                        else "the evidence-backed reconciliation cap was reached"
-                        if owned_queue_active or recent_vector_progress
+                        else "the exact-vector tail stopped producing new evidence"
+                        if (last_queue_position or last_vector_count)
                         else "no owned Desktop queue evidence was available"
                     )
                     return {
@@ -19803,8 +20798,8 @@ def upload_prepared_automatic_batch(
                         "reconciliation_effective_deadline_seconds": round(effective_deadline_seconds, 3),
                         "reconciliation_deadline_extensions": deadline_extensions,
                     }
-                # The active queue earned a bounded extension. Continue the
-                # same observation loop; no request is replayed or added.
+                # The live queue earned an evidence-based extension. Continue
+                # the same observation loop; no request is replayed or added.
                 continue
             if callable(status_callback):
                 if current_submission_vectors:
@@ -19901,10 +20896,20 @@ def upload_prepared_automatic_batch(
         for location in ((batch.get("verification") or {}).get("current_upload_locations_with_vectors") or [])
         if str(location or "").strip()
     }
-    global_errors = [
-        str(error.get("error") or error.get("details") or error.get("response") or "").strip()
-        for error in (report.get("errors") or [])
+    queue_error_entries = [
+        dict(error) for error in (report.get("errors") or [])
         if isinstance(error, dict)
+    ]
+    # Queue errors with no source identity are genuinely shared submission
+    # evidence.  Keep them separate from explicit source-window rejections
+    # below: a source-specific rejection must not be reported against an
+    # otherwise independent PDF, while a shared reconciliation boundary still
+    # needs a useful, persisted explanation.  This variable used to be
+    # referenced before it was defined on the reconciliation-pending path.
+    global_errors = [
+        str(entry.get("error") or entry.get("details") or entry.get("response") or "").strip()
+        for entry in queue_error_entries
+        if not str(entry.get("source_path") or "").strip()
     ]
     drawer_visibility_advisory = any(
         str((batch.get("verification") or {}).get("classification") or "")
@@ -19935,12 +20940,20 @@ def upload_prepared_automatic_batch(
         source_errors = [
             str(attachment.get("error") or "")
             for attachment in source_attachments
-            if str(attachment.get("status") or "") not in {"attached", "reused_cached_location"}
+            if str(attachment.get("status") or "") not in {"attached", "attached_reconciled", "reused_cached_location"}
         ]
+        # Source-window rejection is an explicit non-admission and may let a
+        # later PDF finish. Attribute that error only to its own PDF rather
+        # than turning every successfully confirmed sibling into an error.
+        source_errors.extend(
+            str(entry.get("error") or entry.get("details") or entry.get("response") or "").strip()
+            for entry in queue_error_entries
+            if str(entry.get("source_path") or "") == source_path
+        )
         attached_count = sum(
             1
             for attachment in source_attachments
-            if str(attachment.get("status") or "") in {"attached", "reused_cached_location"}
+            if str(attachment.get("status") or "") in {"attached", "attached_reconciled", "reused_cached_location"}
         )
         cached_attachment_reused_count = sum(
             1
@@ -19964,8 +20977,13 @@ def upload_prepared_automatic_batch(
             if searchable
             else (expected_sources & (observed_sources | source_confirmed_sources))
         )
+        # The aggregate submission can remain unresolved after an earlier
+        # source has already reached exact current-upload proof.  Preserve
+        # that source-local fact in its own queue receipt instead of copying
+        # the aggregate ``searchable`` flag into every sibling result.
+        source_exact = bool(expected_sources) and len(matched_sources) == len(expected_sources)
         attached_complete = len(source_attachments) == len(rows) and all(
-            str(attachment.get("status") or "") in {"attached", "reused_cached_location"}
+            str(attachment.get("status") or "") in {"attached", "attached_reconciled", "reused_cached_location"}
             for attachment in source_attachments
         )
         queue_batches = []
@@ -19979,31 +20997,51 @@ def upload_prepared_automatic_batch(
                 "requested": source_count,
                 "accepted": source_count if str(batch.get("submission_state") or "") == "accepted" else 0,
                 "submission_state": batch.get("submission_state"),
-                "searchability_proven": bool(searchable) and len(matched_sources) == len(expected_sources) and bool(expected_sources),
+                "searchability_proven": source_exact,
                 "submission_seconds": batch.get("submission_seconds", 0),
                 "verification_seconds": batch.get("verification_seconds", 0),
                 "batch_elapsed_seconds": batch.get("batch_elapsed_seconds", 0),
             }
             queue_batches.append(batch_copy)
+        # A shared Desktop queue can time out after exact vector evidence has
+        # already proved that an earlier PDF is complete.  ``searchable`` is
+        # deliberately batch-wide, so using it as the sole success condition
+        # here used to turn every source into an error whenever one later
+        # source was still pending.  A source's own location-to-vector match
+        # is stronger evidence and is safe to credit independently.
+        exact = source_exact
         if source_errors:
             status = "error"
             error = next((value for value in source_errors if value), "This PDF was not attached to AnythingLLM.")
         elif not attached_complete:
             status = "error"
             error = "This PDF was not fully attached to AnythingLLM; no partial workspace queue was submitted."
-        elif (
-            report.get("status") in {"complete", "complete_with_key_cleanup_warning", "reconciliation_pending"}
-            and searchable
-        ):
-            status = str(report.get("status"))
+        elif exact:
+            # Preserve a real completed-run key-cleanup advisory, but do not
+            # make an otherwise complete PDF inherit a sibling's unresolved
+            # shared-queue state.
+            status = (
+                "complete_with_key_cleanup_warning"
+                if str(report.get("status") or "") == "complete_with_key_cleanup_warning"
+                else "complete"
+            )
             error = ""
+        elif str(report.get("status") or "") == "reconciliation_pending":
+            # This source was prepared and attached, but its own exact
+            # vectors have not yet been observed.  It is not a parser or
+            # upload failure and remains recoverable without re-preparing
+            # the whole selection.
+            status = "reconciliation_pending"
+            error = next(
+                (value for value in global_errors if value),
+                "AnythingLLM is still missing exact vector evidence for this prepared PDF.",
+            )
         else:
             status = "error"
             error = next(
                 (value for value in global_errors if value),
                 "AnythingLLM accepted the shared submission, but did not confirm the current upload's exact vector records.",
             )
-        exact = bool(searchable) and bool(expected_sources) and len(matched_sources) == len(expected_sources)
         post_status = "pass" if exact else ("partial_vector_coverage" if matched_sources else "not_checked")
         partial_existing_content = existing_workspace_records > 0
         result = {
@@ -20087,11 +21125,12 @@ def upload_prepared_automatic_batch(
     report["document_results"] = document_results
     report["filename_disambiguations"] = filename_disambiguations
     report["duplicate_preflight"] = duplicate_preflight
+    report["selected_input_exact_duplicates"] = selected_input_duplicates
     report["prepared_record_cache_reused_count"] = len(report.get("reused_cached_locations") or [])
     report["new_workspace_attachment_count"] = sum(
         1
         for attachment in (report.get("attachment_results") or [])
-        if str((attachment or {}).get("status") or "") in {"attached", "reused_cached_location"}
+        if str((attachment or {}).get("status") or "") in {"attached", "attached_reconciled", "reused_cached_location"}
     )
     # ``maybe_upload_to_anythingllm`` can only call its request accepted once
     # the full Desktop queue returns.  For a timed-out queue that value is
@@ -20258,8 +21297,13 @@ def run_automatic(
     try:
         progress(0.025, desc="Creating output folder")
         output_root_base = Path((output_root_override or "").strip() or str(AUTO_OUTPUT_DIR))
+        output_root_base.mkdir(parents=True, exist_ok=True)
+        batch_capacity = automatic_batch_output_capacity_preflight(files, output_root_base)
+        if batch_capacity["status"] != "pass":
+            raise RuntimeError(batch_capacity["message"])
         run_root = Path(run_root_override) if run_root_override else create_fresh_automatic_run_root(output_root_base)
         run_root.mkdir(parents=True, exist_ok=True)
+        _write_automatic_run_json(run_root / "output-capacity-preflight.json", batch_capacity)
         APP_LOGGER.info(
             "automatic run output folder created",
             extra={"event": "automatic_run_started", "run_id": run_root.name},
@@ -20643,6 +21687,11 @@ def run_automatic(
         )
     cancellation_requested = False
     completed_files = 0
+    # Preserve selection order: the first readable occurrence of a byte
+    # identity is canonical for this run, and only later identical paths are
+    # omitted. This is deliberately a source-input rule, not a fuzzy content
+    # or filename policy; different editions remain independent sources.
+    selected_input_canonicals_by_sha = {}
     ocr_eta_applied_files = set()
     # The worker supplies this same ordering on every structured event.  Keep
     # it run-local so stale callbacks from an earlier phase cannot repaint the
@@ -21234,6 +22283,69 @@ def run_automatic(
         if automatic_run_cancellation_requested(run_root):
             cancellation_requested = True
             break
+        # The opening whole-batch check proves only the free-space snapshot at
+        # confirmation time.  Another local program can consume that volume
+        # while a long preparation is running.  Recheck the *remaining*
+        # staged package budget at a source boundary before a new worker
+        # writes anything.  Disk capacity is shared state, so this is a safe
+        # hold for the run rather than a misleading per-PDF failure/skip.
+        remaining_capacity = automatic_batch_output_capacity_preflight(
+            files[file_index - 1 :], output_root_base
+        )
+        remaining_capacity.update(
+            check_kind="remaining_batch_source_boundary",
+            current_file_index=file_index,
+            total_files=total_files,
+            current_source_path=str(file_path),
+            checked_at=datetime.now().isoformat(timespec="seconds"),
+        )
+        try:
+            _write_automatic_run_json(
+                run_root / "output-capacity-latest-check.json",
+                remaining_capacity,
+            )
+        except OSError as exc:
+            # The capacity result is still useful in memory.  A failure to
+            # save this advisory audit record must not change a confirmed
+            # disk-safety decision.
+            APP_LOGGER.warning("could not persist remaining output-capacity check: %s", exc)
+        if remaining_capacity["status"] != "pass":
+            phase = "Output capacity changed — run held before the next PDF"
+            detail = (
+                f"Before PDF {file_index}/{total_files}, the output volume no longer had the reserved "
+                "space for the remaining staged packages. Earlier prepared files were retained and "
+                "AnythingLLM was not changed by this run."
+            )
+            update_live_automatic_run_status(
+                run_root,
+                state="warning",
+                phase=phase,
+                expected_seconds=expected_seconds,
+                details=detail,
+                confirmed_fraction=None,
+                cancel_available=False,
+                activity_observed=False,
+                batch_completed_files=completed_files,
+                batch_total_files=total_files,
+                batch_current_file_index=file_index,
+            )
+            progress(None)
+            return automatic_error_outputs(
+                "AUTO-OUTPUT-002",
+                phase,
+                [remaining_capacity["message"]],
+                [
+                    "Free space on the selected output volume, then start a new run.",
+                    "Earlier prepared files were retained; this held run did not begin an AnythingLLM upload.",
+                ],
+                {
+                    "Output capacity check": str(run_root / "output-capacity-latest-check.json"),
+                    "Current PDF": str(file_path),
+                    "Prepared PDFs retained": completed_files,
+                },
+                readiness_html=latest_readiness_html,
+                terminal_state="warning",
+            )
         pdf_path = Path(file_path)
         active_file_index = file_index
         automatic_phase_rank = 0
@@ -21275,6 +22387,64 @@ def run_automatic(
                 activity_observed=True,
             )
             continue
+        source_record = dict((fast_duplicate_preflight.get("source_records") or {}).get(str(pdf_path), {}) or {})
+        try:
+            source_stat = pdf_path.stat()
+            source_fingerprint = {
+                "size": int(source_stat.st_size),
+                "mtime_ns": int(source_stat.st_mtime_ns),
+            }
+        except OSError:
+            # Preserve the established worker error path for a source that
+            # disappears after input validation. It is not safe to represent
+            # an unreadable path as an exact duplicate.
+            source_fingerprint = {}
+        source_sha = str(source_record.get("source_sha256") or "").strip().lower()
+        if not source_sha and source_fingerprint:
+            try:
+                source_sha = sha256_file(pdf_path)
+            except OSError:
+                source_sha = ""
+        canonical_path = selected_input_canonicals_by_sha.get(source_sha) if source_sha else ""
+        if canonical_path:
+            summary = selected_input_exact_duplicate_summary(
+                pdf_path,
+                batch_output_directories[str(pdf_path)],
+                canonical_path=canonical_path,
+                source_sha256=source_sha,
+            )
+            summaries.append(summary)
+            completed_files += 1
+            progress(
+                end_fraction,
+                desc=format_progress_desc(
+                    f"Exact duplicate skipped — using {Path(canonical_path).name}",
+                    file_index,
+                    total_files,
+                ),
+            )
+            update_live_automatic_run_status(
+                run_root,
+                state="running",
+                phase="Byte-identical selected PDF safely skipped",
+                expected_seconds=expected_seconds,
+                details=(
+                    f"PDF {file_index}/{total_files}: same SHA-256 as {Path(canonical_path).name}; "
+                    "the earlier selected source remains canonical."
+                ),
+                confirmed_fraction=end_fraction,
+                cancel_available=True,
+                activity_observed=True,
+                batch_completed_files=completed_files,
+                batch_total_files=total_files,
+                batch_current_file_index=(
+                    min(total_files, completed_files + 1)
+                    if completed_files < total_files else total_files
+                ),
+            )
+            continue
+        if source_sha:
+            selected_input_canonicals_by_sha[source_sha] = str(pdf_path)
         progress(start_fraction, desc=format_progress_desc(f"Preparing {pdf_path.name}", file_index, total_files))
         args = SimpleNamespace(
             # Never allow a title inferred for (or left over from) one PDF to
@@ -21367,6 +22537,12 @@ def run_automatic(
             # before reuse; this durable cache never changes an existing
             # AnythingLLM payload or a completed run's artifacts.
             unstructured_ocr_cache_dir=str(AUTO_OUTPUT_DIR / "_unstructured-ocr-cache"),
+            # Hashing happens just before this worker starts, so a later
+            # selected byte-identical path can be skipped before extraction.
+            # The pipeline verifies the stat fingerprint and streams a new hash
+            # if the source changed in the hand-off interval.
+            precomputed_source_sha256=source_sha,
+            precomputed_source_fingerprint=source_fingerprint,
             external_preflight_managed=True,
             temporary_validation_cleanup_policy="cleanup_always",
             cancel_callback=lambda root=run_root: automatic_run_cancellation_requested(root),
@@ -21889,7 +23065,6 @@ def run_automatic(
             if (
                 timing_event == "prequeue_cache_snapshot"
                 and desktop_serial_queue
-                and batch_queue_throughput_eligible
                 and not cache_realization_eta_applied
             ):
                 queue_records = max(0, int(report.get("queue_records") or 0))
@@ -21909,9 +23084,26 @@ def run_automatic(
                         ),
                     ),
                 )
+                # The classic timing lanes retain their large-batch guard for
+                # mixed plans: a few cache-backed records are not enough to
+                # replace an otherwise conservative provider estimate.  A
+                # complete, exact cache plan is different.  At that point the
+                # Desktop queue has no normal embedding work at all, no matter
+                # whether the user selected two PDFs or twenty.  Permit that
+                # one evidence-backed adjustment for every batch size while
+                # leaving ordinary and partially cached runs on their
+                # established path.
+                complete_cache_plan = (
+                    queue_records > 0
+                    and cached_records == queue_records
+                    and fresh_records == 0
+                )
+                cache_reprice_eligible = (
+                    batch_queue_throughput_eligible or complete_cache_plan
+                )
                 # A zero-cache snapshot is still a completed observation, but
                 # it must leave the classic estimate wholly untouched.
-                if queue_records and cached_records:
+                if cache_reprice_eligible and queue_records and cached_records:
                     cache_plan_context.update({
                         "exact_snapshot_observed": True,
                         "suppress_combined_queue_rate": True,
@@ -22232,6 +23424,12 @@ def run_automatic(
             lines.append(
                 f"Workspace duplicate preflight: {len(duplicate_preflight['partially_indexed_source_paths'])} PDF(s) had partial prior coverage; "
                 "their selected records were submitted and the retained report identifies the overlap."
+            )
+        selected_input_duplicates = batch_upload_report.get("selected_input_exact_duplicates") or []
+        if selected_input_duplicates:
+            lines.append(
+                f"Selected-input duplicates: {len(selected_input_duplicates)} byte-identical PDF(s) skipped before parsing; "
+                "the earlier selected path was retained as the canonical source."
             )
     if batch_retention_report.get("status") != "not_required":
         lines.append(
@@ -23025,7 +24223,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                             visible=True,
                             info="Used only for New workspace for this document. Unsafe characters are normalized; an existing name becomes Name 2, Name 3, and so on.",
                         )
-                        new_workspace_name_auto_state = gr.State("")
+                        new_workspace_name_auto_state = gr.State({})
                         with gr.Accordion("Workspace query status", open=False, elem_classes=["native-upload-subaccordion"]):
                             workspace_status = gr.Textbox(
                                 label="Workspace query status",
@@ -23208,23 +24406,6 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                                 'candidates and recommended manual cleanup order. It never changes the workspace.</div>'
                             ),
                         )
-                    with gr.Accordion("Run history and recovery", open=False, elem_classes=["native-upload-subaccordion"]):
-                        refresh_ingestion_history_button = gr.Button("Refresh ingestion history")
-                        ingestion_history = gr.HTML(value=ingestion_history_html())
-                        refresh_resume_manifest_button = gr.Button("Check interrupted embedding recovery")
-                        resume_manifest_status = gr.HTML(value=latest_resume_manifest_html(INITIAL_WORKSPACE_VALUE))
-                        resume_embedding_button = gr.Button("Resume pending embedding batches", variant="secondary")
-                        recovery_policy = gr.Radio(
-                            choices=list(RECOVERY_POLICY_LABELS),
-                            value="Leave everything running",
-                            label="Interrupted-run recovery action",
-                            info="Default is non-destructive. Queue cleanup runs only with positive evidence that the active queue belongs to this app run.",
-                        )
-                        recovery_restart_confirmation = gr.Checkbox(
-                            value=False,
-                            label="I understand that restarting AnythingLLM can interrupt other Desktop work",
-                        )
-                        apply_recovery_policy_button = gr.Button("Apply recovery action", variant="secondary")
                     # Timing remains active in the Automatic status card. The
                     # diagnostic inspector is intentionally kept off the
                     # ordinary interface while preserving its refresh callback.
@@ -23293,6 +24474,35 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                             lines=1,
                             max_lines=1,
                         )
+                with gr.Accordion("Run history", open=False, elem_classes=["native-upload-subaccordion"]):
+                    refresh_ingestion_history_button = gr.Button("Refresh ingestion history")
+                    ingestion_history = gr.HTML(value=ingestion_history_html())
+                    refresh_resume_manifest_button = gr.Button("Check interrupted embedding recovery")
+                    resume_manifest_status = gr.HTML(value=latest_resume_manifest_html(INITIAL_WORKSPACE_VALUE))
+                    recovery_skip_sources = gr.CheckboxGroup(
+                        choices=[],
+                        label="Skip unresolved PDFs",
+                        info="Skip only removes selected PDFs from this recovery plan; prepared files remain available.",
+                        visible=False,
+                    )
+                    skip_recovery_sources_button = gr.Button(
+                        "Skip selected PDFs",
+                        variant="secondary",
+                        visible=False,
+                        interactive=False,
+                    )
+                    resume_embedding_button = gr.Button("Resume pending embedding batches", variant="secondary", interactive=False)
+                    recovery_policy = gr.Radio(
+                        choices=list(RECOVERY_POLICY_LABELS),
+                        value="Leave everything running",
+                        label="Interrupted-run recovery action",
+                        info="Default is non-destructive. Queue cleanup runs only with positive evidence that the active queue belongs to this app run.",
+                    )
+                    recovery_restart_confirmation = gr.Checkbox(
+                        value=False,
+                        label="I understand that restarting AnythingLLM can interrupt other Desktop work",
+                    )
+                    apply_recovery_policy_button = gr.Button("Apply recovery action", variant="secondary")
                 backend_mode = gr.Dropdown(
                     choices=["Automatic", "PyMuPDF", "PyMuPDF4LLM", "Unstructured"],
                     value="Automatic",
@@ -23693,16 +24903,37 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             )
             refresh_resume_manifest_button.click(
-                fn=latest_resume_manifest_html,
+                fn=latest_resume_manifest_controls,
                 inputs=workspace_slug,
-                outputs=resume_manifest_status,
+                outputs=[
+                    resume_manifest_status,
+                    recovery_skip_sources,
+                    skip_recovery_sources_button,
+                    resume_embedding_button,
+                ],
                 show_progress="hidden",
                 queue=False,
             )
+            skip_recovery_sources_button.click(
+                fn=skip_pending_recovery_sources,
+                inputs=[api_url, api_key, workspace_slug, recovery_skip_sources],
+                outputs=[
+                    resume_manifest_status,
+                    recovery_skip_sources,
+                    skip_recovery_sources_button,
+                    resume_embedding_button,
+                ],
+                show_progress="full",
+            )
             resume_embedding_button.click(
-                fn=resume_latest_embedding_manifest,
+                fn=resume_latest_embedding_manifest_controls,
                 inputs=[api_url, api_key, workspace_slug],
-                outputs=[resume_manifest_status, resume_embedding_button],
+                outputs=[
+                    resume_manifest_status,
+                    recovery_skip_sources,
+                    skip_recovery_sources_button,
+                    resume_embedding_button,
+                ],
                 show_progress="full",
             )
             apply_recovery_policy_button.click(
@@ -24079,6 +25310,17 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 show_progress="hidden",
                 queue=False,
                 trigger_mode="always_last",
+            )
+            # ``input`` is browser-originated for a Textbox, unlike the
+            # programmatic updates above. It is therefore the reliable place
+            # to distinguish an intentional workspace-name edit from a stale
+            # automatic suggestion while file/metadata events settle.
+            new_workspace_name.input(
+                fn=mark_new_workspace_name_manual_edit,
+                inputs=[new_workspace_name, new_workspace_name_auto_state],
+                outputs=[new_workspace_name_auto_state],
+                show_progress="hidden",
+                queue=False,
             )
             api_url.change(
                 fn=lambda api_url, api_key, workspace_slug: refresh_native_upload_readiness(

@@ -49,7 +49,7 @@ def guarded_mutation_adapter(storage, run_id, snapshot_dir, monkeypatch):
     monkeypatch.setattr(
         anythingllm_persistence,
         "characterize",
-        lambda _storage: {
+        lambda _storage, **_kwargs: {
             "matched_profile": "test-recognized-mutation-profile",
             "capabilities": {
                 "can_write_env_settings": dict(supported),
@@ -155,6 +155,44 @@ def test_guarded_sqlite_write_snapshots_and_restores(tmp_path, monkeypatch):
         ).fetchone()[0] == "768"
     finally:
         con.close()
+
+
+def test_guarded_group_writes_share_one_snapshot_and_remain_atomic(tmp_path, monkeypatch):
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    create_storage(storage)
+    env_path = storage / ".env"
+    env_path.write_text("EMBEDDING_ENGINE='anythingllm'\nEMBEDDING_MODEL_PREF='old'\n", encoding="utf-8")
+    adapter = guarded_mutation_adapter(storage, "group-write", tmp_path / "snapshots", monkeypatch)
+
+    env_result = adapter.write_env_settings({
+        "EMBEDDING_ENGINE": "openai",
+        "OPENAI_MODEL_PREF": "text-embedding-3-small",
+        "EMBEDDING_MODEL_PREF": "text-embedding-3-small",
+    })
+    sqlite_result = adapter.write_sqlite_settings({
+        "text_splitter_chunk_size": 900,
+        "text_splitter_chunk_overlap": 80,
+    })
+
+    env_snapshot = json.loads(Path(env_result["snapshot"]).read_text(encoding="utf-8"))
+    sqlite_snapshot = json.loads(Path(sqlite_result["snapshot"]).read_text(encoding="utf-8"))
+    assert set(env_snapshot["env"]) == {"EMBEDDING_ENGINE", "OPENAI_MODEL_PREF", "EMBEDDING_MODEL_PREF"}
+    assert set(sqlite_snapshot["sqlite"]) == {"text_splitter_chunk_size", "text_splitter_chunk_overlap"}
+    assert _env_value(env_path.read_text(encoding="utf-8"), "EMBEDDING_ENGINE") == "openai"
+    assert _env_value(env_path.read_text(encoding="utf-8"), "EMBEDDING_MODEL_PREF") == "text-embedding-3-small"
+
+    adapter.restore(env_result["snapshot"])
+    adapter.restore(sqlite_result["snapshot"])
+    con = sqlite3.connect(storage / "anythingllm.db")
+    try:
+        values = dict(con.execute("select label, value from system_settings"))
+    finally:
+        con.close()
+    assert _env_value(env_path.read_text(encoding="utf-8"), "EMBEDDING_ENGINE") == "anythingllm"
+    assert _env_value(env_path.read_text(encoding="utf-8"), "EMBEDDING_MODEL_PREF") == "old"
+    assert values["text_splitter_chunk_size"] == "768"
+    assert values["text_splitter_chunk_overlap"] == "128"
 
 
 def test_env_snapshot_redacts_secret_and_restore_skips_unrecoverable_secret(tmp_path):

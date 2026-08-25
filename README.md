@@ -2,8 +2,8 @@
 
 Turn PDFs into inspectable, page-aware text records for
 [AnythingLLM Desktop](https://anythingllm.com/desktop)—or keep the prepared
-files locally. This AnythingLLM assistant lets users upload massive PDF files and gives them: 
-extraction choices, OCR decisions, page settings, local output, and 
+files locally. This AnythingLLM assistant lets users upload massive PDF files and gives them:
+extraction choices, OCR decisions, page settings, local output, and
 AnythingLLM workspace settings and embedding settings. Parse and upload 400 page PDF documents
 to AnythingLLM Desktop (Windows 11) in 2 minutes. Parser Assistant can be operated
 with graphical user interface (no terminal commands or coding required). Install in one click.
@@ -43,7 +43,9 @@ For a complete installation guide and explanation see [Detailed instructions](do
   page-local, or custom page ranges before AnythingLLM applies
   its own internal splitter.
 - **Process a deliberate batch.** Choose individual PDFs or recursively scan a
-  folder, inspect the selected files, then confirm which ones you want to parse and upload.
+  folder (up to 1,000 PDFs at once), inspect the selected files, then confirm
+  which ones you want to parse and upload. Larger libraries should be selected
+  in deliberate subfolders rather than held as one browser payload.
 - **Retain evidence, not just a success toast.** Local outputs and run reports
   distinguish preparation, storage, vector confirmation, and optional live
   retrieval diagnostics.
@@ -105,6 +107,8 @@ Checkout the full screenshot collection here: [docs/screenshots](docs/screenshot
   reading order, tables, scans, images, or every citation.
 - The assistant never overwrites or deletes an existing AnythingLLM workspace.
   Review the selected workspace before confirming an upload.
+- Python 3.11 through 3.14 are supported. The packaged 3.14 path is exercised
+  with the pinned Gradio and PDF dependencies before release.
 
 ## Privacy and local data
 

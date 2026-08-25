@@ -24,10 +24,24 @@ from orchestration import execute_preparation, legacy_summary_from_run
 
 _EVENT_WRITE_LOCK = threading.Lock()
 _RESULT_WRITE_LOCK = threading.Lock()
+
+
+def _write_heartbeat(path: Path, payload: dict) -> None:
+    """Atomically refresh ownership evidence without pretending work advanced.
+
+    Some native/OCR calls can run for minutes without a progress callback.  A
+    durable heartbeat lets a newly started Gradio server recognise that the
+    child is still the owned worker for this run.  It is deliberately separate
+    from the visible progress stream: a liveness pulse must not make an
+    extraction look as if it completed useful work.
+    """
+    _write_json(path, payload)
 def _write_json(path: Path, payload: dict) -> None:
     # Windows can reject simultaneous replacements of one result path even
     # with separate temporary files. The terminal record is tiny, so this
-    # lock avoids that race without serialising OCR or upload work.
+    # lock avoids that race without serialising OCR or upload work. Antivirus
+    # and indexing can still hold the old destination briefly, so retain the
+    # same bounded sharing-violation retry used for durable run controls.
     with _RESULT_WRITE_LOCK:
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = None
@@ -44,8 +58,15 @@ def _write_json(path: Path, payload: dict) -> None:
                 handle.write(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary, path)
-            temporary = None
+            for attempt in range(3):
+                try:
+                    os.replace(temporary, path)
+                    temporary = None
+                    break
+                except PermissionError:
+                    if attempt == 2:
+                        raise
+                    time.sleep(0.08 * (attempt + 1))
         finally:
             if temporary is not None:
                 try:
@@ -130,6 +151,7 @@ def main(config_path: str) -> int:
     run_root = Path(config["run_root"])
     result_path = Path(config["result_path"])
     events_path = Path(config["events_path"])
+    heartbeat_path = run_root / ".automatic-worker-heartbeat.json"
     cancel_marker = run_root / ".cancel-requested.json"
     argument_values = dict(config.get("args") or {})
     # The parent deliberately keeps credentials out of the durable JSON
@@ -147,9 +169,13 @@ def main(config_path: str) -> int:
     # the document.  Ask the compact-output routine to leave them alone; the
     # parent removes them only after this process has exited.
     args.retain_generated_children_until_worker_exit = AUTOMATIC_WORKER_TRANSPORT_ARTIFACTS
-    args.progress_callback = lambda value, stage, desktop_required=False, **metadata: _emit_event(
-        events_path, value, stage, desktop_required=desktop_required, **metadata
-    )
+    def emit_progress(value, stage, desktop_required=False, **metadata):
+        heartbeat_state["stage"] = str(stage or "Preparing PDF")
+        _emit_event(
+            events_path, value, stage, desktop_required=desktop_required, **metadata
+        )
+
+    args.progress_callback = emit_progress
     args.timing_event_callback = lambda stage, event=None, **details: _emit_timing_event(
         events_path, stage, event, **details
     )
@@ -158,6 +184,45 @@ def main(config_path: str) -> int:
         _write_json(result_path, {"status": "cancelled", "message": "Stop requested before worker start."})
         return 0
     started = time.time()
+    heartbeat_stop = threading.Event()
+    heartbeat_state = {"stage": "Preparing PDF"}
+
+    def heartbeat_loop() -> None:
+        while not heartbeat_stop.wait(15.0):
+            try:
+                _write_heartbeat(
+                    heartbeat_path,
+                    {
+                        "pid": os.getpid(),
+                        "run_root": str(run_root),
+                        "recorded_at": time.time(),
+                        "stage": str(heartbeat_state.get("stage") or "Preparing PDF"),
+                    },
+                )
+            except OSError:
+                # The parent retains process ownership even if the output
+                # drive becomes temporarily unavailable.  Never turn a
+                # heartbeat write problem into a silent worker crash.
+                pass
+
+    try:
+        _write_heartbeat(
+            heartbeat_path,
+            {
+                "pid": os.getpid(),
+                "run_root": str(run_root),
+                "recorded_at": started,
+                "stage": "Preparing PDF",
+            },
+        )
+    except OSError:
+        pass
+    heartbeat_thread = threading.Thread(
+        target=heartbeat_loop,
+        name="automatic-preparation-heartbeat",
+        daemon=True,
+    )
+    heartbeat_thread.start()
     _emit_event(
         events_path,
         0.0,
@@ -214,6 +279,9 @@ def main(config_path: str) -> int:
             evidence_kind="worker_failed",
         )
         return 1
+    finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=1.0)
 
 
 if __name__ == "__main__":

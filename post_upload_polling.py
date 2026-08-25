@@ -107,6 +107,7 @@ def poll_post_upload(
     observation_callback: ObservationCallback | None = None,
     retryable_evidence_codes: Collection[str] = (),
     deadline_extension: DeadlineExtension | None = None,
+    allow_active_deadline_extension_beyond_hard_cap: bool = False,
 ) -> PollingResult:
     policy = PollingPolicy.from_values(
         interval_seconds=interval_seconds,
@@ -177,16 +178,19 @@ def poll_post_upload(
         elapsed = monotonic() - started
         if callable(deadline_extension):
             # A slow asynchronous queue can provide real ownership/progress
-            # evidence after its HTTP receipt expires.  Let a caller extend
-            # the active deadline, but never beyond this poller's declared
-            # hard cap.  This keeps the general poller bounded and avoids a
-            # hidden second wait window in higher-level recovery code.
+            # evidence after its HTTP receipt expires. The normal policy
+            # keeps that extension inside ``hard_cap_seconds``. A caller can
+            # explicitly opt into a longer observation only when it owns a
+            # queue-progress contract that independently detects a stall;
+            # this is for a live local queue, not a generic retry loop.
             try:
                 requested_deadline = deadline_extension(dict(evidence), elapsed, timeout)
                 if requested_deadline is not None:
-                    timeout = min(
-                        policy.hard_cap_seconds,
-                        max(timeout, float(requested_deadline)),
+                    requested = max(timeout, float(requested_deadline))
+                    timeout = (
+                        requested
+                        if allow_active_deadline_extension_beyond_hard_cap
+                        else min(policy.hard_cap_seconds, requested)
                     )
             except Exception as exc:  # deadline policy is observational only
                 LOGGER.exception("Post-upload deadline extension failed; retaining existing deadline: %s", exc)

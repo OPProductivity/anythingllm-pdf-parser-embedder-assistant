@@ -79,7 +79,7 @@ def test_characterization_does_not_return_env_values(tmp_path):
     assert secret not in str(result)
 
 
-def test_v116_candidate_keeps_read_only_sqlite_inspection_but_blocks_settings_writes(tmp_path, monkeypatch):
+def test_v116_fingerprinted_profile_grants_guarded_settings_writes(tmp_path, monkeypatch):
     monkeypatch.setattr(anythingllm_compatibility, "_desktop_version", lambda _path: _desktop_version("1.16.0.0"))
     candidate_hash = OBSERVED_CANDIDATE_PACKAGE_FINGERPRINTS["1.16.0"]
     monkeypatch.setattr(
@@ -98,12 +98,12 @@ def test_v116_candidate_keeps_read_only_sqlite_inspection_but_blocks_settings_wr
 
     result = characterize(tmp_path)
 
-    assert result["matched_profile"] == ""
-    assert result["desktop_release_status"] == "observed_candidate"
+    assert result["matched_profile"] == anythingllm_compatibility.V116_PROFILE_ID
+    assert result["desktop_release_status"] == "recognized_mutation_profile"
     assert result["desktop_version"] == "1.16.0.0"
     assert result["desktop_version_normalized"] == OBSERVED_CANDIDATE_DESKTOP_VERSIONS[0]
     assert result["capabilities"]["can_read_sqlite_state"]["status"] == "supported"
-    assert result["capabilities"]["can_write_sqlite_settings"]["status"] == "blocked"
+    assert result["capabilities"]["can_write_sqlite_settings"]["status"] == "supported"
 
 
 def test_loopback_api_contract_probe_reports_core_routes_without_granting_writes(monkeypatch):
