@@ -14,12 +14,17 @@ import os
 import platform
 import sqlite3
 import subprocess
+import threading
 import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
+
+
+_PACKAGE_FINGERPRINT_CACHE: dict[tuple[str, int, int], str] = {}
+_PACKAGE_FINGERPRINT_CACHE_LOCK = threading.Lock()
 
 
 # A *mutation* profile authorizes the guarded persistence adapter only.  Do
@@ -31,6 +36,7 @@ from typing import Iterable
 # official app.asar fingerprint and the current settings schema both match.
 PROFILE_ID = "anythingllm-desktop-1.14.2-through-1.15.0-r2-observed-profile-2"
 V116_PROFILE_ID = "anythingllm-desktop-1.16.0-fingerprinted-settings-profile-1"
+V116_NATIVE_CONTRACT_ID = "anythingllm-desktop-1.16.0-native-pdf-contract-1"
 OBSERVED_COMPATIBLE_DESKTOP_VERSIONS = ("1.14.2", "1.15.0-r2")
 OBSERVED_CANDIDATE_DESKTOP_VERSIONS = ("1.16.0",)
 OBSERVED_CANDIDATE_PACKAGE_FINGERPRINTS = {
@@ -38,6 +44,23 @@ OBSERVED_CANDIDATE_PACKAGE_FINGERPRINTS = {
     # upload/confirmation run.  A release label alone does not identify a
     # locally modified or repackaged Electron bundle.
     "1.16.0": "a40a9bb5915e6383f51fd2a02e76052724a6c9d2576d852025eefcbb23d4282b",  # pragma: allowlist secret -- public package SHA-256 fingerprint, not a credential
+}
+# Mutation authority is capability-specific. This immutable record comes from
+# the isolated 2026-08-22 real-PDF run: workspace creation, native metadata
+# attachment, workspace linking, and exact vector observation all completed.
+# It intentionally does not claim temporary-key deletion or workspace cleanup,
+# which require their own opt-in contract probe evidence.
+OBSERVED_NATIVE_MUTATION_CONTRACTS = {
+    "a40a9bb5915e6383f51fd2a02e76052724a6c9d2576d852025eefcbb23d4282b": {  # pragma: allowlist secret -- package SHA-256
+        "contract_id": V116_NATIVE_CONTRACT_ID,
+        "desktop_version": "1.16.0",
+        "observed_at": "2026-08-22T00:00:00+00:00",
+        "capabilities": (
+            "can_create_workspace",
+            "can_upload_native_metadata",
+            "can_poll_post_upload_state",
+        ),
+    },
 }
 CAPABILITIES = (
     "can_read_env_state",
@@ -183,8 +206,21 @@ def _desktop_package_identity(
     evidence = [_evidence("filesystem", str(asar), observed)]
     if not include_fingerprint:
         return result, evidence, []
+    cache_key = (str(asar.resolve()), int(stat.st_size), int(stat.st_mtime_ns))
     try:
-        result["app_asar_sha256"] = _sha256_file(asar)
+        with _PACKAGE_FINGERPRINT_CACHE_LOCK:
+            cached_fingerprint = _PACKAGE_FINGERPRINT_CACHE.get(cache_key, "")
+        if cached_fingerprint:
+            result["app_asar_sha256"] = cached_fingerprint
+        else:
+            computed_fingerprint = _sha256_file(asar)
+            with _PACKAGE_FINGERPRINT_CACHE_LOCK:
+                # Retain only the current identity for this path. A replaced
+                # package has a different size/mtime key and is re-hashed.
+                for key in [key for key in _PACKAGE_FINGERPRINT_CACHE if key[0] == cache_key[0]]:
+                    _PACKAGE_FINGERPRINT_CACHE.pop(key, None)
+                _PACKAGE_FINGERPRINT_CACHE[cache_key] = computed_fingerprint
+            result["app_asar_sha256"] = computed_fingerprint
     except OSError as exc:
         result["fingerprint_status"] = "fingerprint_error"
         return result, evidence, [f"app_asar_fingerprint_error:{type(exc).__name__}"]
@@ -439,6 +475,15 @@ def characterize(
         and desktop_release_status == "recognized_mutation_profile"
     )
     profile = desktop_candidate_profile if mutation_profile_match else ""
+    native_contract = OBSERVED_NATIVE_MUTATION_CONTRACTS.get(
+        str(desktop_package.get("app_asar_sha256") or ""),
+        {},
+    )
+    native_contract_match = bool(
+        native_contract
+        and storage_schema_match
+        and desktop_version_normalized == native_contract.get("desktop_version")
+    )
 
     env_evidence = [_evidence("filesystem", ".env", "present")] if env_path.exists() else []
     db_evidence = [_evidence("filesystem", "anythingllm.db", "present"), *schema_evidence] if db_path.exists() else []
@@ -484,6 +529,29 @@ def characterize(
                 desktop_evidence,
             )
 
+    if native_contract_match:
+        contract_evidence = [
+            _evidence(
+                "immutable_native_contract",
+                str(native_contract["contract_id"]),
+                f"observed_at={native_contract['observed_at']};package_sha256_matched",
+            ),
+            *package_evidence,
+            *db_evidence,
+        ]
+        for name in native_contract["capabilities"]:
+            capabilities[name] = _supported(
+                contract_evidence,
+                f"Exact package and storage contract match {native_contract['contract_id']}.",
+            )
+    else:
+        for name in ("can_create_workspace", "can_upload_native_metadata", "can_poll_post_upload_state"):
+            capabilities[name] = _blocked(
+                ["native_mutation_contract_not_matched"],
+                "Native mutation is blocked until an exact package contract or isolated probe qualifies it.",
+                [*package_evidence, *db_evidence],
+            )
+
     # API capabilities require endpoint probes and remain unknown in filesystem-only characterization.
     result = {
         "schema_version": 3,
@@ -503,6 +571,10 @@ def characterize(
         "desktop_candidate_profile": desktop_candidate_profile,
         "storage_schema_status": "matched" if storage_schema_match else "unmatched",
         "matched_profile": profile,
+        "native_mutation_contract": (
+            str(native_contract.get("contract_id") or "") if native_contract_match else ""
+        ),
+        "native_mutation_contract_status": "matched" if native_contract_match else "unmatched",
         "profile_status": "matched" if mutation_profile_match else desktop_release_status,
         "observed_compatible_desktop_versions": list(OBSERVED_COMPATIBLE_DESKTOP_VERSIONS),
         "observed_candidate_desktop_versions": list(OBSERVED_CANDIDATE_DESKTOP_VERSIONS),

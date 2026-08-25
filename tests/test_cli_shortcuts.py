@@ -197,3 +197,17 @@ def test_server_marker_stays_valid_under_overlapping_start_writes(tmp_path: Path
     assert record["port"] in range(7900, 7912)
     assert record["command"] == "anythingllm-pdf-assistant start"
     assert not list(tmp_path.glob(".localhost-server.json.*.tmp"))
+
+
+def test_reliability_audit_command_is_explicitly_read_only_by_default(tmp_path: Path):
+    with mock.patch.object(cli, "_reliability_audit_run", return_value=0) as audit:
+        result = cli.main([
+            "reliability",
+            "audit-run",
+            "--run-root",
+            str(tmp_path),
+            "--json",
+        ])
+
+    assert result == 0
+    audit.assert_called_once_with(str(tmp_path), False, True)

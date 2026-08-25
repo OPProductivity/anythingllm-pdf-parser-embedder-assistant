@@ -2676,6 +2676,19 @@ def retain_successful_run_leanly(
                 "records_requested": summary.get("api_embedding_queue_records", 0),
                 "observation": summary.get("api_embedding_progress_observation", {}),
             },
+            "temporary_canary": {
+                # The detailed temporary-workspace tree is intentionally
+                # removed after a green lean run. Preserve the non-content
+                # acceptance and cleanup proof so an automated soak remains
+                # auditable after successful retention.
+                "status": summary.get("temporary_workspace_validation_status", "not_run"),
+                "post_upload_status": summary.get("temporary_workspace_validation_post_upload_status", "not_run"),
+                "runtime_status": summary.get("temporary_workspace_validation_runtime_status", "not_run"),
+                "retention_status": summary.get("temporary_workspace_validation_retention_status", "not_run"),
+                "cleanup_status": summary.get("temporary_workspace_validation_cleanup_status", "not_run"),
+                "chunk_survival_flag": summary.get("temporary_workspace_validation_chunk_survival_flag", ""),
+                "chunk_survival_ratio": summary.get("temporary_workspace_validation_chunk_survival_ratio", 0.0),
+            },
             "shared_batch": dict(shared_batch_receipt or {}),
         },
         "source": {
@@ -5127,12 +5140,12 @@ def correct_ocr_words_from_native_page(native_text, ocr_text, native_raw_text=""
     native_by_key = {}
     for word in native_words:
         key = _reconciliation_token_key(word)
-        if len(key) >= 5:
+        if key:
             native_by_key.setdefault(key, []).append(word)
     unique_native = {
         key: values[0]
         for key, values in native_by_key.items()
-        if len(values) == 1
+        if len(key) >= 5 and len(values) == 1
     }
     replacements_by_span = {}
 
@@ -11712,7 +11725,9 @@ def delete_validation_workspace(api_url, workspace_slug, api_key=None, storage_d
                 storage_dir=storage_dir,
                 document_folder_path=document_folder_path,
             )
-            if result["document_folder_cleanup"].get("status") == "delete_failed":
+            if result["document_folder_cleanup"].get("status") not in {
+                "deleted", "already_absent", "not_applicable",
+            }:
                 result["status"] = "deleted_with_document_cleanup_warning"
                 result["error"] = result["document_folder_cleanup"].get("error") or "Managed document folder cleanup failed."
         return result
@@ -11724,6 +11739,34 @@ def delete_validation_workspace(api_url, workspace_slug, api_key=None, storage_d
             cleanup = cleanup_temporary_desktop_api_key(api_url, temporary_key_id)
             if cleanup.get("status") == "delete_failed" and not result.get("error"):
                 result["error"] = cleanup.get("error", "")
+
+
+def normalize_temporary_validation_exact_evidence(evidence, expected_count):
+    """Separate exact ingestion proof from optional drawer-list visibility."""
+    report = dict(evidence or {})
+    expected = max(0, int(expected_count or 0))
+    observed = int(
+        report.get("matching_vector_rows")
+        or report.get("lancedb_matching_rows")
+        or 0
+    )
+    exact = bool(
+        expected > 0
+        and observed >= expected
+        and report.get("current_upload_vector_evidence_complete") is True
+        and report.get("identity_set_complete") is True
+        and str(report.get("chunk_survival_flag") or "") == "preserved"
+    )
+    if exact and str(report.get("status") or "") not in SUCCESSFUL_POST_UPLOAD_STATUSES:
+        report["advisory_status"] = str(report.get("status") or "")
+        report["advisory_classification"] = str(report.get("classification") or "")
+        report["status"] = "pass_with_missing_workspace_document_records"
+        report["classification"] = "exact_vectors_proven_drawer_observation_advisory"
+        report["message"] = (
+            f"All {expected} exact validation vectors and source identities were confirmed. "
+            "The optional document-list/drawer observation remains advisory."
+        )
+    return report
 
 
 def run_temporary_workspace_validation(
@@ -11813,6 +11856,33 @@ def run_temporary_workspace_validation(
             validation_reconciliation["started_at"] = time.time()
         return validation_remaining_seconds()
 
+    def inspect_validation_exact_vectors(expected_batch, locations, *, observation_mode="fast"):
+        """Keep review-only layout evidence non-terminal until vectors are exact."""
+        evidence = verify_anythingllm_post_upload(
+            storage_dir,
+            result["workspace_slug"],
+            source_sha,
+            expected_batch,
+            upload_locations=locations,
+            observation_mode=observation_mode,
+        )
+        observed = int(
+            evidence.get("matching_vector_rows")
+            or evidence.get("lancedb_matching_rows")
+            or 0
+        )
+        original_status = str(evidence.get("status") or "")
+        if observed < len(expected_batch) and original_status in REVIEWABLE_POST_UPLOAD_STATUSES:
+            evidence = dict(evidence)
+            evidence["review_status_before_exact_vector_gate"] = original_status
+            evidence["status"] = "partial_vector_coverage"
+            evidence["classification"] = "validation_exact_vectors_not_fully_observed"
+            evidence["message"] = (
+                f"Only {observed}/{len(expected_batch)} exact validation vectors are observable; "
+                "the temporary workspace remains under bounded reconciliation."
+            )
+        return evidence
+
     def verify_validation_embedding_batch(batch_report):
         """Resolve an accepted or timed-out batch from exact persisted vectors."""
         start_index = int(batch_report.get("start_index") or 0)
@@ -11836,13 +11906,9 @@ def run_temporary_workspace_validation(
                 )
 
         polling = poll_post_upload(
-            lambda: verify_anythingllm_post_upload(
-                storage_dir,
-                result["workspace_slug"],
-                source_sha,
+            lambda: inspect_validation_exact_vectors(
                 expected_batch,
-                upload_locations=(batch_report.get("locations") or []),
-                observation_mode="fast",
+                batch_report.get("locations") or [],
             ),
             interval_seconds=2.0,
             timeout_seconds=min(45.0, remaining),
@@ -11920,12 +11986,9 @@ def run_temporary_workspace_validation(
 
         remaining = begin_validation_reconciliation()
         post_upload_poll = poll_post_upload(
-            lambda: verify_anythingllm_post_upload(
-                storage_dir,
-                result["workspace_slug"],
-                source_sha,
+            lambda: inspect_validation_exact_vectors(
                 selected_expected_payloads,
-                upload_locations=(upload_report.get("locations") or []),
+                upload_report.get("locations") or [],
             ),
             interval_seconds=3.0,
             timeout_seconds=remaining,
@@ -11943,6 +12006,10 @@ def run_temporary_workspace_validation(
                 "shared_reconciliation_deadline_seconds": validation_reconciliation["deadline_seconds"],
                 "shared_reconciliation_remaining_seconds": round(validation_remaining_seconds(), 3),
             }
+        )
+        post_upload_report = normalize_temporary_validation_exact_evidence(
+            post_upload_report,
+            len(selected_expected_payloads),
         )
         if post_upload_report.get("status") in SUCCESSFUL_POST_UPLOAD_STATUSES:
             runtime_validation_report = validate_anythingllm_native_runtime(
@@ -11979,9 +12046,13 @@ def run_temporary_workspace_validation(
         result["post_upload_status"],
         result["runtime_validation_status"],
     )
-    cleanup_required = cleanup_policy == "cleanup_always" or (
+    ambiguous_upload = result["upload_status"] in {
+        "reconciliation_pending",
+        "submission_unknown",
+    }
+    cleanup_required = (not ambiguous_upload) and (cleanup_policy == "cleanup_always" or (
         cleanup_policy == "cleanup_on_success" and validation_succeeded
-    )
+    ))
     if cleanup_required:
         result["cleanup_result"] = delete_validation_workspace(
             api_url,
@@ -11998,10 +12069,20 @@ def run_temporary_workspace_validation(
         )
     else:
         result["retention_status"] = (
+            "retained_for_ambiguous_mutation_reconciliation"
+            if ambiguous_upload else
             "left_visible_after_unsuccessful_validation"
             if cleanup_policy == "cleanup_on_success"
             else "left_visible_for_manual_review"
         )
+        if ambiguous_upload:
+            result["cleanup_result"] = {
+                "status": "deferred_ambiguous_mutation",
+                "error": "",
+                "message": (
+                    "Cleanup was withheld because AnythingLLM may still be processing this validation workspace."
+                ),
+            }
     if validation_succeeded:
         result["status"] = "complete"
     elif result["upload_status"] not in SUCCESSFUL_UPLOAD_STATUSES:
@@ -12948,6 +13029,7 @@ def _write_embedding_batch_ledger(ledger_path, workspace_slug, result):
             group = grouped_remaining_sources.setdefault(
                 group_key,
                 {
+                    "source_key": group_key,
                     "source_path": source_path,
                     "filename": filename,
                     "locations": [],
@@ -12956,7 +13038,7 @@ def _write_embedding_batch_ledger(ledger_path, workspace_slug, result):
             group["locations"].append(str(location))
         for group in grouped_remaining_sources.values():
             remaining_sources.append({
-                "source_key": group_key,
+                "source_key": group["source_key"],
                 "source_path": group["source_path"],
                 "filename": group["filename"],
                 "record_count": len(group["locations"]),
@@ -15588,6 +15670,19 @@ def maybe_upload_segment_files_source_transactions(
                 "source_key": group["source_key"],
                 "source_path": source_path,
                 "source_filename": source_name,
+                "source_sha256": next(
+                    (
+                        str(row.get("docSource") or "").rsplit("/", 1)[-1]
+                        for row in source_rows
+                        if "sha256/" in str(row.get("docSource") or "")
+                    ),
+                    "",
+                ),
+                "chunk_sources": [
+                    str(row.get("chunkSource") or "")
+                    for row in source_rows
+                    if str(row.get("chunkSource") or "")
+                ],
                 "planned_records": len(source_rows),
                 "state": "prepared",
                 "mutation_scope": "current_source",

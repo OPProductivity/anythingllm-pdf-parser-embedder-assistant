@@ -52,6 +52,12 @@ from gradio.routes import App as GradioFastAPIApp
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 from structured_logging import configure_structured_logger
+from reliability_audit import audit_run_directory, write_failure_bundle
+from prepared_batch_recovery import (
+    verify_prepared_batch_checkpoint,
+    write_prepared_batch_checkpoint,
+)
+from anythingllm_compatibility import characterize as characterize_anythingllm_compatibility
 from portable_paths import ensure_application_directories, package_resource_path
 from run_request import LOCAL_ONLY, NATIVE_UPLOAD, RunRequest
 from automatic_defaults import (
@@ -9557,6 +9563,79 @@ def reset_output_directory():
     return str(AUTO_OUTPUT_DIR)
 
 
+def automatic_native_mutation_compatibility_report(
+    api_url,
+    *,
+    require_settings_write=False,
+):
+    """Qualify the exact local Desktop mutation contract before a run.
+
+    Runtime reachability and authentication prove that an endpoint responds;
+    they do not prove that its upload, queue, storage, or settings semantics
+    still match the assistant.  This read-only gate binds mutation authority
+    to the installed package fingerprint and observed storage schema.
+    """
+    required = ["can_upload_native_metadata", "can_poll_post_upload_state"]
+    if require_settings_write:
+        required.extend(["can_write_env_settings", "can_write_sqlite_settings"])
+    if not is_local_anythingllm_url(str(api_url or "")):
+        return {
+            "status": "blocked",
+            "reason": "native_mutation_contract_requires_local_desktop",
+            "required_capabilities": required,
+            "blocked_capabilities": list(required),
+            "characterization": {},
+        }
+    characterization = characterize_anythingllm_compatibility(
+        default_anythingllm_storage_dir(),
+        include_package_fingerprint=True,
+        api_url=str(api_url or ""),
+    )
+    capabilities = characterization.get("capabilities") or {}
+    blocked = [
+        name for name in required
+        if str((capabilities.get(name) or {}).get("status") or "") != "supported"
+    ]
+    return {
+        "status": "pass" if not blocked else "blocked",
+        "reason": (
+            "exact_native_mutation_contract_matched"
+            if not blocked else "required_native_mutation_capability_not_qualified"
+        ),
+        "required_capabilities": required,
+        "blocked_capabilities": blocked,
+        "characterization": characterization,
+    }
+
+
+def compact_native_mutation_authority(compatibility_report):
+    """Return the redacted batch authority copied into preparation workers."""
+    report = dict(compatibility_report or {})
+    characterization = dict(report.get("characterization") or {})
+    capabilities = dict(characterization.get("capabilities") or {})
+    required = list(report.get("required_capabilities") or [])
+    return {
+        "status": "qualified" if report.get("status") == "pass" else "blocked",
+        "reason": str(report.get("reason") or ""),
+        "desktop_version_normalized": str(
+            characterization.get("desktop_version_normalized") or ""
+        ),
+        "desktop_release_status": str(characterization.get("desktop_release_status") or ""),
+        "matched_profile": str(characterization.get("matched_profile") or ""),
+        "native_mutation_contract": str(
+            characterization.get("native_mutation_contract") or ""
+        ),
+        "storage_schema_status": str(characterization.get("storage_schema_status") or ""),
+        "package_fingerprint_sha256": str(
+            (characterization.get("desktop_package") or {}).get("app_asar_sha256") or ""
+        ),
+        "capability_statuses": {
+            name: str((capabilities.get(name) or {}).get("status") or "unknown")
+            for name in required
+        },
+    }
+
+
 def automatic_batch_output_capacity_preflight(files, output_root, *, safety_reserve_bytes=256 * 1024 * 1024):
     """Check whole-batch artifact capacity before staging begins.
 
@@ -9867,6 +9946,24 @@ def pdf_picker_native_inspection_key(path):
     return resolved, int(stat.st_size), int(stat.st_mtime_ns), int(stat.st_ctime_ns)
 
 
+def local_source_version(path):
+    """Return the non-content source version shared by preview and execution."""
+    key = pdf_picker_native_inspection_key(path)
+    return {"size": int(key[1]), "mtime_ns": int(key[2]), "ctime_ns": int(key[3])}
+
+
+def confirmed_source_version_changed(path, expected_version):
+    """Fail closed only when confirmation supplied an immutable version."""
+    expected = dict(expected_version or {})
+    if not expected:
+        return False, {}, "confirmation_source_version_unavailable"
+    try:
+        observed = local_source_version(path)
+    except OSError as exc:
+        return True, {}, f"source_unreadable:{type(exc).__name__}"
+    return observed != expected, observed, "source_version_changed" if observed != expected else "source_version_matches"
+
+
 def _prune_batch_native_inspection_snapshots(now=None):
     """Drop expired selection coverage while the caller holds the cache lock."""
     current = time.monotonic() if now is None else float(now)
@@ -10044,6 +10141,11 @@ def merge_uploaded_pdfs_into_folder_batch(pdf_files=None, folder_manifest=None):
         # dedicated retry control must not survive as an empty header action.
         gr.update(visible=False),
     )
+
+
+def merge_uploaded_pdfs_into_direct_selection(pdf_files=None, folder_manifest=None):
+    """Direct-picker adapter with an output contract matching its event chain."""
+    return merge_uploaded_pdfs_into_folder_batch(pdf_files, folder_manifest)[:6]
 
 
 def reuse_selected_pdf_files(pdf_files=None):
@@ -12488,7 +12590,7 @@ def apply_saved_automatic_defaults_to_idle_form(pdf_files=None, folder_pdf_files
     return reset_automatic_run_settings_to_defaults()
 
 
-def active_automatic_run_root():
+def active_automatic_run_root(*, allow_recent_unowned=False):
     """Find a current owned run without mistaking recovery evidence for one."""
     live_root = str((LIVE_AUTOMATIC_RUN_STATUS or {}).get("run_root") or "")
     if live_root:
@@ -12517,8 +12619,12 @@ def active_automatic_run_root():
             return run_root
         if progress_age_seconds <= AUTOMATIC_RUN_PROGRESS_STALE_SECONDS:
             # A fresh record without an owned child is not sufficient
-            # authority to block a new run; this preserves the former safe
-            # handling of a server that died before worker launch.
+            # authority to block a new run. It is sufficient for a Cancel
+            # action when the same browser is visibly rendering that run:
+            # persisting the marker is idempotent and prevents a detached
+            # worker from crossing a later source boundary.
+            if allow_recent_unowned:
+                return run_root
             continue
     return None
 
@@ -12851,6 +12957,85 @@ def _write_automatic_run_json(path, payload):
         # practice; failing one progress write must not make a running job
         # appear permanently stalled after a server refresh.
         atomic_write_text(target, json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def terminal_integrity_audit(run_root, completion, *, native_run):
+    """Reconcile durable terminal evidence without changing AnythingLLM.
+
+    The audit runs before timing/history learning so a contradictory result is
+    not admitted as a successful timing observation. Its compact report is an
+    internal run artifact; only failures surface in the normal completion
+    message and receive a bounded redacted diagnostic bundle.
+    """
+    if not native_run:
+        return dict(completion), {}
+    root = Path(run_root)
+    try:
+        audit = audit_run_directory(
+            root,
+            terminal_state_override=str(completion.get("state") or ""),
+        )
+    except Exception as exc:
+        # Failure of this observer must not erase the pipeline's durable
+        # outcome. It does mean a nominal success is not fully certified.
+        APP_LOGGER.exception("terminal integrity audit could not run")
+        if str(completion.get("state") or "") == "successful":
+            return {
+                "state": "warning",
+                "code": "AUTO-INTEGRITY-AUDIT-UNAVAILABLE-001",
+                "message": (
+                    "The PDF result completed, but the independent terminal evidence audit "
+                    f"could not run ({type(exc).__name__}). No upload was retried."
+                ),
+            }, {}
+        return dict(completion), {}
+
+    audit_write_error = None
+    try:
+        _write_automatic_run_json(root / "integrity-audit.json", audit)
+    except OSError as exc:
+        audit_write_error = exc
+        APP_LOGGER.exception("terminal integrity audit result could not be retained")
+
+    if audit.get("audit_status") == "fail":
+        bundle = None
+        bundle_error = None
+        try:
+            bundle = write_failure_bundle(root, audit)
+        except OSError as exc:
+            bundle_error = exc
+            APP_LOGGER.exception("terminal integrity failure bundle could not be retained")
+        finding_count = int((audit.get("summary") or {}).get("error_findings") or 0)
+        APP_LOGGER.error(
+            "terminal integrity audit found %s contradiction(s)",
+            finding_count,
+            extra={"run_id": root.name, "event": "terminal_integrity_failure"},
+        )
+        return {
+            "state": "failed",
+            "code": "AUTO-INTEGRITY-001",
+            "message": (
+                f"Internal run evidence has {finding_count} reconciliation contradiction(s). "
+                "No upload was retried. Review Run history before resuming unresolved sources."
+                + (
+                    f" A compact diagnostic bundle was retained as {bundle.name}."
+                    if bundle else
+                    " The compact diagnostic bundle could not be retained; the integrity failure still stands."
+                    if bundle_error or audit_write_error else ""
+                )
+            ),
+        }, audit
+
+    if audit_write_error and str(completion.get("state") or "") == "successful":
+        return {
+            "state": "warning",
+            "code": "AUTO-INTEGRITY-AUDIT-UNAVAILABLE-001",
+            "message": (
+                "The PDF result completed and the independent evidence check passed, but its "
+                f"audit record could not be retained ({type(audit_write_error).__name__}). No upload was retried."
+            ),
+        }, audit
+    return dict(completion), audit
 
 
 def active_automatic_run_worker(run_root):
@@ -13899,7 +14084,7 @@ def cancel_or_reset_automatic_run(
     # destructive cooperative-stop path is authorized.
     visible_running = 'data-run-state="running"' in str(run_activity_html or "")
     run_root_path = (
-        active_automatic_run_root()
+        active_automatic_run_root(allow_recent_unowned=visible_running)
         if str(record.get("state") or "") in {"running", "preparing"} or visible_running
         else None
     )
@@ -14358,6 +14543,10 @@ def automatic_ocr_preflight_manifest(files, *, backend_mode="Automatic", unstruc
     rows = []
     for raw_path in files or []:
         path = Path(raw_path)
+        try:
+            source_version = local_source_version(path)
+        except OSError:
+            source_version = {}
         profile = automatic_timing_document_profile([path], page_sample_limit=3)
         risk = automatic_ocr_preflight_risk(profile)
         try:
@@ -14411,6 +14600,11 @@ def automatic_ocr_preflight_manifest(files, *, backend_mode="Automatic", unstruc
         rows.append({
             "file": str(path),
             "name": path.name,
+            # This is the immutable selection boundary used by the worker.
+            # It contains no text and lets a long batch reject a PDF that was
+            # replaced after confirmation rather than parsing a different
+            # file or trusting an obsolete duplicate result.
+            "source_version": source_version,
             "pages": max(0, int(profile.get("page_count") or 0)),
             "sampled_pages": max(0, int(profile.get("sampled_pages") or 0)),
             "risk": risk,
@@ -17546,6 +17740,17 @@ def automatic_run_failure_banner_update(code, message):
 
 def automatic_run_result_failure_banner(run_outputs):
     """Expose handled pipeline failures outside the collapsed output accordion."""
+    summary_update = run_outputs[0] if isinstance(run_outputs, (tuple, list)) and run_outputs else {}
+    rendered = str((summary_update or {}).get("value") or "") if isinstance(summary_update, dict) else ""
+    # The returned result belongs to this dispatch; process-global durable
+    # state can still describe a preceding run when validation fails before a
+    # new run root is reserved. Prefer the current handled-error contract so a
+    # stale terminal record cannot relabel the new failure.
+    if 'summary-status error' in rendered:
+        return automatic_run_failure_banner_update(
+            "AUTO-RUN-RESULT-001",
+            "The run returned a failure report instead of a successful result.",
+        )
     durable_completion = automatic_completion_from_durable_record(
         dict(LIVE_AUTOMATIC_RUN_STATUS or {})
     )
@@ -17553,13 +17758,6 @@ def automatic_run_result_failure_banner(run_outputs):
         return automatic_run_failure_banner_update(
             durable_completion.get("code") or "AUTO-RUN-RESULT-001",
             durable_completion.get("message") or "The run returned a failure report instead of a successful result.",
-        )
-    summary_update = run_outputs[0] if isinstance(run_outputs, (tuple, list)) and run_outputs else {}
-    rendered = str((summary_update or {}).get("value") or "") if isinstance(summary_update, dict) else ""
-    if 'summary-status error' in rendered:
-        return automatic_run_failure_banner_update(
-            "AUTO-RUN-RESULT-001",
-            "The run returned a failure report instead of a successful result.",
         )
     return gr.update(value="", visible=False)
 
@@ -20099,6 +20297,39 @@ def selected_input_exact_duplicate_summary(pdf_path, out_dir, *, canonical_path,
     return summary
 
 
+def changed_source_failure_summary(pdf_path, out_dir, *, reason, expected_version, observed_version):
+    """Persist a source-local outcome when a confirmed input changes in place."""
+    source = Path(pdf_path)
+    output_root = Path(out_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    summary = {
+        "pdf": str(source),
+        "output_root": str(output_root),
+        "source_sha256": "",
+        "api_upload_status": "error_source_changed_after_confirmation",
+        "api_upload_error": (
+            "The selected PDF changed or became unreadable after confirmation. "
+            "It was not parsed or submitted to AnythingLLM."
+        ),
+        "post_upload_verification_status": "not_checked_no_upload",
+        "anythingllm_runtime_validation_status": "not_checked_no_upload",
+        "post_upload_classification": "preparation_failed",
+        "app_error_code": "AUTO-SOURCE-CHANGED-001",
+        "app_error_title": "Selected PDF changed after confirmation",
+        "app_error_message": str(reason or "source_version_changed"),
+        "app_error_next_steps": [
+            "Review the PDF, select it again, and run that source separately.",
+            "Other unchanged PDFs in this batch may continue.",
+        ],
+        "source_version_evidence": {
+            "expected": dict(expected_version or {}),
+            "observed": dict(observed_version or {}),
+        },
+    }
+    _write_automatic_run_json(output_root / "run-summary.json", summary)
+    return summary
+
+
 def upload_prepared_automatic_batch(
     summaries,
     *,
@@ -21367,6 +21598,7 @@ def run_automatic(
         auto_apply_recommended_settings = False
     workspace_slug = (workspace_slug or "").strip() if prepare_and_upload else ""
     resolved_api_url = (api_url or "").strip() if prepare_and_upload else ""
+    batch_compatibility_authority = {}
     if prepare_and_upload:
         preferred_api_url = resolved_api_url or DEFAULT_ANYTHINGLLM_API_URL
         api_resolution = detect_anythingllm_api_url(
@@ -21550,6 +21782,39 @@ def run_automatic(
                 readiness_html=latest_readiness_html,
             )
 
+        compatibility_report = automatic_native_mutation_compatibility_report(
+            resolved_api_url,
+            require_settings_write=bool(auto_apply_recommended_settings),
+        )
+        compatibility_path = run_root / "anythingllm-mutation-compatibility.json"
+        try:
+            _write_automatic_run_json(compatibility_path, compatibility_report)
+        except OSError as exc:
+            APP_LOGGER.warning("could not persist AnythingLLM mutation compatibility evidence: %s", exc)
+        if compatibility_report.get("status") != "pass":
+            progress(None)
+            blocked = list(compatibility_report.get("blocked_capabilities") or [])
+            return automatic_error_outputs(
+                "AUTO-COMPATIBILITY-001",
+                "Installed AnythingLLM mutation contract is not qualified",
+                [
+                    "The local API is reachable, but this installed Desktop package or storage schema has not been proven compatible with the assistant's upload path.",
+                    "Blocked capability: " + (", ".join(blocked) if blocked else str(compatibility_report.get("reason") or "unknown")),
+                ],
+                [
+                    "Open Run history to inspect anythingllm-mutation-compatibility.json.",
+                    "Use local-files-only mode until this exact AnythingLLM build is characterized.",
+                ],
+                {
+                    "Compatibility report": str(compatibility_path),
+                    "Desktop version": str((compatibility_report.get("characterization") or {}).get("desktop_version") or "unidentified"),
+                },
+                readiness_html=latest_readiness_html,
+            )
+        batch_compatibility_authority = compact_native_mutation_authority(
+            compatibility_report
+        )
+
     local_choice = normalize_simulation_choice(local_check_mode)
     progress(0.004, desc="Checking retrieval simulation settings")
     simulation_plan = resolve_simulation_run(local_choice, custom_ollama_model, ollama_url)
@@ -21641,6 +21906,33 @@ def run_automatic(
     downloadable = []
     flat_no_logs_exports = []
     total_files = max(len(files), 1)
+    prepared_checkpoint_error = ""
+
+    def persist_prepared_checkpoint(stage):
+        """Persist preparation recovery state without changing run outcome.
+
+        Intermediate write trouble is remembered and retried at the final
+        pre-submission boundary. AnythingLLM mutation is blocked unless that
+        final checkpoint both writes and verifies.
+        """
+        nonlocal prepared_checkpoint_error
+        if not prepare_and_upload:
+            return None
+        try:
+            path = write_prepared_batch_checkpoint(
+                run_root,
+                summaries,
+                total_sources=total_files,
+                workspace_slug=workspace_slug,
+                api_url=resolved_api_url,
+                stage=stage,
+            )
+            prepared_checkpoint_error = ""
+            return path
+        except (OSError, UnicodeError, ValueError, TypeError) as exc:
+            prepared_checkpoint_error = f"{type(exc).__name__}: {exc}"
+            APP_LOGGER.warning("could not persist prepared-batch recovery checkpoint: %s", exc)
+            return None
     # Reserve all batch destinations before any worker starts. Otherwise two
     # same-named PDFs selected from different folders reuse one directory and
     # the later document can overwrite the earlier document's artifacts.
@@ -22356,6 +22648,50 @@ def run_automatic(
         # preflight difficulty profile rather than an equal-file split.
         start_fraction = AUTOMATIC_RUN_PREFLIGHT_DISPLAY_END + float(progress_allocation["start_share"]) * AUTOMATIC_RUN_DOCUMENT_DISPLAY_SPAN
         end_fraction = AUTOMATIC_RUN_PREFLIGHT_DISPLAY_END + float(progress_allocation["end_share"]) * AUTOMATIC_RUN_DOCUMENT_DISPLAY_SPAN
+        expected_source_version = dict(
+            preflight_by_path.get(str(pdf_path), {}).get("source_version") or {}
+        )
+        source_version_changed, observed_source_version, source_version_reason = (
+            confirmed_source_version_changed(pdf_path, expected_source_version)
+        )
+        if source_version_changed:
+            summary = changed_source_failure_summary(
+                pdf_path,
+                batch_output_directories[str(pdf_path)],
+                reason=source_version_reason,
+                expected_version=expected_source_version,
+                observed_version=observed_source_version,
+            )
+            summaries.append(summary)
+            persist_prepared_checkpoint("preparation_in_progress")
+            completed_files += 1
+            progress(
+                end_fraction,
+                desc=format_progress_desc(
+                    f"Changed PDF withheld — continuing after {pdf_path.name}",
+                    file_index,
+                    total_files,
+                ),
+            )
+            update_live_automatic_run_status(
+                run_root,
+                state="running",
+                phase="Changed PDF withheld — preparing the next source",
+                expected_seconds=expected_seconds,
+                details=(
+                    f"PDF {file_index}/{total_files} no longer matches the confirmed selection and was not parsed or uploaded."
+                ),
+                confirmed_fraction=end_fraction,
+                cancel_available=True,
+                activity_observed=True,
+                batch_completed_files=completed_files,
+                batch_total_files=total_files,
+                batch_current_file_index=(
+                    min(total_files, completed_files + 1)
+                    if completed_files < total_files else total_files
+                ),
+            )
+            continue
         if str(pdf_path) in fast_duplicate_skip_paths:
             summary = page_parent_duplicate_shortcut_summary(
                 pdf_path,
@@ -22364,6 +22700,7 @@ def run_automatic(
                 fast_duplicate_preflight,
             )
             summaries.append(summary)
+            persist_prepared_checkpoint("preparation_in_progress")
             completed_files += 1
             progress(
                 end_fraction,
@@ -22414,6 +22751,7 @@ def run_automatic(
                 source_sha256=source_sha,
             )
             summaries.append(summary)
+            persist_prepared_checkpoint("preparation_in_progress")
             completed_files += 1
             progress(
                 end_fraction,
@@ -22543,6 +22881,7 @@ def run_automatic(
             # if the source changed in the hand-off interval.
             precomputed_source_sha256=source_sha,
             precomputed_source_fingerprint=source_fingerprint,
+            external_compatibility_evidence=batch_compatibility_authority,
             external_preflight_managed=True,
             temporary_validation_cleanup_policy="cleanup_always",
             cancel_callback=lambda root=run_root: automatic_run_cancellation_requested(root),
@@ -22898,6 +23237,7 @@ def run_automatic(
             **prepared_page_parent_metadata_evidence(summary),
         }
         summaries.append(summary)
+        persist_prepared_checkpoint("preparation_in_progress")
         # A document becomes batch-complete only once its worker returned a
         # durable summary.  This count stays monotonic while the next PDF gets
         # a fresh reconciliation window; it does not reuse queue/vector x/y.
@@ -23015,6 +23355,86 @@ def run_automatic(
     batch_upload_report = {}
     batch_upload_report_path = run_root / "batch-native-upload-report.json"
     if prepare_and_upload and summaries and not cancellation_requested:
+        checkpoint_path = persist_prepared_checkpoint("preparation_complete")
+        checkpoint_verification = (
+            verify_prepared_batch_checkpoint(run_root)
+            if checkpoint_path is not None
+            else {
+                "status": "blocked",
+                "reusable": False,
+                "reason": prepared_checkpoint_error or "checkpoint_write_failed",
+            }
+        )
+        _write_automatic_run_json(
+            run_root / "prepared-batch-recovery-verification.json",
+            checkpoint_verification,
+        )
+        if not checkpoint_verification.get("reusable"):
+            message = (
+                "Prepared files were retained, but their restart checkpoint could not be verified. "
+                "AnythingLLM was not changed."
+            )
+            for summary in summaries:
+                if str(summary.get("api_upload_status") or "").casefold() in {
+                    "complete",
+                    "skipped_exact_duplicate",
+                }:
+                    continue
+                summary["api_upload_status"] = "error_prepared_checkpoint"
+                summary["api_upload_error"] = message
+                summary["post_upload_verification_status"] = "not_checked_no_upload"
+                summary["anythingllm_runtime_validation_status"] = "not_checked_no_upload"
+            batch_upload_report = {
+                "status": "error_prepared_checkpoint",
+                "uploaded": 0,
+                "embedded": 0,
+                "errors": [{
+                    "error": message,
+                    "reason": str(checkpoint_verification.get("reason") or "unknown"),
+                }],
+                "document_results": {},
+            }
+            _write_automatic_run_json(batch_upload_report_path, batch_upload_report)
+            downloadable.extend([
+                str(batch_upload_report_path),
+                str(run_root / "prepared-batch-recovery-verification.json"),
+            ])
+        else:
+            # This write is the durable boundary between safely reusable local
+            # preparation and a possibly mutating external operation. A crash
+            # after it must reconcile source receipts before any replay.
+            submission_checkpoint = persist_prepared_checkpoint("submission_started")
+            if submission_checkpoint is None:
+                message = (
+                    "The prepared batch is intact, but the pre-submission recovery boundary could not be written. "
+                    "AnythingLLM was not changed."
+                )
+                for summary in summaries:
+                    if str(summary.get("api_upload_status") or "").casefold() in {
+                        "complete",
+                        "skipped_exact_duplicate",
+                    }:
+                        continue
+                    summary["api_upload_status"] = "error_prepared_checkpoint"
+                    summary["api_upload_error"] = message
+                    summary["post_upload_verification_status"] = "not_checked_no_upload"
+                    summary["anythingllm_runtime_validation_status"] = "not_checked_no_upload"
+                batch_upload_report = {
+                    "status": "error_prepared_checkpoint",
+                    "uploaded": 0,
+                    "embedded": 0,
+                    "errors": [{"error": message, "reason": prepared_checkpoint_error}],
+                    "document_results": {},
+                }
+                _write_automatic_run_json(batch_upload_report_path, batch_upload_report)
+                downloadable.append(str(batch_upload_report_path))
+
+    if (
+        prepare_and_upload
+        and summaries
+        and not cancellation_requested
+        and not batch_upload_report
+    ):
         def report_grouped_upload_status(stage, report=None):
             nonlocal expected_seconds, cache_realization_eta_applied
             report = report or {}
@@ -23239,6 +23659,11 @@ def run_automatic(
             downloadable.append(str(batch_upload_report_path))
             if (run_root / "batch-embedding-ledger.json").is_file():
                 schedule_automatic_recovery(run_root, reason="grouped_upload_exception")
+        finally:
+            # Terminal source ledgers remain authoritative for any replay
+            # decision. This checkpoint simply closes the earlier
+            # ``submission_started`` marker when the app stayed alive.
+            persist_prepared_checkpoint("submission_terminal")
 
     batch_retention_report = {"status": "not_required", "documents": []}
     batch_retention_report_path = run_root / "batch-retention-report.json"
@@ -23737,6 +24162,20 @@ def run_automatic(
                     f"Detailed staging output was retained for review: {exc}"
                 ),
             }
+    completion, terminal_audit = terminal_integrity_audit(
+        run_root,
+        completion,
+        native_run=bool(prepare_and_upload and summaries and batch_upload_report),
+    )
+    if terminal_audit:
+        lines.append(
+            "Internal integrity audit: "
+            + (
+                "passed"
+                if terminal_audit.get("audit_status") == "pass"
+                else str(terminal_audit.get("audit_status") or "unavailable")
+            )
+        )
     wall_clock_seconds = time.perf_counter() - started_at
     live_timing_status = dict(LIVE_AUTOMATIC_RUN_STATUS or {})
     if live_timing_status.get("run_root") == str(run_root):
@@ -25194,13 +25633,6 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 show_progress="hidden",
                 queue=False,
             )
-            automatic_tab.select(
-                fn=apply_saved_automatic_defaults_to_idle_form,
-                inputs=[auto_pdfs, auto_folder_pdfs],
-                outputs=fresh_run_settings_outputs,
-                show_progress="hidden",
-                queue=False,
-            )
             automatic_run_inputs = [
                 auto_pdfs,
                 auto_folder_pdfs,
@@ -25507,7 +25939,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 # batch merge must run after the lock/reset boundary, rather
                 # than racing a second ``change`` request that can restore an
                 # old picker value after this selection has begun.
-                fn=merge_uploaded_pdfs_into_folder_batch,
+                fn=merge_uploaded_pdfs_into_direct_selection,
                 inputs=[auto_pdfs, auto_folder_manifest],
                 outputs=[
                     auto_pdfs,

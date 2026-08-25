@@ -76,9 +76,22 @@ def package_resource_path(relative_path: str) -> Path:
     """Find a non-writable package resource in source or installed form."""
 
     relative = Path(relative_path)
-    source_candidate = Path(__file__).resolve().parent / relative
+    module_root = Path(__file__).resolve().parent
+    source_candidate = module_root / relative
     if source_candidate.is_file():
         return source_candidate
+    # ``pip install --target`` and some portable launchers place wheel data
+    # below the target directory without changing ``sysconfig.get_path``.
+    # Resolve that wheel-standard layout relative to this imported module
+    # before consulting the interpreter-wide data directory.
+    target_candidate = (
+        module_root
+        / "share"
+        / "anythingllm-pdf-assistant"
+        / relative
+    )
+    if target_candidate.is_file():
+        return target_candidate
     installed_candidate = (
         Path(sysconfig.get_path("data"))
         / "share"

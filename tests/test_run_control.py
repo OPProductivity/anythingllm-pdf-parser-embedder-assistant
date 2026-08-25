@@ -440,6 +440,38 @@ def test_common_facade_returns_run_result_and_legacy_summary(tmp_path):
     assert (tmp_path / "output" / "run-result.json").exists()
 
 
+def test_preparation_snapshot_labels_batch_mutation_authority_without_rehashing(tmp_path):
+    authority = {
+        "status": "qualified",
+        "native_mutation_contract": "contract-1",
+        "package_fingerprint_sha256": "a" * 64,
+    }
+    args = SimpleNamespace(
+        segment_mode="page_limit",
+        target_passage_length=750,
+        anythingllm_chunk_size=768,
+        anythingllm_storage_dir=str(tmp_path / "missing-storage"),
+        prepare_and_upload=False,
+        run_vector_eval=False,
+        external_preflight_managed=True,
+        external_compatibility_evidence=authority,
+    )
+
+    result = execute_preparation(
+        tmp_path / "input.pdf",
+        tmp_path / "output",
+        args,
+        lambda _pdf, output, _args: {
+            "manifest": str(output / "segment-manifest.jsonl"),
+            "readiness_status": "ready",
+        },
+    )
+
+    assert result.status == "pass"
+    assert result.compatibility["preparation_worker_scope"] == "read_only_non_authoritative"
+    assert result.compatibility["mutation_authority"] == authority
+
+
 def test_pipeline_timing_breakdown_keeps_nested_phases_non_additive_and_persists_it(tmp_path):
     args = SimpleNamespace(
         segment_mode="page_limit",

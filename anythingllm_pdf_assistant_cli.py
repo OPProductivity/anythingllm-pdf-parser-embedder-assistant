@@ -580,6 +580,62 @@ def _compatibility_inspect(
     return 0
 
 
+def _reliability_audit_run(run_root: str, write_bundle: bool, emit_json: bool) -> int:
+    """Run the independent retained-evidence audit without contacting Desktop."""
+    from reliability_audit import audit_run_directory, write_failure_bundle
+
+    audit = audit_run_directory(run_root)
+    bundle = write_failure_bundle(run_root, audit) if write_bundle else None
+    if emit_json:
+        print(json.dumps({**audit, "failure_bundle": bundle.name if bundle else ""}, indent=2, ensure_ascii=False))
+    else:
+        print(f"Integrity audit: {audit['audit_status']}")
+        print(f"Recorded run outcome: {audit['run_outcome']}")
+        for finding in audit.get("findings") or []:
+            print(f"{finding['severity'].upper()} {finding['code']}: {finding['message']}")
+        if bundle:
+            print(f"Compact redacted failure bundle: {bundle.name}")
+    return 1 if audit.get("audit_status") == "fail" else 0
+
+
+def _reliability_self_test(output_root: str, emit_json: bool) -> int:
+    """Run the offline crash and real process-boundary transport matrices."""
+    import tempfile
+    from pathlib import Path
+
+    from reliability_acceptance import run_offline_crash_acceptance
+    from reliability_fault_injection import run_transport_fault_acceptance
+
+    def execute(root: Path):
+        crash = run_offline_crash_acceptance(root / "crash-matrix")
+        transport = run_transport_fault_acceptance(root / "transport-matrix")
+        return {
+            "schema": "anythingllm_pdf_assistant_reliability_self_test_v1",
+            "status": "pass" if crash["status"] == transport["status"] == "pass" else "fail",
+            "crash_matrix": crash,
+            "transport_matrix": transport,
+        }
+
+    if output_root:
+        report = execute(Path(output_root))
+    else:
+        with tempfile.TemporaryDirectory(prefix="anythingllm-pdf-reliability-") as temp_dir:
+            report = execute(Path(temp_dir))
+    if emit_json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        print(f"Reliability self-test: {report['status']}")
+        print(
+            f"Crash checkpoints: {report['crash_matrix']['scenario_count']} "
+            f"({report['crash_matrix']['status']})"
+        )
+        print(
+            f"Transport faults: {report['transport_matrix']['scenario_count']} "
+            f"({report['transport_matrix']['status']})"
+        )
+    return 0 if report["status"] == "pass" else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="AnythingLLM PDF Parser Embedder Assistant")
     subcommands = parser.add_subparsers(dest="command")
@@ -619,6 +675,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="also hash app.asar; this is slower and intended for compatibility audits",
     )
     compatibility.add_argument("--json", action="store_true", help="emit the full redacted evidence record")
+
+    reliability = subcommands.add_parser(
+        "reliability",
+        help="run read-only reliability checks against retained run evidence",
+    )
+    reliability.add_argument("action", choices=("audit-run", "self-test"))
+    reliability.add_argument("--run-root", default="", help="retained Automatic run directory")
+    reliability.add_argument(
+        "--output-root",
+        default="",
+        help="optional retained output directory for the offline self-test",
+    )
+    reliability.add_argument(
+        "--write-failure-bundle",
+        action="store_true",
+        help="write a compact redacted bundle only when contradictions are found",
+    )
+    reliability.add_argument("--json", action="store_true", help="emit the machine-readable audit")
     return parser
 
 
@@ -646,6 +720,17 @@ def main(argv: list[str] | None = None) -> int:
         return _bridge(args.action, args.resources_path)
     if command == "compatibility":
         return _compatibility_inspect(args.storage_dir, args.package_fingerprint, args.json, args.api_url)
+    if command == "reliability":
+        if args.action == "self-test":
+            return _reliability_self_test(args.output_root, args.json)
+        if not args.run_root:
+            print("reliability audit-run requires --run-root", file=sys.stderr)
+            return 2
+        return _reliability_audit_run(
+            args.run_root,
+            args.write_failure_bundle,
+            args.json,
+        )
     raise AssertionError(f"unexpected command: {command}")
 
 

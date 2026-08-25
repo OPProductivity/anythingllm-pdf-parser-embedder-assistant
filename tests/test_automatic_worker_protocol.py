@@ -44,6 +44,20 @@ def test_worker_contract_allows_a_verified_source_identity_snapshot():
     }
 
 
+def test_worker_contract_carries_only_compact_external_compatibility_authority():
+    authority = {
+        "status": "qualified",
+        "native_mutation_contract": "contract-1",
+        "package_fingerprint_sha256": "a" * 64,
+    }
+    payload, key = serializable_automatic_worker_arguments(
+        SimpleNamespace(external_compatibility_evidence=authority)
+    )
+
+    assert key == ""
+    assert payload == {"external_compatibility_evidence": authority}
+
+
 def test_selected_input_duplicate_receipt_is_not_a_workspace_duplicate(tmp_path):
     import rag_pdf_gradio_app as app
 

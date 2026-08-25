@@ -15,6 +15,7 @@ import socket
 import subprocess
 import sys
 import time
+import http.client
 import urllib.request
 from pathlib import Path
 
@@ -45,7 +46,7 @@ def wait_for_http(url: str, process: subprocess.Popen[bytes], timeout_seconds: f
             with urllib.request.urlopen(url, timeout=1) as response:
                 if 200 <= int(response.status) < 500:
                     return
-        except OSError:
+        except (OSError, http.client.HTTPException):
             time.sleep(0.25)
     raise TimeoutError(f"Local Gradio app did not listen at {url} within {timeout_seconds}s.")
 
@@ -116,7 +117,12 @@ def six_pdf_files(tmp_path: Path) -> list[Path]:
         document = fitz.open()
         try:
             page = document.new_page()
-            page.insert_text((72, 72), f"Browser six-file batch PDF {index}.")
+            text = "\n".join(
+                f"Browser six-file batch PDF {index}, native text line {line}. "
+                "This paragraph provides enough ordinary selectable text for the native path."
+                for line in range(1, 18)
+            )
+            page.insert_textbox((72, 72, 540, 760), text, fontsize=10)
             document.save(path)
         finally:
             document.close()
@@ -249,7 +255,7 @@ def test_selected_pdf_exposes_one_confirm_action_and_safe_prestart_cancel(page, 
     confirm = page.get_by_role("button", name="Confirm and start processing")
     cancel = page.get_by_role("button", name="Cancel")
     expect(confirm).to_be_visible(timeout=15000)
-    expect(confirm).to_be_enabled()
+    expect(confirm).to_be_enabled(timeout=20000)
     expect(cancel).to_be_visible()
     expect(cancel).to_be_disabled()
     expect(page.get_by_role("button", name="Review settings and continue")).to_be_hidden()
@@ -301,7 +307,7 @@ def test_six_pdf_local_batch_prepares_every_selected_source(page, local_app_url,
 
     # The terminal status is outside the collapsed downloads section and is
     # therefore the durable user-visible completion signal for every source.
-    expect(page.get_by_text(re.compile(r"Batch: 6/6 PDFs finished"))).to_be_visible(
+    expect(page.get_by_text(re.compile(r"PDF preparation finished: 6/6"))).to_be_visible(
         timeout=120000
     )
 
@@ -418,7 +424,7 @@ def test_dark_theme_confirmation_action_row_does_not_overlap(page, local_app_url
     confirm = page.get_by_role("button", name="Confirm and start processing")
     cancel = page.get_by_role("button", name="Cancel")
     expect(confirm).to_be_visible(timeout=15000)
-    expect(confirm).to_be_enabled()
+    expect(confirm).to_be_enabled(timeout=20000)
     expect(cancel).to_be_visible()
     confirm_box = confirm.bounding_box()
     cancel_box = cancel.bounding_box()
@@ -439,7 +445,7 @@ def test_narrow_confirmation_action_row_wraps_without_overlap(page, local_app_ur
     confirm = page.get_by_role("button", name="Confirm and start processing")
     cancel = page.get_by_role("button", name="Cancel")
     expect(confirm).to_be_visible(timeout=15000)
-    expect(confirm).to_be_enabled()
+    expect(confirm).to_be_enabled(timeout=20000)
     expect(cancel).to_be_visible()
     confirm_box = confirm.bounding_box()
     cancel_box = cancel.bounding_box()

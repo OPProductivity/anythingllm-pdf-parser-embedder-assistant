@@ -183,6 +183,21 @@ def execute_preparation(pdf_path, output_root, args, prepare_callable):
             "compatibility_fingerprint",
             lambda: characterize(storage),
         )
+        external_compatibility = getattr(args, "external_compatibility_evidence", None)
+        if bool(getattr(args, "external_preflight_managed", False)):
+            # The per-source worker deliberately avoids hashing the 60 MB
+            # Desktop package again. Preserve its fast read-only snapshot, but
+            # bind mutation authority to the compact evidence produced by the
+            # authoritative batch-level fingerprint gate. Without this label,
+            # retained runs misleadingly appeared to both reject and accept
+            # the same Desktop contract.
+            compatibility = dict(compatibility)
+            compatibility["preparation_worker_scope"] = "read_only_non_authoritative"
+            compatibility["mutation_authority"] = (
+                dict(external_compatibility)
+                if isinstance(external_compatibility, dict)
+                else {"status": "external_preflight_managed_without_embedded_evidence"}
+            )
         result.compatibility = compatibility
         state = recorder.execute(
             "state_resolution",

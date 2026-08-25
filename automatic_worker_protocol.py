@@ -38,6 +38,7 @@ AUTOMATIC_WORKER_ARGUMENT_FIELDS = frozenset({
     "document_short_label",
     "end_page_override",
     "end_section_names",
+    "external_compatibility_evidence",
     "external_preflight_managed",
     "first_page_override",
     "flat_output_without_logs",
