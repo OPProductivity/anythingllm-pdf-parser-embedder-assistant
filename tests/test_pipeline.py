@@ -3802,6 +3802,89 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(accepted["label"], "Bold")
         self.assertEqual(accepted["kind"], "person")
 
+    def test_filename_leading_author_conventions_beat_weak_title_evidence(self):
+        samples = [{"page": 1, "text": "Siren Songs\nHearing Resilience\nA cultural study"}]
+        person = pipeline.infer_author_from_samples_or_filename(
+            samples,
+            Path("Robin James - Resilience and Melancholy.pdf"),
+            title_hint="Resilience and Melancholy",
+        )
+        surname = pipeline.infer_author_from_samples_or_filename(
+            [], Path("Hughes - Why, You Reckon.pdf"), title_hint="Why, You Reckon",
+        )
+        numbered = pipeline.infer_author_from_samples_or_filename(
+            [], Path("De Grazia 02-Irresistible Empire.pdf"),
+        )
+        self.assertEqual((person["author"], person["source"]), ("Robin James", "filename_leading_name"))
+        self.assertEqual((surname["author"], surname["source"]), ("Hughes", "filename_leading_surname"))
+        self.assertEqual((numbered["author"], numbered["source"]), ("De Grazia", "filename_leading_name_before_section"))
+
+    def test_weak_author_guesses_remain_review_evidence_not_durable_metadata(self):
+        weak_text = pipeline.resolve_author_from_metadata_and_inference(
+            "", {"author": "Siren Songs, Hearing Resilience", "source": "text_top_block_names"},
+        )
+        weak_tail = pipeline.resolve_author_from_metadata_and_inference(
+            "", {"author": "Citizen Ocred", "source": "filename_terminal_name_slug"},
+        )
+        corrected = pipeline.resolve_author_from_metadata_and_inference(
+            "Taylor Example",
+            {"author": "Elena Markham", "source": "filename_leading_name"},
+        )
+        self.assertEqual(weak_text["source"], "not_available")
+        self.assertEqual(weak_tail["source"], "not_available")
+        self.assertEqual(corrected, {
+            "author": "Elena Markham",
+            "source": "filename_leading_name_overrode_pdf_metadata",
+        })
+
+    def test_grouped_source_progress_accumulates_across_pdf_local_queues(self):
+        import rag_pdf_gradio_app as app
+
+        state = {"prepared_records": 30, "source_totals": {}, "source_completed": {}}
+        first = app.grouped_source_window_progress(state, {
+            "timing_event": "queue_progress", "source_window_index": 1,
+            "source_window_total": 3, "queue_records": 10, "desktop_queue_completed": 5,
+        })
+        app.grouped_source_window_progress(state, {
+            "timing_event": "batch_completed", "source_window_index": 1,
+            "source_window_total": 3, "queue_records": 10, "desktop_queue_completed": 10,
+            "searchability_proven": True,
+        })
+        second = app.grouped_source_window_progress(state, {
+            "timing_event": "queue_progress", "source_window_index": 2,
+            "source_window_total": 3, "queue_records": 12, "desktop_queue_completed": 6,
+        })
+        self.assertEqual(first["fraction"], 5 / 30)
+        self.assertEqual(second["completed_records"], 16)
+        self.assertEqual(second["fraction"], 16 / 30)
+        self.assertEqual(second["completed_sources"], 1)
+
+    def test_upload_count_schema_distinguishes_new_attachment_from_confirmation(self):
+        import rag_pdf_gradio_app as app
+
+        report = app.explicit_upload_count_schema({"uploaded": 3, "embedded": 11})
+        self.assertEqual(report["newly_attached_records"], 3)
+        self.assertEqual(report["confirmed_vector_records"], 11)
+        self.assertIn("legacy alias", report["count_semantics"]["uploaded"])
+
+    def test_success_receipt_surfaces_nonblocking_visual_text_review(self):
+        import rag_pdf_gradio_app as app
+
+        summary = {
+            "pdf": "image-heavy.pdf", "api_upload_status": "complete",
+            "api_uploaded": 2, "api_embedded": 2,
+            "post_upload_expected_payloads": 2,
+            "visual_text_review": {
+                "status": "review_needed", "unresolved_page_count": 1,
+                "pages": [{"pdf_page": 3, "reason": "no_text_recovered"}],
+            },
+        }
+        receipt = app.automatic_completion_receipt([summary])
+        message = app.automatic_completion_success_message([summary])
+        self.assertEqual(receipt["visual_review_pages"], 1)
+        self.assertIn("need visual-text review", message)
+        self.assertIn("indexing was not blocked", message)
+
     def test_workspace_batch_suggestion_bounds_identity_reads_and_marks_unread_tail(self):
         import rag_pdf_gradio_app as app
 
@@ -4347,6 +4430,17 @@ class PipelineCoreTests(unittest.TestCase):
         # single UI repaint.
         self.assertEqual(app.bounded_queue_eta_reprice(120, 2_640), 150)
         self.assertEqual(app.bounded_queue_eta_reprice(120, 20), 90)
+
+    def test_visible_queue_reprice_requires_five_samples_and_a_material_change(self):
+        import rag_pdf_gradio_app as app
+
+        self.assertIsNone(app.stable_queue_eta_reprice(1_000, [800, 810, 820, 830]))
+        # One transient high sample cannot dominate the five-sample median.
+        stable = app.stable_queue_eta_reprice(1_000, [800, 810, 820, 830, 5_000])
+        self.assertEqual(stable["raw_forecast_seconds"], 820)
+        self.assertEqual(stable["expected_seconds"], 820)
+        # A sub-threshold change is deliberately not shown as a recalculation.
+        self.assertIsNone(app.stable_queue_eta_reprice(1_000, [940, 950, 960, 970, 980]))
 
     def test_concurrent_ingestion_progress_uses_eta_floor_and_evidence_ceiling(self):
         import rag_pdf_gradio_app as app
@@ -15207,7 +15301,18 @@ class PipelineCoreTests(unittest.TestCase):
 
         self.assertEqual(calls, [1])
         self.assertEqual(result["accepted"], len(locations))
-        self.assertEqual(result["batches"][0]["acceptance_basis"], "vector_observed_after_client_timeout")
+        self.assertEqual(
+            result["batches"][0]["acceptance_basis"],
+            "exact_vectors_observed_after_client_deadline",
+        )
+        self.assertNotIn("error", result["batches"][0])
+        self.assertEqual(
+            result["batches"][0]["resolved_transport_event"]["resolution"],
+            "exact_vectors_observed",
+        )
+        self.assertNotIn("error", result["runtime_events"][0])
+        self.assertIn("timed out", result["runtime_events"][0]["transport_message"])
+        self.assertTrue(result["runtime_events"][0]["resolved"])
         self.assertEqual(result["errors"], [])
 
     def test_timeout_review_observation_without_exact_vectors_remains_resumable(self):
@@ -15586,10 +15691,13 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(verified, [1, 5])
         self.assertEqual(result["accepted"], 8)
         self.assertEqual(result["errors"], [])
-        self.assertEqual(result["batches"][0]["acceptance_basis"], "vector_observed_after_client_timeout")
+        self.assertEqual(
+            result["batches"][0]["acceptance_basis"],
+            "exact_vectors_observed_after_client_deadline",
+        )
         self.assertEqual(
             result["runtime_events"][0]["classification"],
-            "client_timeout_recovered_by_vector_observation",
+            "client_deadline_reconciled_by_vector_observation",
         )
 
     def test_embedding_scheduler_hard_caps_requested_concurrency_at_one(self):
@@ -15670,12 +15778,12 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(result["accepted"], 2)
         self.assertEqual(
             result["batches"][0]["acceptance_basis"],
-            "workspace_attached_after_client_timeout",
+            "workspace_attached_after_client_deadline",
         )
         self.assertEqual(result["batches"][0]["lifecycle_state"], "workspace_attached")
         self.assertEqual(
             result["runtime_events"][0]["classification"],
-            "client_timeout_recovered_by_workspace_attachment",
+            "client_deadline_reconciled_by_workspace_attachment",
         )
 
     def test_runtime_retrieval_accepts_expected_source_within_top_n(self):

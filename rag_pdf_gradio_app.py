@@ -5114,6 +5114,21 @@ _WORKSPACE_PERSON_EVIDENCE_SOURCES = frozenset({
     "text_first_lines_stacked_byline",
     "text_role_followup",
     "filename_explicit_byline",
+    "filename_leading_name",
+    "filename_leading_surname",
+    "filename_leading_name_before_section",
+    "filename_corroborated_text_name",
+    "filename_leading_surnames",
+    "filename_leading_name_overrode_pdf_metadata",
+    "filename_leading_surname_overrode_pdf_metadata",
+    "filename_leading_name_before_section_overrode_pdf_metadata",
+    "filename_corroborated_text_name_overrode_pdf_metadata",
+    "filename_leading_surnames_overrode_pdf_metadata",
+    "text_byline_overrode_pdf_metadata",
+    "text_written_by_overrode_pdf_metadata",
+    "text_author_label_overrode_pdf_metadata",
+    "text_writer_label_overrode_pdf_metadata",
+    "text_bibliographic_author_label_overrode_pdf_metadata",
 })
 WORKSPACE_UNKNOWN_SOURCE_LABEL = "Unknown"
 _WORKSPACE_INSTITUTIONAL_SUFFIXES = (
@@ -5349,9 +5364,22 @@ def workspace_person_identity_from_pdf(pdf_file, *, native_metadata=None):
     # PDF metadata and legacy report shapes are external inputs. Validating the
     # full credit (rather than only its last token) prevents a bare ``Bold``,
     # ``Edition``, or similar title/publisher remnant from becoming a label.
-    person_author = normalize_metadata_author(first_author)
+    single_catalog_surname = source in {
+        "filename_leading_surname",
+        "filename_leading_surname_overrode_pdf_metadata",
+        "filename_leading_surnames",
+        "filename_leading_surnames_overrode_pdf_metadata",
+    }
+    person_author = (
+        normalize_text(first_author)
+        if single_catalog_surname
+        else normalize_metadata_author(first_author)
+    )
     words = re.findall(r"[^\W\d_][\w'’-]*", person_author, flags=re.UNICODE)
-    if len(words) < 2 or ({word.casefold() for word in words} & _WORKSPACE_AUTHOR_STOP_WORDS):
+    if (
+        (len(words) < 2 and not (single_catalog_surname and len(words) == 1))
+        or ({word.casefold() for word in words} & _WORKSPACE_AUTHOR_STOP_WORDS)
+    ):
         return {}
     result = words[-1]
     if result.isupper():
@@ -5359,6 +5387,8 @@ def workspace_person_identity_from_pdf(pdf_file, *, native_metadata=None):
     label = result[:1].upper() + result[1:]
     if source == "pdf_metadata":
         provenance = "embedded PDF author metadata"
+    elif source.startswith("filename_"):
+        provenance = "explicit leading filename author convention"
     elif source == "not_available":
         return {}
     else:
@@ -5409,7 +5439,7 @@ def workspace_source_identity_from_pdf(pdf_file):
         return fallback
     try:
         inspection_key = pdf_picker_native_inspection_key(path)
-        cache_key = ("workspace-source-identity-v2", *inspection_key)
+        cache_key = ("workspace-source-identity-v3", *inspection_key)
     except OSError:
         cache_key = None
     if cache_key is not None:
@@ -12082,8 +12112,84 @@ PRESENTATION_ETA_CONSERVATISM = 1.20
 # Do not turn them into a multi-minute visible ETA revision.
 QUEUE_ETA_MIN_COMPLETED_RECORDS = 12
 QUEUE_ETA_MIN_EVENT_SAMPLES = 12
-QUEUE_ETA_REPRICE_INTERVAL_SECONDS = 30.0
+QUEUE_ETA_SAMPLE_INTERVAL_SECONDS = 30.0
+# Keep sampling the owned Desktop queue continuously, but do not turn every
+# short-lived rate fluctuation into a new promise in the UI. Three minutes and
+# a five-sample median give the serial queue time to cross several ordinary
+# page-parent requests. This changes only when a forecast becomes visible; it
+# does not alter the classic estimate, timing lanes, or queue observations.
+QUEUE_ETA_REPRICE_INTERVAL_SECONDS = 180.0
+QUEUE_ETA_REPRICE_MIN_CHANGE_SECONDS = 90
+QUEUE_ETA_REPRICE_MIN_CHANGE_RATIO = 0.03
 QUEUE_ETA_MAX_CHANGE_RATIO = 0.25
+
+
+def grouped_source_window_progress(progress_state, report):
+    """Convert one PDF-local queue callback into batch-wide record evidence.
+
+    AnythingLLM reports queue positions relative to the current PDF.  The UI
+    progress bar is relative to the entire prepared batch.  Keeping the small
+    accumulator in the outer run callback preserves the established 16--78%
+    queue/identity lane while preventing PDF 2 from appearing to restart at
+    PDF 1's local position (or being hidden forever by the monotonic bar).
+    """
+    state = progress_state
+    event = str((report or {}).get("timing_event") or "")
+    try:
+        source_index = max(0, int((report or {}).get("source_window_index") or 0))
+        source_total = max(0, int((report or {}).get("source_window_total") or 0))
+        queue_total = max(0, int((report or {}).get("queue_records") or (report or {}).get("requested") or 0))
+        queue_completed = max(
+            0,
+            int((report or {}).get("desktop_queue_completed") or 0),
+            int((report or {}).get("desktop_queue_current") or 0),
+            int((report or {}).get("matching_vectors") or 0),
+        )
+    except (TypeError, ValueError):
+        source_index = source_total = queue_total = queue_completed = 0
+    try:
+        prepared_records = max(0, int((report or {}).get("prepared_records") or 0))
+    except (TypeError, ValueError):
+        prepared_records = 0
+    if prepared_records:
+        state["prepared_records"] = max(int(state.get("prepared_records") or 0), prepared_records)
+    if source_total:
+        state["source_total"] = max(int(state.get("source_total") or 0), source_total)
+    totals = state.setdefault("source_totals", {})
+    completed = state.setdefault("source_completed", {})
+    if source_index and queue_total:
+        totals[source_index] = max(int(totals.get(source_index) or 0), queue_total)
+        completed[source_index] = min(
+            totals[source_index],
+            max(int(completed.get(source_index) or 0), queue_completed),
+        )
+        if event in {
+            "batch_completed",
+            "desktop_queue_completed",
+            "exact_vector_reconciliation_complete",
+            "exact_vector_reconciliation_complete_with_provider_rechunking",
+            "exact_vector_reconciliation_complete_with_workspace_duplicates",
+        } and (
+            bool((report or {}).get("searchability_proven"))
+            or event != "batch_completed"
+        ):
+            completed[source_index] = totals[source_index]
+
+    completed_records = sum(max(0, int(value or 0)) for value in completed.values())
+    denominator = max(int(state.get("prepared_records") or 0), sum(max(0, int(value or 0)) for value in totals.values()))
+    fraction = min(1.0, completed_records / denominator) if denominator else 0.0
+    completed_sources = sum(
+        1 for index, total in totals.items()
+        if total > 0 and int(completed.get(index) or 0) >= int(total)
+    )
+    return {
+        "fraction": fraction,
+        "completed_records": completed_records,
+        "total_records": denominator,
+        "source_index": source_index,
+        "source_total": max(source_total, int(state.get("source_total") or 0)),
+        "completed_sources": completed_sources,
+    }
 
 
 def concurrent_ingestion_progress_fraction(evidence_fraction, elapsed_seconds, expected_seconds):
@@ -16667,6 +16773,27 @@ def bounded_queue_eta_reprice(current_expected, queue_forecast):
     return int(math.ceil(min(upper, max(lower, forecast))))
 
 
+def stable_queue_eta_reprice(current_expected, forecast_samples):
+    """Return a material bounded reprice from five independent samples."""
+    samples = [max(0, int(value or 0)) for value in (forecast_samples or [])]
+    if len(samples) < 5:
+        return None
+    raw_forecast = int(round(statistics.median(samples[-5:])))
+    candidate = bounded_queue_eta_reprice(current_expected, raw_forecast)
+    material_change = max(
+        QUEUE_ETA_REPRICE_MIN_CHANGE_SECONDS,
+        int(round(float(current_expected or 0) * QUEUE_ETA_REPRICE_MIN_CHANGE_RATIO)),
+    )
+    if abs(candidate - int(current_expected or 0)) < material_change:
+        return None
+    return {
+        "expected_seconds": candidate,
+        "raw_forecast_seconds": raw_forecast,
+        "material_change_seconds": material_change,
+        "sample_count": len(samples),
+    }
+
+
 def confirmed_prequeue_cache_eta_seconds(
     current_expected,
     elapsed_seconds,
@@ -17840,6 +17967,31 @@ def automatic_completion_receipt(summaries):
         == "deferred_after_exact_vector_proof"
         for summary in rows
     )
+    visual_review_rows = []
+    for summary in rows:
+        review = summary.get("visual_text_review")
+        if not isinstance(review, dict):
+            continue
+        try:
+            unresolved = max(0, int(review.get("unresolved_page_count") or 0))
+        except (TypeError, ValueError):
+            unresolved = 0
+        if not unresolved:
+            continue
+        pages = []
+        for page in review.get("pages") or []:
+            value = page.get("pdf_page") if isinstance(page, dict) else page
+            try:
+                number = int(value or 0)
+            except (TypeError, ValueError):
+                continue
+            if number > 0 and number not in pages:
+                pages.append(number)
+        visual_review_rows.append({
+            "pdf": Path(str(summary.get("pdf") or "document")).name,
+            "unresolved_pages": unresolved,
+            "pages": pages,
+        })
     return {
         "pdfs": len(rows),
         "planned_records": planned,
@@ -17852,6 +18004,9 @@ def automatic_completion_receipt(summaries):
         "partially_reconciled_pdfs": partially_reconciled_pdfs,
         "failed_pdfs": failures,
         "runtime_retrieval_deferred": runtime_deferred,
+        "visual_review_pdfs": len(visual_review_rows),
+        "visual_review_pages": sum(row["unresolved_pages"] for row in visual_review_rows),
+        "visual_review": visual_review_rows,
     }
 
 
@@ -17966,6 +18121,11 @@ def automatic_completion_success_message(summaries, *, include_runtime_note=True
     body = f" {extraction_summary}" if extraction_summary else ""
     if include_runtime_note and receipt["runtime_retrieval_deferred"]:
         body += " Vectors confirmed; live retrieval test skipped."
+    if receipt["visual_review_pages"]:
+        body += (
+            f" {receipt['visual_review_pages']} image-heavy page(s) in "
+            f"{receipt['visual_review_pdfs']} PDF(s) need visual-text review; indexing was not blocked."
+        )
     return lead + body
 
 
@@ -21298,6 +21458,18 @@ def changed_source_failure_summary(pdf_path, out_dir, *, reason, expected_versio
     return summary
 
 
+def explicit_upload_count_schema(report):
+    """Attach unambiguous count names while retaining legacy report keys."""
+    result = report
+    result["newly_attached_records"] = max(0, int(result.get("uploaded") or 0))
+    result["confirmed_vector_records"] = max(0, int(result.get("embedded") or 0))
+    result["count_semantics"] = {
+        "uploaded": "legacy alias of newly_attached_records",
+        "embedded": "legacy alias of confirmed_vector_records",
+    }
+    return result
+
+
 def upload_prepared_automatic_batch(
     summaries,
     *,
@@ -21658,7 +21830,7 @@ def upload_prepared_automatic_batch(
                 "queue_batches": list(summary.get("api_embedding_update_batches") or []),
                 "searchability_proven": True,
             }
-        return {
+        return explicit_upload_count_schema({
             "status": "complete_with_review_holds" if withheld_sources else "complete",
             "uploaded": sum(int(result.get("uploaded") or 0) for result in document_results.values()),
             "embedded": sum(int(result.get("embedded") or 0) for result in document_results.values()),
@@ -21668,16 +21840,16 @@ def upload_prepared_automatic_batch(
             "document_results": document_results,
             "duplicate_preflight": duplicate_preflight,
             "selected_input_exact_duplicates": selected_input_duplicates,
-        }
+        })
 
     if not all_rows:
-        return {
+        return explicit_upload_count_schema({
             "status": "error_missing_upload_files",
             "uploaded": 0,
             "embedded": 0,
             "errors": [{"error": "The selected PDFs produced no native upload records."}],
             "document_results": {},
-        }
+        })
 
     transports = {
         str(summary.get("native_upload_transport") or "file_upload").strip().casefold()
@@ -21703,13 +21875,13 @@ def upload_prepared_automatic_batch(
             }
             document_results[source_path] = result
             persist_grouped_upload_outcome(summary, result)
-        return {
+        return explicit_upload_count_schema({
             "status": "error_mixed_upload_transport",
             "uploaded": 0,
             "embedded": 0,
             "errors": [{"error": message}],
             "document_results": document_results,
-        }
+        })
     transport = transports.pop()
     expected_payloads = upload_plan_rows_to_expected_payloads(all_rows)
     for payload, row in zip(expected_payloads, all_rows):
@@ -22344,7 +22516,7 @@ def upload_prepared_automatic_batch(
         "Exact cached AnythingLLM document locations were linked to this workspace; this is distinct from records already indexed in the workspace."
         if report["prepared_record_cache_reused_count"] else "No prepared-record cache reuse was needed."
     )
-    return report
+    return explicit_upload_count_schema(report)
 
 
 def run_automatic(
@@ -23137,6 +23309,14 @@ def run_automatic(
     last_eta_recalibration_batch = 0
     completed_batches_across_run = 0
     last_queue_eta_recalibration_elapsed = -float("inf")
+    last_queue_eta_sample_elapsed = -float("inf")
+    queue_eta_forecast_samples = []
+    grouped_queue_progress_state = {
+        "prepared_records": 0,
+        "source_total": 0,
+        "source_totals": {},
+        "source_completed": {},
+    }
     active_file_index = 0
     planned_batch_adjustments = {}
     # The Desktop observer reports one rate for the current source window.
@@ -23241,7 +23421,7 @@ def run_automatic(
         The callback is observational: it neither retries AnythingLLM nor
         changes the pipeline's completion decision.
         """
-        nonlocal expected_seconds, last_eta_recalibration_batch, completed_batches_across_run, last_queue_eta_recalibration_elapsed
+        nonlocal expected_seconds, last_eta_recalibration_batch, completed_batches_across_run, last_queue_eta_recalibration_elapsed, last_queue_eta_sample_elapsed
         # The worker can flush an event after the browser has already received
         # a durable cancel acknowledgement. Do not let that late observation
         # revise the ETA, status, or progress checkpoint.
@@ -23317,20 +23497,29 @@ def run_automatic(
                 provider_request_seconds_prior=timing_unit_prior,
                 initial_estimated_records=initial_estimated_batches,
             )
-            # Reprice from owned queue evidence at a bounded cadence.  The
-            # raw observer may emit several records for one queue position;
-            # a mature sample is still repriced only every 30 seconds so the
-            # visible countdown cannot bounce between noisy rate estimates.
+            if (
+                batch_queue_forecast is not None
+                and elapsed - last_queue_eta_sample_elapsed >= QUEUE_ETA_SAMPLE_INTERVAL_SECONDS
+            ):
+                queue_eta_forecast_samples.append(
+                    int(batch_queue_forecast["forecast_seconds"])
+                )
+                del queue_eta_forecast_samples[:-9]
+                last_queue_eta_sample_elapsed = elapsed
+            # Reprice from the median of five spaced owned observations.
+            # The classic formula and bounded change remain intact; the UI
+            # simply stops treating one transient queue rate as a new promise.
             if (
                 batch_queue_forecast is not None
                 and elapsed - last_queue_eta_recalibration_elapsed >= QUEUE_ETA_REPRICE_INTERVAL_SECONDS
+                and len(queue_eta_forecast_samples) >= 5
             ):
-                raw_queue_forecast = int(batch_queue_forecast["forecast_seconds"])
-                queue_forecast = bounded_queue_eta_reprice(
-                    expected_seconds, raw_queue_forecast,
+                stable_reprice = stable_queue_eta_reprice(
+                    expected_seconds,
+                    queue_eta_forecast_samples,
                 )
-                if abs(queue_forecast - expected_seconds) >= 15:
-                    expected_seconds = queue_forecast
+                if stable_reprice is not None:
+                    expected_seconds = stable_reprice["expected_seconds"]
                     run_timing_estimate["expected_seconds"] = expected_seconds
                     run_timing_estimate.setdefault("queue_rate_recalibrations", []).append({
                         "elapsed_seconds": round(elapsed, 3),
@@ -23342,7 +23531,9 @@ def run_automatic(
                             round(remaining_seconds, 3)
                             if remaining_seconds is not None else None
                         ),
-                        "raw_forecast_seconds": raw_queue_forecast,
+                        "raw_forecast_seconds": stable_reprice["raw_forecast_seconds"],
+                        "forecast_sample_count": stable_reprice["sample_count"],
+                        "material_change_seconds": stable_reprice["material_change_seconds"],
                         "expected_seconds": expected_seconds,
                         "batch_queue_evidence": dict(batch_queue_forecast),
                     })
@@ -24439,15 +24630,9 @@ def run_automatic(
                     0,
                     int(report.get("prepared_records") or 0),
                 )
-            queue_total = max(
-                0,
-                int(report.get("queue_records") or report.get("requested") or 0),
-            )
-            queue_completed = max(
-                0,
-                int(report.get("desktop_queue_completed") or 0),
-                int(report.get("desktop_queue_current") or 0),
-                int(report.get("matching_vectors") or 0),
+            grouped_progress = grouped_source_window_progress(
+                grouped_queue_progress_state,
+                report,
             )
             if timing_event in {
                 "first_queue_progress",
@@ -24465,10 +24650,7 @@ def run_automatic(
             else:
                 upload_progress_phase = "queue_receipt"
             phase_start, phase_end = AUTOMATIC_UPLOAD_PHASE_RANGES[upload_progress_phase]
-            evidence_fraction = (
-                min(1.0, queue_completed / queue_total)
-                if queue_total else 0.0
-            )
+            evidence_fraction = grouped_progress["fraction"]
             grouped_confirmed_fraction = phase_start + (
                 phase_end - phase_start
             ) * evidence_fraction
@@ -24584,12 +24766,14 @@ def run_automatic(
                 activity_observed=True,
                 eta_reprice_reason=eta_reprice_reason,
                 progress_phase=upload_progress_phase,
-                completed_units=queue_completed,
-                total_units=queue_total,
+                completed_units=grouped_progress["completed_records"],
+                total_units=grouped_progress["total_records"],
                 evidence_kind="desktop_queue" if upload_progress_phase == "desktop_queue" else "exact_vector_observation" if upload_progress_phase == "identity_set" else "queue_receipt",
-                batch_completed_files=completed_files,
+                batch_completed_files=grouped_progress["completed_sources"],
                 batch_total_files=total_files,
-                batch_current_file_index=total_files,
+                batch_current_file_index=(
+                    grouped_progress["source_index"] or total_files
+                ),
             )
 
         try:

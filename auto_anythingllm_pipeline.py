@@ -770,6 +770,38 @@ POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES = {
     "text_compact_caps_byline",
 }
 
+# Evidence allowed to become durable author metadata without a human review.
+# Weak title-block and generic filename-tail candidates are intentionally not
+# included: they remain useful diagnostics but caused title phrases to be
+# published as authors in real course-library batches.
+TRUSTED_AUTHOR_INFERENCE_SOURCES = POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES | {
+    "text_titlepage_publisher_byline",
+    "text_first_lines_stacked_byline",
+    "text_role_followup",
+    "filename_explicit_byline",
+    "filename_leading_name",
+    "filename_leading_surname",
+    "filename_leading_name_before_section",
+    "filename_corroborated_text_name",
+    "filename_leading_surnames",
+}
+
+AUTHOR_METADATA_OVERRIDE_SOURCES = {
+    "text_byline",
+    "text_written_by",
+    "text_author_label",
+    "text_writer_label",
+    "text_bibliographic_author_label",
+    "text_affiliated_byline",
+    "text_bibliographic_byline",
+    "filename_explicit_byline",
+    "filename_leading_name",
+    "filename_leading_surname",
+    "filename_leading_name_before_section",
+    "filename_corroborated_text_name",
+    "filename_leading_surnames",
+}
+
 AUTHOR_ORGANIZATION_TERMS = {
     "academy",
     "association",
@@ -1713,6 +1745,70 @@ def infer_author_from_text_samples(samples, title_hint=""):
 def infer_author_from_filename(path: Path, title_hint=""):
     stem = normalize_text(path.stem)
     stem = re.sub(r"\[[^\]]+\]$", "", stem).strip()
+    # Course libraries and publisher downloads commonly use an explicit
+    # catalog prefix: ``First Last - Title`` or ``Surname - Title``.  This is
+    # stronger than guessing from a terminal title fragment because the
+    # delimiter establishes the prefix's role and the remainder establishes
+    # that it is followed by a title.  Keep the single-token form as surname
+    # evidence only; do not generalize arbitrary first words into authors.
+    leading_credit = re.match(r"^(.{2,80}?)\s+[-–—]{1,2}\s+(.{4,})$", stem)
+    if leading_credit:
+        prefix = normalize_author_candidate(leading_credit.group(1))
+        prefix_words = re.findall(r"[^\W\d_][\w'.-]*", prefix, flags=re.UNICODE)
+        prefix_is_complete_title = (
+            normalize_text(prefix).casefold()
+            == normalize_text(title_hint).casefold()
+        )
+        surname_pair = re.fullmatch(
+            r"([A-ZÀ-ÖØ-Þ][^\W\d_][\w'.-]*)\s+(?:and|&)\s+"
+            r"([A-ZÀ-ÖØ-Þ][^\W\d_][\w'.-]*)",
+            prefix,
+            flags=re.UNICODE,
+        )
+        if surname_pair and not prefix_is_complete_title:
+            return {
+                "author": f"{surname_pair.group(1)}, {surname_pair.group(2)}",
+                "source": "filename_leading_surnames",
+                "page": 0,
+                "evidence": path.name,
+            }
+        if not prefix_is_complete_title and looks_like_person_name(prefix, allow_all_caps=False):
+            return {
+                "author": prefix,
+                "source": "filename_leading_name",
+                "page": 0,
+                "evidence": path.name,
+            }
+        if (
+            not prefix_is_complete_title
+            and len(prefix_words) == 1
+            and 2 <= len(prefix_words[0]) <= 40
+            and prefix_words[0][0].isupper()
+        ):
+            return {
+                "author": prefix_words[0],
+                "source": "filename_leading_surname",
+                "page": 0,
+                "evidence": path.name,
+            }
+    # Numbered excerpts often omit spaces around the title delimiter, for
+    # example ``De Grazia 02-Irresistible Empire``.  A name-shaped prefix
+    # followed by an explicit section number is still a catalog convention;
+    # the number is never part of the author.
+    numbered_credit = re.match(
+        r"^([A-ZÀ-ÖØ-Þ][^\W\d_][\w'.-]*(?:\s+(?:(?:de|del|della|di|du|la|le|van|von|der|den|ter)|[A-ZÀ-ÖØ-Þ][^\W\d_][\w'.-]*)){1,3})\s+\d{1,3}\s*[-_:]",
+        stem,
+        flags=re.UNICODE,
+    )
+    if numbered_credit:
+        prefix = normalize_author_candidate(numbered_credit.group(1))
+        if looks_like_person_name(prefix, allow_all_caps=False):
+            return {
+                "author": prefix,
+                "source": "filename_leading_name_before_section",
+                "page": 0,
+                "evidence": path.name,
+            }
     # Browser downloads often preserve an explicit byline as a slug, e.g.
     # ``article-title-by-First-Last.pdf``.  This is weaker than text on the
     # page, but much stronger than treating title words as a person.
@@ -1760,7 +1856,32 @@ def infer_author_from_samples_or_filename(samples, path: Path, title_hint=""):
     report = infer_author_from_text_samples(samples, title_hint=title_hint)
     if report.get("source") == "text_non_person_byline":
         return report
-    return report if report.get("author") else infer_author_from_filename(path, title_hint=title_hint)
+    filename_report = infer_author_from_filename(path, title_hint=title_hint)
+    if report.get("author") and report.get("source") in TRUSTED_AUTHOR_INFERENCE_SOURCES:
+        return report
+    if filename_report.get("author") and filename_report.get("source") in TRUSTED_AUTHOR_INFERENCE_SOURCES:
+        return filename_report
+    # A bare title-page name is too weak on its own, but becomes materially
+    # different evidence when the same complete name is independently encoded
+    # at the start of the selected filename.  Compare normalized tokens so
+    # ``jodi-dean-title.pdf`` can corroborate ``Jodi Dean`` without making a
+    # generic first filename word an author.
+    if report.get("author"):
+        author_tokens = [
+            token.casefold()
+            for token in re.findall(r"[^\W\d_]+", normalize_author_candidate(report["author"]), flags=re.UNICODE)
+        ]
+        stem_tokens = [
+            token.casefold()
+            for token in re.findall(r"[^\W\d_]+", normalize_text(Path(path).stem), flags=re.UNICODE)
+        ]
+        if len(author_tokens) >= 2 and stem_tokens[:len(author_tokens)] == author_tokens:
+            return {
+                **report,
+                "source": "filename_corroborated_text_name",
+                "evidence": f"{report.get('evidence') or ''} / {Path(path).name}".strip(" /"),
+            }
+    return report if report.get("author") else filename_report
 
 
 def selected_extraction_author_samples(pages, *, page_limit=4):
@@ -1926,14 +2047,14 @@ def resolve_author_from_metadata_and_inference(metadata_author, inference, *, au
         if (
             inferred_value
             and inferred_value.casefold() != metadata_value.casefold()
-            and inferred_source in {"text_affiliated_byline", "text_bibliographic_byline"}
+            and inferred_source in AUTHOR_METADATA_OVERRIDE_SOURCES
         ):
             return {
                 "author": inferred_value,
                 "source": f"{inferred_source}_overrode_pdf_metadata",
             }
         return {"author": metadata_value, "source": "pdf_metadata"}
-    if inferred_value:
+    if inferred_value and inferred_source in TRUSTED_AUTHOR_INFERENCE_SOURCES:
         return {"author": inferred_value, "source": inferred_source or "text_inference"}
     return {"author": "", "source": "not_available"}
 
@@ -13688,10 +13809,16 @@ def _update_workspace_embeddings_batched_serial(
                 batch_report["submission_state"] = "accepted"
                 batch_report["accepted"] = len(batch)
                 batch_report["acceptance_basis"] = (
-                    "vector_observed_after_client_timeout"
+                    "exact_vectors_observed_after_client_deadline"
                     if batch_report["searchability_proven"]
-                    else "workspace_attached_after_client_timeout"
+                    else "workspace_attached_after_client_deadline"
                 )
+                if batch_report["searchability_proven"]:
+                    batch_report["resolved_transport_event"] = {
+                        "kind": "client_response_deadline_elapsed",
+                        "message": str(batch_report.pop("error", "") or "The client response deadline elapsed."),
+                        "resolution": "exact_vectors_observed",
+                    }
                 result["accepted"] += len(batch)
                 if unresolved_error in result["errors"]:
                     result["errors"].remove(unresolved_error)
@@ -13700,17 +13827,21 @@ def _update_workspace_embeddings_batched_serial(
                     "vector_observed" if batch_report["searchability_proven"] else "workspace_attached",
                     "Recovered after a client timeout using local AnythingLLM observation.",
                 )
-                result["runtime_events"].append(
-                    {
-                        **dict(unresolved_error or {}),
-                        "classification": (
-                            "client_timeout_recovered_by_vector_observation"
-                            if batch_report["searchability_proven"]
-                            else "client_timeout_recovered_by_workspace_attachment"
-                        ),
-                        "verification_status": verification_status,
-                    }
+                resolved_runtime_event = dict(unresolved_error or {})
+                resolved_runtime_event["transport_message"] = str(
+                    resolved_runtime_event.pop("error", "")
+                    or "The client response deadline elapsed."
                 )
+                resolved_runtime_event.update({
+                    "classification": (
+                        "client_deadline_reconciled_by_vector_observation"
+                        if batch_report["searchability_proven"]
+                        else "client_deadline_reconciled_by_workspace_attachment"
+                    ),
+                    "verification_status": verification_status,
+                    "resolved": bool(batch_report["searchability_proven"]),
+                })
+                result["runtime_events"].append(resolved_runtime_event)
             elif (
                 not was_unresolved
                 and verification_status == "timeout"
@@ -15983,6 +16114,8 @@ def maybe_upload_segment_files_source_transactions(
                 "state": str(child.get("status") or "error"),
                 "uploaded": int(child.get("uploaded") or 0),
                 "embedded": int(child.get("embedded") or 0),
+                "newly_attached_records": int(child.get("uploaded") or 0),
+                "confirmed_vector_records": int(child.get("embedded") or 0),
                 "locations": list(child.get("locations") or []),
                 "errors": list(child.get("errors") or []),
             })
@@ -16066,6 +16199,15 @@ def maybe_upload_segment_files_source_transactions(
         aggregate["status"] = "complete_with_key_cleanup_warning"
     else:
         aggregate["status"] = "complete"
+    # ``uploaded`` and ``embedded`` remain for compatibility with retained
+    # v1 artifacts.  Their names are ambiguous in mixed cache/new runs, so
+    # every new report also publishes the exact semantics explicitly.
+    aggregate["newly_attached_records"] = int(aggregate.get("uploaded") or 0)
+    aggregate["confirmed_vector_records"] = int(aggregate.get("embedded") or 0)
+    aggregate["count_semantics"] = {
+        "uploaded": "legacy alias of newly_attached_records",
+        "embedded": "legacy alias of confirmed_vector_records; includes newly attached and pre-existing selected records",
+    }
     persist_transactions(finalize_snapshot=True, include_aggregate_embedding=True)
     return aggregate
 
@@ -21766,7 +21908,12 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             ):
                 batch["submission_state"] = "accepted"
                 batch["accepted"] = int(batch.get("requested") or 0)
-                batch["acceptance_basis"] = "document_wide_vector_observation_after_client_timeout"
+                batch["acceptance_basis"] = "document_wide_exact_vectors_after_client_deadline"
+                batch["resolved_transport_event"] = {
+                    "kind": "client_response_deadline_elapsed",
+                    "message": str(batch.pop("error", "") or "The client response deadline elapsed."),
+                    "resolution": "document_wide_exact_vectors_observed",
+                }
                 set_embedding_batch_lifecycle(
                     batch,
                     "vector_observed",
@@ -21787,7 +21934,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         )
         embedding_update.setdefault("runtime_events", []).append(
             {
-                "event": "client_timeout_reconciled_by_document_wide_vector_observation",
+                "event": "client_deadline_reconciled_by_document_wide_vector_observation",
                 "recovered_batches": recovered_batches,
                 "observed_vectors": observed_vectors,
                 "expected_vectors": expected_vectors,
@@ -21806,6 +21953,16 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             )
         post_upload_report["reconciled_original_run"] = True
         post_upload_report["reconciled_batches"] = recovered_batches
+        if embedding_batch_ledger_path:
+            # The document-wide observer is a later, stronger fact than the
+            # interim client-deadline record. Persist that resolved state to
+            # the authoritative embedding ledger as well as the per-PDF API
+            # report; otherwise successful runs retain a stale active error.
+            _write_embedding_batch_ledger(
+                embedding_batch_ledger_path,
+                target_workspace_slug,
+                embedding_update,
+            )
         write_json(inspection_dir / "api-upload-report.json", upload_report)
     if post_upload_report.get("status") == "partial_vector_coverage":
         # Preserve an explicit upload-level incomplete state even when all

@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 
-AUDIT_SCHEMA = "anythingllm_pdf_assistant_reliability_audit_v1"
+AUDIT_SCHEMA = "anythingllm_pdf_assistant_reliability_audit_v2"
 FAILURE_BUNDLE_DIRECTORY = "reliability-failures"
 MAX_ARTIFACT_BYTES = 32 * 1024 * 1024
 TERMINAL_STATES = frozenset({"successful", "warning", "failed", "cancelled"})
@@ -175,8 +175,8 @@ def _audit_source_transactions(
         "retained_sources": len(transactions),
         "state_counts": dict(sorted(Counter(states).items())),
         "planned_records": sum(_safe_int(row.get("planned_records")) for row in transactions),
-        "uploaded_records": sum(_safe_int(row.get("uploaded")) for row in transactions),
-        "embedded_records": sum(_safe_int(row.get("embedded")) for row in transactions),
+        "newly_attached_records": sum(_safe_int(row.get("uploaded")) for row in transactions),
+        "confirmed_vector_records": sum(_safe_int(row.get("embedded")) for row in transactions),
         "location_count": sum(len(row.get("locations") or []) for row in transactions),
         "held_at_source": stop_index or None,
     }
@@ -253,6 +253,7 @@ def _audit_document_results(
         "selected_records": selected,
         "newly_attached_records": attached,
         "existing_workspace_records": existing,
+        "confirmed_vector_records": confirmed,
         "confirmed_records": confirmed,
         "inferred_existing_result_rows": inferred_existing_rows,
     }
@@ -316,7 +317,7 @@ def audit_run_directory(
         and report_uploaded == 0
         and report_embedded > 0
         and report_embedded == documented_existing
-        and report_embedded == _safe_int(document_summary.get("confirmed_records"))
+        and report_embedded == _safe_int(document_summary.get("confirmed_vector_records"))
     )
     claimed_remote_records = max(
         report_uploaded,
@@ -370,7 +371,7 @@ def audit_run_directory(
              "AUDIT-CROSS-DOCUMENT-001",
              "Batch newly attached count disagrees with the per-PDF results.",
              "batch-native-upload-report.json")
-        _add(findings, report_embedded != _safe_int(document_summary.get("confirmed_records")),
+        _add(findings, report_embedded != _safe_int(document_summary.get("confirmed_vector_records")),
              "AUDIT-CROSS-DOCUMENT-002",
              "Batch confirmed count disagrees with the per-PDF results.",
              "batch-native-upload-report.json")
@@ -388,12 +389,12 @@ def audit_run_directory(
          "Embedding accepted count disagrees with the records submitted by this run.", "batch-embedding-ledger.json")
 
     if source_summary:
-        _add(findings, source_summary["uploaded_records"] != report_uploaded,
+        _add(findings, source_summary["newly_attached_records"] != report_uploaded,
              "AUDIT-CROSS-SOURCE-001",
              "Source transaction uploaded totals disagree with the batch report.",
              "source-transaction-ledger.json")
         source_embedded_target = report_uploaded if document_summary.get("present") else report_embedded
-        _add(findings, source_summary["embedded_records"] != source_embedded_target,
+        _add(findings, source_summary["confirmed_vector_records"] != source_embedded_target,
              "AUDIT-CROSS-SOURCE-002",
              "Source transaction vector totals disagree with this run's submitted-record total.",
              "source-transaction-ledger.json")
@@ -441,8 +442,18 @@ def audit_run_directory(
             ),
             "source_transactions": source_summary,
             "upload_status": report_status,
+            "newly_attached_records": report_uploaded,
+            "confirmed_vector_records": report_embedded,
+            # Backward-compatible aliases for older report readers. New code
+            # should use the explicit names above.
             "uploaded_records": report_uploaded,
             "confirmed_records": report_embedded,
+            "count_semantics": {
+                "newly_attached_records": "records attached to the workspace by this run",
+                "confirmed_vector_records": "all selected records proven searchable, including safe reuse",
+                "uploaded_records": "legacy alias of newly_attached_records",
+                "confirmed_records": "legacy alias of confirmed_vector_records",
+            },
             "document_results": document_summary,
             "embedding_requested": requested,
             "embedding_accepted": accepted,

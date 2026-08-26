@@ -231,8 +231,8 @@ def test_mixed_existing_and_new_records_reconcile_without_false_overcount(tmp_pa
     audit = audit_run_directory(tmp_path)
 
     assert audit["audit_status"] == "pass"
-    assert audit["summary"]["uploaded_records"] == 2
-    assert audit["summary"]["confirmed_records"] == 5
+    assert audit["summary"]["newly_attached_records"] == 2
+    assert audit["summary"]["confirmed_vector_records"] == 5
 
 
 def test_existing_record_claim_without_per_pdf_evidence_fails_closed(tmp_path):
