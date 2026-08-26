@@ -71,7 +71,7 @@ def test_intent_without_transport_receipt_is_safe_to_submit(tmp_path):
     assert plan["sources"][0]["reason"] == "intent_persisted_but_no_transport_receipt"
 
 
-@pytest.mark.parametrize("receipt_state", ["submitted", "submission_unknown", "attached"])
+@pytest.mark.parametrize("receipt_state", ["submitted", "submission_unknown", "attached", "global_hold"])
 def test_any_possible_external_mutation_forbids_automatic_replay(tmp_path, receipt_state):
     _ledger(tmp_path, "attachment_intent_durable")
     _receipt(tmp_path, receipt_state)
@@ -149,3 +149,77 @@ def test_in_progress_preparation_can_resume_locally_but_never_submit(tmp_path):
 
     assert plan["sources"][0]["action"] == "resume_local_preparation"
     assert plan["automatic_submission_allowed"] is False
+
+
+def test_interrupted_append_only_source_journal_materializes_latest_states(tmp_path):
+    (tmp_path / "source-transaction-ledger.json").write_text(
+        json.dumps({
+            "workspace_slug": "workspace",
+            "run_id": "run-journal",
+            "transaction_count": 2,
+            "transactions": [],
+            "transaction_event_journal": "source-transaction-events.jsonl",
+            "journal_finalized": False,
+        }),
+        encoding="utf-8",
+    )
+    events = [
+        {"transaction": {"source_index": 1, "source_sha256": "a" * 64, "planned_records": 2, "state": "prepared"}},
+        {"transaction": {"source_index": 1, "source_sha256": "a" * 64, "planned_records": 2, "state": "attachment_intent_durable"}},
+        {"transaction": {"source_index": 1, "source_sha256": "a" * 64, "planned_records": 2, "state": "exact_vectors_proven"}},
+        {"transaction": {"source_index": 2, "source_sha256": "b" * 64, "planned_records": 1, "state": "prepared"}},
+    ]
+    (tmp_path / "source-transaction-events.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+
+    plan = build_prepared_recovery_plan(tmp_path)
+
+    assert plan["status"] == "ready"
+    assert [source["action"] for source in plan["sources"]] == [
+        "preserve_completed",
+        "safe_to_submit",
+    ]
+    assert plan["automatic_submission_allowed"] is True
+
+
+def test_malformed_source_transaction_journal_blocks_automatic_replay(tmp_path):
+    (tmp_path / "source-transaction-ledger.json").write_text(
+        json.dumps({
+            "transaction_count": 1,
+            "transactions": [],
+            "transaction_event_journal": "source-transaction-events.jsonl",
+            "journal_finalized": False,
+        }),
+        encoding="utf-8",
+    )
+    (tmp_path / "source-transaction-events.jsonl").write_text(
+        '{"transaction":\n', encoding="utf-8"
+    )
+
+    plan = build_prepared_recovery_plan(tmp_path)
+
+    assert plan["status"] == "blocked"
+    assert plan["automatic_submission_allowed"] is False
+    assert "malformed_source_transaction_event_line:1" in plan["reason"]
+
+
+def test_empty_published_source_journal_is_blocked_not_misreported_ready(tmp_path):
+    (tmp_path / "source-transaction-ledger.json").write_text(
+        json.dumps({
+            "transaction_count": 2,
+            "transactions": [],
+            "transaction_event_journal": "source-transaction-events.jsonl",
+            "journal_finalized": False,
+        }),
+        encoding="utf-8",
+    )
+    (tmp_path / "source-transaction-events.jsonl").write_text("", encoding="utf-8")
+
+    plan = build_prepared_recovery_plan(tmp_path)
+
+    assert plan["status"] == "blocked"
+    assert plan["sources"] == []
+    assert plan["automatic_submission_allowed"] is False
+    assert plan["reason"] == "source_transaction_journal_has_no_source_event"

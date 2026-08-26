@@ -100,7 +100,12 @@ def test_selection_acknowledgement_only_becomes_ready_after_a_file_snapshot():
     import rag_pdf_gradio_app as app
 
     pending, *_ = app.automatic_selection_begin_state({"revision": 2})
-    assert pending == {"state": "pending", "revision": 3}
+    assert pending == {
+        "state": "pending",
+        "revision": 3,
+        "selection_signature": "",
+        "accept_next_signature": False,
+    }
     assert not app.automatic_selection_is_ready(pending)
 
     ready = app.automatic_selection_finish_state(pending, ["C:/approved.pdf"], [], {})[0]

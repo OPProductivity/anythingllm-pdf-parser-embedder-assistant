@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from prepared_batch_recovery import verify_prepared_batch_checkpoint
+from source_transaction_journal import materialize_source_transaction_journal
 
 
 RECOVERY_SCHEMA = "anythingllm_pdf_assistant_prepared_recovery_v1"
@@ -18,6 +19,7 @@ AMBIGUOUS_RECEIPT_STATES = frozenset({
     "attached",
     "attached_reconciled",
     "reused_cached_location",
+    "global_hold",
 })
 SAFE_REJECTED_RECEIPT_STATES = frozenset({"rejected"})
 
@@ -156,13 +158,14 @@ def build_prepared_recovery_plan(run_root: str | Path) -> dict[str, Any]:
             "sources": [],
             "automatic_submission_allowed": False,
         }
+    ledger, transaction_event_errors = materialize_source_transaction_journal(root, ledger)
     receipts, receipt_errors = _read_receipts(receipt_path)
     receipts_by_pdf: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for receipt in receipts:
         receipts_by_pdf[str(receipt.get("pdf_sha256") or "")].append(receipt)
 
     sources: list[dict[str, Any]] = []
-    global_hold = bool(receipt_errors)
+    global_hold = bool(receipt_errors or transaction_event_errors)
     for row in ledger.get("transactions") or []:
         if not isinstance(row, dict):
             global_hold = True
@@ -219,7 +222,7 @@ def build_prepared_recovery_plan(run_root: str | Path) -> dict[str, Any]:
     return {
         "schema": RECOVERY_SCHEMA,
         "status": "blocked" if global_hold else "ready",
-        "reason": ";".join(receipt_errors),
+        "reason": ";".join([*transaction_event_errors, *receipt_errors]),
         "sources": sources,
         "action_counts": dict(sorted(action_counts.items())),
         "automatic_submission_allowed": (

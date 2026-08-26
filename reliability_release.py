@@ -106,6 +106,7 @@ def _scale_acceptance_passed(path: str | Path | None) -> bool:
         and int(report.get("source_count") or 0) >= 1000
         and int(report.get("artifact_count") or 0) >= 3000
         and report.get("external_mutation_attempted") is False
+        and report.get("scope") == "prepared_checkpoint_durability_only"
         and required.issubset(checks)
         and all(checks[name] is True for name in required)
     )
@@ -250,10 +251,15 @@ def certify_release(
     checks = {
         "python_supported": python_supported,
         "offline_crash_matrix": crash.get("status") == "pass",
-        "transport_fault_matrix": transport.get("status") == "pass",
+        "transport_fault_matrix": (
+            transport.get("status") == "pass"
+            and transport.get("scope")
+            == "loopback_transport_recovery_and_production_classifier"
+            and all((transport.get("production_classifier_checks") or {}).values())
+        ),
         "anythingllm_mutation_contract": compatibility_ready,
         "disposable_live_canary": _live_canary_passed(live_canary_path),
-        "large_scale_acceptance": _scale_acceptance_passed(scale_report_path),
+        "prepared_checkpoint_scale_acceptance": _scale_acceptance_passed(scale_report_path),
         "eta_regression_evidence": _eta_regression_passed(eta_report_path),
         "default_python_suite": _default_suite_passed(default_junit_path),
         "browser_ui_acceptance": _ui_acceptance_passed(ui_junit_path),

@@ -1,10 +1,12 @@
-"""Large-batch durability acceptance without contacting AnythingLLM.
+"""Prepared-checkpoint scale acceptance without contacting AnythingLLM.
 
 The runner creates one thousand independent prepared source receipts using the
 production checkpoint writer, verifies every artifact, proves one changed
 source blocks reuse, restores it, and proves a durable submission-start marker
 prevents replay of the entire batch.  It exercises filesystem scale and
 recovery classification while remaining deterministic and free of source data.
+It does not exercise PDF extraction, workers, Gradio, Desktop queues, or
+embedding; those paths require separate production-path and live checks.
 """
 
 from __future__ import annotations
@@ -107,6 +109,14 @@ def run_scale_acceptance(output_root: str | Path, *, source_count: int = DEFAULT
         "source_count": count,
         "artifact_count": count * 3,
         "external_mutation_attempted": False,
+        "scope": "prepared_checkpoint_durability_only",
+        "not_covered": [
+            "pdf_extraction",
+            "worker_supervision",
+            "gradio_event_chains",
+            "anythingllm_submission",
+            "embedding_confirmation",
+        ],
         "checks": checks,
     }
     atomic_write_json(root / "scale-acceptance-report.json", report)

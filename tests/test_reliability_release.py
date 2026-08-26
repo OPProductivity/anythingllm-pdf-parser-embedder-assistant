@@ -34,7 +34,12 @@ def test_release_certificate_requires_clean_source_and_valid_rollback(tmp_path, 
     monkeypatch.setattr(
         release,
         "run_transport_fault_acceptance",
-        lambda _root: {"status": "pass", "scenario_count": 5},
+        lambda _root: {
+            "status": "pass",
+            "scenario_count": 5,
+            "scope": "loopback_transport_recovery_and_production_classifier",
+            "production_classifier_checks": {"422": True, "500": True},
+        },
     )
     monkeypatch.setattr(
         release,
@@ -78,7 +83,8 @@ def test_release_certificate_requires_clean_source_and_valid_rollback(tmp_path, 
     scale.write_text(json.dumps({
         "schema": "anythingllm_pdf_assistant_scale_acceptance_v1",
         "status": "pass", "source_count": 1000, "artifact_count": 3000,
-        "external_mutation_attempted": False, "checks": {
+        "external_mutation_attempted": False,
+        "scope": "prepared_checkpoint_durability_only", "checks": {
             "all_sources_checkpointed": True,
             "all_sources_reloadable": True,
             "single_changed_artifact_blocks_reuse": True,
@@ -124,7 +130,12 @@ def test_release_certificate_blocks_without_live_and_browser_evidence(tmp_path, 
     )
     monkeypatch.setattr(
         release, "run_transport_fault_acceptance",
-        lambda _root: {"status": "pass", "scenario_count": 5},
+        lambda _root: {
+            "status": "pass",
+            "scenario_count": 5,
+            "scope": "loopback_transport_recovery_and_production_classifier",
+            "production_classifier_checks": {"422": True, "500": True},
+        },
     )
     monkeypatch.setattr(
         release, "_git_state",
@@ -139,7 +150,7 @@ def test_release_certificate_blocks_without_live_and_browser_evidence(tmp_path, 
 
     assert result["status"] == "blocked"
     assert result["checks"]["disposable_live_canary"] is False
-    assert result["checks"]["large_scale_acceptance"] is False
+    assert result["checks"]["prepared_checkpoint_scale_acceptance"] is False
     assert result["checks"]["eta_regression_evidence"] is False
     assert result["checks"]["default_python_suite"] is False
     assert result["checks"]["browser_ui_acceptance"] is False

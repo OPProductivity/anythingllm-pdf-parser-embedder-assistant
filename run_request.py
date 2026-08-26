@@ -15,7 +15,10 @@ from typing import Any, Callable, Mapping
 
 LOCAL_ONLY = "local_only"
 NATIVE_UPLOAD = "native_upload"
-SEGMENT_MODES = frozenset({"none", "passages", "page", "page_limit"})
+SEGMENT_MODES = frozenset({
+    "none", "passages", "page", "page_limit", "page_passages",
+    "custom_page_ranges",
+})
 BACKEND_MODES = frozenset({"automatic", "pymupdf", "pymupdf4llm", "unstructured"})
 UNSTRUCTURED_STRATEGIES = frozenset({"auto", "fast", "hi_res", "ocr_only"})
 MARKER_STYLES = frozenset({"short", "compact", "full"})
@@ -72,6 +75,7 @@ class RunRequest:
     inline_markers_enabled: bool = True
 
     segment_mode: str = "page_limit"
+    custom_page_group_sizes: tuple[int, ...] = ()
     target_passage_length: int = 750
     anythingllm_chunk_size_override: int | None = None
     anythingllm_chunk_overlap_override: int | None = None
@@ -104,6 +108,12 @@ class RunRequest:
             raise ValueError(f"Unsupported backend mode: {self.backend_mode!r}")
         if self.segment_mode not in SEGMENT_MODES:
             raise ValueError(f"Unsupported segment mode: {self.segment_mode!r}")
+        if any(int(value) < 1 for value in self.custom_page_group_sizes):
+            raise ValueError("custom_page_group_sizes must contain only positive page counts.")
+        if self.segment_mode == "custom_page_ranges" and not self.custom_page_group_sizes:
+            raise ValueError("custom_page_ranges requires at least one positive page-group size.")
+        if self.segment_mode != "custom_page_ranges" and self.custom_page_group_sizes:
+            raise ValueError("custom_page_group_sizes is valid only for custom_page_ranges.")
         if self.unstructured_strategy not in UNSTRUCTURED_STRATEGIES:
             raise ValueError(f"Unsupported Unstructured strategy: {self.unstructured_strategy!r}")
         if self.marker_style not in MARKER_STYLES:
@@ -154,6 +164,7 @@ class RunRequest:
         segment_mode: str,
         native_metadata_upload_mode: str = "native_header",
         native_upload_transport: str = "raw_text",
+        native_upload_representation: str = "segments",
         upload_limit: int = 0,
     ) -> "RunRequest":
         """Adapt name-keyed Gradio settings after the UI resolves its labels.
@@ -191,6 +202,9 @@ class RunRequest:
             validation_phrases=_lines(settings.get("automatic_validation_phrases")),
             unstructured_strategy=str(settings.get("unstructured_strategy") or "auto").casefold(),
             segment_mode=segment_mode,
+            custom_page_group_sizes=tuple(
+                int(value) for value in (settings.get("custom_page_group_sizes") or ())
+            ),
             target_passage_length=int(settings.get("target_passage_length") or 750),
             anythingllm_chunk_size_override=None if inherit else int(settings.get("anythingllm_chunk_size") or 0) or None,
             anythingllm_chunk_overlap_override=None if inherit else max(0, int(settings.get("anythingllm_chunk_overlap") or 0)),
@@ -201,6 +215,7 @@ class RunRequest:
             workspace_slug=_optional_text(settings.get("workspace_slug")) if native else None,
             upload_limit=upload_limit if native else 0,
             native_metadata_upload_mode=native_metadata_upload_mode,
+            native_upload_representation=native_upload_representation,
             native_upload_transport=native_upload_transport,
             create_document_folders=bool(settings.get("anythingllm_create_document_folders", True)) if native else False,
             document_folder_name=_optional_text(settings.get("anythingllm_document_folder_name")) if native else None,
@@ -217,11 +232,13 @@ class RunRequest:
             document_label=str(getattr(args, "document_label", "") or "").strip(),
             document_author=str(getattr(args, "document_author", "") or "").strip(),
             document_short_label=str(getattr(args, "document_short_label", "") or "").strip(),
+            use_file_title_fallback=bool(getattr(args, "use_file_title_fallback", False)),
             output_root_override=_optional_text(getattr(args, "out_dir", "")),
             retain_diagnostic_evidence=not bool(getattr(args, "lean_retention", True)),
             backend_mode=str(getattr(args, "backend_mode", "automatic") or "automatic").casefold(),
             deep_extraction=bool(getattr(args, "deep_extraction", False)),
             include_front_matter=bool(getattr(args, "include_front_matter", False)),
+            include_back_matter=bool(getattr(args, "include_back_matter", False)),
             first_page_override=int(getattr(args, "first_page_override", 0) or 0) or None,
             end_page_override=int(getattr(args, "end_page_override", 0) or 0) or None,
             end_section_names=_lines(getattr(args, "end_section_names", ())),
@@ -230,6 +247,9 @@ class RunRequest:
             marker_style=str(getattr(args, "marker_style", "short") or "short").casefold(),
             inline_markers_enabled=not bool(getattr(args, "disable_inline_markers", False)),
             segment_mode=str(getattr(args, "segment_mode", "page_limit") or "page_limit"),
+            custom_page_group_sizes=tuple(
+                int(value) for value in (getattr(args, "custom_page_group_sizes", ()) or ())
+            ),
             target_passage_length=int(getattr(args, "target_passage_length", 750) or 750),
             anythingllm_chunk_size_override=int(getattr(args, "anythingllm_chunk_size", 0) or 0) or None,
             anythingllm_chunk_overlap_override=(
@@ -245,6 +265,10 @@ class RunRequest:
             native_upload_representation=str(getattr(args, "native_upload_representation", "segments") or "segments"),
             native_upload_transport=str(getattr(args, "native_upload_transport", "raw_text") or "raw_text"),
             create_document_folders=bool(getattr(args, "anythingllm_create_document_folders", True)) if native else False,
+            document_folder_name=(
+                _optional_text(getattr(args, "anythingllm_document_folder_name", ""))
+                if native else None
+            ),
             temporary_validation_requested=bool(getattr(args, "run_chunk_survival_validation", False)),
             temporary_validation_cleanup_policy=str(
                 getattr(args, "temporary_validation_cleanup_policy", "cleanup_always") or "cleanup_always"
@@ -277,6 +301,7 @@ class RunRequest:
             end_page_override=self.end_page_override or 0,
             target_passage_length=self.target_passage_length,
             segment_mode=self.segment_mode,
+            custom_page_group_sizes=list(self.custom_page_group_sizes),
             end_section_names=list(self.end_section_names),
             validation_phrases=list(self.validation_phrases),
             unstructured_strategy=self.unstructured_strategy,

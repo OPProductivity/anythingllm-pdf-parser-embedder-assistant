@@ -13,6 +13,7 @@ def test_cli_adapter_excludes_api_key_and_round_trips_legacy_execution_fields():
         input="C:/approved/source.pdf", out_dir="C:/runs", document_label="Source",
         document_author="Author", document_short_label="S", lean_retention=False,
         backend_mode="automatic", deep_extraction=True, include_front_matter=True,
+        include_back_matter=True, use_file_title_fallback=True,
         first_page_override=2, end_page_override=4, end_section_names=["References"],
         validation_phrases=["anchor"], unstructured_strategy="auto", marker_style="short",
         disable_inline_markers=False, segment_mode="page_limit", target_passage_length=750,
@@ -22,6 +23,7 @@ def test_cli_adapter_excludes_api_key_and_round_trips_legacy_execution_fields():
         anythingllm_api_key="must-not-live-on-request", workspace_slug="approved-workspace",  # pragma: allowlist secret -- synthetic request-redaction fixture
         upload_limit=2, native_metadata_upload_mode="strict", native_upload_representation="segments",
         native_upload_transport="file_upload", anythingllm_create_document_folders=True,
+        anythingllm_document_folder_name="approved-folder",
         run_chunk_survival_validation=False, temporary_validation_cleanup_policy="cleanup_always",
     )
 
@@ -35,6 +37,9 @@ def test_cli_adapter_excludes_api_key_and_round_trips_legacy_execution_fields():
     assert legacy.segment_mode == "page_limit"
     assert legacy.anythingllm_chunk_size == 768
     assert legacy.anythingllm_chunk_overlap == 128
+    assert legacy.include_back_matter is True
+    assert legacy.use_file_title_fallback is True
+    assert legacy.anythingllm_document_folder_name == "approved-folder"
 
 
 def test_automatic_adapter_normalizes_local_only_native_fields_away():

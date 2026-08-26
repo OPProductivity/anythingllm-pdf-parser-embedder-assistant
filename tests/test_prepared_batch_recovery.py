@@ -92,6 +92,12 @@ def test_incomplete_checkpoint_is_not_reusable(tmp_path):
 
     assert result["reusable"] is False
     assert result["reason"] == "preparation_checkpoint_is_incomplete"
+    payload = json.loads(
+        (tmp_path / "prepared-batch-recovery-manifest.json").read_text(encoding="utf-8")
+    )
+    assert payload["artifact_evidence"] == "deferred_until_preparation_complete"
+    assert payload["sources"][0]["artifacts"] == []
+    assert payload["sources"][0]["summary_path"].endswith("run-summary.json")
 
 
 def test_submission_started_never_authorizes_replay(tmp_path):

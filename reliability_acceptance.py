@@ -22,6 +22,11 @@ from prepared_recovery import build_prepared_recovery_plan
 from prepared_batch_recovery import write_prepared_batch_checkpoint
 from reliability_audit import audit_run_directory
 from run_control import atomic_write_json
+from source_transaction_journal import (
+    append_source_transaction_event,
+    finalize_source_transaction_journal,
+    initialize_source_transaction_journal,
+)
 
 
 ACCEPTANCE_SCHEMA = "anythingllm_pdf_assistant_offline_crash_acceptance_v1"
@@ -56,16 +61,36 @@ def _transaction(state: str) -> dict[str, Any]:
     return row
 
 
-def _write_ledger(root: Path, state: str) -> None:
+def _append_ledger_state(root: Path, state: str) -> None:
     held = state in {"ambiguous_external_mutation_held", "global_run_hold"}
-    atomic_write_json(root / "source-transaction-ledger.json", {
-        "workspace_slug": "fixture-workspace",
-        "run_id": root.name,
-        "transaction_count": 1,
-        "transactions": [_transaction(state)],
-        "stopped_after_source_transaction": 1 if held else None,
-        "stop_reason": state if held else "",
-    })
+    ledger = root / "source-transaction-ledger.json"
+    event_path = ledger.with_name("source-transaction-events.jsonl")
+    if not ledger.exists():
+        initialize_source_transaction_journal(
+            ledger,
+            workspace_slug="fixture-workspace",
+            run_id=root.name,
+            transaction_count=1,
+        )
+    append_source_transaction_event(
+        event_path,
+        _transaction(state),
+        stopped_after_source_transaction=1 if held else None,
+        stop_reason=state if held else "",
+    )
+
+
+def _finalize_ledger(root: Path, state: str) -> None:
+    held = state in {"ambiguous_external_mutation_held", "global_run_hold"}
+    finalize_source_transaction_journal(
+        root / "source-transaction-ledger.json",
+        workspace_slug="fixture-workspace",
+        run_id=root.name,
+        transaction_count=1,
+        transactions=[_transaction(state)],
+        stopped_after_source_transaction=1 if held else None,
+        stop_reason=state if held else "",
+    )
 
 
 def _append_receipt(root: Path, state: str, *, location: str = "") -> None:
@@ -168,10 +193,10 @@ def checkpoint_worker(root: Path, scenario: str) -> int:
     if scenario == "crash_after_batch_submission_started_before_source_ledger":
         _write_prepared_batch_boundary(root, "submission_started")
         os._exit(CRASH_EXIT_CODE)
-    _write_ledger(root, "prepared")
+    _append_ledger_state(root, "prepared")
     if scenario == "crash_after_prepared":
         os._exit(CRASH_EXIT_CODE)
-    _write_ledger(root, "attachment_intent_durable")
+    _append_ledger_state(root, "attachment_intent_durable")
     if scenario == "crash_after_intent":
         os._exit(CRASH_EXIT_CODE)
     if scenario == "crash_after_request_started":
@@ -190,7 +215,8 @@ def checkpoint_worker(root: Path, scenario: str) -> int:
         os._exit(CRASH_EXIT_CODE)
     if scenario == "definite_rejection":
         _append_receipt(root, "rejected")
-        _write_ledger(root, "source_rejected_without_remote_mutation")
+        _append_ledger_state(root, "source_rejected_without_remote_mutation")
+        _finalize_ledger(root, "source_rejected_without_remote_mutation")
         atomic_write_json(root / "batch-native-upload-report.json", {
             "status": "error", "uploaded": 0, "embedded": 0, "locations": [],
         })
@@ -203,9 +229,10 @@ def checkpoint_worker(root: Path, scenario: str) -> int:
         "exact_vectors_proven",
     }:
         _append_receipt(root, "attached", location=LOCATIONS[0])
-        _write_ledger(root, "exact_vectors_proven")
+        _append_ledger_state(root, "exact_vectors_proven")
         if scenario == "crash_after_all_exact_vectors":
             os._exit(CRASH_EXIT_CODE)
+        _finalize_ledger(root, "exact_vectors_proven")
         _write_complete_terminal_evidence(
             root,
             include_progress=scenario in {"crash_after_terminal_progress", "exact_vectors_proven"},

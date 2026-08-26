@@ -36,7 +36,7 @@ recovery plan, and terminal audit.
 | F-09 | Worker kill after durable intent | Restart distinguishes unsent from ambiguous intent. |
 | F-10 | Worker kill after receipt | Restart reconciles before any submission. |
 | F-11 | Worker kill after exact vector proof | Proven source is never resubmitted. |
-| F-12 | Server loss while worker continues | Worker evidence remains authoritative; browser ownership can reconnect. |
+| F-12 | Server loss while worker continues | The active PDF worker and its result survive; later PDFs require explicit continuation after restart. |
 | F-13 | Source disappears or changes after preview | Changed source is rejected locally; unaffected sources continue. |
 | F-14 | Disk capacity falls before next source | Next source is held before preparation; earlier work retained. |
 | F-15 | Exact selected-input duplicate | One canonical preparation; duplicate receives explicit skipped outcome. |
@@ -82,6 +82,12 @@ verified with production durability code. It proves exact reload, changed-file
 rejection, restoration, and the no-replay rule after submission may have
 started. This complements, but does not substitute for, disposable live canaries.
 
+`reliability_parent_loss_acceptance.py` terminates the real orchestration
+parent after it launches an owned preparation worker. It certifies that the
+active PDF finishes to a durable result. It deliberately does **not** certify
+automatic continuation of later PDFs: the batch loop still belongs to the
+server process, so a server loss pauses the batch after the active source.
+
 The live canary is never run against an existing user workspace. Paid-provider
 use remains opt-in. A canary failure cannot trigger an automatic retry after an
 ambiguous mutation.
@@ -113,21 +119,30 @@ support non-PDF formats, add model/provider allowlists, make retrieval probes
 mandatory, auto-retry ambiguous mutations, increase mutation concurrency,
 restore diagnostic UI tabs, or perform unrelated visual refinement.
 
-## Current validation evidence (2026-08-25)
+## Current validation evidence (2026-08-26)
 
 The release candidate has been exercised on CPython 3.14.6 and AnythingLLM
 Desktop 1.16.0. This section records evidence, not a permanent claim about a
 future dependency or Desktop build.
 
-- Default deterministic suite: 851 passed, 17 browser UI tests intentionally
-  deselected, one third-party Starlette/httpx deprecation warning. Statement
-  and branch coverage was 66.75%, above the enforced 63% project floor.
-- Separate isolated Chromium UI suite: all 17 tests passed, including
+- Default deterministic suite: 891 passed, 19 browser UI tests intentionally
+  deselected, one third-party Starlette/httpx deprecation warning. The last
+  enforced statement and branch coverage run was 66.75%, above the 63% floor.
+- Separate isolated Chromium UI suite: all 19 tests passed, including
   selection readiness, six-PDF local preparation, dark mode, and narrow layout.
 - Crash acceptance: 13 scenarios passed, covering every numbered checkpoint
-  and the rejection/success boundary cases.
+  and the rejection/success boundary cases. The source-state checkpoints now
+  use the same append-only journal component as production; re-entry and torn
+  journal tails are separately tested fail-closed.
 - Process-boundary transport acceptance: five scenarios passed (definite
   rejection, lost response, connection refusal, delayed vectors, SQLite busy).
+- Parent-loss acceptance: the real 24-page local preparation worker remained
+  alive after its orchestration parent was terminated and published a passing
+  durable result. This certifies the active source only; later batch sources
+  are not automatically continued after a server loss.
+- Current disposable live journal canary: two copied real PDFs produced two
+  independent source transactions, two uploaded records, two exact-vector
+  confirmations, a passing integrity audit, and exact workspace/folder cleanup.
 - Disposable live grouped canary: two real PDFs, two exact source windows,
   nine records uploaded and confirmed, terminal integrity audit passed.
 - Exact selected-input duplicate canary: one canonical PDF embedded, its
@@ -147,9 +162,11 @@ future dependency or Desktop build.
   fast local snapshot as explicitly read-only/non-authoritative while carrying
   the same qualified v1.16 mutation contract and package fingerprint proven by
   the single batch gate. The 60 MB Desktop package was not rehashed per PDF.
-- Anonymous large-scale acceptance: 1,000 independent source checkpoints and
-  3,000 retained artifacts passed exact reload, tamper rejection, restoration,
-  and no-replay-after-submission-start checks.
+- Anonymous prepared-checkpoint scale acceptance: 1,000 independent source
+  checkpoints and 3,000 retained artifacts passed exact reload, tamper
+  rejection, restoration, and no-replay-after-submission-start checks. This is
+  checkpoint-durability evidence only; it is not a claim that parsing,
+  AnythingLLM mutation, OCR, UI, or cancellation ran at 1,000-PDF scale.
 - Classic ETA regression evidence passed for anonymous single, medium, large,
   OCR, cache-realization, queue-repricing, and recalibration-threshold cases;
   private timing history was not read and the estimator was not changed.

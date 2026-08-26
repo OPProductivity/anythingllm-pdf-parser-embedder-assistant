@@ -109,6 +109,7 @@ from auto_anythingllm_pipeline import (
     finalize_batch_inspection_context,
     get_anythingllm_metadata_schema,
     infer_author_from_initial_pdf_pages,
+    infer_author_from_samples_or_filename,
     is_local_anythingllm_url,
     is_lancedb_safe_namespace,
     LANCEDB_WORKSPACE_NAME_LIMIT,
@@ -117,6 +118,7 @@ from auto_anythingllm_pipeline import (
     managed_anythingllm_upload_folder_name,
     maybe_upload_to_anythingllm,
     native_identity_stem,
+    normalize_text,
     normalize_metadata_author,
     observe_workspace_embedding_queue_activity,
     ocr_upload_hold_guidance,
@@ -133,6 +135,7 @@ from auto_anythingllm_pipeline import (
     remove_confirmed_workspace_queue_entries,
     restart_anythingllm_desktop,
     resolve_anythingllm_api_key,
+    resolve_author_from_metadata_and_inference,
     resolve_title_from_metadata_or_filename,
     resolve_embedder_capability,
     resolve_default_simulation_adapter,
@@ -361,6 +364,16 @@ TIMING_MODEL_LARGE_BATCH_MIN_MATCHING_RUNS = 3
 TIMING_MODEL_LARGE_BATCH_MIN_FRESH_RECORDS = 3000
 TIMING_MODEL_LARGE_BATCH_FULL_CONFIDENCE_RECORDS = 6000
 TIMING_MODEL_LARGE_BATCH_MIN_SECONDS = 1.25
+# Cached page parents still have to be attached to the target workspace and
+# confirmed through one sequential source window per PDF. These conservative
+# floors are refined upward (never downward) from successful all-cache runs.
+# They are consulted only after an exact pre-queue cache snapshot; the classic
+# opening ETA and fresh-upload timing lanes never use them.
+TIMING_MODEL_CACHE_TAIL_MIN_MATCHING_RUNS = 5
+TIMING_MODEL_CACHE_TAIL_RECORD_SECONDS_FLOOR = 0.08
+TIMING_MODEL_CACHE_TAIL_SOURCE_SECONDS_FLOOR = 3.0
+TIMING_MODEL_CACHE_TAIL_RECORD_SECONDS_CEILING = 0.50
+TIMING_MODEL_CACHE_TAIL_SOURCE_SECONDS_CEILING = 15.0
 # A timing row may be useful only when it uses this exact Desktop queue
 # protocol. The provider allowance is separately recorded on every row: v3
 # used the fixed first-run allowance and v4 can apply a bounded lane prior.
@@ -613,16 +626,21 @@ def acquire_automatic_anythingllm_mutation_lease(owner):
         return {"acquired": True, "owner": requested_owner, "scope": "windows-named-mutex"}
 
 
-def release_automatic_anythingllm_mutation_lease():
+def release_automatic_anythingllm_mutation_lease(expected_owner=None):
     """Release the cross-process mutation lease after terminal handling."""
     global AUTOMATIC_ANYTHINGLLM_MUTATION_MUTEX_HANDLE
     global AUTOMATIC_ANYTHINGLLM_MUTATION_OWNER
     with AUTOMATIC_ANYTHINGLLM_MUTATION_MUTEX_LOCK:
+        if (
+            expected_owner is not None
+            and str(expected_owner) != AUTOMATIC_ANYTHINGLLM_MUTATION_OWNER
+        ):
+            return False
         handle = AUTOMATIC_ANYTHINGLLM_MUTATION_MUTEX_HANDLE
         AUTOMATIC_ANYTHINGLLM_MUTATION_MUTEX_HANDLE = None
         AUTOMATIC_ANYTHINGLLM_MUTATION_OWNER = ""
         if handle is None:
-            return
+            return False
         if os.name == "nt":
             # The lightweight non-Windows fallback is unreachable here, so
             # this is the real Windows kernel handle returned by CreateMutex.
@@ -630,6 +648,7 @@ def release_automatic_anythingllm_mutation_lease():
                 ctypes.windll.kernel32.CloseHandle(handle)
             except Exception:
                 pass
+        return True
 
 
 def automatic_next_run_noop(output_count, record=None):
@@ -908,6 +927,99 @@ APP_CONNECTION_WATCHDOG_HEAD = """
       if (target.checked) apply(systemTheme.matches);
       syncCheckbox();
     }, true);
+
+    // Capture selected names before Gradio starts its required transfer to the
+    // localhost server. This parser-time listener is active before the File
+    // component hydrates, so all selected names can be shown together instead
+    // of appearing one-by-one as transfer responses complete.
+    const syncAutomaticPdfPickerPresentation = () => {
+      const automaticUpload = document.getElementById("automatic-pdf-upload");
+      if (!automaticUpload) return;
+      const nativeText = automaticUpload.textContent || "";
+      const treeWalker = document.createTreeWalker(automaticUpload, NodeFilter.SHOW_TEXT);
+      let textNode = treeWalker.nextNode();
+      while (textNode) {
+        const value = textNode.nodeValue || "";
+        if (/Uploading\\s+\\d+\\s+files?/i.test(value)) {
+          textNode.nodeValue = value.replace(/Uploading(\\s+\\d+\\s+files?)/i, "Adding$1");
+        }
+        textNode = treeWalker.nextNode();
+      }
+      const pending = window.ragPendingAutomaticPdfSelection;
+      let pendingList = automaticUpload.querySelector(".rag-pending-pdf-list");
+      if (!pending?.files?.length) {
+        automaticUpload.classList.remove("rag-pdf-selection-pending");
+        pendingList?.remove();
+        return;
+      }
+      const nativePreview = automaticUpload.querySelector(".file-preview");
+      const nativePreviewNames = nativePreview
+        ? Array.from(nativePreview.querySelectorAll("[aria-label]"))
+            .map((node) => node.getAttribute("aria-label") || "")
+        : [];
+      const allNativeRowsReady = Boolean(nativePreview)
+        && pending.files.every((file) => nativePreviewNames.includes(file.name));
+      if (allNativeRowsReady) {
+        window.ragPendingAutomaticPdfSelection = null;
+        automaticUpload.classList.remove("rag-pdf-selection-pending");
+        pendingList?.remove();
+        return;
+      }
+      automaticUpload.classList.add("rag-pdf-selection-pending");
+      if (!pendingList) {
+        pendingList = document.createElement("div");
+        pendingList.className = "rag-pending-pdf-list";
+        pendingList.setAttribute("role", "status");
+        pendingList.setAttribute("aria-live", "polite");
+        automaticUpload.appendChild(pendingList);
+      }
+      const signature = pending.files.map((file) => `${file.name}\\0${file.sizeLabel}`).join("\\0");
+      if (pendingList.dataset.signature === signature) return;
+      pendingList.dataset.signature = signature;
+      const status = document.createElement("div");
+      status.className = "rag-pending-pdf-status";
+      status.textContent = `Adding ${pending.files.length} file${pending.files.length === 1 ? "" : "s"}…`;
+      pendingList.replaceChildren(status, ...pending.files.map((file) => {
+        const row = document.createElement("div");
+        row.className = "rag-pending-pdf-row";
+        const name = document.createElement("span");
+        name.className = "rag-pending-pdf-name";
+        name.textContent = file.name;
+        const size = document.createElement("span");
+        size.className = "rag-pending-pdf-size";
+        size.textContent = file.sizeLabel;
+        row.append(name, size);
+        return row;
+      }));
+    };
+    document.addEventListener("change", (event) => {
+      const input = event.target;
+      if (!(input instanceof HTMLInputElement)
+          || input.type !== "file"
+          || !input.closest("#automatic-pdf-upload")) return;
+      const files = Array.from(input.files || []).map((file) => ({
+        name: file.name,
+        sizeLabel: file.size >= 1048576
+          ? `${(file.size / 1048576).toFixed(1)} MB`
+          : `${Math.max(1, Math.ceil(file.size / 1024))} KB`,
+      }));
+      window.ragPendingAutomaticPdfSelection = files.length ? { files } : null;
+      requestAnimationFrame(syncAutomaticPdfPickerPresentation);
+    }, true);
+    let pickerPresentationQueued = false;
+    const pickerPresentationObserver = new MutationObserver(() => {
+      if (pickerPresentationQueued) return;
+      pickerPresentationQueued = true;
+      requestAnimationFrame(() => {
+        pickerPresentationQueued = false;
+        syncAutomaticPdfPickerPresentation();
+      });
+    });
+    pickerPresentationObserver.observe(document.documentElement, {
+      childList: true,
+      characterData: true,
+      subtree: true,
+    });
     let lastThemePointerToggleAt = 0;
     const toggleFromEvent = (event, { allowRecentPointer = false } = {}) => {
       const target = event.target;
@@ -1122,7 +1234,7 @@ class LocalServerConnectionWatchdogMiddleware(BaseHTTPMiddleware):
 
         document = re.sub(
             r"</head>",
-            f"{APP_BROWSER_THEME_HEAD}</head>",
+            lambda _match: f"{APP_BROWSER_THEME_HEAD}</head>",
             document,
             count=1,
             flags=re.IGNORECASE,
@@ -1350,7 +1462,24 @@ APP_JS = """
     const button = host?.querySelector("button") || host;
     if (!button || button.dataset.ragRunTimerBound === "true") return;
     button.dataset.ragRunTimerBound = "true";
-    button.addEventListener("click", () => startAutomaticRunTimer(true));
+    button.addEventListener("click", () => {
+      const shouldAcknowledge = !button.disabled
+        && /confirm and start processing/i.test(button.textContent || "");
+      startAutomaticRunTimer(true);
+      // Gradio's streaming callback yields before PDF inspection, but the
+      // request itself can still spend several seconds reaching that first
+      // server update. A microtask runs after the current click has propagated
+      // to Gradio, so this acknowledgement cannot prevent submission and is
+      // visible in the same browser frame.
+      queueMicrotask(() => {
+        if (!shouldAcknowledge) return;
+        button.dataset.ragClientConfirmPending = "true";
+        button.setAttribute("aria-busy", "true");
+        button.disabled = true;
+        button.textContent = "Processing…";
+        button.classList.add("rag-run-processing", "rag-confirm-submitting");
+      });
+    });
   };
   const syncAutomaticRunTimer = () => {
     const timer = document.getElementById("automatic-run-timing");
@@ -1535,6 +1664,11 @@ APP_JS = """
       const button = host?.querySelector("button") || host;
       if (!button) continue;
       const text = (button.textContent || "").toLowerCase();
+      if (!text.includes("processing")) {
+        delete button.dataset.ragClientConfirmPending;
+        button.removeAttribute("aria-busy");
+        button.classList.remove("rag-confirm-submitting");
+      }
       button.classList.toggle("rag-run-success", text.includes("successful"));
       button.classList.toggle("rag-run-warning", text.includes("review upload"));
       button.classList.toggle("rag-run-failed", text.includes("failed"));
@@ -3159,6 +3293,45 @@ body.dark .batch-folder-inline-notice {
 .pdf-upload-input:not(:has(.file-preview)) {
     min-height: 156px !important;
 }
+.pdf-upload-input.rag-pdf-selection-pending .file-preview {
+    display: none !important;
+}
+.rag-pending-pdf-list {
+    display: grid;
+    width: 100%;
+    padding: 8px 10px;
+    gap: 1px;
+    border-radius: var(--radius-lg, 8px);
+    background: inherit;
+}
+.rag-pending-pdf-status {
+    padding: 2px 8px 5px;
+    color: var(--body-text-color-subdued, #64748b);
+    font-size: 0.88rem;
+}
+.rag-pending-pdf-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    min-width: 0;
+    padding: 7px 8px;
+    gap: 12px;
+    border-bottom: 1px solid var(--border-color-primary, rgba(148, 163, 184, 0.25));
+}
+.rag-pending-pdf-row:last-child {
+    border-bottom: 0;
+}
+.rag-pending-pdf-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.rag-pending-pdf-size {
+    flex: 0 0 auto;
+    color: var(--body-text-color-subdued, #64748b);
+    font-size: 0.82rem;
+}
 /* Gradio's file preview may otherwise inherit the browser's fallback or its
    monospace metadata token. Keep the selected-file row on the same interface
    font as the rest of this app, including an upload selected during recovery. */
@@ -4209,6 +4382,29 @@ body:not(.dark) .gradio-container label[data-testid$="-checkbox-label"] {
 }
 body.dark .automatic-run-activity.warning { color: #fcd34d; }
 body.dark .automatic-run-activity.failed { color: #fca5a5; }
+#automatic-restart-notice,
+#automatic-restart-notice > div,
+#automatic-restart-notice .wrap {
+    margin: 0 !important;
+    padding: 0 !important;
+    border: 0 !important;
+    background: transparent !important;
+    box-shadow: none !important;
+}
+.automatic-restart-notice {
+    margin: 3px 0 0;
+    padding: 7px 9px;
+    border-left: 3px solid #3b82f6;
+    border-radius: 4px;
+    background: color-mix(in srgb, #3b82f6 8%, transparent);
+    color: var(--body-text-color, #334155);
+    font-size: 0.88em;
+    line-height: 1.3;
+}
+body.dark .automatic-restart-notice {
+    background: color-mix(in srgb, #60a5fa 11%, transparent);
+    color: var(--body-text-color, #e2e8f0);
+}
 #automatic-run-failure,
 #automatic-run-failure > div,
 #automatic-run-failure .wrap {
@@ -4283,6 +4479,11 @@ body.dark .automatic-run-failure {
     border-color: #2563eb !important;
     color: #ffffff !important;
     opacity: 1 !important;
+}
+#confirm-automatic-run-button button.rag-confirm-submitting,
+#confirm-automatic-run-button button.rag-confirm-submitting:disabled {
+    cursor: wait !important;
+    pointer-events: none !important;
 }
 #cancel-automatic-run-button button {
     border: 1px solid #94a3b8 !important;
@@ -4878,9 +5079,14 @@ def refresh_workspaces_with_readiness(api_url, api_key, workspace_slug):
 # Keep suggestion assembly within that boundary rather than building a longer
 # string and relying on the final safety helper to cut an author in half.
 WORKSPACE_NAME_SOURCE_LABEL_LIMIT = LANCEDB_WORKSPACE_NAME_LIMIT
-WORKSPACE_SOURCE_IDENTITY_CACHE_LIMIT = 96
+# Identity records contain no sampled source text, only a compact label and
+# provenance. Retain enough exact source versions for two maximum-size picker
+# selections so later confirmation callbacks do not reopen the first 904 PDFs
+# after an ordinary 96-entry LRU eviction.
+WORKSPACE_SOURCE_IDENTITY_CACHE_LIMIT = BATCH_FOLDER_MAX_DOCUMENTS * 2
 WORKSPACE_SOURCE_IDENTITY_CACHE = OrderedDict()
 WORKSPACE_SOURCE_IDENTITY_CACHE_LOCK = threading.Lock()
+WORKSPACE_SOURCE_IDENTITY_INFLIGHT = {}
 _WORKSPACE_AUTHOR_STOP_WORDS = {
     "a", "an", "and", "by", "for", "from", "in", "of", "on", "the", "to", "with",
 }
@@ -4961,6 +5167,13 @@ def workspace_institutional_identity_from_text_samples(samples):
         organization = workspace_institutional_name_from_value(ownership_match.group(1))
     else:
         organization = ""
+    # Copyright establishes ownership, not authorship.  A membership body or
+    # agency may genuinely issue its own report, but a publishing imprint is
+    # ordinarily only the rights holder for someone else's work. Keep Press/
+    # Publisher available for explicit embedded author metadata above, while
+    # refusing to turn a footer copyright into a workspace source identity.
+    if re.search(r"\b(?:press|publishers?)$", organization, flags=re.I):
+        organization = ""
     if organization:
         # An abbreviation is only safe when the document itself writes it as
         # an abbreviation for this exact verified organization.  Initialising
@@ -5033,7 +5246,7 @@ def workspace_institutional_label_from_text_samples(samples):
     return str(workspace_institutional_identity_from_text_samples(samples).get("label") or "")
 
 
-def workspace_institutional_identity_from_pdf(pdf_file):
+def workspace_institutional_identity_from_pdf(pdf_file, *, native_metadata=None):
     """Read native-only evidence for one collective or institutional source."""
     path = Path(str(pdf_file))
     if not path.exists() or path.suffix.casefold() != ".pdf":
@@ -5041,7 +5254,11 @@ def workspace_institutional_identity_from_pdf(pdf_file):
     try:
         # The pipeline's ordinary metadata helper samples the opening pages and
         # final provenance page without OCR or Unstructured processing.
-        metadata = pdf_metadata(path, include_author_samples=True)
+        metadata = (
+            dict(native_metadata)
+            if isinstance(native_metadata, dict)
+            else pdf_metadata(path, include_author_samples=True)
+        )
         metadata_organization = workspace_institutional_name_from_value(metadata.get("author") or "")
         if metadata_organization:
             return {
@@ -5063,13 +5280,39 @@ def workspace_institutional_label_from_pdf(pdf_file):
     return str(workspace_institutional_identity_from_pdf(pdf_file).get("label") or "")
 
 
-def workspace_person_identity_from_pdf(pdf_file):
+def workspace_person_identity_from_pdf(pdf_file, *, native_metadata=None):
     """Return one person identity record from the shared author inference path."""
     path = Path(str(pdf_file))
     if not path.exists() or path.suffix.casefold() != ".pdf":
         return {}
     try:
-        author_report = infer_author_from_initial_pdf_pages(path, page_limit=3)
+        if isinstance(native_metadata, dict):
+            metadata = dict(native_metadata)
+            opening_samples = [
+                sample for sample in (metadata.get("_author_text_samples") or [])
+                if 1 <= int(sample.get("page") or 0) <= 3
+            ]
+            resolved_title = normalize_text(
+                resolve_title_from_metadata_or_filename(metadata.get("title") or "", path)["title"]
+            )
+            inference = infer_author_from_samples_or_filename(
+                opening_samples,
+                path,
+                title_hint=resolved_title,
+            )
+            resolved = resolve_author_from_metadata_and_inference(
+                metadata.get("author") or "",
+                inference,
+            )
+            author_report = {
+                "author": resolved["author"],
+                "source": resolved["source"],
+                "page": int(inference.get("page") or 0),
+                "evidence": str(inference.get("evidence") or ""),
+            }
+        else:
+            metadata = None
+            author_report = infer_author_from_initial_pdf_pages(path, page_limit=3)
         author = str(author_report.get("author") or "").strip()
         # A visible affiliated byline (for example, a foreword contributor)
         # may correctly override PDF metadata during full document metadata
@@ -5078,7 +5321,9 @@ def workspace_person_identity_from_pdf(pdf_file):
         # ordinary text/metadata recognition continues to use the shared
         # pipeline result unchanged.
         if str(author_report.get("source") or "") == "text_affiliated_byline_overrode_pdf_metadata":
-            metadata_author = normalize_metadata_author(pdf_metadata(path).get("author") or "")
+            metadata_author = normalize_metadata_author(
+                (metadata or pdf_metadata(path)).get("author") or ""
+            )
             if metadata_author:
                 author = metadata_author
                 author_report = {**author_report, "source": "pdf_metadata"}
@@ -5173,17 +5418,48 @@ def workspace_source_identity_from_pdf(pdf_file):
             if cached is not None:
                 WORKSPACE_SOURCE_IDENTITY_CACHE.move_to_end(cache_key)
                 return dict(cached)
-    identity = workspace_person_identity_from_pdf(path)
-    if not identity:
-        identity = workspace_institutional_identity_from_pdf(path)
-    result = {**fallback, **identity}
-    if cache_key is not None:
-        with WORKSPACE_SOURCE_IDENTITY_CACHE_LOCK:
-            WORKSPACE_SOURCE_IDENTITY_CACHE[cache_key] = dict(result)
-            WORKSPACE_SOURCE_IDENTITY_CACHE.move_to_end(cache_key)
-            while len(WORKSPACE_SOURCE_IDENTITY_CACHE) > WORKSPACE_SOURCE_IDENTITY_CACHE_LIMIT:
-                WORKSPACE_SOURCE_IDENTITY_CACHE.popitem(last=False)
-    return result
+            identity_ready = WORKSPACE_SOURCE_IDENTITY_INFLIGHT.get(cache_key)
+            owns_inspection = identity_ready is None
+            if owns_inspection:
+                identity_ready = threading.Event()
+                WORKSPACE_SOURCE_IDENTITY_INFLIGHT[cache_key] = identity_ready
+        if not owns_inspection:
+            # Another callback is inspecting this exact source version. Wait
+            # for its compact result rather than opening the same large PDF in
+            # parallel. The owner always signals in ``finally``; the timeout
+            # is only a defensive escape if the hosting thread itself dies.
+            identity_ready.wait(timeout=120.0)
+            with WORKSPACE_SOURCE_IDENTITY_CACHE_LOCK:
+                cached = WORKSPACE_SOURCE_IDENTITY_CACHE.get(cache_key)
+                if cached is not None:
+                    WORKSPACE_SOURCE_IDENTITY_CACHE.move_to_end(cache_key)
+                    return dict(cached)
+    # Person and institutional identity use overlapping native evidence. Read
+    # it once so an unresolved person does not cause a second open of a large
+    # PDF before the user can confirm. This retains opening-page and final-page
+    # provenance evidence; it only removes duplicated I/O.
+    try:
+        try:
+            native_metadata = pdf_metadata(path, include_author_samples=True)
+        except Exception:
+            native_metadata = None
+        identity = workspace_person_identity_from_pdf(path, native_metadata=native_metadata)
+        if not identity:
+            identity = workspace_institutional_identity_from_pdf(path, native_metadata=native_metadata)
+        result = {**fallback, **identity}
+        if cache_key is not None:
+            with WORKSPACE_SOURCE_IDENTITY_CACHE_LOCK:
+                WORKSPACE_SOURCE_IDENTITY_CACHE[cache_key] = dict(result)
+                WORKSPACE_SOURCE_IDENTITY_CACHE.move_to_end(cache_key)
+                while len(WORKSPACE_SOURCE_IDENTITY_CACHE) > WORKSPACE_SOURCE_IDENTITY_CACHE_LIMIT:
+                    WORKSPACE_SOURCE_IDENTITY_CACHE.popitem(last=False)
+        return result
+    finally:
+        if cache_key is not None and 'owns_inspection' in locals() and owns_inspection:
+            with WORKSPACE_SOURCE_IDENTITY_CACHE_LOCK:
+                event = WORKSPACE_SOURCE_IDENTITY_INFLIGHT.pop(cache_key, None)
+                if event is not None:
+                    event.set()
 
 
 def workspace_source_identity_plan(pdf_files):
@@ -5380,6 +5656,18 @@ def workspace_name_selection_signature(pdf_files, folder_pdf_files=None):
     return hashlib.sha256(encoded).hexdigest() if selected_files else ""
 
 
+def automatic_selection_signature(pdf_files=None, folder_pdf_files=None, folder_manifest=None):
+    """Identify the exact visible selection acknowledged by a UI callback."""
+    manifest = dict(folder_manifest or {}) if isinstance(folder_manifest, dict) else {}
+    manifest_files = manifest.get("selected_pdf_candidates") or manifest.get("pdf_candidates") or []
+    selected_files = list(dict.fromkeys(
+        normalize_file_list(pdf_files)
+        + normalize_file_list(folder_pdf_files)
+        + normalize_file_list(manifest_files)
+    ))
+    return workspace_name_selection_signature(selected_files)
+
+
 def mark_new_workspace_name_manual_edit(current_name, last_suggestion=None):
     """Record a user edit without confusing a prior automatic value for one."""
     state = workspace_name_auto_state(last_suggestion)
@@ -5431,6 +5719,27 @@ def update_new_workspace_name_control(
         "user_edited": bool(state["user_edited"] and value == current),
     }
     return gr.update(value=value, visible=True, interactive=True), next_state
+
+
+def update_new_workspace_name_without_pdf_inspection(
+    workspace_slug,
+    document_label,
+    current_name="",
+    last_suggestion=None,
+):
+    """Update the editable workspace field without opening selected PDFs.
+
+    A typed document label can still become an immediate suggestion. A blank
+    label remains blank so confirmation can derive the source-aware name.
+    """
+    return update_new_workspace_name_control(
+        workspace_slug,
+        document_label,
+        [],
+        [],
+        current_name,
+        last_suggestion,
+    )
 
 
 def create_new_document_workspace(api_url, api_key, document_label, pdf_files, workspace_name_override=""):
@@ -7970,14 +8279,6 @@ def submit_embedding_resume_manifest(
                 message="Exact attachment-to-vector reconciliation completed while recovery was being checked; no prepared locations remain.",
             )
             return result
-        lease = acquire_automatic_anythingllm_mutation_lease("manual recovery resume")
-        if not lease.get("acquired"):
-            result.update(
-                status="resume_blocked_assistant_mutation_active",
-                reconciled_locations=reconciled_count,
-                message="Another PDF Assistant process currently owns the AnythingLLM mutation lane; no recovery resume was submitted.",
-            )
-            return result
         source_rows = recovery_remaining_source_rows(manifest, manifest_path=path)
         source_by_location = {
             str(location or "").replace("\\", "/").lstrip("/"): row
@@ -8010,6 +8311,14 @@ def submit_embedding_resume_manifest(
                 status="resume_source_attribution_unavailable",
                 reconciled_locations=reconciled_count,
                 message="Recovery cannot safely reconstruct per-PDF source windows for every remaining record; no broad fallback batch was submitted.",
+            )
+            return result
+        lease = acquire_automatic_anythingllm_mutation_lease("manual recovery resume")
+        if not lease.get("acquired"):
+            result.update(
+                status="resume_blocked_assistant_mutation_active",
+                reconciled_locations=reconciled_count,
+                message="Another PDF Assistant process currently owns the AnythingLLM mutation lane; no recovery resume was submitted.",
             )
             return result
         location_sources = [
@@ -9647,7 +9956,13 @@ def compact_native_mutation_authority(compatibility_report):
     }
 
 
-def automatic_batch_output_capacity_preflight(files, output_root, *, safety_reserve_bytes=256 * 1024 * 1024):
+def automatic_batch_output_capacity_preflight(
+    files,
+    output_root,
+    *,
+    safety_reserve_bytes=256 * 1024 * 1024,
+    projected_source_bytes=None,
+):
     """Check whole-batch artifact capacity before staging begins.
 
     Per-PDF capacity checks protect an individual writer, but staged native
@@ -9659,14 +9974,23 @@ def automatic_batch_output_capacity_preflight(files, output_root, *, safety_rese
     artifact_total = 0
     temporary_peak = 0
     unreadable = []
-    for raw_path in files or []:
+    projections = []
+    supplied_projections = list(projected_source_bytes or [])
+    for index, raw_path in enumerate(files or []):
         source = Path(raw_path)
-        try:
-            source_bytes = max(0, int(source.stat().st_size))
-        except OSError:
-            unreadable.append(str(source))
-            continue
-        projected_artifacts = max(16 * 1024 * 1024, source_bytes * 2)
+        if index < len(supplied_projections):
+            try:
+                projected_artifacts = max(0, int(supplied_projections[index]))
+            except (TypeError, ValueError):
+                projected_artifacts = 0
+        else:
+            try:
+                source_bytes = max(0, int(source.stat().st_size))
+            except OSError:
+                unreadable.append(str(source))
+                continue
+            projected_artifacts = max(16 * 1024 * 1024, source_bytes * 2)
+        projections.append(projected_artifacts)
         artifact_total += projected_artifacts
         temporary_peak = max(temporary_peak, max(8 * 1024 * 1024, projected_artifacts // 2))
     target = Path(output_root)
@@ -9676,6 +10000,10 @@ def automatic_batch_output_capacity_preflight(files, output_root, *, safety_rese
         "status": "pass" if not unreadable and usage.free >= required else "insufficient_space",
         "selected_pdfs": len(files or []),
         "projected_artifact_bytes": artifact_total,
+        # Reuse this immutable size projection at later source boundaries.
+        # Free space is still queried live on every check; only the repeated
+        # O(n^2) stat walk over the remaining source paths is removed.
+        "projected_source_bytes": projections,
         "temporary_peak_bytes": temporary_peak,
         "safety_reserve_bytes": int(safety_reserve_bytes),
         "required_free_bytes": required,
@@ -10155,7 +10483,14 @@ def merge_uploaded_pdfs_into_folder_batch(pdf_files=None, folder_manifest=None):
 
 
 def merge_uploaded_pdfs_into_direct_selection(pdf_files=None, folder_manifest=None):
-    """Direct-picker adapter with an output contract matching its event chain."""
+    """Merge direct files only when an existing folder batch needs them.
+
+    A normal direct selection needs no server-side PDF inspection at picker
+    time. Confirmation owns that authoritative validation.
+    """
+    manifest = dict(folder_manifest or {}) if isinstance(folder_manifest, dict) else {}
+    if not clean_downloadable_paths(manifest.get("pdf_candidates") or []):
+        return tuple(gr.update() for _ in range(6))
     return merge_uploaded_pdfs_into_folder_batch(pdf_files, folder_manifest)[:6]
 
 
@@ -10684,9 +11019,22 @@ def output_folder_button_state(paths, output_root=""):
 
 @automatic_next_run_callback(1)
 def metadata_selection_layout_state(pdf_files=None, folder_pdf_files=None):
-    """Reserve the editable metadata area before slow inspection finishes."""
+    """Reserve the editable metadata area while the selection state settles."""
     has_input = bool(normalize_file_list(pdf_files) or normalize_file_list(folder_pdf_files))
     return gr.update(open=has_input)
+
+
+def deferred_pdf_inspection_preview(pdf_files=None, folder_pdf_files=None):
+    """Describe the post-Confirm inspection boundary without reading a PDF."""
+    count = len(unique_local_path_strings(
+        normalize_file_list(pdf_files) + normalize_file_list(folder_pdf_files)
+    ))
+    message = (
+        "Selected files are ready. PDF inspection starts after Confirm."
+        if count
+        else "Select a PDF to inspect its metadata."
+    )
+    return f'<div class="metadata-summary"><div class="metadata-status">{message}</div></div>'
 
 
 def selected_manifest_path(paths):
@@ -11515,14 +11863,18 @@ def automatic_selection_pending_action_states(pdf_files=None, folder_pdf_files=N
 def _automatic_selection_begin_state(
     previous_state=None,
     _viewed_run_root=None,
+    pdf_files=None,
+    folder_pdf_files=None,
+    folder_manifest=None,
     *,
     preserve_ordinary_picker=False,
+    selection_not_yet_chosen=False,
 ):
     """Lock run-defining controls until a new picker selection has settled.
 
     Gradio dispatches a File change and a radio change as independent browser
-    events.  The file path requires several asynchronous inspection callbacks
-    which intentionally restore the saved defaults for a *new* selection.
+    events.  The file path requires several asynchronous state callbacks which
+    intentionally restore the saved defaults for a *new* selection.
     Without this small per-browser state boundary, an operator could choose a
     different mode while those callbacks were pending and have the late
     defaults silently win.  This does not alter a run request or ETA; it only
@@ -11551,8 +11903,24 @@ def _automatic_selection_begin_state(
         revision = max(0, int(state.get("revision") or 0)) + 1
     except (TypeError, ValueError):
         revision = 1
+    signature = automatic_selection_signature(pdf_files, folder_pdf_files, folder_manifest)
+    if (
+        not selection_not_yet_chosen
+        and signature
+        and state.get("state") == "ready"
+        and state.get("selection_signature") == signature
+    ):
+        # Returning a File value can cause some Gradio releases to emit a
+        # second change for that identical value. It is an acknowledgement
+        # replay, not a new selection transaction.
+        return state, str(_viewed_run_root or ""), gr.update(), gr.update(), gr.update(), gr.update()
     return (
-        {"state": "pending", "revision": revision},
+        {
+            "state": "pending",
+            "revision": revision,
+            "selection_signature": "" if selection_not_yet_chosen else signature,
+            "accept_next_signature": bool(selection_not_yet_chosen),
+        },
         "",
         # Folder batches and ordinary-file selections are intentionally
         # mergeable. Keeping the ordinary picker in its normal presentation
@@ -11570,27 +11938,56 @@ def _automatic_selection_begin_state(
     )
 
 
-def automatic_selection_begin_state(previous_state=None, _viewed_run_root=None):
+def automatic_selection_begin_state(
+    previous_state=None,
+    _viewed_run_root=None,
+    pdf_files=None,
+    folder_pdf_files=None,
+    folder_manifest=None,
+):
     """Lock the ordinary picker and run controls for a direct file selection."""
     return _automatic_selection_begin_state(
         previous_state,
         _viewed_run_root,
+        pdf_files,
+        folder_pdf_files,
+        folder_manifest,
         preserve_ordinary_picker=False,
     )
 
 
-def automatic_folder_selection_begin_state(previous_state=None, _viewed_run_root=None):
+def automatic_folder_selection_begin_state(
+    previous_state=None,
+    _viewed_run_root=None,
+    pdf_files=None,
+    folder_pdf_files=None,
+    folder_manifest=None,
+):
     """Start a folder-batch update without blanking the ordinary PDF picker."""
     return _automatic_selection_begin_state(
         previous_state,
         _viewed_run_root,
+        pdf_files,
+        folder_pdf_files,
+        folder_manifest,
         preserve_ordinary_picker=True,
+        selection_not_yet_chosen=True,
     )
 
 
 def automatic_selection_finish_state(selection_state, pdf_files=None, folder_pdf_files=None, folder_manifest=None):
     """Acknowledge that the visible selection/configuration snapshot is ready."""
     state = dict(selection_state or {})
+    observed_signature = automatic_selection_signature(pdf_files, folder_pdf_files, folder_manifest)
+    expected_signature = str(state.get("selection_signature") or "")
+    if (
+        expected_signature
+        and observed_signature != expected_signature
+        and not state.get("accept_next_signature")
+    ):
+        # This is a late callback for an older File.change chain. Never let it
+        # re-enable Confirm for a different, newer picker value.
+        return state, gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
     global LIVE_AUTOMATIC_RUN_STATUS
     with LIVE_AUTOMATIC_RUN_STATUS_LOCK:
         status = dict(LIVE_AUTOMATIC_RUN_STATUS or {})
@@ -11604,6 +12001,8 @@ def automatic_selection_finish_state(selection_state, pdf_files=None, folder_pdf
             or (dict(folder_manifest or {}).get("pdf_candidates") or [])
         )
         state["state"] = "ready" if has_files else "idle"
+        state["selection_signature"] = observed_signature
+        state["accept_next_signature"] = False
         if str(status.get("state") or "") == "preparing" and not str(status.get("run_root") or "").strip():
             LIVE_AUTOMATIC_RUN_STATUS = {}
     return (
@@ -11787,6 +12186,7 @@ def update_live_automatic_run_status(
     batch_total_files=None,
     batch_current_file_index=None,
     confirmation_in_flight=None,
+    confirmation_owner_token=None,
 ):
     """Persist progress evidence plus a deliberately capped time-based estimate.
 
@@ -11929,6 +12329,11 @@ def update_live_automatic_run_status(
         "cancel_available": bool(cancel_available),
         "cancel_requested": bool(cancel_requested),
         "confirmation_in_flight": confirmation_active,
+        "confirmation_owner_token": str(
+            confirmation_owner_token
+            if confirmation_owner_token is not None
+            else previous.get("confirmation_owner_token") or ""
+        ),
         "expected_seconds": expected,
         "comparable_runs": comparable_value,
         "confirmed_fraction": confirmed,
@@ -12366,6 +12771,9 @@ def refresh_live_automatic_run_ui(viewed_run_root=None):
             eta_acceleration_seconds=record.get("eta_acceleration_seconds", 0),
             server_driven=True,
             comparable_runs=record.get("comparable_runs"),
+            progress_phase=record.get("progress_phase"),
+            completed_units=record.get("completed_units"),
+            total_units=record.get("total_units"),
         ) if state == "running" else gr.update()
         return (
             activity,
@@ -13183,6 +13591,126 @@ def automatic_worker_is_live(run_root):
     )
 
 
+def interrupted_automatic_batch_notice(output_root=None):
+    """Describe an unfinished batch inherited from an earlier server process.
+
+    This is deliberately observational. A restarted server does not own the
+    old worker's ``Popen`` handle and must never replay or terminate it. The
+    durable marker/result can still tell the user whether the active PDF is
+    running, finished, or stopped, and the progress record tells us whether
+    later PDFs remain in the parent-owned batch loop.
+    """
+    # A live in-memory record means this server owns the batch. A browser
+    # reload during an ordinary run must not be described as a server crash.
+    if str((LIVE_AUTOMATIC_RUN_STATUS or {}).get("run_root") or ""):
+        return {"visible": False, "html": "", "state": "owned"}
+
+    root = Path(output_root) if output_root is not None else Path(AUTO_OUTPUT_DIR)
+    candidates = sorted(
+        automatic_run_artifact_paths(root, "run-progress.json"),
+        key=lambda path: path.stat().st_mtime if path.exists() else 0,
+        reverse=True,
+    )
+    for progress_path in candidates:
+        progress = _read_automatic_run_json(progress_path)
+        if not progress:
+            continue
+        state = str(progress.get("state") or "").casefold()
+        # Only the newest readable run is relevant. A later terminal run is
+        # evidence that an older interrupted run is no longer the user's
+        # current startup concern.
+        if state not in {"running", "preparing"}:
+            return {"visible": False, "html": "", "state": state or "terminal"}
+
+        run_root = Path(str(progress.get("run_root") or progress_path.parent))
+        worker = active_automatic_run_worker(run_root)
+        if not worker:
+            return {"visible": False, "html": "", "state": "unowned"}
+
+        try:
+            total = max(0, int(progress.get("batch_total_files") or 0))
+            current = max(0, int(progress.get("batch_current_file_index") or 0))
+        except (TypeError, ValueError):
+            total = current = 0
+        if total and not current:
+            try:
+                current = min(total, max(1, int(progress.get("batch_completed_files") or 0) + 1))
+            except (TypeError, ValueError):
+                current = 1
+        later = max(0, total - current) if total and current else None
+
+        result = {}
+        marker_pdf = str(worker.get("pdf_path") or "")
+        for config_path in sorted(
+            run_root.rglob(".automatic-worker-config.json"),
+            key=lambda path: path.stat().st_mtime if path.exists() else 0,
+            reverse=True,
+        ):
+            config = _read_automatic_run_json(config_path)
+            if str(config.get("run_root") or "") != str(run_root):
+                continue
+            if marker_pdf and str(config.get("pdf_path") or "") != marker_pdf:
+                continue
+            result_path = Path(str(config.get("result_path") or ""))
+            if result_path.is_file():
+                result = _read_automatic_run_json(result_path)
+            break
+
+        if automatic_worker_is_live(run_root):
+            observed_state = "running"
+            action = "is still processing"
+        else:
+            result_status = str(result.get("status") or "").casefold()
+            if result_status == "completed":
+                observed_state = "completed"
+                action = "finished safely"
+            elif result_status == "cancelled":
+                observed_state = "cancelled"
+                action = "was cancelled"
+            elif result_status == "failed":
+                observed_state = "failed"
+                action = "stopped with an error"
+            else:
+                observed_state = "unknown"
+                action = "stopped without a terminal result"
+
+        if total and current:
+            subject = f"PDF {current} of {total} {action}."
+        else:
+            subject = f"The active PDF {action}."
+        if later is None:
+            continuation = "Any later PDFs remain paused."
+        elif later:
+            continuation = (
+                f"{later} later PDF{'s' if later != 1 else ''} "
+                f"{'remain' if later != 1 else 'remains'} paused."
+            )
+        else:
+            continuation = "No later PDFs remain in that batch."
+        rendered = (
+            '<div class="automatic-restart-notice" role="status">'
+            '<strong>Interrupted batch detected.</strong> '
+            f"{html.escape(subject)} {html.escape(continuation)} "
+            "Open <em>Advanced → Run history</em> to review the retained evidence."
+            "</div>"
+        )
+        return {
+            "visible": True,
+            "html": rendered,
+            "state": observed_state,
+            "run_root": str(run_root),
+            "current": current,
+            "total": total,
+            "later": later,
+        }
+    return {"visible": False, "html": "", "state": "none"}
+
+
+def interrupted_automatic_batch_notice_update():
+    notice = interrupted_automatic_batch_notice()
+    return gr.update(value=notice["html"], visible=notice["visible"])
+
+
 def remove_owned_automatic_worker_marker(run_root, process):
     """Remove a worker marker only when it still identifies this process.
 
@@ -13723,6 +14251,7 @@ def execute_automatic_preparation_in_worker(
     config_path = output / ".automatic-worker-config.json"
     result_path = output / ".automatic-worker-result.json"
     events_path = output / ".automatic-worker-events.jsonl"
+    stderr_path = output / ".automatic-worker-stderr.log"
     worker_script = Path(__file__).with_name("cancellable_preparation_worker.py")
     argument_values, worker_api_key = serializable_automatic_worker_arguments(args)
     # The child still needs a user-supplied remote key, but run artifacts must
@@ -13750,20 +14279,25 @@ def execute_automatic_preparation_in_worker(
     # observe the marker between these writes, accept the request, and be
     # unable to stop the just-created owned process until it happened to poll
     # the durable marker itself.
+    stderr_handle = stderr_path.open("a", encoding="utf-8")
     with ACTIVE_AUTOMATIC_RUN_WORKER_PROCESSES_LOCK:
         worker_environment = None
         if worker_api_key_env:
             worker_environment = dict(os.environ)
             worker_environment[worker_api_key_env] = worker_api_key
-        process = subprocess.Popen(
-            [sys.executable, str(worker_script), str(config_path)],
-            cwd=str(Path(__file__).resolve().parent),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=creationflags,
-            env=worker_environment,
-        )
+        try:
+            process = subprocess.Popen(
+                [sys.executable, str(worker_script), str(config_path)],
+                cwd=str(Path(__file__).resolve().parent),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_handle,
+                creationflags=creationflags,
+                env=worker_environment,
+            )
+        except BaseException:
+            stderr_handle.close()
+            raise
         worker_marker = root / AUTOMATIC_RUN_WORKER_MARKER
         try:
             _write_automatic_run_json(
@@ -13782,6 +14316,7 @@ def execute_automatic_preparation_in_worker(
             # ownership of this child. Stop the worker tree before propagating the
             # setup error rather than leaving it to process PDFs invisibly.
             stop_unregistered_automatic_worker(process)
+            stderr_handle.close()
             raise
         ACTIVE_AUTOMATIC_RUN_WORKER_PROCESSES[worker_key] = process
     event_offset = 0
@@ -13796,6 +14331,19 @@ def execute_automatic_preparation_in_worker(
     background_runtime_recovery_attempted = False
     runtime_guard = new_automatic_runtime_guard()
     worker_record = active_automatic_run_worker(root)
+
+    def worker_failure_evidence():
+        try:
+            stderr_tail = stderr_path.read_text(encoding="utf-8", errors="replace")[-12000:]
+        except OSError:
+            stderr_tail = ""
+        return {
+            "worker_exit_code": process.returncode,
+            "worker_last_stage": latest_stage,
+            "worker_stderr_path": str(stderr_path),
+            "worker_stderr_tail": stderr_tail,
+        }
+
     try:
         while process.poll() is None:
             if automatic_run_cancellation_requested(root):
@@ -14002,7 +14550,12 @@ def execute_automatic_preparation_in_worker(
             with events_path.open("r", encoding="utf-8") as handle:
                 handle.seek(event_offset)
                 for line in handle:
-                    event = json.loads(line)
+                    try:
+                        event = json.loads(line)
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        # A torn final line must not hide later complete events
+                        # that were already flushed by another callback.
+                        continue
                     if not isinstance(event, dict):
                         continue
                     if event.get("type") == "timing":
@@ -14014,7 +14567,7 @@ def execute_automatic_preparation_in_worker(
                             event.get("stage", "Working"),
                             progress_event=event,
                         )
-        except (OSError, ValueError, json.JSONDecodeError):
+        except OSError:
             pass
         if automatic_run_cancellation_requested(root):
             recovery = write_automatic_cancellation_recovery(root, pdf_path, worker_record)
@@ -14025,11 +14578,13 @@ def execute_automatic_preparation_in_worker(
             return {
                 "status": "failed",
                 "error": f"The preparation worker ended without a readable result: {exc}",
+                **worker_failure_evidence(),
             }
         if not isinstance(result, dict):
             return {
                 "status": "failed",
                 "error": "The preparation worker ended with a malformed non-object result record.",
+                **worker_failure_evidence(),
             }
         if result.get("status") != "completed":
             return {"status": result.get("status") or "failed", **result}
@@ -14037,6 +14592,9 @@ def execute_automatic_preparation_in_worker(
             return {
                 "status": "failed",
                 "error": result.get("operator_summary") or "The preparation worker reported a non-passing run.",
+                "summary": dict(result.get("summary") or {}),
+                "run_control": dict(result.get("run_control") or {}),
+                **worker_failure_evidence(),
             }
         worker_cleanup = automatic_success_worker_artifact_cleanup_report(
             output,
@@ -14047,6 +14605,10 @@ def execute_automatic_preparation_in_worker(
             result["lean_worker_artifact_cleanup_pending"] = worker_cleanup["pending"]
         return {"status": "completed", **result}
     finally:
+        try:
+            stderr_handle.close()
+        except OSError:
+            pass
         # A stale marker must never authorize a later Cancel click against a
         # reused Windows PID. A replacement worker may already own this run
         # root after a controlled Desktop restart, so remove only our marker.
@@ -14167,6 +14729,9 @@ def automatic_run_timing_html(
     eta_acceleration_seconds=0,
     server_driven=False,
     comparable_runs=None,
+    progress_phase="",
+    completed_units=None,
+    total_units=None,
 ):
     expected = max(0, int(round(float(expected_seconds or 0))))
     actual = max(0, int(round(float(actual_seconds or 0)))) if actual_seconds is not None else None
@@ -14188,12 +14753,38 @@ def automatic_run_timing_html(
             # not produced an ETA yet.  ``0m00s`` reads as a failed or
             # completed timer; make the temporary unknown explicit instead.
             label = "Est: calculating…"
+        elif expected > 0 and remaining == 0:
+            # An opening estimate can expire before the queue has accumulated
+            # the deliberately conservative sample count required to reprice
+            # the canonical ETA. Do not leave a fast run displaying an
+            # indefinite recalculation message. Queue-owned x/y evidence can
+            # provide a small, deliberately rough presentation-only tail that
+            # changes when records finish, rather than on every elapsed-second
+            # repaint. The classic expected_seconds value, timing lanes,
+            # history, and bounded live recalibration remain untouched.
+            try:
+                queue_completed = max(0, int(completed_units))
+                queue_total = max(0, int(total_units))
+            except (TypeError, ValueError):
+                queue_completed = queue_total = 0
+            counted_tail_phase = str(progress_phase or "").casefold() in {
+                "desktop_queue",
+                "identity_set",
+                "queue_receipt",
+            }
+            if counted_tail_phase and 0 < queue_completed < queue_total:
+                queue_remaining = queue_total - queue_completed
+                rough_tail_seconds = max(
+                    10,
+                    int(math.ceil(
+                        queue_remaining * DESKTOP_SERIAL_PROVIDER_REQUEST_PRIOR_SECONDS + 10.0
+                    )),
+                )
+                label = f"Est: ~{format_estimate_clock(rough_tail_seconds)}"
+            else:
+                label = "Est: finishing…"
         else:
-            label = (
-                "Est: recalculating from Desktop queue…"
-                if expected > 0 and remaining == 0
-                else f"Est: {format_estimate_clock(remaining)}"
-            )
+            label = f"Est: {format_estimate_clock(remaining)}"
     elif state == "cancelled" and actual is not None:
         label = f"Stopped: {format_estimate_clock(actual)}"
     elif actual is not None and state in {"successful", "warning", "failed"}:
@@ -14323,6 +14914,12 @@ def automatic_timing_document_profile(files, *, document_limit=None, page_sample
         "sparse_pages": 0,
         "short_pages": 0,
         "long_pages": 0,
+        # A Gradio temporary upload can disappear after input validation but
+        # before this UI-only profiler opens it. The estimate caller uses this
+        # count to retain the last stable timer instead of replacing it with a
+        # zero-page profile. Authoritative confirmation validates again.
+        "missing_inputs": 0,
+        "unreadable_inputs": 0,
     }
     sampled_char_counts = []
     sampled_line_counts = []
@@ -14361,7 +14958,11 @@ def automatic_timing_document_profile(files, *, document_limit=None, page_sample
                 profile["long_pages"] += int(chars > 3000)
             document.close()
         except Exception as exc:
-            APP_LOGGER.info("timing profile skipped unreadable input %s: %s", path, exc)
+            profile["unreadable_inputs"] += 1
+            if not path.is_file() or isinstance(exc, FileNotFoundError):
+                profile["missing_inputs"] += 1
+            else:
+                APP_LOGGER.info("timing profile skipped unreadable input %s: %s", path, exc)
     sampling_ratio = len(raw_paths) / max(1, len(profiled_paths))
     if sampling_ratio > 1:
         # Preserve density ratios while scaling page- and batch-driven timing
@@ -15953,6 +16554,102 @@ def queue_evidence_eta_seconds(elapsed_seconds, queue_remaining_seconds):
     return int(math.ceil(max(elapsed + 8.0, elapsed + remaining + handoff_tail)))
 
 
+def observe_batch_queue_forecast(
+    context,
+    report,
+    *,
+    elapsed_seconds,
+    provider_request_seconds_prior,
+    initial_estimated_records=0,
+):
+    """Build a batch-wide queue forecast from source-local Desktop evidence.
+
+    Desktop reports ``estimated remaining`` for only the active PDF source
+    window. Treating that value as the remainder of a multi-PDF run caused a
+    severe early underprediction, followed by repeated upward corrections as
+    later windows appeared. This accumulator keeps the existing source-window
+    contract and classic prior: it combines completed records across observed
+    windows, assumes every unobserved prepared record is still pending, and
+    lets live evidence influence at most 65% of the per-record cost.
+    """
+    state = context if isinstance(context, dict) else {}
+    report = report if isinstance(report, dict) else {}
+    try:
+        queue_rate = max(0.0, float(report.get("desktop_queue_records_per_minute") or 0.0))
+        queue_completed = max(
+            0,
+            int(report.get("desktop_queue_completed") or 0),
+            int(report.get("desktop_queue_current") or report.get("desktop_current_record") or 0) - 1,
+        )
+        queue_total = max(0, int(report.get("queue_records") or 0))
+    except (TypeError, ValueError):
+        return None
+    if queue_rate <= 0.0 or queue_completed <= 0 or queue_total <= 0:
+        return None
+    source_key = str(
+        report.get("source_path")
+        or report.get("source_window_index")
+        or "active-source"
+    )
+    window_observations = state.setdefault("queue_rate_windows", {})
+    window_observations[source_key] = {
+        "completed": min(queue_total, queue_completed),
+        "active_seconds": min(queue_total, queue_completed) * 60.0 / queue_rate,
+        "queue_total": queue_total,
+    }
+    completed_records = sum(
+        max(0, int(value.get("completed") or 0))
+        for value in window_observations.values()
+    )
+    observed_active_seconds = sum(
+        max(0.0, float(value.get("active_seconds") or 0.0))
+        for value in window_observations.values()
+    )
+    if completed_records <= 0 or observed_active_seconds <= 0.0:
+        return None
+    prepared_records = max(
+        completed_records,
+        int(state.get("prepared_records") or 0),
+        max(0, int(initial_estimated_records or 0)),
+    )
+    remaining_records = max(0, prepared_records - completed_records)
+    observed_seconds_per_record = observed_active_seconds / completed_records
+    prior_seconds_per_record = max(0.1, float(provider_request_seconds_prior or 0.0))
+    # The prior remains the majority vote during the first few records. With
+    # broader evidence the current run may contribute more, but never fully
+    # replace the proven timing lane with one workload's local cadence.
+    evidence_weight = min(0.65, 0.65 * completed_records / 120.0)
+    blended_seconds_per_record = (
+        prior_seconds_per_record * (1.0 - evidence_weight)
+        + observed_seconds_per_record * evidence_weight
+    )
+    source_total = max(
+        1,
+        int(report.get("source_window_total") or 1),
+    )
+    source_index = max(1, int(report.get("source_window_index") or 1))
+    remaining_source_windows = max(0, source_total - source_index)
+    remaining_seconds = (
+        remaining_records * blended_seconds_per_record
+        + min(30.0, remaining_source_windows * 1.5)
+    )
+    return {
+        "forecast_seconds": queue_evidence_eta_seconds(
+            elapsed_seconds,
+            remaining_seconds,
+        ),
+        "prepared_records": prepared_records,
+        "completed_records": completed_records,
+        "remaining_records": remaining_records,
+        "observed_windows": len(window_observations),
+        "observed_seconds_per_record": round(observed_seconds_per_record, 4),
+        "prior_seconds_per_record": round(prior_seconds_per_record, 4),
+        "blended_seconds_per_record": round(blended_seconds_per_record, 4),
+        "evidence_weight": round(evidence_weight, 4),
+        "remaining_source_windows": remaining_source_windows,
+    }
+
+
 def bounded_queue_eta_reprice(current_expected, queue_forecast):
     """Take one readable ETA step toward mature owned-queue evidence.
 
@@ -15977,6 +16674,9 @@ def confirmed_prequeue_cache_eta_seconds(
     fresh_provider_requests,
     provider_request_seconds,
     features,
+    cached_attachment_records=0,
+    remaining_source_windows=0,
+    cache_attachment_prior=None,
 ):
     """Reprice only the unstarted Desktop queue after exact cache evidence.
 
@@ -15986,32 +16686,177 @@ def confirmed_prequeue_cache_eta_seconds(
     location has a usable vector-cache file.  Preparation, attachment, and
     all earlier classic ETA calculations are already elapsed at that point.
 
-    Preserve the original native model's final-observation allowance and add
-    a small handoff margin.  The result can only reduce the current estimate;
-    live queue evidence and exact vector reconciliation remain the authorities
-    for completion, recovery, and any later slow-path observation.
+    Cached records are not free: they still need a workspace attachment, one
+    sequential source-window handoff, and exact-vector reconciliation. Price
+    those known remaining operations separately. The result can only reduce
+    the current estimate; live queue evidence and exact-vector reconciliation
+    remain the authorities for completion and any later slow-path observation.
     """
     current = max(0.0, float(current_expected or 0.0))
     elapsed = max(0.0, float(elapsed_seconds or 0.0))
     fresh = max(0, int(fresh_provider_requests or 0))
     request_seconds = max(1.0, float(provider_request_seconds or 0.0))
+    cached = max(0, int(cached_attachment_records or 0))
+    source_windows = max(0, int(remaining_source_windows or 0))
+    prior = cache_attachment_prior if isinstance(cache_attachment_prior, dict) else {}
+    cached_record_seconds = max(
+        TIMING_MODEL_CACHE_TAIL_RECORD_SECONDS_FLOOR,
+        float(prior.get("record_seconds") or 0.0),
+    )
+    cached_source_seconds = max(
+        TIMING_MODEL_CACHE_TAIL_SOURCE_SECONDS_FLOOR,
+        float(prior.get("source_seconds") or 0.0),
+    )
     probe_scope = str((features or {}).get("native_upload_scope") or "") == NATIVE_UPLOAD_SCOPE_PROBE_LABEL
     documents = max(1, int((features or {}).get("document_count") or 1))
     # Keep this tied to the same final-observation term as
-    # ``timing_model_base_seconds``.  At this point staging, duplicate audit,
-    # and attachment are complete; only the already-planned queue and its
-    # exact-vector handoff can remain.
+    # ``timing_model_base_seconds``. Staging and duplicate audit are complete;
+    # the current source's cache attachment is known, while later source
+    # windows retain their own conservative allowances.
     classic_final_observation = 5.0 + max(0, documents - 1) * 35.0 if probe_scope else 8.0
-    remaining_tail = max(12.0, classic_final_observation + 4.0)
+    final_observation_floor = 20.0 if cached or source_windows else 12.0
+    remaining_tail = (
+        max(final_observation_floor, classic_final_observation + 4.0)
+        + cached * cached_record_seconds
+        + source_windows * cached_source_seconds
+    )
     candidate = elapsed + fresh * request_seconds + remaining_tail
     return int(math.ceil(min(current, max(elapsed + 8.0, candidate))))
+
+
+def timing_model_cached_attachment_tail_prior(history):
+    """Return a conservative post-snapshot cache-tail allowance.
+
+    Only successful, current-protocol runs whose entire submitted record set
+    was cache-backed may contribute. The stored per-source submission windows
+    provide a compact phase measurement without reopening large run traces.
+    A 75th-percentile observation receives a small safety margin, while fixed
+    floors prevent a quick cohort from making cached attachment look free.
+    """
+    per_record = []
+    per_source = []
+    for row in history or []:
+        try:
+            records = max(0, int(row.get("actual_records") or 0))
+            cached = max(0, int(row.get("cached_attachment_reused_records") or 0))
+            sources = max(0, int(row.get("document_count") or 0))
+            submission_seconds = sum(
+                max(0.0, float(value or 0.0))
+                for value in (row.get("batch_submission_seconds") or [])
+            )
+        except (TypeError, ValueError):
+            continue
+        if (
+            str(row.get("state") or "") != "successful"
+            or not timing_model_formula_compatible(row)
+            or records <= 0
+            or cached != records
+            or sources <= 0
+            or submission_seconds <= 0.0
+        ):
+            continue
+        per_record.append(submission_seconds / records)
+        per_source.append(submission_seconds / sources)
+    support = min(len(per_record), len(per_source))
+    record_seconds = TIMING_MODEL_CACHE_TAIL_RECORD_SECONDS_FLOOR
+    source_seconds = TIMING_MODEL_CACHE_TAIL_SOURCE_SECONDS_FLOOR
+    if support >= TIMING_MODEL_CACHE_TAIL_MIN_MATCHING_RUNS:
+        record_seconds = min(
+            TIMING_MODEL_CACHE_TAIL_RECORD_SECONDS_CEILING,
+            max(record_seconds, _timing_percentile(per_record, .75) * 1.10),
+        )
+        source_seconds = min(
+            TIMING_MODEL_CACHE_TAIL_SOURCE_SECONDS_CEILING,
+            max(source_seconds, _timing_percentile(per_source, .75) * 1.10),
+        )
+    return {
+        "record_seconds": round(record_seconds, 4),
+        "source_seconds": round(source_seconds, 4),
+        "matching_runs": support,
+        "minimum_matching_runs": TIMING_MODEL_CACHE_TAIL_MIN_MATCHING_RUNS,
+        "source": (
+            "bounded successful all-cache history"
+            if support >= TIMING_MODEL_CACHE_TAIL_MIN_MATCHING_RUNS
+            else "conservative cache-tail floors"
+        ),
+    }
+
+
+def observe_prequeue_cache_plan(context, report, *, initial_estimated_records=0):
+    """Record one source-local cache snapshot and price only proved reuse.
+
+    A grouped batch emits one snapshot per PDF. Unobserved prepared records
+    remain fresh-provider work until their own source window proves otherwise.
+    Repeated status relays for the same source are idempotent.
+    """
+    state = context if isinstance(context, dict) else {}
+    report = report if isinstance(report, dict) else {}
+    queue_records = max(0, int(report.get("queue_records") or 0))
+    cached_records = min(
+        queue_records,
+        max(0, int(report.get("prequeue_cached_records") or 0)),
+    )
+    reported_fresh = report.get("prequeue_fresh_records")
+    fresh_records = min(
+        queue_records - cached_records,
+        max(
+            0,
+            int(
+                reported_fresh
+                if reported_fresh is not None
+                else queue_records - cached_records
+            ),
+        ),
+    )
+    source_index = max(1, int(report.get("source_window_index") or 1))
+    source_total = max(
+        source_index,
+        int(report.get("source_window_total") or source_index),
+    )
+    source_key = str(report.get("source_path") or source_index)
+    observed_windows = state.setdefault("observed_source_windows", set())
+    state.update({
+        "exact_snapshot_observed": True,
+        "suppress_combined_queue_rate": cached_records > 0,
+        "queue_records": queue_records,
+        "cached_records": cached_records,
+        "fresh_records": fresh_records,
+    })
+    if source_key not in observed_windows:
+        observed_windows.add(source_key)
+        state["observed_records"] = int(state.get("observed_records") or 0) + queue_records
+        state["observed_cached_records"] = (
+            int(state.get("observed_cached_records") or 0) + cached_records
+        )
+        state["observed_fresh_records"] = (
+            int(state.get("observed_fresh_records") or 0) + fresh_records
+        )
+    prepared_records = max(
+        int(state.get("prepared_records") or 0),
+        max(0, int(initial_estimated_records or 0)),
+        int(state.get("observed_records") or 0),
+    )
+    unobserved_records = max(
+        0,
+        prepared_records - int(state.get("observed_records") or 0),
+    )
+    return {
+        "queue_records": queue_records,
+        "cached_records": cached_records,
+        "fresh_records": fresh_records,
+        "source_index": source_index,
+        "source_total": source_total,
+        "unobserved_records": unobserved_records,
+        "remaining_provider_requests": fresh_records + unobserved_records,
+        "remaining_source_windows": max(1, source_total - source_index + 1),
+    }
 
 
 def current_cache_plan_progress_text(stage_text, report):
     """Append only the cache plan proved by this exact progress event.
 
-    The ETA keeps the first exact pre-queue snapshot as batch-level timing
-    context.  That snapshot must never be reused as per-source UI text: later
+    The ETA accumulates each exact source-local snapshot as timing evidence.
+    A snapshot must never be reused as another source's UI text because later
     source windows can have entirely different record counts.
     """
     stage_text = str(stage_text or "")
@@ -16928,6 +17773,15 @@ def refresh_automatic_run_estimate(
         local_check_mode=local_check_mode,
         profile_document_limit=effective_profile_document_limit,
     )
+    if int((estimate.get("profile") or {}).get("missing_inputs") or 0) > 0:
+        # This is a non-authoritative UI race, not a source-preflight result.
+        # Keep the last visible estimate and let confirmation validate the
+        # selected source again if the user starts the run.
+        APP_LOGGER.info(
+            "stale UI timing selection ignored",
+            extra={"event": "stale_ui_selection_ignored"},
+        )
+        return gr.update()
     return automatic_run_timing_html(
         estimate["expected_seconds"],
         estimate["source"],
@@ -18009,6 +18863,9 @@ def validated_automatic_run_settings(values):
                 "strict" if settings.get("native_metadata_mode") == "Strict metadata only" else "native_header"
             ),
             native_upload_transport="raw_text",
+            native_upload_representation=native_upload_representation_for_segment_mode(
+                pipeline_segment_mode(settings.get("segment_mode"))
+            ),
             upload_limit=0,
         )
     except (TypeError, ValueError) as exc:
@@ -18394,7 +19251,11 @@ def confirm_button_completion_update(run_outputs):
     return gr.update(value=value, interactive=False, variant=variant)
 
 
-def run_automatic_from_confirmation_stream(*values, progress=gr.Progress(track_tqdm=False)):
+def _run_automatic_from_confirmation_stream_body(
+    *values,
+    progress=gr.Progress(track_tqdm=False),
+    _confirmation_owner_token="",
+):
     """Stream a start acknowledgement, then the verified terminal run result.
 
     The prior single-return handler left the browser unchanged for the entire
@@ -18403,6 +19264,10 @@ def run_automatic_from_confirmation_stream(*values, progress=gr.Progress(track_t
     compatibility and post-upload verification contract while making progress
     visible immediately.
     """
+    confirmation_owner_token = (
+        str(_confirmation_owner_token or "").strip()
+        or f"automatic-run-{uuid.uuid4().hex}"
+    )
     # Admit a Confirm exactly once. Gradio serializes the named event in the
     # usual case, but a replayed HTTP event or a double click must not become a
     # second queued document run after the first one completes.
@@ -18417,6 +19282,7 @@ def run_automatic_from_confirmation_stream(*values, progress=gr.Progress(track_t
                 confirmed_fraction=0.0,
                 cancel_available=False,
                 confirmation_in_flight=True,
+                confirmation_owner_token=confirmation_owner_token,
             )
     if already_owned:
         APP_LOGGER.warning("ignored duplicate Confirm while Automatic lifecycle is active")
@@ -18477,7 +19343,12 @@ def run_automatic_from_confirmation_stream(*values, progress=gr.Progress(track_t
         settings.get("workspace_slug") or "not-selected",
         len(settings.get("files") or []),
     )
-    lease = acquire_automatic_anythingllm_mutation_lease("Automatic PDF run")
+    lease_required = settings.get("mode") == MODE_NATIVE_UPLOAD_LABEL
+    lease = (
+        acquire_automatic_anythingllm_mutation_lease(confirmation_owner_token)
+        if lease_required
+        else {"acquired": True, "scope": "local-only-no-desktop-mutation"}
+    )
     if not lease.get("acquired"):
         final = automatic_confirmation_failure_response(
             "AUTO-CONFIRM-LEASE-001",
@@ -18539,7 +19410,8 @@ def run_automatic_from_confirmation_stream(*values, progress=gr.Progress(track_t
         # The worker has returned a terminal result (or raised into the
         # existing error path). Only then may another direct app process
         # mutate AnythingLLM through this assistant.
-        release_automatic_anythingllm_mutation_lease()
+        if lease_required:
+            release_automatic_anythingllm_mutation_lease(confirmation_owner_token)
     yield (
         *final,
         confirm_button_completion_update(final),
@@ -18549,6 +19421,52 @@ def run_automatic_from_confirmation_stream(*values, progress=gr.Progress(track_t
         # which keeps the already-mounted button hidden after success.
         output_folder_button_state(final[3], settings.get("output_root_override")),
     )
+
+
+def run_automatic_from_confirmation_stream(*values, progress=gr.Progress(track_tqdm=False)):
+    """Own the complete streaming lifecycle, including every yield boundary.
+
+    Closing a Gradio streaming response raises ``GeneratorExit`` at the last
+    yield. The previous body acquired lifecycle and Desktop ownership before
+    later yields but entered its cleanup block only afterwards. Keep one outer
+    finalizer around the entire body so a disconnected or replaced browser
+    request cannot strand Confirm ownership or the mutation lease.
+    """
+    owner_token = f"automatic-run-{uuid.uuid4().hex}"
+    try:
+        yield from _run_automatic_from_confirmation_stream_body(
+            *values,
+            progress=progress,
+            _confirmation_owner_token=owner_token,
+        )
+    finally:
+        # Idempotent: the normal body already releases after the worker. This
+        # boundary also covers GeneratorExit and failures before that block.
+        release_automatic_anythingllm_mutation_lease(owner_token)
+        record = dict(LIVE_AUTOMATIC_RUN_STATUS or {})
+        owns_confirmation = str(record.get("confirmation_owner_token") or "") == owner_token
+        nonterminal_owned_state = str(record.get("state") or "") in {"preparing", "running"}
+        if owns_confirmation and (
+            automatic_confirmation_in_flight(record) or nonterminal_owned_state
+        ):
+            update_live_automatic_run_status(
+                record.get("run_root") or None,
+                state="failed",
+                phase=(
+                    "Run ended before a terminal result"
+                    if str(record.get("state") or "") == "running"
+                    else "Run did not start"
+                ),
+                expected_seconds=record.get("expected_seconds", 0),
+                details=(
+                    "The owned run stream ended unexpectedly. Its durable run folder was retained for diagnosis."
+                    if str(record.get("state") or "") == "running"
+                    else "The confirmation request ended before an owned worker started; no later PDF was submitted."
+                ),
+                confirmed_fraction=record.get("confirmed_fraction", 0.0),
+                cancel_available=False,
+                confirmation_in_flight=False,
+            )
 
 
 def run_automatic_from_ready_confirmation_stream(selection_state, *values, progress=gr.Progress(track_tqdm=False)):
@@ -21957,6 +22875,7 @@ def run_automatic(
     flat_no_logs_exports = []
     total_files = max(len(files), 1)
     prepared_checkpoint_error = ""
+    prepared_checkpoint_artifact_cache = {}
 
     def persist_prepared_checkpoint(stage):
         """Persist preparation recovery state without changing run outcome.
@@ -21976,6 +22895,7 @@ def run_automatic(
                 workspace_slug=workspace_slug,
                 api_url=resolved_api_url,
                 stage=stage,
+                artifact_cache=prepared_checkpoint_artifact_cache,
             )
             prepared_checkpoint_error = ""
             return path
@@ -22219,13 +23139,11 @@ def run_automatic(
     last_queue_eta_recalibration_elapsed = -float("inf")
     active_file_index = 0
     planned_batch_adjustments = {}
-    cache_realization_eta_applied = False
-    # The Desktop observer currently reports one combined queue rate.  Once a
-    # read-only snapshot proves that a queue contains cache-backed records,
-    # that rate is not a provider-only measurement: cache attachments can
-    # finish immediately while fresh records still wait on the embedding
-    # provider.  Keep the exact snapshot here so the observer can continue to
-    # report progress without using that mixed rate to reprice the ETA.
+    # The Desktop observer reports one rate for the current source window.
+    # When that exact window contains cache-backed records, its rate is not a
+    # provider-only measurement. Track the active snapshot so the observer can
+    # still report progress without using a mixed rate to reprice the ETA; a
+    # later proven fresh-only source window may use its own clean queue rate.
     cache_plan_context = {
         "exact_snapshot_observed": False,
         "suppress_combined_queue_rate": False,
@@ -22233,15 +23151,21 @@ def run_automatic(
         "cached_records": 0,
         "fresh_records": 0,
         "rate_guard_recorded": False,
+        "prepared_records": 0,
+        "observed_records": 0,
+        "observed_cached_records": 0,
+        "observed_fresh_records": 0,
+        "observed_source_windows": set(),
     }
     initial_expected_seconds = expected_seconds
     timing_features = dict(run_timing_estimate.get("features") or {})
+    cache_attachment_prior = timing_model_cached_attachment_tail_prior(
+        _read_timing_jsonl(TIMING_MODEL_RUNS_PATH)
+    )
+    run_timing_estimate["cached_attachment_tail_prior"] = dict(cache_attachment_prior)
     desktop_serial_queue = (
         str(timing_features.get("embedding_submission_strategy") or "").casefold()
         == "desktop_queue"
-    )
-    batch_queue_throughput_eligible = timing_model_large_batch_queue_eligible(
-        timing_features
     )
     # The Desktop receipt is one outer request, but the stock Desktop server
     # invokes the provider once per page parent.  Keep all later exact-count
@@ -22378,7 +23302,6 @@ def run_automatic(
         if (
             live.get("run_root") == str(run_root)
             and queue_rate > 0.0
-            and queue_remaining is not None
             and queue_rate_is_mature
             and combined_queue_rate_is_safe
         ):
@@ -22387,19 +23310,26 @@ def run_automatic(
             except (TypeError, ValueError):
                 remaining_seconds = None
             elapsed = time.time() - float(live.get("started_epoch") or time.time())
+            batch_queue_forecast = observe_batch_queue_forecast(
+                cache_plan_context,
+                report,
+                elapsed_seconds=elapsed,
+                provider_request_seconds_prior=timing_unit_prior,
+                initial_estimated_records=initial_estimated_batches,
+            )
             # Reprice from owned queue evidence at a bounded cadence.  The
             # raw observer may emit several records for one queue position;
             # a mature sample is still repriced only every 30 seconds so the
             # visible countdown cannot bounce between noisy rate estimates.
             if (
-                remaining_seconds is not None
+                batch_queue_forecast is not None
                 and elapsed - last_queue_eta_recalibration_elapsed >= QUEUE_ETA_REPRICE_INTERVAL_SECONDS
             ):
-                raw_queue_forecast = queue_evidence_eta_seconds(elapsed, remaining_seconds)
+                raw_queue_forecast = int(batch_queue_forecast["forecast_seconds"])
                 queue_forecast = bounded_queue_eta_reprice(
                     expected_seconds, raw_queue_forecast,
                 )
-                if abs(queue_forecast - expected_seconds) >= 5:
+                if abs(queue_forecast - expected_seconds) >= 15:
                     expected_seconds = queue_forecast
                     run_timing_estimate["expected_seconds"] = expected_seconds
                     run_timing_estimate.setdefault("queue_rate_recalibrations", []).append({
@@ -22408,9 +23338,13 @@ def run_automatic(
                         "queue_total": queue_total,
                         "queue_event_samples": queue_event_samples,
                         "queue_records_per_minute": round(queue_rate, 3),
-                        "queue_remaining_seconds": round(remaining_seconds, 3),
+                        "source_queue_remaining_seconds": (
+                            round(remaining_seconds, 3)
+                            if remaining_seconds is not None else None
+                        ),
                         "raw_forecast_seconds": raw_queue_forecast,
                         "expected_seconds": expected_seconds,
+                        "batch_queue_evidence": dict(batch_queue_forecast),
                     })
                     update_live_automatic_run_status(
                         run_root,
@@ -22632,7 +23566,9 @@ def run_automatic(
         # writes anything.  Disk capacity is shared state, so this is a safe
         # hold for the run rather than a misleading per-PDF failure/skip.
         remaining_capacity = automatic_batch_output_capacity_preflight(
-            files[file_index - 1 :], output_root_base
+            files[file_index - 1 :],
+            output_root_base,
+            projected_source_bytes=(batch_capacity.get("projected_source_bytes") or [])[file_index - 1 :],
         )
         remaining_capacity.update(
             check_kind="remaining_batch_source_boundary",
@@ -23486,7 +24422,7 @@ def run_automatic(
         and not batch_upload_report
     ):
         def report_grouped_upload_status(stage, report=None):
-            nonlocal expected_seconds, cache_realization_eta_applied
+            nonlocal expected_seconds
             report = report or {}
             stage_text = str(stage or "Submitting the selected PDF batch to AnythingLLM")
             # The grouped Desktop route owns the live queue observer.  Feed
@@ -23498,6 +24434,11 @@ def run_automatic(
             # healthy fast queue anchored to its conservative first-run prior.
             record_pipeline_timing(stage_text, report)
             timing_event = str(report.get("timing_event") or "")
+            if timing_event == "prepared_batch_complete":
+                cache_plan_context["prepared_records"] = max(
+                    0,
+                    int(report.get("prepared_records") or 0),
+                )
             queue_total = max(
                 0,
                 int(report.get("queue_records") or report.get("requested") or 0),
@@ -23535,75 +24476,63 @@ def run_automatic(
             if (
                 timing_event == "prequeue_cache_snapshot"
                 and desktop_serial_queue
-                and not cache_realization_eta_applied
             ):
-                queue_records = max(0, int(report.get("queue_records") or 0))
-                cached_records = min(
-                    queue_records,
-                    max(0, int(report.get("prequeue_cached_records") or 0)),
+                cache_observation = observe_prequeue_cache_plan(
+                    cache_plan_context,
+                    report,
+                    initial_estimated_records=initial_estimated_batches,
                 )
-                reported_fresh_records = report.get("prequeue_fresh_records")
-                fresh_records = min(
-                    queue_records - cached_records,
-                    max(
-                        0,
-                        int(
-                            reported_fresh_records
-                            if reported_fresh_records is not None
-                            else queue_records - cached_records
-                        ),
-                    ),
-                )
-                # The classic timing lanes retain their large-batch guard for
-                # mixed plans: a few cache-backed records are not enough to
-                # replace an otherwise conservative provider estimate.  A
-                # complete, exact cache plan is different.  At that point the
-                # Desktop queue has no normal embedding work at all, no matter
-                # whether the user selected two PDFs or twenty.  Permit that
-                # one evidence-backed adjustment for every batch size while
-                # leaving ordinary and partially cached runs on their
-                # established path.
-                complete_cache_plan = (
-                    queue_records > 0
-                    and cached_records == queue_records
-                    and fresh_records == 0
-                )
-                cache_reprice_eligible = (
-                    batch_queue_throughput_eligible or complete_cache_plan
-                )
-                # A zero-cache snapshot is still a completed observation, but
-                # it must leave the classic estimate wholly untouched.
-                if cache_reprice_eligible and queue_records and cached_records:
-                    cache_plan_context.update({
-                        "exact_snapshot_observed": True,
-                        "suppress_combined_queue_rate": True,
-                        "queue_records": queue_records,
-                        "cached_records": cached_records,
-                        "fresh_records": fresh_records,
-                    })
+                queue_records = cache_observation["queue_records"]
+                cached_records = cache_observation["cached_records"]
+                fresh_records = cache_observation["fresh_records"]
+                source_index = cache_observation["source_index"]
+                source_total = cache_observation["source_total"]
+                unobserved_records = cache_observation["unobserved_records"]
+                remaining_provider_requests = cache_observation[
+                    "remaining_provider_requests"
+                ]
+                remaining_source_windows = cache_observation[
+                    "remaining_source_windows"
+                ]
+                # A zero-cache snapshot is completed evidence but leaves the
+                # classic estimate untouched. Any proved cache hit may remove
+                # only its own provider allowance and substitutes a measured,
+                # conservative attachment/source-window cost.
+                if queue_records and cached_records:
                     elapsed = max(0.0, time.perf_counter() - started_at)
                     repriced_expected = confirmed_prequeue_cache_eta_seconds(
                         expected_seconds,
                         elapsed,
-                        fresh_provider_requests=fresh_records,
+                        fresh_provider_requests=remaining_provider_requests,
                         provider_request_seconds=timing_unit_prior,
                         features=timing_features,
+                        cached_attachment_records=cached_records,
+                        remaining_source_windows=remaining_source_windows,
+                        cache_attachment_prior=cache_attachment_prior,
                     )
                     if repriced_expected + 5 < int(expected_seconds):
                         previous_expected_seconds = int(expected_seconds)
                         expected_seconds = repriced_expected
                         run_timing_estimate["expected_seconds"] = expected_seconds
-                        run_timing_estimate["confirmed_prequeue_cache_reprice"] = {
+                        reprice_record = {
+                            "source_window_index": source_index,
+                            "source_window_total": source_total,
                             "queue_records": queue_records,
                             "cached_provider_requests": cached_records,
                             "fresh_provider_requests": fresh_records,
+                            "unobserved_records_assumed_fresh": unobserved_records,
+                            "remaining_source_windows": remaining_source_windows,
                             "provider_request_seconds_prior": round(timing_unit_prior, 3),
+                            "cached_attachment_tail_prior": dict(cache_attachment_prior),
                             "classic_initial_non_batch_seconds": round(initial_non_batch_seconds, 3),
                             "previous_expected_seconds": previous_expected_seconds,
                             "expected_seconds": expected_seconds,
                         }
+                        run_timing_estimate["confirmed_prequeue_cache_reprice"] = reprice_record
+                        run_timing_estimate.setdefault(
+                            "confirmed_prequeue_cache_reprices", []
+                        ).append(reprice_record)
                         eta_reprice_reason = "confirmed_prequeue_cache_plan"
-                    cache_realization_eta_applied = True
             if str(report.get("timing_event") or "") == "workspace_duplicate_preflight_complete":
                 # The initial estimate must assume every prepared page record
                 # needs a Desktop queue operation. Once the read-only
@@ -23639,8 +24568,8 @@ def run_automatic(
                     f"{reconciled_count} partially indexed PDF(s); {len(report.get('remaining_documents') or []) if isinstance(report.get('remaining_documents'), list) else max(0, int(report.get('remaining_documents') or 0))} PDF(s) / "
                     f"{remaining_records} page record(s) remain for submission"
                 )
-            # Keep the first exact cache snapshot as ETA evidence, but render
-            # only counts owned by the current event. Reusing the first
+            # Accumulate exact cache snapshots for ETA evidence, but render
+            # only counts owned by the current event. Reusing an earlier
             # source's plan here made every later source display its counts.
             stage_text = current_cache_plan_progress_text(stage_text, report)
             update_live_automatic_run_status(
@@ -24470,6 +25399,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 type="filepath",
                 file_count="multiple",
                 height=156,
+                elem_id="automatic-pdf-upload",
                 elem_classes=["pdf-upload-input"],
                 buttons=[retry_selected_pdf_files_button],
             )
@@ -24697,7 +25627,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                         new_workspace_name = gr.Textbox(
                             label="New workspace name",
                             value="",
-                            placeholder="Choose a PDF to derive a safe name, or type your own",
+                            placeholder="Optional: type a name, or leave blank to derive one after Confirm",
                             lines=1,
                             max_lines=1,
                             max_length=LANCEDB_WORKSPACE_NAME_LIMIT,
@@ -25254,6 +26184,11 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     visible=False,
                     elem_id="automatic-run-failure",
                 )
+                automatic_restart_notice = gr.HTML(
+                    value="",
+                    visible=False,
+                    elem_id="automatic-restart-notice",
+                )
             auto_download_state = gr.State([])
             with gr.Accordion(
                 "Run output and downloads",
@@ -25645,6 +26580,13 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 show_progress="hidden",
                 queue=False,
             )
+            demo.load(
+                fn=interrupted_automatic_batch_notice_update,
+                inputs=None,
+                outputs=[automatic_restart_notice],
+                show_progress="hidden",
+                queue=False,
+            )
             # Folder scans are local, time-sensitive observations.  Unlike a
             # completed run presentation, there is no safe reason to restore a
             # prior scan after the page or localhost server is reloaded.
@@ -25765,9 +26707,9 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 show_progress="hidden",
                 queue=False,
             )
-            workspace_slug.change(
-                fn=update_new_workspace_name_control,
-                inputs=[workspace_slug, auto_label, auto_pdfs, auto_folder_pdfs, new_workspace_name, new_workspace_name_auto_state],
+            workspace_slug.input(
+                fn=update_new_workspace_name_without_pdf_inspection,
+                inputs=[workspace_slug, auto_label, new_workspace_name, new_workspace_name_auto_state],
                 outputs=[new_workspace_name, new_workspace_name_auto_state],
                 show_progress="hidden",
                 queue=False,
@@ -25777,9 +26719,9 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 # resurrect the New-workspace name field.
                 trigger_mode="always_last",
             )
-            auto_label.change(
-                fn=update_new_workspace_name_control,
-                inputs=[workspace_slug, auto_label, auto_pdfs, auto_folder_pdfs, new_workspace_name, new_workspace_name_auto_state],
+            auto_label.input(
+                fn=update_new_workspace_name_without_pdf_inspection,
+                inputs=[workspace_slug, auto_label, new_workspace_name, new_workspace_name_auto_state],
                 outputs=[new_workspace_name, new_workspace_name_auto_state],
                 show_progress="hidden",
                 queue=False,
@@ -25829,7 +26771,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
             )
             retry_selected_pdf_files_button.click(
                 fn=automatic_selection_begin_state,
-                inputs=[automatic_selection_state, automatic_viewed_run_root],
+                inputs=[automatic_selection_state, automatic_viewed_run_root, auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
                 outputs=[
                     automatic_selection_state,
                     automatic_viewed_run_root,
@@ -25956,11 +26898,11 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             )
             # Lock the run-defining mode as soon as a native picker selection
-            # reaches the server.  The longer chain below then restores a
+            # reaches the server.  The state chain below then restores a
             # coherent fresh-run snapshot before the control is re-enabled.
             auto_pdfs.change(
                 fn=automatic_selection_begin_state,
-                inputs=[automatic_selection_state, automatic_viewed_run_root],
+                inputs=[automatic_selection_state, automatic_viewed_run_root, auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
                 outputs=[
                     automatic_selection_state,
                     automatic_viewed_run_root,
@@ -26008,6 +26950,12 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 show_progress="hidden",
                 queue=False,
             ).then(
+                fn=deferred_pdf_inspection_preview,
+                inputs=[auto_pdfs, auto_folder_pdfs],
+                outputs=[auto_metadata_preview],
+                show_progress="hidden",
+                queue=False,
+            ).then(
                 fn=reset_automatic_run_settings_to_defaults,
                 inputs=[workspace_slug],
                 outputs=fresh_run_settings_outputs,
@@ -26026,58 +26974,9 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 show_progress="hidden",
                 queue=False,
             ).then(
-                fn=refresh_automatic_run_estimate_for_fresh_selection,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
-                outputs=[auto_run_timing],
-                show_progress="hidden",
-                queue=False,
-            ).then(
                 fn=automatic_mode_ui_updates,
                 inputs=[auto_mode],
                 outputs=automatic_mode_ui_outputs,
-                show_progress="hidden",
-                queue=False,
-            ).then(
-                # Metadata can take a moment on a large PDF. Set the safe
-                # ready action state first so a late metadata callback cannot
-                # leave Cancel interactive while Confirm is already enabled.
-                fn=automatic_selection_action_states,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state],
-                outputs=[
-                    confirm_automatic_run_button,
-                    cancel_automatic_run_button,
-                    automatic_run_activity,
-                ],
-                show_progress="hidden",
-                queue=False,
-            ).then(
-                fn=automatic_detected_metadata_preview,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest],
-                outputs=[
-                    auto_label,
-                    auto_author,
-                    auto_short_label,
-                    auto_metadata_preview,
-                    document_metadata_section,
-                ],
-                show_progress="hidden",
-            ).then(
-                fn=update_new_workspace_name_control,
-                inputs=[workspace_slug, auto_label, auto_pdfs, auto_folder_pdfs, new_workspace_name, new_workspace_name_auto_state],
-                outputs=[new_workspace_name, new_workspace_name_auto_state],
-                show_progress="hidden",
-                queue=False,
-            ).then(
-                # Confirm is enabled only after automatic metadata and the
-                # derived workspace name have settled. Otherwise an operator
-                # can submit a transient blank/default snapshot.
-                fn=automatic_selection_action_states,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state],
-                outputs=[
-                    confirm_automatic_run_button,
-                    cancel_automatic_run_button,
-                    automatic_run_activity,
-                ],
                 show_progress="hidden",
                 queue=False,
             ).then(
@@ -26096,7 +26995,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
             )
             choose_pdf_folder_button.click(
                 fn=automatic_folder_selection_begin_state,
-                inputs=[automatic_selection_state, automatic_viewed_run_root],
+                inputs=[automatic_selection_state, automatic_viewed_run_root, auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
                 outputs=[
                     automatic_selection_state,
                     automatic_viewed_run_root,
@@ -26224,7 +27123,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
             )
             retry_selected_pdf_batch_button.click(
                 fn=automatic_folder_selection_begin_state,
-                inputs=[automatic_selection_state, automatic_viewed_run_root],
+                inputs=[automatic_selection_state, automatic_viewed_run_root, auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
                 outputs=[
                     automatic_selection_state,
                     automatic_viewed_run_root,
@@ -26762,7 +27661,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 api_url,
                 inherit_anythingllm_settings,
             ]:
-                timer_setting.change(
+                timer_setting.input(
                     fn=refresh_automatic_run_estimate,
                     inputs=automatic_timer_inputs,
                     outputs=[auto_run_timing],

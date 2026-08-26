@@ -3186,9 +3186,9 @@ class PipelineCoreTests(unittest.TestCase):
             now=111,
         )
 
-        # An exhausted running estimate is recalibrated from live Desktop
-        # queue evidence rather than rendered as a misleading zero countdown.
-        self.assertIn("Est: recalculating from Desktop queue", rendered)
+        # Without live queue counts, an exhausted estimate is an explicit final
+        # phase rather than a misleading zero or a false Desktop-queue claim.
+        self.assertIn("Est: finishing", rendered)
         self.assertNotIn("Est: -", rendered)
 
     def test_workspace_name_is_sanitized_before_anythingllm_can_create_an_invalid_namespace(self):
@@ -3261,6 +3261,137 @@ class PipelineCoreTests(unittest.TestCase):
             ),
             "410/410 selected records linked and verified",
         )
+
+    def test_stale_ui_timing_profile_marks_a_vanished_temporary_input(self):
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            missing = Path(temp_dir) / "already-removed.pdf"
+            profile = app.automatic_timing_document_profile([missing])
+
+        self.assertEqual(profile["documents"], 1)
+        self.assertEqual(profile["missing_inputs"], 1)
+        self.assertEqual(profile["unreadable_inputs"], 1)
+
+    def test_stale_ui_timing_profile_cannot_replace_the_visible_estimate(self):
+        import rag_pdf_gradio_app as app
+
+        original_status = app.LIVE_AUTOMATIC_RUN_STATUS
+        original_validate = app.validate_pdf_inputs
+        original_estimate = app.estimate_automatic_run
+        try:
+            app.LIVE_AUTOMATIC_RUN_STATUS = {}
+            app.validate_pdf_inputs = lambda _files: (["C:/temp/vanished.pdf"], None)
+            app.estimate_automatic_run = lambda *_args, **_kwargs: {
+                "expected_seconds": 0,
+                "source": "invalid transient profile",
+                "profile": {"missing_inputs": 1},
+            }
+            update = app.refresh_automatic_run_estimate(
+                ["C:/temp/vanished.pdf"],
+                [],
+                app.MODE_NATIVE_UPLOAD_LABEL,
+                app.NATIVE_UPLOAD_SCOPE_ALL_LABEL,
+            )
+        finally:
+            app.LIVE_AUTOMATIC_RUN_STATUS = original_status
+            app.validate_pdf_inputs = original_validate
+            app.estimate_automatic_run = original_estimate
+
+        self.assertEqual(update, {"__type__": "update"})
+
+    def test_cache_tail_prior_uses_only_successful_all_cache_current_protocol_runs(self):
+        import rag_pdf_gradio_app as app
+
+        def row(*, records=10, sources=2, seconds=4.0, cached=None, state="successful"):
+            return {
+                "state": state,
+                "mode": app.MODE_NATIVE_UPLOAD_LABEL,
+                "embedding_submission_strategy": "desktop_queue",
+                "timing_formula_revision": app.TIMING_MODEL_FORMULA_REVISION,
+                "actual_records": records,
+                "cached_attachment_reused_records": records if cached is None else cached,
+                "document_count": sources,
+                "batch_submission_seconds": [seconds],
+            }
+
+        history = [row() for _ in range(5)]
+        history.extend([
+            row(seconds=400.0, cached=0),
+            row(seconds=400.0, state="failed"),
+        ])
+        prior = app.timing_model_cached_attachment_tail_prior(history)
+
+        self.assertEqual(prior["matching_runs"], 5)
+        self.assertEqual(prior["record_seconds"], 0.44)
+        self.assertEqual(prior["source_seconds"], 3.0)
+        self.assertEqual(prior["source"], "bounded successful all-cache history")
+
+    def test_cached_attachment_reprice_keeps_record_and_source_window_work(self):
+        import rag_pdf_gradio_app as app
+
+        repriced = app.confirmed_prequeue_cache_eta_seconds(
+            10_000,
+            100,
+            fresh_provider_requests=0,
+            provider_request_seconds=3.0,
+            features={"document_count": 44},
+            cached_attachment_records=2_587,
+            remaining_source_windows=37,
+            cache_attachment_prior={"record_seconds": 0.08, "source_seconds": 3.0},
+        )
+
+        self.assertEqual(repriced, 438)
+        self.assertGreater(repriced, 100 + 200)
+
+    def test_first_source_cache_snapshot_keeps_unobserved_batch_records_fresh(self):
+        import rag_pdf_gradio_app as app
+
+        context = {"prepared_records": 2_587}
+        first = app.observe_prequeue_cache_plan(
+            context,
+            {
+                "source_path": "first.pdf",
+                "source_window_index": 1,
+                "source_window_total": 37,
+                "queue_records": 11,
+                "prequeue_cached_records": 11,
+                "prequeue_fresh_records": 0,
+            },
+            initial_estimated_records=2_500,
+        )
+        repeated = app.observe_prequeue_cache_plan(
+            context,
+            {
+                "source_path": "first.pdf",
+                "source_window_index": 1,
+                "source_window_total": 37,
+                "queue_records": 11,
+                "prequeue_cached_records": 11,
+                "prequeue_fresh_records": 0,
+            },
+            initial_estimated_records=2_500,
+        )
+
+        self.assertEqual(first["remaining_provider_requests"], 2_576)
+        self.assertEqual(first["remaining_source_windows"], 37)
+        self.assertEqual(repeated["remaining_provider_requests"], 2_576)
+        self.assertEqual(context["observed_records"], 11)
+        self.assertTrue(context["suppress_combined_queue_rate"])
+
+        app.observe_prequeue_cache_plan(
+            context,
+            {
+                "source_path": "second.pdf",
+                "source_window_index": 2,
+                "source_window_total": 37,
+                "queue_records": 5,
+                "prequeue_cached_records": 0,
+                "prequeue_fresh_records": 5,
+            },
+            initial_estimated_records=2_500,
+        )
+        self.assertFalse(context["suppress_combined_queue_rate"])
 
     def test_new_workspace_name_collision_uses_a_visible_numeric_suffix(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3566,6 +3697,13 @@ class PipelineCoreTests(unittest.TestCase):
                 "text": "© 2016-2026 World Nuclear Association, registered in England and Wales.",
             }]),
             "World Nuclear Association",
+        )
+        self.assertEqual(
+            app.workspace_institutional_label_from_text_samples([{
+                "page": 17,
+                "text": "© 2026 University of California Press. All rights reserved.",
+            }]),
+            "",
         )
         self.assertEqual(
             app.workspace_institutional_label_from_text_samples([{
@@ -4134,6 +4272,72 @@ class PipelineCoreTests(unittest.TestCase):
         # queue interval, so it is not a second serial duration in the ETA.
         self.assertEqual(app.queue_evidence_eta_seconds(20, 20), 50)
         self.assertEqual(app.queue_evidence_eta_seconds(20, 2), 28)
+
+    def test_batch_queue_forecast_counts_unopened_source_windows_as_remaining_work(self):
+        import rag_pdf_gradio_app as app
+
+        context = {"prepared_records": 898}
+        forecast = app.observe_batch_queue_forecast(
+            context,
+            {
+                "source_path": "first.pdf",
+                "source_window_index": 1,
+                "source_window_total": 17,
+                "queue_records": 20,
+                "desktop_queue_completed": 12,
+                "desktop_queue_records_per_minute": 60,
+            },
+            elapsed_seconds=200,
+            provider_request_seconds_prior=3.0,
+            initial_estimated_records=898,
+        )
+
+        self.assertEqual(forecast["completed_records"], 12)
+        self.assertEqual(forecast["remaining_records"], 886)
+        self.assertEqual(forecast["observed_windows"], 1)
+        # The Desktop's current-source remainder is only eight seconds.  The
+        # batch forecast must retain all 16 unopened PDF windows instead of
+        # collapsing the whole run to roughly elapsed + eight seconds.
+        self.assertGreater(forecast["forecast_seconds"], 2_500)
+
+    def test_batch_queue_forecast_aggregates_windows_without_double_counting_callbacks(self):
+        import rag_pdf_gradio_app as app
+
+        context = {"prepared_records": 100}
+        first = {
+            "source_path": "first.pdf",
+            "source_window_index": 1,
+            "source_window_total": 2,
+            "queue_records": 50,
+            "desktop_queue_completed": 50,
+            "desktop_queue_records_per_minute": 30,
+        }
+        app.observe_batch_queue_forecast(
+            context, first, elapsed_seconds=100,
+            provider_request_seconds_prior=3.0,
+        )
+        # A repeated relay replaces the same source observation.
+        app.observe_batch_queue_forecast(
+            context, first, elapsed_seconds=101,
+            provider_request_seconds_prior=3.0,
+        )
+        second = app.observe_batch_queue_forecast(
+            context,
+            {
+                "source_path": "second.pdf",
+                "source_window_index": 2,
+                "source_window_total": 2,
+                "queue_records": 50,
+                "desktop_queue_completed": 10,
+                "desktop_queue_records_per_minute": 20,
+            },
+            elapsed_seconds=130,
+            provider_request_seconds_prior=3.0,
+        )
+
+        self.assertEqual(second["completed_records"], 60)
+        self.assertEqual(second["remaining_records"], 40)
+        self.assertEqual(second["observed_windows"], 2)
 
     def test_mature_queue_reprice_moves_the_eta_in_bounded_readable_steps(self):
         import rag_pdf_gradio_app as app
@@ -5095,7 +5299,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(app.paced_progress_percent(record, now=100.5), 42)
         self.assertEqual(app.paced_progress_percent(record, now=108.0), 70)
 
-    def test_running_estimate_counts_down_and_labels_an_active_overrun_for_recalibration(self):
+    def test_running_estimate_counts_down_and_uses_a_stable_queue_tail_after_overrun(self):
         import rag_pdf_gradio_app as app
 
         countdown = app.automatic_run_timing_html(
@@ -5109,9 +5313,42 @@ class PipelineCoreTests(unittest.TestCase):
             state="running",
             started_epoch=100.0,
             now=240.0,
+            progress_phase="desktop_queue",
+            completed_units=1,
+            total_units=13,
+        )
+        later_repaint = app.automatic_run_timing_html(
+            expected_seconds=138,
+            state="running",
+            started_epoch=100.0,
+            now=260.0,
+            progress_phase="desktop_queue",
+            completed_units=1,
+            total_units=13,
+        )
+        later_evidence = app.automatic_run_timing_html(
+            expected_seconds=138,
+            state="running",
+            started_epoch=100.0,
+            now=260.0,
+            progress_phase="desktop_queue",
+            completed_units=8,
+            total_units=13,
+        )
+        exact_vector_repaint = app.automatic_run_timing_html(
+            expected_seconds=138,
+            state="running",
+            started_epoch=100.0,
+            now=261.0,
+            progress_phase="identity_set",
+            completed_units=8,
+            total_units=13,
         )
         self.assertIn("Est: 02m15s", countdown)
-        self.assertIn("Est: recalculating from Desktop queue", overrun)
+        self.assertIn("Est: ~00m46s", overrun)
+        self.assertIn("Est: ~00m46s", later_repaint)
+        self.assertIn("Est: ~00m25s", later_evidence)
+        self.assertIn("Est: ~00m25s", exact_vector_repaint)
 
     def test_running_estimate_always_counts_down_and_can_accelerate_with_progress(self):
         import rag_pdf_gradio_app as app
@@ -5161,6 +5398,31 @@ class PipelineCoreTests(unittest.TestCase):
             self.assertTrue(result[6]["visible"])
         finally:
             app.LIVE_AUTOMATIC_RUN_STATUS = original_status
+
+    def test_running_status_refresh_forwards_queue_counts_to_the_overrun_tail(self):
+        import rag_pdf_gradio_app as app
+
+        original_status = app.LIVE_AUTOMATIC_RUN_STATUS
+        original_time = app.time.time
+        try:
+            app.time.time = lambda: 240.0
+            app.LIVE_AUTOMATIC_RUN_STATUS = {
+                "state": "running",
+                "phase": "Submitting the selected PDF batch to AnythingLLM",
+                "progress_phase": "desktop_queue",
+                "completed_units": 1,
+                "total_units": 13,
+                "expected_seconds": 138,
+                "started_epoch": 100.0,
+                "confirmed_fraction": 0.8,
+            }
+            result = app.refresh_live_automatic_run_ui()
+        finally:
+            app.time.time = original_time
+            app.LIVE_AUTOMATIC_RUN_STATUS = original_status
+
+        self.assertIn("Est: ~00m46s", result[1])
+        self.assertNotIn("recalculating", result[1])
 
     def test_inflight_anythingllm_batch_is_cancellable_by_owned_worker_termination(self):
         import rag_pdf_gradio_app as app
@@ -7670,6 +7932,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertNotIn("automatic-normal-actions", element_ids)
         self.assertNotIn("automatic-confirm-actions", element_ids)
         self.assertIn("automatic-run-failure", element_ids)
+        self.assertIn("automatic-restart-notice", element_ids)
         normal, confirmation, cancel = app.automatic_action_row_updates()
         self.assertNotIn("visible", normal)
         self.assertFalse(confirmation["interactive"])
@@ -7742,15 +8005,61 @@ class PipelineCoreTests(unittest.TestCase):
             if (pdf_component["id"], "change") in dependency.get("targets", [])
         ]
         # A selection has exactly one direct owner. Its narrow chained helpers
-        # refresh defaults, ETA, metadata, workspace name, and Review
-        # in order; parallel direct listeners previously caused visible stale
-        # values before that chain caught up.
+        # acknowledge the browser-transferred paths and restore a coherent form;
+        # authoritative inspection belongs to Confirm.
         self.assertEqual(len(selection_dependencies), 1)
         self.assertTrue(
             str(selection_dependencies[0].get("api_name") or "").startswith(
                 "automatic_selection_begin_state"
             )
         )
+
+        chain_names = []
+        current = selection_dependencies[0]
+        while current:
+            chain_names.append(str(current.get("api_name") or ""))
+            children = [
+                dependency
+                for dependency in app.demo.config["dependencies"]
+                if dependency.get("trigger_after") == current["id"]
+            ]
+            self.assertLessEqual(len(children), 1)
+            current = children[0] if children else None
+        self.assertTrue(any("deferred_pdf_inspection_preview" in name for name in chain_names))
+        self.assertFalse(any("detected_metadata_preview" in name for name in chain_names))
+        self.assertFalse(any("refresh_automatic_run_estimate" in name for name in chain_names))
+        self.assertFalse(any("update_new_workspace_name_control" in name for name in chain_names))
+
+    def test_direct_picker_does_not_read_pdf_before_confirm_without_folder_batch(self):
+        import rag_pdf_gradio_app as app
+
+        with mock.patch.object(
+            app,
+            "merge_uploaded_pdfs_into_folder_batch",
+            side_effect=AssertionError("direct selection inspected before Confirm"),
+        ):
+            updates = app.merge_uploaded_pdfs_into_direct_selection(
+                ["browser-cache-file.pdf"],
+                {},
+            )
+
+        self.assertEqual(len(updates), 6)
+        self.assertTrue(all(update == {"__type__": "update"} for update in updates))
+
+    def test_direct_picker_shows_all_browser_selected_names_during_transfer(self):
+        import rag_pdf_gradio_app as app
+
+        self.assertEqual("automatic-pdf-upload", next(
+            component["props"].get("elem_id")
+            for component in app.demo.config["components"]
+            if component.get("props", {}).get("elem_id") == "automatic-pdf-upload"
+        ))
+        self.assertIn("ragPendingAutomaticPdfSelection", app.APP_BROWSER_THEME_HEAD)
+        self.assertIn('textNode.nodeValue = value.replace', app.APP_BROWSER_THEME_HEAD)
+        self.assertIn('"Adding$1"', app.APP_BROWSER_THEME_HEAD)
+        self.assertIn(".rag-pending-pdf-list", app.APP_CSS)
+        preview = app.deferred_pdf_inspection_preview(["one.pdf", "two.pdf"], [])
+        self.assertIn("PDF inspection starts after Confirm", preview)
 
     def test_run_timer_estimate_refreshes_for_mode_and_upload_scope(self):
         import rag_pdf_gradio_app as app
@@ -13319,6 +13628,78 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(report["author"], "Jane Doe")
         self.assertEqual(report["source"], "text_edited_by")
 
+    def test_author_inference_does_not_promote_reference_entries_on_later_pages(self):
+        report = pipeline.infer_author_from_text_samples(
+            [
+                {"page": 1, "text": "Example Film Theory\nOpening discussion without a byline.\n"},
+                {
+                    "page": 9,
+                    "text": (
+                        "Works Cited\n"
+                        "Fan, Victor. Cinema Approaching Reality. Minneapolis: University Press.\n"
+                    ),
+                },
+            ],
+            title_hint="Example Film Theory",
+        )
+
+        self.assertEqual(report["author"], "")
+
+    def test_publisher_titlepage_rule_selects_author_not_preceding_title(self):
+        report = pipeline.infer_author_from_text_samples(
+            [{
+                "page": 1,
+                "text": (
+                    "What Is Digital Cinema?\n"
+                    "Lev Manovich\n"
+                    "Example University Press\n"
+                ),
+            }],
+            title_hint="unhelpful-file-name",
+        )
+
+        self.assertEqual(report["author"], "Lev Manovich")
+        self.assertEqual(report["source"], "text_titlepage_publisher_byline")
+
+    def test_stacked_author_rule_rejects_bibliographic_sidebar_fragments(self):
+        report = pipeline.infer_author_from_text_samples(
+            [{
+                "page": 1,
+                "text": (
+                    "WHITE PRIVILEGE AND LOOKING RELATIONS\n"
+                    "Emergence of the Afro-\n"
+                    "American Woman\n"
+                    "Novelist, New York\n"
+                    "Oxford University Press, 1987;\n"
+                ),
+            }],
+            title_hint="WHITE PRIVILEGE AND LOOKING RELATIONS",
+        )
+
+        self.assertEqual(report["author"], "")
+
+    def test_stacked_single_author_email_must_match_candidate_surname(self):
+        report = pipeline.infer_author_from_text_samples(
+            [{
+                "page": 1,
+                "text": (
+                    "Example Chapter\n"
+                    "P. Kääpä (*)\n"
+                    "Centre for Media Studies, Example University\n"
+                    "Coventry, UK\n"
+                    "e-mail: P.Kaapa@example.edu\n"
+                ),
+            }],
+            title_hint="Example Chapter",
+        )
+
+        self.assertEqual(report["author"], "P. Kääpä")
+        self.assertNotIn("Coventry", report["author"])
+
+    def test_metadata_title_rejects_generic_export_placeholder(self):
+        self.assertEqual(pipeline.normalize_metadata_title("someTitle"), "")
+        self.assertEqual(pipeline.normalize_metadata_title("Document Title"), "")
+
     def test_author_inference_ignores_crossmark_and_citation_boilerplate(self):
         report = pipeline.infer_author_from_text_samples(
             [
@@ -16092,7 +16473,12 @@ class PipelineCoreTests(unittest.TestCase):
                 report = pipeline.maybe_upload_to_anythingllm(
                     "http://anythingllm", "key", [], workspace_slug="workspace",
                     upload_transport="file_upload", upload_plan_rows=rows,
+                    submission_receipt_path=root / "receipts.jsonl",
                 )
+                receipts = [
+                    json.loads(line)
+                    for line in (root / "receipts.jsonl").read_text(encoding="utf-8").splitlines()
+                ]
             finally:
                 pipeline.post_multipart_form = original_multipart
                 pipeline.post_json = original_json
@@ -16103,6 +16489,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual([row["status"] for row in report["attachment_results"]], ["attached", "submission_unknown"])
         self.assertEqual(report["source_transactions"][0]["state"], "exact_vectors_proven")
         self.assertEqual(report["source_transactions"][1]["state"], "ambiguous_external_mutation_held")
+        self.assertEqual(receipts[-1]["state"], "submission_unknown")
 
     def test_explicit_source_attachment_rejection_releases_the_next_pdf(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -16134,7 +16521,17 @@ class PipelineCoreTests(unittest.TestCase):
                 report = pipeline.maybe_upload_to_anythingllm(
                     "http://anythingllm", "key", [], workspace_slug="workspace",
                     upload_transport="file_upload", upload_plan_rows=rows,
+                    embedding_ledger_path=root / "batch-embedding-ledger.json",
                 )
+                transaction_ledger = json.loads(
+                    (root / "source-transaction-ledger.json").read_text(encoding="utf-8")
+                )
+                transaction_events = [
+                    json.loads(line)
+                    for line in (root / "source-transaction-events.jsonl").read_text(
+                        encoding="utf-8"
+                    ).splitlines()
+                ]
             finally:
                 pipeline.post_multipart_form = original_multipart
                 pipeline.post_json = original_json
@@ -16149,6 +16546,13 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(report["source_transactions"][1]["state"], "source_rejected_without_remote_mutation")
         self.assertTrue(report["source_transactions"][1]["later_sources_released"])
         self.assertEqual(report["source_transactions"][2]["state"], "exact_vectors_proven")
+        self.assertTrue(transaction_ledger["journal_finalized"])
+        self.assertEqual(len(transaction_ledger["transactions"]), 3)
+        self.assertEqual(len(transaction_events), 9)
+        self.assertEqual(
+            [event["transaction"]["state"] for event in transaction_events[-3:]],
+            ["prepared", "attachment_intent_durable", "exact_vectors_proven"],
+        )
 
     def test_attachment_success_without_location_holds_later_sources_and_never_reports_complete(self):
         """A 2xx without a durable location is an unknown mutation, not success.
@@ -18889,6 +19293,113 @@ class TimingAndInspectionSafetyTests(unittest.TestCase):
             completion["message"],
             "1 PDF(s) ready Vectors confirmed; live retrieval test skipped.",
         )
+
+    def test_restart_notice_reports_completed_active_pdf_and_paused_remainder(self):
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_root = Path(temp_dir)
+            run_root = output_root / "r-interrupted"
+            pdf_root = run_root / "pdf-0003"
+            pdf_root.mkdir(parents=True)
+            pdf_path = output_root / "source.pdf"
+            result_path = pdf_root / ".automatic-worker-result.json"
+            (run_root / "run-progress.json").write_text(json.dumps({
+                "state": "running",
+                "run_root": str(run_root),
+                "batch_completed_files": 2,
+                "batch_current_file_index": 3,
+                "batch_total_files": 7,
+            }), encoding="utf-8")
+            (run_root / app.AUTOMATIC_RUN_WORKER_MARKER).write_text(json.dumps({
+                "kind": "automatic-preparation-worker",
+                "pid": 12345,
+                "run_root": str(run_root),
+                "pdf_path": str(pdf_path),
+            }), encoding="utf-8")
+            (pdf_root / ".automatic-worker-config.json").write_text(json.dumps({
+                "run_root": str(run_root),
+                "pdf_path": str(pdf_path),
+                "result_path": str(result_path),
+            }), encoding="utf-8")
+            result_path.write_text(json.dumps({"status": "completed"}), encoding="utf-8")
+
+            with mock.patch.object(app, "LIVE_AUTOMATIC_RUN_STATUS", {}), mock.patch.object(
+                app, "automatic_worker_is_live", return_value=False
+            ):
+                notice = app.interrupted_automatic_batch_notice(output_root)
+
+        self.assertTrue(notice["visible"])
+        self.assertEqual(notice["state"], "completed")
+        self.assertEqual(notice["later"], 4)
+        self.assertIn("PDF 3 of 7 finished safely", notice["html"])
+        self.assertIn("4 later PDFs remain paused", notice["html"])
+
+    def test_restart_notice_reports_surviving_worker_without_claiming_replay(self):
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_root = Path(temp_dir)
+            run_root = output_root / "r-interrupted"
+            run_root.mkdir(parents=True)
+            (run_root / "run-progress.json").write_text(json.dumps({
+                "state": "preparing",
+                "run_root": str(run_root),
+                "batch_current_file_index": 5,
+                "batch_total_files": 6,
+            }), encoding="utf-8")
+            (run_root / app.AUTOMATIC_RUN_WORKER_MARKER).write_text(json.dumps({
+                "kind": "automatic-preparation-worker",
+                "pid": 12345,
+                "run_root": str(run_root),
+                "pdf_path": str(output_root / "source.pdf"),
+            }), encoding="utf-8")
+
+            with mock.patch.object(app, "LIVE_AUTOMATIC_RUN_STATUS", {}), mock.patch.object(
+                app, "automatic_worker_is_live", return_value=True
+            ):
+                notice = app.interrupted_automatic_batch_notice(output_root)
+
+        self.assertEqual(notice["state"], "running")
+        self.assertIn("PDF 5 of 6 is still processing", notice["html"])
+        self.assertIn("1 later PDF remains paused", notice["html"])
+        self.assertNotIn("resume", notice["html"].casefold())
+
+    def test_restart_notice_is_suppressed_for_browser_reload_of_owned_run(self):
+        import rag_pdf_gradio_app as app
+
+        with mock.patch.object(
+            app, "LIVE_AUTOMATIC_RUN_STATUS", {"run_root": "owned-by-this-server"}
+        ):
+            notice = app.interrupted_automatic_batch_notice("unused")
+
+        self.assertFalse(notice["visible"])
+        self.assertEqual(notice["state"], "owned")
+
+    def test_restart_notice_does_not_resurface_older_interrupted_run(self):
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_root = Path(temp_dir)
+            old_root = output_root / "r-old"
+            new_root = output_root / "r-new"
+            old_root.mkdir()
+            new_root.mkdir()
+            (old_root / "run-progress.json").write_text(
+                json.dumps({"state": "running", "run_root": str(old_root)}),
+                encoding="utf-8",
+            )
+            time.sleep(0.01)
+            (new_root / "run-progress.json").write_text(
+                json.dumps({"state": "successful", "run_root": str(new_root)}),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(app, "LIVE_AUTOMATIC_RUN_STATUS", {}):
+                notice = app.interrupted_automatic_batch_notice(output_root)
+
+        self.assertFalse(notice["visible"])
+        self.assertEqual(notice["state"], "successful")
 
 
 if __name__ == "__main__":

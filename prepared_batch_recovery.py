@@ -31,16 +31,32 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _artifact(path: Path, role: str) -> dict[str, Any]:
+def _artifact(path: Path, role: str, artifact_cache=None) -> dict[str, Any]:
     resolved = path.resolve(strict=True)
     if not resolved.is_file():
         raise ValueError(f"required prepared artifact is not a file: {role}")
-    return {
+    stat = resolved.stat()
+    cache_key = (str(resolved), str(role))
+    cached = (artifact_cache or {}).get(cache_key)
+    if (
+        isinstance(cached, dict)
+        and int(cached.get("size") or -1) == stat.st_size
+        and int(cached.get("mtime_ns") or -1) == stat.st_mtime_ns
+    ):
+        return dict(cached["artifact"])
+    artifact = {
         "role": role,
         "path": str(resolved),
-        "size": resolved.stat().st_size,
+        "size": stat.st_size,
         "sha256": _sha256(resolved),
     }
+    if artifact_cache is not None:
+        artifact_cache[cache_key] = {
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "artifact": dict(artifact),
+        }
+    return artifact
 
 
 def _summary_path(summary: dict[str, Any]) -> Path | None:
@@ -98,34 +114,45 @@ def build_prepared_batch_checkpoint(
     workspace_slug: str,
     api_url: str,
     stage: str,
+    artifact_cache=None,
 ) -> dict[str, Any]:
     """Build a checkpoint from durable artifacts, raising on missing inputs."""
     root = Path(run_root).resolve(strict=True)
     sources: list[dict[str, Any]] = []
+    compact_progress = str(stage) == "preparation_in_progress"
     for index, summary in enumerate(summaries, start=1):
         state = _source_state(summary)
         artifacts: list[dict[str, Any]] = []
         summary_path = _summary_path(summary)
         if summary_path is None:
             raise ValueError(f"source {index} has no durable source-summary receipt")
-        if state == "prepared_for_submission":
-            artifacts.append(_artifact(summary_path, "source_summary"))
+        if compact_progress:
+            # An in-progress batch is deliberately non-replayable. Its source
+            # summary files are already durable and independently diagnostic,
+            # so copying every growing upload-plan/text hash array into every
+            # prefix checkpoint is quadratic evidence amplification. The final
+            # preparation-complete boundary below still hashes every artifact
+            # and is independently verified before AnythingLLM can mutate.
+            pass
+        elif state == "prepared_for_submission":
+            artifacts.append(_artifact(summary_path, "source_summary", artifact_cache))
             plan_path = _upload_plan_path(summary)
             if plan_path is None:
                 raise ValueError(f"source {index} has no upload plan")
-            artifacts.append(_artifact(plan_path, "upload_plan"))
+            artifacts.append(_artifact(plan_path, "upload_plan", artifact_cache))
             text_files = _plan_text_files(plan_path)
             if not text_files:
                 raise ValueError(f"source {index} upload plan contains no text files")
-            artifacts.extend(_artifact(path, "prepared_text") for path in text_files)
+            artifacts.extend(_artifact(path, "prepared_text", artifact_cache) for path in text_files)
         else:
-            artifacts.append(_artifact(summary_path, "source_summary"))
+            artifacts.append(_artifact(summary_path, "source_summary", artifact_cache))
 
         source_hash = str(summary.get("source_sha256") or "").strip().lower()
         sources.append({
             "source_index": index,
             "source_identity": f"sha256:{source_hash}" if source_hash else "unavailable",
             "state": state,
+            "summary_path": str(summary_path) if compact_progress else "",
             "artifacts": artifacts,
         })
 
@@ -141,6 +168,10 @@ def build_prepared_batch_checkpoint(
         "workspace_slug": str(workspace_slug or ""),
         "api_origin": str(api_url or "").split("?", 1)[0].split("#", 1)[0],
         "sources": sources,
+        "artifact_evidence": (
+            "deferred_until_preparation_complete"
+            if compact_progress else "content_hashed"
+        ),
     }
 
 
@@ -152,6 +183,7 @@ def write_prepared_batch_checkpoint(
     workspace_slug: str,
     api_url: str,
     stage: str,
+    artifact_cache=None,
 ) -> Path:
     root = Path(run_root)
     payload = build_prepared_batch_checkpoint(
@@ -161,6 +193,7 @@ def write_prepared_batch_checkpoint(
         workspace_slug=workspace_slug,
         api_url=api_url,
         stage=stage,
+        artifact_cache=artifact_cache,
     )
     path = root / MANIFEST_NAME
     atomic_write_json(path, payload)

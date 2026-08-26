@@ -65,6 +65,11 @@ from validation_contract import (
     SUCCESSFUL_UPLOAD_STATUSES,
     evidence_layers_succeeded,
 )
+from source_transaction_journal import (
+    append_source_transaction_event,
+    finalize_source_transaction_journal,
+    initialize_source_transaction_journal,
+)
 
 from rag_pdf_tools import (
     DEFAULT_END_SECTION_HEADINGS,
@@ -1068,6 +1073,7 @@ def normalize_author_candidate(value):
         candidate,
         flags=re.I,
     )
+    candidate = re.sub(r"\s*\(\s*\)", "", candidate)
     candidate = re.sub(r"\s+", " ", candidate).strip(" ,;:-—–")
     return candidate
 
@@ -1263,12 +1269,53 @@ def extract_stacked_affiliated_names(lines, title_hint=""):
         previous = values[index - 1] if index else ""
         if (
             len(group) >= 2
-            and re.search(r"\b(?:for|of|and|the|in|on|to|with|from)\s*$", previous, flags=re.I)
+            and (
+                re.search(r"\b(?:for|of|and|the|in|on|to|with|from)\s*$", previous, flags=re.I)
+                or previous.rstrip().endswith(("-", "‐", "‑", "‒", "–", "—"))
+            )
         ):
             group = group[1:]
         context = values[cursor: cursor + 3]
         context_has_email = any("@" in value for value in context)
-        context_has_affiliation = any(has_author_affiliation_hint(value) for value in context)
+        context_has_affiliation = any(
+            has_author_affiliation_hint(value)
+            and not looks_like_publisher_imprint_line(value)
+            for value in context
+        )
+        # A city/country line can be person-shaped after PDF column ordering
+        # (for example ``Coventry, UK`` -> ``UK Coventry``).  A following
+        # email proves the real author's identity only when the candidate's
+        # surname is also represented in that address.  This keeps the useful
+        # single-name-plus-email layout without promoting a postal line.
+        if len(group) == 1 and context_has_email:
+            email_local_parts = [
+                match.group(1)
+                for value in context
+                for match in re.finditer(r"\b([\w.+-]+)@[\w.-]+\.[A-Za-z]{2,}\b", value)
+            ]
+            folded_name_tokens = [
+                "".join(
+                    character for character in unicodedata.normalize("NFKD", token).casefold()
+                    if character.isascii() and character.isalnum()
+                )
+                for token in re.findall(r"[^\W\d_][\w'.-]*", group[0], flags=re.UNICODE)
+            ]
+            folded_name_tokens = [token for token in folded_name_tokens if len(token) >= 3]
+            folded_locals = [
+                "".join(
+                    character for character in unicodedata.normalize("NFKD", local).casefold()
+                    if character.isascii() and character.isalnum()
+                )
+                for local in email_local_parts
+            ]
+            context_has_email = bool(
+                folded_name_tokens
+                and any(
+                    token in local
+                    for token in folded_name_tokens
+                    for local in folded_locals
+                )
+            )
         if context_has_email or (context_has_affiliation and len(group) >= 2):
             for name in group:
                 if name not in recovered:
@@ -1394,7 +1441,13 @@ def infer_author_from_text_samples(samples, title_hint=""):
         # by a bibliographic ``From <name>, ...`` line. This avoids promoting
         # ordinary title-case headings to authors.
         affiliated_names: list[str] = []
-        for line in lines[:24]:
+        # Structural title-page inference is intentionally limited to the
+        # opening pages.  References and bibliographies contain the same
+        # name/affiliation/publisher shapes, but they are not document
+        # bylines. Explicit labelled credits below remain eligible on every
+        # sampled page.
+        title_page_lines = lines if 1 <= page <= 3 else []
+        for line in title_page_lines[:24]:
             candidate = ""
             comma_match = re.match(r"^(.{3,80}?),\s*(.+)$", line)
             if (
@@ -1417,7 +1470,7 @@ def infer_author_from_text_samples(samples, title_hint=""):
                 "page": page,
                 "evidence": " / ".join(affiliated_names[:4]),
             }
-        for line in lines[:16]:
+        for line in title_page_lines[:16]:
             adjacent_affiliated_names = extract_adjacent_affiliated_name_pairs(
                 line,
                 title_hint=title_hint,
@@ -1476,7 +1529,7 @@ def infer_author_from_text_samples(samples, title_hint=""):
         # reliable than title-block geometry. Only then consider the compact
         # stacked-name layout used by scholarly title pages.
         stacked_affiliated_names = extract_stacked_affiliated_names(
-            lines[:40],
+            title_page_lines[:40],
             title_hint=title_hint,
         )
         if stacked_affiliated_names:
@@ -1498,8 +1551,18 @@ def infer_author_from_text_samples(samples, title_hint=""):
                 candidate = normalize_author_candidate(line)
                 if not looks_like_person_name(candidate, title_hint=title_hint, allow_all_caps=False):
                     continue
-                nearby = " ".join(top_lines[max(0, index - 2): min(len(top_lines), index + 4)])
-                if re.search(r"\b(?:university\s+press|press|publisher|published\s+by)\b", nearby, flags=re.I):
+                if "," in line:
+                    # A comma-inverted bare line immediately above a press is
+                    # indistinguishable from a bibliography/location fragment
+                    # (``Novelist, New York``). Explicit author labels and the
+                    # dedicated affiliation rule still support surname-first
+                    # names; this weak publisher-layout fallback abstains.
+                    continue
+                # The imprint must directly follow the candidate.  Searching
+                # a wider neighborhood allowed a chapter title one line above
+                # the real author to borrow the author's publisher evidence.
+                following = top_lines[index + 1] if index + 1 < len(top_lines) else ""
+                if looks_like_publisher_imprint_line(following):
                     return {
                         "author": candidate,
                         "source": "text_titlepage_publisher_byline",
@@ -1582,7 +1645,14 @@ def infer_author_from_text_samples(samples, title_hint=""):
         # never on later prose pages where organisations and locations often
         # happen to look like names.  Explicit ``By …``/role credits above
         # continue to work on any of the inspected opening pages.
-        allow_generic_top_block = bool(title_matched) or (not normalized_title and page <= 2)
+        bibliographic_opening_context = bool(
+            re.search(r"\b(?:18|19|20)\d{2}\b", " ".join(top_lines))
+            and any(";" in line for line in top_lines)
+        )
+        allow_generic_top_block = (
+            (bool(title_matched) or (not normalized_title and page <= 2))
+            and not bibliographic_opening_context
+        )
         reviewed_work_context = False
         for index, line in enumerate(top_lines):
             if index < title_start_index:
@@ -1803,7 +1873,11 @@ def normalize_metadata_title(value):
     if len(title) < 3 or len(title) > 300 or any(ord(character) < 32 for character in title):
         return ""
     lowered = title.casefold().strip()
-    if re.fullmatch(r"(?:untitled(?: document)?|new document|document(?: \d+)?|scan(?: \d+)?)", lowered):
+    if re.fullmatch(
+        r"(?:untitled(?: document)?|new document|document(?: \d+)?|scan(?: \d+)?|"
+        r"some[ _-]?title|document[ _-]?title|pdf[ _-]?title)",
+        lowered,
+    ):
         return ""
     # A source-layout/office extension in Title metadata is a strong sign of
     # an internal production filename, including short names such as
@@ -9761,6 +9835,54 @@ def _page_parent_payload_reuse_key(payload):
     ).hexdigest()
 
 
+def _indexed_cached_document_candidates(storage_dir, chunk_sources):
+    """Return globally attached document paths for exact source identities.
+
+    The Desktop database already indexes every raw document that has been
+    attached to any workspace.  Consulting that compact index first avoids a
+    cold recursive walk over thousands of unrelated JSON files.  ``None``
+    means the index could not be consulted and permits the conservative
+    filesystem fallback; an empty set is a valid, authoritative no-match.
+
+    This is only a candidate filter.  Callers must still verify the raw JSON,
+    complete payload digest, requested folder, and vector-cache entry.
+    """
+    expected = {str(value or "").strip() for value in (chunk_sources or []) if str(value or "").strip()}
+    if not storage_dir or not expected:
+        return set()
+    db_path = Path(storage_dir) / "anythingllm.db"
+    if not db_path.is_file():
+        return None
+    con = None
+    try:
+        con = sqlite_readonly_connection(db_path)
+        candidates = set()
+        for docpath, raw_metadata in con.execute(
+            "select docpath, metadata from workspace_documents where docpath is not null"
+        ):
+            try:
+                metadata = (
+                    raw_metadata
+                    if isinstance(raw_metadata, dict)
+                    else json.loads(str(raw_metadata or "{}"))
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(metadata, dict):
+                continue
+            if str(metadata.get("chunkSource") or "").strip() not in expected:
+                continue
+            location = str(docpath or "").replace("\\", "/").strip("/")
+            if location:
+                candidates.add(location)
+        return candidates
+    except (sqlite3.Error, OSError, TypeError, ValueError):
+        return None
+    finally:
+        if con is not None:
+            con.close()
+
+
 def find_reusable_cached_document_locations(
     storage_dir,
     payloads,
@@ -9827,8 +9949,22 @@ def find_reusable_cached_document_locations(
         if not cache_entry_names:
             return reusable
         allowed_folders = set(expected_folders or []) if expected_folders is not None else None
+        indexed_locations = _indexed_cached_document_candidates(
+            storage,
+            expected_chunk_sources,
+        )
+        if indexed_locations is None:
+            candidate_paths = custom_documents.rglob("*.json")
+        else:
+            # An attached-document index miss is safe to treat as no reuse:
+            # ordinary upload remains the fallback.  A stale/orphaned raw file
+            # is deliberately not worth a full-store cold scan on every run.
+            candidate_paths = (
+                documents_root / Path(location)
+                for location in sorted(indexed_locations)
+            )
         candidates_by_key = {}
-        for candidate in custom_documents.rglob("*.json"):
+        for candidate in candidate_paths:
             try:
                 # The search root is already under ``documents_root``.  Do not
                 # resolve every normal local file: Windows path resolution was
@@ -9837,13 +9973,16 @@ def find_reusable_cached_document_locations(
                 # original root-containment safety property.
                 if candidate.is_symlink():
                     continue
-                relative = candidate.relative_to(documents_root).as_posix()
+                resolved_candidate = candidate.resolve()
+                if not resolved_candidate.is_relative_to(custom_documents):
+                    continue
+                relative = resolved_candidate.relative_to(documents_root).as_posix()
                 relative_folder = Path(relative).parent.as_posix().casefold()
                 if allowed_folders is not None and relative_folder not in allowed_folders:
                     continue
                 if str(uuid.uuid5(uuid.NAMESPACE_URL, relative)) not in cache_entry_names:
                     continue
-                raw_bytes = candidate.read_bytes()
+                raw_bytes = resolved_candidate.read_bytes()
                 # ``chunkSource`` is part of the final hash below.  Checking
                 # for its stable value first avoids JSON decoding unrelated
                 # cached records; a coincidental text match only causes an
@@ -11128,6 +11267,23 @@ def classify_anythingllm_mutation_outcome(*, stage, status=None, response_text="
         "error": (f"AnythingLLM returned HTTP {code}." if code else "AnythingLLM write outcome is unknown."),
         "stage": normalized_stage,
     }
+
+
+def mutation_outcome_receipt_state(outcome):
+    """Map mutation certainty to the durable recovery vocabulary.
+
+    ``rejected`` is intentionally reserved for an explicit source-local
+    refusal: recovery is allowed to release later PDFs only for that state.
+    Authentication, workspace, and rate-limit failures are run-wide holds;
+    server/transport failures remain ambiguous because the remote mutation may
+    already have happened before the response was lost.
+    """
+    category = str((outcome or {}).get("category") or "")
+    if category == "explicit_source_rejection":
+        return "rejected"
+    if category in {"global_configuration_rejection", "temporary_global_hold"}:
+        return "global_hold"
+    return "submission_unknown"
 
 
 def verify_anythingllm_upload_auth(api_url, api_key=None):
@@ -12677,17 +12833,20 @@ def healthy_owned_desktop_queue(queue, expected_records=0, *, poll_interval_seco
     """Return whether current-run SSE evidence proves Desktop is still writing."""
     queue = dict(queue or {})
     total = max(0, int(queue.get("queue_records") or expected_records or 0))
-    position = max(
-        int(queue.get("desktop_queue_completed") or 0),
-        int(queue.get("desktop_queue_current") or 0),
-    )
+    completed = max(0, int(queue.get("desktop_queue_completed") or 0))
+    current = max(0, int(queue.get("desktop_queue_current") or 0))
     try:
         event_age = float(str(queue.get("desktop_queue_last_event_age_seconds") or ""))
     except (TypeError, ValueError):
         event_age = None
     return bool(
         total > 0
-        and 0 < position < total
+        # ``current`` is one-based. The last (or only) record is still active
+        # when current == total; completion is a separate counter. The former
+        # position < total test made every one-record source window, and the
+        # final record of every larger window, impossible to classify alive.
+        and completed < total
+        and 0 < current <= total
         and str(queue.get("desktop_queue_observer_state") or "") == "connected"
         and event_age is not None
         and event_age <= max(15.0, float(poll_interval_seconds or 2.0) * 3.0)
@@ -14831,15 +14990,34 @@ def maybe_upload_payloads(
                             },
                         )
                 else:
-                    attachment.update(status="rejected", error=f"HTTP {status}")
+                    outcome = classify_anythingllm_mutation_outcome(
+                        stage="document_attachment",
+                        status=status,
+                        response_text=response_text,
+                    )
+                    receipt_state = mutation_outcome_receipt_state(outcome)
+                    attachment.update(
+                        status=("rejected" if receipt_state == "rejected" else receipt_state),
+                        error=f"HTTP {status}",
+                        mutation_outcome=outcome,
+                    )
                     attachment_results.append(attachment)
-                    errors.append({"status": status, "segment": payload.get("metadata", {}).get("chunkSource", "")})
+                    errors.append({
+                        **outcome,
+                        "status": status,
+                        "segment": payload.get("metadata", {}).get("chunkSource", ""),
+                        "source_path": str(payload.get("_automatic_source_path") or ""),
+                    })
                     record_submission_receipt(
                         submission_receipt_path, payload,
                         run_id=run_id, workspace_slug=workspace_slug, transport="raw_text",
-                        state="rejected", correlation_id=correlation_id, http_status=status,
+                        state=receipt_state, correlation_id=correlation_id, http_status=status,
                         error=f"HTTP {status}",
-                        next_check="Inspect the server response and correct the request before an explicit resubmission.",
+                        next_check=(
+                            "Correct the source request before an explicit resubmission."
+                            if receipt_state == "rejected"
+                            else "Reconcile AnythingLLM state before any replay; this response does not prove that no mutation occurred."
+                        ),
                     )
             except Exception as exc:
                 attachment.update(status="submission_unknown", error=str(exc))
@@ -15348,10 +15526,15 @@ def maybe_upload_segment_files(
                     record_submission_receipt(
                         submission_receipt_path, receipt_payload,
                         run_id=run_id, workspace_slug=workspace_slug, transport="file_upload",
-                        state="rejected", correlation_id=correlation_id, http_status=status,
+                        state=mutation_outcome_receipt_state(outcome),
+                        correlation_id=correlation_id, http_status=status,
                         prepared_payload_hash=prepared_file_hash,
                         error=f"HTTP {status}",
-                        next_check="Inspect the server response and correct the request before an explicit resubmission.",
+                        next_check=(
+                            "Correct the source request before an explicit resubmission."
+                            if outcome["category"] == "explicit_source_rejection"
+                            else "Reconcile AnythingLLM state before any replay; this response does not prove that no mutation occurred."
+                        ),
                     )
             except Exception as exc:
                 outcome = classify_anythingllm_mutation_outcome(
@@ -15595,12 +15778,33 @@ def maybe_upload_segment_files_source_transactions(
         temporary_key_id = temporary_key["id"]
         authentication_mode = "temporary_desktop_api_key"
 
+    cache_lookup_started = time.perf_counter()
+    if callable(status_callback):
+        status_callback(
+            f"Checking {len(rows)} prepared record(s) for safe cache reuse",
+            {
+                "timing_event": "batch_cache_lookup_started",
+                "prepared_records": len(rows),
+                "source_window_total": len(grouped),
+            },
+        )
     reusable_payloads = upload_plan_rows_to_expected_payloads(rows)
     reusable_locations = find_reusable_cached_document_locations(
         storage_dir,
         reusable_payloads,
         folder_names=[row.get("_anythingllm_folder_name") or folder_name for row in rows],
     )
+    if callable(status_callback):
+        status_callback(
+            f"Cache check complete: {sum(bool(location) for location in reusable_locations)} reusable record(s)",
+            {
+                "timing_event": "batch_cache_lookup_completed",
+                "prepared_records": len(rows),
+                "reusable_records": sum(bool(location) for location in reusable_locations),
+                "lookup_elapsed_seconds": round(time.perf_counter() - cache_lookup_started, 3),
+                "source_window_total": len(grouped),
+            },
+        )
     reusable_by_identity = {
         (str(row.get("_automatic_source_path") or ""), str(row.get("chunkSource") or "")): location
         for row, location in zip(rows, reusable_locations)
@@ -15635,24 +15839,52 @@ def maybe_upload_segment_files_source_transactions(
         Path(embedding_ledger_path).with_name("source-transaction-ledger.json")
         if embedding_ledger_path else None
     )
+    transaction_event_path = (
+        transaction_ledger_path.with_name("source-transaction-events.jsonl")
+        if transaction_ledger_path else None
+    )
 
-    def persist_transactions():
-        if transaction_ledger_path:
-            write_json(transaction_ledger_path, {
-                "workspace_slug": workspace_slug,
-                "run_id": run_id,
-                "transaction_count": len(grouped),
-                "transactions": aggregate["source_transactions"],
-                "stopped_after_source_transaction": aggregate.get("stopped_after_source_transaction"),
-                "stop_reason": aggregate.get("stop_reason", ""),
-            })
-        _write_embedding_batch_ledger(
-            embedding_ledger_path,
-            workspace_slug,
-            aggregate["embedding_update"],
-        )
+    def persist_transactions(
+        transaction=None,
+        *,
+        finalize_snapshot=False,
+        include_aggregate_embedding=False,
+    ):
+        if transaction_event_path and isinstance(transaction, dict):
+            append_source_transaction_event(
+                transaction_event_path,
+                transaction,
+                stopped_after_source_transaction=aggregate.get("stopped_after_source_transaction"),
+                stop_reason=aggregate.get("stop_reason", ""),
+            )
+        if transaction_ledger_path and finalize_snapshot:
+            finalize_source_transaction_journal(
+                transaction_ledger_path,
+                workspace_slug=workspace_slug,
+                run_id=run_id,
+                transaction_count=len(grouped),
+                transactions=aggregate["source_transactions"],
+                stopped_after_source_transaction=aggregate.get("stopped_after_source_transaction"),
+                stop_reason=aggregate.get("stop_reason", ""),
+            )
+        if include_aggregate_embedding:
+            _write_embedding_batch_ledger(
+                embedding_ledger_path,
+                workspace_slug,
+                aggregate["embedding_update"],
+            )
 
     try:
+        if transaction_ledger_path:
+            # Publish the recovery contract before the first source event.
+            # Keep this inside the existing temporary-key cleanup boundary:
+            # a local disk failure must not leak an ephemeral Desktop key.
+            initialize_source_transaction_journal(
+                transaction_ledger_path,
+                workspace_slug=workspace_slug,
+                run_id=run_id,
+                transaction_count=len(grouped),
+            )
         for source_index, group in enumerate(grouped, start=1):
             source_path = str(group["source_path"] or "")
             source_name = Path(source_path).name if source_path else f"PDF {source_index}"
@@ -15689,7 +15921,10 @@ def maybe_upload_segment_files_source_transactions(
                 "mutation_scope": "current_source",
             }
             aggregate["source_transactions"].append(transaction)
-            persist_transactions()
+            # The source-transaction ledger is the durable ownership record at
+            # this boundary. The aggregate embedding ledger has not changed
+            # yet, so rewriting its growing batch/event arrays is pure I/O.
+            persist_transactions(transaction)
 
             def source_status(message, report, *, _index=source_index, _name=source_name):
                 if callable(status_callback):
@@ -15706,7 +15941,7 @@ def maybe_upload_segment_files_source_transactions(
                     )
 
             transaction["state"] = "attachment_intent_durable"
-            persist_transactions()
+            persist_transactions(transaction)
             source_ledger = (
                 Path(embedding_ledger_path).parent
                 / "source-transactions"
@@ -15799,12 +16034,12 @@ def maybe_upload_segment_files_source_transactions(
             )
             if child_status in {"complete", "complete_with_key_cleanup_warning"}:
                 transaction["state"] = "exact_vectors_proven"
-                persist_transactions()
+                persist_transactions(transaction)
                 continue
             if may_continue:
                 transaction["state"] = "source_rejected_without_remote_mutation"
                 transaction["later_sources_released"] = True
-                persist_transactions()
+                persist_transactions(transaction)
                 continue
             transaction["state"] = (
                 "ambiguous_external_mutation_held"
@@ -15814,7 +16049,7 @@ def maybe_upload_segment_files_source_transactions(
             transaction["later_sources_released"] = False
             aggregate["stopped_after_source_transaction"] = source_index
             aggregate["stop_reason"] = transaction["state"]
-            persist_transactions()
+            persist_transactions(transaction)
             break
     finally:
         if temporary_key_id:
@@ -15831,7 +16066,7 @@ def maybe_upload_segment_files_source_transactions(
         aggregate["status"] = "complete_with_key_cleanup_warning"
     else:
         aggregate["status"] = "complete"
-    persist_transactions()
+    persist_transactions(finalize_snapshot=True, include_aggregate_embedding=True)
     return aggregate
 
 
@@ -19030,13 +19265,24 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 active_unstructured["resolved"] if backend == "unstructured" else ""
             )
 
-            def report_backend_page_progress(completed, total):
+            def report_backend_page_progress(completed, total, activity=None):
                 page_total = max(1, int(total or known_pages))
                 aggregate_total = max(1, page_total * max(1, len(backend_names)))
                 aggregate_completed = backend_index * page_total + min(page_total, max(0, int(completed or 0)))
+                active_pages = [
+                    int(row.get("page") or 0)
+                    for row in ((activity or {}).get("active_pages") or [])
+                    if int(row.get("page") or 0) > 0
+                ]
+                activity_suffix = (
+                    "; worker alive on PDF page"
+                    + ("s " if len(active_pages) != 1 else " ")
+                    + ", ".join(str(page) for page in active_pages)
+                    if active_pages else ""
+                )
                 report_upload_phase(
                     "extraction",
-                    f"{extraction_label}: {min(page_total, max(0, int(completed or 0)))}/{page_total} pages processed",
+                    f"{extraction_label}: {min(page_total, max(0, int(completed or 0)))}/{page_total} pages processed{activity_suffix}",
                     completed_units=aggregate_completed,
                     total_units=aggregate_total,
                     fallback_fraction=aggregate_completed / aggregate_total,

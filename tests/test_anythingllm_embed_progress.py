@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -129,6 +130,51 @@ def test_cached_reuse_respects_requested_document_folder_layout(tmp_path):
     assert find_reusable_cached_document_locations(
         tmp_path, [payload], folder_names=["custom-documents/nested"]
     ) == [location]
+
+
+def test_cached_reuse_uses_desktop_index_and_ignores_unattached_orphan(tmp_path):
+    location = "custom-documents/indexed-page-parent.json"
+    orphan_location = "custom-documents/orphan-page-parent.json"
+    document = {
+        "pageContent": "Exact indexed text.",
+        "title": "Example title",
+        "docAuthor": "Example author",
+        "description": "PDF page: 1.",
+        "docSource": "local-pdf://sha256/indexed",
+        "chunkSource": "page-parent://indexed-p0001",
+    }
+    documents_root = tmp_path / "documents"
+    for candidate_location in (location, orphan_location):
+        path = documents_root / candidate_location
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(document), encoding="utf-8")
+    cache_dir = tmp_path / "vector-cache"
+    cache_dir.mkdir()
+    for candidate_location in (location, orphan_location):
+        (cache_dir / f"{uuid.uuid5(uuid.NAMESPACE_URL, candidate_location)}.json").write_text(
+            "[]", encoding="utf-8"
+        )
+    con = sqlite3.connect(tmp_path / "anythingllm.db")
+    try:
+        con.execute("create table workspace_documents (docpath text, metadata text)")
+        con.execute(
+            "insert into workspace_documents (docpath, metadata) values (?, ?)",
+            (location, json.dumps({"chunkSource": document["chunkSource"]})),
+        )
+        con.commit()
+    finally:
+        con.close()
+    payload = {
+        "textContent": document["pageContent"],
+        "metadata": {
+            key: document[key]
+            for key in ("title", "docAuthor", "description", "docSource", "chunkSource")
+        },
+    }
+
+    # The attached Desktop index gives one bounded candidate. The identical
+    # orphan does not trigger a recursive full-store recovery scan.
+    assert find_reusable_cached_document_locations(tmp_path, [payload]) == [location]
 
 
 def test_progress_listener_filters_unrelated_workspace_queue_events():

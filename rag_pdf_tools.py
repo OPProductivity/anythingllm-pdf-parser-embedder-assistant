@@ -25,9 +25,11 @@ import site
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections import defaultdict
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, as_completed, wait
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures.process import BrokenProcessPool
 from functools import lru_cache
 from multiprocessing import get_context
 from pathlib import Path
@@ -42,6 +44,12 @@ except ImportError:
 PYMUPDF4LLM_OCR_DPI = 200
 PYMUPDF4LLM_OCR_PAGE_WORKERS_DEFAULT = 4
 PYMUPDF4LLM_OCR_PAGE_WORKERS_MAX = 4
+# This is a worker-liveness lease, not a page-processing deadline. A healthy
+# worker refreshes its current page/phase while PyMuPDF4LLM is running and may
+# take arbitrarily long. Retirement is allowed only when even that independent
+# liveness thread has stopped for a sustained interval.
+PYMUPDF4LLM_WORKER_HEARTBEAT_SECONDS = 5.0
+PYMUPDF4LLM_WORKER_STALE_HEARTBEAT_SECONDS = 90.0
 UNSTRUCTURED_OCR_PAGE_WORKERS_DEFAULT = 2
 UNSTRUCTURED_OCR_PAGE_WORKERS_MAX = 4
 # A page-level timeout prevents one broken OCR/layout-model invocation from
@@ -699,9 +707,25 @@ def save_unstructured_ocr_cache(
             "element_rows": element_rows,
             "written_at": time.time(),
         }
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        os.replace(temporary, path)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temporary = Path(handle.name)
+                handle.write(json.dumps(payload, ensure_ascii=False))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+            temporary = None
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
         return str(path)
     except (OSError, TypeError, ValueError):
         return ""
@@ -721,6 +745,63 @@ def _pymupdf4llm_one_page(pdf_path_text: str, page_index: int, ocr_dpi: int | No
     return {"page": page_index + 1, "text": text, "kind": "markdown_page"}
 
 
+class Pymupdf4llmWorkerIsolationError(RuntimeError):
+    """An isolated native page worker cannot be safely replayed in its parent."""
+
+
+class Pymupdf4llmWorkerUnresponsiveError(Pymupdf4llmWorkerIsolationError):
+    """An isolated page worker stopped reporting liveness, not merely speed."""
+
+
+def _pymupdf4llm_one_page_observed(
+    pdf_path_text: str,
+    page_index: int,
+    ocr_dpi: int | None,
+    activity_path_text: str,
+):
+    """Run one page while independently reporting its exact active phase."""
+    activity_path = Path(activity_path_text)
+    stop = threading.Event()
+    write_lock = threading.Lock()
+
+    def write_activity(phase):
+        payload = {
+            "pid": os.getpid(),
+            "page": page_index + 1,
+            "phase": str(phase),
+            "updated_at_epoch": time.time(),
+        }
+        with write_lock:
+            temporary = activity_path.with_suffix(f".{os.getpid()}.tmp")
+            temporary.write_text(json.dumps(payload), encoding="utf-8")
+            os.replace(temporary, activity_path)
+
+    write_activity("starting_page_backend")
+
+    def heartbeat():
+        while not stop.wait(PYMUPDF4LLM_WORKER_HEARTBEAT_SECONDS):
+            try:
+                write_activity("extracting_page_with_pymupdf4llm")
+            except OSError:
+                # The result/exception remains authoritative. A transient
+                # activity-file problem must not corrupt extracted text.
+                pass
+
+    thread = threading.Thread(
+        target=heartbeat,
+        name=f"pymupdf4llm-page-{page_index + 1}-activity",
+        daemon=True,
+    )
+    thread.start()
+    try:
+        result = _pymupdf4llm_one_page(pdf_path_text, page_index, ocr_dpi)
+        write_activity("page_complete")
+        return result
+    finally:
+        stop.set()
+        thread.join(timeout=1.0)
+
+
 def _parallel_pymupdf4llm_pages(
     pdf_path: Path,
     page_count: int,
@@ -728,17 +809,132 @@ def _parallel_pymupdf4llm_pages(
     worker_count: int,
     progress_callback=None,
 ):
-    """Extract ordered page text with isolated OCR processes, never threads."""
+    """Extract ordered pages with bounded, activity-observed process workers.
+
+    At most one page is queued per worker. There is deliberately no page or
+    document duration limit. A pool is retired only when a submitted worker
+    stops refreshing the independent activity record, which distinguishes a
+    slow page from an unresponsive native process.
+    """
     pages = []
-    with ProcessPoolExecutor(max_workers=min(worker_count, page_count)) as executor:
-        futures = {
-            executor.submit(_pymupdf4llm_one_page, str(pdf_path), page_index, ocr_dpi): page_index
-            for page_index in range(page_count)
-        }
-        for completed_count, future in enumerate(as_completed(futures), start=1):
-            pages.append(future.result())
+    active_workers = min(worker_count, page_count)
+    with tempfile.TemporaryDirectory(prefix="rag-pymupdf4llm-pages-") as activity_dir:
+        executor = ProcessPoolExecutor(
+            max_workers=active_workers,
+            mp_context=get_context("spawn"),
+        )
+        terminated = False
+        pending = {}
+        submitted_at = {}
+        activity_paths = {}
+        next_page_index = 0
+        last_activity_report = 0.0
+
+        def submit_next_page():
+            nonlocal next_page_index
+            page_index = next_page_index
+            activity_path = Path(activity_dir) / f"page-{page_index + 1:05d}.json"
+            future = executor.submit(
+                _pymupdf4llm_one_page_observed,
+                str(pdf_path),
+                page_index,
+                ocr_dpi,
+                str(activity_path),
+            )
+            pending[future] = page_index
+            submitted_at[future] = time.monotonic()
+            activity_paths[future] = activity_path
+            next_page_index += 1
+
+        try:
             if callable(progress_callback):
-                progress_callback(completed_count, page_count)
+                progress_callback(0, page_count)
+            while len(pending) < active_workers and next_page_index < page_count:
+                submit_next_page()
+            while pending:
+                done, _ = wait(set(pending), timeout=0.5, return_when=FIRST_COMPLETED)
+                for future in done:
+                    page_index = pending.pop(future)
+                    submitted_at.pop(future, None)
+                    activity_paths.pop(future, None)
+                    try:
+                        pages.append(future.result())
+                    except BrokenProcessPool as exc:
+                        _terminate_unstructured_executor(executor)
+                        terminated = True
+                        raise Pymupdf4llmWorkerIsolationError(
+                            f"The isolated PyMuPDF4LLM worker process stopped on PDF page "
+                            f"{page_index + 1}. The same native call was not replayed in the parent."
+                        ) from exc
+                    except Exception as exc:
+                        _terminate_unstructured_executor(executor)
+                        terminated = True
+                        raise RuntimeError(
+                            f"PyMuPDF4LLM failed for PDF page {page_index + 1}: "
+                            f"{type(exc).__name__}: {exc}"
+                        ) from exc
+                    if callable(progress_callback):
+                        progress_callback(len(pages), page_count)
+                    while len(pending) < active_workers and next_page_index < page_count:
+                        submit_next_page()
+
+                now_epoch = time.time()
+                now_monotonic = time.monotonic()
+                unresponsive = []
+                active_page_phases = []
+                for future, page_index in pending.items():
+                    path = activity_paths[future]
+                    last_activity = None
+                    try:
+                        activity = json.loads(path.read_text(encoding="utf-8"))
+                        last_activity = float(activity.get("updated_at_epoch") or 0.0)
+                        active_page_phases.append({
+                            "page": int(activity.get("page") or page_index + 1),
+                            "phase": str(activity.get("phase") or "working"),
+                        })
+                    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                        pass
+                    stale = (
+                        now_epoch - last_activity
+                        if last_activity
+                        else now_monotonic - submitted_at[future]
+                    )
+                    if stale > PYMUPDF4LLM_WORKER_STALE_HEARTBEAT_SECONDS:
+                        unresponsive.append(page_index + 1)
+                if (
+                    callable(progress_callback)
+                    and active_page_phases
+                    and now_monotonic - last_activity_report >= PYMUPDF4LLM_WORKER_HEARTBEAT_SECONDS
+                ):
+                    activity = {
+                        "active_pages": sorted(active_page_phases, key=lambda row: row["page"]),
+                        "liveness": "worker_heartbeats_current",
+                    }
+                    try:
+                        parameters = inspect.signature(progress_callback).parameters.values()
+                        accepts_activity = any(
+                            parameter.name == "activity"
+                            or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                            for parameter in parameters
+                        )
+                    except (TypeError, ValueError):
+                        accepts_activity = False
+                    if accepts_activity:
+                        progress_callback(len(pages), page_count, activity=activity)
+                    else:
+                        progress_callback(len(pages), page_count)
+                    last_activity_report = now_monotonic
+                if unresponsive:
+                    _terminate_unstructured_executor(executor)
+                    terminated = True
+                    raise Pymupdf4llmWorkerUnresponsiveError(
+                        "PyMuPDF4LLM page worker liveness stopped for PDF page(s) "
+                        + ", ".join(str(value) for value in sorted(unresponsive))
+                        + ". Only the isolated page-worker pool was terminated."
+                    )
+        finally:
+            if not terminated:
+                executor.shutdown(wait=True, cancel_futures=True)
     pages.sort(key=lambda row: int(row["page"]))
     expected_pages = list(range(1, page_count + 1))
     observed_pages = [int(row["page"]) for row in pages]
@@ -825,6 +1021,13 @@ def get_pages_with_pymupdf4llm(pdf_path: Path, progress_callback=None):
                     ),
                     source_page_count,
                 )
+            except Pymupdf4llmWorkerIsolationError:
+                # A liveness failure is not evidence that sequential execution
+                # is safe; a crashed or unresponsive native call could hang or
+                # terminate the owning worker if it were replayed there.
+                # Let Automatic compare another extractor, or surface the
+                # explicit-backend failure, without killing the parent tree.
+                raise
             except Exception as exc:
                 # Complete sequential extraction is safer than retaining a partly
                 # observed parallel result. The fallback is visible in background

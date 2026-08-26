@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
 import shutil
@@ -15,6 +16,7 @@ import time
 import urllib.error
 import urllib.request
 import webbrowser
+from contextlib import contextmanager
 from pathlib import Path
 
 from portable_paths import application_paths, ensure_application_directories, package_resource_path
@@ -29,6 +31,54 @@ BRIDGE_COMMAND_TIMEOUT_SECONDS = 120
 BROWSER_READY_TIMEOUT_SECONDS = 45
 BROWSER_READY_POLL_SECONDS = 0.15
 _SERVER_MARKER_WRITE_LOCK = threading.Lock()
+_SERVER_START_LOCK = threading.Lock()
+
+
+@contextmanager
+def _server_start_ownership_lock(port: int):
+    """Serialize the check-and-claim boundary across shortcut processes.
+
+    The marker's atomic write protects file integrity, but it cannot stop two
+    separate shortcut processes from both observing "no server" before either
+    writes it. A Windows named mutex is released by the kernel even if a
+    starter crashes, avoiding a stale lock-file failure mode.
+    """
+    if os.name != "nt":
+        with _SERVER_START_LOCK:
+            yield
+        return
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_mutex = kernel32.CreateMutexW
+    create_mutex.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+    create_mutex.restype = ctypes.c_void_p
+    wait_for_single = kernel32.WaitForSingleObject
+    wait_for_single.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    wait_for_single.restype = ctypes.c_uint32
+    release_mutex = kernel32.ReleaseMutex
+    release_mutex.argtypes = [ctypes.c_void_p]
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [ctypes.c_void_p]
+    name = f"Local\\AnythingLLMPdfAssistantStart-{int(port)}"
+    handle = create_mutex(None, False, name)
+    if not handle:
+        raise RuntimeError("Windows could not create the local server startup lock.")
+    acquired = False
+    try:
+        # Do not invent a second startup deadline here. The guarded preflight
+        # operations already have their own bounded calls, and Windows releases
+        # this kernel object automatically if the owning starter crashes.
+        # A duplicate shortcut invocation can therefore wait until it can read
+        # the first process's published marker instead of failing after an
+        # arbitrary 15-second race window.
+        result = wait_for_single(handle, 0xFFFFFFFF)  # INFINITE
+        if result not in (0x00000000, 0x00000080):  # OBJECT_0 or ABANDONED
+            raise RuntimeError("Another local server start is still being resolved.")
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            release_mutex(handle)
+        close_handle(handle)
 
 
 def _port_is_available(port: int) -> bool:
@@ -472,17 +522,27 @@ def _start(port: int, browser: bool) -> int:
     # a process-creation command. If its owned server is already listening or
     # still completing startup, attach to that one rather than failing in a
     # hidden process where the person receives no feedback.
-    if _recorded_server_is_alive_on_port(port):
-        if browser:
-            # This short-lived command is itself launched by a desktop
-            # shortcut. Wait for its browser helper here: a daemon watcher
-            # would otherwise be discarded the moment this process returns.
-            watcher = _open_browser_when_local_app_is_ready(port)
-            watcher.join(BROWSER_READY_TIMEOUT_SECONDS + BROWSER_READY_POLL_SECONDS)
-        print(f"The owned local PDF assistant is already starting or serving at {_local_app_url(port)}")
-        return 0
+    try:
+        with _server_start_ownership_lock(port):
+            if _recorded_server_is_alive_on_port(port):
+                if browser:
+                    # This short-lived command is itself launched by a desktop
+                    # shortcut. Wait for its browser helper here: a daemon watcher
+                    # would otherwise be discarded the moment this process returns.
+                    watcher = _open_browser_when_local_app_is_ready(port)
+                    watcher.join(BROWSER_READY_TIMEOUT_SECONDS + BROWSER_READY_POLL_SECONDS)
+                print(f"The owned local PDF assistant is already starting or serving at {_local_app_url(port)}")
+                return 0
 
-    if _doctor(port, allow_owned_running_server=False) != 0:
+            if _doctor(port, allow_owned_running_server=False) != 0:
+                return 1
+            # Claim ownership before importing the large Gradio application.
+            # The cross-process lock covers the observation and publication as
+            # one transaction; after publication later starters can attach.
+            os.environ.setdefault(SERVER_ROOT_PID_ENV, str(os.getpid()))
+            marker = _write_server_marker(port)
+    except RuntimeError as exc:
+        print(f"Could not claim local server startup ownership: {exc}", file=sys.stderr)
         return 1
     # Shortcut creation belongs to install/repair, not to every launch. The
     # old per-start Desktop/PowerShell lookup added avoidable startup work and
@@ -491,8 +551,6 @@ def _start(port: int, browser: bool) -> int:
     # Desktop click can otherwise arrive during that import while neither a
     # listener nor a marker exists, causing two full servers to race for the
     # same port.
-    os.environ.setdefault(SERVER_ROOT_PID_ENV, str(os.getpid()))
-    marker = _write_server_marker(port)
     try:
         os.environ["GRADIO_SERVER_PORT"] = str(port)
         # This is a local document assistant.  Opening the browser is only a

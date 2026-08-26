@@ -25,7 +25,9 @@ from typing import Any
 
 from auto_anythingllm_pipeline import (
     append_jsonl_receipt,
+    classify_anythingllm_mutation_outcome,
     get_json,
+    mutation_outcome_receipt_state,
     post_json,
     record_submission_receipt,
 )
@@ -409,11 +411,36 @@ def run_transport_fault_acceptance(output_root: str | Path) -> dict[str, Any]:
                 1 for row in journal_rows if row.get("event") == "vector_observation"
             ),
         })
+    classifier_checks = {
+        str(status): mutation_outcome_receipt_state(
+            classify_anythingllm_mutation_outcome(
+                stage="fault_acceptance",
+                status=status,
+                response_text="synthetic loopback response",
+            )
+        ) == expected
+        for status, expected in (
+            (422, "rejected"),
+            (401, "global_hold"),
+            (429, "global_hold"),
+            (500, "submission_unknown"),
+        )
+    }
     report = {
         "schema": SCHEMA,
         "generated_at": datetime.now(UTC).isoformat(),
-        "status": "pass" if all(row["status"] == "pass" for row in results) else "fail",
+        "status": "pass" if (
+            all(row["status"] == "pass" for row in results)
+            and all(classifier_checks.values())
+        ) else "fail",
+        "scope": "loopback_transport_recovery_and_production_classifier",
+        "not_covered": [
+            "gradio_event_chains",
+            "real_anythingllm_desktop_mutation",
+            "provider_embedding_queue",
+        ],
         "scenario_count": len(results),
+        "production_classifier_checks": classifier_checks,
         "results": results,
     }
     atomic_write_json(root / "transport-fault-acceptance-report.json", report)

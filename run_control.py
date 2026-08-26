@@ -145,8 +145,23 @@ class RunRecorder:
         payload["event"] = event
         payload["persisted_at"] = utc_now()
         atomic_write_json(self.checkpoint_path, payload)
+        # ``run-checkpoint.json`` is the authoritative resumable snapshot.
+        # Repeating that entire, ever-growing object in JSONL made diagnostic
+        # history quadratic for large documents (large evidence blobs were
+        # copied once per stage transition). Keep the event stream durable but
+        # store only the transition and a compact stage-status index.
+        event_payload = {
+            "schema_version": 2,
+            "run_id": self.result.run_id,
+            "event": event,
+            "persisted_at": payload["persisted_at"],
+            "status": self.result.status,
+            "stage_statuses": {
+                name: stage.status for name, stage in self.result.stages.items()
+            },
+        }
         with self.event_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            handle.write(json.dumps(event_payload, ensure_ascii=False) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
 

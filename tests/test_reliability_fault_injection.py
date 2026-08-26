@@ -11,6 +11,8 @@ def test_loopback_transport_fault_matrix_preserves_request_and_replay_invariants
 
     assert report["status"] == "pass"
     assert report["scenario_count"] == 5
+    assert report["scope"] == "loopback_transport_recovery_and_production_classifier"
+    assert all(report["production_classifier_checks"].values())
     by_name = {row["scenario"]: row for row in report["results"]}
     assert by_name["definite_rejection_then_success"]["request_sources"] == [1, 2]
     assert by_name["lost_response_after_acceptance"]["request_sources"] == [1]

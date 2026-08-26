@@ -212,7 +212,7 @@ def test_pdf_picker_exposes_only_the_native_pdf_accept_filter(page, local_app_ur
 def test_new_workspace_name_field_enforces_the_creation_length_limit(page, local_app_url):
     page.goto(local_app_url)
     workspace_name = page.get_by_placeholder(
-        "Choose a PDF to derive a safe name, or type your own",
+        "Optional: type a name, or leave blank to derive one after Confirm",
         exact=True,
     )
 
@@ -293,6 +293,36 @@ def test_multiple_pdf_selection_keeps_both_files_in_the_pending_batch(page, loca
     expect(page.get_by_role("button", name="Remove this file")).to_have_count(2)
 
 
+def test_multiple_pdf_transfer_lists_every_selected_name_before_local_copy_finishes(
+    page, local_app_url, two_pdf_files
+):
+    """Do not present the localhost transfer as partial PDF processing."""
+    page.goto(local_app_url)
+    upload = page.locator("#automatic-pdf-upload input[type='file']")
+    expect(upload).to_have_count(1, timeout=15000)
+    first_frame = page.evaluate(
+        """async () => {
+          const input = document.querySelector("#automatic-pdf-upload input[type='file']");
+          const transfer = new DataTransfer();
+          const payload = new Uint8Array(16 * 1024 * 1024);
+          transfer.items.add(new File([payload], "browser-first.pdf", {type: "application/pdf"}));
+          transfer.items.add(new File([payload], "browser-second.pdf", {type: "application/pdf"}));
+          input.files = transfer.files;
+          input.dispatchEvent(new Event("change", {bubbles: true}));
+          await new Promise(requestAnimationFrame);
+          const root = document.querySelector("#automatic-pdf-upload");
+          return {
+            pendingText: root.querySelector(".rag-pending-pdf-list")?.textContent || "",
+            rootText: root.textContent || "",
+          };
+        }"""
+    )
+    assert "Adding 2 files" in first_frame["pendingText"]
+    for path in two_pdf_files:
+        assert path.name in first_frame["pendingText"]
+    assert "Uploading 2 files" not in first_frame["rootText"]
+
+
 def test_six_pdf_selection_keeps_every_file_in_the_pending_batch(page, local_app_url, six_pdf_files):
     """The ordinary picker must not truncate a six-file selection before Confirm."""
     page.goto(local_app_url)
@@ -316,6 +346,8 @@ def test_six_pdf_local_batch_prepares_every_selected_source(page, local_app_url,
     expect(confirm).to_be_enabled(timeout=20000)
     page.get_by_role("radio", name="Create local files only").check()
     confirm.click()
+    live_confirm = page.locator("#confirm-automatic-run-button")
+    expect(live_confirm).to_have_text("Processing…", timeout=500)
 
     # The terminal status is outside the collapsed downloads section and is
     # therefore the durable user-visible completion signal for every source.

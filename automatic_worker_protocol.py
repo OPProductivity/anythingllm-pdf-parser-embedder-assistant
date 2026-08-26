@@ -16,6 +16,7 @@ AUTOMATIC_WORKER_TRANSPORT_ARTIFACTS = (
     ".automatic-worker-config.json",
     ".automatic-worker-events.jsonl",
     ".automatic-worker-result.json",
+    ".automatic-worker-stderr.log",
 )
 
 # This is the complete data-only namespace built for the active Automatic
