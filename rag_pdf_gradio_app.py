@@ -16799,9 +16799,10 @@ def observe_batch_queue_forecast(
     window. Treating that value as the remainder of a multi-PDF run caused a
     severe early underprediction, followed by repeated upward corrections as
     later windows appeared. This accumulator keeps the existing source-window
-    contract and classic prior: it combines completed records across observed
-    windows, assumes every unobserved prepared record is still pending, and
-    lets live evidence influence at most 65% of the per-record cost.
+    contract and classic prior. Before the shared cache lookup completes,
+    every unobserved prepared record remains pending at the classic prior.
+    After that exact batch-wide lookup, live provider cadence applies only to
+    the proved-fresh remainder, never to records already proved cache-backed.
     """
     state = context if isinstance(context, dict) else {}
     report = report if isinstance(report, dict) else {}
@@ -16843,7 +16844,18 @@ def observe_batch_queue_forecast(
         int(state.get("prepared_records") or 0),
         max(0, int(initial_estimated_records or 0)),
     )
-    remaining_records = max(0, prepared_records - completed_records)
+    batch_cache_plan_observed = bool(state.get("batch_cache_plan_observed"))
+    if batch_cache_plan_observed:
+        known_fresh_records = min(
+            prepared_records,
+            max(0, int(state.get("batch_fresh_records") or 0)),
+        )
+        remaining_records = max(0, known_fresh_records - completed_records)
+        cache_unknown_records = 0
+    else:
+        known_fresh_records = 0
+        remaining_records = max(0, prepared_records - completed_records)
+        cache_unknown_records = remaining_records
     observed_seconds_per_record = observed_active_seconds / completed_records
     prior_seconds_per_record = max(0.1, float(provider_request_seconds_prior or 0.0))
     # The prior remains the majority vote during the first few records. With
@@ -16872,12 +16884,47 @@ def observe_batch_queue_forecast(
         "prepared_records": prepared_records,
         "completed_records": completed_records,
         "remaining_records": remaining_records,
+        "batch_cache_plan_observed": batch_cache_plan_observed,
+        "known_fresh_records": known_fresh_records,
+        "cache_unknown_records": cache_unknown_records,
         "observed_windows": len(window_observations),
         "observed_seconds_per_record": round(observed_seconds_per_record, 4),
         "prior_seconds_per_record": round(prior_seconds_per_record, 4),
         "blended_seconds_per_record": round(blended_seconds_per_record, 4),
         "evidence_weight": round(evidence_weight, 4),
         "remaining_source_windows": remaining_source_windows,
+    }
+
+
+def observe_batch_prequeue_cache_plan(context, report):
+    """Persist the coordinator's exact batch-wide cache classification.
+
+    The multi-source coordinator already performs one shared reusable-location
+    scan before opening any per-PDF mutation window. This changes no upload
+    decision: source-local snapshots remain the final pre-mutation verification
+    for each PDF.
+    """
+    state = context if isinstance(context, dict) else {}
+    report = report if isinstance(report, dict) else {}
+    prepared_records = max(0, int(report.get("prepared_records") or 0))
+    cached_records = min(
+        prepared_records,
+        max(0, int(report.get("reusable_records") or 0)),
+    )
+    fresh_records = max(0, prepared_records - cached_records)
+    source_total = max(0, int(report.get("source_window_total") or 0))
+    state.update({
+        "batch_cache_plan_observed": True,
+        "prepared_records": prepared_records,
+        "batch_cached_records": cached_records,
+        "batch_fresh_records": fresh_records,
+        "batch_source_total": source_total,
+    })
+    return {
+        "prepared_records": prepared_records,
+        "cached_records": cached_records,
+        "fresh_records": fresh_records,
+        "source_total": source_total,
     }
 
 
@@ -23473,6 +23520,10 @@ def run_automatic(
     # still report progress without using a mixed rate to reprice the ETA; a
     # later proven fresh-only source window may use its own clean queue rate.
     cache_plan_context = {
+        "batch_cache_plan_observed": False,
+        "batch_cached_records": 0,
+        "batch_fresh_records": 0,
+        "batch_source_total": 0,
         "exact_snapshot_observed": False,
         "suppress_combined_queue_rate": False,
         "queue_records": 0,
@@ -24804,6 +24855,45 @@ def run_automatic(
             ) * evidence_fraction
             eta_reprice_reason = ""
             if (
+                timing_event == "batch_cache_lookup_completed"
+                and desktop_serial_queue
+            ):
+                batch_cache_observation = observe_batch_prequeue_cache_plan(
+                    cache_plan_context,
+                    report,
+                )
+                prepared_records = batch_cache_observation["prepared_records"]
+                cached_records = batch_cache_observation["cached_records"]
+                fresh_records = batch_cache_observation["fresh_records"]
+                source_total = batch_cache_observation["source_total"]
+                if prepared_records and cached_records:
+                    elapsed = max(0.0, time.perf_counter() - started_at)
+                    repriced_expected = confirmed_prequeue_cache_eta_seconds(
+                        expected_seconds,
+                        elapsed,
+                        fresh_provider_requests=fresh_records,
+                        provider_request_seconds=timing_unit_prior,
+                        features=timing_features,
+                        cached_attachment_records=cached_records,
+                        remaining_source_windows=source_total,
+                        cache_attachment_prior=cache_attachment_prior,
+                    )
+                    if repriced_expected + 5 < int(expected_seconds):
+                        previous_expected_seconds = int(expected_seconds)
+                        expected_seconds = repriced_expected
+                        run_timing_estimate["expected_seconds"] = expected_seconds
+                        run_timing_estimate["confirmed_batch_cache_reprice"] = {
+                            "prepared_records": prepared_records,
+                            "cached_provider_requests": cached_records,
+                            "fresh_provider_requests": fresh_records,
+                            "remaining_source_windows": source_total,
+                            "provider_request_seconds_prior": round(timing_unit_prior, 3),
+                            "cached_attachment_tail_prior": dict(cache_attachment_prior),
+                            "previous_expected_seconds": previous_expected_seconds,
+                            "expected_seconds": expected_seconds,
+                        }
+                        eta_reprice_reason = "confirmed_batch_cache_plan"
+            if (
                 timing_event == "prequeue_cache_snapshot"
                 and desktop_serial_queue
             ):
@@ -24828,7 +24918,11 @@ def run_automatic(
                 # classic estimate untouched. Any proved cache hit may remove
                 # only its own provider allowance and substitutes a measured,
                 # conservative attachment/source-window cost.
-                if queue_records and cached_records:
+                if (
+                    queue_records
+                    and cached_records
+                    and not cache_plan_context.get("batch_cache_plan_observed")
+                ):
                     elapsed = max(0.0, time.perf_counter() - started_at)
                     repriced_expected = confirmed_prequeue_cache_eta_seconds(
                         expected_seconds,

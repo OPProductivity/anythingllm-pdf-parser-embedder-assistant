@@ -4383,6 +4383,43 @@ class PipelineCoreTests(unittest.TestCase):
         # collapsing the whole run to roughly elapsed + eight seconds.
         self.assertGreater(forecast["forecast_seconds"], 2_500)
 
+    def test_batch_queue_forecast_does_not_price_proved_cache_as_provider_work(self):
+        import rag_pdf_gradio_app as app
+
+        context = {"prepared_records": 1_727}
+        plan = app.observe_batch_prequeue_cache_plan(
+            context,
+            {
+                "prepared_records": 1_727,
+                "reusable_records": 1_217,
+                "source_window_total": 36,
+            },
+        )
+        forecast = app.observe_batch_queue_forecast(
+            context,
+            {
+                "source_path": "slow-fresh.pdf",
+                "source_window_index": 18,
+                "source_window_total": 36,
+                "queue_records": 95,
+                "desktop_queue_completed": 95,
+                "desktop_queue_records_per_minute": 20.243,
+            },
+            elapsed_seconds=982.0,
+            provider_request_seconds_prior=3.0,
+            initial_estimated_records=615,
+        )
+
+        self.assertEqual(plan["cached_records"], 1_217)
+        self.assertEqual(plan["fresh_records"], 510)
+        self.assertTrue(forecast["batch_cache_plan_observed"])
+        self.assertEqual(forecast["known_fresh_records"], 510)
+        self.assertEqual(forecast["remaining_records"], 415)
+        self.assertEqual(forecast["cache_unknown_records"], 0)
+        # The former arithmetic treated all 1,632 not-yet-counted records as
+        # provider work and could forecast more than 3,200 seconds.
+        self.assertLess(forecast["forecast_seconds"], 2_500)
+
     def test_batch_queue_forecast_aggregates_windows_without_double_counting_callbacks(self):
         import rag_pdf_gradio_app as app
 
