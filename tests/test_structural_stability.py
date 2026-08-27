@@ -1,6 +1,7 @@
 import json
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -185,6 +186,187 @@ def test_concurrent_workspace_identity_callbacks_share_one_inspection(tmp_path):
     assert all(not worker.is_alive() for worker in workers)
     assert [result["label"] for result in results] == ["Author", "Author"]
     assert read_metadata.call_count == 1
+
+
+def test_title_adjacent_author_is_trusted_but_one_word_style_markers_are_not():
+    trusted = pipeline.infer_author_from_text_samples(
+        [{"page": 1, "text": "Visual Pleasure and Narrative Cinema\nLaura Mulvey\nI\nIntroduction\n"}],
+        title_hint="Visual Pleasure and Narrative Cinema",
+    )
+    assert trusted["author"] == "Laura Mulvey"
+    assert trusted["source"] == "text_title_adjacent_byline"
+
+    marker = pipeline.infer_author_from_text_samples(
+        [{"page": 1, "text": "A Sample Article\nBold\nIntroduction\n"}],
+        title_hint="A Sample Article",
+    )
+    assert marker.get("author") in {None, ""}
+
+
+def test_catalog_filename_author_cues_are_delimited_not_first_word_guesses():
+    cases = {
+        "LúciaNagib_2011_Chapter7THESELF.pdf": ("Lúcia Nagib", "filename_compact_name_before_year"),
+        "Jennifer L Fleissner Chapter 2 The Great Outdoors.pdf": ("Jennifer L Fleissner", "filename_name_before_section_label"),
+        "WARTENBERG-2023.pdf": ("Wartenberg", "filename_surname_before_year"),
+    }
+    for filename, expected in cases.items():
+        report = pipeline.infer_author_from_filename(Path(filename), title_hint="")
+        assert (report["author"], report["source"]) == expected
+    assert not pipeline.infer_author_from_filename(Path("Politics of Virtue.pdf"))["author"]
+    assert not pipeline.infer_author_from_filename(Path("Carnal_Thoughts.pdf"))["author"]
+
+
+def test_grouped_queue_cadence_does_not_use_the_slowest_source_window(tmp_path):
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    ledger = {
+        "batches": [
+            {
+                "requested": 100,
+                "searchability_proven": True,
+                "verification": {"desktop_queue_observer": {
+                    "desktop_queue_records_per_minute": rate,
+                    "desktop_queue_completed": 100,
+                    "desktop_queue_observer_state": "connected",
+                }},
+            }
+            for rate in (60.0, 6.0)
+        ]
+    }
+    (run_root / "batch-embedding-ledger.json").write_text(json.dumps(ledger), encoding="utf-8")
+    row = {
+        "run_key": str(run_root),
+        "mode": app.MODE_NATIVE_UPLOAD_LABEL,
+        "embedding_submission_strategy": "desktop_queue",
+        "actual_records": 200,
+        "actual_seconds": 300,
+        "cached_attachment_reused_records": 0,
+    }
+    cadence = app.timing_model_desktop_queue_cadence(row)
+    assert cadence["basis"] == "whole_run_upper_bound_for_grouped_source_windows"
+    assert cadence["seconds_per_record"] == 1.5
+    assert cadence["records_per_minute"] == 40.0
+
+
+def test_large_batch_learned_multiplier_ignores_small_run_ratios():
+    profile = {
+        "documents": 17,
+        "page_count": 900,
+        "mean_chars_per_page": 3_200,
+        "text_density_bucket": "high",
+        "layout_bucket": "text_first",
+        "ocr_risk_bucket": "low",
+        "line_density_bucket": "medium",
+        "page_variability_bucket": "mixed",
+        "file_size_bucket": "medium",
+    }
+    arguments = (
+        [f"source-{index}.pdf" for index in range(17)],
+        app.MODE_NATIVE_UPLOAD_LABEL,
+        app.NATIVE_UPLOAD_SCOPE_ALL_LABEL,
+    )
+    keywords = {
+        "segment_mode": app.SEGMENT_PAGE_LIMIT_LABEL,
+        "chunk_size": 8191,
+        "chunk_overlap": 20,
+        "target_passage_length": 750,
+        "backend_mode": "Automatic",
+    }
+    with (
+        mock.patch.object(app, "automatic_timing_document_profile", return_value=profile),
+        mock.patch.object(app, "hydrated_timing_model_history", return_value=[]),
+        mock.patch.object(
+            app,
+            "timing_stage_prior_seconds",
+            return_value=(0.0, 0, "conservative unmeasured phase prior"),
+        ),
+    ):
+        baseline = app.estimate_automatic_run(*arguments, **keywords)
+
+    small_slow_run = {
+        **baseline["features"],
+        "source": "automatic-run",
+        "state": "successful",
+        "duration_provenance": "active_observation_window",
+        "timing_formula_revision": app.TIMING_MODEL_FORMULA_REVISION,
+        "run_key": "C:/real-runs/small-slow-run",
+        "document_count": 2,
+        "actual_records": 100,
+        "estimated_records": 100,
+        "actual_seconds": float(baseline["expected_seconds"]) * 4.0,
+    }
+    with (
+        mock.patch.object(app, "automatic_timing_document_profile", return_value=profile),
+        mock.patch.object(app, "hydrated_timing_model_history", return_value=[small_slow_run]),
+        mock.patch.object(
+            app,
+            "timing_stage_prior_seconds",
+            return_value=(0.0, 0, "conservative unmeasured phase prior"),
+        ),
+    ):
+        estimate = app.estimate_automatic_run(*arguments, **keywords)
+
+    assert estimate["expected_seconds"] == baseline["expected_seconds"]
+    assert estimate["comparable_runs"] == 0
+
+
+def test_desktop_timing_topology_distinguishes_source_windows_from_legacy_shared_batch(tmp_path):
+    common = {
+        "mode": app.MODE_NATIVE_UPLOAD_LABEL,
+        "embedding_submission_strategy": "desktop_queue",
+        "document_count": 2,
+    }
+    legacy_root = tmp_path / "legacy"
+    legacy_root.mkdir()
+    assert app.timing_model_desktop_queue_topology({
+        **common,
+        "run_key": str(legacy_root),
+    }) == app.DESKTOP_QUEUE_TOPOLOGY_LEGACY_SHARED
+
+    window_root = tmp_path / "windows"
+    window_root.mkdir()
+    (window_root / "source-transaction-ledger.json").write_text(
+        json.dumps({"transactions": [{"state": "exact_vectors_proven"}, {"state": "exact_vectors_proven"}]}),
+        encoding="utf-8",
+    )
+    assert app.timing_model_desktop_queue_topology({
+        **common,
+        "run_key": str(window_root),
+    }) == app.DESKTOP_QUEUE_TOPOLOGY_SOURCE_WINDOWS
+
+
+def test_small_desktop_multiplier_requires_matching_scale_and_queue_topology():
+    target = {
+        "mode": app.MODE_NATIVE_UPLOAD_LABEL,
+        "embedding_submission_strategy": "desktop_queue",
+        "desktop_queue_topology": app.DESKTOP_QUEUE_TOPOLOGY_SOURCE_WINDOWS,
+        "document_count": 4,
+        "estimated_records": 44,
+        "ocr_preflight_likely_pages": 0,
+    }
+    matching = {
+        **target,
+        "actual_records": 40,
+    }
+    assert app.timing_model_multiplier_observation_comparable(target, matching)
+    assert not app.timing_model_multiplier_observation_comparable(target, {
+        **matching,
+        "desktop_queue_topology": app.DESKTOP_QUEUE_TOPOLOGY_LEGACY_SHARED,
+    })
+    # OCR preparation does not partition the Desktop queue-rate regime. A slow
+    # current-topology OCR run may still be valid evidence for provider delay.
+    assert app.timing_model_multiplier_observation_comparable(target, {
+        **matching,
+        "ocr_used": True,
+    })
+    assert not app.timing_model_multiplier_observation_comparable(target, {
+        **matching,
+        "actual_records": 100,
+    })
+    assert not app.timing_model_multiplier_observation_comparable(target, {
+        **matching,
+        "document_count": 9,
+    })
 
 
 def test_stale_selection_finish_cannot_authorize_a_newer_file_set():

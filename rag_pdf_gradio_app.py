@@ -337,6 +337,9 @@ DESKTOP_REFRESH_BRIDGE_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{43}\Z")
 # diagnosis but cannot discard an unsent chat draft.
 DESKTOP_REFRESH_BRIDGE_REQUIRED_DRAFT_GUARD_VERSION = 2
 DESKTOP_SERIAL_PROVIDER_REQUEST_PROTOCOL_REVISION = "desktop-page-parent-serial-v2"
+DESKTOP_QUEUE_TOPOLOGY_SINGLE_SOURCE = "single_pdf_source"
+DESKTOP_QUEUE_TOPOLOGY_SOURCE_WINDOWS = "sequential_pdf_source_windows_v1"
+DESKTOP_QUEUE_TOPOLOGY_LEGACY_SHARED = "legacy_shared_multi_pdf_request"
 # The internal Desktop profiler measured a 25-page native-text run at a 2.29 s
 # mean and 1.42 s median per page-parent namespace operation, with substantial
 # provider-tail variance. Use a small conservative first-run allowance until a
@@ -5110,6 +5113,7 @@ _WORKSPACE_PERSON_EVIDENCE_SOURCES = frozenset({
     "text_stacked_affiliated_byline",
     "text_bibliographic_byline",
     "text_compact_caps_byline",
+    "text_title_adjacent_byline",
     "text_titlepage_publisher_byline",
     "text_first_lines_stacked_byline",
     "text_role_followup",
@@ -5119,11 +5123,17 @@ _WORKSPACE_PERSON_EVIDENCE_SOURCES = frozenset({
     "filename_leading_name_before_section",
     "filename_corroborated_text_name",
     "filename_leading_surnames",
+    "filename_compact_name_before_year",
+    "filename_name_before_section_label",
+    "filename_surname_before_year",
     "filename_leading_name_overrode_pdf_metadata",
     "filename_leading_surname_overrode_pdf_metadata",
     "filename_leading_name_before_section_overrode_pdf_metadata",
     "filename_corroborated_text_name_overrode_pdf_metadata",
     "filename_leading_surnames_overrode_pdf_metadata",
+    "filename_compact_name_before_year_overrode_pdf_metadata",
+    "filename_name_before_section_label_overrode_pdf_metadata",
+    "filename_surname_before_year_overrode_pdf_metadata",
     "text_byline_overrode_pdf_metadata",
     "text_written_by_overrode_pdf_metadata",
     "text_author_label_overrode_pdf_metadata",
@@ -5369,6 +5379,8 @@ def workspace_person_identity_from_pdf(pdf_file, *, native_metadata=None):
         "filename_leading_surname_overrode_pdf_metadata",
         "filename_leading_surnames",
         "filename_leading_surnames_overrode_pdf_metadata",
+        "filename_surname_before_year",
+        "filename_surname_before_year_overrode_pdf_metadata",
     }
     person_author = (
         normalize_text(first_author)
@@ -15568,6 +15580,7 @@ def timing_formula_lane(features):
         str(features.get("native_upload_representation") or "not_applicable"),
         str(features.get("embedding_timing_lane") or "unknown"),
         str(features.get("embedding_submission_strategy") or "not_applicable"),
+        str(features.get("desktop_queue_topology") or "not_applicable"),
         str(features.get("embedding_submission_parallelism") or 0),
         str(features.get("desktop_embedding_batch_protocol") or "not_applicable"),
         str(features.get("embedding_provider_input_batch_size") or 0),
@@ -15804,6 +15817,13 @@ def timing_model_features(profile, mode, native_upload_scope, *, segment_mode=""
             str(ANYTHINGLLM_EMBEDDING_SUBMISSION_STRATEGY or "desktop_queue")
             if mode == MODE_NATIVE_UPLOAD_LABEL else "not_applicable"
         ),
+        "desktop_queue_topology": (
+            DESKTOP_QUEUE_TOPOLOGY_SOURCE_WINDOWS
+            if desktop_queue and document_count > 1
+            else DESKTOP_QUEUE_TOPOLOGY_SINGLE_SOURCE
+            if desktop_queue
+            else "not_applicable"
+        ),
         "embedding_batch_size": batch_size,
         "embedding_submission_parallelism": (
             1
@@ -15906,6 +15926,98 @@ def timing_model_cached_attachment_reuse_count(row):
         return 0
 
 
+def timing_model_desktop_queue_topology(row):
+    """Identify the physical Desktop request topology of one timing row.
+
+    Multi-PDF uploads changed from one shared mutation to durable sequential
+    per-PDF source windows. Their setup, observer, and exact-vector tails are
+    not interchangeable timing evidence. Old JSONL rows remain append-only;
+    durable run artifacts let us classify them read-only instead.
+    """
+    explicit = str((row or {}).get("desktop_queue_topology") or "").strip()
+    if explicit:
+        return explicit
+    if (
+        str((row or {}).get("mode") or "") != MODE_NATIVE_UPLOAD_LABEL
+        or str((row or {}).get("embedding_submission_strategy") or "").casefold()
+        != "desktop_queue"
+    ):
+        return "not_applicable"
+    if max(1, int((row or {}).get("document_count") or 1)) <= 1:
+        return DESKTOP_QUEUE_TOPOLOGY_SINGLE_SOURCE
+    try:
+        run_root = Path(str((row or {}).get("run_key") or ""))
+        ledger_path = run_root / "source-transaction-ledger.json"
+        if ledger_path.is_file():
+            ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+            transactions = [
+                item for item in (ledger.get("transactions") or [])
+                if isinstance(item, dict)
+            ]
+            if len(transactions) > 1:
+                return DESKTOP_QUEUE_TOPOLOGY_SOURCE_WINDOWS
+        report_path = run_root / "batch-native-upload-report.json"
+        if report_path.is_file():
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            if (
+                str(report.get("submission_strategy") or "").casefold()
+                == "desktop_source_windows"
+                or int(report.get("source_window_count") or 0) > 1
+            ):
+                return DESKTOP_QUEUE_TOPOLOGY_SOURCE_WINDOWS
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        pass
+    return DESKTOP_QUEUE_TOPOLOGY_LEGACY_SHARED
+
+
+def timing_model_multiplier_observation_comparable(features, historical):
+    """Guard the whole-run multiplier against unlike queue shapes.
+
+    The classic phase formula already prices pages and provider requests. This
+    filter affects only its bounded historical correction. In particular, a
+    retired shared Desktop mutation or a radically different workload must not
+    inflate a small source-window batch merely because their page totals are
+    superficially similar. OCR is deliberately not a hard boundary here: the
+    dominant external queue variance applies to both OCR and native documents.
+    """
+    if (
+        str((features or {}).get("mode") or "") != MODE_NATIVE_UPLOAD_LABEL
+        or str((features or {}).get("embedding_submission_strategy") or "").casefold()
+        != "desktop_queue"
+    ):
+        return True
+    requested_topology = timing_model_desktop_queue_topology(features)
+    historical_topology = timing_model_desktop_queue_topology(historical)
+    if requested_topology != historical_topology:
+        return False
+    requested_documents = max(1, int((features or {}).get("document_count") or 1))
+    if requested_documents >= TIMING_MODEL_LARGE_BATCH_MIN_DOCUMENTS:
+        # The mature 10+ lane retains its existing, separately tested scale
+        # guard below. Do not alter that successful batch calibration here.
+        return True
+    historical_documents = max(1, int((historical or {}).get("document_count") or 1))
+    if not (
+        max(1, int(math.floor(requested_documents * .50)))
+        <= historical_documents
+        <= max(1, int(math.ceil(requested_documents * 2.00)))
+    ):
+        return False
+    requested_records = max(1, int((features or {}).get("estimated_records") or 1))
+    historical_records = max(
+        1,
+        int(
+            (historical or {}).get("actual_records")
+            or (historical or {}).get("estimated_records")
+            or 1
+        ),
+    )
+    return (
+        max(1, int(math.floor(requested_records * .50)))
+        <= historical_records
+        <= max(1, int(math.ceil(requested_records * 2.00)))
+    )
+
+
 def timing_model_cache_reuse_fraction(row):
     """Return the observed cached-location share for one native upload row."""
     cached = timing_model_cached_attachment_reuse_count(row)
@@ -15997,15 +16109,28 @@ def timing_model_desktop_queue_cadence(row):
     )
     if fresh_records < TIMING_MODEL_DESKTOP_CADENCE_MIN_FRESH_RECORDS:
         return {}
-    # The lower observed rate is the conservative rate when one run contains
-    # several receipts.  It prevents a short warm/cache-adjacent receipt from
-    # making the historical lane unrealistically optimistic.
-    records_per_minute = min(rates)
+    # A single historical receipt has one coherent queue clock. Grouped
+    # source-window runs do not: each PDF starts a fresh observer, and taking
+    # the slowest tiny window made its local start-up delay look like the
+    # cadence of all 900 records. That is how a completed 21-minute workload
+    # later acquired a 62-minute opening estimate. For multiple receipts use
+    # the complete run duration per fresh record as a conservative upper bound
+    # (it includes preparation and reporting too); retain the exact observer
+    # rate for the original one-receipt contract.
+    if len(rates) > 1 and float(row.get("actual_seconds") or 0.0) > 0.0:
+        seconds_per_record = float(row["actual_seconds"]) / fresh_records
+        records_per_minute = 60.0 / seconds_per_record
+        cadence_basis = "whole_run_upper_bound_for_grouped_source_windows"
+    else:
+        records_per_minute = rates[0]
+        seconds_per_record = 60.0 / records_per_minute
+        cadence_basis = "single_receipt_queue_observer"
     return {
         "fresh_records": fresh_records,
         "records_per_minute": records_per_minute,
-        "seconds_per_record": 60.0 / records_per_minute,
+        "seconds_per_record": seconds_per_record,
         "receipts": len(rates),
+        "basis": cadence_basis,
     }
 
 
@@ -17304,6 +17429,7 @@ def hydrated_timing_model_history():
                             row.get("embedding_engine"),
                             row.get("embedding_model"),
                         )
+                    row["desktop_queue_topology"] = timing_model_desktop_queue_topology(row)
                     row["timing_formula_lane"] = timing_formula_lane(row)
                     if not row.get("batch_seconds"):
                         row["batch_seconds"] = [
@@ -17461,7 +17587,12 @@ def estimate_automatic_run(
     features["probe_observation_prior_source"] = probe_observation_source
     base = timing_model_base_seconds(features, batch_seconds_prior=batch_prior)
     comparable = sorted(
-        ((timing_model_similarity(features, row), row) for row in history if timing_model_learning_observation_usable(row)),
+        (
+            (timing_model_similarity(features, row), row)
+            for row in history
+            if timing_model_learning_observation_usable(row)
+            and timing_model_multiplier_observation_comparable(features, row)
+        ),
         key=lambda item: item[0], reverse=True,
     )[:8]
     ratios = []
@@ -17494,6 +17625,23 @@ def estimate_automatic_run(
             or int(row.get("chunk_overlap") or 0) != int(features.get("chunk_overlap") or 0)
         ):
             continue
+        # A two-PDF request and a 17-PDF Desktop queue can share every mode,
+        # splitter, model, and layout label while having opposite setup/tail
+        # proportions. Small-run ratios were therefore raising large-batch
+        # estimates even when two completed 17-PDF runs showed the formula was
+        # already conservative. Keep the learned multiplier in the same
+        # architecture, but require scale-comparable evidence for a 10+ PDF
+        # selection.
+        if timing_model_large_batch_queue_eligible(features):
+            historical_documents = max(1, int(row.get("document_count") or 1))
+            historical_records = max(1, int(row.get("actual_records") or row.get("estimated_records") or 1))
+            target_records = max(1, int(features.get("estimated_records") or 1))
+            if (
+                historical_documents < TIMING_MODEL_LARGE_BATCH_MIN_DOCUMENTS
+                or historical_records < int(math.floor(target_records * .50))
+                or historical_records > int(math.ceil(target_records * 2.00))
+            ):
+                continue
         historical_batch_prior, _, _ = timing_model_batch_prior_seconds(row, history)
         historical_base = timing_model_base_seconds(row, batch_seconds_prior=historical_batch_prior)
         if historical_base > 0:
@@ -27895,6 +28043,31 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     automatic_normal_actions,
                     confirm_automatic_run_button,
                     cancel_automatic_run_button,
+                ],
+                show_progress="hidden",
+                queue=False,
+            ).then(
+                # A long queued generator can cause the browser's one-second
+                # Timer request chain to stop delivering even though the
+                # server and worker remain healthy. The stream still updates
+                # its button/timing outputs, which produced the impossible
+                # overnight screenshot: “Processing successful” beside a
+                # stale 11% activity card. Reconcile every terminal surface
+                # once from the durable run record; the timer remains the live
+                # path and this does not invent progress.
+                fn=refresh_live_automatic_run_ui,
+                inputs=[automatic_viewed_run_root],
+                outputs=[
+                    automatic_run_activity,
+                    auto_run_timing,
+                    auto_button,
+                    confirm_automatic_run_button,
+                    automatic_confirmation,
+                    automatic_normal_actions,
+                    cancel_automatic_run_button,
+                    automatic_run_failure,
+                    auto_summary,
+                    open_generated_output_button,
                 ],
                 show_progress="hidden",
                 queue=False,

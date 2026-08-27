@@ -775,6 +775,10 @@ POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES = {
 # included: they remain useful diagnostics but caused title phrases to be
 # published as authors in real course-library batches.
 TRUSTED_AUTHOR_INFERENCE_SOURCES = POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES | {
+    # Native PDF title geometry is sufficiently strong for catalog metadata,
+    # but OCR can hallucinate the same adjacency. Keep it out of the stricter
+    # post-OCR mutation allowlist above.
+    "text_title_adjacent_byline",
     "text_titlepage_publisher_byline",
     "text_first_lines_stacked_byline",
     "text_role_followup",
@@ -784,6 +788,9 @@ TRUSTED_AUTHOR_INFERENCE_SOURCES = POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES | {
     "filename_leading_name_before_section",
     "filename_corroborated_text_name",
     "filename_leading_surnames",
+    "filename_compact_name_before_year",
+    "filename_name_before_section_label",
+    "filename_surname_before_year",
 }
 
 AUTHOR_METADATA_OVERRIDE_SOURCES = {
@@ -800,6 +807,9 @@ AUTHOR_METADATA_OVERRIDE_SOURCES = {
     "filename_leading_name_before_section",
     "filename_corroborated_text_name",
     "filename_leading_surnames",
+    "filename_compact_name_before_year",
+    "filename_name_before_section_label",
+    "filename_surname_before_year",
 }
 
 AUTHOR_ORGANIZATION_TERMS = {
@@ -1458,6 +1468,7 @@ def infer_author_from_text_samples(samples, title_hint=""):
         (r"(?:^|\n)\s*(?:book|chapter|article|document)\s+author\s*[:\-]\s*([^\n]{3,90})", "text_bibliographic_author_label"),
         (r"(?:^|\n)\s*instructor\s*[:\-]\s*([^\n]{3,90})", "text_instructor_label"),
     ]
+    weak_fallback = None
     for sample in samples:
         raw_text = strip_known_extraction_structure_labels(
             str(sample.get("text") or "").replace("\r\n", "\n").replace("\r", "\n")
@@ -1594,7 +1605,21 @@ def infer_author_from_text_samples(samples, title_hint=""):
                 # a wider neighborhood allowed a chapter title one line above
                 # the real author to borrow the author's publisher evidence.
                 following = top_lines[index + 1] if index + 1 < len(top_lines) else ""
-                if looks_like_publisher_imprint_line(following):
+                following_two = " ".join(top_lines[index + 1:index + 3])
+                following_three = " ".join(top_lines[index + 1:index + 4])
+                split_imprint_prefix = bool(
+                    re.fullmatch(r"[A-Z]{2,}(?:\s+[A-Z]{2,})?", following)
+                )
+                if (
+                    looks_like_publisher_imprint_line(following)
+                    or (
+                        split_imprint_prefix
+                        and (
+                            looks_like_publisher_imprint_line(following_two)
+                            or looks_like_publisher_imprint_line(following_three)
+                        )
+                    )
+                ):
                     return {
                         "author": candidate,
                         "source": "text_titlepage_publisher_byline",
@@ -1648,13 +1673,69 @@ def infer_author_from_text_samples(samples, title_hint=""):
                     }
         title_start_index = 0
         title_matched = False
-        normalized_title = normalize_text(title_hint).casefold() if title_hint else ""
+        normalized_title = (
+            normalize_text(re.sub(r"[_\W]+", " ", title_hint, flags=re.UNICODE)).casefold()
+            if title_hint else ""
+        )
         if normalized_title:
             for index, line in enumerate(top_lines):
-                lowered = line.casefold().strip()
+                lowered = normalize_text(
+                    re.sub(r"[_\W]+", " ", line, flags=re.UNICODE)
+                ).casefold()
                 if lowered and (lowered in normalized_title or normalized_title in lowered):
                     title_start_index = index
                     title_matched = True
+                    break
+        # A large and common scholarly layout is simply ``Title`` followed by
+        # one or more person names.  The older generic top-block fallback saw
+        # this evidence but deliberately left it untrusted, so genuine names
+        # such as Laura Mulvey remained Unknown.  Promote only the line
+        # immediately following a positively matched title (or a short run of
+        # wrapped title lines), never an arbitrary title-shaped line.  A bare
+        # one-word marker such as ``Bold`` or ``Edition`` still cannot satisfy
+        # the person-name predicate.
+        if title_matched and 1 <= page <= 3:
+            for candidate_index in range(title_start_index + 1, min(len(top_lines), title_start_index + 5)):
+                line = top_lines[candidate_index]
+                if line.casefold() in AUTHOR_BLOCK_STOP_HINTS:
+                    break
+                candidates = split_author_line_candidates(
+                    line,
+                    title_hint=title_hint,
+                    allow_all_caps=False,
+                )
+                if not candidates:
+                    candidate = normalize_author_candidate(line)
+                    if looks_like_person_name(candidate, title_hint=title_hint, allow_all_caps=False):
+                        candidates = [candidate]
+                if candidates:
+                    following = top_lines[candidate_index + 1] if candidate_index + 1 < len(top_lines) else ""
+                    # Multi-column bibliographic furniture can put a broken
+                    # citation name directly after an article title (for
+                    # example ``Alary Helen`` / ``Washington, Invented``).
+                    # A short comma fragment is evidence of that column merge,
+                    # not an author credit. Ordinary prose after a real name
+                    # remains allowed even when its sentence contains commas.
+                    if "," in following and len(following.split()) <= 5:
+                        continue
+                    return {
+                        "author": ", ".join(candidates[:12]),
+                        "source": "text_title_adjacent_byline",
+                        "page": page,
+                        "evidence": line,
+                    }
+                # Continue across wrapped title lines, but stop as soon as
+                # prose, a heading, or publication furniture begins.
+                normalized_candidate_line = normalize_text(
+                    re.sub(r"[_\W]+", " ", line, flags=re.UNICODE)
+                ).casefold()
+                is_wrapped_title_line = bool(
+                    normalized_candidate_line
+                    and normalized_candidate_line in normalized_title
+                )
+                if not is_wrapped_title_line and (
+                    len(line.split()) > 10 or re.search(r"[.!?]$", line)
+                ):
                     break
         generic_fallback_last_index = min(len(top_lines) - 1, title_start_index + 8)
         for index, line in enumerate(top_lines):
@@ -1733,18 +1814,50 @@ def infer_author_from_text_samples(samples, title_hint=""):
             ):
                 detected_names.append(candidate)
         if detected_names:
-            return {
+            # Keep looking through the bounded opening-page sample. A weak
+            # generic name on a download/copyright cover must not prevent a
+            # later proper title page from supplying an explicit title-adjacent
+            # or publisher-backed author. The weak result remains available
+            # for review only if no stronger source appears.
+            weak_fallback = weak_fallback or {
                 "author": ", ".join(detected_names[:12]),
                 "source": "text_top_block_names",
                 "page": page,
                 "evidence": " / ".join(detected_names[:4]),
             }
-    return {"author": "", "source": "not_found", "page": 0, "evidence": ""}
+    return weak_fallback or {"author": "", "source": "not_found", "page": 0, "evidence": ""}
 
 
 def infer_author_from_filename(path: Path, title_hint=""):
     stem = normalize_text(path.stem)
     stem = re.sub(r"\[[^\]]+\]$", "", stem).strip()
+    # Explicit catalog-style prefixes are useful when a chapter excerpt omits
+    # its book author from the sampled pages.  Each form below has an
+    # independent delimiter/section/year cue; none treats a filename's first
+    # capitalized word as an author merely because it is capitalized.
+    compact_before_year = re.match(
+        r"^([A-ZÀ-ÖØ-Þ][a-zà-öø-ÿ'’-]+)([A-ZÀ-ÖØ-Þ][a-zà-öø-ÿ'’-]+)[_-](?:18|19|20)\d{2}(?=[_-]|$)",
+        stem,
+    )
+    if compact_before_year:
+        candidate = normalize_author_candidate(" ".join(compact_before_year.groups()))
+        if looks_like_person_name(candidate, allow_all_caps=False):
+            return {"author": candidate, "source": "filename_compact_name_before_year", "page": 0, "evidence": path.name}
+    name_before_section = re.match(
+        r"^([A-ZÀ-ÖØ-Þ][^\W\d_][\w'’-]+(?:\s+[A-ZÀ-ÖØ-Þ](?:\.)?)?\s+[A-ZÀ-ÖØ-Þ][^\W\d_][\w'’-]+)\s+(?:chapter|article|essay|paper)\b",
+        stem,
+        flags=re.I | re.UNICODE,
+    )
+    if name_before_section:
+        candidate = normalize_author_candidate(name_before_section.group(1))
+        if looks_like_person_name(candidate, allow_all_caps=False):
+            return {"author": candidate, "source": "filename_name_before_section_label", "page": 0, "evidence": path.name}
+    surname_before_year = re.match(
+        r"^([A-ZÀ-ÖØ-Þ][A-ZÀ-ÖØ-Þ'’-]{2,})[-_](?:18|19|20)\d{2}(?=[_-]|$)",
+        stem,
+    )
+    if surname_before_year:
+        return {"author": surname_before_year.group(1).title(), "source": "filename_surname_before_year", "page": 0, "evidence": path.name}
     # Course libraries and publisher downloads commonly use an explicit
     # catalog prefix: ``First Last - Title`` or ``Surname - Title``.  This is
     # stronger than guessing from a terminal title fragment because the
@@ -22374,7 +22487,11 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     if not partial_vector_coverage:
         report_upload_phase(
             "validation",
-            "Exact storage and retrieval validation complete",
+            (
+                "Exact storage and retrieval validation complete"
+                if args.prepare_and_upload
+                else "PDF preparation complete"
+            ),
             completed_units=1,
             total_units=1,
             fallback_fraction=PIPELINE_PROGRESS_REPORTING,
@@ -22382,7 +22499,11 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         )
         report_upload_phase(
             "reporting",
-            "Writing retrieval and readiness reports",
+            (
+                "Writing retrieval and readiness reports"
+                if args.prepare_and_upload
+                else "Writing preparation reports"
+            ),
             completed_units=0,
             total_units=1,
             fallback_fraction=PIPELINE_PROGRESS_REPORTING,

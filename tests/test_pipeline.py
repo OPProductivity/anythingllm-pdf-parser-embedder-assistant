@@ -13632,7 +13632,7 @@ class PipelineCoreTests(unittest.TestCase):
         )
         self.assertIn("Vladimir Karpukhin", report["author"])
         self.assertIn("Patrick Lewis", report["author"])
-        self.assertEqual(report["source"], "text_top_block_names")
+        self.assertIn(report["source"], {"text_top_block_names", "text_title_adjacent_byline"})
 
     def test_author_inference_finds_semicolon_and_middle_dot_names(self):
         report = pipeline.infer_author_from_text_samples(
@@ -13653,7 +13653,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn("Bob Jones", report["author"])
         self.assertIn("Carla Gomez", report["author"])
         self.assertIn("David Chen", report["author"])
-        self.assertEqual(report["source"], "text_top_block_names")
+        self.assertIn(report["source"], {"text_top_block_names", "text_title_adjacent_byline"})
 
     def test_author_inference_finds_adjacent_names_with_footnote_numbers(self):
         report = pipeline.infer_author_from_text_samples(
@@ -13672,7 +13672,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn("Alec Radford", report["author"])
         self.assertIn("Jong Wook Kim", report["author"])
         self.assertIn("Ilya Sutskever", report["author"])
-        self.assertEqual(report["source"], "text_top_block_names")
+        self.assertIn(report["source"], {"text_top_block_names", "text_title_adjacent_byline"})
 
     def test_author_inference_accepts_lowercase_name_particles(self):
         report = pipeline.infer_author_from_text_samples(
@@ -13691,7 +13691,7 @@ class PipelineCoreTests(unittest.TestCase):
         )
         self.assertIn("Jan van der Meer", report["author"])
         self.assertIn("Maria de la Cruz", report["author"])
-        self.assertEqual(report["source"], "text_top_block_names")
+        self.assertIn(report["source"], {"text_top_block_names", "text_title_adjacent_byline"})
 
     def test_author_inference_accepts_unicode_letter_names(self):
         self.assertTrue(
@@ -13817,7 +13817,7 @@ class PipelineCoreTests(unittest.TestCase):
             title_hint="Example Book: A Review of Public Ideas on Policy, Merit, and Community",
         )
         self.assertEqual(report["author"], "Sample Reviewer")
-        self.assertIn(report["source"], {"text_top_block_names", "text_role_followup"})
+        self.assertIn(report["source"], {"text_top_block_names", "text_role_followup", "text_title_adjacent_byline"})
 
     def test_author_inference_reads_instructor_label(self):
         report = pipeline.infer_author_from_text_samples(
@@ -13900,7 +13900,7 @@ class PipelineCoreTests(unittest.TestCase):
             title_hint="Example Book: An Example Title and Its Sample Subtitle",
         )
         self.assertEqual(report["author"], "Sample Author")
-        self.assertEqual(report["source"], "text_top_block_names")
+        self.assertIn(report["source"], {"text_top_block_names", "text_title_adjacent_byline"})
 
     def test_author_inference_recovers_all_caps_titlepage_name_above_plain_press_imprint(self):
         report = pipeline.infer_author_from_text_samples(
@@ -13978,7 +13978,13 @@ class PipelineCoreTests(unittest.TestCase):
             title_hint="Example Article",
         )
         self.assertEqual(report["author"], "")
-        self.assertEqual(report["source"], "selected_extraction_rejected_weak_text_top_block_names")
+        self.assertIn(
+            report["source"],
+            {
+                "selected_extraction_rejected_weak_text_top_block_names",
+                "selected_extraction_rejected_weak_text_title_adjacent_byline",
+            },
+        )
 
     def test_apply_source_identity_to_segments_updates_only_identity_fields(self):
         rows = [{"source_author": "", "source_short_label": "Old", "metadata_provenance": {}, "text": "body"}]
