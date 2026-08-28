@@ -12249,6 +12249,13 @@ PRESENTATION_ETA_CONSERVATISM = 1.20
 QUEUE_ETA_MIN_COMPLETED_RECORDS = 12
 QUEUE_ETA_MIN_EVENT_SAMPLES = 12
 QUEUE_ETA_SAMPLE_INTERVAL_SECONDS = 30.0
+# A fast queue should not spend another full three-minute visibility interval
+# displaying a deliberately conservative opening estimate once it has already
+# produced corroborating *cross-source* evidence.  This applies only to a
+# downward correction; the stricter normal interval remains the sole route
+# for an upward correction.
+QUEUE_ETA_EARLY_DOWNWARD_REPRICE_INTERVAL_SECONDS = 120.0
+QUEUE_ETA_EARLY_DOWNWARD_REPRICE_MIN_SAMPLES = 4
 # Keep sampling the owned Desktop queue continuously, but do not turn every
 # short-lived rate fluctuation into a new promise in the UI. Three minutes and
 # a five-sample median give the serial queue time to cross several ordinary
@@ -17492,6 +17499,63 @@ def stable_queue_eta_reprice(
         "raw_forecast_seconds": raw_forecast,
         "material_change_seconds": material_change,
         "sample_count": len(samples),
+    }
+
+
+def early_downward_queue_eta_reprice(current_expected, forecast_samples, *, observed_windows=1):
+    """Allow one earlier, still-corroborated downward Desktop ETA correction.
+
+    The normal reprice path intentionally waits for five samples and three
+    minutes because an increase must not let one slow source window rewrite a
+    whole batch.  When four spaced observations from at least two source
+    windows support a *lower* forecast, however, keeping the opening
+    estimate visible for that extra interval is pure presentation lag.  Reuse
+    the established bounded-step and material-change rules; this helper adds
+    no new timing formula or queue evidence source.
+    """
+    samples = [max(0, int(value or 0)) for value in (forecast_samples or [])]
+    if len(samples) < QUEUE_ETA_EARLY_DOWNWARD_REPRICE_MIN_SAMPLES:
+        return {
+            "status": "suppressed",
+            "suppression_reason": "fewer_than_four_spaced_samples",
+            "sample_count": len(samples),
+        }
+    if int(observed_windows or 0) < QUEUE_ETA_MIN_WINDOWS_FOR_INCREASE:
+        return {
+            "status": "suppressed",
+            "suppression_reason": "downward_change_needs_two_source_windows",
+            "sample_count": len(samples),
+        }
+    recent = samples[-QUEUE_ETA_EARLY_DOWNWARD_REPRICE_MIN_SAMPLES:]
+    raw_forecast = int(round(statistics.median(recent)))
+    current = int(current_expected or 0)
+    if raw_forecast >= current:
+        return {
+            "status": "suppressed",
+            "suppression_reason": "not_a_downward_forecast",
+            "raw_forecast_seconds": raw_forecast,
+            "sample_count": len(recent),
+        }
+    material_change = max(
+        QUEUE_ETA_REPRICE_MIN_CHANGE_SECONDS,
+        int(round(current * QUEUE_ETA_REPRICE_MIN_CHANGE_RATIO)),
+    )
+    candidate = bounded_queue_eta_reprice(current, raw_forecast)
+    if abs(candidate - current) < material_change:
+        return {
+            "status": "suppressed",
+            "suppression_reason": "bounded_change_below_material_threshold",
+            "raw_forecast_seconds": raw_forecast,
+            "candidate_expected_seconds": candidate,
+            "material_change_seconds": material_change,
+            "sample_count": len(recent),
+        }
+    return {
+        "status": "applied",
+        "expected_seconds": candidate,
+        "raw_forecast_seconds": raw_forecast,
+        "material_change_seconds": material_change,
+        "sample_count": len(recent),
     }
 
 
@@ -24517,6 +24581,7 @@ def run_automatic(
     last_eta_recalibration_batch = 0
     completed_batches_across_run = 0
     last_queue_eta_recalibration_elapsed = -float("inf")
+    last_early_downward_reprice_elapsed = -float("inf")
     last_queue_eta_sample_elapsed = -float("inf")
     queue_eta_forecast_samples = []
     latest_batch_queue_forecast_seconds = 0
@@ -24634,7 +24699,7 @@ def run_automatic(
         The callback is observational: it neither retries AnythingLLM nor
         changes the pipeline's completion decision.
         """
-        nonlocal expected_seconds, last_eta_recalibration_batch, completed_batches_across_run, last_queue_eta_recalibration_elapsed, last_queue_eta_sample_elapsed, latest_batch_queue_forecast_seconds
+        nonlocal expected_seconds, last_eta_recalibration_batch, completed_batches_across_run, last_queue_eta_recalibration_elapsed, last_early_downward_reprice_elapsed, last_queue_eta_sample_elapsed, latest_batch_queue_forecast_seconds
         # The worker can flush an event after the browser has already received
         # a durable cancel acknowledgement. Do not let that late observation
         # revise the ETA, status, or progress checkpoint.
@@ -24715,17 +24780,43 @@ def run_automatic(
             # Reprice from the median of five spaced owned observations.
             # The classic formula and bounded change remain intact; the UI
             # simply stops treating one transient queue rate as a new promise.
-            if (
-                batch_queue_rate_is_mature
-                and elapsed - last_queue_eta_recalibration_elapsed >= QUEUE_ETA_REPRICE_INTERVAL_SECONDS
+            # A separately guarded, downward-only path can surface genuinely
+            # fast cross-source evidence one minute sooner.  It never permits
+            # an upward correction before the established five-sample window.
+            normal_reprice_due = (
+                elapsed - last_queue_eta_recalibration_elapsed
+                >= QUEUE_ETA_REPRICE_INTERVAL_SECONDS
                 and len(queue_eta_forecast_samples) >= 5
-            ):
-                stable_reprice = stable_queue_eta_reprice(
-                    expected_seconds,
-                    queue_eta_forecast_samples,
-                    observed_windows=batch_queue_forecast.get("observed_windows", 0),
-                    return_decision=True,
-                )
+            )
+            early_samples = queue_eta_forecast_samples[
+                -QUEUE_ETA_EARLY_DOWNWARD_REPRICE_MIN_SAMPLES:
+            ]
+            early_forecast_is_downward = bool(early_samples) and (
+                int(round(statistics.median(early_samples))) < int(expected_seconds or 0)
+            )
+            early_downward_reprice_due = (
+                elapsed - last_early_downward_reprice_elapsed
+                >= QUEUE_ETA_EARLY_DOWNWARD_REPRICE_INTERVAL_SECONDS
+                and len(queue_eta_forecast_samples)
+                >= QUEUE_ETA_EARLY_DOWNWARD_REPRICE_MIN_SAMPLES
+                and int(batch_queue_forecast.get("observed_windows") or 0)
+                >= QUEUE_ETA_MIN_WINDOWS_FOR_INCREASE
+                and early_forecast_is_downward
+            )
+            if batch_queue_rate_is_mature and (normal_reprice_due or early_downward_reprice_due):
+                if normal_reprice_due:
+                    stable_reprice = stable_queue_eta_reprice(
+                        expected_seconds,
+                        queue_eta_forecast_samples,
+                        observed_windows=batch_queue_forecast.get("observed_windows", 0),
+                        return_decision=True,
+                    )
+                else:
+                    stable_reprice = early_downward_queue_eta_reprice(
+                        expected_seconds,
+                        queue_eta_forecast_samples,
+                        observed_windows=batch_queue_forecast.get("observed_windows", 0),
+                    )
                 if stable_reprice.get("status") == "applied":
                     expected_seconds = stable_reprice["expected_seconds"]
                     run_timing_estimate["expected_seconds"] = expected_seconds
@@ -24774,7 +24865,10 @@ def run_automatic(
                         new_expected_seconds=expected_seconds,
                         raw_forecast_seconds=stable_reprice.get("raw_forecast_seconds"),
                     )
-                last_queue_eta_recalibration_elapsed = elapsed
+                if normal_reprice_due or stable_reprice.get("status") == "applied":
+                    last_queue_eta_recalibration_elapsed = elapsed
+                if early_downward_reprice_due:
+                    last_early_downward_reprice_elapsed = elapsed
         if str(report.get("timing_event") or "") == "exact_segment_plan_ready":
             exact_records = max(0, int(report.get("exact_records") or 0))
             exact_batches = max(0, int(report.get("exact_batches") or 0))

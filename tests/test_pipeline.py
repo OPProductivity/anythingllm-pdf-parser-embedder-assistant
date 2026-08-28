@@ -4720,6 +4720,28 @@ class PipelineCoreTests(unittest.TestCase):
         # A sub-threshold change is deliberately not shown as a recalculation.
         self.assertIsNone(app.stable_queue_eta_reprice(1_000, [940, 950, 960, 970, 980]))
 
+    def test_early_downward_queue_reprice_requires_cross_source_evidence(self):
+        import rag_pdf_gradio_app as app
+
+        forecasts = [800, 810, 820, 830]
+        blocked = app.early_downward_queue_eta_reprice(
+            1_000, forecasts, observed_windows=1
+        )
+        self.assertEqual(
+            blocked["suppression_reason"], "downward_change_needs_two_source_windows"
+        )
+        reprice = app.early_downward_queue_eta_reprice(
+            1_000, forecasts, observed_windows=2
+        )
+        self.assertEqual(reprice["raw_forecast_seconds"], 815)
+        self.assertEqual(reprice["expected_seconds"], 815)
+        self.assertEqual(
+            app.early_downward_queue_eta_reprice(
+                1_000, [1_100, 1_110, 1_120, 1_130], observed_windows=3
+            )["suppression_reason"],
+            "not_a_downward_forecast",
+        )
+
     def test_upward_queue_reprice_requires_cross_source_consensus_and_is_small(self):
         import rag_pdf_gradio_app as app
 
