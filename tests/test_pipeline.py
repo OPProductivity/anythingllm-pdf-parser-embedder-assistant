@@ -8452,10 +8452,19 @@ class PipelineCoreTests(unittest.TestCase):
         # Confirm submits concrete current controls rather than State-only
         # review data, so the direct action cannot become a visible no-op.
         self.assertGreater(len(confirm_dependencies[0]["inputs"]), 1)
-        self.assertEqual(len(confirm_dependencies[0]["outputs"]), 13)
+        self.assertEqual(len(confirm_dependencies[0]["outputs"]), 17)
         confirm_function = app.demo.fns[confirm_dependencies[0]["id"]]
         self.assertEqual(confirm_function.concurrency_id, app.AUTOMATIC_RUN_CONCURRENCY_ID)
         self.assertEqual(confirm_function.concurrency_limit, 1)
+
+    def test_active_run_locks_all_source_picker_affordances(self):
+        import rag_pdf_gradio_app as app
+
+        locked = app.automatic_picker_lifecycle_updates({"state": "running"})
+        self.assertEqual(len(locked), 4)
+        self.assertTrue(all(not update["interactive"] for update in locked))
+        unlocked = app.automatic_picker_lifecycle_updates({"state": "successful"})
+        self.assertTrue(all(update["interactive"] for update in unlocked))
 
     def test_run_control_containers_never_use_dynamic_visibility(self):
         """A Gradio container visibility transition previously stacked action bars."""

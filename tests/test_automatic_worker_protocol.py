@@ -165,8 +165,9 @@ def test_browser_stream_keeps_presentation_state_as_an_extra_output():
     )
 
     assert len(updates) == 1
-    assert len(updates[0]) == 13
-    assert updates[0][-1] == ""
+    assert len(updates[0]) == 17
+    assert updates[0][-5] == ""
+    assert all(update.get("__type__") == "update" for update in updates[0][-4:])
 
 
 def test_successful_retention_reports_a_locked_artifact_without_failing_the_document(tmp_path, monkeypatch):

@@ -19847,6 +19847,26 @@ def automatic_action_row_updates():
     )
 
 
+def automatic_picker_lifecycle_updates(record=None):
+    """Keep every source-selection affordance inert while a run owns its manifest.
+
+    Confirm captures an immutable list of source paths before the worker starts.
+    Leaving Gradio's file chips interactive afterwards cannot alter that worker,
+    but it can make the visible selection disagree with the active run and
+    accidentally prepare a different next-run form.  The picker lock is a
+    presentation boundary only: it neither changes the frozen request nor
+    broadens cancellation authority.
+    """
+    status = dict(LIVE_AUTOMATIC_RUN_STATUS or {}) if record is None else dict(record or {})
+    interactive = not automatic_lifecycle_busy(status)
+    return (
+        gr.update(interactive=interactive),
+        gr.update(interactive=interactive),
+        gr.update(interactive=interactive),
+        gr.update(interactive=interactive),
+    )
+
+
 def automatic_run_failure_banner_html(code, message):
     # Durable status records include ``CODE: message`` so they remain useful
     # outside the rendered alert.  The alert already has a dedicated code
@@ -20807,7 +20827,7 @@ def run_automatic_for_browser_stream(
         status_root = str(status.get("run_root") or "").strip()
         if status_root:
             owned_root = status_root
-        yield (*outputs, owned_root)
+        yield (*outputs, owned_root, *automatic_picker_lifecycle_updates(status))
 
 
 METADATA_PREVIEW_TEXT_LAYER_PAGE_LIMIT = 3
@@ -29287,6 +29307,10 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     cancel_automatic_run_button,
                     open_generated_output_button,
                     automatic_viewed_run_root,
+                    auto_pdfs,
+                    choose_pdf_folder_button,
+                    auto_folder_file_selector,
+                    retry_selected_pdf_files_button,
                 ],
                 # The live Automatic status card already acknowledges Confirm
                 # immediately and owns all visible progress.  Targeting
