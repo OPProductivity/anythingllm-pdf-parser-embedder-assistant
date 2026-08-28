@@ -286,7 +286,7 @@ def execute_preparation(pdf_path, output_root, args, prepare_callable):
                 "Local preparation completed, but the AnythingLLM upload/indexing/retrieval evidence contract did not pass."
             )
             delegated_stage.operator_message = (
-                "Preparation completed; AnythingLLM evidence needs review."
+                "Preparation completed; AnythingLLM evidence is not confirmed."
             )
             recorder.persist("legacy_preparation_engine:degraded")
         recorder.skip("pdf_extraction_normalization", "Delegated to legacy_preparation_engine.")

@@ -131,6 +131,37 @@ def test_v116_exact_package_contract_grants_only_observed_native_capabilities(tm
     assert result["capabilities"]["can_create_temp_api_key"]["status"] == "unknown"
 
 
+def test_v1161_exact_package_contract_grants_qualified_probe_capabilities(tmp_path, monkeypatch):
+    expected = anythingllm_compatibility.OBSERVED_CANDIDATE_PACKAGE_FINGERPRINTS["1.16.1"]
+    monkeypatch.setattr(anythingllm_compatibility, "_desktop_version", lambda _exe: ("1.16.1.0", [], []))
+    monkeypatch.setattr(
+        anythingllm_compatibility,
+        "_desktop_package_identity",
+        lambda _path, include_fingerprint: (
+            {"app_asar_sha256": expected, "fingerprint_status": "computed", "resources_dir": ""}, [], [],
+        ),
+    )
+    (tmp_path / ".env").write_text("EMBEDDING_ENGINE='openrouter'\n", encoding="utf-8")
+    (tmp_path / "documents").mkdir()
+    (tmp_path / "lancedb").mkdir()
+    create_profile_database(tmp_path / "anythingllm.db")
+
+    result = anythingllm_compatibility.characterize(tmp_path, include_package_fingerprint=True)
+
+    assert result["matched_profile"] == anythingllm_compatibility.V1161_PROFILE_ID
+    assert result["native_mutation_contract"] == anythingllm_compatibility.V1161_NATIVE_CONTRACT_ID
+    for capability in (
+        "can_create_temp_api_key",
+        "can_delete_temp_api_key",
+        "can_create_workspace",
+        "can_delete_workspace",
+        "can_upload_native_metadata",
+        "can_poll_post_upload_state",
+        "can_runtime_verify_embedder",
+    ):
+        assert result["capabilities"][capability]["status"] == "supported"
+
+
 def test_unknown_package_blocks_native_mutation_without_hiding_read_only_storage(tmp_path, monkeypatch):
     monkeypatch.setattr(anythingllm_compatibility, "_desktop_version", lambda _exe: ("9.9.9", [], []))
     monkeypatch.setattr(
@@ -184,6 +215,42 @@ def test_loopback_api_contract_probe_reports_core_routes_without_granting_writes
     assert result["advisory_routes"]["/v1/workspace/{slug}/embed-progress"] == "undocumented_advisory"
     assert requests[0][0].endswith("/api/docs/swagger-ui-init.js")
     assert "Authorization" not in requests[0][1]
+
+
+def test_api_contract_probe_uses_bounded_installed_openapi_when_swagger_initializer_is_empty(
+    tmp_path, monkeypatch,
+):
+    class EmptyResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _limit):
+            return b""
+
+    openapi = tmp_path / "openapi.json"
+    openapi.write_text(
+        __import__("json").dumps({
+            "paths": {route: {} for route in anythingllm_compatibility.REQUIRED_API_CONTRACT_ROUTES}
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        anythingllm_compatibility.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: EmptyResponse(),
+    )
+
+    result = probe_api_contract(
+        "http://127.0.0.1:3001",
+        installed_openapi_path=openapi,
+    )
+
+    assert result["status"] == "qualified_read_only_contract"
+    assert result["contract_evidence_source"] == "installed_package_openapi"
+    assert result["missing_core_routes"] == []
 
 
 def test_api_contract_probe_rejects_non_loopback_urls_without_network_access(monkeypatch):

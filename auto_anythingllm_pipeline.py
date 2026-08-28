@@ -784,6 +784,7 @@ TRUSTED_AUTHOR_INFERENCE_SOURCES = POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES | {
     "text_role_followup",
     "filename_explicit_byline",
     "filename_leading_name",
+    "filename_leading_names",
     "filename_leading_surname",
     "filename_leading_name_before_section",
     "filename_corroborated_text_name",
@@ -791,6 +792,7 @@ TRUSTED_AUTHOR_INFERENCE_SOURCES = POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES | {
     "filename_compact_name_before_year",
     "filename_name_before_section_label",
     "filename_surname_before_year",
+    "filename_surname_before_section_number",
 }
 
 AUTHOR_METADATA_OVERRIDE_SOURCES = {
@@ -803,6 +805,7 @@ AUTHOR_METADATA_OVERRIDE_SOURCES = {
     "text_bibliographic_byline",
     "filename_explicit_byline",
     "filename_leading_name",
+    "filename_leading_names",
     "filename_leading_surname",
     "filename_leading_name_before_section",
     "filename_corroborated_text_name",
@@ -810,6 +813,7 @@ AUTHOR_METADATA_OVERRIDE_SOURCES = {
     "filename_compact_name_before_year",
     "filename_name_before_section_label",
     "filename_surname_before_year",
+    "filename_surname_before_section_number",
 }
 
 AUTHOR_ORGANIZATION_TERMS = {
@@ -1144,6 +1148,53 @@ def author_phrase_is_title_fragment(candidate, title_hint=""):
     return candidate_phrase in title_phrase
 
 
+def author_candidate_is_document_role(value):
+    """Reject compact document furniture that merely has a name-like shape.
+
+    These are grammatical roles, not a global blacklist of individual words.
+    A real surname may be ``Edition`` or an organisation may contain an
+    acronym; only the complete, strongly structured field/edition expressions
+    below are rejected.
+    """
+    candidate = normalize_author_candidate(value)
+    if not candidate:
+        return False
+    return bool(
+        re.fullmatch(
+            r"(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|"
+            r"tenth|eleventh|twelfth|\d{1,2}(?:st|nd|rd|th))\s+edition",
+            candidate,
+            flags=re.I,
+        )
+        or re.fullmatch(
+            r"(?:credits?|credit\s+value|course\s+credits?|study\s+load)\s*"
+            r"\([A-Z][A-Z0-9.-]{1,9}\)",
+            candidate,
+            flags=re.I,
+        )
+    )
+
+
+def author_candidate_is_font_metadata(value):
+    """Recognize a font-family/style value stored in the PDF Author field.
+
+    Publishing software sometimes writes values such as ``Dorel Extra Bold``
+    into uncontrolled author metadata.  Require an actual typography style
+    sequence at the end; a person whose surname happens to be Bold is not
+    rejected without the accompanying style descriptor.
+    """
+    candidate = normalize_author_candidate(value)
+    return bool(
+        re.fullmatch(
+            r".{2,60}\s+(?:extra|semi|demi|ultra)\s+"
+            r"(?:bold|light|condensed|expanded)(?:\s+(?:italic|oblique))?",
+            candidate,
+            flags=re.I,
+        )
+        or re.fullmatch(r".{2,60}\s+(?:regular|roman)\s+(?:italic|oblique)", candidate, flags=re.I)
+    )
+
+
 def looks_like_person_name(value, title_hint="", *, allow_all_caps=True):
     candidate = normalize_author_candidate(value)
     if not candidate:
@@ -1151,6 +1202,8 @@ def looks_like_person_name(value, title_hint="", *, allow_all_caps=True):
     if len(candidate) < 5 or len(candidate) > 80:
         return False
     lowered = candidate.casefold()
+    if author_candidate_is_document_role(candidate):
+        return False
     if any(term in lowered for term in AUTHOR_STOP_TERMS):
         return False
     if author_phrase_is_title_fragment(candidate, title_hint):
@@ -1858,6 +1911,36 @@ def infer_author_from_filename(path: Path, title_hint=""):
     )
     if surname_before_year:
         return {"author": surname_before_year.group(1).title(), "source": "filename_surname_before_year", "page": 0, "evidence": path.name}
+    # Course packs commonly number excerpts as ``Surname_1 Title`` or
+    # ``Surname 4``. The section number is the independent catalog cue: this
+    # does not generalize an arbitrary first filename word into an author.
+    # Reject document-role prefixes contextually so ``Chapter 1`` and
+    # ``Paper_2`` cannot become plausible-looking surnames.
+    surname_before_section_number = re.match(
+        r"^([A-ZÀ-ÖØ-Þ][^\W\d_](?:[^\W\d_]|['’-]){1,39})[ _-]+\d{1,3}(?=[ _.:_-]|$)",
+        stem,
+        flags=re.UNICODE,
+    )
+    if surname_before_section_number:
+        candidate = normalize_text(surname_before_section_number.group(1))
+        disallowed_numbered_prefixes = {
+            "article", "chapter", "document", "excerpt", "file", "paper",
+            "part", "poem", "poems", "scan", "section", "source", "volume",
+            "vol", "week",
+        }
+        if (
+            candidate.casefold() not in disallowed_numbered_prefixes
+            and candidate.casefold() not in AUTHOR_ROLE_HINTS
+            and candidate.casefold() not in AUTHOR_BLOCK_STOP_HINTS
+            and candidate.casefold() not in HEADING_STOPWORDS
+            and candidate.casefold() not in AUTHOR_ORGANIZATION_TERMS
+        ):
+            return {
+                "author": candidate,
+                "source": "filename_surname_before_section_number",
+                "page": 0,
+                "evidence": path.name,
+            }
     # Course libraries and publisher downloads commonly use an explicit
     # catalog prefix: ``First Last - Title`` or ``Surname - Title``.  This is
     # stronger than guessing from a terminal title fragment because the
@@ -1885,7 +1968,35 @@ def infer_author_from_filename(path: Path, title_hint=""):
                 "page": 0,
                 "evidence": path.name,
             }
-        if not prefix_is_complete_title and looks_like_person_name(prefix, allow_all_caps=False):
+        # A catalog prefix can contain two or more complete names, not only
+        # two bare surnames: ``First Last and First Last - Title``.  The shared
+        # author-line splitter already validates each person independently and
+        # rejects title/prose fragments.  Reuse it here instead of weakening
+        # the single-person shape rule or adding a document-specific exception.
+        leading_names = split_author_line_candidates(
+            prefix,
+            # The explicit ``credit - title`` delimiter establishes that this
+            # is the credit field. PDF title metadata often repeats that field
+            # verbatim (``Names - Site``); passing it back as a title hint
+            # would incorrectly reject the very author evidence being parsed.
+            title_hint="",
+            allow_all_caps=False,
+        )
+        if len(leading_names) >= 2 and not prefix_is_complete_title:
+            return {
+                "author": ", ".join(leading_names[:12]),
+                "source": "filename_leading_names",
+                "page": 0,
+                "evidence": path.name,
+            }
+        if (
+            not prefix_is_complete_title
+            and looks_like_person_name(
+                prefix,
+                title_hint=title_hint,
+                allow_all_caps=False,
+            )
+        ):
             return {
                 "author": prefix,
                 "source": "filename_leading_name",
@@ -2088,6 +2199,8 @@ def normalize_metadata_author(value):
     normalized = []
     for piece in pieces:
         candidate = normalize_author_candidate(piece)
+        if author_candidate_is_font_metadata(candidate):
+            continue
         if looks_like_person_name(candidate) and candidate not in normalized:
             normalized.append(candidate)
     return ", ".join(normalized)
@@ -2731,7 +2844,7 @@ def retain_successful_run_leanly(
     """Replace a successful run's forensic tree with usable text + compact facts.
 
     Full candidates, metadata payload files, storage snapshots, and repeated
-    CSV/HTML/JSON reports are valuable only while a run needs review. A ready
+    CSV/HTML/JSON reports are valuable only while a run is unresolved. A ready
     run keeps root-level parsed text, the selected local segment text files,
     and one self-contained summary/recovery record. The caller still receives
     the rich in-memory summary for the live UI.
@@ -2947,6 +3060,8 @@ def retain_successful_run_leanly(
             "readiness_status": summary.get("readiness_status"),
             "selected_backend": summary.get("selected_backend"),
             "total_pipeline_seconds": summary.get("total_pipeline_seconds"),
+            "ocr_processing_seconds": summary.get("ocr_processing_seconds", 0.0),
+            "ocr_cache_reused_pages": summary.get("ocr_cache_reused_pages", 0),
             "api_upload_status": summary.get("api_upload_status"),
             "post_upload_verification_status": summary.get("post_upload_verification_status"),
             "anythingllm_runtime_validation_status": summary.get("anythingllm_runtime_validation_status"),
@@ -4027,7 +4142,7 @@ def _layout_reading_order(rows, width, height):
     return sorted(rows, key=lambda row: (row["y0"], row["x0"])), "visual_line_order", None
 
 
-def apply_region_aware_native_layout(pdf_path, pages):
+def apply_region_aware_native_layout(pdf_path, pages, progress_callback=None):
     """Create conservative semantic text from positioned native PDF lines.
 
     The original extracted page text is retained in ``raw_text``. Only strong
@@ -4037,13 +4152,18 @@ def apply_region_aware_native_layout(pdf_path, pages):
     and is reported as a review candidate.
     """
     page_layouts = {}
+    targeted_ocr_seconds = 0.0
+    page_total = 0
     with fitz.open(pdf_path) as document:
-        for page_number in range(1, int(document.page_count or 0) + 1):
+        page_total = int(document.page_count or 0)
+        for page_number in range(1, page_total + 1):
             page = document.load_page(page_number - 1)
             rows = _layout_line_rows(page)
             page_layouts[page_number] = {
                 "width": float(page.rect.width), "height": float(page.rect.height), "rows": rows,
             }
+            if progress_callback:
+                progress_callback(page_number, page_total, "native_layout_scan")
     top_counts = Counter()
     bottom_counts = Counter()
     for layout in page_layouts.values():
@@ -4094,12 +4214,16 @@ def apply_region_aware_native_layout(pdf_path, pages):
         annotation_candidates = annotation_plan.pop("candidate_spans", set())
         body_reocr_text = ""
         if annotation_plan.get("applied"):
+            if progress_callback:
+                progress_callback(page_number, page_total, "targeted_ocr_started")
+            targeted_ocr_started = time.perf_counter()
             candidate_text = _reocr_confirmed_native_body_region(
                 pdf_path,
                 page_number,
                 annotation_plan.get("body_bounds"),
                 layout["width"],
             )
+            targeted_ocr_seconds += time.perf_counter() - targeted_ocr_started
             raw_text = str(page_info.get("text") or "")
             # Select the fresh OCR only when it contains a substantial share
             # of the original prose and demonstrably reduces corruption. This
@@ -4111,6 +4235,8 @@ def apply_region_aware_native_layout(pdf_path, pages):
                 and _layout_text_noise_score(candidate_text) <= _layout_text_noise_score(raw_text) * .65
             ):
                 body_reocr_text = candidate_text
+            if progress_callback:
+                progress_callback(page_number, page_total, "targeted_ocr_finished")
         if annotation_plan.get("applied"):
             cleaned_rows = []
             for row_index, row in enumerate(layout["rows"]):
@@ -4253,6 +4379,8 @@ def apply_region_aware_native_layout(pdf_path, pages):
                 "reading_region_count": len(reading_regions or []),
             },
         })
+        if progress_callback:
+            progress_callback(page_number, page_total, "native_layout_page_complete")
     return transformed, {
         "status": "applied",
         "method": "native_positioned_lines_conservative_v1",
@@ -4264,6 +4392,7 @@ def apply_region_aware_native_layout(pdf_path, pages):
         "photographed_spread_page_count": sum(
             row["reading_order"] == "photographed_spread_column_first" for row in review_pages
         ),
+        "targeted_ocr_seconds": round(targeted_ocr_seconds, 3),
         "pages": review_pages,
     }
 
@@ -10117,6 +10246,68 @@ def _indexed_cached_document_candidates(storage_dir, chunk_sources):
             con.close()
 
 
+def observe_indexed_source_identity_hint(storage_dir, chunk_sources):
+    """Count globally attached source identities without claiming cache reuse.
+
+    This deliberately weaker, read-only observation is useful for measuring
+    how predictive an early page-parent identity lookup would be.  A matching
+    ``chunkSource`` does *not* prove that the raw text, metadata, destination
+    folder, payload digest, or vector-cache entry matches the current plan.
+    Callers must therefore never use this result to skip work or reprice ETA.
+    """
+    expected = {
+        str(value or "").strip()
+        for value in (chunk_sources or [])
+        if str(value or "").strip()
+    }
+    observation = {
+        "status": "not_available",
+        "expected_source_identities": len(expected),
+        "matched_source_identities": 0,
+    }
+    if not expected:
+        observation["status"] = "empty_plan"
+        return observation
+    if not storage_dir:
+        return observation
+    db_path = Path(storage_dir) / "anythingllm.db"
+    if not db_path.is_file():
+        return observation
+    con = None
+    try:
+        con = sqlite_readonly_connection(db_path)
+        matched = set()
+        for (raw_metadata,) in con.execute(
+            "select metadata from workspace_documents where metadata is not null"
+        ):
+            try:
+                metadata = (
+                    raw_metadata
+                    if isinstance(raw_metadata, dict)
+                    else json.loads(str(raw_metadata or "{}"))
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(metadata, dict):
+                continue
+            chunk_source = str(metadata.get("chunkSource") or "").strip()
+            if chunk_source in expected:
+                matched.add(chunk_source)
+                if len(matched) == len(expected):
+                    break
+        observation.update(
+            status="complete",
+            matched_source_identities=len(matched),
+        )
+        return observation
+    except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
+        observation["error"] = f"{type(exc).__name__}: {exc}"
+        return observation
+    finally:
+        if con is not None:
+            con.close()
+
+
 def find_reusable_cached_document_locations(
     storage_dir,
     payloads,
@@ -10411,7 +10602,7 @@ def anythingllm_embed_progress_message(event):
     if event_type == "doc_complete":
         return f"AnythingLLM Desktop queue: completed record {record_position}"
     if event_type == "doc_failed":
-        return f"AnythingLLM Desktop queue: record {record_position} needs review"
+        return f"AnythingLLM Desktop queue: record {record_position} was not confirmed"
     if event_type == "file_removed":
         return "AnythingLLM Desktop queue: a queued record was removed"
     if event_type == "all_complete":
@@ -12082,7 +12273,98 @@ def cleanup_validation_workspace_documents(workspace_slug, storage_dir=None, doc
     return result
 
 
-def delete_validation_workspace(api_url, workspace_slug, api_key=None, storage_dir=None, document_folder_path=""):
+def cleanup_validation_document_records(
+    api_url,
+    api_key,
+    document_locations,
+    *,
+    storage_dir=None,
+    workspace_slug="",
+):
+    """Permanently remove only exact document locations created by a probe."""
+    result = {
+        "status": "not_applicable",
+        "requested": 0,
+        "confirmed_absent": 0,
+        "locations": [],
+        "error": "",
+    }
+    normalized = []
+    seen = set()
+    managed_prefix = (
+        f"custom-documents/{sanitize_anythingllm_folder_name(f'{workspace_slug}-docs')}/"
+        if workspace_slug
+        else ""
+    )
+    for value in document_locations or []:
+        location = _safe_app_owned_queue_location(value)
+        if not location or location.casefold() in seen:
+            continue
+        # Raw-text probe documents are created by AnythingLLM with a unique
+        # ``raw-`` basename. File-upload probes use the dedicated managed
+        # workspace folder. Refuse every other location rather than widening
+        # this cleanup into a general document-deletion API.
+        basename = location.rsplit("/", 1)[-1].casefold()
+        if not basename.startswith("raw-") and not (
+            managed_prefix and location.casefold().startswith(managed_prefix.casefold())
+        ):
+            result["status"] = "rejected_unmanaged_location"
+            result["error"] = f"Validation cleanup refused unmanaged document location: {location}"
+            return result
+        seen.add(location.casefold())
+        normalized.append(location)
+    if not normalized:
+        return result
+    if len(normalized) > 100:
+        result["status"] = "rejected_excessive_scope"
+        result["error"] = "Validation cleanup refused more than 100 document locations."
+        return result
+    result["requested"] = len(normalized)
+    result["locations"] = normalized
+    try:
+        status, response_text = delete_json(
+            api_url.rstrip("/") + "/api/v1/system/remove-documents",
+            api_key=api_key,
+            timeout=60,
+            body={"names": normalized},
+        )
+    except Exception as exc:
+        result["status"] = "delete_failed"
+        result["error"] = str(exc)
+        return result
+    if not 200 <= status < 300:
+        result["status"] = "delete_failed"
+        result["error"] = response_text[:500]
+        return result
+    storage = Path(storage_dir) if storage_dir else default_anythingllm_storage_dir()
+    documents_root = (storage / "documents").resolve()
+    remaining = []
+    for location in normalized:
+        candidate = (documents_root / Path(location)).resolve()
+        try:
+            candidate.relative_to(documents_root)
+        except ValueError:
+            remaining.append(location)
+            continue
+        if candidate.exists():
+            remaining.append(location)
+    result["confirmed_absent"] = len(normalized) - len(remaining)
+    if remaining:
+        result["status"] = "delete_unconfirmed"
+        result["error"] = f"{len(remaining)} validation document file(s) remained after API cleanup."
+    else:
+        result["status"] = "deleted"
+    return result
+
+
+def delete_validation_workspace(
+    api_url,
+    workspace_slug,
+    api_key=None,
+    storage_dir=None,
+    document_folder_path="",
+    document_locations=None,
+):
     if not workspace_slug:
         return {"status": "not_applicable", "error": ""}
     runtime_key, _ = resolve_anythingllm_api_key(api_url, api_key, storage_dir)
@@ -12100,6 +12382,9 @@ def delete_validation_workspace(api_url, workspace_slug, api_key=None, storage_d
         "status": "error",
         "error": "",
         "document_folder_cleanup": {"status": "not_attempted", "path": "", "error": ""},
+        "document_record_cleanup": {
+            "status": "not_attempted", "requested": 0, "confirmed_absent": 0, "error": ""
+        },
     }
     try:
         status, response_text = delete_json(
@@ -12110,16 +12395,30 @@ def delete_validation_workspace(api_url, workspace_slug, api_key=None, storage_d
         result["status"] = "deleted" if 200 <= status < 300 else "delete_failed"
         result["error"] = "" if 200 <= status < 300 else response_text
         if result["status"] == "deleted":
+            result["document_record_cleanup"] = cleanup_validation_document_records(
+                api_url,
+                runtime_key,
+                document_locations,
+                storage_dir=storage_dir,
+                workspace_slug=workspace_slug,
+            )
             result["document_folder_cleanup"] = cleanup_validation_workspace_documents(
                 workspace_slug,
                 storage_dir=storage_dir,
                 document_folder_path=document_folder_path,
             )
-            if result["document_folder_cleanup"].get("status") not in {
+            cleanup_warning = result["document_folder_cleanup"].get("status") not in {
                 "deleted", "already_absent", "not_applicable",
-            }:
+            } or result["document_record_cleanup"].get("status") not in {
+                "deleted", "not_applicable",
+            }
+            if cleanup_warning:
                 result["status"] = "deleted_with_document_cleanup_warning"
-                result["error"] = result["document_folder_cleanup"].get("error") or "Managed document folder cleanup failed."
+                result["error"] = (
+                    result["document_record_cleanup"].get("error")
+                    or result["document_folder_cleanup"].get("error")
+                    or "Managed validation document cleanup failed."
+                )
         return result
     except Exception as exc:
         result["error"] = str(exc)
@@ -12450,6 +12749,7 @@ def run_temporary_workspace_validation(
             api_key=api_key,
             storage_dir=storage_dir,
             document_folder_path=(upload_report.get("document_folder_path") or ""),
+            document_locations=(upload_report.get("locations") or []),
         )
         cleanup_status = result["cleanup_result"].get("status")
         result["retention_status"] = (
@@ -13804,7 +14104,17 @@ def _update_workspace_embeddings_batched_serial(
                 "classification": "client_timeout_submission_unknown" if timeout_like else "client_transport_submission_unknown",
                 **outcome,
             }
-            batch_report["error"] = error["error"]
+            # A short HTTP receipt deadline is a hand-off observation point,
+            # not an embedding failure verdict. Preserve the raw exception
+            # for diagnostics, but keep the durable/operator-facing message
+            # aligned with the still-active exact-vector reconciliation.
+            batch_report["raw_transport_error"] = error["error"]
+            batch_report["error"] = (
+                "The client response deadline elapsed while AnythingLLM continued processing; "
+                "exact-vector observation is in progress."
+                if timeout_like
+                else error["error"]
+            )
             # A client timeout does not prove that Desktop rejected the work.
             # Preserve that uncertainty and do not automatically retry it.
             batch_report["submission_state"] = "unresolved"
@@ -13813,6 +14123,11 @@ def _update_workspace_embeddings_batched_serial(
             # budget which later document-wide checks must honour rather than
             # beginning another full 480-second wait.
             batch_report["receipt_deadline_elapsed"] = bool(timeout_like)
+            batch_report["receipt_state"] = (
+                "deadline_elapsed_observing_queue"
+                if timeout_like
+                else "transport_interrupted_observing_queue"
+            )
             batch_report["reconciliation_started_at_epoch"] = time.time()
             batch_report["reconciliation_deadline_seconds"] = (
                 ANYTHINGLLM_EMBEDDING_RECONCILIATION_TIMEOUT_SECONDS
@@ -13830,9 +14145,9 @@ def _update_workspace_embeddings_batched_serial(
             if callable(status_callback):
                 status_callback(
                     (
-                        f"AnythingLLM batch {batch_number} response timed out; reconciling exact vectors before deciding whether anything failed"
+                        f"AnythingLLM batch {batch_number} response is still pending; observing the AnythingLLM queue and exact vectors"
                         if timeout_like else
-                        f"AnythingLLM batch {batch_number} response was interrupted; reconciling exact vectors before deciding whether anything failed"
+                        f"AnythingLLM batch {batch_number} response was interrupted; observing the AnythingLLM queue and exact vectors"
                     ),
                     dict(batch_report),
                 )
@@ -13927,9 +14242,11 @@ def _update_workspace_embeddings_batched_serial(
                     else "workspace_attached_after_client_deadline"
                 )
                 if batch_report["searchability_proven"]:
+                    batch_report["receipt_state"] = "deadline_elapsed_vectors_confirmed"
                     batch_report["resolved_transport_event"] = {
                         "kind": "client_response_deadline_elapsed",
-                        "message": str(batch_report.pop("error", "") or "The client response deadline elapsed."),
+                        "message": str(batch_report.pop("error", "") or "The client response deadline elapsed while AnythingLLM continued processing."),
+                        "raw_transport_error": str(batch_report.pop("raw_transport_error", "") or ""),
                         "resolution": "exact_vectors_observed",
                     }
                 result["accepted"] += len(batch)
@@ -16457,7 +16774,7 @@ def apply_temporary_key_cleanup_review(selected, upload_report, prepare_and_uplo
     warnings = list(upload_report.get("warnings") or [])
     warnings.append(
         {
-            "warning": "Temporary Desktop API key cleanup needs review; upload evidence is retained.",
+            "warning": "Temporary Desktop API key cleanup was not confirmed; upload evidence is retained.",
             "reason": cleanup_reason,
         }
     )
@@ -18161,7 +18478,7 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
             result["message"] = (
                 f"Only {result['lancedb_matching_rows']} matching LanceDB row(s) were observed for "
                 f"{result['uploaded_payload_count']} planned/uploaded payload(s). Retrieval may work for a subset, "
-                "but this document is incomplete and needs review or explicit recovery."
+                "but this document is incomplete and requires explicit recovery."
             )
         elif not matching_docs and vector_namespace_evidence_exists:
             if normalized_observation_mode in {"fast", "identity"}:
@@ -19019,7 +19336,7 @@ def build_html_report(profile, candidates, selected, output_paths, storage_repor
             f"<td>{html.escape(', '.join(candidate.get('score_reasons', [])) or 'none')}</td></tr>"
         )
     if selected["readiness_status"] != "ready":
-        selected_status = "Needs review"
+        selected_status = "Extraction not ready"
     elif upload_report.get("status") == "complete":
         selected_status = "Extraction ready; native upload completed pending storage verification"
     else:
@@ -19414,6 +19731,8 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     automatic_candidate_shortcuts = []
     automatic_targeted_ocr_pages = []
     shared_boundary_reference = None
+    ocr_processing_seconds = 0.0
+    ocr_cache_reused_pages = 0
 
     candidates = []
     for backend_index, backend in enumerate(backend_names):
@@ -19570,7 +19889,53 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 "reason": "This extraction is not an OCR candidate with a prepared native peer.",
             }
             if backend == "pymupdf":
-                pages, layout_evidence = apply_region_aware_native_layout(pdf_path, pages)
+                def report_native_layout_progress(completed, total, activity):
+                    completed = min(max(0, int(completed or 0)), max(1, int(total or 0)))
+                    total = max(1, int(total or 0))
+                    layout_aggregate_total = max(
+                        1, total * max(1, len(backend_names))
+                    )
+                    # Native page extraction is complete before this
+                    # conservative layout/OCR substage begins. Keep the same
+                    # evidence boundary for every substage message.
+                    layout_aggregate_completed = min(
+                        layout_aggregate_total,
+                        (backend_index + 1) * total,
+                    )
+                    if activity == "targeted_ocr_started":
+                        detail = (
+                            f"Targeted OCR recovery on PDF page {completed}; "
+                            f"{completed - 1}/{total} layout pages reviewed"
+                        )
+                        evidence = "targeted_ocr_active"
+                    elif activity == "targeted_ocr_finished":
+                        detail = (
+                            f"Targeted OCR recovery finished on PDF page {completed}; "
+                            f"{completed}/{total} layout pages reviewed"
+                        )
+                        evidence = "targeted_ocr_finished"
+                    else:
+                        detail = f"Inspecting native layout: {completed}/{total} pages reviewed"
+                        evidence = "native_layout_progress"
+                    # PyMuPDF extraction has already supplied all page-count
+                    # evidence. This truthful substage label keeps the same
+                    # completed-unit boundary rather than inflating progress.
+                    report_upload_phase(
+                        "extraction",
+                        detail,
+                        completed_units=layout_aggregate_completed,
+                        total_units=layout_aggregate_total,
+                        fallback_fraction=(
+                            layout_aggregate_completed / layout_aggregate_total
+                        ),
+                        evidence_kind=evidence,
+                    )
+
+                pages, layout_evidence = apply_region_aware_native_layout(
+                    pdf_path,
+                    pages,
+                    progress_callback=report_native_layout_progress,
+                )
             elif backend == "unstructured":
                 pages, layout_evidence = remove_verified_photographed_ocr_running_headers(pages)
                 native_peer = next(
@@ -20044,13 +20409,43 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                     "candidate_dir": str(candidate_dir),
                 }
             )
+        backend_elapsed_seconds = time.perf_counter() - backend_started
+        candidate = candidates[-1]
+        candidate_ocr_seconds = 0.0
+        candidate_ocr_cache_pages = 0
+        if backend == "pymupdf":
+            candidate_ocr_seconds = max(
+                0.0,
+                float((candidate.get("layout_evidence") or {}).get("targeted_ocr_seconds") or 0.0),
+            )
+        elif (
+            backend == "unstructured"
+            and str(candidate.get("unstructured_strategy") or "").casefold()
+            in {"hi_res", "ocr_only"}
+        ):
+            execution = candidate.get("unstructured_execution") or {}
+            if str(execution.get("mode") or "") == "persistent_ocr_cache_hit":
+                candidate_ocr_cache_pages = len(
+                    execution.get("targeted_page_numbers") or candidate.get("pages") or []
+                )
+            else:
+                # The isolated OCR lane includes worker startup, recognition,
+                # reconciliation, and its cache write. That full monotonic span
+                # is the honest user-perceived OCR cost for this candidate.
+                candidate_ocr_seconds = backend_elapsed_seconds
+        candidate["ocr_processing_seconds"] = round(candidate_ocr_seconds, 3)
+        candidate["ocr_cache_reused_pages"] = max(0, int(candidate_ocr_cache_pages))
+        ocr_processing_seconds += candidate_ocr_seconds
+        ocr_cache_reused_pages += candidate_ocr_cache_pages
         emit_pipeline_timing_event(
             args,
             f"extraction_backend:{backend}",
-            elapsed_seconds=time.perf_counter() - backend_started,
+            elapsed_seconds=backend_elapsed_seconds,
             event="phase_completed",
             backend=backend,
             candidate_success=not bool(candidates[-1].get("error")),
+            ocr_processing_seconds=round(candidate_ocr_seconds, 3),
+            ocr_cache_reused_pages=max(0, int(candidate_ocr_cache_pages)),
         )
         if backend_mode == "automatic" and backend == "pymupdf4llm" and "unstructured" not in backend_names:
             evaluated = [candidate for candidate in candidates if not candidate.get("error")]
@@ -21714,7 +22109,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             warnings = list(upload_report.get("warnings") or [])
             warnings.append(
                 {
-                    "warning": "Upload continued even though preparation needs review.",
+                    "warning": "Upload continued even though local preparation was not fully verified.",
                     "reasons": selected["readiness_reasons"],
                 }
             )
@@ -22553,6 +22948,8 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             "variant_outputs": c.get("variant_outputs", {}),
             "unstructured_execution": c.get("unstructured_execution", {}),
             "unstructured_strategy": c.get("unstructured_strategy", ""),
+            "ocr_processing_seconds": c.get("ocr_processing_seconds", 0.0),
+            "ocr_cache_reused_pages": c.get("ocr_cache_reused_pages", 0),
             "native_ocr_reconciliation": c.get("native_ocr_reconciliation", {}),
             "score_reasons": c.get("score_reasons", []),
         }
@@ -22748,6 +23145,8 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         "source_short_label": profile.get("source_short_label", ""),
         "metadata_provenance": dict(profile.get("metadata_provenance") or {}),
         "total_pipeline_seconds": round(time.perf_counter() - total_started, 2),
+        "ocr_processing_seconds": round(ocr_processing_seconds, 3),
+        "ocr_cache_reused_pages": max(0, int(ocr_cache_reused_pages)),
         "readiness_status": selected["readiness_status"],
         "readiness_reasons": selected["readiness_reasons"],
         # The Automatic UI stages workers before its one shared Desktop queue

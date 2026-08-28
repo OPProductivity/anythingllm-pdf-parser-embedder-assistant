@@ -262,7 +262,7 @@ def _doctor(port: int, *, allow_owned_running_server: bool = True) -> int:
             return 0
         problems.append(f"port {port} is already in use")
     if problems:
-        print("Portable installation needs attention:", file=sys.stderr)
+        print("Portable installation is incomplete:", file=sys.stderr)
         for problem in problems:
             print(f"- {problem}", file=sys.stderr)
         return 1

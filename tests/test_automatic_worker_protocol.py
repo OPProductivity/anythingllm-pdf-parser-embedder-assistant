@@ -130,7 +130,8 @@ def test_confirm_guard_refuses_a_replayed_click_while_selection_is_pending():
 
     assert len(updates) == 1
     assert len(updates[0]) == 12
-    assert "AUTO-CONFIRM-003" in updates[0][0]["value"]
+    assert "run confirmation" in updates[0][0]["value"]
+    assert "AUTO-CONFIRM-003" not in updates[0][0]["value"]
     assert status == {"state": "preparing"}
 
 

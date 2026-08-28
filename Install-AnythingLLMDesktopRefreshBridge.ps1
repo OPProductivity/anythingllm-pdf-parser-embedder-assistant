@@ -381,12 +381,12 @@ try {
         $main.Contains('he.app.whenReady().then(XX).then(()=>__pdfPrepRefreshBridge.startPdfPrepRefreshBridge({app:he.app,getMainWindow:()=>$X})).catch(e=>{')
     )
     $v116AnchorMatch = (
-        $versionText -match '^[vV]?1\.16\.0(?:[-+].*)?$' -and
+        $versionText -match '^[vV]?1\.16\.(?:0|1)(?:[-+].*)?$' -and
         [regex]::Matches($main, [regex]::Escape($v116ImportAnchor)).Count -eq 1 -and
         [regex]::Matches($main, [regex]::Escape($v116StartAnchor)).Count -eq 1
     )
     $patchedV116AnchorMatch = (
-        $versionText -match '^[vV]?1\.16\.0(?:[-+].*)?$' -and
+        $versionText -match '^[vV]?1\.16\.(?:0|1)(?:[-+].*)?$' -and
         $bridgeModulePresent -and
         $main.Contains('const __pdfPrepRefreshBridge=require("./pdf-prep-refresh-bridge.cjs");' + $v116ImportAnchor) -and
         $main.Contains('he.app.whenReady().then(XX).then(()=>__pdfPrepRefreshBridge.startPdfPrepRefreshBridge({app:he.app,getMainWindow:()=>$X})).catch(e=>{')
@@ -448,9 +448,10 @@ try {
             $startReplacement = 'he.app.whenReady().then(XX).then(()=>__pdfPrepRefreshBridge.startPdfPrepRefreshBridge({app:he.app,getMainWindow:()=>$X})).catch(e=>{'
         }
         elseif ($v116AnchorMatch) {
-            # v1.16 retains the audited 1.15 window-creation seams. The exact
-            # version and one-occurrence anchors still gate this path, so no
-            # future release is accepted merely because its minified names match.
+            # v1.16.0 and v1.16.1 retain the audited 1.15 window-creation
+            # seams. The exact patch allow-list and one-occurrence anchors
+            # still gate this path, so no future release is accepted merely
+            # because its minified names match.
             $importAnchor = $v116ImportAnchor
             $startAnchor = $v116StartAnchor
             $startReplacement = 'he.app.whenReady().then(XX).then(()=>__pdfPrepRefreshBridge.startPdfPrepRefreshBridge({app:he.app,getMainWindow:()=>$X})).catch(e=>{'

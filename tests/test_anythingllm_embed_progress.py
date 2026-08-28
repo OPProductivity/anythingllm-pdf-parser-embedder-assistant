@@ -12,11 +12,41 @@ from auto_anythingllm_pipeline import (
     anythingllm_embed_progress_message,
     find_reusable_cached_document_locations,
     listen_for_anythingllm_embed_progress,
+    observe_indexed_source_identity_hint,
     parse_anythingllm_embed_progress_event,
 )
 
 
 pytestmark = pytest.mark.offline_deterministic
+
+
+def test_shadow_identity_hint_counts_distinct_sources_without_claiming_cache(tmp_path):
+    con = sqlite3.connect(tmp_path / "anythingllm.db")
+    try:
+        con.execute("create table workspace_documents (metadata text)")
+        con.executemany(
+            "insert into workspace_documents (metadata) values (?)",
+            [
+                (json.dumps({"chunkSource": "page-parent://one"}),),
+                (json.dumps({"chunkSource": "page-parent://one"}),),
+                (json.dumps({"chunkSource": "page-parent://other"}),),
+                ("not-json",),
+            ],
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    observation = observe_indexed_source_identity_hint(
+        tmp_path,
+        ["page-parent://one", "page-parent://two"],
+    )
+
+    assert observation == {
+        "status": "complete",
+        "expected_source_identities": 2,
+        "matched_source_identities": 1,
+    }
 
 
 def test_parses_desktop_embed_progress_event_and_renders_compact_status():

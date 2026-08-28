@@ -12,9 +12,32 @@ an isolated workspace, prepared three page records, linked all three records,
 and confirmed three linked vectors.  This proves one end-to-end contract, not
 all options or future releases.
 
-The bridge has separately been installed with exact v1.16 package anchors.
-The Desktop in-app updater remains outside this plan: its packaged updater
-configuration must not be treated as a supported update route.
+The refresh bridge is qualified separately with exact package anchors. It was
+not installed into the running v1.16.1 package during the contract
+qualification, so upload authority remains independent from renderer-refresh
+customization. The Desktop in-app updater remains outside this plan: its
+packaged updater configuration must not be treated as a supported update route.
+
+### v1.16.1 qualification (2026-08-28)
+
+The official Windows Desktop v1.16.1 package is now a separate immutable
+profile, not an alias for v1.16.0. Qualification recorded:
+
+- exact `app.asar` SHA-256
+  `4f00651eb1a421a3a37fb60dc9486e0dc5577d21efac96dcf4b05ad2887ea910`;
+- the required SQLite columns and all four documented core API routes;
+- temporary API-key creation and revocation;
+- isolated workspace creation, raw-text metadata upload, document linking,
+  exact vector confirmation, runtime retrieval, workspace deletion, and exact
+  probe-document deletion;
+- no surviving validation workspace or raw probe document after cleanup; and
+- exact one-occurrence refresh-bridge anchors for v1.16.1, validated without
+  modifying the installed package.
+
+The v1.16.1 Swagger initializer can briefly be empty while Desktop starts.
+Read-only route discovery may therefore fall back to the bounded OpenAPI file
+inside the same fingerprinted package. That documentation fallback never
+grants mutation authority by itself.
 
 ## Principles
 
@@ -70,7 +93,8 @@ contract.
 
 ### 2. Define a v1.16 capability contract
 
-Create an explicit `anythingllm-desktop-1.16.0-observed-profile-1` record.
+Create a separate explicit profile record for every qualified patch release
+(currently v1.16.0 and v1.16.1).
 It should store only non-secret contract facts:
 
 - exact Desktop version and a hash/fingerprint of the relevant package entry;

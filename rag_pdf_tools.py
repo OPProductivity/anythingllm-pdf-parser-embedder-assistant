@@ -795,7 +795,15 @@ def _pymupdf4llm_one_page_observed(
     thread.start()
     try:
         result = _pymupdf4llm_one_page(pdf_path_text, page_index, ocr_dpi)
-        write_activity("page_complete")
+        try:
+            write_activity("page_complete")
+        except OSError:
+            # The extracted page is authoritative. On Windows the parent can
+            # briefly hold the heartbeat JSON open while reading it, causing
+            # os.replace() to report a sharing violation. Losing this optional
+            # final telemetry update must not discard a completed extraction
+            # and replay the whole document through the sequential fallback.
+            pass
         return result
     finally:
         stop.set()

@@ -37,13 +37,23 @@ _PACKAGE_FINGERPRINT_CACHE_LOCK = threading.Lock()
 PROFILE_ID = "anythingllm-desktop-1.14.2-through-1.15.0-r2-observed-profile-2"
 V116_PROFILE_ID = "anythingllm-desktop-1.16.0-fingerprinted-settings-profile-1"
 V116_NATIVE_CONTRACT_ID = "anythingllm-desktop-1.16.0-native-pdf-contract-1"
+V1161_PROFILE_ID = "anythingllm-desktop-1.16.1-fingerprinted-settings-profile-1"
+V1161_NATIVE_CONTRACT_ID = "anythingllm-desktop-1.16.1-native-pdf-contract-1"
 OBSERVED_COMPATIBLE_DESKTOP_VERSIONS = ("1.14.2", "1.15.0-r2")
-OBSERVED_CANDIDATE_DESKTOP_VERSIONS = ("1.16.0",)
+OBSERVED_CANDIDATE_DESKTOP_VERSIONS = ("1.16.0", "1.16.1")
 OBSERVED_CANDIDATE_PACKAGE_FINGERPRINTS = {
     # Official Desktop v1.16.0 package observed during the isolated native
     # upload/confirmation run.  A release label alone does not identify a
     # locally modified or repackaged Electron bundle.
     "1.16.0": "a40a9bb5915e6383f51fd2a02e76052724a6c9d2576d852025eefcbb23d4282b",  # pragma: allowlist secret -- public package SHA-256 fingerprint, not a credential
+    # Official Windows x64 Desktop v1.16.1 package observed and qualified by
+    # an isolated create/upload/link/vector/retrieval/cleanup contract run on
+    # 2026-08-28.  The exact package remains part of the authority boundary.
+    "1.16.1": "4f00651eb1a421a3a37fb60dc9486e0dc5577d21efac96dcf4b05ad2887ea910",  # pragma: allowlist secret -- public package SHA-256 fingerprint, not a credential
+}
+OBSERVED_CANDIDATE_SETTINGS_PROFILES = {
+    "1.16.0": V116_PROFILE_ID,
+    "1.16.1": V1161_PROFILE_ID,
 }
 # Mutation authority is capability-specific. This immutable record comes from
 # the isolated 2026-08-22 real-PDF run: workspace creation, native metadata
@@ -59,6 +69,20 @@ OBSERVED_NATIVE_MUTATION_CONTRACTS = {
             "can_create_workspace",
             "can_upload_native_metadata",
             "can_poll_post_upload_state",
+        ),
+    },
+    "4f00651eb1a421a3a37fb60dc9486e0dc5577d21efac96dcf4b05ad2887ea910": {  # pragma: allowlist secret -- package SHA-256
+        "contract_id": V1161_NATIVE_CONTRACT_ID,
+        "desktop_version": "1.16.1",
+        "observed_at": "2026-08-28T06:47:45+00:00",
+        "capabilities": (
+            "can_create_temp_api_key",
+            "can_delete_temp_api_key",
+            "can_create_workspace",
+            "can_delete_workspace",
+            "can_upload_native_metadata",
+            "can_poll_post_upload_state",
+            "can_runtime_verify_embedder",
         ),
     },
 }
@@ -298,7 +322,7 @@ def _desktop_release_status(version: str, package_sha256: str = "") -> tuple[str
             return "candidate_version_requires_package_fingerprint", ""
         if package_sha256 != expected_fingerprint:
             return "unprofiled_package_fingerprint", ""
-        return "recognized_mutation_profile", V116_PROFILE_ID
+        return "recognized_mutation_profile", OBSERVED_CANDIDATE_SETTINGS_PROFILES[version]
     if version:
         return "unprofiled", ""
     return "unidentified", ""
@@ -378,7 +402,28 @@ def _documented_openapi_paths(payload: str) -> set[str]:
     }
 
 
-def probe_api_contract(api_url: str, *, timeout_seconds: float = 5.0) -> dict:
+def _openapi_paths_from_file(openapi_path: Path | None) -> tuple[set[str], str]:
+    """Read only the bounded installed OpenAPI file tied to this package."""
+    if openapi_path is None or not openapi_path.is_file():
+        return set(), "installed_openapi_missing"
+    try:
+        if openapi_path.stat().st_size > 4 * 1024 * 1024:
+            return set(), "installed_openapi_too_large"
+        payload = json.loads(openapi_path.read_text(encoding="utf-8"))
+        paths = payload.get("paths", {}) if isinstance(payload, dict) else {}
+        if not isinstance(paths, dict):
+            return set(), "installed_openapi_paths_invalid"
+        return {str(path) for path in paths}, ""
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        return set(), f"installed_openapi_error:{type(exc).__name__}"
+
+
+def probe_api_contract(
+    api_url: str,
+    *,
+    timeout_seconds: float = 5.0,
+    installed_openapi_path: Path | None = None,
+) -> dict:
     """Read the local Swagger contract without granting write authority.
 
     The probe never creates a key, workspace, document, or queue entry.  It
@@ -402,6 +447,7 @@ def probe_api_contract(api_url: str, *, timeout_seconds: float = 5.0) -> dict:
         "advisory_routes": {
             route: "not_checked" for route in ADVISORY_API_CONTRACT_ROUTES
         },
+        "contract_evidence_source": "",
         "error": validation_error,
     }
     if validation_error:
@@ -418,9 +464,18 @@ def probe_api_contract(api_url: str, *, timeout_seconds: float = 5.0) -> dict:
             result["error"] = "api_docs_response_too_large"
             return result
         paths = _documented_openapi_paths(body.decode("utf-8", errors="replace"))
+        if paths:
+            result["contract_evidence_source"] = "loopback_swagger_initializer"
     except Exception as exc:
         result["error"] = f"api_docs_probe_error:{type(exc).__name__}"
-        return result
+        paths = set()
+    if not paths and installed_openapi_path is not None:
+        paths, fallback_error = _openapi_paths_from_file(installed_openapi_path)
+        if paths:
+            result["contract_evidence_source"] = "installed_package_openapi"
+            result["error"] = ""
+        elif not result["error"]:
+            result["error"] = fallback_error
     documented = [route for route in REQUIRED_API_CONTRACT_ROUTES if route in paths]
     missing = [route for route in REQUIRED_API_CONTRACT_ROUTES if route not in paths]
     result["documented_core_routes"] = documented
@@ -584,7 +639,16 @@ def characterize(
         "capabilities": {name: asdict(value) for name, value in capabilities.items()},
     }
     if str(api_url or "").strip():
-        result["api_contract"] = probe_api_contract(api_url)
+        resources_dir_text = str(desktop_package.get("resources_dir") or "").strip()
+        installed_openapi = (
+            Path(resources_dir_text) / "backend" / "swagger" / "openapi.json"
+            if resources_dir_text
+            else None
+        )
+        result["api_contract"] = probe_api_contract(
+            api_url,
+            installed_openapi_path=installed_openapi,
+        )
     return result
 
 

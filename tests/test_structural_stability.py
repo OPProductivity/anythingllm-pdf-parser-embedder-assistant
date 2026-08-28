@@ -208,15 +208,18 @@ def test_catalog_filename_author_cues_are_delimited_not_first_word_guesses():
         "LúciaNagib_2011_Chapter7THESELF.pdf": ("Lúcia Nagib", "filename_compact_name_before_year"),
         "Jennifer L Fleissner Chapter 2 The Great Outdoors.pdf": ("Jennifer L Fleissner", "filename_name_before_section_label"),
         "WARTENBERG-2023.pdf": ("Wartenberg", "filename_surname_before_year"),
+        "Foley_1 Historical Materialism.pdf": ("Foley", "filename_surname_before_section_number"),
+        "Veblen 6.pdf": ("Veblen", "filename_surname_before_section_number"),
     }
     for filename, expected in cases.items():
         report = pipeline.infer_author_from_filename(Path(filename), title_hint="")
         assert (report["author"], report["source"]) == expected
     assert not pipeline.infer_author_from_filename(Path("Politics of Virtue.pdf"))["author"]
     assert not pipeline.infer_author_from_filename(Path("Carnal_Thoughts.pdf"))["author"]
+    assert not pipeline.infer_author_from_filename(Path("Paper_2.pdf"))["author"]
 
 
-def test_grouped_queue_cadence_does_not_use_the_slowest_source_window(tmp_path):
+def test_grouped_queue_cadence_uses_record_weighted_queue_time_only(tmp_path):
     run_root = tmp_path / "run"
     run_root.mkdir()
     ledger = {
@@ -239,13 +242,16 @@ def test_grouped_queue_cadence_does_not_use_the_slowest_source_window(tmp_path):
         "mode": app.MODE_NATIVE_UPLOAD_LABEL,
         "embedding_submission_strategy": "desktop_queue",
         "actual_records": 200,
-        "actual_seconds": 300,
+        # Whole-run time includes preparation and verification and must not be
+        # folded into the queue rate; the ETA formula prices those phases.
+        "actual_seconds": 900,
         "cached_attachment_reused_records": 0,
     }
     cadence = app.timing_model_desktop_queue_cadence(row)
-    assert cadence["basis"] == "whole_run_upper_bound_for_grouped_source_windows"
-    assert cadence["seconds_per_record"] == 1.5
-    assert cadence["records_per_minute"] == 40.0
+    assert cadence["basis"] == "weighted_source_window_queue_observers"
+    # 100 records at 60/min plus 100 at 6/min = 1,100 queue seconds / 200.
+    assert cadence["seconds_per_record"] == 5.5
+    assert cadence["records_per_minute"] == pytest.approx(60 / 5.5)
 
 
 def test_large_batch_learned_multiplier_ignores_small_run_ratios():
@@ -482,6 +488,33 @@ def test_pymupdf_page_worker_reports_activity_while_native_call_is_slow(tmp_path
     assert activity["page"] == 1
     assert activity["phase"] == "extracting_page_with_pymupdf4llm"
     assert observed["result"]["text"] == "done"
+
+
+def test_pymupdf_page_worker_keeps_completed_result_when_final_heartbeat_is_read_locked(tmp_path):
+    activity_path = tmp_path / "activity.json"
+    held_readers = []
+
+    def completed_page(*_args):
+        # Python's Windows file handle prevents os.replace() while this reader
+        # is open, matching the intermittent parent-observer collision seen in
+        # the real parallel OCR benchmark.
+        held_readers.append(activity_path.open("r", encoding="utf-8"))
+        return {"page": 1, "text": "completed text", "kind": "markdown_page"}
+
+    try:
+        with mock.patch.object(
+            rag_pdf_tools,
+            "_pymupdf4llm_one_page",
+            side_effect=completed_page,
+        ):
+            result = rag_pdf_tools._pymupdf4llm_one_page_observed(
+                "source.pdf", 0, 200, str(activity_path)
+            )
+    finally:
+        for reader in held_readers:
+            reader.close()
+
+    assert result == {"page": 1, "text": "completed text", "kind": "markdown_page"}
 
 
 def test_unresponsive_pymupdf_pool_never_retries_the_same_native_call_in_parent(tmp_path):
