@@ -1759,7 +1759,7 @@ class PipelineCoreTests(unittest.TestCase):
         button = app.automatic_completion_button_state(completion)
         self.assertEqual(button["value"], "Completed — 1 PDF not processed")
 
-    def test_terminal_status_message_is_expandable_and_hides_internal_code(self):
+    def test_terminal_status_message_uses_the_persistent_readable_lane_and_hides_internal_code(self):
         import rag_pdf_gradio_app as app
 
         rendered = app.automatic_live_status_html({
@@ -1772,10 +1772,48 @@ class PipelineCoreTests(unittest.TestCase):
             "last_activity_epoch": 120.0,
         })
 
-        self.assertIn('<details class="automatic-run-terminal-details">', rendered)
-        self.assertIn("<summary>", rendered)
+        self.assertIn('class="automatic-run-progress-details"', rendered)
+        self.assertNotIn("automatic-run-terminal-details", rendered)
         self.assertIn("Two PDFs were not processed", rendered)
         self.assertNotIn("AUTO-OCR-REVIEW-PARTIAL-001", rendered)
+
+    def test_grouped_upload_status_keeps_queue_and_verification_lanes_together(self):
+        import rag_pdf_gradio_app as app
+
+        display = {}
+        queue = app.combined_grouped_upload_status_details(
+            display,
+            "AnythingLLM queue group 5 of 6: embedding 198/340 records",
+            {"timing_event": "queue_progress", "source_window_index": 5},
+        )
+        combined = app.combined_grouped_upload_status_details(
+            display,
+            "Checking workspace attachment (step 1 of 2): 235/340 records searchable",
+            {"timing_event": "exact_vector_observation", "source_window_index": 5},
+        )
+
+        self.assertIn("AnythingLLM queue group 5", queue)
+        self.assertIn("AnythingLLM queue group 5", combined)
+        self.assertIn("Checking workspace attachment", combined)
+        self.assertIn("\n— ", combined)
+
+    def test_grouped_upload_status_discards_prior_source_verification(self):
+        import rag_pdf_gradio_app as app
+
+        display = {}
+        app.combined_grouped_upload_status_details(
+            display,
+            "Checking workspace attachment: source 4",
+            {"timing_event": "exact_vector_observation", "source_window_index": 4},
+        )
+        next_source = app.combined_grouped_upload_status_details(
+            display,
+            "AnythingLLM queue group 5: embedding 1/20 records",
+            {"timing_event": "queue_progress", "source_window_index": 5},
+        )
+
+        self.assertIn("queue group 5", next_source)
+        self.assertNotIn("source 4", next_source)
 
     def test_terminal_ocr_hold_records_workflow_completion_separately_from_upload(self):
         import rag_pdf_gradio_app as app
@@ -3500,6 +3538,55 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(repriced, 438)
         self.assertGreater(repriced, 100 + 200)
 
+    def test_exact_batch_plan_prices_only_fully_cached_source_windows(self):
+        import rag_pdf_gradio_app as app
+
+        all_sources = app.confirmed_prequeue_cache_eta_seconds(
+            10_000,
+            191,
+            fresh_provider_requests=621,
+            provider_request_seconds=1.72,
+            features={"document_count": 21},
+            cached_attachment_records=595,
+            remaining_source_windows=21,
+            cache_attachment_prior={"record_seconds": 0.08, "source_seconds": 3.15},
+        )
+        exact_plan = app.confirmed_batch_execution_plan_eta_seconds(
+            10_000,
+            191,
+            fresh_provider_requests=621,
+            provider_request_seconds=1.72,
+            features={"document_count": 21},
+            cached_attachment_records=595,
+            source_total=21,
+            cached_documents=11,
+            cache_attachment_prior={"record_seconds": 0.08, "source_seconds": 3.15},
+        )
+
+        self.assertLess(exact_plan, all_sources)
+        self.assertGreater(exact_plan, 191 + 621 * 1.72)
+
+    def test_exact_batch_plan_drops_provisional_ocr_surcharge_from_remaining_eta(self):
+        import rag_pdf_gradio_app as app
+
+        # 4,818 seconds mirrors an OCR-inflated opening estimate. Once all
+        # preparation is represented by elapsed time and the batch identities
+        # are exact, only the unstarted fresh/cache work belongs in the ETA.
+        exact_plan = app.confirmed_batch_execution_plan_eta_seconds(
+            4_818,
+            191,
+            fresh_provider_requests=621,
+            provider_request_seconds=1.72,
+            features={"document_count": 21},
+            cached_attachment_records=595,
+            source_total=21,
+            cached_documents=11,
+            cache_attachment_prior={"record_seconds": 0.08, "source_seconds": 3.15},
+        )
+
+        self.assertLess(exact_plan, 1_400)
+        self.assertGreater(exact_plan, 191)
+
     def test_first_source_cache_snapshot_keeps_unobserved_batch_records_fresh(self):
         import rag_pdf_gradio_app as app
 
@@ -4082,6 +4169,61 @@ class PipelineCoreTests(unittest.TestCase):
         }
         self.assertEqual(app.current_source_vector_progress_count(report), 706)
 
+    def test_vector_liveness_ignores_broader_identity_set_for_current_source(self):
+        import rag_pdf_gradio_app as app
+
+        report = {
+            "matching_vector_rows": 12,
+            "lancedb_matching_rows": 12,
+            "current_upload_document_vector_count": 2,
+            # This includes ten prior source identities and must not advance
+            # the current two-record source window.
+            "observed_chunk_source_count": 12,
+        }
+        self.assertEqual(
+            app.current_source_vector_progress_count(report, expected_records=2),
+            2,
+        )
+
+    def test_grouped_source_progress_ignores_workspace_wide_vector_total(self):
+        import rag_pdf_gradio_app as app
+
+        state = {
+            "prepared_records": 12,
+            "source_totals": {1: 10},
+            "source_completed": {1: 10},
+        }
+        current = app.grouped_source_window_progress(state, {
+            "timing_event": "exact_vector_observation",
+            "source_window_index": 2,
+            "source_window_total": 2,
+            "queue_records": 2,
+            "matching_vectors": 12,
+            "observed_chunk_source_count": 12,
+            "current_upload_document_vector_count": 0,
+        })
+        self.assertEqual(current["completed_records"], 10)
+        self.assertEqual(current["fraction"], 10 / 12)
+
+    def test_direct_picker_count_is_rendered_inside_the_picker_immediately(self):
+        import rag_pdf_gradio_app as app
+
+        self.assertIn("rag-selected-pdf-count", app.APP_CONNECTION_WATCHDOG_HEAD)
+        self.assertIn("PDF${selectedCount === 1 ? \"\" : \"s\"} selected", app.APP_CONNECTION_WATCHDOG_HEAD)
+        self.assertNotIn("automatic-selected-pdf-count", app.APP_CONNECTION_WATCHDOG_HEAD)
+
+    def test_direct_picker_reserves_count_space_and_keeps_add_more_available_while_settling(self):
+        import rag_pdf_gradio_app as app
+
+        self.assertIn("rag-pending-picker-actions", app.APP_BROWSER_THEME_HEAD)
+        self.assertIn("Add more PDF files", app.APP_BROWSER_THEME_HEAD)
+        self.assertIn("files: [...earlierFiles, ...files]", app.APP_BROWSER_THEME_HEAD)
+        self.assertIn("right: 104px", app.APP_CSS)
+        self.assertIn(
+            "#automatic-pdf-upload.rag-pdf-selection-pending .icon-button-wrapper.top-panel",
+            app.APP_CSS,
+        )
+
     def test_upload_count_schema_distinguishes_new_attachment_from_confirmation(self):
         import rag_pdf_gradio_app as app
 
@@ -4638,6 +4780,8 @@ class PipelineCoreTests(unittest.TestCase):
                 "prepared_records": 1_727,
                 "reusable_records": 1_217,
                 "source_window_total": 36,
+                "cached_documents": 17,
+                "partially_cached_documents": 4,
             },
         )
         forecast = app.observe_batch_queue_forecast(
@@ -4656,6 +4800,8 @@ class PipelineCoreTests(unittest.TestCase):
         )
 
         self.assertEqual(plan["cached_records"], 1_217)
+        self.assertEqual(plan["cached_documents"], 17)
+        self.assertEqual(plan["partially_cached_documents"], 4)
         self.assertEqual(plan["fresh_records"], 510)
         self.assertTrue(forecast["batch_cache_plan_observed"])
         self.assertEqual(forecast["known_fresh_records"], 510)
@@ -8415,6 +8561,8 @@ class PipelineCoreTests(unittest.TestCase):
                 started = next(stream)
                 observed_state = dict(app.LIVE_AUTOMATIC_RUN_STATUS)
                 completed = next(stream)
+                with self.assertRaises(StopIteration):
+                    next(stream)
             finally:
                 app.validated_automatic_run_settings = original_validate
                 app.run_automatic_from_confirmation = original_run
@@ -8493,7 +8641,7 @@ class PipelineCoreTests(unittest.TestCase):
         # Confirm submits concrete current controls rather than State-only
         # review data, so the direct action cannot become a visible no-op.
         self.assertGreater(len(confirm_dependencies[0]["inputs"]), 1)
-        self.assertEqual(len(confirm_dependencies[0]["outputs"]), 17)
+        self.assertEqual(len(confirm_dependencies[0]["outputs"]), 16)
         confirm_function = app.demo.fns[confirm_dependencies[0]["id"]]
         self.assertEqual(confirm_function.concurrency_id, app.AUTOMATIC_RUN_CONCURRENCY_ID)
         self.assertEqual(confirm_function.concurrency_limit, 1)
@@ -8502,10 +8650,31 @@ class PipelineCoreTests(unittest.TestCase):
         import rag_pdf_gradio_app as app
 
         locked = app.automatic_picker_lifecycle_updates({"state": "running"})
-        self.assertEqual(len(locked), 4)
+        self.assertEqual(len(locked), 3)
         self.assertTrue(all(not update["interactive"] for update in locked))
         unlocked = app.automatic_picker_lifecycle_updates({"state": "successful"})
         self.assertTrue(all(update["interactive"] for update in unlocked))
+
+    def test_gradio_event_outputs_all_have_rendered_components(self):
+        """A dangling output makes Gradio drop an otherwise valid stream.
+
+        Buttons mounted inside a File component's header are usable event
+        targets, but Gradio 6 does not expose them as independent rendered
+        components. They therefore cannot be included in another event's
+        output list.
+        """
+        import rag_pdf_gradio_app as app
+
+        config = app.demo.get_config_file()
+        component_ids = {component["id"] for component in config["components"]}
+        dangling = [
+            (dependency.get("api_name"), output_id)
+            for dependency in config["dependencies"]
+            for output_id in dependency.get("outputs", [])
+            if output_id not in component_ids
+        ]
+
+        self.assertEqual(dangling, [])
 
     def test_run_control_containers_never_use_dynamic_visibility(self):
         """A Gradio container visibility transition previously stacked action bars."""
@@ -8617,11 +8786,17 @@ class PipelineCoreTests(unittest.TestCase):
 
         local_seconds = int(re.search(r'data-expected-seconds="(\d+)"', local_timer).group(1))
         upload_seconds = int(re.search(r'data-expected-seconds="(\d+)"', upload_timer).group(1))
+        local_model_seconds = int(re.search(r'data-model-expected-seconds="(\d+)"', local_timer).group(1))
+        upload_model_seconds = int(re.search(r'data-model-expected-seconds="(\d+)"', upload_timer).group(1))
         # Local-only preparation is not subject to the native-upload floor;
         # a tiny ordinary text PDF can now receive the tested 8-second
         # minimum while a true upload retains a conservative larger budget.
-        self.assertGreaterEqual(local_seconds, 8)
-        self.assertGreater(upload_seconds, local_seconds)
+        # The displayed opening estimate is intentionally 30% more optimistic;
+        # the model value remains intact in a separate durable DOM field.
+        self.assertGreaterEqual(local_model_seconds, 8)
+        self.assertGreater(upload_model_seconds, local_model_seconds)
+        self.assertLess(local_seconds, local_model_seconds)
+        self.assertLess(upload_seconds, upload_model_seconds)
         self.assertIn("Est:", local_timer)
         self.assertIn("Est:", upload_timer)
 
@@ -15462,6 +15637,283 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(result["batches"][0]["verification"]["status"], "pass")
         self.assertTrue(any("sequential queue" in message for message in statuses))
 
+    def test_deferred_source_attachment_returns_locations_to_its_queue_group(self):
+        """Deferred source grouping must not misclassify its own hand-off as an error."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            text_file = Path(temp_dir) / "prepared.txt"
+            text_file.write_text("prepared page text", encoding="utf-8")
+            row = {
+                "filename": "prepared.txt",
+                "text_file": str(text_file),
+                "chunkSource": "page-parent://test-p0001",
+                "docSource": "local-pdf://sha256/" + "a" * 64,
+                "_automatic_source_path": "C:/sources/test.pdf",
+                "_validated_prepared_file_sha256": pipeline.hashlib.sha256(
+                    text_file.read_bytes()
+                ).hexdigest(),
+            }
+            expected_payload = {
+                "metadata": {
+                    "title": "test",
+                    "docSource": row["docSource"],
+                    "chunkSource": row["chunkSource"],
+                },
+            }
+            with (
+                mock.patch.object(
+                    pipeline,
+                    "resolve_anythingllm_api_key",
+                    return_value=("key", "provided"),
+                ),
+                mock.patch.object(
+                    pipeline,
+                    "upload_plan_rows_to_expected_payloads",
+                    return_value=[expected_payload],
+                ),
+                mock.patch.object(
+                    pipeline,
+                    "find_reusable_cached_document_locations",
+                    return_value=[""],
+                ),
+                mock.patch.object(
+                    pipeline,
+                    "snapshot_staged_document_locations",
+                    return_value=set(),
+                ),
+                mock.patch.object(
+                    pipeline,
+                    "post_multipart_form",
+                    return_value=(200, '{"success": true}'),
+                ),
+                mock.patch.object(
+                    pipeline,
+                    "extract_document_location",
+                    return_value="custom-documents/prepared.json",
+                ),
+            ):
+                result = pipeline.maybe_upload_segment_files(
+                    "http://anythingllm",
+                    "key",
+                    [row],
+                    workspace_slug="queue-workspace",
+                    defer_embedding_update=True,
+                )
+
+        self.assertEqual(result["status"], "attached_pending_queue")
+        self.assertEqual(result["locations"], ["custom-documents/prepared.json"])
+        self.assertEqual(result["errors"], [])
+
+    def test_source_queue_group_plan_preserves_a_large_pdf_as_one_group(self):
+        groups = [
+            {"source_key": "A", "rows": [{}, {}]},
+            {"source_key": "B", "rows": [{}]},
+            {"source_key": "C", "rows": [{} for _ in range(600)]},
+            {"source_key": "D", "rows": [{}]},
+        ]
+
+        planned = pipeline.plan_source_queue_groups(
+            groups, max_sources=4, max_records=10,
+        )
+
+        self.assertEqual(
+            [[item["source_key"] for item in group] for group in planned],
+            [["A", "B"], ["C"], ["D"]],
+        )
+
+    def test_source_transactions_submit_one_bounded_queue_group_after_source_local_attachment(self):
+        rows = [
+            {
+                "_automatic_source_path": "C:/sources/A.pdf",
+                "chunkSource": "page-parent://a-1",
+                "docSource": "local-pdf://sha256/" + "a" * 64,
+            },
+            {
+                "_automatic_source_path": "C:/sources/B.pdf",
+                "chunkSource": "page-parent://b-1",
+                "docSource": "local-pdf://sha256/" + "b" * 64,
+            },
+            {
+                "_automatic_source_path": "C:/sources/C.pdf",
+                "chunkSource": "page-parent://c-1",
+                "docSource": "local-pdf://sha256/" + "c" * 64,
+            },
+        ]
+        calls = []
+
+        def fake_segment(_url, _key, source_rows, **kwargs):
+            self.assertTrue(kwargs["defer_embedding_update"])
+            source_path = source_rows[0]["_automatic_source_path"]
+            location = "custom/" + Path(source_path).stem + ".json"
+            return {
+                "status": "attached_pending_queue",
+                "uploaded": len(source_rows),
+                "embedded": 0,
+                "locations": [location],
+                "reused_cached_locations": [],
+                "attachment_results": [{
+                    "location": location,
+                    "source_path": source_path,
+                    "filename": Path(source_path).name,
+                }],
+                "embedding_update": {},
+                "errors": [],
+            }
+
+        def fake_queue(_url, _key, _workspace, locations, **kwargs):
+            calls.append((list(locations), kwargs))
+            self.assertTrue(kwargs["_source_window_execution"])
+            verifier = kwargs["batch_verifier"]
+            verifier({"locations": list(locations)})
+            return {
+                "accepted": len(locations),
+                "requested": len(locations),
+                "queue_records": len(locations),
+                "planned_locations": list(locations),
+                "batches": [{
+                    "submission_state": "accepted",
+                    "searchability_proven": True,
+                }],
+                "runtime_events": [],
+                "errors": [],
+            }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                mock.patch.object(pipeline, "resolve_anythingllm_api_key", return_value=("key", "provided")),
+                mock.patch.object(pipeline, "find_reusable_cached_document_locations", return_value=["", "", ""]),
+                mock.patch.object(pipeline, "snapshot_staged_document_locations", return_value=set()),
+                mock.patch.object(pipeline, "maybe_upload_segment_files", side_effect=fake_segment),
+                mock.patch.object(pipeline, "update_workspace_embeddings_desktop_queue", side_effect=fake_queue),
+            ):
+                result = pipeline.maybe_upload_segment_files_source_transactions(
+                    "http://anythingllm", "key", rows,
+                    workspace_slug="queue-workspace",
+                    storage_dir=temp_dir,
+                    embedding_ledger_path=Path(temp_dir) / "batch-embedding-ledger.json",
+                    batch_verifier=lambda report: self.assertEqual(
+                        report["source_paths"],
+                        ["C:/sources/A.pdf", "C:/sources/B.pdf", "C:/sources/C.pdf"],
+                    ) or {},
+                )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls[0][0]), 3)
+        self.assertEqual(result["embedding_update"]["submission_strategy"], "durable_bounded_pdf_queue_groups")
+        self.assertTrue(all(
+            row["state"] == "exact_vectors_proven"
+            for row in result["source_transactions"]
+        ))
+
+    def test_source_local_rejection_does_not_discard_other_sources_in_its_queue_group(self):
+        rows = [
+            {"_automatic_source_path": "C:/sources/A.pdf", "chunkSource": "a", "docSource": "local-pdf://sha256/" + "a" * 64},
+            {"_automatic_source_path": "C:/sources/B.pdf", "chunkSource": "b", "docSource": "local-pdf://sha256/" + "b" * 64},
+            {"_automatic_source_path": "C:/sources/C.pdf", "chunkSource": "c", "docSource": "local-pdf://sha256/" + "c" * 64},
+        ]
+        queued = []
+
+        def fake_segment(_url, _key, source_rows, **_kwargs):
+            source_path = source_rows[0]["_automatic_source_path"]
+            if source_path.endswith("B.pdf"):
+                return {
+                    "status": "error",
+                    "uploaded": 0,
+                    "embedded": 0,
+                    "locations": [],
+                    "reused_cached_locations": [],
+                    "attachment_results": [],
+                    "embedding_update": {},
+                    "errors": [{
+                        "error": "Rejected before mutation",
+                        "classification": "prepared_upload_file_missing",
+                        "may_continue_later_sources": True,
+                    }],
+                }
+            location = "custom/" + Path(source_path).stem + ".json"
+            return {
+                "status": "attached_pending_queue", "uploaded": 1, "embedded": 0,
+                "locations": [location], "reused_cached_locations": [],
+                "attachment_results": [{"location": location, "source_path": source_path, "filename": Path(source_path).name}],
+                "embedding_update": {}, "errors": [],
+            }
+
+        def fake_queue(_url, _key, _workspace, locations, **_kwargs):
+            queued.append(list(locations))
+            return {
+                "accepted": len(locations), "requested": len(locations),
+                "queue_records": len(locations), "planned_locations": list(locations),
+                "batches": [{"submission_state": "accepted", "searchability_proven": True}],
+                "runtime_events": [], "errors": [],
+            }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                mock.patch.object(pipeline, "resolve_anythingllm_api_key", return_value=("key", "provided")),
+                mock.patch.object(pipeline, "find_reusable_cached_document_locations", return_value=["", "", ""]),
+                mock.patch.object(pipeline, "snapshot_staged_document_locations", return_value=set()),
+                mock.patch.object(pipeline, "maybe_upload_segment_files", side_effect=fake_segment),
+                mock.patch.object(pipeline, "update_workspace_embeddings_desktop_queue", side_effect=fake_queue),
+            ):
+                result = pipeline.maybe_upload_segment_files_source_transactions(
+                    "http://anythingllm", "key", rows,
+                    workspace_slug="queue-workspace", storage_dir=temp_dir,
+                )
+
+        self.assertEqual(queued, [["custom/A.json", "custom/C.json"]])
+        states = {row["source_filename"]: row["state"] for row in result["source_transactions"]}
+        self.assertEqual(states["A.pdf"], "exact_vectors_proven")
+        self.assertEqual(states["B.pdf"], "source_rejected_without_remote_mutation")
+        self.assertEqual(states["C.pdf"], "exact_vectors_proven")
+
+    def test_ambiguous_queue_group_holds_later_groups_without_replaying_the_group(self):
+        rows = [
+            {"_automatic_source_path": f"C:/sources/{name}.pdf", "chunkSource": name, "docSource": "local-pdf://sha256/" + name.casefold() * 64}
+            for name in ("A", "B", "C", "D", "E")
+        ]
+        queued = []
+
+        def fake_segment(_url, _key, source_rows, **_kwargs):
+            source_path = source_rows[0]["_automatic_source_path"]
+            location = "custom/" + Path(source_path).stem + ".json"
+            return {
+                "status": "attached_pending_queue", "uploaded": 1, "embedded": 0,
+                "locations": [location], "reused_cached_locations": [],
+                "attachment_results": [{"location": location, "source_path": source_path, "filename": Path(source_path).name}],
+                "embedding_update": {}, "errors": [],
+            }
+
+        def fake_queue(_url, _key, _workspace, locations, **_kwargs):
+            queued.append(list(locations))
+            return {
+                "accepted": 0, "requested": len(locations), "queue_records": len(locations),
+                "planned_locations": list(locations),
+                "batches": [{"submission_state": "unresolved", "searchability_proven": False}],
+                "runtime_events": [],
+                "errors": [{"category": "ambiguous_external_mutation", "error": "receipt unknown"}],
+            }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                mock.patch.object(pipeline, "resolve_anythingllm_api_key", return_value=("key", "provided")),
+                mock.patch.object(pipeline, "find_reusable_cached_document_locations", return_value=[""] * 5),
+                mock.patch.object(pipeline, "snapshot_staged_document_locations", return_value=set()),
+                mock.patch.object(pipeline, "maybe_upload_segment_files", side_effect=fake_segment),
+                mock.patch.object(pipeline, "update_workspace_embeddings_desktop_queue", side_effect=fake_queue),
+            ):
+                result = pipeline.maybe_upload_segment_files_source_transactions(
+                    "http://anythingllm", "key", rows,
+                    workspace_slug="queue-workspace", storage_dir=temp_dir,
+                )
+
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(len(queued[0]), 4)
+        self.assertEqual(result["stopped_after_source_transaction"], 1)
+        self.assertEqual(len(result["source_transactions"]), 4)
+        self.assertTrue(all(
+            row["state"] == "ambiguous_external_mutation_held"
+            for row in result["source_transactions"]
+        ))
+
     def test_desktop_source_windows_continue_after_an_explicitly_rejected_pdf(self):
         original_queue = pipeline.update_workspace_embeddings_desktop_queue
         child_calls = []
@@ -17207,7 +17659,9 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(queue_calls, [{"adds": ["custom-documents/first.json"], "deletes": []}])
         self.assertEqual(report["status"], "reconciliation_pending")
         self.assertEqual([row["status"] for row in report["attachment_results"]], ["attached", "submission_unknown"])
-        self.assertEqual(report["source_transactions"][0]["state"], "exact_vectors_proven")
+        # The first source was safely submitted before the later ambiguous
+        # attachment held the group, but the mocked 2xx does not prove vectors.
+        self.assertEqual(report["source_transactions"][0]["state"], "ambiguous_external_mutation_held")
         self.assertEqual(report["source_transactions"][1]["state"], "ambiguous_external_mutation_held")
         self.assertEqual(receipts[-1]["state"], "submission_unknown")
 
@@ -17259,20 +17713,29 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(
             queue_calls,
             [
-                {"adds": ["custom-documents/first.json"], "deletes": []},
-                {"adds": ["custom-documents/third.json"], "deletes": []},
+                {
+                    "adds": [
+                        "custom-documents/first.json",
+                        "custom-documents/third.json",
+                    ],
+                    "deletes": [],
+                },
             ],
         )
         self.assertEqual(report["source_transactions"][1]["state"], "source_rejected_without_remote_mutation")
         self.assertTrue(report["source_transactions"][1]["later_sources_released"])
-        self.assertEqual(report["source_transactions"][2]["state"], "exact_vectors_proven")
+        # The explicit rejection released the third source into the bounded
+        # queue group. A bare mocked 2xx still cannot be called vector proof.
+        self.assertEqual(report["source_transactions"][2]["state"], "ambiguous_external_mutation_held")
+        self.assertEqual(report["status"], "reconciliation_pending")
         self.assertTrue(transaction_ledger["journal_finalized"])
         self.assertEqual(len(transaction_ledger["transactions"]), 3)
-        self.assertEqual(len(transaction_events), 9)
-        self.assertEqual(
-            [event["transaction"]["state"] for event in transaction_events[-3:]],
-            ["prepared", "attachment_intent_durable", "exact_vectors_proven"],
-        )
+        # Group-level queue evidence adds durable state transitions; do not
+        # make the contract depend on an incidental journal-event count.
+        self.assertGreaterEqual(len(transaction_events), 9)
+        journal_states = [event["transaction"]["state"] for event in transaction_events]
+        self.assertIn("source_rejected_without_remote_mutation", journal_states)
+        self.assertGreaterEqual(journal_states.count("ambiguous_external_mutation_held"), 2)
 
     def test_attachment_success_without_location_holds_later_sources_and_never_reports_complete(self):
         """A 2xx without a durable location is an unknown mutation, not success.
@@ -17330,7 +17793,7 @@ class PipelineCoreTests(unittest.TestCase):
             for error in report["errors"]
         ))
 
-    def test_missing_attachment_location_is_recovered_by_exact_new_staged_document(self):
+    def test_missing_attachment_location_recovery_does_not_claim_vectors_from_http_acceptance(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             storage = root / "storage"
@@ -17374,12 +17837,20 @@ class PipelineCoreTests(unittest.TestCase):
                 pipeline.post_multipart_form = original_multipart
                 pipeline.post_json = original_json
 
-        self.assertEqual(report["status"], "complete")
+        # The local staged-document reconciliation restores exact attachment
+        # locations, but a bare 2xx embedding receipt is not vector evidence.
+        # The bounded queue route must retain recovery rather than reporting a
+        # false complete result.
+        self.assertEqual(report["status"], "reconciliation_pending")
         self.assertEqual(
             [row["status"] for row in report["attachment_results"]],
             ["attached_reconciled", "attached_reconciled"],
         )
-        self.assertEqual(len(queue_calls), 2)
+        self.assertEqual(len(queue_calls), 1)
+        self.assertTrue(all(
+            row["state"] == "ambiguous_external_mutation_held"
+            for row in report["source_transactions"]
+        ))
 
     def test_file_upload_transport_moves_segments_into_pdf_subfolder(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -20216,6 +20687,55 @@ class TimingAndInspectionSafetyTests(unittest.TestCase):
 
         self.assertFalse(notice["visible"])
         self.assertEqual(notice["state"], "successful")
+
+    def test_stale_picker_state_does_not_reject_a_visible_confirm_payload(self):
+        import rag_pdf_gradio_app as app
+
+        values = [None] * len(app.AUTOMATIC_RUN_FIELDS)
+        values[app.AUTOMATIC_RUN_FIELDS.index("pdf_files")] = ["C:/selected.pdf"]
+        delegated = object()
+
+        def fake_stream(*_args, **_kwargs):
+            yield delegated
+
+        with mock.patch.object(app, "run_automatic_from_confirmation_stream", fake_stream):
+            result = list(app.run_automatic_from_ready_confirmation_stream(
+                {"state": "pending"}, *values
+            ))
+
+        self.assertEqual(result, [delegated])
+
+    def test_stale_picker_state_without_a_pdf_still_does_not_start(self):
+        import rag_pdf_gradio_app as app
+
+        values = [None] * len(app.AUTOMATIC_RUN_FIELDS)
+        self.assertFalse(app.automatic_confirmation_payload_has_selected_pdf(values))
+
+    def test_exact_cache_reuse_marks_the_timing_text_without_claiming_a_lookup(self):
+        import rag_pdf_gradio_app as app
+
+        plain = app.automatic_run_timing_html(expected_seconds=90, state="running")
+        cached = app.automatic_run_timing_html(
+            expected_seconds=90,
+            state="running",
+            cache_reuse_records=7,
+        )
+
+        self.assertNotIn("cache-reuse-confirmed", plain)
+        self.assertIn("cache-reuse-confirmed", cached)
+
+    def test_opening_eta_optimism_is_presentation_only_and_cache_exempts_it(self):
+        import rag_pdf_gradio_app as app
+
+        self.assertEqual(app.opening_eta_presentation_seconds(100), 70)
+        self.assertEqual(app.opening_eta_presentation_seconds(100, exact_cache_reuse_records=1), 100)
+        rendered = app.automatic_run_timing_html(
+            expected_seconds=100,
+            presentation_expected_seconds=70,
+            state="ready",
+        )
+        self.assertIn('data-model-expected-seconds="100"', rendered)
+        self.assertIn("Est: 01m10s", rendered)
 
 
 if __name__ == "__main__":

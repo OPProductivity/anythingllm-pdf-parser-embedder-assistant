@@ -24,6 +24,7 @@ import html
 import hashlib
 import math
 import os
+import queue
 import re
 import shutil
 import sqlite3
@@ -352,6 +353,12 @@ DESKTOP_SERIAL_PROVIDER_REQUEST_PRIOR_SECONDS = 3.0
 # look stale.  This is presentation-only: it neither changes the estimate nor
 # weakens any live-reprice guardrail.
 INITIAL_ETA_LABEL_GRACE_SECONDS = 120
+# The opening number is deliberately an operator-facing planning signal, not
+# the model's internal truth. Keep the requested optimism isolated here so it
+# cannot alter multi-lane pacing, historical learning, safety ceilings, or
+# source-window scheduling. The first material observed reprice restores the
+# unmodified model estimate; proved cache reuse does so immediately.
+OPENING_NONCACHE_ETA_DISPLAY_FACTOR = 0.70
 # A partially cached upload can still measure the normal Desktop queue when
 # the overwhelming majority of records were freshly embedded.  Conversely,
 # a mostly cached attachment run is not capacity evidence for a future fresh
@@ -438,11 +445,23 @@ APP_THEME = gr.themes.Soft(primary_hue="blue", neutral_hue="slate")
 # read-mostly record. The durable copy lives beside the generated artifacts so
 # an error can always be inspected after the browser event has ended.
 LIVE_AUTOMATIC_RUN_STATUS = {}
-# ``run-progress.json`` remains an every-callback recovery snapshot.  The
-# append-only trace is deliberately leaner: page-parent cache linking can emit
-# hundreds of legitimate callbacks in a fraction of a second, none of which
-# need to become a separate durable UI-timeline row.  Keep only the last trace
-# signature for each active root; terminal and material checkpoints always win.
+# ``run-progress.json`` is a recovery snapshot, not a per-record journal.
+# Source-transaction receipts retain the durable mutation boundary.  A
+# one-second snapshot cadence prevents thousands of queue callbacks from
+# becoming competing fsync-heavy rewrites on Windows; state/phase/terminal
+# transitions always persist immediately.
+AUTOMATIC_RUN_PROGRESS_SNAPSHOT_INTERVAL_SECONDS = 1.0
+AUTOMATIC_RUN_PROGRESS_SNAPSHOT_STATE = {}
+# The timing timeline is diagnostic evidence. Preserve phase/mutation
+# boundaries exactly, but coalesce repeated queue/cache observations to one
+# readable one-second cadence.
+TIMING_TIMELINE_SNAPSHOT_INTERVAL_SECONDS = 1.0
+TIMING_TIMELINE_LAST_PERSISTED = {}
+# The append-only trace is deliberately leaner: page-parent cache linking can
+# emit hundreds of legitimate callbacks in a fraction of a second, none of
+# which need to become a separate durable UI-timeline row. Keep only the last
+# trace signature for each active root; terminal and material checkpoints
+# always win.
 AUTOMATIC_RUN_PROGRESS_TRACE_STATE = {}
 AUTOMATIC_RUN_PROGRESS_TRACE_MIN_INTERVAL_SECONDS = 1.0
 # Unlike run-progress.json, the trace is a best-effort chronological audit
@@ -959,23 +978,90 @@ APP_CONNECTION_WATCHDOG_HEAD = """
         }
         textNode = treeWalker.nextNode();
       }
+      const nativePreview = automaticUpload.querySelector(".file-preview");
+      // Gradio also gives its upload/clear controls aria-label values.  Count
+      // only the file-name cells; otherwise three selected PDFs can display
+      // as four because the upload button is mistaken for a file.
+      const nativePreviewNames = nativePreview
+        ? Array.from(nativePreview.querySelectorAll("td[aria-label]"))
+            .map((node) => node.getAttribute("aria-label") || "")
+            .filter((name) => /\\.pdf$/i.test(name))
+        : [];
       const pending = window.ragPendingAutomaticPdfSelection;
+      const selectedCount = pending?.files?.length || new Set(nativePreviewNames).size;
+      const syncPendingActionRail = () => {
+        let rail = automaticUpload.querySelector(".rag-pending-picker-actions");
+        if (!pending?.files?.length) {
+          rail?.remove();
+          return;
+        }
+        if (!rail) {
+          rail = document.createElement("div");
+          rail.className = "rag-pending-picker-actions";
+          rail.setAttribute("aria-label", "Selected PDF actions");
+          automaticUpload.appendChild(rail);
+        }
+        const makeAction = (action, label, enabled) => {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = `rag-pending-picker-action rag-pending-picker-${action}`;
+          button.setAttribute("aria-label", label);
+          button.title = label;
+          button.disabled = !enabled;
+          button.textContent = action === "add" ? "↑" : action === "reuse" ? "↻" : "×";
+          return button;
+        };
+        const fileInput = automaticUpload.querySelector('input[type="file"]');
+        const addMore = makeAction("add", "Add more PDF files", Boolean(fileInput) && !fileInput.disabled);
+        addMore.addEventListener("click", () => {
+          // Keep the native input as the one browser-owned file chooser. This
+          // retains Gradio's multi-location append behavior without a second
+          // hidden uploader or a synthetic file-list mutation.
+          if (fileInput && !fileInput.disabled) fileInput.click();
+        });
+        // The matching native controls may be unmounted while Gradio is
+        // transferring files. Retain their footprint, but do not let a clear
+        // or reuse action race the in-flight selection update.
+        rail.replaceChildren(
+          addMore,
+          makeAction("reuse", "Use selected files again", false),
+          makeAction("clear", "Clear selected files", false),
+        );
+      };
+      syncPendingActionRail();
+      let countBadge = automaticUpload.querySelector(".rag-selected-pdf-count");
+      if (selectedCount) {
+        if (!countBadge) {
+          countBadge = document.createElement("span");
+          countBadge.className = "rag-selected-pdf-count";
+          countBadge.setAttribute("role", "status");
+          countBadge.setAttribute("aria-live", "polite");
+          automaticUpload.appendChild(countBadge);
+        }
+        countBadge.textContent = `${selectedCount} PDF${selectedCount === 1 ? "" : "s"} selected`;
+      } else {
+        countBadge?.remove();
+      }
       let pendingList = automaticUpload.querySelector(".rag-pending-pdf-list");
       if (!pending?.files?.length) {
         automaticUpload.classList.remove("rag-pdf-selection-pending");
         pendingList?.remove();
         return;
       }
-      const nativePreview = automaticUpload.querySelector(".file-preview");
-      const nativePreviewNames = nativePreview
-        ? Array.from(nativePreview.querySelectorAll("[aria-label]"))
-            .map((node) => node.getAttribute("aria-label") || "")
-        : [];
-      const allNativeRowsReady = Boolean(nativePreview)
-        && pending.files.every((file) => nativePreviewNames.includes(file.name));
+      const remainingNativeNames = new Map();
+      for (const name of nativePreviewNames) {
+        remainingNativeNames.set(name, (remainingNativeNames.get(name) || 0) + 1);
+      }
+      const allNativeRowsReady = Boolean(nativePreview) && pending.files.every((file) => {
+        const remaining = remainingNativeNames.get(file.name) || 0;
+        if (!remaining) return false;
+        remainingNativeNames.set(file.name, remaining - 1);
+        return true;
+      });
       if (allNativeRowsReady) {
         window.ragPendingAutomaticPdfSelection = null;
         automaticUpload.classList.remove("rag-pdf-selection-pending");
+        automaticUpload.querySelector(".rag-pending-picker-actions")?.remove();
         pendingList?.remove();
         return;
       }
@@ -1017,7 +1103,14 @@ APP_CONNECTION_WATCHDOG_HEAD = """
           ? `${(file.size / 1048576).toFixed(1)} MB`
           : `${Math.max(1, Math.ceil(file.size / 1024))} KB`,
       }));
-      window.ragPendingAutomaticPdfSelection = files.length ? { files } : null;
+      // Selecting from a second location while the first chooser transfer is
+      // still settling is an intentional normal workflow. Preserve the
+      // already-visible pending rows so the count/list never jumps backwards;
+      // Gradio remains the authority for the eventual server-side selection.
+      const earlierFiles = window.ragPendingAutomaticPdfSelection?.files || [];
+      window.ragPendingAutomaticPdfSelection = files.length
+        ? { files: [...earlierFiles, ...files] }
+        : null;
       requestAnimationFrame(syncAutomaticPdfPickerPresentation);
     }, true);
     let pickerPresentationQueued = false;
@@ -1466,8 +1559,14 @@ APP_JS = """
       timer.className = "automatic-run-timing running";
       const initialLabelHasMatured = elapsedMs >= 120000;
       const basis = timer.dataset.etaBasis === "cache_plan_confirmed"
-        ? " · cache plan confirmed"
-        : timer.dataset.etaBasis === "live_observations"
+        ? (() => {
+            const cachedDocuments = Number(timer.dataset.cacheReuseDocuments || 0);
+            const totalDocuments = Number(timer.dataset.cacheTotalDocuments || 0);
+            return cachedDocuments > 0 && totalDocuments > 0
+              ? ` · ${cachedDocuments} of ${totalDocuments} documents already cached`
+              : "";
+          })()
+        : ["live_observations", "execution_plan_confirmed"].includes(timer.dataset.etaBasis)
           ? ""
           : expected > 0 && !initialLabelHasMatured ? " · initial estimate" : "";
       timer.innerHTML = `<strong>${expected > 0 ? `Est: ${formatEstimate(window.ragAutomaticRunDisplayedRemaining)}${basis}` : "Est: calculating…"}</strong>`;
@@ -1485,7 +1584,21 @@ APP_JS = """
     button.addEventListener("click", () => {
       const shouldAcknowledge = !button.disabled
         && /confirm and start processing/i.test(button.textContent || "");
-      startAutomaticRunTimer(true);
+      // The confirmation screen's ETA is a planning preview, not a
+      // run-owned countdown.  Do not let it keep ticking after the click:
+      // the first displayed run estimate must come from the worker's durable
+      // status record.  This avoids a visible jump when confirmation takes a
+      // few seconds to establish the authoritative start time.
+      const timer = document.getElementById("automatic-run-timing");
+      if (shouldAcknowledge && timer) {
+        if (window.ragAutomaticRunTimerInterval) {
+          window.clearTimeout(window.ragAutomaticRunTimerInterval);
+          window.ragAutomaticRunTimerInterval = 0;
+        }
+        timer.dataset.runState = "preparing";
+        timer.dataset.expectedSeconds = "0";
+        timer.innerHTML = "<strong>Est: calculating…</strong>";
+      }
       // Gradio's streaming callback yields before PDF inspection, but the
       // request itself can still spend several seconds reaching that first
       // server update. A microtask runs after the current click has propagated
@@ -3313,8 +3426,76 @@ body.dark .batch-folder-inline-notice {
 .pdf-upload-input:not(:has(.file-preview)) {
     min-height: 156px !important;
 }
+#automatic-pdf-upload {
+    position: relative;
+}
+#automatic-pdf-upload > .rag-selected-pdf-count {
+    position: absolute;
+    top: 8px;
+    /* The native File header owns the far right edge for add/reuse/clear.
+       Reserve that whole action rail so a selected-file count cannot be
+       hidden underneath those controls at any responsive width. */
+    right: 104px;
+    z-index: 3;
+    max-width: calc(100% - 210px);
+    overflow: hidden;
+    color: var(--body-text-color-subdued, #64748b);
+    font-size: 0.82rem;
+    font-weight: 600;
+    line-height: 1.25;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    pointer-events: none;
+}
 .pdf-upload-input.rag-pdf-selection-pending .file-preview {
     display: none !important;
+}
+/* Gradio briefly unmounts its header actions while it transfers a new File
+   selection. Keep an identically placed, stable action rail in that interval:
+   add-more deliberately remains live, while the actions that would mutate the
+   in-flight selection are visibly disabled until the authoritative list is
+   mounted again. */
+#automatic-pdf-upload.rag-pdf-selection-pending .icon-button-wrapper.top-panel {
+    visibility: hidden !important;
+}
+#automatic-pdf-upload > .rag-pending-picker-actions {
+    position: absolute;
+    top: 7px;
+    right: 10px;
+    z-index: 4;
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    min-height: 24px;
+}
+#automatic-pdf-upload .rag-pending-picker-action {
+    display: inline-grid;
+    place-items: center;
+    width: 24px;
+    height: 24px;
+    min-width: 24px;
+    min-height: 24px;
+    padding: 0;
+    border: 1px solid var(--border-color-primary, #475569);
+    border-radius: 4px;
+    background: var(--background-fill-secondary, #172033);
+    color: var(--body-text-color, #e5eefc);
+    font-size: 1rem;
+    font-weight: 600;
+    line-height: 1;
+}
+#automatic-pdf-upload .rag-pending-picker-action:not(:disabled) {
+    cursor: pointer;
+    color: var(--color-accent, #2563eb);
+}
+#automatic-pdf-upload .rag-pending-picker-action:disabled {
+    cursor: wait;
+    opacity: 0.52;
+}
+.rag-pending-pdf-list {
+    /* The count remains visible in its own reserved header line instead of
+       competing with the first immediate pending filename. */
+    padding-top: 36px;
 }
 .rag-pending-pdf-list {
     display: grid;
@@ -4263,6 +4444,12 @@ body:not(.dark) .gradio-container label[data-testid$="-checkbox-label"] {
     font-size: 0.92em;
     font-variant-numeric: tabular-nums;
 }
+.automatic-run-timing.cache-reuse-confirmed strong {
+    color: #15803d !important;
+}
+body.dark .automatic-run-timing.cache-reuse-confirmed strong {
+    color: #22c55e !important;
+}
 .automatic-run-timing-host,
 .automatic-run-timing-host > div,
 .automatic-run-timing-host > .wrap,
@@ -4350,55 +4537,21 @@ body:not(.dark) .gradio-container label[data-testid$="-checkbox-label"] {
     min-width: 0;
 }
 .automatic-run-progress-details {
-    /* A live card is a status summary, not the full terminal report.  Two
-       lines preserve the useful explanation while keeping the terminal
-       receipt inside the same stable lane as an active queue update.  The
-       complete, unabridged outcome remains in Run output and downloads. */
-    display: -webkit-box;
-    min-height: 1.25em;
-    overflow: hidden;
-    -webkit-box-orient: vertical;
-    -webkit-line-clamp: 2;
-}
-.automatic-run-terminal-details {
-    grid-column: 1 / -1;
-    min-width: 0;
-    min-height: 1.25em;
-}
-.automatic-run-terminal-details summary {
-    position: relative;
-    display: -webkit-box;
-    min-height: 1.25em;
-    padding-right: 22px;
-    overflow: hidden;
-    cursor: pointer;
-    list-style: none;
-    overflow-wrap: anywhere;
-    -webkit-box-orient: vertical;
-    -webkit-line-clamp: 2;
-}
-.automatic-run-terminal-details summary::-webkit-details-marker { display: none; }
-.automatic-run-terminal-details summary::after {
-    content: "▶";
-    position: absolute;
-    top: 0;
-    right: 2px;
-    color: currentColor;
-    font-size: .82em;
-}
-.automatic-run-terminal-details[open] summary {
+    /* Queue and exact-vector observations are independent evidence lanes.
+       Reserve their full four-line area from the start, rather than replacing
+       one with the other or making the card jump as a later callback wraps. */
     display: block;
-    overflow: visible;
-    -webkit-line-clamp: unset;
+    min-height: 4.8em;
+    overflow-wrap: anywhere;
+    white-space: pre-line;
 }
-.automatic-run-terminal-details[open] summary::after { content: "▼"; }
 /* Running status and its terminal receipt occupy the same visual lane. */
 .automatic-run-activity.running .automatic-run-progress-label,
 .automatic-run-activity.successful .automatic-run-progress-label,
 .automatic-run-activity.warning .automatic-run-progress-label,
 .automatic-run-activity.failed .automatic-run-progress-label,
 .automatic-run-activity.cancelled .automatic-run-progress-label {
-    min-height: 6.25em;
+    min-height: 9.75em;
 }
 .automatic-run-progress-label span { font-variant-numeric: tabular-nums; }
 .automatic-run-batch-count {
@@ -4408,7 +4561,9 @@ body:not(.dark) .gradio-container label[data-testid$="-checkbox-label"] {
 }
 .automatic-run-activity.preparing .automatic-run-progress-label {
     display: block;
-    min-height: 2.45em;
+    /* Confirmation already owns the run. Reserve the same status-card height
+       now so the first worker update cannot push the surrounding controls. */
+    min-height: 9.75em;
     padding-top: 3px;
     line-height: 1.2;
 }
@@ -4577,6 +4732,9 @@ body.dark #automatic-run-timing.automatic-run-timing {
 body.dark #automatic-run-timing.automatic-run-timing strong,
 body.dark #automatic-run-timing.automatic-run-timing .automatic-run-timing-detail {
     color: inherit !important;
+}
+body.dark #automatic-run-timing.automatic-run-timing.cache-reuse-confirmed strong {
+    color: #22c55e !important;
 }
 /* Final light-mode native-picker treatment.  This belongs at the end of the
    stylesheet because Gradio's generic light Block rule is intentionally
@@ -12271,6 +12429,14 @@ QUEUE_ETA_MAX_CHANGE_RATIO = 0.25
 # move by at most one readable step.
 QUEUE_ETA_MAX_UPWARD_CHANGE_RATIO = 0.05
 QUEUE_ETA_MAX_UPWARD_CHANGE_SECONDS = 90
+# The step cap above prevents a single abrupt jump.  It did not prevent a
+# three-minute cadence from repeatedly accumulating the same slow observation
+# into a much larger promise.  Keep a bounded run-level envelope around the
+# opening multi-lane estimate; a second independently observed queue group is
+# still required before any upward movement is considered.
+QUEUE_ETA_MAX_UPWARD_RUN_RATIO = 0.20
+QUEUE_ETA_MAX_UPWARD_RUN_MIN_SECONDS = 180
+QUEUE_ETA_MAX_UPWARD_RUN_MAX_SECONDS = 900
 QUEUE_ETA_MIN_WINDOWS_FOR_INCREASE = 2
 QUEUE_ETA_UPWARD_CONSENSUS_SAMPLES = 4
 OCR_RUNTIME_ETA_MAX_VISIBLE_REPRICES = 4
@@ -12307,7 +12473,7 @@ def grouped_source_window_progress(progress_state, report):
             0,
             int((report or {}).get("desktop_queue_completed") or 0),
             int((report or {}).get("desktop_queue_current") or 0),
-            int((report or {}).get("matching_vectors") or 0),
+            current_source_vector_progress_count(report, expected_records=queue_total),
         )
     except (TypeError, ValueError):
         source_index = source_total = queue_total = queue_completed = 0
@@ -12370,25 +12536,24 @@ def grouped_upload_owns_progress_event(grouped_upload_active, phase_name):
     }
 
 
-def current_source_vector_progress_count(report):
+def current_source_vector_progress_count(report, *, expected_records=None):
     """Return exact-vector movement belonging only to the current source.
 
-    Workspace-wide matching-row counts can include earlier source windows and
-    are useful diagnostic evidence, but must never keep a later held source
-    alive. The reconciliation liveness clock advances only from the current
-    source's identity-matched vector count.
+    Workspace-wide matching-row counts and the broader identity-set count can
+    include earlier source windows. They remain useful diagnostics, but must
+    never advance a later source's progress or liveness clock. The only count
+    allowed here is the verifier's exact current-upload count, optionally
+    bounded by the current source's prepared-record total.
     """
-    values = (
-        (report or {}).get("current_upload_document_vector_count"),
-        (report or {}).get("observed_chunk_source_count"),
-    )
-    parsed = []
-    for value in values:
-        try:
-            parsed.append(max(0, int(value or 0)))
-        except (TypeError, ValueError):
-            continue
-    return max(parsed or [0])
+    try:
+        observed = max(0, int((report or {}).get("current_upload_document_vector_count") or 0))
+    except (TypeError, ValueError):
+        observed = 0
+    try:
+        expected = max(0, int(expected_records)) if expected_records is not None else 0
+    except (TypeError, ValueError):
+        expected = 0
+    return min(observed, expected) if expected else observed
 
 
 def concurrent_ingestion_progress_fraction(evidence_fraction, elapsed_seconds, expected_seconds):
@@ -12497,11 +12662,16 @@ def update_live_automatic_run_status(
     batch_completed_files=None,
     batch_total_files=None,
     batch_current_file_index=None,
+    authoritative_batch_completed_files=False,
     confirmation_in_flight=None,
     confirmation_owner_token=None,
     completion_code=None,
     not_processed_pdf_count=None,
     queue_forecast_expected_seconds=None,
+    cache_reuse_records=None,
+    cache_reuse_documents=None,
+    cache_total_documents=None,
+    presentation_expected_seconds=None,
 ):
     """Persist progress evidence plus a deliberately capped time-based estimate.
 
@@ -12556,6 +12726,23 @@ def update_live_automatic_run_status(
         if incoming_progress_phase else str(phase or "Working") != str(previous.get("phase") or "")
     )
     expected = max(0, int(expected_seconds or previous.get("expected_seconds") or 0))
+    prior_presentation_expected = max(
+        0,
+        int(previous.get("presentation_expected_seconds") or expected),
+    )
+    if presentation_expected_seconds is None:
+        # A real, material reprice supersedes the opening-only display
+        # adjustment. Ordinary status repaints retain their existing display
+        # clock and cannot disturb either the model or the UI.
+        presentation_expected = (
+            expected if str(eta_reprice_reason or "").strip()
+            else prior_presentation_expected
+        )
+    else:
+        try:
+            presentation_expected = max(0, int(presentation_expected_seconds))
+        except (TypeError, ValueError):
+            presentation_expected = expected
     if cancel_available is None:
         cancel_available = previous.get("cancel_available", str(state or "") == "running")
     if cancel_requested is None:
@@ -12575,14 +12762,34 @@ def update_live_automatic_run_status(
     batch_total = _batch_count(batch_total_files, prior_batch_total)
     prior_batch_completed = _batch_count(previous.get("batch_completed_files"))
     incoming_batch_completed = _batch_count(batch_completed_files, prior_batch_completed)
-    # A batch result never becomes unfinished just because a later current-PDF
-    # callback arrives. Queue/vector work remains separate evidence.
-    batch_completed = max(prior_batch_completed, incoming_batch_completed)
+    # Local preparation and confirmed AnythingLLM queue work are different
+    # facts.  During the authoritative grouped queue lane, replace the earlier
+    # preparation count with the exact confirmed-source count instead of
+    # preserving a misleading "all PDFs completed" high-water mark.
+    batch_completed = (
+        incoming_batch_completed
+        if authoritative_batch_completed_files
+        else max(prior_batch_completed, incoming_batch_completed)
+    )
     if batch_total:
         batch_completed = min(batch_completed, batch_total)
     batch_current = _batch_count(batch_current_file_index, previous.get("batch_current_file_index"))
     if batch_total > 1:
         batch_current = min(batch_current, batch_total)
+    prior_cache_reuse_records = _batch_count(previous.get("cache_reuse_records"))
+    cache_reuse_records = _batch_count(cache_reuse_records, prior_cache_reuse_records)
+    prior_cache_reuse_documents = _batch_count(previous.get("cache_reuse_documents"))
+    cache_reuse_documents = _batch_count(
+        cache_reuse_documents,
+        prior_cache_reuse_documents,
+    )
+    prior_cache_total_documents = _batch_count(previous.get("cache_total_documents"))
+    cache_total_documents = _batch_count(
+        cache_total_documents,
+        prior_cache_total_documents,
+    )
+    if cache_total_documents:
+        cache_reuse_documents = min(cache_reuse_documents, cache_total_documents)
     remaining_fraction = max(0.0, 1.0 - confirmed)
     # A phase earns at most a modest forecast allowance. If the phase exceeds
     # its budget, the bar waits at the cap for real evidence instead of racing
@@ -12670,11 +12877,18 @@ def update_live_automatic_run_status(
             else previous.get("confirmation_owner_token") or ""
         ),
         "expected_seconds": expected,
+        "presentation_expected_seconds": presentation_expected,
         "queue_forecast_expected_seconds": (
             max(0, int(queue_forecast_expected_seconds))
             if queue_forecast_expected_seconds is not None
             else max(0, int(previous.get("queue_forecast_expected_seconds") or 0))
         ),
+        # This is exact, run-owned cache evidence. A lookup beginning is not
+        # enough to set it: the UI may only signal cache acceleration after a
+        # proven reusable record count is available.
+        "cache_reuse_records": cache_reuse_records,
+        "cache_reuse_documents": cache_reuse_documents,
+        "cache_total_documents": cache_total_documents,
         "comparable_runs": comparable_value,
         "confirmed_fraction": confirmed,
         "phase_started_epoch": now if phase_changed else float(previous.get("phase_started_epoch") or now),
@@ -12758,10 +12972,38 @@ def update_live_automatic_run_status(
         CANCELLED_AUTOMATIC_RUN_ROOTS.discard(str(Path(record["run_root"])))
     status_path = Path(record["run_root"]) / "run-progress.json" if record["run_root"] else None
     if status_path:
-        try:
-            _write_automatic_run_json(status_path, record)
-        except OSError as exc:
-            APP_LOGGER.warning("could not persist automatic run progress: %s", exc)
+        # The browser receives the in-memory record immediately.  The durable
+        # source journal remains the authority for external mutations, so the
+        # status snapshot can safely coalesce ordinary x/y queue repainting.
+        # Never coalesce a lifecycle boundary, cancellation acknowledgement,
+        # phase change, or terminal outcome: those are the useful recovery
+        # landmarks after a server restart.
+        snapshot_key = str(status_path)
+        prior_snapshot = dict(AUTOMATIC_RUN_PROGRESS_SNAPSHOT_STATE.get(snapshot_key) or {})
+        snapshot_signature = (
+            record.get("state"),
+            record.get("progress_phase"),
+            bool(record.get("cancel_requested")),
+            bool(record.get("confirmation_in_flight")),
+        )
+        terminal_snapshot = terminal_state
+        lifecycle_changed = snapshot_signature != tuple(prior_snapshot.get("signature") or ())
+        due_for_snapshot = (
+            now - float(prior_snapshot.get("written_epoch") or 0.0)
+            >= AUTOMATIC_RUN_PROGRESS_SNAPSHOT_INTERVAL_SECONDS
+        )
+        if lifecycle_changed or terminal_snapshot or due_for_snapshot:
+            try:
+                _write_automatic_run_json(status_path, record)
+                if terminal_snapshot:
+                    AUTOMATIC_RUN_PROGRESS_SNAPSHOT_STATE.pop(snapshot_key, None)
+                else:
+                    AUTOMATIC_RUN_PROGRESS_SNAPSHOT_STATE[snapshot_key] = {
+                        "signature": snapshot_signature,
+                        "written_epoch": now,
+                    }
+            except OSError as exc:
+                APP_LOGGER.warning("could not persist automatic run progress: %s", exc)
     if record["run_root"]:
         checkpoint_updates = {"final_expected_seconds": expected}
         reprice_reason = str(eta_reprice_reason or "").strip()
@@ -13060,22 +13302,15 @@ def automatic_live_status_html(status=None):
             f"{terminal_label} {format_estimate_clock(actual)}"
             "</span>"
         )
-    terminal_state = state.casefold() in {"successful", "warning", "failed", "cancelled"}
-    if details and terminal_state:
-        # The former two-line clamp pointed to a now-hidden output accordion,
-        # so a terminal explanation could end mid-word with no way to read it.
-        # Keep the closed card compact and layout-stable, but let the operator
-        # expand the exact retained explanation in place.
-        details_suffix = (
-            '<details class="automatic-run-terminal-details">'
-            f'<summary>— {details}</summary></details>'
-        )
-    else:
-        details_suffix = (
-            f'<span class="automatic-run-progress-details">— {details}</span>'
-            if details
-            else '<span class="automatic-run-progress-details" aria-hidden="true"></span>'
-        )
+    # Do not use a native ``details`` element here. The server-owned one-second
+    # observer may replace this fragment, which closes an expanded element and
+    # made the former arrow look non-functional. The permanent lane is easier
+    # to read and does not introduce a terminal layout jump.
+    details_suffix = (
+        f'<span class="automatic-run-progress-details">— {details}</span>'
+        if details
+        else '<span class="automatic-run-progress-details" aria-hidden="true"></span>'
+    )
     return (
         f'<div class="automatic-run-activity {html.escape(state)}" '
         f'data-run-state="{html.escape(state)}" '
@@ -13186,6 +13421,7 @@ def refresh_live_automatic_run_ui(viewed_run_root=None):
         timing = automatic_run_timing_html(
             record.get("expected_seconds", 0),
             state="running",
+            presentation_expected_seconds=record.get("presentation_expected_seconds"),
             started_epoch=record.get("started_epoch"),
             eta_acceleration_seconds=record.get("eta_acceleration_seconds", 0),
             server_driven=True,
@@ -13197,6 +13433,9 @@ def refresh_live_automatic_run_ui(viewed_run_root=None):
             queue_forecast_expected_seconds=record.get(
                 "queue_forecast_expected_seconds", 0
             ),
+            cache_reuse_records=record.get("cache_reuse_records", 0),
+            cache_reuse_documents=record.get("cache_reuse_documents", 0),
+            cache_total_documents=record.get("cache_total_documents", 0),
         ) if state == "running" else gr.update()
         return (
             activity,
@@ -15296,6 +15535,21 @@ def cancel_or_reset_automatic_run(
     )
 
 
+def opening_eta_presentation_seconds(expected_seconds, *, exact_cache_reuse_records=0):
+    """Return the UI-only opening ETA without changing the timing model."""
+    try:
+        expected = max(0, int(round(float(expected_seconds or 0))))
+    except (TypeError, ValueError):
+        expected = 0
+    try:
+        cached = max(0, int(exact_cache_reuse_records or 0))
+    except (TypeError, ValueError):
+        cached = 0
+    if not expected or cached:
+        return expected
+    return max(1, int(math.ceil(expected * OPENING_NONCACHE_ETA_DISPLAY_FACTOR)))
+
+
 def automatic_run_timing_html(
     expected_seconds=0,
     source="",
@@ -15312,13 +15566,31 @@ def automatic_run_timing_html(
     total_units=None,
     eta_basis="initial_estimate",
     queue_forecast_expected_seconds=0,
+    cache_reuse_records=0,
+    cache_reuse_documents=0,
+    cache_total_documents=0,
+    presentation_expected_seconds=None,
 ):
     expected = max(0, int(round(float(expected_seconds or 0))))
+    presentation_expected = (
+        expected
+        if presentation_expected_seconds is None
+        else max(0, int(round(float(presentation_expected_seconds or 0))))
+    )
     actual = max(0, int(round(float(actual_seconds or 0)))) if actual_seconds is not None else None
     current_time = time.time() if now is None else float(now)
     started = float(started_epoch or 0)
     server_timer_value = "true" if server_driven else "false"
     resolved_eta_basis = str(eta_basis or "initial_estimate")
+    try:
+        reusable_record_count = max(0, int(cache_reuse_records or 0))
+    except (TypeError, ValueError):
+        reusable_record_count = 0
+    try:
+        reusable_document_count = max(0, int(cache_reuse_documents or 0))
+        cache_document_total = max(0, int(cache_total_documents or 0))
+    except (TypeError, ValueError):
+        reusable_document_count = cache_document_total = 0
     elapsed = max(0, int(current_time - started)) if started else 0
     # The label is a statement about confidence in the displayed value, not
     # about whether the ETA formula has ever been recalculated.  A still-valid
@@ -15330,9 +15602,15 @@ def automatic_run_timing_html(
         and resolved_eta_basis == "initial_estimate"
         and elapsed >= INITIAL_ETA_LABEL_GRACE_SECONDS
     )
+    cache_plan_suffix = (
+        f" · {reusable_document_count} of {cache_document_total} documents already cached"
+        if reusable_document_count and cache_document_total
+        else ""
+    )
     basis_suffix = {
-        "cache_plan_confirmed": " · cache plan confirmed",
+        "cache_plan_confirmed": cache_plan_suffix,
         "live_observations": "",
+        "execution_plan_confirmed": "",
     }.get(
         resolved_eta_basis,
         "" if initial_label_has_matured else " · initial estimate",
@@ -15345,13 +15623,13 @@ def automatic_run_timing_html(
         # Say that the estimate is being recalibrated until fresh queue
         # evidence produces a trustworthy replacement. Completion duration is
         # shown separately at the terminal state, where it is factual.
-        remaining = max(0, expected - elapsed - acceleration)
+        remaining = max(0, presentation_expected - elapsed - acceleration)
         if expected <= 0 and str(source or "").casefold() == "pre-processing":
             # Confirmation has been accepted, but the canonical preflight has
             # not produced an ETA yet.  ``0m00s`` reads as a failed or
             # completed timer; make the temporary unknown explicit instead.
             label = "Est: calculating…"
-        elif expected > 0 and remaining == 0:
+        elif presentation_expected > 0 and remaining == 0:
             # An opening estimate can expire before the queue has accumulated
             # the deliberately conservative sample count required to reprice
             # the canonical ETA. Do not leave a fast run displaying an
@@ -15393,7 +15671,7 @@ def automatic_run_timing_html(
                 label = "Est: finishing…"
         else:
             label = f"Est: {format_estimate_clock(remaining)}"
-        if expected > 0:
+        if presentation_expected > 0:
             label += basis_suffix
     elif state == "cancelled" and actual is not None:
         label = f"Stopped: {format_estimate_clock(actual)}"
@@ -15403,13 +15681,17 @@ def automatic_run_timing_html(
         # do not show a second duration derived from later callback timing.
         label = ""
     else:
-        label = f"Est: {format_estimate_clock(expected)}{basis_suffix if expected > 0 else ''}"
+        label = f"Est: {format_estimate_clock(presentation_expected)}{basis_suffix if presentation_expected > 0 else ''}"
     strong_attrs = "" if label else ' aria-hidden="true"'
     return (
-        f'<div id="automatic-run-timing" class="automatic-run-timing {html.escape(state)}" '
-        f'data-expected-seconds="{expected}" data-actual-seconds="{actual if actual is not None else ""}" '
+        f'<div id="automatic-run-timing" class="automatic-run-timing {html.escape(state)}'
+        f'{" cache-reuse-confirmed" if reusable_record_count else ""}" '
+        f'data-expected-seconds="{presentation_expected}" data-model-expected-seconds="{expected}" '
+        f'data-actual-seconds="{actual if actual is not None else ""}" '
         f'data-started-epoch="{started:.3f}" '
         f'data-eta-basis="{html.escape(resolved_eta_basis)}" '
+        f'data-cache-reuse-documents="{reusable_document_count}" '
+        f'data-cache-total-documents="{cache_document_total}" '
         f'data-server-timer="{server_timer_value}" '
         f'data-run-state="{html.escape(state)}">'
         f'<strong{strong_attrs}>{html.escape(label)}</strong>'
@@ -17319,8 +17601,14 @@ def observe_batch_queue_forecast(
         return None
     if queue_rate <= 0.0 or queue_completed <= 0 or queue_total <= 0:
         return None
+    # A bounded queue group may contain several PDFs. Its observed rate is one
+    # shared Desktop request, not independent evidence for every member PDF.
+    # Prefer the explicit group identity whenever it is present so a single
+    # slow group cannot satisfy the cross-source requirement for an upward ETA
+    # correction merely because it contains multiple source paths.
     source_key = str(
-        report.get("source_path")
+        report.get("source_queue_group_index")
+        or report.get("source_path")
         or report.get("source_window_index")
         or "active-source"
     )
@@ -17377,9 +17665,20 @@ def observe_batch_queue_forecast(
     )
     source_total = max(
         1,
-        int(report.get("source_window_total") or 1),
+        int(
+            report.get("source_queue_group_total")
+            or report.get("source_window_total")
+            or 1
+        ),
     )
-    source_index = max(1, int(report.get("source_window_index") or 1))
+    source_index = max(
+        1,
+        int(
+            report.get("source_queue_group_index")
+            or report.get("source_window_index")
+            or 1
+        ),
+    )
     remaining_source_windows = max(0, source_total - source_index)
     remaining_seconds = (
         remaining_records * blended_seconds_per_record
@@ -17439,18 +17738,30 @@ def observe_batch_prequeue_cache_plan(context, report):
     )
     fresh_records = max(0, prepared_records - cached_records)
     source_total = max(0, int(report.get("source_window_total") or 0))
+    cached_documents = min(
+        source_total,
+        max(0, int(report.get("cached_documents") or 0)),
+    )
+    partially_cached_documents = min(
+        max(0, source_total - cached_documents),
+        max(0, int(report.get("partially_cached_documents") or 0)),
+    )
     state.update({
         "batch_cache_plan_observed": True,
         "prepared_records": prepared_records,
         "batch_cached_records": cached_records,
         "batch_fresh_records": fresh_records,
         "batch_source_total": source_total,
+        "batch_cached_documents": cached_documents,
+        "batch_partially_cached_documents": partially_cached_documents,
     })
     return {
         "prepared_records": prepared_records,
         "cached_records": cached_records,
         "fresh_records": fresh_records,
         "source_total": source_total,
+        "cached_documents": cached_documents,
+        "partially_cached_documents": partially_cached_documents,
     }
 
 
@@ -17473,6 +17784,28 @@ def bounded_queue_eta_reprice(current_expected, queue_forecast):
     )
     upper = current + upward_step
     return int(math.ceil(min(upper, max(lower, forecast))))
+
+
+def cap_queue_eta_reprice_to_opening(candidate_expected, *, opening_expected):
+    """Keep cumulative upward queue reprices inside one run-level envelope.
+
+    The classic opening model remains the anchor.  Mature queue evidence may
+    lower it freely, and may raise it only after independent group evidence,
+    but repeated samples from the same difficult run may not ratchet it
+    indefinitely.  The raw forecast remains in diagnostics for investigation.
+    """
+    opening = max(0, int(opening_expected or 0))
+    candidate = max(0, int(candidate_expected or 0))
+    if not opening or candidate <= opening:
+        return candidate
+    allowance = min(
+        QUEUE_ETA_MAX_UPWARD_RUN_MAX_SECONDS,
+        max(
+            QUEUE_ETA_MAX_UPWARD_RUN_MIN_SECONDS,
+            int(round(opening * QUEUE_ETA_MAX_UPWARD_RUN_RATIO)),
+        ),
+    )
+    return min(candidate, opening + allowance)
 
 
 def stable_queue_eta_reprice(
@@ -17611,6 +17944,7 @@ def confirmed_prequeue_cache_eta_seconds(
     features,
     cached_attachment_records=0,
     remaining_source_windows=0,
+    cached_source_windows=None,
     cache_attachment_prior=None,
 ):
     """Reprice only the unstarted Desktop queue after exact cache evidence.
@@ -17622,10 +17956,12 @@ def confirmed_prequeue_cache_eta_seconds(
     all earlier classic ETA calculations are already elapsed at that point.
 
     Cached records are not free: they still need a workspace attachment, one
-    sequential source-window handoff, and exact-vector reconciliation. Price
-    those known remaining operations separately. The result can only reduce
-    the current estimate; live queue evidence and exact-vector reconciliation
-    remain the authorities for completion and any later slow-path observation.
+    sequential cache-source handoff, and exact-vector reconciliation. Price
+    those known cache operations separately; fresh records retain their
+    existing provider prior instead of inheriting a cache-tail source cost.
+    The result can only reduce the current estimate; live queue evidence and
+    exact-vector reconciliation remain the authorities for completion and any
+    later slow-path observation.
     """
     current = max(0.0, float(current_expected or 0.0))
     elapsed = max(0.0, float(elapsed_seconds or 0.0))
@@ -17633,6 +17969,14 @@ def confirmed_prequeue_cache_eta_seconds(
     request_seconds = max(1.0, float(provider_request_seconds or 0.0))
     cached = max(0, int(cached_attachment_records or 0))
     source_windows = max(0, int(remaining_source_windows or 0))
+    if cached_source_windows is not None:
+        try:
+            source_windows = min(
+                source_windows,
+                max(0, int(cached_source_windows)),
+            )
+        except (TypeError, ValueError):
+            pass
     prior = cache_attachment_prior if isinstance(cache_attachment_prior, dict) else {}
     cached_record_seconds = max(
         TIMING_MODEL_CACHE_TAIL_RECORD_SECONDS_FLOOR,
@@ -17657,6 +18001,39 @@ def confirmed_prequeue_cache_eta_seconds(
     )
     candidate = elapsed + fresh * request_seconds + remaining_tail
     return int(math.ceil(min(current, max(elapsed + 8.0, candidate))))
+
+
+def confirmed_batch_execution_plan_eta_seconds(
+    current_expected,
+    elapsed_seconds,
+    *,
+    fresh_provider_requests,
+    provider_request_seconds,
+    features,
+    cached_attachment_records,
+    source_total,
+    cached_documents,
+    cache_attachment_prior=None,
+):
+    """Price the unstarted work only after the full batch plan is exact.
+
+    Local preparation, including any observed OCR, is already represented by
+    ``elapsed_seconds``.  The visible estimate must therefore be rebuilt from
+    the exact fresh record count and the separately proven cache attachment
+    tail, rather than carry forward provisional OCR surcharges from the
+    preflight phase.
+    """
+    return confirmed_prequeue_cache_eta_seconds(
+        current_expected,
+        elapsed_seconds,
+        fresh_provider_requests=fresh_provider_requests,
+        provider_request_seconds=provider_request_seconds,
+        features=features,
+        cached_attachment_records=cached_attachment_records,
+        remaining_source_windows=source_total,
+        cached_source_windows=cached_documents,
+        cache_attachment_prior=cache_attachment_prior,
+    )
 
 
 def timing_model_cached_attachment_tail_prior(history):
@@ -17823,6 +18200,53 @@ def current_cache_plan_progress_text(stage_text, report):
         f"{stage_text} — Cache plan: {cached_records} cached / "
         f"{fresh_records} require normal embedding."
     )
+
+
+def combined_grouped_upload_status_details(display_state, stage_text, report):
+    """Keep the live Desktop-queue and vector-observation lanes together.
+
+    The two observers are intentionally independent: a queue heartbeat says
+    that AnythingLLM is working, while the workspace read proves that records
+    have become searchable.  Rendering only the newest callback made a healthy
+    run look as though it was oscillating between mutually exclusive stages.
+    Keep one latest sentence from each observer for the active source window.
+    """
+    state = display_state if isinstance(display_state, dict) else {}
+    report = report if isinstance(report, dict) else {}
+    text = str(stage_text or "").strip()
+    event = str(report.get("timing_event") or "").strip()
+    try:
+        source_index = max(0, int(report.get("source_window_index") or 0))
+    except (TypeError, ValueError):
+        source_index = 0
+    active_index = max(0, int(state.get("source_window_index") or 0))
+    if source_index and source_index > active_index:
+        # A prior source's exact-vector count must not be shown beside a newer
+        # source's queue heartbeat.
+        state["source_window_index"] = source_index
+        state["queue"] = ""
+        state["verification"] = ""
+    elif source_index and not active_index:
+        state["source_window_index"] = source_index
+
+    if event in {
+        "exact_vector_observation",
+        "exact_vector_reconciliation_complete",
+        "exact_vector_reconciliation_complete_with_provider_rechunking",
+        "exact_vector_reconciliation_complete_with_workspace_duplicates",
+    }:
+        state["verification"] = text
+    elif text:
+        # Receipt, cache-plan, and Desktop queue callbacks occupy the queue
+        # lane. A later live queue heartbeat naturally replaces an older
+        # receipt without erasing the independent verification line.
+        state["queue"] = text
+
+    lines = [
+        str(state.get("queue") or "").strip(),
+        str(state.get("verification") or "").strip(),
+    ]
+    return "\n— ".join(line for line in lines if line)
 
 
 def timing_model_similarity(features, historical):
@@ -18823,7 +19247,13 @@ def record_timing_model_run(
 
 
 def record_timing_model_event(run_root, stage, batch_report=None):
-    """Persist batch evidence for ETA learning and this run's own timeline."""
+    """Persist compact timing evidence without making queue polling an I/O lane.
+
+    Source-transaction journals, receipts, and terminal records retain the
+    durable recovery evidence.  This diagnostic timeline therefore preserves
+    all semantic boundaries but coalesces identical high-frequency counters to
+    one observation per second.
+    """
     batch = batch_report or {}
     event = {
         "recorded_at": datetime.now().isoformat(timespec="seconds"),
@@ -18851,6 +19281,45 @@ def record_timing_model_event(run_root, stage, batch_report=None):
         "backend": str(batch.get("backend") or ""),
         "candidate_success": bool(batch.get("candidate_success")),
     }
+    event_name = str(event.get("event") or "status")
+    repeated_observations = {
+        "attachment_progress",
+        "cached_attachment_reuse",
+        "queue_progress",
+        "exact_vector_observation",
+    }
+    timeline_key = str(run_root)
+    boundary_signature = (
+        event_name,
+        str(stage or ""),
+        int(event.get("batch") or 0),
+        str(event.get("submission_state") or ""),
+    )
+    # Queue/cache status text intentionally changes for every x/y counter.
+    # That is not a new diagnostic boundary. Keep the event/batch identity so
+    # the once-per-second coalescing path can do its job.
+    timeline_signature = (
+        (
+            event_name,
+            int(event.get("batch") or 0),
+            int(event.get("total_batches") or 0),
+        )
+        if event_name in repeated_observations
+        else boundary_signature
+    )
+    now = time.time()
+    prior_timing = dict(TIMING_TIMELINE_LAST_PERSISTED.get(timeline_key) or {})
+    is_repeated_observation = event_name in repeated_observations
+    due_for_timing_snapshot = (
+        now - float(prior_timing.get("written_epoch") or 0.0)
+        >= TIMING_TIMELINE_SNAPSHOT_INTERVAL_SECONDS
+    )
+    semantic_boundary = not is_repeated_observation or timeline_signature != tuple(
+        prior_timing.get("signature") or ()
+    )
+    should_persist = semantic_boundary or due_for_timing_snapshot
+    if not should_persist:
+        return False
     _append_timing_jsonl(TIMING_MODEL_EVENTS_PATH, event)
     # The aggregate model is useful for future estimates, but it forces an
     # operator investigating one slow PDF to sift through unrelated runs.
@@ -18864,9 +19333,17 @@ def record_timing_model_event(run_root, stage, batch_report=None):
             with timeline_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(event, ensure_ascii=False) + "\n")
                 handle.flush()
-                os.fsync(handle.fileno())
     except (OSError, TypeError, ValueError) as exc:
         APP_LOGGER.warning("could not persist run timing timeline: %s", exc)
+    terminal_event = event_name in {"batch_completed", "batch_failed", "batch_cancelled"}
+    if terminal_event:
+        TIMING_TIMELINE_LAST_PERSISTED.pop(timeline_key, None)
+    else:
+        TIMING_TIMELINE_LAST_PERSISTED[timeline_key] = {
+            "signature": timeline_signature,
+            "written_epoch": now,
+        }
+    return True
 
 
 def refresh_automatic_run_estimate(
@@ -18956,6 +19433,9 @@ def refresh_automatic_run_estimate(
         estimate["expected_seconds"],
         estimate["source"],
         state="ready",
+        presentation_expected_seconds=opening_eta_presentation_seconds(
+            estimate["expected_seconds"]
+        ),
     )
 
 
@@ -19913,7 +20393,6 @@ def automatic_picker_lifecycle_updates(record=None):
         gr.update(interactive=interactive),
         gr.update(interactive=interactive),
         gr.update(interactive=interactive),
-        gr.update(interactive=interactive),
     )
 
 
@@ -20602,6 +21081,7 @@ def _run_automatic_from_confirmation_stream_body(
     *values,
     progress=gr.Progress(track_tqdm=False),
     _confirmation_owner_token="",
+    _confirmation_preclaimed=False,
 ):
     """Stream a start acknowledgement, then the verified terminal run result.
 
@@ -20615,30 +21095,39 @@ def _run_automatic_from_confirmation_stream_body(
         str(_confirmation_owner_token or "").strip()
         or f"automatic-run-{uuid.uuid4().hex}"
     )
-    # Admit a Confirm exactly once. Gradio serializes the named event in the
-    # usual case, but a replayed HTTP event or a double click must not become a
-    # second queued document run after the first one completes.
+    # The browser-facing generator claims the confirmation synchronously so
+    # its first response can immediately acknowledge the click. The durable
+    # worker then continues under that exact ownership token. Retain the
+    # older direct-call path for tests and non-browser callers.
     with LIVE_AUTOMATIC_RUN_STATUS_LOCK:
-        already_owned = automatic_lifecycle_busy()
-        if not already_owned:
-            update_live_automatic_run_status(
-                state="preparing",
-                phase="Preparing selected PDFs",
-                expected_seconds=0,
-                details="Checking files and AnythingLLM readiness.",
-                confirmed_fraction=0.0,
-                cancel_available=False,
-                confirmation_in_flight=True,
-                confirmation_owner_token=confirmation_owner_token,
+        current_status = dict(LIVE_AUTOMATIC_RUN_STATUS or {})
+        if _confirmation_preclaimed:
+            already_owned = (
+                str(current_status.get("confirmation_owner_token") or "")
+                != confirmation_owner_token
             )
+        else:
+            already_owned = automatic_lifecycle_busy(current_status)
+            if not already_owned:
+                update_live_automatic_run_status(
+                    state="preparing",
+                    phase="Preparing selected PDFs",
+                    expected_seconds=0,
+                    details="Checking files and AnythingLLM readiness.",
+                    confirmed_fraction=0.0,
+                    cancel_available=False,
+                    confirmation_in_flight=True,
+                    confirmation_owner_token=confirmation_owner_token,
+                )
     if already_owned:
         APP_LOGGER.warning("ignored duplicate Confirm while Automatic lifecycle is active")
         yield tuple(gr.update() for _ in range(12))
         return
-    # Yield before any expensive confirmation work. The browser's one-second
-    # observer reads the same durable ``preparing`` state, so this covers all
-    # post-click work rather than making the action button look stuck.
-    yield automatic_preprocessing_started_response()
+    # Direct callers still receive the acknowledgement here. Browser callers
+    # received it synchronously before the worker thread was started, so a
+    # transient browser stream replacement cannot hide the first click.
+    if not _confirmation_preclaimed:
+        yield automatic_preprocessing_started_response()
     try:
         settings, validation_report, _warnings, allowed = validated_automatic_run_settings(values)
         if len(values) > len(AUTOMATIC_RUN_FIELDS) + 1:
@@ -20770,89 +21259,214 @@ def _run_automatic_from_confirmation_stream_body(
     )
 
 
-def run_automatic_from_confirmation_stream(*values, progress=gr.Progress(track_tqdm=False)):
-    """Own the complete streaming lifecycle, including every yield boundary.
+def _background_automatic_progress(*_args, **_kwargs):
+    """Avoid touching Gradio's request-local progress object from a worker."""
+    return None
 
-    Closing a Gradio streaming response raises ``GeneratorExit`` at the last
-    yield. The previous body acquired lifecycle and Desktop ownership before
-    later yields but entered its cleanup block only afterwards. Keep one outer
-    finalizer around the entire body so a disconnected or replaced browser
-    request cannot strand Confirm ownership or the mutation lease.
+
+def _finalize_owned_confirmation_stream_failure(owner_token, error=None):
+    """Persist a real worker failure without confusing it with a client disconnect."""
+    record = dict(LIVE_AUTOMATIC_RUN_STATUS or {})
+    owns_confirmation = str(record.get("confirmation_owner_token") or "") == str(owner_token or "")
+    nonterminal_owned_state = str(record.get("state") or "") in {"preparing", "running"}
+    if not owns_confirmation or not (
+        automatic_confirmation_in_flight(record) or nonterminal_owned_state
+    ):
+        return
+    running = str(record.get("state") or "") == "running"
+    error_detail = safe_user_error_text(error, fallback="") if error else ""
+    details = (
+        "The owned PDF worker ended unexpectedly. Its durable run folder was retained for diagnosis."
+        if running
+        else "The owned PDF worker stopped before it could reserve or start the pipeline. No PDF was submitted."
+    )
+    if error_detail:
+        details = f"{details} {error_detail}"
+    update_live_automatic_run_status(
+        record.get("run_root") or None,
+        state="failed",
+        phase="Run ended before a terminal result" if running else "Run did not start",
+        expected_seconds=record.get("expected_seconds", 0),
+        details=details,
+        confirmed_fraction=record.get("confirmed_fraction", 0.0),
+        cancel_available=False,
+        confirmation_in_flight=False,
+    )
+
+
+def _run_automatic_confirmation_background_worker(
+    events,
+    completed,
+    owner_token,
+    values,
+):
+    """Keep one confirmed run alive when its browser stream is replaced.
+
+    The UI generator is only a presentation channel.  OCR preflight can take
+    minutes on a large selection, so tying the confirmed worker to that HTTP
+    stream made a harmless browser cancellation look like a failed run before
+    the worker had a chance to start.  The worker owns its lease and durable
+    lifecycle record; this bridge only forwards its existing UI updates.
     """
-    owner_token = f"automatic-run-{uuid.uuid4().hex}"
+    failure = None
     try:
-        yield from _run_automatic_from_confirmation_stream_body(
+        for output in _run_automatic_from_confirmation_stream_body(
             *values,
-            progress=progress,
+            progress=_background_automatic_progress,
             _confirmation_owner_token=owner_token,
-        )
-    finally:
-        # Idempotent: the normal body already releases after the worker. This
-        # boundary also covers GeneratorExit and failures before that block.
-        release_automatic_anythingllm_mutation_lease(owner_token)
-        record = dict(LIVE_AUTOMATIC_RUN_STATUS or {})
-        owns_confirmation = str(record.get("confirmation_owner_token") or "") == owner_token
-        nonterminal_owned_state = str(record.get("state") or "") in {"preparing", "running"}
-        if owns_confirmation and (
-            automatic_confirmation_in_flight(record) or nonterminal_owned_state
+            _confirmation_preclaimed=True,
         ):
-            update_live_automatic_run_status(
-                record.get("run_root") or None,
-                state="failed",
-                phase=(
-                    "Run ended before a terminal result"
-                    if str(record.get("state") or "") == "running"
-                    else "Run did not start"
-                ),
-                expected_seconds=record.get("expected_seconds", 0),
-                details=(
-                    "The owned run stream ended unexpectedly. Its durable run folder was retained for diagnosis."
-                    if str(record.get("state") or "") == "running"
-                    else "The confirmation request ended before an owned worker started; no later PDF was submitted."
-                ),
-                confirmed_fraction=record.get("confirmed_fraction", 0.0),
-                cancel_available=False,
-                confirmation_in_flight=False,
+            events.put(("output", output))
+    except BaseException as exc:  # Preserve the original exception for direct callers/tests.
+        failure = exc
+        _finalize_owned_confirmation_stream_failure(owner_token, exc)
+        events.put(("error", exc))
+    finally:
+        if failure is None:
+            # A generator may finish without a terminal result only if a
+            # future edit introduces a premature return.  Treat that as a real
+            # worker defect, not as a browser/request failure.
+            _finalize_owned_confirmation_stream_failure(owner_token)
+        # The body releases after its normal pipeline return.  This outer
+        # worker boundary additionally covers validation, reservation, and
+        # preflight exceptions before that inner release exists.
+        release_automatic_anythingllm_mutation_lease(owner_token)
+        completed.set()
+        events.put(("done", None))
+
+
+def run_automatic_from_confirmation_stream(*values, progress=gr.Progress(track_tqdm=False)):
+    """Bridge a durable confirmed worker to the browser's streaming response.
+
+    A browser reload, timer overlap, or replaced Gradio response must not
+    cancel a valid confirmation.  The worker therefore continues independently
+    after the first visible acknowledgement; active and terminal status remain
+    available through the existing one-second durable-status observer.
+    """
+    del progress  # Worker progress is represented by durable status, not request-local Gradio state.
+    owner_token = f"automatic-run-{uuid.uuid4().hex}"
+    # Claim before creating the background thread. Previously the worker made
+    # this claim and emitted the first UI yield. If Gradio replaced that stream
+    # during the several-second worker-start window, the run could continue
+    # correctly but its first Confirm click looked like it had done nothing.
+    with LIVE_AUTOMATIC_RUN_STATUS_LOCK:
+        if automatic_lifecycle_busy():
+            APP_LOGGER.warning("ignored duplicate Confirm while Automatic lifecycle is active")
+            yield tuple(gr.update() for _ in range(12))
+            return
+        update_live_automatic_run_status(
+            state="preparing",
+            phase="Preparing selected PDFs",
+            expected_seconds=0,
+            details="Checking files and AnythingLLM readiness.",
+            confirmed_fraction=0.0,
+            cancel_available=False,
+            confirmation_in_flight=True,
+            confirmation_owner_token=owner_token,
+        )
+    events = queue.Queue()
+    completed = threading.Event()
+    worker = threading.Thread(
+        target=_run_automatic_confirmation_background_worker,
+        args=(events, completed, owner_token, tuple(values)),
+        name=f"anythingllm-confirm-{owner_token.rsplit('-', 1)[-1][:8]}",
+        daemon=True,
+    )
+    worker_started = False
+    stream_interrupted = False
+    try:
+        worker.start()
+        worker_started = True
+        # This yield is intentionally outside the worker. It is the first
+        # browser-visible consequence of a valid Confirm click and therefore
+        # cannot wait behind worker startup, status writes, or validation.
+        yield automatic_preprocessing_started_response()
+        while True:
+            kind, payload = events.get()
+            if kind == "output":
+                yield payload
+                continue
+            if kind == "error":
+                raise payload
+            if kind == "done":
+                return
+    except GeneratorExit:
+        # The worker continues.  Do not turn a lost browser response into the
+        # old false terminal error, and do not release its AnythingLLM lease.
+        stream_interrupted = True
+        raise
+    finally:
+        if not worker_started:
+            _finalize_owned_confirmation_stream_failure(
+                owner_token,
+                "The confirmed worker could not be started.",
+            )
+            release_automatic_anythingllm_mutation_lease(owner_token)
+        elif stream_interrupted and not completed.is_set():
+            APP_LOGGER.info(
+                "automatic confirmation browser stream closed; durable worker remains active",
+                extra={"event": "automatic_confirmation_stream_detached"},
             )
 
 
-def run_automatic_from_ready_confirmation_stream(selection_state, *values, progress=gr.Progress(track_tqdm=False)):
-    """Require the picker/configuration acknowledgement before accepting Confirm.
+def automatic_confirmation_payload_has_selected_pdf(values):
+    """Return whether a Confirm payload, not its browser state, has a PDF.
 
-    The button is disabled while selection work is pending, but this server
-    guard also covers a replayed click or a browser event delivered out of
-    order.  It deliberately delegates to the established confirmation stream
-    once ready, leaving the run lifecycle, ETA, and durable reservation logic
-    unchanged.
+    ``gr.State`` is asynchronous presentation state.  It is useful for
+    disabling the button while the picker settles, but an older state update
+    must not reject the newer, visible File values that the user just clicked
+    Confirm for.  Execution still runs the full server-side validation before
+    reserving a run root.
+    """
+    try:
+        core = dict(zip(AUTOMATIC_RUN_FIELDS, values[: len(AUTOMATIC_RUN_FIELDS)], strict=True))
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        normalize_file_list(core.get("pdf_files"))
+        or normalize_file_list(core.get("folder_pdf_files"))
+    )
+
+
+def run_automatic_from_ready_confirmation_stream(selection_state, *values, progress=gr.Progress(track_tqdm=False)):
+    """Accept one visible Confirm click while preserving server-side validation.
+
+    The picker state remains a UI lock, but it is not an authority over an
+    irreversible action.  A stale ``pending`` state can arrive after the File
+    payload has already reached the server; the visible selection is then
+    valid and should start on this click, not require repeated clicks.
     """
     if not automatic_selection_is_ready(selection_state):
-        # This is not a run failure: selection is an idle-form transaction and
-        # has not reserved a run root or begun preparation.  Use the normal
-        # visible error shape without changing shared lifecycle status, so the
-        # remaining selection callbacks can still complete cleanly.
-        final = (
-            *automatic_error_outputs(
-                "AUTO-CONFIRM-003",
-                "Selected PDF settings are still being prepared",
-                ["Wait until the PDF selection is ready, then confirm the current visible settings."],
-                ["The selected PDF and output mode were not submitted while their configuration was changing."],
-                timing_html=automatic_run_timing_html(
-                    state="ready",
-                    message="Preparing the selected PDF settings; Confirm will become available when ready.",
+        if not automatic_confirmation_payload_has_selected_pdf(values):
+            # There is no concrete selected value to validate. Preserve the
+            # friendly idle response rather than attempting to reserve a run.
+            final = (
+                *automatic_error_outputs(
+                    "AUTO-CONFIRM-003",
+                    "Choose at least one PDF before starting",
+                    ["Select a readable PDF, then confirm the current visible settings."],
+                    ["Nothing was submitted to AnythingLLM."],
+                    timing_html=automatic_run_timing_html(
+                        state="ready",
+                        message="Choose a PDF before starting processing.",
+                    ),
                 ),
-            ),
-            gr.update(),
-            automatic_run_failure_banner_update(
-                "AUTO-CONFIRM-003", "Selected PDF settings are still being prepared"
-            ),
+                gr.update(),
+                automatic_run_failure_banner_update(
+                    "AUTO-CONFIRM-003", "Choose at least one PDF before starting"
+                ),
+            )
+            yield (
+                *final,
+                confirm_button_completion_update(final),
+                gr.update(value="Cancel", interactive=False),
+                gr.update(visible=False, interactive=False),
+            )
+            return
+        APP_LOGGER.info(
+            "accepting visible Confirm payload while picker acknowledgement is stale",
+            extra={"event": "automatic_confirm_selection_state_lag"},
         )
-        yield (
-            *final,
-            confirm_button_completion_update(final),
-            gr.update(value="Cancel", interactive=False),
-            gr.update(visible=False, interactive=False),
-        )
-        return
     yield from run_automatic_from_confirmation_stream(*values, progress=progress)
 
 
@@ -23150,7 +23764,22 @@ def upload_prepared_automatic_batch(
 
     def verify_batch(batch_report):
         source_path = str(batch_report.get("source_path") or "").strip()
-        expected_batch = list(expected_payloads_by_source.get(source_path) or [])
+        source_paths = [
+            str(path or "").strip()
+            for path in (batch_report.get("source_paths") or [])
+            if str(path or "").strip()
+        ]
+        if source_paths:
+            # A bounded queue group owns several independently durable PDFs.
+            # Verify all and only its rows; child queue batches reset their
+            # local indices, so global start/end positions are not valid here.
+            expected_batch = [
+                payload
+                for path in source_paths
+                for payload in expected_payloads_by_source.get(path, [])
+            ]
+        else:
+            expected_batch = list(expected_payloads_by_source.get(source_path) or [])
         if not expected_batch:
             # A single-PDF/legacy route has no source-window annotation, so
             # retain its established global-index behavior. Source windows
@@ -23277,7 +23906,10 @@ def upload_prepared_automatic_batch(
             if queue_position > last_queue_position:
                 last_queue_position = queue_position
                 last_queue_progress_elapsed = elapsed
-            current_source_vectors = current_source_vector_progress_count(last_report)
+            current_source_vectors = current_source_vector_progress_count(
+                last_report,
+                expected_records=len(expected_batch),
+            )
             if current_source_vectors > last_vector_count:
                 last_vector_count = current_source_vectors
                 last_vector_progress_elapsed = elapsed
@@ -23962,6 +24594,7 @@ def run_automatic(
             state="running",
             phase="Preparing PDF and checking AnythingLLM",
             expected_seconds=expected_seconds,
+            presentation_expected_seconds=opening_eta_presentation_seconds(expected_seconds),
             comparable_runs=(
                 run_timing_estimate.get("comparable_runs")
                 if estimate_comparable_runs is None else estimate_comparable_runs
@@ -24440,7 +25073,6 @@ def run_automatic(
     selected_input_canonicals_by_sha = {}
     ocr_eta_applied_files = set()
     pending_ocr_eta_surcharge = 0
-    ocr_eta_reprice_count = 0
     predicted_ocr_files = sum(
         1
         for row in (ocr_preflight_manifest or {}).get("files") or []
@@ -24509,7 +25141,7 @@ def run_automatic(
         progress_event=None,
     ):
         nonlocal expected_seconds, ocr_eta_applied_files, automatic_phase_rank
-        nonlocal pending_ocr_eta_surcharge, ocr_eta_reprice_count
+        nonlocal pending_ocr_eta_surcharge
         nonlocal grouped_upload_progress_active
         stage_text = str(stage or "Working")
         stage_key = stage_text.casefold()
@@ -24538,40 +25170,19 @@ def run_automatic(
             if surcharge:
                 pending_ocr_eta_surcharge += surcharge
                 run_timing_estimate.setdefault("ocr_runtime_surcharges", []).append(
-                    {"file": pdf_path.name, "pages": observed_pages, "seconds": surcharge}
-                )
-            ocr_eta_applied_files.add(str(pdf_path))
-            observed_ocr_files = len(ocr_eta_applied_files)
-            next_checkpoint = (
-                ocr_eta_reprice_checkpoints[ocr_eta_reprice_count]
-                if ocr_eta_reprice_count < len(ocr_eta_reprice_checkpoints)
-                else None
-            )
-            if (
-                pending_ocr_eta_surcharge
-                and next_checkpoint is not None
-                and observed_ocr_files >= next_checkpoint
-            ):
-                expected_seconds = max(
-                    0,
-                    int(
-                        expected_seconds
-                        or run_timing_estimate.get("expected_seconds")
-                        or 0
-                    ),
-                ) + pending_ocr_eta_surcharge
-                run_timing_estimate["expected_seconds"] = expected_seconds
-                run_timing_estimate.setdefault("ocr_runtime_reprices", []).append(
                     {
-                        "checkpoint": next_checkpoint,
-                        "observed_ocr_files": observed_ocr_files,
-                        "added_seconds": pending_ocr_eta_surcharge,
-                        "expected_seconds": expected_seconds,
+                        "file": pdf_path.name,
+                        "pages": observed_pages,
+                        "seconds": surcharge,
+                        "display_policy": "deferred_until_exact_execution_plan",
                     }
                 )
-                pending_ocr_eta_surcharge = 0
-                ocr_eta_reprice_count += 1
-                eta_reprice_reason = "ocr_runtime_observed"
+            ocr_eta_applied_files.add(str(pdf_path))
+            # OCR is an observed local cost, not a reliable forecast for the
+            # unopened batch.  Keep the evidence for the run record, but do
+            # not inflate the visible ETA until the exact fresh/cache plan is
+            # known.  At that point elapsed time already includes this work
+            # and the remaining queue can be priced from proven identities.
         source_fraction = max(0.0, min(1.0, float(value)))
         # Structured worker events already carry the canonical automatic
         # phase allocation. Do not run them through the old source-scale
@@ -24682,6 +25293,14 @@ def run_automatic(
         "source_total": 0,
         "source_totals": {},
         "source_completed": {},
+    }
+    # Presentation only. Keep the two independent live observations visible
+    # together for one source window; neither value participates in progress,
+    # retries, or the AnythingLLM mutation protocol.
+    grouped_upload_display_state = {
+        "source_window_index": 0,
+        "queue": "",
+        "verification": "",
     }
     active_file_index = 0
     planned_batch_adjustments = {}
@@ -24910,6 +25529,24 @@ def run_automatic(
                         observed_windows=batch_queue_forecast.get("observed_windows", 0),
                     )
                 if stable_reprice.get("status") == "applied":
+                    uncapped_expected = int(stable_reprice["expected_seconds"])
+                    capped_expected = cap_queue_eta_reprice_to_opening(
+                        uncapped_expected,
+                        opening_expected=initial_expected_seconds,
+                    )
+                    if capped_expected != uncapped_expected:
+                        stable_reprice = dict(stable_reprice)
+                        stable_reprice["expected_seconds"] = capped_expected
+                        stable_reprice["run_upward_cap_applied"] = True
+                        stable_reprice["uncapped_expected_seconds"] = uncapped_expected
+                    if capped_expected == int(expected_seconds):
+                        stable_reprice = {
+                            "status": "suppressed",
+                            "suppression_reason": "opening_eta_upward_envelope_reached",
+                            "raw_forecast_seconds": stable_reprice.get("raw_forecast_seconds"),
+                            "candidate_expected_seconds": capped_expected,
+                        }
+                if stable_reprice.get("status") == "applied":
                     expected_seconds = stable_reprice["expected_seconds"]
                     run_timing_estimate["expected_seconds"] = expected_seconds
                     run_timing_estimate.setdefault("queue_rate_recalibrations", []).append({
@@ -24925,6 +25562,12 @@ def run_automatic(
                         "raw_forecast_seconds": stable_reprice["raw_forecast_seconds"],
                         "forecast_sample_count": stable_reprice["sample_count"],
                         "material_change_seconds": stable_reprice["material_change_seconds"],
+                        "run_upward_cap_applied": bool(
+                            stable_reprice.get("run_upward_cap_applied")
+                        ),
+                        "uncapped_expected_seconds": stable_reprice.get(
+                            "uncapped_expected_seconds"
+                        ),
                         "expected_seconds": expected_seconds,
                         "batch_queue_evidence": dict(batch_queue_forecast),
                     })
@@ -25018,36 +25661,20 @@ def run_automatic(
                     eta_reprice_reason="exact_segment_count",
                 )
         if str(report.get("timing_event") or "") == "phase_completed":
-            phase_elapsed = float(report.get("phase_elapsed_seconds") or 0.0)
-            if live.get("run_root") == str(run_root) and phase_elapsed >= 10.0:
-                elapsed = time.time() - float(live.get("started_epoch") or time.time())
-                phase_corrected = evidence_paced_eta_seconds(
-                    expected_seconds,
-                    elapsed,
-                    float(live.get("confirmed_fraction") or 0.0),
-                )
-                # Stage timing is useful early evidence, but batch cadence is
-                # stronger. Apply a small damping factor to keep the visible
-                # countdown readable and prevent a cheap stage from whiplash.
-                damped_phase = int(round(expected_seconds + (phase_corrected - expected_seconds) * .30))
-                if abs(damped_phase - expected_seconds) >= 15:
-                    expected_seconds = max(0, damped_phase)
-                    run_timing_estimate["expected_seconds"] = expected_seconds
-                    run_timing_estimate.setdefault("phase_recalibrations", []).append({
-                        "stage": str(stage), "phase_elapsed_seconds": round(phase_elapsed, 3),
-                        "expected_seconds": expected_seconds,
-                    })
-                    update_live_automatic_run_status(
-                        run_root,
-                        state="running",
-                        phase=live.get("phase") or str(stage or "Working"),
-                        expected_seconds=expected_seconds,
-                        details=live.get("details") or "",
-                        confirmed_fraction=live.get("confirmed_fraction"),
-                        cancel_available=live.get("cancel_available", True),
-                        cancel_requested=live.get("cancel_requested", False),
-                        eta_reprice_reason="completed_phase_timing",
-                    )
+            # A local phase completion (metadata, one PDF's extraction, or a
+            # post-upload inspection) is valuable diagnostic evidence, but it
+            # is not a measured rate for the unstarted batch.  Repricing the
+            # whole run from every such completion made successive cheap or
+            # slow phases ratchet the ETA away from the multi-lane opening
+            # estimate.  Retain the observation in the timing timeline only;
+            # exact segment/cache plans and mature owned Desktop queue
+            # evidence remain the sole live ETA authorities.
+            run_timing_estimate.setdefault("phase_observations", []).append({
+                "stage": str(stage),
+                "phase_elapsed_seconds": round(
+                    float(report.get("phase_elapsed_seconds") or 0.0), 3
+                ),
+            })
         if str(report.get("timing_event") or "") != "batch_completed":
             return
         if desktop_serial_queue:
@@ -25237,6 +25864,23 @@ def run_automatic(
         # preflight difficulty profile rather than an equal-file split.
         start_fraction = AUTOMATIC_RUN_PREFLIGHT_DISPLAY_END + float(progress_allocation["start_share"]) * AUTOMATIC_RUN_DOCUMENT_DISPLAY_SPAN
         end_fraction = AUTOMATIC_RUN_PREFLIGHT_DISPLAY_END + float(progress_allocation["end_share"]) * AUTOMATIC_RUN_DOCUMENT_DISPLAY_SPAN
+        # A source that is already indexed, duplicated, or changed still
+        # completes local selection/preparation evidence, not the Desktop
+        # queue.  Its historical ``end_fraction`` covered the whole 0.5--97%
+        # document span and could permanently pin a cache-heavy run near 98%
+        # before fresh source windows began. Keep every local-only shortcut in
+        # the payload-preparation lane; the grouped Desktop observer owns the
+        # shared queue/vector lane afterwards.
+        local_preparation_end_fraction = (
+            AUTOMATIC_RUN_PREFLIGHT_DISPLAY_END
+            + float(progress_allocation["end_share"])
+            * (
+                AUTOMATIC_UPLOAD_PHASE_RANGES["payloads"][1]
+                - AUTOMATIC_RUN_PREFLIGHT_DISPLAY_END
+            )
+            if prepare_and_upload
+            else end_fraction
+        )
         expected_source_version = dict(
             preflight_by_path.get(str(pdf_path), {}).get("source_version") or {}
         )
@@ -25255,7 +25899,7 @@ def run_automatic(
             persist_prepared_checkpoint("preparation_in_progress")
             completed_files += 1
             progress(
-                end_fraction,
+                local_preparation_end_fraction,
                 desc=format_progress_desc(
                     f"Changed PDF withheld — continuing after {pdf_path.name}",
                     file_index,
@@ -25270,7 +25914,7 @@ def run_automatic(
                 details=(
                     f"PDF {file_index}/{total_files} no longer matches the confirmed selection and was not parsed or uploaded."
                 ),
-                confirmed_fraction=end_fraction,
+                confirmed_fraction=local_preparation_end_fraction,
                 cancel_available=True,
                 activity_observed=True,
                 batch_completed_files=completed_files,
@@ -25292,7 +25936,7 @@ def run_automatic(
             persist_prepared_checkpoint("preparation_in_progress")
             completed_files += 1
             progress(
-                end_fraction,
+                local_preparation_end_fraction,
                 desc=format_progress_desc(
                     f"Already indexed — skipped local parsing for {pdf_path.name}",
                     file_index,
@@ -25308,7 +25952,7 @@ def run_automatic(
                     f"PDF {file_index}/{total_files}: every physical page-parent identity was already "
                     "linked to a vector in this workspace."
                 ),
-                confirmed_fraction=end_fraction,
+                confirmed_fraction=local_preparation_end_fraction,
                 cancel_available=True,
                 activity_observed=True,
             )
@@ -25343,7 +25987,7 @@ def run_automatic(
             persist_prepared_checkpoint("preparation_in_progress")
             completed_files += 1
             progress(
-                end_fraction,
+                local_preparation_end_fraction,
                 desc=format_progress_desc(
                     f"Exact duplicate skipped — using {Path(canonical_path).name}",
                     file_index,
@@ -25359,7 +26003,7 @@ def run_automatic(
                     f"PDF {file_index}/{total_files}: same SHA-256 as {Path(canonical_path).name}; "
                     "the earlier selected source remains canonical."
                 ),
-                confirmed_fraction=end_fraction,
+                confirmed_fraction=local_preparation_end_fraction,
                 cancel_available=True,
                 activity_observed=True,
                 batch_completed_files=completed_files,
@@ -26025,7 +26669,7 @@ def run_automatic(
         and not batch_upload_report
     ):
         def report_grouped_upload_status(stage, report=None):
-            nonlocal expected_seconds
+            nonlocal expected_seconds, pending_ocr_eta_surcharge
             report = report or {}
             stage_text = str(stage or "Submitting the selected PDF batch to AnythingLLM")
             # The grouped Desktop route owns the live queue observer.  Feed
@@ -26074,6 +26718,7 @@ def run_automatic(
             ) * evidence_fraction
             eta_reprice_reason = ""
             eta_basis_update = None
+            cache_reuse_records = None
             if (
                 timing_event == "batch_cache_lookup_completed"
                 and desktop_serial_queue
@@ -26086,40 +26731,83 @@ def run_automatic(
                 cached_records = batch_cache_observation["cached_records"]
                 fresh_records = batch_cache_observation["fresh_records"]
                 source_total = batch_cache_observation["source_total"]
-                if prepared_records and cached_records:
-                    elapsed = max(0.0, time.perf_counter() - started_at)
-                    repriced_expected = confirmed_prequeue_cache_eta_seconds(
-                        expected_seconds,
-                        elapsed,
-                        fresh_provider_requests=fresh_records,
-                        provider_request_seconds=timing_unit_prior,
-                        features=timing_features,
-                        cached_attachment_records=cached_records,
-                        remaining_source_windows=source_total,
-                        cache_attachment_prior=cache_attachment_prior,
+                cached_documents = batch_cache_observation["cached_documents"]
+                cache_reuse_records = cached_records
+                if prepared_records:
+                    deferred_ocr_seconds = pending_ocr_eta_surcharge
+                    deferred_ocr_files = len(
+                        run_timing_estimate.get("ocr_runtime_surcharges", [])
                     )
-                    if repriced_expected + 5 < int(expected_seconds):
-                        previous_expected_seconds = int(expected_seconds)
-                        expected_seconds = repriced_expected
-                        run_timing_estimate["expected_seconds"] = expected_seconds
-                        run_timing_estimate["confirmed_batch_cache_reprice"] = {
-                            "prepared_records": prepared_records,
-                            "cached_provider_requests": cached_records,
-                            "fresh_provider_requests": fresh_records,
-                            "remaining_source_windows": source_total,
-                            "provider_request_seconds_prior": round(timing_unit_prior, 3),
-                            "cached_attachment_tail_prior": dict(cache_attachment_prior),
-                            "previous_expected_seconds": previous_expected_seconds,
-                            "expected_seconds": expected_seconds,
-                        }
-                        eta_reprice_reason = "confirmed_batch_cache_plan"
+                    if cached_records:
+                        # Cache evidence changes the future work materially:
+                        # preparation (including OCR) is already elapsed, and
+                        # the exact fresh/cache plan is now the authority for
+                        # the remaining Desktop queue.
                         eta_basis_update = "cache_plan_confirmed"
+                        elapsed = max(0.0, time.perf_counter() - started_at)
+                        repriced_expected = confirmed_batch_execution_plan_eta_seconds(
+                            expected_seconds,
+                            elapsed,
+                            fresh_provider_requests=fresh_records,
+                            provider_request_seconds=timing_unit_prior,
+                            features=timing_features,
+                            cached_attachment_records=cached_records,
+                            source_total=source_total,
+                            cached_documents=cached_documents,
+                            cache_attachment_prior=cache_attachment_prior,
+                        )
+                        if repriced_expected + 5 < int(expected_seconds):
+                            previous_expected_seconds = int(expected_seconds)
+                            expected_seconds = repriced_expected
+                            run_timing_estimate["expected_seconds"] = expected_seconds
+                            run_timing_estimate["confirmed_batch_cache_reprice"] = {
+                                "prepared_records": prepared_records,
+                                "cached_provider_requests": cached_records,
+                                "fresh_provider_requests": fresh_records,
+                                "remaining_source_windows": source_total,
+                                "cached_source_windows": cached_documents,
+                                "provider_request_seconds_prior": round(timing_unit_prior, 3),
+                                "cached_attachment_tail_prior": dict(cache_attachment_prior),
+                                "deferred_ocr_seconds": deferred_ocr_seconds,
+                                "ocr_observations_deferred_until_exact_plan": deferred_ocr_files,
+                                "previous_expected_seconds": previous_expected_seconds,
+                                "expected_seconds": expected_seconds,
+                            }
+                            eta_reprice_reason = "confirmed_batch_cache_plan"
+                    elif deferred_ocr_seconds:
+                        # With no cache hits, every unfinished record still
+                        # needs normal provider work. Apply the observed OCR
+                        # correction once now that the all-fresh execution
+                        # plan is proven, rather than jumping repeatedly while
+                        # local preparation is still discovering pages.
+                        previous_expected_seconds = int(expected_seconds)
+                        expected_seconds = previous_expected_seconds + deferred_ocr_seconds
+                        run_timing_estimate["expected_seconds"] = expected_seconds
+                        run_timing_estimate.setdefault("ocr_runtime_reprices", []).append(
+                            {
+                                "checkpoint": "exact_execution_plan",
+                                "observed_ocr_files": deferred_ocr_files,
+                                "added_seconds": deferred_ocr_seconds,
+                                "expected_seconds": expected_seconds,
+                                "display_policy": "applied_after_zero_cache_plan",
+                            }
+                        )
+                        eta_reprice_reason = "ocr_runtime_observed"
+                        eta_basis_update = "live_observations"
+                    else:
+                        eta_basis_update = "execution_plan_confirmed"
+                    # OCR that happened during preparation has now either
+                    # informed the all-fresh correction or been represented
+                    # by elapsed time in the cache-aware reprice. Never carry
+                    # it into a later queue ETA as a second surcharge.
+                    pending_ocr_eta_surcharge = 0
                 update_eta_checkpoint_record(
                     run_root,
                     numbers={
                         "prepared_records": prepared_records,
                         "exact_cached_records": cached_records,
                         "exact_fresh_records": fresh_records,
+                        "exact_cached_documents": cached_documents,
                         "post_cache_expected_seconds": expected_seconds,
                     },
                 )
@@ -26144,6 +26832,7 @@ def run_automatic(
                 remaining_source_windows = cache_observation[
                     "remaining_source_windows"
                 ]
+                cache_reuse_records = cached_records
                 # A zero-cache snapshot is completed evidence but leaves the
                 # classic estimate untouched. Any proved cache hit may remove
                 # only its own provider allowance and substitutes a measured,
@@ -26226,12 +26915,17 @@ def run_automatic(
             # only counts owned by the current event. Reusing an earlier
             # source's plan here made every later source display its counts.
             stage_text = current_cache_plan_progress_text(stage_text, report)
+            display_stage_text = combined_grouped_upload_status_details(
+                grouped_upload_display_state,
+                stage_text,
+                report,
+            )
             update_live_automatic_run_status(
                 run_root,
                 state="running",
                 phase="Submitting the selected PDF batch to AnythingLLM",
                 expected_seconds=expected_seconds,
-                details=stage_text,
+                details=display_stage_text,
                 confirmed_fraction=grouped_confirmed_fraction,
                 cancel_available=not automatic_run_cancellation_requested(run_root),
                 cancel_requested=automatic_run_cancellation_requested(run_root),
@@ -26247,7 +26941,22 @@ def run_automatic(
                 batch_current_file_index=(
                     grouped_progress["source_index"] or total_files
                 ),
+                authoritative_batch_completed_files=True,
                 queue_forecast_expected_seconds=latest_batch_queue_forecast_seconds,
+                cache_reuse_records=cache_reuse_records,
+                cache_reuse_documents=(
+                    cached_documents
+                    if timing_event == "batch_cache_lookup_completed"
+                    else None
+                ),
+                cache_total_documents=(
+                    source_total
+                    if timing_event == "batch_cache_lookup_completed"
+                    else None
+                ),
+                presentation_expected_seconds=(
+                    expected_seconds if (cache_reuse_records or 0) > 0 else None
+                ),
             )
 
         grouped_upload_progress_active = True
@@ -28515,7 +29224,6 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     auto_folder_file_selector,
                     batch_folder_selection_panel,
                     auto_folder_status,
-                    retry_selected_pdf_files_button,
                 ],
                 show_progress="minimal",
                 queue=True,
@@ -29411,7 +30119,6 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     auto_pdfs,
                     choose_pdf_folder_button,
                     auto_folder_file_selector,
-                    retry_selected_pdf_files_button,
                 ],
                 # The live Automatic status card already acknowledges Confirm
                 # immediately and owns all visible progress.  Targeting

@@ -135,6 +135,43 @@ def test_confirm_guard_refuses_a_replayed_click_while_selection_is_pending():
     assert status == {"state": "preparing"}
 
 
+def test_confirm_claims_and_acknowledges_before_the_background_worker_runs(monkeypatch):
+    """A first click must visibly respond even if worker scheduling is delayed.
+
+    This is the exact window that previously made a legitimate Confirm look
+    inert: Gradio could detach the browser stream before the worker produced
+    its first generator value.  Keep the worker held so the test proves the
+    response and lifecycle claim originate in the click handler itself.
+    """
+    import rag_pdf_gradio_app as app
+
+    class HeldWorker:
+        def __init__(self, *args, **kwargs):
+            self.started = False
+
+        def start(self):
+            self.started = True
+
+    original_status = app.LIVE_AUTOMATIC_RUN_STATUS
+    monkeypatch.setattr(app.threading, "Thread", HeldWorker)
+    try:
+        app.LIVE_AUTOMATIC_RUN_STATUS = {}
+        stream = app.run_automatic_from_confirmation_stream(
+            *([None] * len(app.AUTOMATIC_RUN_FIELDS))
+        )
+        acknowledgement = next(stream)
+        status = dict(app.LIVE_AUTOMATIC_RUN_STATUS)
+        stream.close()
+    finally:
+        app.LIVE_AUTOMATIC_RUN_STATUS = original_status
+
+    assert len(acknowledgement) == 12
+    assert acknowledgement[4]["value"] == "Processing…"
+    assert status["state"] == "preparing"
+    assert status["confirmation_in_flight"] is True
+    assert status["confirmation_owner_token"]
+
+
 def test_browser_status_poller_ignores_a_run_owned_by_another_session():
     import rag_pdf_gradio_app as app
 
@@ -165,9 +202,9 @@ def test_browser_stream_keeps_presentation_state_as_an_extra_output():
     )
 
     assert len(updates) == 1
-    assert len(updates[0]) == 17
-    assert updates[0][-5] == ""
-    assert all(update.get("__type__") == "update" for update in updates[0][-4:])
+    assert len(updates[0]) == 16
+    assert updates[0][-4] == ""
+    assert all(update.get("__type__") == "update" for update in updates[0][-3:])
 
 
 def test_successful_retention_reports_a_locked_artifact_without_failing_the_document(tmp_path, monkeypatch):

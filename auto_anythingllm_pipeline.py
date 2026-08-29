@@ -13320,6 +13320,12 @@ ANYTHINGLLM_EMBEDDING_SUBMISSION_STRATEGY = "desktop_queue"
 ANYTHINGLLM_EMBEDDING_UPDATE_BATCH_SIZE = 2
 ANYTHINGLLM_EMBEDDING_WARMUP_BATCH_SIZE = 1
 ANYTHINGLLM_EMBEDDING_WARMUP_BATCH_COUNT = 1
+# A source transaction remains the recovery/audit boundary, but serializing a
+# full Desktop queue and exact-vector observation after every individual PDF
+# leaves the queue empty between otherwise independent sources.  Keep each
+# queue mutation bounded while restoring a useful amount of queue continuity.
+ANYTHINGLLM_SOURCE_QUEUE_GROUP_MAX_SOURCES = 4
+ANYTHINGLLM_SOURCE_QUEUE_GROUP_MAX_RECORDS = 512
 # This is deliberately a hard cap, rather than a default.  Callers must not
 # accidentally restore the unsafe four-to-six ramp by passing a larger limit.
 ANYTHINGLLM_EMBEDDING_MAX_CONCURRENT_BATCHES = 1
@@ -15705,6 +15711,7 @@ def maybe_upload_segment_files(
     submission_receipt_path=None,
     run_id="",
     record_label="uploaded files",
+    defer_embedding_update=False,
 ):
     auth_resolution_started = time.monotonic()
     if not api_url:
@@ -16171,7 +16178,7 @@ def maybe_upload_segment_files(
                     "error": "At least one prepared record was not attached; no partial workspace embedding request was submitted.",
                 }
             )
-        elif uploaded > 0 and locations:
+        elif uploaded > 0 and locations and not defer_embedding_update:
             embedding_update = update_workspace_embeddings_desktop_queue(
                 api_url,
                 api_key,
@@ -16196,7 +16203,12 @@ def maybe_upload_segment_files(
             )
             embedded = embedding_update["accepted"]
             errors.extend(embedding_update["errors"])
-        elif uploaded > 0:
+        elif uploaded > 0 and not defer_embedding_update:
+            # A source transaction deliberately stops here after its local
+            # attachment step.  Its owning coordinator queues the returned
+            # locations as part of a bounded source group; treating that
+            # intentional hand-off as a missing-location error prevents every
+            # fresh multi-PDF run from reaching the queue.
             errors.append(
                 {
                     "endpoint": "update-embeddings",
@@ -16213,7 +16225,13 @@ def maybe_upload_segment_files(
         }
         for batch in (embedding_update.get("batches") or [])
     )
-    if uploaded > 0 and locations and embedded != len(locations) and not errors:
+    if (
+        not defer_embedding_update
+        and uploaded > 0
+        and locations
+        and embedded != len(locations)
+        and not errors
+    ):
         errors.append(
             {
                 "endpoint": "update-embeddings",
@@ -16228,6 +16246,11 @@ def maybe_upload_segment_files(
         status = "error"
     elif reconciliation_pending:
         status = "reconciliation_pending"
+    elif defer_embedding_update and uploaded > 0 and locations and not errors:
+        # The source-transaction coordinator owns the following bounded
+        # Desktop queue group.  Attachments and their durable receipts are
+        # complete, but no vector claim is made until that group proves it.
+        status = "attached_pending_queue"
     elif embedded != len(locations) or errors:
         status = "error"
     elif temporary_key_cleanup.get("status") == "delete_failed":
@@ -16260,6 +16283,52 @@ def maybe_upload_segment_files(
     }
 
 
+def plan_source_queue_groups(
+    source_groups,
+    *,
+    max_sources=ANYTHINGLLM_SOURCE_QUEUE_GROUP_MAX_SOURCES,
+    max_records=ANYTHINGLLM_SOURCE_QUEUE_GROUP_MAX_RECORDS,
+):
+    """Return ordered, bounded queue groups without splitting a PDF source.
+
+    A source can be larger than the record budget; it is deliberately kept
+    whole in its own group.  Splitting a source would make an ambiguous
+    Desktop mutation harder to recover and would not accelerate Desktop's
+    internal per-document queue.  The limits only bound how many independent
+    sources can share one external queue mutation.
+    """
+    try:
+        source_limit = max(1, int(max_sources or 1))
+    except (TypeError, ValueError):
+        source_limit = 1
+    try:
+        record_limit = max(1, int(max_records or 1))
+    except (TypeError, ValueError):
+        record_limit = 1
+    planned = []
+    current = []
+    current_records = 0
+    for source in source_groups or []:
+        rows = list((source or {}).get("rows") or [])
+        source_records = len(rows)
+        if current and (
+            len(current) >= source_limit
+            or current_records + source_records > record_limit
+        ):
+            planned.append(current)
+            current = []
+            current_records = 0
+        current.append(source)
+        current_records += source_records
+        if current_records >= record_limit or len(current) >= source_limit:
+            planned.append(current)
+            current = []
+            current_records = 0
+    if current:
+        planned.append(current)
+    return planned
+
+
 def maybe_upload_segment_files_source_transactions(
     api_url,
     api_key,
@@ -16277,13 +16346,13 @@ def maybe_upload_segment_files_source_transactions(
     run_id="",
     record_label="uploaded files",
 ):
-    """Attach and prove each selected PDF as one durable source transaction.
+    """Attach PDFs as durable source transactions and queue small groups.
 
-    Cache discovery and authentication remain batch-scoped. Every external
-    mutation after that is source-scoped: a definite local refusal can release
-    the next PDF, while an unknown write outcome stops the mutation lane. This
-    is the boundary needed for large runs to retain earlier success without
-    allowing a problematic source to erase or silently reorder later work.
+    Cache discovery and authentication remain batch-scoped. Attachments stay
+    source-scoped, so an explicit local refusal can release healthy siblings.
+    Attached sources then enter a bounded Desktop queue group. An unknown
+    queue write holds only that group and later groups, while every earlier
+    source remains independently recoverable from its durable receipt.
     """
     rows = list(upload_rows or [])
     grouped = []
@@ -16355,6 +16424,31 @@ def maybe_upload_segment_files_source_transactions(
         reusable_payloads,
         folder_names=[row.get("_anythingllm_folder_name") or folder_name for row in rows],
     )
+    # The shared lookup already has an exact answer for every prepared record.
+    # Preserve the existing record-level plan for the importer, and derive a
+    # source-level summary for the UI from those same results. This does not
+    # trigger a second storage scan merely to classify selected PDFs.
+    reusable_by_identity = {
+        (
+            str(row.get("_automatic_source_path") or ""),
+            str(row.get("chunkSource") or ""),
+        ): location
+        for row, location in zip(rows, reusable_locations)
+    }
+    cached_document_count = 0
+    partially_cached_document_count = 0
+    for source_group in grouped:
+        reusable_flags = [
+            bool(reusable_by_identity.get((
+                str(source_row.get("_automatic_source_path") or ""),
+                str(source_row.get("chunkSource") or ""),
+            )))
+            for source_row in list(source_group.get("rows") or [])
+        ]
+        if reusable_flags and all(reusable_flags):
+            cached_document_count += 1
+        elif any(reusable_flags):
+            partially_cached_document_count += 1
     if callable(status_callback):
         status_callback(
             f"Cache check complete: {sum(bool(location) for location in reusable_locations)} reusable record(s)",
@@ -16362,14 +16456,12 @@ def maybe_upload_segment_files_source_transactions(
                 "timing_event": "batch_cache_lookup_completed",
                 "prepared_records": len(rows),
                 "reusable_records": sum(bool(location) for location in reusable_locations),
+                "cached_documents": cached_document_count,
+                "partially_cached_documents": partially_cached_document_count,
                 "lookup_elapsed_seconds": round(time.perf_counter() - cache_lookup_started, 3),
                 "source_window_total": len(grouped),
             },
         )
-    reusable_by_identity = {
-        (str(row.get("_automatic_source_path") or ""), str(row.get("chunkSource") or "")): location
-        for row, location in zip(rows, reusable_locations)
-    }
     pre_attachment_locations = snapshot_staged_document_locations(storage_dir)
     aggregate = {
         "status": "complete",
@@ -16435,6 +16527,14 @@ def maybe_upload_segment_files_source_transactions(
                 aggregate["embedding_update"],
             )
 
+    queue_groups = plan_source_queue_groups(grouped)
+    aggregate["embedding_update"].update({
+        "submission_strategy": "durable_bounded_pdf_queue_groups",
+        "source_queue_group_count": len(queue_groups),
+        "source_queue_group_max_sources": ANYTHINGLLM_SOURCE_QUEUE_GROUP_MAX_SOURCES,
+        "source_queue_group_max_records": ANYTHINGLLM_SOURCE_QUEUE_GROUP_MAX_RECORDS,
+    })
+
     try:
         if transaction_ledger_path:
             # Publish the recovery contract before the first source event.
@@ -16446,19 +16546,33 @@ def maybe_upload_segment_files_source_transactions(
                 run_id=run_id,
                 transaction_count=len(grouped),
             )
-        for source_index, group in enumerate(grouped, start=1):
-            source_path = str(group["source_path"] or "")
-            source_name = Path(source_path).name if source_path else f"PDF {source_index}"
-            source_rows = []
-            for row in group["rows"]:
-                source_row = dict(row)
-                source_row["_reusable_location_override"] = reusable_by_identity.get(
-                    (source_path, str(row.get("chunkSource") or "")),
-                    "",
-                )
-                source_row["_attachment_preexisting_locations_override"] = pre_attachment_locations
-                source_rows.append(source_row)
-            transaction = {
+        source_index_by_key = {
+            str(group.get("source_key") or ""): position
+            for position, group in enumerate(grouped, start=1)
+        }
+        stop_submission = False
+        for queue_group_index, queue_group in enumerate(queue_groups, start=1):
+            pending_queue_sources = []
+            # An ambiguous later attachment stops *new* work in this group,
+            # but it must not strand an earlier source whose attachment has a
+            # durable location receipt. Flush those already-safe locations as
+            # their own bounded queue group, then hold the ambiguous source
+            # and all later sources for recovery.
+            hold_after_queue_group = False
+            for group in queue_group:
+                source_index = source_index_by_key[str(group.get("source_key") or "")]
+                source_path = str(group["source_path"] or "")
+                source_name = Path(source_path).name if source_path else f"PDF {source_index}"
+                source_rows = []
+                for row in group["rows"]:
+                    source_row = dict(row)
+                    source_row["_reusable_location_override"] = reusable_by_identity.get(
+                        (source_path, str(row.get("chunkSource") or "")),
+                        "",
+                    )
+                    source_row["_attachment_preexisting_locations_override"] = pre_attachment_locations
+                    source_rows.append(source_row)
+                transaction = {
                 "source_index": source_index,
                 "source_count": len(grouped),
                 "source_key": group["source_key"],
@@ -16478,142 +16592,251 @@ def maybe_upload_segment_files_source_transactions(
                     if str(row.get("chunkSource") or "")
                 ],
                 "planned_records": len(source_rows),
-                "state": "prepared",
-                "mutation_scope": "current_source",
-            }
-            aggregate["source_transactions"].append(transaction)
+                    "state": "prepared",
+                    "mutation_scope": "current_source",
+                    "source_queue_group_index": queue_group_index,
+                    "source_queue_group_total": len(queue_groups),
+                }
+                aggregate["source_transactions"].append(transaction)
             # The source-transaction ledger is the durable ownership record at
             # this boundary. The aggregate embedding ledger has not changed
             # yet, so rewriting its growing batch/event arrays is pure I/O.
-            persist_transactions(transaction)
+                persist_transactions(transaction)
 
-            def source_status(message, report, *, _index=source_index, _name=source_name):
-                if callable(status_callback):
-                    contextual = dict(report or {})
-                    contextual.update({
-                        "source_window_index": _index,
-                        "source_window_total": len(grouped),
-                        "source_path": source_path,
-                        "source_filename": _name,
-                    })
-                    status_callback(
-                        f"AnythingLLM PDF {_index} of {len(grouped)} ({_name}): {message}",
-                        contextual,
-                    )
+                def source_status(message, report, *, _index=source_index, _name=source_name):
+                    if callable(status_callback):
+                        contextual = dict(report or {})
+                        contextual.update({
+                            "source_window_index": _index,
+                            "source_window_total": len(grouped),
+                            "source_queue_group_index": queue_group_index,
+                            "source_queue_group_total": len(queue_groups),
+                            "source_path": source_path,
+                            "source_filename": _name,
+                        })
+                        status_callback(
+                            f"Preparing AnythingLLM PDF {_index} of {len(grouped)} ({_name}): {message}",
+                            contextual,
+                        )
 
-            transaction["state"] = "attachment_intent_durable"
-            persist_transactions(transaction)
-            source_ledger = (
+                transaction["state"] = "attachment_intent_durable"
+                persist_transactions(transaction)
+                source_ledger = (
                 Path(embedding_ledger_path).parent
                 / "source-transactions"
                 / f"{source_index:04d}-embedding-ledger.json"
-                if embedding_ledger_path else None
-            )
+                    if embedding_ledger_path else None
+                )
 
-            def source_callback(callback, report):
+                child = maybe_upload_segment_files(
+                    api_url,
+                    resolved_key,
+                    source_rows,
+                    workspace_slug=workspace_slug,
+                    folder_name=folder_name,
+                    storage_dir=storage_dir,
+                    embedding_ledger_path=source_ledger,
+                    status_callback=source_status,
+                    cancel_callback=cancel_callback,
+                    submission_receipt_path=submission_receipt_path,
+                    run_id=run_id,
+                    record_label=f"page-parent record(s) for {source_name}",
+                    defer_embedding_update=True,
+                )
+                transaction.update({
+                    "uploaded": int(child.get("uploaded") or 0),
+                    "embedded": 0,
+                    "newly_attached_records": int(child.get("uploaded") or 0),
+                    "confirmed_vector_records": 0,
+                    "locations": list(child.get("locations") or []),
+                    "errors": list(child.get("errors") or []),
+                })
+                aggregate["uploaded"] += transaction["uploaded"]
+                aggregate["locations"].extend(child.get("locations") or [])
+                aggregate["reused_cached_locations"].extend(child.get("reused_cached_locations") or [])
+                aggregate["attachment_results"].extend(child.get("attachment_results") or [])
+
+                child_status = str(child.get("status") or "error")
+                primary_errors = [
+                    error for error in (child.get("errors") or [])
+                    if isinstance(error, dict)
+                    and str(error.get("classification") or "") not in {
+                        "attachment_batch_incomplete",
+                        "embedding_update_incomplete",
+                    }
+                ]
+                may_continue = bool(primary_errors) and all(
+                    bool(error.get("may_continue_later_sources")) for error in primary_errors
+                )
+                if child_status == "attached_pending_queue":
+                    transaction["state"] = "attached_pending_queue_group"
+                    persist_transactions(transaction)
+                    pending_queue_sources.append((transaction, child))
+                    continue
+                for error in child.get("errors") or []:
+                    error_copy = dict(error) if isinstance(error, dict) else {"error": str(error)}
+                    error_copy.setdefault("source_path", source_path)
+                    aggregate["errors"].append(error_copy)
+                if may_continue:
+                    transaction["state"] = "source_rejected_without_remote_mutation"
+                    transaction["later_sources_released"] = True
+                    persist_transactions(transaction)
+                    continue
+                transaction["state"] = (
+                    "ambiguous_external_mutation_held"
+                    if any(str(error.get("category") or "") == "ambiguous_external_mutation" for error in primary_errors)
+                    else "global_run_hold"
+                )
+                transaction["later_sources_released"] = False
+                aggregate["stopped_after_source_transaction"] = source_index
+                aggregate["stop_reason"] = transaction["state"]
+                persist_transactions(transaction)
+                hold_after_queue_group = True
+                break
+
+            if not pending_queue_sources:
+                if hold_after_queue_group:
+                    stop_submission = True
+                    break
+                continue
+
+            queue_locations = [
+                location
+                for transaction, _child in pending_queue_sources
+                for location in transaction.get("locations") or []
+            ]
+            queue_source_paths = [
+                str(transaction.get("source_path") or "")
+                for transaction, _child in pending_queue_sources
+                if str(transaction.get("source_path") or "")
+            ]
+            first_source_index = min(int(transaction["source_index"]) for transaction, _child in pending_queue_sources)
+
+            def queue_group_status(message, report):
+                if not callable(status_callback):
+                    return
                 contextual = dict(report or {})
                 contextual.update({
-                    "source_path": source_path,
-                    "source_filename": source_name,
+                    "source_window_index": first_source_index,
+                    "source_window_total": len(grouped),
+                    "source_queue_group_index": queue_group_index,
+                    "source_queue_group_total": len(queue_groups),
+                    "source_queue_group_sources": len(pending_queue_sources),
+                    "source_paths": list(queue_source_paths),
+                })
+                status_callback(
+                    f"AnythingLLM queue group {queue_group_index} of {len(queue_groups)} "
+                    f"({len(pending_queue_sources)} PDF(s)): {message}",
+                    contextual,
+                )
+
+            def queue_group_callback(callback, report):
+                contextual = dict(report or {})
+                contextual.update({
+                    "source_paths": list(queue_source_paths),
+                    "source_queue_group_index": queue_group_index,
+                    "source_queue_group_total": len(queue_groups),
                 })
                 return callback(contextual)
 
-            child = maybe_upload_segment_files(
+            group_ledger = (
+                Path(embedding_ledger_path).parent
+                / "queue-groups"
+                / f"{queue_group_index:04d}-embedding-ledger.json"
+                if embedding_ledger_path else None
+            )
+            queue_update = update_workspace_embeddings_desktop_queue(
                 api_url,
                 resolved_key,
-                source_rows,
-                workspace_slug=workspace_slug,
-                folder_name=folder_name,
-                storage_dir=storage_dir,
-                embedding_ledger_path=source_ledger,
-                status_callback=source_status,
+                workspace_slug,
+                queue_locations,
+                ledger_path=group_ledger,
+                status_callback=queue_group_status,
                 batch_verifier=(
-                    (lambda report, _callback=batch_verifier: source_callback(_callback, report))
+                    (lambda report, _callback=batch_verifier: queue_group_callback(_callback, report))
                     if callable(batch_verifier) else None
                 ),
                 batch_inspector=(
-                    (lambda report, _callback=batch_inspector: source_callback(_callback, report))
+                    (lambda report, _callback=batch_inspector: queue_group_callback(_callback, report))
                     if callable(batch_inspector) else None
                 ),
                 cancel_callback=cancel_callback,
-                submission_receipt_path=submission_receipt_path,
-                run_id=run_id,
-                record_label=f"page-parent record(s) for {source_name}",
+                record_label=f"page-parent record(s) from {len(pending_queue_sources)} selected PDF(s)",
+                storage_dir=storage_dir,
+                location_sources=[
+                    {"location": str(attachment.get("location") or ""), "source_path": str(attachment.get("source_path") or ""), "filename": str(attachment.get("filename") or "")}
+                    for transaction, child in pending_queue_sources
+                    for attachment in (child.get("attachment_results") or [])
+                    if str(attachment.get("location") or "")
+                ],
+                _source_window_execution=True,
             )
-            transaction.update({
-                "state": str(child.get("status") or "error"),
-                "uploaded": int(child.get("uploaded") or 0),
-                "embedded": int(child.get("embedded") or 0),
-                "newly_attached_records": int(child.get("uploaded") or 0),
-                "confirmed_vector_records": int(child.get("embedded") or 0),
-                "locations": list(child.get("locations") or []),
-                "errors": list(child.get("errors") or []),
-            })
-            aggregate["uploaded"] += transaction["uploaded"]
-            aggregate["embedded"] += transaction["embedded"]
-            aggregate["locations"].extend(child.get("locations") or [])
-            aggregate["reused_cached_locations"].extend(child.get("reused_cached_locations") or [])
-            aggregate["attachment_results"].extend(child.get("attachment_results") or [])
-            child_update = dict(child.get("embedding_update") or {})
-            aggregate["embedding_update"]["accepted"] += int(child_update.get("accepted") or 0)
-            aggregate["embedding_update"]["requested"] += int(child_update.get("requested") or 0)
-            aggregate["embedding_update"]["queue_records"] += int(child_update.get("queue_records") or child_update.get("requested") or 0)
-            aggregate["embedding_update"]["planned_locations"].extend(child_update.get("planned_locations") or child.get("locations") or [])
-            for batch in child_update.get("batches") or []:
+            aggregate["embedding_update"]["accepted"] += int(queue_update.get("accepted") or 0)
+            aggregate["embedding_update"]["requested"] += int(queue_update.get("requested") or 0)
+            aggregate["embedding_update"]["queue_records"] += int(queue_update.get("queue_records") or queue_update.get("requested") or 0)
+            aggregate["embedding_update"]["planned_locations"].extend(queue_update.get("planned_locations") or queue_locations)
+            group_batches = list(queue_update.get("batches") or [])
+            for batch in group_batches:
                 batch_copy = dict(batch)
                 batch_copy.update({
-                    "batch": source_index,
-                    "total_batches": len(grouped),
-                    "source_window_index": source_index,
-                    "source_window_total": len(grouped),
-                    "source_path": source_path,
-                    "source_filename": source_name,
+                    "batch": queue_group_index,
+                    "total_batches": len(queue_groups),
+                    "source_queue_group_index": queue_group_index,
+                    "source_queue_group_total": len(queue_groups),
+                    "source_paths": list(queue_source_paths),
                 })
                 aggregate["embedding_update"]["batches"].append(batch_copy)
-            for error in child.get("errors") or []:
-                error_copy = dict(error) if isinstance(error, dict) else {"error": str(error)}
-                error_copy.setdefault("source_path", source_path)
-                aggregate["errors"].append(error_copy)
-            for error in child_update.get("errors") or []:
-                error_copy = dict(error) if isinstance(error, dict) else {"error": str(error)}
-                error_copy.setdefault("source_path", source_path)
-                aggregate["embedding_update"]["errors"].append(error_copy)
             aggregate["embedding_update"]["runtime_events"] = (
                 aggregate["embedding_update"]["runtime_events"]
-                + list(child_update.get("runtime_events") or [])
+                + list(queue_update.get("runtime_events") or [])
             )[-ANYTHINGLLM_EMBEDDING_RUNTIME_EVENT_TAIL_LIMIT:]
-
-            child_status = str(child.get("status") or "error")
-            primary_errors = [
-                error for error in (child.get("errors") or [])
-                if isinstance(error, dict)
-                and str(error.get("classification") or "") not in {
-                    "attachment_batch_incomplete",
-                    "embedding_update_incomplete",
-                }
-            ]
-            may_continue = bool(primary_errors) and all(
-                bool(error.get("may_continue_later_sources")) for error in primary_errors
+            queue_errors = list(queue_update.get("errors") or [])
+            for error in queue_errors:
+                error_copy: dict[str, Any] = (
+                    dict(error) if isinstance(error, dict) else {"error": str(error)}
+                )
+                error_copy.setdefault("source_queue_group_index", queue_group_index)
+                error_copy.setdefault("source_paths", list(queue_source_paths))
+                aggregate["errors"].append(error_copy)
+                aggregate["embedding_update"]["errors"].append(error_copy)
+            queue_exact = (
+                bool(queue_locations)
+                and int(queue_update.get("accepted") or 0) == len(queue_locations)
+                and bool(group_batches)
+                and all(bool(batch.get("searchability_proven")) for batch in group_batches)
+                and not queue_errors
             )
-            if child_status in {"complete", "complete_with_key_cleanup_warning"}:
-                transaction["state"] = "exact_vectors_proven"
-                persist_transactions(transaction)
-                continue
-            if may_continue:
-                transaction["state"] = "source_rejected_without_remote_mutation"
-                transaction["later_sources_released"] = True
-                persist_transactions(transaction)
-                continue
-            transaction["state"] = (
-                "ambiguous_external_mutation_held"
-                if any(str(error.get("category") or "") == "ambiguous_external_mutation" for error in primary_errors)
-                else "global_run_hold"
+            queue_rejected = bool(group_batches) and all(
+                str(batch.get("submission_state") or "") == "rejected"
+                for batch in group_batches
             )
-            transaction["later_sources_released"] = False
-            aggregate["stopped_after_source_transaction"] = source_index
-            aggregate["stop_reason"] = transaction["state"]
-            persist_transactions(transaction)
+            for transaction, _child in pending_queue_sources:
+                source_locations = list(transaction.get("locations") or [])
+                transaction["embedded"] = len(source_locations) if queue_exact else 0
+                transaction["confirmed_vector_records"] = transaction["embedded"]
+                transaction["queue_group_locations"] = source_locations
+                if queue_exact:
+                    transaction["state"] = "exact_vectors_proven"
+                    aggregate["embedded"] += transaction["embedded"]
+                elif queue_rejected:
+                    transaction["state"] = "source_queue_rejected_without_remote_mutation"
+                    transaction["later_sources_released"] = True
+                else:
+                    transaction["state"] = "ambiguous_external_mutation_held"
+                    transaction["later_sources_released"] = False
+                transaction["errors"] = list(transaction.get("errors") or []) + queue_errors
+                persist_transactions(transaction)
+            if queue_exact or queue_rejected:
+                if hold_after_queue_group:
+                    stop_submission = True
+                    break
+                continue
+            aggregate["stopped_after_source_transaction"] = first_source_index
+            aggregate["stop_reason"] = "ambiguous_external_mutation_held"
+            stop_submission = True
             break
+        if stop_submission:
+            pass
     finally:
         if temporary_key_id:
             temporary_key_cleanup = cleanup_temporary_desktop_api_key(api_url, temporary_key_id)

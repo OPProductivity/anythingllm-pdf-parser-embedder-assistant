@@ -1,4 +1,5 @@
 import json
+from unittest import mock
 
 import pytest
 
@@ -103,12 +104,29 @@ def test_eta_ui_distinguishes_initial_and_confirmed_cache_plan():
         started_epoch=100,
         now=110,
         eta_basis="cache_plan_confirmed",
+        cache_reuse_documents=3,
+        cache_total_documents=5,
     )
 
     assert "initial estimate" in initial
     assert 'data-eta-basis="initial_estimate"' in initial
-    assert "cache plan confirmed" in confirmed
+    assert "3 of 5 documents already cached" in confirmed
     assert 'data-eta-basis="cache_plan_confirmed"' in confirmed
+
+
+def test_exact_zero_cache_plan_does_not_claim_cached_documents():
+    import rag_pdf_gradio_app as app
+
+    rendered = app.automatic_run_timing_html(
+        expected_seconds=90,
+        state="running",
+        started_epoch=100,
+        now=110,
+        eta_basis="execution_plan_confirmed",
+    )
+
+    assert "initial estimate" not in rendered
+    assert "cached" not in rendered
 
 
 def test_stable_opening_eta_stops_calling_itself_initial_after_two_minutes():
@@ -199,3 +217,130 @@ def test_ocr_runtime_reprices_have_four_or_fewer_visible_checkpoints():
     assert app.ocr_runtime_eta_reprice_checkpoints(20) == (1, 7, 14, 20)
     assert len(app.ocr_runtime_eta_reprice_checkpoints(375)) <= 4
     assert app.ocr_runtime_eta_reprice_checkpoints(0) == (1, 2, 4, 8)
+
+
+def test_run_progress_snapshot_coalesces_same_phase_queue_repaints(tmp_path):
+    import rag_pdf_gradio_app as app
+
+    original_status = app.LIVE_AUTOMATIC_RUN_STATUS
+    original_snapshots = app.AUTOMATIC_RUN_PROGRESS_SNAPSHOT_STATE
+    original_interval = app.AUTOMATIC_RUN_PROGRESS_SNAPSHOT_INTERVAL_SECONDS
+    try:
+        app.LIVE_AUTOMATIC_RUN_STATUS = {}
+        app.AUTOMATIC_RUN_PROGRESS_SNAPSHOT_STATE = {}
+        app.AUTOMATIC_RUN_PROGRESS_SNAPSHOT_INTERVAL_SECONDS = 99.0
+        with mock.patch.object(app, "_write_automatic_run_json") as write:
+            app.update_live_automatic_run_status(
+                tmp_path,
+                state="running",
+                phase="AnythingLLM queue: 1/100",
+                progress_phase="desktop_queue",
+                completed_units=1,
+                total_units=100,
+            )
+            app.update_live_automatic_run_status(
+                tmp_path,
+                state="running",
+                phase="AnythingLLM queue: 2/100",
+                progress_phase="desktop_queue",
+                completed_units=2,
+                total_units=100,
+            )
+            app.update_live_automatic_run_status(
+                tmp_path,
+                state="successful",
+                phase="Ready",
+                progress_phase="reporting",
+                completed_units=100,
+                total_units=100,
+            )
+    finally:
+        app.LIVE_AUTOMATIC_RUN_STATUS = original_status
+        app.AUTOMATIC_RUN_PROGRESS_SNAPSHOT_STATE = original_snapshots
+        app.AUTOMATIC_RUN_PROGRESS_SNAPSHOT_INTERVAL_SECONDS = original_interval
+
+    # The first lifecycle record and terminal record are durable; the rapid
+    # second x/y repaint remains immediately visible in memory but is not a
+    # second atomic status rewrite.
+    progress_writes = [
+        call for call in write.call_args_list
+        if str(call.args[0]).endswith("run-progress.json")
+    ]
+    assert len(progress_writes) == 2
+
+
+def test_queue_eta_upward_cap_is_run_level_but_never_blocks_a_decrease():
+    import rag_pdf_gradio_app as app
+
+    assert app.cap_queue_eta_reprice_to_opening(2_000, opening_expected=1_000) == 1_200
+    assert app.cap_queue_eta_reprice_to_opening(850, opening_expected=1_000) == 850
+
+
+def test_bounded_queue_group_counts_as_one_upward_eta_evidence_window():
+    import rag_pdf_gradio_app as app
+
+    context = {"prepared_records": 80, "batch_cache_plan_observed": False}
+    shared = {
+        "desktop_queue_records_per_minute": 30,
+        "desktop_queue_completed": 20,
+        "queue_records": 40,
+        "source_window_total": 4,
+        "source_queue_group_total": 2,
+    }
+    first = app.observe_batch_queue_forecast(
+        context,
+        {**shared, "source_path": "first.pdf", "source_queue_group_index": 1},
+        elapsed_seconds=60,
+        provider_request_seconds_prior=2,
+    )
+    same_group = app.observe_batch_queue_forecast(
+        context,
+        {**shared, "source_path": "second.pdf", "source_queue_group_index": 1},
+        elapsed_seconds=61,
+        provider_request_seconds_prior=2,
+    )
+    second_group = app.observe_batch_queue_forecast(
+        context,
+        {**shared, "source_path": "third.pdf", "source_queue_group_index": 2},
+        elapsed_seconds=62,
+        provider_request_seconds_prior=2,
+    )
+
+    assert first["observed_windows"] == 1
+    assert same_group["observed_windows"] == 1
+    assert second_group["observed_windows"] == 2
+
+
+def test_timing_timeline_coalesces_repeated_queue_observations(tmp_path):
+    import rag_pdf_gradio_app as app
+
+    original_dir = app.TIMING_MODEL_DIR
+    original_events = app.TIMING_MODEL_EVENTS_PATH
+    original_timeline = app.TIMING_TIMELINE_LAST_PERSISTED
+    original_interval = app.TIMING_TIMELINE_SNAPSHOT_INTERVAL_SECONDS
+    try:
+        app.TIMING_MODEL_DIR = tmp_path / "model"
+        app.TIMING_MODEL_EVENTS_PATH = app.TIMING_MODEL_DIR / "events.jsonl"
+        app.TIMING_TIMELINE_LAST_PERSISTED = {}
+        app.TIMING_TIMELINE_SNAPSHOT_INTERVAL_SECONDS = 99.0
+        root = tmp_path / "run"
+        assert app.record_timing_model_event(
+            root, "Desktop queue: 1/100", {"timing_event": "queue_progress", "batch": 1}
+        )
+        assert not app.record_timing_model_event(
+            root, "Desktop queue: 2/100", {"timing_event": "queue_progress", "batch": 1}
+        )
+        assert app.record_timing_model_event(
+            root, "Desktop queue", {"timing_event": "desktop_queue_completed", "batch": 1}
+        )
+        rows = [
+            json.loads(line)
+            for line in (root / "timing-evidence-timeline.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+    finally:
+        app.TIMING_MODEL_DIR = original_dir
+        app.TIMING_MODEL_EVENTS_PATH = original_events
+        app.TIMING_TIMELINE_LAST_PERSISTED = original_timeline
+        app.TIMING_TIMELINE_SNAPSHOT_INTERVAL_SECONDS = original_interval
+
+    assert [row["event"] for row in rows] == ["queue_progress", "desktop_queue_completed"]

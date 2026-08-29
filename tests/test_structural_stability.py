@@ -390,10 +390,12 @@ def test_stale_selection_finish_cannot_authorize_a_newer_file_set():
 
 def test_generator_close_runs_outer_stream_cleanup():
     releases = []
+    completed = threading.Event()
 
     def body(*_values, **_kwargs):
         yield ("preparing",)
         yield ("started",)
+        completed.set()
 
     with (
         mock.patch.object(app, "_run_automatic_from_confirmation_stream_body", body),
@@ -406,8 +408,49 @@ def test_generator_close_runs_outer_stream_cleanup():
         stream = app.run_automatic_from_confirmation_stream()
         assert next(stream) == ("preparing",)
         stream.close()
+        assert completed.wait(timeout=1)
     assert len(releases) == 1
     assert releases[0].startswith("automatic-run-")
+
+
+def test_browser_stream_close_keeps_owned_confirmation_worker_running():
+    original_status = app.LIVE_AUTOMATIC_RUN_STATUS
+    worker_continued = threading.Event()
+
+    def body(*_values, _confirmation_owner_token="", **_kwargs):
+        app.update_live_automatic_run_status(
+            state="preparing",
+            phase="Checking selected PDFs",
+            confirmation_in_flight=True,
+            confirmation_owner_token=_confirmation_owner_token,
+        )
+        yield ("acknowledged",)
+        app.update_live_automatic_run_status(
+            state="running",
+            phase="Preparing PDF",
+            confirmation_owner_token=_confirmation_owner_token,
+        )
+        worker_continued.set()
+        app.update_live_automatic_run_status(
+            state="successful",
+            phase="Processing successful",
+            confirmation_owner_token=_confirmation_owner_token,
+        )
+
+    try:
+        app.LIVE_AUTOMATIC_RUN_STATUS = {}
+        with mock.patch.object(app, "_run_automatic_from_confirmation_stream_body", body):
+            stream = app.run_automatic_from_confirmation_stream()
+            assert next(stream) == ("acknowledged",)
+            stream.close()
+            assert worker_continued.wait(timeout=1)
+        # The browser stream is no longer an ownership boundary. Its worker
+        # reaches a genuine terminal state instead of the former
+        # "confirmation request ended" failure.
+        assert app.LIVE_AUTOMATIC_RUN_STATUS["state"] == "successful"
+        assert app.LIVE_AUTOMATIC_RUN_STATUS["phase"] == "Processing successful"
+    finally:
+        app.LIVE_AUTOMATIC_RUN_STATUS = original_status
 
 
 def test_unowned_stream_cleanup_cannot_release_another_run_lease():
