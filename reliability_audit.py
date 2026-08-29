@@ -380,13 +380,36 @@ def audit_run_directory(
     accepted = _safe_int(embedding.get("accepted"))
     recovery = embedding.get("recovery") if isinstance(embedding.get("recovery"), dict) else {}
     remaining = list(recovery.get("remaining_locations") or [])
+    has_held_source = bool(source_summary.get("held_at_source"))
+    # A cooperative cancellation can land after AnythingLLM has attached a
+    # source window but before every location in that window has exact vector
+    # proof.  That is deliberately a recoverable boundary, not an internal
+    # count contradiction: the durable report retains the attached total,
+    # while the ledger retains only the exact confirmations and a manifest for
+    # the held window.  Keep this narrowly scoped so a normal completed run
+    # with mismatched totals still fails the audit.
+    cancelled_pending_recovery = (
+        terminal_state == "cancelled"
+        and report_status == "reconciliation_pending"
+        and has_held_source
+        and str(recovery.get("state") or "") == "resume_available"
+        and bool(remaining)
+    )
     _add(findings, accepted > requested, "AUDIT-EMBEDDING-COUNT-001",
          "Accepted embedding records exceed requested records.", "batch-embedding-ledger.json")
     _add(findings, requested and requested != report_uploaded, "AUDIT-CROSS-COUNT-001",
          "Embedding requested count and upload-report count disagree.", "batch-embedding-ledger.json")
     accepted_target = report_uploaded if document_summary.get("present") else report_embedded
-    _add(findings, accepted and accepted != accepted_target, "AUDIT-CROSS-COUNT-002",
-         "Embedding accepted count disagrees with the records submitted by this run.", "batch-embedding-ledger.json")
+    if cancelled_pending_recovery:
+        findings.append(Finding(
+            "AUDIT-CANCELLED-RECONCILIATION-001", "warning",
+            "Cancellation retained a held AnythingLLM source window with incomplete exact vector confirmation; "
+            "the recovery manifest must be reviewed before resuming.",
+            "batch-embedding-ledger.json",
+        ))
+    else:
+        _add(findings, accepted and accepted != accepted_target, "AUDIT-CROSS-COUNT-002",
+             "Embedding accepted count disagrees with the records submitted by this run.", "batch-embedding-ledger.json")
 
     if source_summary:
         _add(findings, source_summary["newly_attached_records"] != report_uploaded,
@@ -394,12 +417,12 @@ def audit_run_directory(
              "Source transaction uploaded totals disagree with the batch report.",
              "source-transaction-ledger.json")
         source_embedded_target = report_uploaded if document_summary.get("present") else report_embedded
-        _add(findings, source_summary["confirmed_vector_records"] != source_embedded_target,
-             "AUDIT-CROSS-SOURCE-002",
-             "Source transaction vector totals disagree with this run's submitted-record total.",
-             "source-transaction-ledger.json")
-        has_hold = bool(source_summary.get("held_at_source"))
-        _add(findings, has_hold and str(recovery.get("state") or "") != "resume_available",
+        if not cancelled_pending_recovery:
+            _add(findings, source_summary["confirmed_vector_records"] != source_embedded_target,
+                 "AUDIT-CROSS-SOURCE-002",
+                 "Source transaction vector totals disagree with this run's submitted-record total.",
+                 "source-transaction-ledger.json")
+        _add(findings, has_held_source and str(recovery.get("state") or "") != "resume_available",
              "AUDIT-RECOVERY-001", "A held source has no resumable recovery state.",
              "batch-embedding-ledger.json")
         all_proven = (
@@ -429,10 +452,16 @@ def audit_run_directory(
 
     error_count = sum(1 for item in findings if item.severity == "error")
     warning_count = sum(1 for item in findings if item.severity == "warning")
+    audit_status = (
+        "fail" if error_count
+        else "recovery_required" if cancelled_pending_recovery
+        else "active" if active
+        else "pass"
+    )
     return {
         "schema": AUDIT_SCHEMA,
         "generated_at": datetime.now(UTC).isoformat(),
-        "audit_status": "fail" if error_count else ("active" if active else "pass"),
+        "audit_status": audit_status,
         "run_outcome": terminal_state or "unknown",
         "native_evidence_present": True,
         "artifact_presence": presence,
@@ -459,6 +488,13 @@ def audit_run_directory(
             "embedding_accepted": accepted,
             "recovery_state": str(recovery.get("state") or ""),
             "recovery_remaining_records": len(remaining),
+            "cancelled_reconciliation": {
+                "required": cancelled_pending_recovery,
+                "newly_attached_records": report_uploaded,
+                "exactly_confirmed_records": report_embedded,
+                "unresolved_records": max(0, report_uploaded - report_embedded),
+                "held_source": source_summary.get("held_at_source"),
+            },
             "error_findings": error_count,
             "warning_findings": warning_count,
         },

@@ -4063,6 +4063,25 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(second["fraction"], 16 / 30)
         self.assertEqual(second["completed_sources"], 1)
 
+    def test_grouped_upload_owns_late_worker_queue_progress(self):
+        import rag_pdf_gradio_app as app
+
+        self.assertTrue(app.grouped_upload_owns_progress_event(True, "desktop_queue"))
+        self.assertTrue(app.grouped_upload_owns_progress_event(True, "identity_set"))
+        self.assertFalse(app.grouped_upload_owns_progress_event(False, "desktop_queue"))
+        self.assertFalse(app.grouped_upload_owns_progress_event(True, "extraction"))
+
+    def test_vector_liveness_uses_current_source_not_workspace_total(self):
+        import rag_pdf_gradio_app as app
+
+        report = {
+            "matching_vector_rows": 2091,
+            "lancedb_matching_rows": 2091,
+            "current_upload_document_vector_count": 706,
+            "observed_chunk_source_count": 706,
+        }
+        self.assertEqual(app.current_source_vector_progress_count(report), 706)
+
     def test_upload_count_schema_distinguishes_new_attachment_from_confirmation(self):
         import rag_pdf_gradio_app as app
 
@@ -15614,6 +15633,33 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(completion, original)
         self.assertEqual(retained, {})
 
+    def test_terminal_integrity_recovery_required_preserves_cancelled_outcome(self):
+        """A known held source is not reclassified as an internal audit failure."""
+        import rag_pdf_gradio_app as app
+
+        audit = {
+            "audit_status": "recovery_required",
+            "summary": {"error_findings": 0, "warning_findings": 1},
+            "findings": [{"code": "AUDIT-CANCELLED-RECONCILIATION-001"}],
+        }
+        original = {
+            "state": "cancelled",
+            "code": "CANCELLED-RECONCILIATION-REQUIRED",
+            "message": "2 record(s) remain unconfirmed in the held source window.",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                mock.patch.object(app, "audit_run_directory", return_value=audit),
+                mock.patch.object(app, "write_failure_bundle") as write_bundle,
+            ):
+                completion, retained = app.terminal_integrity_audit(
+                    temp_dir, original, native_run=True,
+                )
+
+        self.assertEqual(completion, original)
+        self.assertEqual(retained, audit)
+        write_bundle.assert_not_called()
+
     def test_terminal_integrity_bundle_failure_does_not_soften_proven_contradiction(self):
         import rag_pdf_gradio_app as app
 
@@ -18997,6 +19043,102 @@ class PipelineCoreTests(unittest.TestCase):
             int(detail.get("reconciliation_deadline_extensions") or 0) >= 1
             for detail in statuses
         ))
+
+    def test_grouped_batch_verifier_holds_when_queue_completes_but_source_vectors_stop(self):
+        """Earlier workspace vectors must not keep a completed held source alive."""
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            text_file = root / "prepared.txt"
+            text_file.write_text("prepared", encoding="utf-8")
+            plan_file = root / "upload-plan.csv"
+            plan_file.write_text(
+                "filename,title,docAuthor,description,docSource,chunkSource,text_file\n"
+                + "\n".join(
+                    f"page-{index}.txt,Page {index},,,local-pdf://sha256/held,held-p{index:04d},{text_file}"
+                    for index in range(1, 4)
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            summary = {
+                "pdf": str(root / "held.pdf"),
+                "source_sha256": "held",
+                "native_upload_plan": str(plan_file),
+                "native_upload_transport": "file_upload",
+            }
+            clock = [0.0]
+            captured = {}
+            queue = {
+                "queue_records": 3,
+                "completed": 3,
+                "current": 3,
+                "events_observed": 3,
+                "last_event_monotonic": 0.0,
+                "first_progress_monotonic": 0.0,
+                "last_progress_monotonic": 0.0,
+                "first_progress_position": 1,
+                "last_progress_position": 3,
+                "observer_state": "connected",
+            }
+
+            def fake_verify(_storage, _workspace, _source_sha, _payloads, **_kwargs):
+                # 2,091 is deliberately unrelated workspace-wide evidence.
+                # The current source itself remains fixed at 2/3.
+                return {
+                    "status": "partial_vector_coverage",
+                    "matching_vector_rows": 2091,
+                    "lancedb_matching_rows": 2091,
+                    "current_upload_document_vector_count": 2,
+                    "observed_chunk_source_count": 2,
+                    "identity_set_checked": True,
+                    "identity_set_complete": False,
+                    "current_upload_vector_evidence_complete": False,
+                }
+
+            def fake_upload(*_args, **kwargs):
+                verification = kwargs["batch_verifier"]({
+                    "start_index": 0,
+                    "end_index": 3,
+                    "locations": [f"custom-documents/held-{index}.json" for index in range(1, 4)],
+                    "desktop_queue_observer": queue,
+                })
+                captured["verification"] = verification
+                return {
+                    "status": "reconciliation_pending", "uploaded": 3, "embedded": 2,
+                    "attachment_results": [{
+                        "source_path": str(root / "held.pdf"),
+                        "chunk_source": f"held-p{index:04d}",
+                        "location": f"custom-documents/held-{index}.json",
+                        "status": "attached", "error": "",
+                    } for index in range(1, 4)],
+                    "embedding_update": {"requested": 3, "accepted": 2, "batches": [{
+                        "submission_state": "unresolved", "searchability_proven": False,
+                        "locations": [f"custom-documents/held-{index}.json" for index in range(1, 4)],
+                        "verification": verification,
+                    }]},
+                }
+
+            def fake_sleep(_seconds):
+                clock[0] = 480.0
+
+            with mock.patch.object(app, "maybe_upload_to_anythingllm", side_effect=fake_upload), mock.patch.object(
+                app, "verify_anythingllm_post_upload", side_effect=fake_verify
+            ), mock.patch.object(app.time, "monotonic", side_effect=lambda: clock[0]), mock.patch.object(
+                app.time, "sleep", side_effect=fake_sleep
+            ):
+                report = app.upload_prepared_automatic_batch(
+                    [summary], api_url="http://anythingllm", api_key="key",  # pragma: allowlist secret -- synthetic upload fixture
+                    workspace_slug="workspace", run_root=root / "run",
+                )
+
+        self.assertEqual(report["status"], "reconciliation_pending")
+        self.assertEqual(
+            captured["verification"]["classification"],
+            "batch_exact_vector_confirmation_stalled_after_queue_completion",
+        )
+        self.assertIn("2/3 exact page-parent vectors", captured["verification"]["message"])
 
     def test_grouped_upload_outcome_rewrites_staged_per_document_reports(self):
         import rag_pdf_gradio_app as app

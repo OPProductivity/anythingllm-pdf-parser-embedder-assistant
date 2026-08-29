@@ -12356,6 +12356,41 @@ def grouped_source_window_progress(progress_state, report):
     }
 
 
+def grouped_upload_owns_progress_event(grouped_upload_active, phase_name):
+    """Return whether the source-window accumulator owns this progress phase.
+
+    Local workers can flush a late structured queue callback after the grouped
+    AnythingLLM route has become authoritative. Its PDF-local fraction is not
+    safe to merge into the batch-wide bar: the normal monotonic display guard
+    would retain that inflated value even after the authoritative source-window
+    accumulator reports the correct whole-batch fraction.
+    """
+    return bool(grouped_upload_active) and str(phase_name or "").strip() in {
+        "queue_receipt", "desktop_queue", "identity_set",
+    }
+
+
+def current_source_vector_progress_count(report):
+    """Return exact-vector movement belonging only to the current source.
+
+    Workspace-wide matching-row counts can include earlier source windows and
+    are useful diagnostic evidence, but must never keep a later held source
+    alive. The reconciliation liveness clock advances only from the current
+    source's identity-matched vector count.
+    """
+    values = (
+        (report or {}).get("current_upload_document_vector_count"),
+        (report or {}).get("observed_chunk_source_count"),
+    )
+    parsed = []
+    for value in values:
+        try:
+            parsed.append(max(0, int(value or 0)))
+        except (TypeError, ValueError):
+            continue
+    return max(parsed or [0])
+
+
 def concurrent_ingestion_progress_fraction(evidence_fraction, elapsed_seconds, expected_seconds):
     """Combine owned queue/vector evidence with the current elapsed/ETA pair.
 
@@ -23227,8 +23262,9 @@ def upload_prepared_automatic_batch(
             if queue_position > last_queue_position:
                 last_queue_position = queue_position
                 last_queue_progress_elapsed = elapsed
-            if observed > last_vector_count:
-                last_vector_count = observed
+            current_source_vectors = current_source_vector_progress_count(last_report)
+            if current_source_vectors > last_vector_count:
+                last_vector_count = current_source_vectors
                 last_vector_progress_elapsed = elapsed
             exact = (
                 current_submission_complete
@@ -23354,20 +23390,33 @@ def upload_prepared_automatic_batch(
                         deadline_extensions += 1
                         extension_granted = True
                 if not extension_granted:
+                    queue_completed_without_vectors = (
+                        queue_total > 0
+                        and queue_position >= queue_total
+                        and current_source_vectors < len(expected_batch)
+                    )
                     progress_basis = (
-                        "the owned Desktop queue stopped providing recent progress"
-                        if not (owned_queue_active or recent_vector_progress) and queue_total
-                        else "the exact-vector tail stopped producing new evidence"
-                        if (last_queue_position or last_vector_count)
-                        else "no owned Desktop queue evidence was available"
+                        "the Desktop queue completed but this source's exact vector confirmation stopped"
+                        if queue_completed_without_vectors
+                        else (
+                            "the owned Desktop queue stopped providing recent progress"
+                            if not (owned_queue_active or recent_vector_progress) and queue_total
+                            else "the exact-vector tail stopped producing new evidence"
+                            if (last_queue_position or last_vector_count)
+                            else "no owned Desktop queue evidence was available"
+                        )
                     )
                     return {
                         **last_report,
                         **queue,
                         "status": "timeout",
-                        "classification": "batch_exact_vector_observation_timeout",
+                        "classification": (
+                            "batch_exact_vector_confirmation_stalled_after_queue_completion"
+                            if queue_completed_without_vectors
+                            else "batch_exact_vector_observation_timeout"
+                        ),
                         "message": (
-                            f"The AnythingLLM receipt was unresolved and only {observed}/{len(expected_batch)} exact "
+                            f"The AnythingLLM receipt was unresolved and only {current_source_vectors}/{len(expected_batch)} exact "
                             f"page-parent vectors were observed before the {effective_deadline_seconds:.0f}-second "
                             f"reconciliation boundary because {progress_basis}."
                         ),
@@ -24389,6 +24438,11 @@ def run_automatic(
     # it run-local so stale callbacks from an earlier phase cannot repaint the
     # single visible progress bar after the workflow has advanced.
     automatic_phase_rank = 0
+    # Once the grouped route begins, only its per-source accumulator may
+    # advance the shared AnythingLLM queue interval. This prevents late
+    # worker-local queue callbacks from leaving the whole batch visually far
+    # ahead of its actual source-window evidence.
+    grouped_upload_progress_active = False
     progress_allocations = automatic_progress_file_allocations(
         files,
         segment_mode=segment_mode,
@@ -24441,8 +24495,12 @@ def run_automatic(
     ):
         nonlocal expected_seconds, ocr_eta_applied_files, automatic_phase_rank
         nonlocal pending_ocr_eta_surcharge, ocr_eta_reprice_count
+        nonlocal grouped_upload_progress_active
         stage_text = str(stage or "Working")
         stage_key = stage_text.casefold()
+        phase_name = str((progress_event or {}).get("phase") or "").strip()
+        if grouped_upload_owns_progress_event(grouped_upload_progress_active, phase_name):
+            return
         eta_reprice_reason = ""
         if (
             str(pdf_path) not in ocr_eta_applied_files
@@ -24505,7 +24563,6 @@ def run_automatic(
         # mapper: that would reclassify local extraction as Desktop indexing.
         # Untagged callbacks remain diagnostic-only legacy fallbacks while the
         # remaining non-automatic callers keep their established values.
-        phase_name = str((progress_event or {}).get("phase") or "").strip()
         # A worker can flush a buffered extraction or queue callback after a
         # later observer has already supplied exact vector evidence.  Numeric
         # high-water protection alone is insufficient: without this guard the
@@ -26178,6 +26235,7 @@ def run_automatic(
                 queue_forecast_expected_seconds=latest_batch_queue_forecast_seconds,
             )
 
+        grouped_upload_progress_active = True
         try:
             batch_upload_report = upload_prepared_automatic_batch(
                 summaries,
@@ -26699,18 +26757,41 @@ def run_automatic(
     if not incomplete_indexing:
         progress(0.98, desc="Finalizing run output and completion checks")
 
-    completion = (
-        {
-            "state": "cancelled",
-            "message": (
+    if cancellation_requested:
+        attached_records = int(
+            batch_upload_report.get("newly_attached_records")
+            or batch_upload_report.get("uploaded")
+            or 0
+        )
+        confirmed_records = int(
+            batch_upload_report.get("confirmed_vector_records")
+            or batch_upload_report.get("embedded")
+            or 0
+        )
+        unresolved_records = max(0, attached_records - confirmed_records)
+        if unresolved_records:
+            cancellation_message = (
+                "Cancellation completed at a safe checkpoint. "
+                f"{confirmed_records} of {attached_records} attached record(s) have exact searchable-vector proof; "
+                f"{unresolved_records} record(s) remain unconfirmed in the held source window. "
+                "No later PDF or new AnythingLLM request was submitted, and nothing was retried. "
+                "Review the recovery manifest before resuming."
+            )
+            cancellation_code = "CANCELLED-RECONCILIATION-REQUIRED"
+        else:
+            cancellation_message = (
                 "Cancellation completed at the current safe checkpoint. Progress remained frozen; no later PDF or "
                 "new AnythingLLM request was submitted. An already accepted Desktop request may still finish; review "
                 "the recovery manifest before resuming."
-            ),
+            )
+            cancellation_code = "CANCELLED-SAFE-CHECKPOINT"
+        completion = {
+            "state": "cancelled",
+            "code": cancellation_code,
+            "message": cancellation_message,
         }
-        if cancellation_requested
-        else automatic_completion(summaries, prepare_and_upload)
-    )
+    else:
+        completion = automatic_completion(summaries, prepare_and_upload)
     if (
         completion["state"] == "successful"
         and batch_retention_report.get("status") == "retained_for_review"
