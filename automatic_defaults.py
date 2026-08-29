@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from portable_paths import application_paths
+from process_lock import named_process_lock
 
 
 AUTOMATIC_DEFAULTS_SCHEMA_VERSION = 1
@@ -162,7 +163,9 @@ def save_automatic_defaults(
     """Atomically save defaults, rejecting a concurrently changed profile."""
 
     path = automatic_defaults_path(home_directory)
-    with _AUTOMATIC_DEFAULTS_WRITE_LOCK:
+    with _AUTOMATIC_DEFAULTS_WRITE_LOCK, named_process_lock(
+        "automatic-defaults", str(path.resolve()), timeout_seconds=5.0
+    ):
         current = load_automatic_defaults(builtin_defaults, home_directory=home_directory)
         current_revision = int(current["revision"])
         if current_revision != expected_revision and not overwrite:

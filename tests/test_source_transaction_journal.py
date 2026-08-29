@@ -88,6 +88,19 @@ def test_final_snapshot_is_materially_compatible_and_skips_journal_replay(tmp_pa
     assert build_prepared_recovery_plan(tmp_path)["sources"][0]["action"] == "preserve_completed"
 
 
+def test_out_of_range_source_transaction_blocks_automatic_recovery(tmp_path):
+    ledger = tmp_path / "source-transaction-ledger.json"
+    journal = initialize_source_transaction_journal(
+        ledger, workspace_slug="workspace", run_id="run-range", transaction_count=1
+    )
+    append_source_transaction_event(journal, _transaction("prepared", source_index=2))
+
+    plan = build_prepared_recovery_plan(tmp_path)
+
+    assert plan["status"] == "blocked"
+    assert "malformed_source_transaction_event_line:1" in plan["reason"]
+
+
 def test_orphan_event_reservation_is_not_silently_adopted(tmp_path):
     (tmp_path / EVENT_JOURNAL_NAME).write_text("", encoding="utf-8")
 

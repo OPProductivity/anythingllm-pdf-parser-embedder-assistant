@@ -107,11 +107,27 @@ def test_stop_refuses_a_recycled_or_unowned_process():
             mock.patch.object(cli.sys, "platform", "win32"),
             mock.patch.object(cli, "_server_marker_path", return_value=marker),
             mock.patch.object(cli, "_powershell", return_value="powershell.exe"),
+            mock.patch.object(cli, "_port_is_available", return_value=False),
             mock.patch.object(cli.subprocess, "run", return_value=process_result) as run,
         ):
             assert cli._stop() == 1
 
     assert run.call_count == 1
+
+
+def test_stop_removes_a_stale_marker_when_its_port_is_free(capsys):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        marker = Path(tmpdir) / "localhost-server.json"
+        marker.write_text('{"pid": 42, "port": 7860}', encoding="utf-8")
+        with (
+            mock.patch.object(cli.sys, "platform", "win32"),
+            mock.patch.object(cli, "_server_marker_path", return_value=marker),
+            mock.patch.object(cli, "_owned_server_process_command", return_value=""),
+            mock.patch.object(cli, "_port_is_available", return_value=True),
+        ):
+            assert cli._stop() == 0
+        assert not marker.exists()
+    assert "stale" in capsys.readouterr().out.casefold()
 
 
 def test_stop_terminates_only_a_verified_owned_server_tree():

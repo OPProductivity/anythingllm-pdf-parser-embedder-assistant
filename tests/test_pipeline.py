@@ -4307,8 +4307,10 @@ class PipelineCoreTests(unittest.TestCase):
                 self.assertEqual(rendered.count('role="progressbar"'), 1)
                 self.assertIn('aria-label="Overall run progress"', rendered)
                 self.assertNotIn("automatic-run-time-progress", rendered)
-                if state in {"successful", "warning"}:
+                if state == "successful":
                     self.assertIn('aria-valuenow="100"', rendered)
+                if state == "warning":
+                    self.assertIn('aria-valuenow="87"', rendered)
                 if state == "cancelled":
                     self.assertNotIn('aria-valuenow="100"', rendered)
 
@@ -4384,6 +4386,26 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(app.paced_progress_percent(record, now=182.0), 98)
         record["state"] = "successful"
         self.assertEqual(app.paced_progress_percent(record, now=182.0), 100)
+
+    def test_warning_progress_never_claims_unconfirmed_work_is_complete(self):
+        import rag_pdf_gradio_app as app
+
+        record = {"state": "warning", "confirmed_fraction": 0.5}
+        self.assertEqual(app.paced_progress_percent(record, now=100.0), 50)
+        record["confirmed_fraction"] = 1.0
+        self.assertEqual(app.paced_progress_percent(record, now=100.0), 99)
+
+    def test_cancellation_count_uses_recovery_locations_not_cached_embedding_total(self):
+        import rag_pdf_gradio_app as app
+
+        report = {
+            "newly_attached_records": 1,
+            "embedded": 9,
+            "recovery": {
+                "remaining_locations": ["custom-documents/new.json", "CUSTOM-DOCUMENTS/NEW.json"],
+            },
+        }
+        self.assertEqual(app.cancellation_unresolved_record_count(report), 1)
 
     def test_success_style_targets_the_visible_confirmation_button(self):
         import rag_pdf_gradio_app as app
@@ -6499,7 +6521,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn(">warning<", updates[8]["value"])
         self.assertTrue(updates[9]["visible"])
         self.assertTrue(updates[9]["interactive"])
-        self.assertIn("Overall progress: 100%", second_updates[0]["value"])
+        self.assertIn("Overall progress: 99%", second_updates[0]["value"])
         self.assertNotIn("Compl:", second_updates[1])
 
     def test_cancelled_run_never_claims_upload_verification_or_full_completion(self):

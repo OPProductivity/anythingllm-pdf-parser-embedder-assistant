@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from anythingllm_compatibility import characterize
+from process_lock import named_process_lock
 
 
 ENV_SECRET_MARKERS = ("KEY", "SECRET", "TOKEN", "PASSWORD")
@@ -174,7 +175,9 @@ class AnythingLLMPersistenceAdapter:
         path = self.storage / ".env"
         if not path.is_file():
             raise FileNotFoundError(f"AnythingLLM .env was not found at {path}")
-        with PERSISTENCE_WRITE_LOCK:
+        with PERSISTENCE_WRITE_LOCK, named_process_lock(
+            "anythingllm-settings", str(self.storage.resolve()), timeout_seconds=5.0
+        ):
             snapshot = self.snapshot(env_keys=[key for key, _value in updates], reason=reason)
             original = _read_env_lines(path)
             updated = original
@@ -219,7 +222,9 @@ class AnythingLLMPersistenceAdapter:
         db_path = self.storage / "anythingllm.db"
         if not db_path.is_file():
             raise FileNotFoundError(f"AnythingLLM SQLite database was not found at {db_path}")
-        with PERSISTENCE_WRITE_LOCK:
+        with PERSISTENCE_WRITE_LOCK, named_process_lock(
+            "anythingllm-settings", str(self.storage.resolve()), timeout_seconds=5.0
+        ):
             snapshot = self.snapshot(sqlite_labels=updates.keys(), reason=reason)
             con = sqlite3.connect(db_path, timeout=5.0)
             try:
@@ -240,6 +245,12 @@ class AnythingLLMPersistenceAdapter:
 
     def restore(self, snapshot_path):
         self._require("can_restore_snapshotted_settings")
+        with PERSISTENCE_WRITE_LOCK, named_process_lock(
+            "anythingllm-settings", str(self.storage.resolve()), timeout_seconds=5.0
+        ):
+            return self._restore_locked(snapshot_path)
+
+    def _restore_locked(self, snapshot_path):
         payload = json.loads(Path(snapshot_path).read_text(encoding="utf-8"))
         restored = {"env": [], "sqlite": [], "skipped_env": []}
         env_updates = []

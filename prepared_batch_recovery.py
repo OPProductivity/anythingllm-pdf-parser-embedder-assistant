@@ -232,11 +232,34 @@ def verify_prepared_batch_checkpoint(run_root: str | Path) -> dict[str, Any]:
         }
 
     problems: list[str] = []
+    try:
+        declared_total = int(payload.get("total_sources") or 0)
+        declared_checkpointed = int(payload.get("checkpointed_sources") or 0)
+    except (TypeError, ValueError):
+        declared_total = declared_checkpointed = 0
+        problems.append("invalid_source_counts")
+    raw_sources = payload.get("sources") or []
+    if not isinstance(raw_sources, list):
+        raw_sources = []
+        problems.append("malformed_source_collection")
+    if declared_total < 0 or declared_checkpointed < 0:
+        problems.append("invalid_source_counts")
+    if declared_checkpointed != len(raw_sources):
+        problems.append("checkpointed_source_count_mismatch")
+    source_indexes: list[int] = []
     verified_sources: list[dict[str, Any]] = []
-    for source in payload.get("sources") or []:
+    for source in raw_sources:
         if not isinstance(source, dict):
             problems.append("malformed_source_record")
             continue
+        try:
+            source_index = int(source.get("source_index") or 0)
+        except (TypeError, ValueError):
+            source_index = 0
+            problems.append("invalid_source_index:0")
+        source_indexes.append(source_index)
+        if source_index < 1 or source_index > declared_total:
+            problems.append(f"invalid_source_index:{source_index}")
         source_problems: list[str] = []
         for artifact in source.get("artifacts") or []:
             try:
@@ -253,23 +276,23 @@ def verify_prepared_batch_checkpoint(run_root: str | Path) -> dict[str, Any]:
                 source_problems.append(f"unreadable:{artifact.get('role') or 'artifact'}")
         if source_problems:
             problems.extend(
-                f"source_{int(source.get('source_index') or 0)}:{problem}"
+                f"source_{source_index}:{problem}"
                 for problem in source_problems
             )
         verified_sources.append({
-            "source_index": int(source.get("source_index") or 0),
+            "source_index": source_index,
             "source_identity": str(source.get("source_identity") or "unavailable"),
             "state": str(source.get("state") or "unknown"),
             "verified": not source_problems,
             "problems": source_problems,
         })
 
+    if len(set(source_indexes)) != len(source_indexes):
+        problems.append("duplicate_source_index")
     stage = str(payload.get("stage") or "")
-    complete = int(payload.get("checkpointed_sources") or 0) == int(
-        payload.get("total_sources") or -1
-    )
+    complete = declared_checkpointed == declared_total and source_indexes == list(range(1, declared_total + 1))
     source_rows = [
-        source for source in payload.get("sources") or [] if isinstance(source, dict)
+        source for source in raw_sources if isinstance(source, dict)
     ]
     uploadable = any(
         source.get("state") == "prepared_for_submission"
@@ -305,8 +328,8 @@ def verify_prepared_batch_checkpoint(run_root: str | Path) -> dict[str, Any]:
         "reason": reason,
         "reusable": reusable,
         "stage": stage,
-        "total_sources": int(payload.get("total_sources") or 0),
-        "checkpointed_sources": int(payload.get("checkpointed_sources") or 0),
+        "total_sources": declared_total,
+        "checkpointed_sources": declared_checkpointed,
         "workspace_slug": str(payload.get("workspace_slug") or ""),
         "api_origin": str(payload.get("api_origin") or ""),
         "sources": verified_sources,

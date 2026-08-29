@@ -144,15 +144,15 @@ def materialize_source_transaction_journal(
 ) -> tuple[dict[str, Any], list[str]]:
     """Overlay each source's latest complete event onto an active ledger."""
     journal_name = str(ledger.get("transaction_event_journal") or "").strip()
+    errors = _validate_transaction_ledger(ledger)
     if not journal_name or bool(ledger.get("journal_finalized")):
-        return ledger, []
+        return ledger, errors
     journal_path = Path(root) / Path(journal_name).name
     if not journal_path.is_file():
-        return ledger, ["source_transaction_event_journal_missing"]
+        return ledger, [*errors, "source_transaction_event_journal_missing"]
     latest: dict[int, dict[str, Any]] = {}
     stopped_after = ledger.get("stopped_after_source_transaction")
     stop_reason = str(ledger.get("stop_reason") or "")
-    errors: list[str] = []
     try:
         with journal_path.open("r", encoding="utf-8") as handle:
             for line_number, line in enumerate(handle, start=1):
@@ -166,6 +166,9 @@ def materialize_source_transaction_journal(
                     source_index = int(transaction.get("source_index") or 0)
                     if source_index < 1:
                         raise ValueError("event has no valid source index")
+                    transaction_count = int(ledger.get("transaction_count") or 0)
+                    if source_index > transaction_count:
+                        raise ValueError("event source index is outside declared transaction count")
                     latest[source_index] = transaction
                     if event.get("stopped_after_source_transaction") is not None:
                         stopped_after = event.get("stopped_after_source_transaction")
@@ -182,3 +185,32 @@ def materialize_source_transaction_journal(
     materialized["stopped_after_source_transaction"] = stopped_after
     materialized["stop_reason"] = stop_reason
     return materialized, errors
+
+
+def _validate_transaction_ledger(ledger: dict[str, Any]) -> list[str]:
+    """Reject corrupted source indexes before any recovery can replay them."""
+    try:
+        transaction_count = int(ledger.get("transaction_count") or 0)
+    except (TypeError, ValueError):
+        return ["source_transaction_count_invalid"]
+    if transaction_count < 0:
+        return ["source_transaction_count_invalid"]
+    transactions = ledger.get("transactions") or []
+    if not isinstance(transactions, list):
+        return ["source_transaction_collection_invalid"]
+    seen: set[int] = set()
+    errors: list[str] = []
+    for position, transaction in enumerate(transactions, start=1):
+        if not isinstance(transaction, dict):
+            errors.append(f"source_transaction_invalid:{position}")
+            continue
+        try:
+            source_index = int(transaction.get("source_index") or 0)
+        except (TypeError, ValueError):
+            source_index = 0
+        if source_index < 1 or source_index > transaction_count:
+            errors.append(f"source_transaction_index_out_of_range:{position}")
+        elif source_index in seen:
+            errors.append(f"source_transaction_index_duplicate:{source_index}")
+        seen.add(source_index)
+    return errors

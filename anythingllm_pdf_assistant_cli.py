@@ -154,8 +154,8 @@ def _marker_root_pid(record: dict) -> int:
         return 0
 
 
-def _owned_server_process_command(pid: int) -> str:
-    """Return a PID's command line on Windows, without trusting a recycled PID."""
+def _owned_server_process_command(pid: int) -> str | None:
+    """Return a PID's command line; ``None`` means the ownership probe failed."""
     powershell = _powershell()
     if sys.platform != "win32" or not powershell or int(pid) <= 0:
         return ""
@@ -177,7 +177,7 @@ def _owned_server_process_command(pid: int) -> str:
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return ""
+        return None
     return observed.stdout or ""
 
 
@@ -239,7 +239,10 @@ def _recorded_server_is_alive_on_port(port: int) -> bool:
         recorded_port = int(record.get("port") or 0)
         if pid <= 0 or recorded_port != int(port):
             return False
-        command_line = _owned_server_process_command(pid).casefold()
+        command = _owned_server_process_command(pid)
+        if command is None:
+            return False
+        command_line = command.casefold()
         if not any(token in command_line for token in ("anythingllm_pdf_assistant_cli", "anythingllm-pdf-assistant")):
             return False
         listener_owned = _listener_belongs_to_server_root(port, pid)
@@ -484,8 +487,21 @@ def _stop() -> int:
     if pid <= 0 or port <= 0:
         print("The local server marker is invalid; refusing to stop an unknown process.", file=sys.stderr)
         return 1
-    command_line = _owned_server_process_command(pid).casefold()
+    command = _owned_server_process_command(pid)
+    if command is None:
+        print("Could not verify the recorded local server process; refusing to stop it and keeping its marker for diagnosis.", file=sys.stderr)
+        return 1
+    command_line = command.casefold()
     if not any(token in command_line for token in ("anythingllm_pdf_assistant_cli", "anythingllm-pdf-assistant")):
+        # A process can disappear between the shortcut reading its marker and
+        # this ownership check.  When the recorded port is also free, keeping
+        # the stale marker only makes the next Start/Stop action misleading.
+        # Never remove it when something is listening: that could be a PID
+        # reuse or an unrelated application and must remain diagnostic-only.
+        if _port_is_available(port):
+            marker.unlink(missing_ok=True)
+            print("Removed a stale local PDF assistant server marker; no owned server is running.")
+            return 0
         print("The recorded process is no longer the owned PDF assistant server; refusing to stop it.", file=sys.stderr)
         return 1
     listener_owned = _listener_belongs_to_server_root(port, pid)

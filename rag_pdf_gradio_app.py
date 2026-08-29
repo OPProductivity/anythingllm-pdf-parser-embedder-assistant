@@ -12435,8 +12435,14 @@ def paced_progress_fraction(record, now=None):
     """Return the stable visible fraction, rather than every raw estimate."""
     now = time.time() if now is None else float(now)
     state = str(record.get("state") or "")
-    if state in {"successful", "warning"}:
+    if state == "successful":
         return 1.0
+    if state == "warning":
+        # A warning can be issued after only part of a batch has exact vector
+        # evidence.  It is terminal, but it is not a successful 100% run.
+        # Keep the terminal card and progress bar consistent with the durable
+        # completion evidence instead of visually claiming success.
+        return min(0.99, max(0.0, float(record.get("confirmed_fraction") or 0.0)))
     if record.get("cancel_requested"):
         # The cancel request is durable before the owned worker necessarily
         # observes it. A final progress event can therefore arrive while the
@@ -12887,8 +12893,10 @@ def paced_progress_percent(record, now=None):
     """Return a whole-percent, slow-safe estimate for the visible progress bar."""
     now = time.time() if now is None else float(now)
     state = str(record.get("state") or "")
-    if state in {"successful", "warning"}:
+    if state == "successful":
         return 100
+    if state == "warning":
+        return min(99, math.ceil(paced_progress_fraction(record, now) * 100.0 - 1e-9))
     if state in {"cancelled", "failed"}:
         # Terminal status must never continue to look alive because the page
         # timer refreshed. Freeze it at the last displayed evidence checkpoint.
@@ -19195,6 +19203,13 @@ def automatic_completion_success_message(summaries, *, include_runtime_note=True
             f"{receipt['visual_review_pdfs']} PDF(s) need visual-text review; indexing was not blocked."
         )
     return lead + body
+
+
+def cancellation_unresolved_record_count(batch_upload_report):
+    """Count only durable recovery locations, never broader cache reuse."""
+    recovery = (batch_upload_report or {}).get("recovery") or {}
+    locations = recovery.get("remaining_locations") or []
+    return len({str(location).strip().casefold() for location in locations if str(location).strip()})
 
 
 def automatic_completion(summaries, prepare_and_upload):
@@ -26768,7 +26783,12 @@ def run_automatic(
             or batch_upload_report.get("embedded")
             or 0
         )
-        unresolved_records = max(0, attached_records - confirmed_records)
+        # ``embedded`` includes cache-linked records in mixed runs, whereas
+        # ``newly_attached_records`` deliberately does not.  The recovery
+        # manifest is the authoritative, source-local statement of work that
+        # remains unresolved after cancellation; do not subtract unrelated
+        # cache reuse from a new-attachment counter.
+        unresolved_records = cancellation_unresolved_record_count(batch_upload_report)
         if unresolved_records:
             cancellation_message = (
                 "Cancellation completed at a safe checkpoint. "

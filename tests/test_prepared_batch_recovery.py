@@ -100,6 +100,23 @@ def test_incomplete_checkpoint_is_not_reusable(tmp_path):
     assert payload["sources"][0]["summary_path"].endswith("run-summary.json")
 
 
+def test_duplicate_or_noncontiguous_source_indexes_block_reuse(tmp_path):
+    summaries = [_prepared_summary(tmp_path, "one"), _prepared_summary(tmp_path, "two")]
+    write_prepared_batch_checkpoint(
+        tmp_path, summaries, total_sources=2, workspace_slug="workspace",
+        api_url="http://127.0.0.1:3001/api", stage="preparation_complete",
+    )
+    path = tmp_path / "prepared-batch-recovery-manifest.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["sources"][1]["source_index"] = 1
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = verify_prepared_batch_checkpoint(tmp_path)
+
+    assert result["reusable"] is False
+    assert "duplicate_source_index" in result["reason"]
+
+
 def test_submission_started_never_authorizes_replay(tmp_path):
     summary = _prepared_summary(tmp_path)
     write_prepared_batch_checkpoint(

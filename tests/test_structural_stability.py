@@ -517,6 +517,29 @@ def test_pymupdf_page_worker_keeps_completed_result_when_final_heartbeat_is_read
     assert result == {"page": 1, "text": "completed text", "kind": "markdown_page"}
 
 
+def test_pymupdf_page_worker_uses_secondary_heartbeat_when_primary_replace_is_locked(tmp_path, monkeypatch):
+    activity_path = tmp_path / "activity.json"
+    original_replace = rag_pdf_tools.os.replace
+
+    def primary_locked(source, destination):
+        if Path(destination) == activity_path:
+            raise PermissionError("primary heartbeat temporarily locked")
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(rag_pdf_tools.os, "replace", primary_locked)
+    with mock.patch.object(
+        rag_pdf_tools, "_pymupdf4llm_one_page",
+        return_value={"page": 1, "text": "completed text", "kind": "markdown_page"},
+    ):
+        result = rag_pdf_tools._pymupdf4llm_one_page_observed(
+            "source.pdf", 0, 200, str(activity_path)
+        )
+
+    secondary = activity_path.with_name("activity.heartbeat.json")
+    assert json.loads(secondary.read_text(encoding="utf-8"))["phase"] == "page_complete"
+    assert result["text"] == "completed text"
+
+
 def test_unresponsive_pymupdf_pool_never_retries_the_same_native_call_in_parent(tmp_path):
     pdf = tmp_path / "two-pages.pdf"
     document = fitz.open()

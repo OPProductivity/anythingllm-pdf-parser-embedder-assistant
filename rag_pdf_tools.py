@@ -753,6 +753,20 @@ class Pymupdf4llmWorkerUnresponsiveError(Pymupdf4llmWorkerIsolationError):
     """An isolated page worker stopped reporting liveness, not merely speed."""
 
 
+def _pymupdf4llm_activity_paths(activity_path: Path) -> tuple[Path, Path]:
+    """Return independent heartbeat slots for one isolated page worker.
+
+    Windows can temporarily refuse a replacement while an observer has one
+    JSON handle open.  A second slot keeps optional liveness telemetry from
+    becoming a single-file failure point; extraction results remain the only
+    authority for page content.
+    """
+    return (
+        activity_path,
+        activity_path.with_name(f"{activity_path.stem}.heartbeat{activity_path.suffix}"),
+    )
+
+
 def _pymupdf4llm_one_page_observed(
     pdf_path_text: str,
     page_index: int,
@@ -760,7 +774,7 @@ def _pymupdf4llm_one_page_observed(
     activity_path_text: str,
 ):
     """Run one page while independently reporting its exact active phase."""
-    activity_path = Path(activity_path_text)
+    activity_paths = _pymupdf4llm_activity_paths(Path(activity_path_text))
     stop = threading.Event()
     write_lock = threading.Lock()
 
@@ -772,9 +786,21 @@ def _pymupdf4llm_one_page_observed(
             "updated_at_epoch": time.time(),
         }
         with write_lock:
-            temporary = activity_path.with_suffix(f".{os.getpid()}.tmp")
-            temporary.write_text(json.dumps(payload), encoding="utf-8")
-            os.replace(temporary, activity_path)
+            failures: list[OSError] = []
+            for activity_path in activity_paths:
+                temporary = activity_path.with_suffix(f".{os.getpid()}.tmp")
+                try:
+                    temporary.write_text(json.dumps(payload), encoding="utf-8")
+                    os.replace(temporary, activity_path)
+                    return
+                except OSError as exc:
+                    failures.append(exc)
+                    try:
+                        temporary.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+            if failures:
+                raise failures[-1]
 
     write_activity("starting_page_backend")
 
@@ -851,7 +877,7 @@ def _parallel_pymupdf4llm_pages(
             )
             pending[future] = page_index
             submitted_at[future] = time.monotonic()
-            activity_paths[future] = activity_path
+            activity_paths[future] = _pymupdf4llm_activity_paths(activity_path)
             next_page_index += 1
 
         try:
@@ -891,17 +917,23 @@ def _parallel_pymupdf4llm_pages(
                 unresponsive = []
                 active_page_phases = []
                 for future, page_index in pending.items():
-                    path = activity_paths[future]
+                    paths = activity_paths[future]
                     last_activity = None
-                    try:
-                        activity = json.loads(path.read_text(encoding="utf-8"))
-                        last_activity = float(activity.get("updated_at_epoch") or 0.0)
+                    newest_activity = None
+                    for path in paths:
+                        try:
+                            activity = json.loads(path.read_text(encoding="utf-8"))
+                            observed_at = float(activity.get("updated_at_epoch") or 0.0)
+                            if observed_at and (last_activity is None or observed_at > last_activity):
+                                newest_activity = activity
+                                last_activity = observed_at
+                        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                            pass
+                    if newest_activity is not None:
                         active_page_phases.append({
-                            "page": int(activity.get("page") or page_index + 1),
-                            "phase": str(activity.get("phase") or "working"),
+                            "page": int(newest_activity.get("page") or page_index + 1),
+                            "phase": str(newest_activity.get("phase") or "working"),
                         })
-                    except (OSError, TypeError, ValueError, json.JSONDecodeError):
-                        pass
                     stale = (
                         now_epoch - last_activity
                         if last_activity
