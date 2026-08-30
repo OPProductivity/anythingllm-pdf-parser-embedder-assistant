@@ -180,6 +180,71 @@ def test_cancelled_held_source_is_recovery_required_not_a_count_contradiction(tm
     assert "AUDIT-CROSS-SOURCE-002" not in codes
 
 
+def test_cancelled_held_queue_group_is_recovery_required_not_an_integrity_failure(tmp_path):
+    """A bounded group may retain multiple held sources after one ambiguous receipt."""
+    locations = [
+        "custom-documents/a.json", "custom-documents/b.json",
+        "custom-documents/c.json", "custom-documents/d.json",
+    ]
+    _write(tmp_path / "run-progress.json", {
+        "state": "cancelled", "completed_units": 2, "total_units": 4,
+    })
+    _write(tmp_path / "batch-native-upload-report.json", {
+        "status": "reconciliation_pending", "uploaded": 4, "embedded": 2,
+        "locations": locations,
+    })
+    _write(tmp_path / "batch-embedding-ledger.json", {
+        "requested": 4, "accepted": 2,
+        "recovery": {"state": "resume_available", "remaining_locations": locations[2:]},
+    })
+    _write(tmp_path / "source-transaction-ledger.json", {
+        "transaction_count": 6,
+        "transactions": [
+            {"source_index": 1, "planned_records": 2, "state": "exact_vectors_proven",
+             "uploaded": 2, "embedded": 2, "locations": locations[:2],
+             "source_queue_group_index": 1},
+            {"source_index": 2, "planned_records": 1, "state": "ambiguous_external_mutation_held",
+             "uploaded": 1, "embedded": 0, "locations": locations[2:3],
+             "source_queue_group_index": 2, "later_sources_released": False},
+            {"source_index": 3, "planned_records": 1, "state": "ambiguous_external_mutation_held",
+             "uploaded": 1, "embedded": 0, "locations": locations[3:],
+             "source_queue_group_index": 2, "later_sources_released": False},
+        ],
+        "stopped_after_source_transaction": 2,
+        "stop_reason": "ambiguous_external_mutation_held",
+    })
+
+    audit = audit_run_directory(tmp_path)
+    codes = {row["code"] for row in audit["findings"]}
+
+    assert audit["audit_status"] == "recovery_required"
+    assert "AUDIT-SOURCE-STOP-001" not in codes
+    assert "AUDIT-SOURCE-STOP-002" not in codes
+    assert "AUDIT-SOURCE-STOP-003" not in codes
+
+
+def test_held_queue_group_cannot_release_a_later_group(tmp_path):
+    """Group-aware auditing must still reject work after the held group."""
+    _green_run(tmp_path)
+    _write(tmp_path / "source-transaction-ledger.json", {
+        "transaction_count": 3,
+        "transactions": [
+            {"source_index": 1, "planned_records": 1, "state": "ambiguous_external_mutation_held",
+             "uploaded": 0, "embedded": 0, "locations": [], "source_queue_group_index": 1},
+            {"source_index": 2, "planned_records": 1, "state": "ambiguous_external_mutation_held",
+             "uploaded": 0, "embedded": 0, "locations": [], "source_queue_group_index": 1},
+            {"source_index": 3, "planned_records": 1, "state": "exact_vectors_proven",
+             "uploaded": 1, "embedded": 1, "locations": ["custom-documents/late.json"],
+             "source_queue_group_index": 2},
+        ],
+        "stopped_after_source_transaction": 1,
+        "stop_reason": "ambiguous_external_mutation_held",
+    })
+
+    audit = audit_run_directory(tmp_path)
+    assert "AUDIT-SOURCE-STOP-001" in {row["code"] for row in audit["findings"]}
+
+
 def test_failure_bundle_is_compact_and_contains_no_source_path_or_workspace_name(tmp_path):
     _green_run(tmp_path)
     report = json.loads((tmp_path / "batch-native-upload-report.json").read_text())

@@ -213,16 +213,13 @@ def compatible_output_filename(parent, preferred_stem, suffix, *, fallback="arti
     return filename
 
 # Upload-mode progress is a user-facing evidence scale, not the old generic
-# pipeline's anonymous 0..1 values. The two-trial medium-PDF cohort measured
-# local preparation at a 15.9% median, shared ingestion at 62.2%, and
-# retrieval/validation at 16.1%. More importantly,
-# Desktop's queue and the targeted page-parent observer overlap: treating them
-# as two *consecutive* ranges double-counts the longest part of the run.  They
-# therefore share the same 16--78% ingestion range. Their labels remain
-# distinct, but either stream can advance the one bar only by its proven x/y.
-# The Gradio owner additionally constrains this active range by its live ETA,
-# so the percentage and the displayed elapsed/remaining time cannot diverge
-# dramatically when one observer gets ahead of the other.
+# pipeline's anonymous 0..1 values. Desktop's queue and the targeted
+# page-parent observer overlap, so they share one wide ingestion lane instead
+# of being added as two serial durations. The former 16--78% allocation
+# compressed exact-vector evidence into a 78% ceiling and made ordinary runs
+# jump from that ceiling to terminal success. Keep the modern ownership model,
+# but restore a wide 16--94% shared lane and reserve real late-stage space for
+# retrieval, validation, and reporting.
 AUTOMATIC_UPLOAD_PHASE_RANGES = {
     "metadata": (0.0000, 0.0190),
     "extraction": (0.0190, 0.0860),
@@ -230,10 +227,10 @@ AUTOMATIC_UPLOAD_PHASE_RANGES = {
     "payloads": (0.1080, 0.1340),
     "attachments": (0.1340, 0.1500),
     "queue_receipt": (0.1500, 0.1600),
-    "desktop_queue": (0.1600, 0.7800),
-    "identity_set": (0.1600, 0.7800),
-    "retrieval_sample": (0.7800, 0.9400),
-    "validation": (0.9400, 0.9800),
+    "desktop_queue": (0.1600, 0.9400),
+    "identity_set": (0.1600, 0.9400),
+    "retrieval_sample": (0.9400, 0.9700),
+    "validation": (0.9700, 0.9800),
     "reporting": (0.9800, 1.0000),
 }
 
@@ -12839,8 +12836,6 @@ def upload_block_reason_for_readiness(selected: dict) -> str:
         for reason in ((selected or {}).get("readiness_reasons") or [])
         if str(reason).strip()
     }
-    if "photographed_spread_requires_manual_review" in reasons:
-        return "photographed_spread_requires_manual_review"
     if "needs_unstructured_or_ocr" in reasons:
         return "needs_unstructured_or_ocr"
     ocr_assisted = (
@@ -15036,6 +15031,29 @@ def update_workspace_embeddings_desktop_queue(
         for location in unique_locations
         if _anythingllm_vector_cache_hit(storage_dir, location)
     }
+    # Preserve cache/fresh *runs* in queued order, rather than only the two
+    # totals.  A mixed Desktop group can process (for example) a short cached
+    # prefix, a long fresh source, then a cached suffix.  The UI-side ETA
+    # observer needs that layout to derive a provider cadence from the fresh
+    # interval alone; aggregate queue throughput would otherwise blend the
+    # two fundamentally different operations.  Run-length encoding keeps the
+    # callback bounded even for unusually large single-PDF groups.
+    prequeue_cache_flags = [
+        _normalized_anythingllm_document_location(location)
+        in preexisting_cached_locations
+        for location in unique_locations
+    ]
+    prequeue_cache_segments = []
+    for position, cache_hit in enumerate(prequeue_cache_flags, start=1):
+        if (
+            prequeue_cache_segments
+            and bool(prequeue_cache_segments[-1]["cached"]) == bool(cache_hit)
+        ):
+            prequeue_cache_segments[-1]["end"] = position
+        else:
+            prequeue_cache_segments.append(
+                {"start": position, "end": position, "cached": bool(cache_hit)}
+            )
     prequeue_cache_snapshot_epoch = time.time()
     if callable(status_callback):
         status_callback(
@@ -15049,6 +15067,7 @@ def update_workspace_embeddings_desktop_queue(
                 "queue_records": requested,
                 "prequeue_cached_records": len(preexisting_cached_locations),
                 "prequeue_fresh_records": max(0, requested - len(preexisting_cached_locations)),
+                "prequeue_cache_segments": prequeue_cache_segments,
                 "prequeue_cache_snapshot_epoch": prequeue_cache_snapshot_epoch,
             },
         )
@@ -15069,7 +15088,19 @@ def update_workspace_embeddings_desktop_queue(
         "first_progress_position": 0,
         "last_progress_monotonic": 0.0,
         "last_progress_position": 0,
-        "cached_record_positions": set(),
+        # This set is known before the request begins, not inferred from
+        # whichever events happened to arrive first.  That makes later
+        # fresh-only completion counts exact even if an SSE event is delayed.
+        "cached_record_positions": {
+            position
+            for position, cache_hit in enumerate(prequeue_cache_flags, start=1)
+            if cache_hit
+        },
+        "fresh_segment_first_progress_monotonic": 0.0,
+        "fresh_segment_last_progress_monotonic": 0.0,
+        "fresh_segment_first_position": 0,
+        "fresh_segment_last_position": 0,
+        "fresh_segment_progress_samples": 0,
     }
 
     def queue_snapshot():
@@ -15082,11 +15113,37 @@ def update_workspace_embeddings_desktop_queue(
             first_progress_position = int(queue_state["first_progress_position"] or 0)
             last_progress_position = int(queue_state["last_progress_position"] or 0)
             cached_records = len(queue_state["cached_record_positions"])
+            fresh_completed = max(
+                0,
+                completed
+                - sum(
+                    1
+                    for position in queue_state["cached_record_positions"]
+                    if position <= completed
+                ),
+            )
+            fresh_first_at = float(
+                queue_state["fresh_segment_first_progress_monotonic"] or 0.0
+            )
+            fresh_last_at = float(
+                queue_state["fresh_segment_last_progress_monotonic"] or 0.0
+            )
+            fresh_first_position = int(queue_state["fresh_segment_first_position"] or 0)
+            fresh_last_position = int(queue_state["fresh_segment_last_position"] or 0)
+            fresh_samples = max(0, int(queue_state["fresh_segment_progress_samples"] or 0))
             records_per_second = 0.0
             if last_progress_at > first_progress_at and last_progress_position > first_progress_position:
                 records_per_second = (last_progress_position - first_progress_position) / (
                     last_progress_at - first_progress_at
                 )
+            fresh_records_per_second = 0.0
+            if (
+                fresh_last_at > fresh_first_at
+                and fresh_last_position > fresh_first_position
+            ):
+                fresh_records_per_second = (
+                    fresh_last_position - fresh_first_position
+                ) / (fresh_last_at - fresh_first_at)
             queue_position = max(completed, current)
             remaining_seconds = (
                 round(max(0, requested - queue_position) / records_per_second, 3)
@@ -15112,6 +15169,14 @@ def update_workspace_embeddings_desktop_queue(
                 "desktop_queue_records_per_minute": round(records_per_second * 60.0, 3) if records_per_second else None,
                 "desktop_queue_estimated_remaining_seconds": remaining_seconds,
                 "desktop_queue_cached_records": cached_records,
+                "desktop_queue_fresh_completed": fresh_completed,
+                "desktop_queue_active_fresh_records_per_minute": (
+                    round(fresh_records_per_second * 60.0, 3)
+                    if fresh_records_per_second else None
+                ),
+                "desktop_queue_active_fresh_segment_start": fresh_first_position,
+                "desktop_queue_active_fresh_segment_end": fresh_last_position,
+                "desktop_queue_active_fresh_segment_samples": fresh_samples,
             }
 
     def queue_activity_summary():
@@ -15199,6 +15264,32 @@ def update_workspace_embeddings_desktop_queue(
                     first_queue_progress = True
                 queue_state["last_progress_monotonic"] = now
                 queue_state["last_progress_position"] = progress_position
+            # Measure only a contiguous fresh interval.  A cached prefix or
+            # suffix must not distort the provider-rate sample, and a fresh
+            # interval after a cache interval deliberately starts a new sample
+            # rather than pretending the skipped cache time was embedding.
+            if position > 0 and not cache_hit and progress_position == position:
+                fresh_last_position = int(
+                    queue_state["fresh_segment_last_position"] or 0
+                )
+                now = time.monotonic()
+                if (
+                    not queue_state["fresh_segment_first_progress_monotonic"]
+                    or position > fresh_last_position + 1
+                ):
+                    queue_state["fresh_segment_first_progress_monotonic"] = now
+                    queue_state["fresh_segment_first_position"] = position
+                    queue_state["fresh_segment_progress_samples"] = 1
+                elif position > fresh_last_position:
+                    queue_state["fresh_segment_progress_samples"] = max(
+                        1,
+                        int(queue_state["fresh_segment_progress_samples"] or 0) + 1,
+                    )
+                queue_state["fresh_segment_last_progress_monotonic"] = now
+                queue_state["fresh_segment_last_position"] = max(
+                    fresh_last_position,
+                    position,
+                )
         snapshot = queue_snapshot()
         if not callable(status_callback):
             return
@@ -16366,7 +16457,12 @@ def maybe_upload_segment_files_source_transactions(
             by_source[source_key] = group
             grouped.append(group)
         group["rows"].append(dict(row))
-    if len(grouped) <= 1:
+    # A row without a source path cannot safely be represented as a durable
+    # per-PDF transaction. Retain the legacy route only for that compatibility
+    # case. One known PDF must use the same transaction boundary as a batch:
+    # it can still have an ambiguous attachment or queue receipt even though
+    # there are no later PDFs to protect.
+    if not grouped:
         return maybe_upload_segment_files(
             api_url,
             api_key,
@@ -16415,6 +16511,12 @@ def maybe_upload_segment_files_source_transactions(
             {
                 "timing_event": "batch_cache_lookup_started",
                 "prepared_records": len(rows),
+                # The coordinator's exact batch plan is deliberately named
+                # separately from worker-local preparation totals. A later
+                # local callback can include a held or skipped PDF and must
+                # not expand the Desktop queue denominator.
+                "queue_eligible_records": len(rows),
+                "queue_eligible_sources": len(grouped),
                 "source_window_total": len(grouped),
             },
         )
@@ -16455,6 +16557,8 @@ def maybe_upload_segment_files_source_transactions(
             {
                 "timing_event": "batch_cache_lookup_completed",
                 "prepared_records": len(rows),
+                "queue_eligible_records": len(rows),
+                "queue_eligible_sources": len(grouped),
                 "reusable_records": sum(bool(location) for location in reusable_locations),
                 "cached_documents": cached_document_count,
                 "partially_cached_documents": partially_cached_document_count,
@@ -16911,7 +17015,13 @@ def maybe_upload_to_anythingllm(
             for row in selected_rows
             if str(row.get("_automatic_source_path") or "").strip()
         }
-        if len(source_keys) > 1:
+        # Use the durable source-transaction coordinator whenever the upload
+        # plan can attribute its rows to at least one selected PDF. A
+        # one-PDF run has no later sibling to release, but it still needs the
+        # same crash journal, exact recovery manifest, and queue-proof
+        # semantics as a multi-PDF run. Rows without a safe source key retain
+        # the legacy compatibility route below.
+        if source_keys:
             return maybe_upload_segment_files_source_transactions(
                 api_url,
                 api_key,
@@ -20882,9 +20992,10 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     if selected.get("native_chunk_eval", {}).get("status") != "pass":
         readiness_reasons.append("native_header_metadata_does_not_survive_chunk_simulation")
     # The column-first recovery keeps citations tied to the original physical
-    # PDF page, but it cannot prove that a photographed book spread has no
-    # cropped or obscured words at its fold.  Require a human visual check
-    # before upload when the condition is sustained across a document.
+    # PDF page. A photographed spread is useful layout-review evidence, but
+    # it is not itself evidence that the chosen text is unsafe. Preserve the
+    # observation in the report; only demonstrated text-quality failures can
+    # withhold an otherwise complete PDF from AnythingLLM.
     if int(layout_evidence.get("photographed_spread_page_count") or 0) >= 2:
         readiness_reasons.append("photographed_spread_requires_manual_review")
 

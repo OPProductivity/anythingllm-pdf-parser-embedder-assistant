@@ -114,13 +114,44 @@ def _audit_source_transactions(
          "At least one source transaction has no state.", artifact)
 
     if stop_index:
-        _add(findings, stop_index != len(transactions), "AUDIT-SOURCE-STOP-001",
-             "A held mutation must be the final retained source transaction.", artifact)
+        # A bounded AnythingLLM queue group can submit several sources before a
+        # single external mutation becomes ambiguous.  In that case the worker
+        # deliberately retains every source in that *same* group as held, so it
+        # can never release a later group by accident.  Older source-at-a-time
+        # ledgers still require the held source to be final.
+        try:
+            held_position = indices.index(stop_index)
+        except ValueError:
+            held_position = -1
+        held_rows = transactions[held_position:] if held_position >= 0 else []
+        held_group = (
+            _safe_int(held_rows[0].get("source_queue_group_index"))
+            if held_rows else 0
+        )
+        grouped_hold_is_coherent = bool(
+            held_group
+            and held_rows
+            and all(
+                _safe_int(row.get("source_queue_group_index")) == held_group
+                and str(row.get("state") or "") in HELD_SOURCE_STATES
+                for row in held_rows
+            )
+        )
+        legacy_hold_is_coherent = bool(
+            held_position == len(transactions) - 1
+            and held_rows
+            and str(held_rows[0].get("state") or "") in HELD_SOURCE_STATES
+        )
+        _add(findings, not (grouped_hold_is_coherent or legacy_hold_is_coherent),
+             "AUDIT-SOURCE-STOP-001",
+             "A held mutation may retain only held sources from its final queue group.", artifact)
         final_state = states[-1] if states else ""
         _add(findings, final_state not in HELD_SOURCE_STATES, "AUDIT-SOURCE-STOP-002",
              "The ledger records a stop boundary but its final source is not held.", artifact)
-        _add(findings, stop_reason != final_state, "AUDIT-SOURCE-STOP-003",
-             "The stop reason does not match the final held source state.", artifact)
+        _add(findings, not held_rows or any(
+            str(row.get("state") or "") != stop_reason for row in held_rows
+        ), "AUDIT-SOURCE-STOP-003",
+             "The stop reason does not match every retained held source state.", artifact)
     else:
         _add(findings, any(state in HELD_SOURCE_STATES for state in states),
              "AUDIT-SOURCE-STOP-004",

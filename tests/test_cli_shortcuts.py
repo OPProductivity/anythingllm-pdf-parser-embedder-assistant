@@ -153,6 +153,67 @@ def test_stop_terminates_only_a_verified_owned_server_tree():
     assert run.call_args.args[0] == ["taskkill", "/PID", "42", "/T", "/F"]
 
 
+def test_stop_retains_owned_run_cancellation_before_terminating_server_tree(tmp_path: Path):
+    marker = tmp_path / "localhost-server.json"
+    marker.write_text('{"root_pid": 42, "port": 7860}', encoding="utf-8")
+    outputs = tmp_path / "automatic-runs"
+    run_root = outputs / "r-owned"
+    run_root.mkdir(parents=True)
+    progress_path = run_root / cli.AUTOMATIC_RUN_PROGRESS_NAME
+    progress_path.write_text(
+        json.dumps(
+            {
+                "state": "running",
+                "server_root_pid": 42,
+                "phase": "AnythingLLM queue",
+                "confirmed_fraction": 0.42,
+            }
+        ),
+        encoding="utf-8",
+    )
+    foreign_root = outputs / "r-foreign"
+    foreign_root.mkdir()
+    (foreign_root / cli.AUTOMATIC_RUN_PROGRESS_NAME).write_text(
+        json.dumps({"state": "running", "server_root_pid": 99}), encoding="utf-8"
+    )
+    stop_result = mock.Mock(returncode=0, stdout="SUCCESS", stderr="")
+    with (
+        mock.patch.object(cli.sys, "platform", "win32"),
+        mock.patch.object(cli, "_server_marker_path", return_value=marker),
+        mock.patch.object(cli, "_owned_server_process_command", return_value="python -m anythingllm_pdf_assistant_cli start"),
+        mock.patch.object(cli, "_listener_belongs_to_server_root", return_value=True),
+        mock.patch.object(cli, "_port_is_available", return_value=True),
+        mock.patch.object(cli, "application_paths", return_value={"automatic_outputs": outputs}),
+        mock.patch.object(cli.subprocess, "run", return_value=stop_result),
+    ):
+        assert cli._stop() == 0
+
+    terminal = json.loads(progress_path.read_text(encoding="utf-8"))
+    recovery = json.loads((run_root / cli.AUTOMATIC_RUN_CANCELLATION_RECOVERY).read_text(encoding="utf-8"))
+    assert terminal["state"] == "cancelled"
+    assert terminal["cancel_requested"] is True
+    assert recovery["status"] == "cancelled"
+    assert recovery["reason"] == "owned_local_server_stop"
+    assert (run_root / cli.AUTOMATIC_RUN_CANCELLATION_MARKER).is_file()
+    assert json.loads((foreign_root / cli.AUTOMATIC_RUN_PROGRESS_NAME).read_text(encoding="utf-8"))["state"] == "running"
+
+
+def test_server_stop_refuses_to_kill_when_owned_recovery_cannot_be_written(tmp_path: Path, capsys):
+    marker = tmp_path / "localhost-server.json"
+    marker.write_text('{"root_pid": 42, "port": 7860}', encoding="utf-8")
+    with (
+        mock.patch.object(cli.sys, "platform", "win32"),
+        mock.patch.object(cli, "_server_marker_path", return_value=marker),
+        mock.patch.object(cli, "_owned_server_process_command", return_value="python -m anythingllm_pdf_assistant_cli start"),
+        mock.patch.object(cli, "_listener_belongs_to_server_root", return_value=True),
+        mock.patch.object(cli, "_prepare_owned_active_runs_for_server_stop", side_effect=OSError("disk unavailable")),
+        mock.patch.object(cli.subprocess, "run") as run,
+    ):
+        assert cli._stop() == 1
+    assert run.call_count == 0
+    assert "cancellation recovery" in capsys.readouterr().err
+
+
 def test_stop_keeps_the_marker_when_ownership_probe_times_out(capsys):
     with tempfile.TemporaryDirectory() as tmpdir:
         marker = Path(tmpdir) / "localhost-server.json"

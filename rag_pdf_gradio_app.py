@@ -4467,6 +4467,12 @@ body.dark .automatic-run-timing.cache-reuse-confirmed strong {
     box-shadow: none !important;
     outline: 0 !important;
 }
+/* The ready-state estimate still uses this legacy host.  Running and terminal
+   estimates now render inline with the batch receipt, but retain this small
+   lane so hiding the legacy child cannot pull the controls below it upward. */
+.automatic-run-timing-host {
+    min-height: 18px !important;
+}
 .automatic-run-activity-host,
 .automatic-run-activity-host > div,
 .automatic-run-activity-host > .wrap,
@@ -4489,6 +4495,14 @@ body.dark .automatic-run-timing.cache-reuse-confirmed strong {
 .automatic-run-activity.warning { color: #a16207; }
 .automatic-run-activity.failed { color: #b91c1c; }
 .automatic-run-activity.ready { color: var(--body-text-color-subdued, #64748b); }
+.automatic-run-activity {
+    /* Reserve the complete progress surface from Ready through terminal
+       state. Previously only the inner running label had a minimum height,
+       so the surrounding Gradio HTML surface jumped from a short Ready card
+       to the multi-line live card and again at cancellation/completion. */
+    height: calc(8px + 11em + 2px);
+    overflow: hidden;
+}
 .automatic-run-progress {
     height: 8px;
     width: 100%;
@@ -4525,14 +4539,19 @@ body.dark .automatic-run-timing.cache-reuse-confirmed strong {
 .automatic-run-progress-overall {
     grid-column: 1;
     min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 .automatic-run-progress-phase {
     grid-column: 2;
     min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 .automatic-run-progress-details,
-.automatic-run-batch-count,
-.automatic-run-progress-timing {
+.automatic-run-batch-timing {
     grid-column: 1 / -1;
     min-width: 0;
 }
@@ -4541,7 +4560,9 @@ body.dark .automatic-run-timing.cache-reuse-confirmed strong {
        Reserve their full four-line area from the start, rather than replacing
        one with the other or making the card jump as a later callback wraps. */
     display: block;
-    min-height: 4.8em;
+    min-height: 0;
+    max-height: none;
+    overflow-y: auto;
     overflow-wrap: anywhere;
     white-space: pre-line;
 }
@@ -4551,19 +4572,33 @@ body.dark .automatic-run-timing.cache-reuse-confirmed strong {
 .automatic-run-activity.warning .automatic-run-progress-label,
 .automatic-run-activity.failed .automatic-run-progress-label,
 .automatic-run-activity.cancelled .automatic-run-progress-label {
-    min-height: 9.75em;
+    /* Keep the bottom receipt/timer lane at the physical bottom of the
+       reserved gray status surface. The flexible detail lane above it can
+       scroll without changing either the card or surrounding controls. */
+    height: 11em;
+    min-height: 11em;
+    grid-template-rows: 1.25em minmax(0, 1fr) 3.75em;
 }
 .automatic-run-progress-label span { font-variant-numeric: tabular-nums; }
-.automatic-run-batch-count {
-    min-height: 1.25em;
+.automatic-run-batch-timing {
+    /* Keep the PDF receipt, elapsed clock, and estimate in three stable rows
+       at the bottom of the card. This makes the status easy to scan without
+       leaving a misleading blank strip below it. */
+    min-height: 3.75em;
+    max-height: 3.75em;
+    overflow: hidden;
     color: var(--body-text-color-subdued, #94a3b8);
     font-size: 0.92em;
+    margin-left: 0;
+    padding-left: 0;
+    text-indent: 0;
 }
+.automatic-run-batch-count { display: inline; }
 .automatic-run-activity.preparing .automatic-run-progress-label {
     display: block;
     /* Confirmation already owns the run. Reserve the same status-card height
        now so the first worker update cannot push the surrounding controls. */
-    min-height: 9.75em;
+    min-height: 11em;
     padding-top: 3px;
     line-height: 1.2;
 }
@@ -4577,15 +4612,38 @@ body.dark .automatic-run-timing.cache-reuse-confirmed strong {
     white-space: nowrap;
 }
 .automatic-run-progress-timing {
-    /* The duration is deliberately a compact second line. It must never
-       move horizontally when a variable-length activity description wraps. */
+    display: inline;
+    margin-left: 6px;
+    line-height: 1.25;
+}
+/* In the fixed bottom receipt lane, timing begins a new line after the PDF
+   count. It is not an inline continuation, so inherit none of the legacy
+   spacing used by the old one-line timer host. */
+.automatic-run-batch-timing .automatic-run-progress-timing {
     display: block;
-    min-height: 1.15em;
     margin-left: 0;
-    margin-top: -1px;
-    line-height: 1.15;
-    color: var(--body-text-color-subdued, #64748b);
-    font-size: .92em;
+    padding-left: 0;
+    text-indent: 0;
+}
+.automatic-run-progress-timing-estimate {
+    color: inherit;
+    font-weight: 700;
+}
+.automatic-run-progress-timing.cache-reuse-confirmed .automatic-run-progress-timing-estimate {
+    color: #15803d;
+}
+body.dark .automatic-run-progress-timing.cache-reuse-confirmed .automatic-run-progress-timing-estimate {
+    color: #22c55e;
+}
+/* The active estimate is rendered beside Elapsed in the durable activity
+   card. Keep the legacy timer node mounted for its browser-clock contract,
+   but do not give it a second line while a run is active. */
+.automatic-run-timing.running,
+.automatic-run-timing.successful,
+.automatic-run-timing.warning,
+.automatic-run-timing.failed,
+.automatic-run-timing.cancelled {
+    display: none !important;
 }
 body.dark .automatic-run-activity.warning { color: #fcd34d; }
 body.dark .automatic-run-activity.failed { color: #fca5a5; }
@@ -12407,6 +12465,14 @@ PRESENTATION_ETA_CONSERVATISM = 1.20
 QUEUE_ETA_MIN_COMPLETED_RECORDS = 12
 QUEUE_ETA_MIN_EVENT_SAMPLES = 12
 QUEUE_ETA_SAMPLE_INTERVAL_SECONDS = 30.0
+# A bounded queue group that is the *entire* proved fresh run is different
+# from the first group of a large batch: it has no unseen source whose rate
+# could invalidate the observation. Let two spaced, agreeing mature samples
+# correct that short whole-run case. Large or multi-group runs continue to use
+# the established five-sample / cross-group policy below.
+QUEUE_ETA_REPRESENTATIVE_GROUP_MIN_SAMPLES = 2
+QUEUE_ETA_REPRESENTATIVE_GROUP_REPRICE_INTERVAL_SECONDS = 90.0
+QUEUE_ETA_REPRESENTATIVE_GROUP_MAX_SAMPLE_SPREAD_RATIO = 0.25
 # A fast queue should not spend another full three-minute visibility interval
 # displaying a deliberately conservative opening estimate once it has already
 # produced corroborating *cross-source* evidence.  This applies only to a
@@ -12439,6 +12505,21 @@ QUEUE_ETA_MAX_UPWARD_RUN_MIN_SECONDS = 180
 QUEUE_ETA_MAX_UPWARD_RUN_MAX_SECONDS = 900
 QUEUE_ETA_MIN_WINDOWS_FOR_INCREASE = 2
 QUEUE_ETA_UPWARD_CONSENSUS_SAMPLES = 4
+# This protects real unfinished pipeline work from being erased by one
+# downward queue-rate sample. It was replayed against retained terminal runs.
+QUEUE_ETA_PHASE_FLOOR_WEIGHT = .75
+QUEUE_ETA_STRONG_REVERSAL_MIN_GROWTH = .15
+# A rate measured only in the first source group is not representative of an
+# unopened multi-source batch. A one-PDF run is exempt; otherwise a downward
+# reprice needs broad source or record coverage before it can change the ETA.
+QUEUE_ETA_MIN_SOURCE_COVERAGE_FOR_DOWNWARD_REPRICE = .50
+QUEUE_ETA_MIN_RECORD_COVERAGE_FOR_DOWNWARD_REPRICE = .65
+# Once a batch-wide cache map is exact, fresh-only coverage is stronger
+# evidence than an arbitrary elapsed-time delay.  The threshold was replayed
+# against the 27 cached -> 225 fresh -> 211 cached Desktop group: the first
+# stable reprice becomes eligible after at least 45% of that known fresh run,
+# rather than treating its short cached prefix as provider throughput.
+QUEUE_ETA_MIN_FRESH_SEGMENT_COVERAGE_FOR_REPRICE = .45
 OCR_RUNTIME_ETA_MAX_VISIBLE_REPRICES = 4
 
 
@@ -12459,7 +12540,7 @@ def grouped_source_window_progress(progress_state, report):
 
     AnythingLLM reports queue positions relative to the current PDF.  The UI
     progress bar is relative to the entire prepared batch.  Keeping the small
-    accumulator in the outer run callback preserves the established 16--78%
+    accumulator in the outer run callback preserves the established 16--94%
     queue/identity lane while preventing PDF 2 from appearing to restart at
     PDF 1's local position (or being hidden forever by the monotonic bar).
     """
@@ -12468,6 +12549,8 @@ def grouped_source_window_progress(progress_state, report):
     try:
         source_index = max(0, int((report or {}).get("source_window_index") or 0))
         source_total = max(0, int((report or {}).get("source_window_total") or 0))
+        queue_group_index = max(0, int((report or {}).get("source_queue_group_index") or 0))
+        queue_group_sources = max(0, int((report or {}).get("source_queue_group_sources") or 0))
         queue_total = max(0, int((report or {}).get("queue_records") or (report or {}).get("requested") or 0))
         queue_completed = max(
             0,
@@ -12475,23 +12558,52 @@ def grouped_source_window_progress(progress_state, report):
             int((report or {}).get("desktop_queue_current") or 0),
             current_source_vector_progress_count(report, expected_records=queue_total),
         )
+        eligible_records = max(0, int((report or {}).get("queue_eligible_records") or 0))
+        eligible_sources = max(0, int((report or {}).get("queue_eligible_sources") or 0))
+        cached_records = max(0, int((report or {}).get("reusable_records") or 0))
+        cached_sources = max(0, int((report or {}).get("cached_documents") or 0))
     except (TypeError, ValueError):
-        source_index = source_total = queue_total = queue_completed = 0
-    try:
-        prepared_records = max(0, int((report or {}).get("prepared_records") or 0))
-    except (TypeError, ValueError):
-        prepared_records = 0
-    if prepared_records:
-        state["prepared_records"] = max(int(state.get("prepared_records") or 0), prepared_records)
+        (
+            source_index,
+            source_total,
+            queue_group_index,
+            queue_group_sources,
+            queue_total,
+            queue_completed,
+            eligible_records,
+            eligible_sources,
+            cached_records,
+            cached_sources,
+        ) = (0,) * 10
+    # Only the coordinator's all-batch cache event is allowed to establish the
+    # upload denominator. ``prepared_records`` also appears in late local
+    # worker callbacks and can include held/duplicate PDFs, which previously
+    # made a complete upload look stuck at 79%.
+    if eligible_records:
+        state["eligible_records"] = eligible_records
+    if eligible_sources:
+        state["eligible_sources"] = eligible_sources
+    if cached_records:
+        state["cached_records"] = cached_records
+    if cached_sources:
+        state["cached_sources"] = cached_sources
     if source_total:
         state["source_total"] = max(int(state.get("source_total") or 0), source_total)
-    totals = state.setdefault("source_totals", {})
-    completed = state.setdefault("source_completed", {})
-    if source_index and queue_total:
-        totals[source_index] = max(int(totals.get(source_index) or 0), queue_total)
-        completed[source_index] = min(
-            totals[source_index],
-            max(int(completed.get(source_index) or 0), queue_completed),
+    totals = state.setdefault("queue_group_totals", {})
+    completed = state.setdefault("queue_group_completed", {})
+    group_sources = state.setdefault("queue_group_sources", {})
+    # A source-window index is merely the first PDF in a queue group. Key by
+    # the explicit group id so a four-PDF group is never counted as one PDF.
+    group_key = queue_group_index or source_index
+    if group_key and queue_total:
+        totals[group_key] = max(int(totals.get(group_key) or 0), queue_total)
+        if queue_group_sources:
+            group_sources[group_key] = max(
+                int(group_sources.get(group_key) or 0), queue_group_sources
+            )
+        completed[group_key] = min(
+            totals[group_key],
+            max(int(completed.get(group_key) or 0), queue_completed),
         )
         if event in {
             "batch_completed",
@@ -12503,13 +12615,24 @@ def grouped_source_window_progress(progress_state, report):
             bool((report or {}).get("searchability_proven"))
             or event != "batch_completed"
         ):
-            completed[source_index] = totals[source_index]
+            completed[group_key] = totals[group_key]
 
-    completed_records = sum(max(0, int(value or 0)) for value in completed.values())
-    denominator = max(int(state.get("prepared_records") or 0), sum(max(0, int(value or 0)) for value in totals.values()))
+    queue_completed_records = sum(max(0, int(value or 0)) for value in completed.values())
+    cached_record_base = max(0, int(state.get("cached_records") or 0))
+    completed_records = cached_record_base + queue_completed_records
+    exact_eligible_records = max(0, int(state.get("eligible_records") or 0))
+    denominator = (
+        exact_eligible_records
+        if exact_eligible_records
+        else max(
+            int(state.get("prepared_records") or 0),
+            sum(max(0, int(value or 0)) for value in totals.values()) + cached_record_base,
+        )
+    )
     fraction = min(1.0, completed_records / denominator) if denominator else 0.0
-    completed_sources = sum(
-        1 for index, total in totals.items()
+    completed_sources = max(0, int(state.get("cached_sources") or 0)) + sum(
+        max(1, int(group_sources.get(index) or 1))
+        for index, total in totals.items()
         if total > 0 and int(completed.get(index) or 0) >= int(total)
     )
     return {
@@ -12517,8 +12640,15 @@ def grouped_source_window_progress(progress_state, report):
         "completed_records": completed_records,
         "total_records": denominator,
         "source_index": source_index,
-        "source_total": max(source_total, int(state.get("source_total") or 0)),
-        "completed_sources": completed_sources,
+        "source_total": max(
+            source_total,
+            int(state.get("source_total") or 0),
+            int(state.get("eligible_sources") or 0),
+        ),
+        "completed_sources": min(
+            max(source_total, int(state.get("eligible_sources") or 0)),
+            completed_sources,
+        ),
     }
 
 
@@ -12672,6 +12802,7 @@ def update_live_automatic_run_status(
     cache_reuse_documents=None,
     cache_total_documents=None,
     presentation_expected_seconds=None,
+    eta_reprice_context=None,
 ):
     """Persist progress evidence plus a deliberately capped time-based estimate.
 
@@ -12839,6 +12970,17 @@ def update_live_automatic_run_status(
         resolved_eta_basis = "live_observations"
     else:
         resolved_eta_basis = str(previous.get("eta_basis") or "initial_estimate")
+    try:
+        server_root_pid = max(
+            0,
+            int(
+                previous.get("server_root_pid")
+                or os.environ.get("ANYTHINGLLM_PDF_ASSISTANT_SERVER_ROOT_PID")
+                or 0
+            ),
+        )
+    except (TypeError, ValueError):
+        server_root_pid = 0
     record = {
         "state": str(state or "running"),
         "phase": str(phase or "Working"),
@@ -12853,6 +12995,11 @@ def update_live_automatic_run_status(
         # explicit, evidence-backed ETA reprice.  Persist the reason so a
         # later benchmark can distinguish it from an ordinary status repaint.
         "eta_reprice_reason": str(eta_reprice_reason or ""),
+        "eta_reprice_context": (
+            dict(eta_reprice_context)
+            if isinstance(eta_reprice_context, dict)
+            else {}
+        ),
         "eta_basis": resolved_eta_basis,
         "details": str(details or ""),
         # Stable internal identifiers belong in durable evidence, not inside
@@ -12908,6 +13055,10 @@ def update_live_automatic_run_status(
         # still active (the old high-water mark repeatedly became 100%).
         "elapsed_percent_floor": min(99, max(previous_elapsed_floor, int(math.floor(current_elapsed_raw)))),
         "updated_epoch": now,
+        # A desktop Stop action may only reconcile runs created by its own
+        # launch-root process. This owner is durable so a restarted app does
+        # not leave its killed worker falsely reported as still running.
+        "server_root_pid": server_root_pid,
         "run_root": str(run_root or previous.get("run_root") or ""),
         # Ordinary local artifact paths allow the read-only status poller to
         # restore the completed-run folder button after a lost stream.
@@ -13027,6 +13178,7 @@ def update_live_automatic_run_status(
                 progress_phase=record.get("progress_phase"),
                 previous_expected_seconds=previous_expected,
                 new_expected_seconds=expected,
+                decision_context=record.get("eta_reprice_context"),
             )
         if terminal_state:
             checkpoint_updates["actual_elapsed_seconds"] = round(
@@ -13071,6 +13223,7 @@ def update_live_automatic_run_status(
                 "batch_current_file_index": record.get("batch_current_file_index", 0),
                 "evidence_kind": record.get("evidence_kind", ""),
                 "eta_reprice_reason": record.get("eta_reprice_reason", ""),
+                "eta_reprice_context": record.get("eta_reprice_context", {}),
                 "details": record["details"],
                 "confirmed_percent": round(float(record["confirmed_fraction"]) * 100.0, 3),
                 "visible_progress_percent": paced_progress_percent(record, now),
@@ -13100,15 +13253,24 @@ def update_live_automatic_run_status(
                 # the same percent in the same second.
                 trace_phase_marker = str(trace_entry["progress_phase"] or trace_entry["phase"])
                 trace_details = str(trace_entry["details"] or "")
-                if "Checking workspace attachment (step 1 of 2)" in trace_details:
+                if "Checking vector evidence (step 1 of 2)" in trace_details:
                     trace_phase_marker = "workspace_attachment_step_1"
                 elif "Confirming exact workspace vectors (step 2 of 2)" in trace_details:
                     trace_phase_marker = "workspace_vector_confirmation_step_2"
+                diagnostic_progress = (
+                    trace_entry["progress_phase"] == "post_completion_storage_diagnostic"
+                )
                 trace_signature = (
                     trace_entry["state"],
                     trace_phase_marker,
                     trace_entry["eta_reprice_reason"],
                     visible_percent,
+                    # A post-completion diagnostic can stay at the same UI
+                    # percent while its own x/y proof advances. Retain every
+                    # such update so the forensic trace cannot falsely show
+                    # a 0/15 diagnostic beside a UI that reached 14/15.
+                    trace_entry["completed_units"] if diagnostic_progress else None,
+                    trace_entry["total_units"] if diagnostic_progress else None,
                 )
                 terminal_trace = trace_entry["state"] in {"successful", "warning", "failed", "cancelled"}
                 material_checkpoint = trace_signature != prior_trace.get("signature") or terminal_trace
@@ -13151,6 +13313,24 @@ def paced_progress_percent(record, now=None):
     # Round up to whole percentages, but never show 100% before terminal
     # evidence has been received.
     return min(99, math.ceil(paced_progress_fraction(record, now) * 100.0 - 1e-9))
+
+
+def automatic_eta_finishing_detail(progress_phase="", phase=""):
+    """Return a short, factual activity label for an exhausted presentation ETA.
+
+    The estimate reaching zero is not terminal evidence. Keep the suffix tied
+    to the current structured phase, rather than repeating a long or mutable
+    queue description in the compact timing row.
+    """
+    normalized = str(progress_phase or "").strip().casefold()
+    return {
+        "desktop_queue": "Desktop queue active",
+        "queue_receipt": "checking queue receipt",
+        "identity_set": "confirming vectors",
+        "retrieval_sample": "checking retrieval",
+        "validation": "checking evidence",
+        "reporting": "saving run record",
+    }.get(normalized, "finalizing")
 
 
 def raw_elapsed_time_percent(record, now=None):
@@ -13240,14 +13420,36 @@ def automatic_live_status_html(status=None):
         # Keep the later AnythingLLM record queue separate from this count.
         is_submission_phase = "submitting" in str(record.get("phase") or "").casefold()
         terminal_state = state.casefold() in {"successful", "warning", "failed", "cancelled"}
-        if is_submission_phase:
+        is_desktop_queue = str(record.get("evidence_kind") or "") in {
+            "desktop_queue", "exact_vector_observation", "queue_receipt",
+        }
+        if is_desktop_queue:
+            try:
+                evidence_completed = max(0, int(record.get("completed_units") or 0))
+                evidence_total = max(0, int(record.get("total_units") or 0))
+            except (TypeError, ValueError):
+                evidence_completed = evidence_total = 0
+            exact_vectors_complete = (
+                str(record.get("evidence_kind") or "") == "exact_vector_observation"
+                and evidence_completed >= evidence_total
+                and evidence_total > 0
+            )
+            if exact_vectors_complete:
+                batch_label = (
+                    f"PDFs with vectors confirmed: {batch_completed}/{batch_total}"
+                )
+            else:
+                batch_label = (
+                    f"PDFs submitted: {batch_completed}/{batch_total} · vectors pending"
+                )
+        elif is_submission_phase:
             batch_label = f"PDF preparation: {batch_completed}/{batch_total} ready for submission"
         elif terminal_state:
-            # This counter covers local preparation decisions.  A terminal
-            # partial upload can therefore legitimately show 2/2 here while
-            # only a subset of its vectors is searchable; never label that
-            # as completed PDFs at the terminal state.
-            batch_label = f"PDF preparation finished: {batch_completed}/{batch_total}"
+            # Terminal selected-file accounting is not the same fact as vector
+            # confirmation. The terminal receipt names submitted, duplicate,
+            # and held PDFs separately; this neutral line must not imply that
+            # every selected PDF was locally prepared or submitted.
+            batch_label = f"PDF source decisions recorded: {batch_completed}/{batch_total}"
         else:
             page_match = re.search(
                 r":\s*(\d+)\s*/\s*(\d+)\s+pages?\s+processed\b",
@@ -13280,9 +13482,43 @@ def automatic_live_status_html(status=None):
     if state == "running":
         started = float(record.get("started_epoch") or now)
         elapsed = max(0, int(now - started))
+        def _status_count(value):
+            try:
+                return max(0, int(value or 0))
+            except (TypeError, ValueError):
+                return 0
+
+        presentation_expected = _status_count(
+            record.get("presentation_expected_seconds") or record.get("expected_seconds")
+        )
+        remaining = max(0, presentation_expected - elapsed)
+        eta_basis = str(record.get("eta_basis") or "initial_estimate")
+        cache_reuse_documents = _status_count(record.get("cache_reuse_documents"))
+        cache_total_documents = _status_count(record.get("cache_total_documents"))
+        if presentation_expected:
+            estimate_detail = (
+                f"Est: finishing · {automatic_eta_finishing_detail(record.get('progress_phase'), raw_phase)}"
+                if remaining <= 0
+                else f"Est: {format_estimate_clock(remaining)}"
+            )
+            if eta_basis == "cache_plan_confirmed" and cache_reuse_documents and cache_total_documents:
+                estimate_detail += (
+                    f" · {cache_reuse_documents} of {cache_total_documents} documents already cached"
+                )
+            elif eta_basis == "initial_estimate" and elapsed < INITIAL_ETA_LABEL_GRACE_SECONDS:
+                estimate_detail += " · initial estimate"
+        else:
+            estimate_detail = "Est: calculating…"
+        timing_class = (
+            "automatic-run-progress-timing cache-reuse-confirmed"
+            if _status_count(record.get("cache_reuse_records")) > 0
+            else "automatic-run-progress-timing"
+        )
         timing_text = (
-            '<span class="automatic-run-progress-timing">'
+            f'<span class="{timing_class}">'
             f"Elapsed {format_estimate_clock(elapsed)}"
+            "<br>"
+            f'<span class="automatic-run-progress-timing-estimate">{html.escape(estimate_detail)}</span>'
             "</span>"
         )
     elif state in {"successful", "warning", "failed", "cancelled"}:
@@ -13311,6 +13547,11 @@ def automatic_live_status_html(status=None):
         if details
         else '<span class="automatic-run-progress-details" aria-hidden="true"></span>'
     )
+    batch_timing_suffix = (
+        '<span class="automatic-run-batch-timing">'
+        f"{batch_suffix}<br>{timing_text}"
+        "</span>"
+    )
     return (
         f'<div class="automatic-run-activity {html.escape(state)}" '
         f'data-run-state="{html.escape(state)}" '
@@ -13322,7 +13563,7 @@ def automatic_live_status_html(status=None):
         f'<div class="automatic-run-progress-label">'
         f'<strong class="automatic-run-progress-overall">Overall progress: {percent_text}</strong>'
         f'<span class="automatic-run-progress-phase">{phase}</span>'
-        f'{details_suffix}{batch_suffix}{timing_text}</div></div>'
+        f'{details_suffix}{batch_timing_suffix}</div></div>'
     )
 
 
@@ -14140,6 +14381,7 @@ def append_eta_recalculation_event(
     displayed_fraction=None,
     raw_forecast_seconds=None,
     suppression_reason="",
+    decision_context=None,
 ):
     """Append one low-frequency, human-auditable ETA decision record."""
     root = Path(str(run_root or ""))
@@ -14185,6 +14427,10 @@ def append_eta_recalculation_event(
             else None
         ),
     }
+    # Keep the small, factual inputs that explain an ETA decision.  This is
+    # append-only diagnostic evidence, not a second ETA model.
+    if isinstance(decision_context, dict):
+        record["decision_context"] = dict(decision_context)
     try:
         with AUTOMATIC_RUN_ETA_CHECKPOINT_LOCK:
             path = root / "eta-recalculation-events.jsonl"
@@ -15668,7 +15914,10 @@ def automatic_run_timing_html(
                 )
                 label = f"Est: ~{format_estimate_clock(rough_tail_seconds)}"
             else:
-                label = "Est: finishing…"
+                label = (
+                    "Est: finishing · "
+                    f"{automatic_eta_finishing_detail(progress_phase, source)}"
+                )
         else:
             label = f"Est: {format_estimate_clock(remaining)}"
         if presentation_expected > 0:
@@ -17597,10 +17846,20 @@ def observe_batch_queue_forecast(
             int(report.get("desktop_queue_current") or report.get("desktop_current_record") or 0) - 1,
         )
         queue_total = max(0, int(report.get("queue_records") or 0))
+        fresh_rate = max(
+            0.0,
+            float(report.get("desktop_queue_active_fresh_records_per_minute") or 0.0),
+        )
+        fresh_completed = max(0, int(report.get("desktop_queue_fresh_completed") or 0))
+        fresh_event_samples = max(
+            0,
+            int(report.get("desktop_queue_active_fresh_segment_samples") or 0),
+        )
     except (TypeError, ValueError):
         return None
-    if queue_rate <= 0.0 or queue_completed <= 0 or queue_total <= 0:
+    if queue_completed <= 0 or queue_total <= 0:
         return None
+    batch_cache_plan_observed = bool(state.get("batch_cache_plan_observed"))
     # A bounded queue group may contain several PDFs. Its observed rate is one
     # shared Desktop request, not independent evidence for every member PDF.
     # Prefer the explicit group identity whenever it is present so a single
@@ -17613,15 +17872,43 @@ def observe_batch_queue_forecast(
         or "active-source"
     )
     window_observations = state.setdefault("queue_rate_windows", {})
-    window_observations[source_key] = {
-        "completed": min(queue_total, queue_completed),
-        "active_seconds": min(queue_total, queue_completed) * 60.0 / queue_rate,
-        "queue_total": queue_total,
-        "event_samples": max(
-            0,
-            int(report.get("desktop_queue_events_observed") or 0),
-        ),
-    }
+    if batch_cache_plan_observed:
+        # Never convert aggregate Desktop throughput from a mixed group into
+        # a provider rate.  The worker exports the current contiguous fresh
+        # segment separately, backed by its pre-queue cache map.  When the
+        # active group is entirely cached there is simply no provider-rate
+        # evidence yet, which is safer than reusing cache speed as embedding
+        # speed.
+        if fresh_rate <= 0.0 or fresh_completed <= 0:
+            return None
+        queue_plans = state.get("queue_group_cache_plans") or {}
+        queue_plan = queue_plans.get(source_key) or {}
+        fresh_in_group = max(0, int(queue_plan.get("fresh_records") or 0))
+        if fresh_in_group <= 0:
+            return None
+        fresh_completed = min(fresh_in_group, fresh_completed)
+        window_observations[source_key] = {
+            "completed": fresh_completed,
+            "active_seconds": fresh_completed * 60.0 / fresh_rate,
+            "queue_total": fresh_in_group,
+            "event_samples": fresh_event_samples,
+            "fresh_segment_coverage": fresh_completed / fresh_in_group,
+            "cache_segmented": True,
+        }
+    else:
+        if queue_rate <= 0.0:
+            return None
+        window_observations[source_key] = {
+            "completed": min(queue_total, queue_completed),
+            "active_seconds": min(queue_total, queue_completed) * 60.0 / queue_rate,
+            "queue_total": queue_total,
+            "event_samples": max(
+                0,
+                int(report.get("desktop_queue_events_observed") or 0),
+            ),
+            "fresh_segment_coverage": 0.0,
+            "cache_segmented": False,
+        }
     completed_records = sum(
         max(0, int(value.get("completed") or 0))
         for value in window_observations.values()
@@ -17641,7 +17928,6 @@ def observe_batch_queue_forecast(
         int(state.get("prepared_records") or 0),
         max(0, int(initial_estimated_records or 0)),
     )
-    batch_cache_plan_observed = bool(state.get("batch_cache_plan_observed"))
     if batch_cache_plan_observed:
         known_fresh_records = min(
             prepared_records,
@@ -17696,12 +17982,22 @@ def observe_batch_queue_forecast(
         "known_fresh_records": known_fresh_records,
         "cache_unknown_records": cache_unknown_records,
         "observed_windows": len(window_observations),
+        "source_total": source_total,
         "observed_event_samples": observed_event_samples,
         "observed_seconds_per_record": round(observed_seconds_per_record, 4),
         "prior_seconds_per_record": round(prior_seconds_per_record, 4),
         "blended_seconds_per_record": round(blended_seconds_per_record, 4),
         "evidence_weight": round(evidence_weight, 4),
         "remaining_source_windows": remaining_source_windows,
+        "cache_segmented_observation": batch_cache_plan_observed,
+        "fresh_segment_coverage": max(
+            [
+                max(0.0, float(value.get("fresh_segment_coverage") or 0.0))
+                for value in window_observations.values()
+                if bool(value.get("cache_segmented"))
+            ]
+            or [0.0]
+        ),
     }
 
 
@@ -17709,9 +18005,11 @@ def batch_queue_forecast_is_mature(forecast):
     """Use accumulated batch evidence, never the active PDF's local counter."""
     evidence = forecast if isinstance(forecast, dict) else {}
     prepared = max(0, int(evidence.get("prepared_records") or 0))
+    known_fresh = max(0, int(evidence.get("known_fresh_records") or 0))
     required = min(
         QUEUE_ETA_MIN_COMPLETED_RECORDS,
-        prepared or QUEUE_ETA_MIN_COMPLETED_RECORDS,
+        (known_fresh if evidence.get("cache_segmented_observation") else prepared)
+        or QUEUE_ETA_MIN_COMPLETED_RECORDS,
     )
     return bool(
         evidence
@@ -17719,6 +18017,141 @@ def batch_queue_forecast_is_mature(forecast):
         and int(evidence.get("observed_event_samples") or 0)
         >= min(QUEUE_ETA_MIN_EVENT_SAMPLES, required)
     )
+
+
+def batch_queue_forecast_has_broad_downward_coverage(forecast):
+    """Return whether a downward queue ETA reprice covers enough batch work.
+
+    The queue observer can be mature in a technical sense after the first
+    source group. That is enough to prove activity, not enough to project a
+    fast first group over later PDFs. A serial one-source run has no such
+    unseen-source risk and may use its mature evidence immediately.
+    """
+    evidence = forecast if isinstance(forecast, dict) else {}
+    source_total = max(1, int(evidence.get("source_total") or 1))
+    observed_windows = max(0, int(evidence.get("observed_windows") or 0))
+    prepared = max(0, int(evidence.get("prepared_records") or 0))
+    known_fresh = max(0, int(evidence.get("known_fresh_records") or 0))
+    denominator = known_fresh or prepared
+    completed = max(0, int(evidence.get("completed_records") or 0))
+    if bool(evidence.get("cache_segmented_observation")):
+        # This coverage is measured against the exact fresh run in the active
+        # queue group, not against cache-backed records or wall-clock time.
+        return bool(
+            max(0.0, float(evidence.get("fresh_segment_coverage") or 0.0))
+            >= QUEUE_ETA_MIN_FRESH_SEGMENT_COVERAGE_FOR_REPRICE
+        )
+    if source_total == 1:
+        return True
+    source_coverage = observed_windows / source_total
+    record_coverage = completed / denominator if denominator else 0.0
+    return bool(
+        source_coverage >= QUEUE_ETA_MIN_SOURCE_COVERAGE_FOR_DOWNWARD_REPRICE
+        or record_coverage >= QUEUE_ETA_MIN_RECORD_COVERAGE_FOR_DOWNWARD_REPRICE
+    )
+
+
+def batch_queue_forecast_is_representative_whole_run(forecast):
+    """Return whether one mature group covers the complete remaining run.
+
+    A three-PDF group can be one Desktop queue mutation. It is safe to use its
+    cadence early only when it is also the only planned queue group after the
+    exact cache plan has been observed. This deliberately does *not* treat a
+    four-PDF first group of a 96-PDF run as representative evidence.
+    """
+    evidence = forecast if isinstance(forecast, dict) else {}
+    return bool(
+        evidence
+        and bool(evidence.get("batch_cache_plan_observed"))
+        and max(1, int(evidence.get("source_total") or 1)) == 1
+        and max(0, int(evidence.get("observed_windows") or 0)) == 1
+        and max(0, int(evidence.get("remaining_source_windows") or 0)) == 0
+        and max(0, int(evidence.get("prepared_records") or 0)) > 0
+    )
+
+
+def representative_whole_run_queue_eta_reprice(
+    current_expected,
+    forecast_samples,
+    *,
+    current_elapsed=None,
+):
+    """Take one bounded reprice from a whole-run queue group.
+
+    This is intentionally narrower than the normal queue reprice: two spaced
+    samples are enough only because no later group remains unseen. Their
+    rebased spread must agree, and the existing bounded step still limits what
+    the interface promises in one repaint.
+    """
+    samples = normalized_queue_forecast_samples(forecast_samples)
+    if len(samples) < QUEUE_ETA_REPRESENTATIVE_GROUP_MIN_SAMPLES:
+        return {
+            "status": "suppressed",
+            "suppression_reason": "fewer_than_two_spaced_whole_run_samples",
+            "sample_count": len(samples),
+        }
+    recent = samples[-QUEUE_ETA_REPRESENTATIVE_GROUP_MIN_SAMPLES:]
+    raw_forecast = rebased_queue_forecast_seconds(
+        recent,
+        current_elapsed=current_elapsed,
+        sample_count=QUEUE_ETA_REPRESENTATIVE_GROUP_MIN_SAMPLES,
+    )
+    if current_elapsed is not None and all(timestamped for _, _, timestamped in recent):
+        elapsed = max(0.0, float(current_elapsed or 0.0))
+        rebased = [
+            max(0.0, forecast - sample_elapsed + elapsed)
+            for sample_elapsed, forecast, _ in recent
+        ]
+        spread = max(rebased) - min(rebased)
+        allowed_spread = max(
+            15.0,
+            float(raw_forecast) * QUEUE_ETA_REPRESENTATIVE_GROUP_MAX_SAMPLE_SPREAD_RATIO,
+        )
+        if spread > allowed_spread:
+            return {
+                "status": "suppressed",
+                "suppression_reason": "whole_run_samples_disagree",
+                "raw_forecast_seconds": raw_forecast,
+                "sample_count": len(recent),
+                "sample_spread_seconds": round(spread, 3),
+            }
+    current = int(current_expected or 0)
+    material_change = max(15, int(round(current * QUEUE_ETA_REPRICE_MIN_CHANGE_RATIO)))
+    candidate = bounded_queue_eta_reprice(current, raw_forecast)
+    if abs(candidate - current) < material_change:
+        # A mature whole-run observer can also establish that the classic
+        # estimate remains sound. In that case there is no model reprice, but
+        # continuing to show the opening-only 30% discount is misleading.
+        # Promote the existing model estimate to the visible clock once the
+        # observed forecast differs by a readable amount; do not invent a
+        # smaller ETA change merely to satisfy the usual material threshold.
+        presentation_change = max(10, int(round(current * QUEUE_ETA_REPRICE_MIN_CHANGE_RATIO)))
+        if abs(raw_forecast - current) >= presentation_change:
+            return {
+                "status": "applied",
+                "expected_seconds": current,
+                "raw_forecast_seconds": raw_forecast,
+                "material_change_seconds": 0,
+                "sample_count": len(recent),
+                "whole_run_representative": True,
+                "presentation_only": True,
+            }
+        return {
+            "status": "suppressed",
+            "suppression_reason": "bounded_change_below_material_threshold",
+            "raw_forecast_seconds": raw_forecast,
+            "candidate_expected_seconds": candidate,
+            "material_change_seconds": material_change,
+            "sample_count": len(recent),
+        }
+    return {
+        "status": "applied",
+        "expected_seconds": candidate,
+        "raw_forecast_seconds": raw_forecast,
+        "material_change_seconds": material_change,
+        "sample_count": len(recent),
+        "whole_run_representative": True,
+    }
 
 
 def observe_batch_prequeue_cache_plan(context, report):
@@ -17808,11 +18241,86 @@ def cap_queue_eta_reprice_to_opening(candidate_expected, *, opening_expected):
     return min(candidate, opening + allowance)
 
 
+def normalized_queue_forecast_samples(forecast_samples):
+    """Normalize legacy total-only samples and current timestamped samples.
+
+    Queue forecasts are absolute finish times.  They must be rebased before
+    samples gathered at different elapsed times can be compared.  The legacy
+    integer form remains supported for deterministic callers and older tests.
+    """
+    normalized = []
+    for sample in forecast_samples or []:
+        if isinstance(sample, (tuple, list)) and len(sample) == 3:
+            try:
+                elapsed = max(0.0, float(sample[0] or 0.0))
+                forecast = max(0.0, float(sample[1] or 0.0))
+                timestamped = bool(sample[2])
+            except (TypeError, ValueError):
+                continue
+            if forecast:
+                normalized.append((elapsed, forecast, timestamped))
+            continue
+        if isinstance(sample, dict):
+            try:
+                forecast = max(0.0, float(sample.get("forecast_seconds") or 0.0))
+                elapsed = max(0.0, float(sample.get("elapsed_seconds") or 0.0))
+            except (TypeError, ValueError):
+                continue
+            if forecast:
+                normalized.append((elapsed, forecast, True))
+            continue
+        try:
+            forecast = max(0.0, float(sample or 0.0))
+        except (TypeError, ValueError):
+            continue
+        if forecast:
+            normalized.append((0.0, forecast, False))
+    return normalized
+
+
+def rebased_queue_forecast_seconds(forecast_samples, *, current_elapsed=None, sample_count=5):
+    """Return a current-time total from recent owned queue observations."""
+    samples = normalized_queue_forecast_samples(forecast_samples)[-max(1, int(sample_count or 1)):]
+    if not samples:
+        return 0
+    if current_elapsed is None or not all(timestamped for _, _, timestamped in samples):
+        return int(round(statistics.median(forecast for _, forecast, _ in samples)))
+    elapsed = max(0.0, float(current_elapsed or 0.0))
+    remaining = [max(0.0, forecast - sample_elapsed) for sample_elapsed, forecast, _ in samples]
+    return int(round(elapsed + statistics.median(remaining)))
+
+
+def queue_forecast_has_strong_reversal(forecast_samples):
+    """Identify a material, continuing rise in recent queue totals.
+
+    This deliberately ignores a mild rise: it is a hold only when five
+    timestamped observations rise continuously by at least fifteen percent.
+    """
+    samples = normalized_queue_forecast_samples(forecast_samples)[-5:]
+    if len(samples) < 5 or not all(timestamped for _, _, timestamped in samples):
+        return False
+    totals = [forecast for _, forecast, _ in samples]
+    return bool(
+        all(right > left for left, right in zip(totals, totals[1:]))
+        and totals[-1] >= totals[0] * (1.0 + QUEUE_ETA_STRONG_REVERSAL_MIN_GROWTH)
+    )
+
+
+def phase_aware_queue_eta_floor(current_expected, elapsed_seconds, confirmed_fraction):
+    """Keep a bounded fraction of confirmed-not-yet-complete work in the ETA."""
+    current = max(0.0, float(current_expected or 0.0))
+    elapsed = max(0.0, float(elapsed_seconds or 0.0))
+    confirmed = min(1.0, max(0.0, float(confirmed_fraction or 0.0)))
+    return int(math.ceil(elapsed + QUEUE_ETA_PHASE_FLOOR_WEIGHT * current * (1.0 - confirmed)))
+
+
 def stable_queue_eta_reprice(
     current_expected,
     forecast_samples,
     *,
     observed_windows=1,
+    current_elapsed=None,
+    confirmed_fraction=None,
     return_decision=False,
 ):
     """Return a material bounded reprice from spaced, corroborated samples.
@@ -17822,7 +18330,7 @@ def stable_queue_eta_reprice(
     least four of the last five forecasts above the current estimate. This
     prevents one slow source from causing the whole batch ETA to jump upward.
     """
-    samples = [max(0, int(value or 0)) for value in (forecast_samples or [])]
+    samples = normalized_queue_forecast_samples(forecast_samples)
     def suppressed(reason, **details):
         if not return_decision:
             return None
@@ -17830,7 +18338,11 @@ def stable_queue_eta_reprice(
 
     if len(samples) < 5:
         return suppressed("fewer_than_five_spaced_samples", sample_count=len(samples))
-    raw_forecast = int(round(statistics.median(samples[-5:])))
+    raw_forecast = rebased_queue_forecast_seconds(
+        samples,
+        current_elapsed=current_elapsed,
+        sample_count=5,
+    )
     current = int(current_expected or 0)
     if raw_forecast > current:
         # A fixed 90-second minimum made an upward correction mathematically
@@ -17842,7 +18354,7 @@ def stable_queue_eta_reprice(
             max(15, int(round(current * QUEUE_ETA_REPRICE_MIN_CHANGE_RATIO))),
         )
         upward_threshold = current + material_change
-        upward_votes = sum(value >= upward_threshold for value in samples[-5:])
+        upward_votes = sum(forecast >= upward_threshold for _, forecast, _ in samples[-5:])
         if int(observed_windows or 0) < QUEUE_ETA_MIN_WINDOWS_FOR_INCREASE:
             return suppressed(
                 "upward_change_needs_two_source_windows",
@@ -17861,6 +18373,33 @@ def stable_queue_eta_reprice(
             int(round(current * QUEUE_ETA_REPRICE_MIN_CHANGE_RATIO)),
         )
     candidate = bounded_queue_eta_reprice(current, raw_forecast)
+    phase_floor_seconds = None
+    phase_floor_applied = False
+    if raw_forecast < current and current_elapsed is not None:
+        phase_floor_seconds = phase_aware_queue_eta_floor(
+            current,
+            current_elapsed,
+            confirmed_fraction,
+        )
+        bounded_candidate = candidate
+        candidate = max(
+            candidate,
+            phase_floor_seconds,
+        )
+        phase_floor_applied = candidate > bounded_candidate
+        # A steadily rising sequence means that the queue rate is slowing;
+        # it must not be extrapolated freely.  Earlier code froze the ETA
+        # outright here.  That became counterproductive once the caller had
+        # already established broad batch coverage: the phase floor plus the
+        # normal 25% bounded step are a conservative correction, whereas a
+        # full hold leaves a stale opening estimate visible for another long
+        # interval.  Retain the fact in durable diagnostics without treating
+        # it as a reason to discard that bounded evidence.
+        rate_reversal_limited = bool(
+            candidate < current and queue_forecast_has_strong_reversal(samples)
+        )
+    else:
+        rate_reversal_limited = False
     if abs(candidate - current) < material_change:
         return suppressed(
             "bounded_change_below_material_threshold",
@@ -17875,10 +18414,20 @@ def stable_queue_eta_reprice(
         "raw_forecast_seconds": raw_forecast,
         "material_change_seconds": material_change,
         "sample_count": len(samples),
+        "rate_reversal_limited": rate_reversal_limited,
+        "phase_floor_seconds": phase_floor_seconds,
+        "phase_floor_applied": phase_floor_applied,
     }
 
 
-def early_downward_queue_eta_reprice(current_expected, forecast_samples, *, observed_windows=1):
+def early_downward_queue_eta_reprice(
+    current_expected,
+    forecast_samples,
+    *,
+    observed_windows=1,
+    current_elapsed=None,
+    confirmed_fraction=None,
+):
     """Allow one earlier, still-corroborated downward Desktop ETA correction.
 
     The normal reprice path intentionally waits for five samples and three
@@ -17889,7 +18438,7 @@ def early_downward_queue_eta_reprice(current_expected, forecast_samples, *, obse
     the established bounded-step and material-change rules; this helper adds
     no new timing formula or queue evidence source.
     """
-    samples = [max(0, int(value or 0)) for value in (forecast_samples or [])]
+    samples = normalized_queue_forecast_samples(forecast_samples)
     if len(samples) < QUEUE_ETA_EARLY_DOWNWARD_REPRICE_MIN_SAMPLES:
         return {
             "status": "suppressed",
@@ -17903,7 +18452,11 @@ def early_downward_queue_eta_reprice(current_expected, forecast_samples, *, obse
             "sample_count": len(samples),
         }
     recent = samples[-QUEUE_ETA_EARLY_DOWNWARD_REPRICE_MIN_SAMPLES:]
-    raw_forecast = int(round(statistics.median(recent)))
+    raw_forecast = rebased_queue_forecast_seconds(
+        recent,
+        current_elapsed=current_elapsed,
+        sample_count=QUEUE_ETA_EARLY_DOWNWARD_REPRICE_MIN_SAMPLES,
+    )
     current = int(current_expected or 0)
     if raw_forecast >= current:
         return {
@@ -17917,6 +18470,20 @@ def early_downward_queue_eta_reprice(current_expected, forecast_samples, *, obse
         int(round(current * QUEUE_ETA_REPRICE_MIN_CHANGE_RATIO)),
     )
     candidate = bounded_queue_eta_reprice(current, raw_forecast)
+    phase_floor_seconds = None
+    phase_floor_applied = False
+    if current_elapsed is not None:
+        phase_floor_seconds = phase_aware_queue_eta_floor(
+            current,
+            current_elapsed,
+            confirmed_fraction,
+        )
+        bounded_candidate = candidate
+        candidate = max(
+            candidate,
+            phase_floor_seconds,
+        )
+        phase_floor_applied = candidate > bounded_candidate
     if abs(candidate - current) < material_change:
         return {
             "status": "suppressed",
@@ -17932,6 +18499,8 @@ def early_downward_queue_eta_reprice(current_expected, forecast_samples, *, obse
         "raw_forecast_seconds": raw_forecast,
         "material_change_seconds": material_change,
         "sample_count": len(recent),
+        "phase_floor_seconds": phase_floor_seconds,
+        "phase_floor_applied": phase_floor_applied,
     }
 
 
@@ -18003,6 +18572,25 @@ def confirmed_prequeue_cache_eta_seconds(
     return int(math.ceil(min(current, max(elapsed + 8.0, candidate))))
 
 
+def confirmed_batch_cache_remaining_factor(cached_records, fresh_records):
+    """Return the tested remaining-work factor for an exact cache plan."""
+    cached = max(0, int(cached_records or 0))
+    fresh = max(0, int(fresh_records or 0))
+    if not cached:
+        return 1.0
+    cache_share = cached / max(1, cached + fresh)
+    if fresh == 0:
+        return .40
+    if cache_share >= .90:
+        return .95
+    # Four retained mixed-cache terminal runs require at most .69 of the
+    # baseline remaining work.  .70 is the smallest tested two-decimal factor
+    # that remained conservative for each of them; do not fit the slowest run
+    # exactly, and do not infer anything further from the one-run all-cache
+    # and cache-dominant classes above.
+    return .70
+
+
 def confirmed_batch_execution_plan_eta_seconds(
     current_expected,
     elapsed_seconds,
@@ -18023,7 +18611,7 @@ def confirmed_batch_execution_plan_eta_seconds(
     tail, rather than carry forward provisional OCR surcharges from the
     preflight phase.
     """
-    return confirmed_prequeue_cache_eta_seconds(
+    baseline = confirmed_prequeue_cache_eta_seconds(
         current_expected,
         elapsed_seconds,
         fresh_provider_requests=fresh_provider_requests,
@@ -18034,6 +18622,18 @@ def confirmed_batch_execution_plan_eta_seconds(
         cached_source_windows=cached_documents,
         cache_attachment_prior=cache_attachment_prior,
     )
+    cached = max(0, int(cached_attachment_records or 0))
+    fresh = max(0, int(fresh_provider_requests or 0))
+    if not cached:
+        return baseline
+    # The execution plan makes cache reuse exact before this calculation. A
+    # uniform discount was accurate near the end of some mixed runs but
+    # mispriced all-cache and cache-dominant runs. Discount only future work,
+    # by the exact cache mix; elapsed preparation is never repriced.
+    remaining_factor = confirmed_batch_cache_remaining_factor(cached, fresh)
+    elapsed = max(0.0, float(elapsed_seconds or 0.0))
+    repriced = elapsed + max(0.0, float(baseline) - elapsed) * remaining_factor
+    return int(math.ceil(min(float(current_expected or baseline), max(elapsed + 8.0, repriced))))
 
 
 def timing_model_cached_attachment_tail_prior(history):
@@ -18126,14 +18726,70 @@ def observe_prequeue_cache_plan(context, report, *, initial_estimated_records=0)
         int(report.get("source_window_total") or source_index),
     )
     source_key = str(report.get("source_path") or source_index)
+    queue_group_key = str(
+        report.get("source_queue_group_index")
+        or report.get("source_path")
+        or source_index
+    )
+    raw_segments = list(report.get("prequeue_cache_segments") or [])
+    normalized_segments = []
+    expected_start = 1
+    for raw in raw_segments:
+        if not isinstance(raw, dict):
+            normalized_segments = []
+            break
+        try:
+            start = int(raw.get("start") or 0)
+            end = int(raw.get("end") or 0)
+        except (TypeError, ValueError):
+            normalized_segments = []
+            break
+        if start != expected_start or end < start or end > queue_records:
+            normalized_segments = []
+            break
+        normalized_segments.append({
+            "start": start,
+            "end": end,
+            "cached": bool(raw.get("cached")),
+        })
+        expected_start = end + 1
+    if queue_records and expected_start != queue_records + 1:
+        normalized_segments = []
+    segment_cached = sum(
+        segment["end"] - segment["start"] + 1
+        for segment in normalized_segments
+        if segment["cached"]
+    )
+    # Older worker payloads have no run map.  They remain usable only when
+    # the whole group is one class; a mixed old payload intentionally withholds
+    # live provider-rate repricing rather than guessing its fresh positions.
+    if not normalized_segments and queue_records and cached_records in {0, queue_records}:
+        normalized_segments = [{
+            "start": 1,
+            "end": queue_records,
+            "cached": bool(cached_records),
+        }]
+        segment_cached = cached_records
+    segments_exact = bool(normalized_segments) and segment_cached == cached_records
     observed_windows = state.setdefault("observed_source_windows", set())
     state.update({
         "exact_snapshot_observed": True,
-        "suppress_combined_queue_rate": cached_records > 0,
+        # Retained as a compatibility key for older diagnostic consumers. The
+        # live estimator no longer globally suppresses a whole batch merely
+        # because one group contains cache records.
+        "suppress_combined_queue_rate": False,
         "queue_records": queue_records,
         "cached_records": cached_records,
         "fresh_records": fresh_records,
     })
+    queue_plans = state.setdefault("queue_group_cache_plans", {})
+    queue_plans[queue_group_key] = {
+        "queue_records": queue_records,
+        "cached_records": cached_records,
+        "fresh_records": fresh_records,
+        "segments": normalized_segments,
+        "segments_exact": segments_exact,
+    }
     if source_key not in observed_windows:
         observed_windows.add(source_key)
         state["observed_records"] = int(state.get("observed_records") or 0) + queue_records
@@ -18161,6 +18817,9 @@ def observe_prequeue_cache_plan(context, report, *, initial_estimated_records=0)
         "unobserved_records": unobserved_records,
         "remaining_provider_requests": fresh_records + unobserved_records,
         "remaining_source_windows": max(1, source_total - source_index + 1),
+        "queue_group_key": queue_group_key,
+        "cache_segments_exact": segments_exact,
+        "cache_segment_count": len(normalized_segments),
     }
 
 
@@ -19633,7 +20292,7 @@ def automatic_completion_success_message(summaries, *, include_runtime_note=True
         else:
             lead += ": "
         lead += (
-            f"{newly_linked} records cache-linked and confirmed; no new embedding needed."
+            f"{newly_linked} records cache-linked; vectors confirmed."
         )
     elif newly_linked and cached_linked:
         if existing_records:
@@ -19641,14 +20300,14 @@ def automatic_completion_success_message(summaries, *, include_runtime_note=True
         else:
             lead += ": "
         lead += (
-            f"{newly_linked} added and confirmed ({cached_linked} cache-linked; {fresh_linked} embedded)."
+            f"{newly_linked} records linked; vectors confirmed ({cached_linked} cache-linked; {fresh_linked} freshly embedded)."
         )
     elif newly_linked:
         if existing_records:
             lead += f": {existing_records} records re-verified; "
         else:
             lead += ": "
-        lead += f"{newly_linked} records embedded and confirmed."
+        lead += f"{newly_linked} records freshly embedded; vectors confirmed."
     elif planned_records:
         lead += (
             f": all {planned_records} records already indexed and re-verified; no upload needed."
@@ -19676,7 +20335,7 @@ def automatic_completion_success_message(summaries, *, include_runtime_note=True
     extraction_summary = automatic_extraction_method_summary(summaries)
     body = f" {extraction_summary}" if extraction_summary else ""
     if include_runtime_note and receipt["runtime_retrieval_deferred"]:
-        body += " Vectors confirmed; live retrieval test skipped."
+        body += " Vectors confirmed; live retrieval not run."
     if receipt["visual_review_pages"]:
         body += (
             f" {receipt['visual_review_pages']} image-heavy page(s) in "
@@ -20018,12 +20677,16 @@ def automatic_completion(summaries, prepare_and_upload):
             if summary_id not in withheld_ids:
                 withheld_ids.add(summary_id)
                 withheld.append(summary)
-        ready_count = sum(
+        submitted_count = sum(
             str(summary.get("api_upload_status") or "")
-            in {"complete", "complete_with_key_cleanup_warning", "skipped_exact_duplicate"}
+            in {"complete", "complete_with_key_cleanup_warning"}
             for summary in summaries
         )
-        if preparation_withheld and not ocr_withheld and not ready_count:
+        selected_duplicate_count = sum(
+            str(summary.get("api_upload_status") or "") == "skipped_exact_duplicate"
+            for summary in summaries
+        )
+        if preparation_withheld and not ocr_withheld and not submitted_count:
             first = preparation_withheld[0]
             title = str(first.get("app_error_title") or "Local PDF preparation failed")
             detail = str(first.get("api_upload_error") or title)
@@ -20046,10 +20709,16 @@ def automatic_completion(summaries, prepare_and_upload):
         ).removeprefix("AnythingLLM upload was withheld:").removeprefix(
             "AnythingLLM upload was withheld "
         ).strip()
-        ready_detail = (
-            f" {ready_count} other PDF(s) were submitted and confirmed in AnythingLLM."
-            if ready_count else " No eligible PDF records were submitted."
-        )
+        source_receipt = []
+        if submitted_count:
+            source_receipt.append(
+                f" {submitted_count} other PDF(s) were submitted and confirmed in AnythingLLM."
+            )
+        if selected_duplicate_count:
+            source_receipt.append(
+                f" {selected_duplicate_count} byte-identical selected PDF(s) were skipped."
+            )
+        ready_detail = "".join(source_receipt) or " No eligible PDF records were submitted."
         local_detail = (
             f" {len(preparation_withheld)} PDF(s) were also not processed because local preparation failed."
             if preparation_withheld else ""
@@ -20061,7 +20730,7 @@ def automatic_completion(summaries, prepare_and_upload):
                 "AUTO-LAYOUT-REVIEW-001"
                 if photographed_spread_hold and not preparation_withheld
                 else "AUTO-OCR-REVIEW-001"
-                if ocr_withheld and not preparation_withheld and not ready_count
+                if ocr_withheld and not preparation_withheld and not submitted_count
                 else "AUTO-OCR-REVIEW-PARTIAL-001"
                 if ocr_withheld and not preparation_withheld
                 else "AUTO-PDF-REVIEW-001"
@@ -23317,10 +23986,10 @@ def explicit_upload_count_schema(report):
 def upload_report_has_complete_vector_proof(report):
     """Return whether a grouped upload has proved every submitted vector.
 
-    The grouped source-window observer legitimately owns the 16--78% ingestion
+    The grouped source-window observer legitimately owns the 16--94% ingestion
     lane while records are in flight. Once its final exact-vector receipt is
-    durable, however, leaving the live status at 78% falsely suggests that
-    roughly a fifth of the upload itself is still outstanding. This helper is
+    durable, however, leaving the live status below the reporting tail falsely
+    suggests that upload work is still outstanding. This helper is
     deliberately stricter than a successful HTTP response: it requires the
     complete upload report and full exact-vector coverage.
     """
@@ -24077,12 +24746,12 @@ def upload_prepared_automatic_batch(
             if callable(status_callback):
                 if current_submission_vectors:
                     progress_detail = (
-                        f"Checking workspace attachment (step 1 of 2): {current_submission_vectors}/{len(expected_batch)} "
+                        f"Checking vector evidence (step 1 of 2): {current_submission_vectors}/{len(expected_batch)} "
                         "selected record(s) have searchable-vector evidence; exact confirmation follows"
                     )
                 else:
                     progress_detail = (
-                        f"Checking workspace attachment (step 1 of 2): {unique_identities}/{len(expected_batch)} "
+                        f"Checking vector evidence (step 1 of 2): {unique_identities}/{len(expected_batch)} "
                         "unique source identities observed; exact confirmation follows"
                     )
                 status_callback(
@@ -25214,7 +25883,7 @@ def run_automatic(
             automatic_phase_rank = phase_rank
         if prepare_and_upload and phase_name in AUTOMATIC_UPLOAD_PHASE_RANGES:
             # UploadPhaseReporter already emits the canonical whole-run
-            # allocation (for example the Desktop queue's 16--78% range).
+            # allocation (for example the Desktop queue's 16--94% range).
             # It must not be scaled a second time into this PDF's local
             # preparation share.
             confirmed_fraction = source_fraction
@@ -25325,6 +25994,7 @@ def run_automatic(
         "observed_cached_records": 0,
         "observed_fresh_records": 0,
         "observed_source_windows": set(),
+        "queue_group_cache_plans": {},
     }
     initial_expected_seconds = expected_seconds
     timing_features = dict(run_timing_estimate.get("features") or {})
@@ -25440,25 +26110,15 @@ def run_automatic(
             queue_event_samples = max(0, int(report.get("desktop_queue_events_observed") or 0))
         except (TypeError, ValueError):
             queue_event_samples = 0
-        combined_queue_rate_is_safe = not bool(
-            cache_plan_context.get("suppress_combined_queue_rate")
-        )
-        if (
-            not combined_queue_rate_is_safe
-            and not cache_plan_context.get("rate_guard_recorded")
-        ):
-            cache_plan_context["rate_guard_recorded"] = True
-            run_timing_estimate["queue_rate_repricing_guard"] = {
-                "reason": "combined_cache_and_provider_queue_rate",
-                "queue_records": int(cache_plan_context.get("queue_records") or 0),
-                "cached_records": int(cache_plan_context.get("cached_records") or 0),
-                "fresh_records": int(cache_plan_context.get("fresh_records") or 0),
-                "action": "preserved_confirmed_prequeue_cache_plan",
-            }
+        try:
+            fresh_queue_rate = float(
+                report.get("desktop_queue_active_fresh_records_per_minute") or 0.0
+            )
+        except (TypeError, ValueError):
+            fresh_queue_rate = 0.0
         if (
             live.get("run_root") == str(run_root)
-            and queue_rate > 0.0
-            and combined_queue_rate_is_safe
+            and (queue_rate > 0.0 or fresh_queue_rate > 0.0)
         ):
             try:
                 remaining_seconds = max(0.0, float(queue_remaining))
@@ -25484,26 +26144,54 @@ def run_automatic(
                 and elapsed - last_queue_eta_sample_elapsed >= QUEUE_ETA_SAMPLE_INTERVAL_SECONDS
             ):
                 queue_eta_forecast_samples.append(
-                    int(batch_queue_forecast["forecast_seconds"])
+                    {
+                        "elapsed_seconds": round(elapsed, 3),
+                        "forecast_seconds": int(batch_queue_forecast["forecast_seconds"]),
+                    }
                 )
                 del queue_eta_forecast_samples[:-9]
                 last_queue_eta_sample_elapsed = elapsed
-            # Reprice from the median of five spaced owned observations.
-            # The classic formula and bounded change remain intact; the UI
-            # simply stops treating one transient queue rate as a new promise.
-            # A separately guarded, downward-only path can surface genuinely
-            # fast cross-source evidence one minute sooner.  It never permits
-            # an upward correction before the established five-sample window.
+            # Reprice from the median of five spaced owned observations for
+            # ordinary batches. A separately guarded whole-run path may use
+            # two agreeing samples only when the active bounded group covers
+            # every remaining source. This keeps a short complete run from
+            # retaining an obsolete opening display clock, without allowing a
+            # first group of a large batch to rewrite the ETA.
             normal_reprice_due = (
                 elapsed - last_queue_eta_recalibration_elapsed
                 >= QUEUE_ETA_REPRICE_INTERVAL_SECONDS
                 and len(queue_eta_forecast_samples) >= 5
             )
+            representative_whole_run = batch_queue_forecast_is_representative_whole_run(
+                batch_queue_forecast
+            )
+            representative_reprice_due = (
+                representative_whole_run
+                and elapsed - last_queue_eta_recalibration_elapsed
+                >= QUEUE_ETA_REPRESENTATIVE_GROUP_REPRICE_INTERVAL_SECONDS
+                and len(queue_eta_forecast_samples)
+                >= QUEUE_ETA_REPRESENTATIVE_GROUP_MIN_SAMPLES
+            )
             early_samples = queue_eta_forecast_samples[
                 -QUEUE_ETA_EARLY_DOWNWARD_REPRICE_MIN_SAMPLES:
             ]
+            queue_sample_forecast = rebased_queue_forecast_seconds(
+                queue_eta_forecast_samples,
+                current_elapsed=elapsed,
+                sample_count=5,
+            )
+            queue_forecast_is_downward = bool(queue_sample_forecast) and (
+                queue_sample_forecast < int(expected_seconds or 0)
+            )
+            queue_downward_coverage_ready = batch_queue_forecast_has_broad_downward_coverage(
+                batch_queue_forecast
+            )
             early_forecast_is_downward = bool(early_samples) and (
-                int(round(statistics.median(early_samples))) < int(expected_seconds or 0)
+                rebased_queue_forecast_seconds(
+                    early_samples,
+                    current_elapsed=elapsed,
+                    sample_count=QUEUE_ETA_EARLY_DOWNWARD_REPRICE_MIN_SAMPLES,
+                ) < int(expected_seconds or 0)
             )
             early_downward_reprice_due = (
                 elapsed - last_early_downward_reprice_elapsed
@@ -25514,12 +26202,31 @@ def run_automatic(
                 >= QUEUE_ETA_MIN_WINDOWS_FOR_INCREASE
                 and early_forecast_is_downward
             )
-            if batch_queue_rate_is_mature and (normal_reprice_due or early_downward_reprice_due):
-                if normal_reprice_due:
+            if batch_queue_rate_is_mature and (
+                representative_reprice_due or normal_reprice_due or early_downward_reprice_due
+            ):
+                if representative_reprice_due:
+                    stable_reprice = representative_whole_run_queue_eta_reprice(
+                        expected_seconds,
+                        queue_eta_forecast_samples,
+                        current_elapsed=elapsed,
+                    )
+                elif queue_forecast_is_downward and not queue_downward_coverage_ready:
+                    stable_reprice = {
+                        "status": "deferred",
+                        "deferral_reason": "awaiting_broader_queue_coverage",
+                        "raw_forecast_seconds": queue_sample_forecast,
+                        "candidate_expected_seconds": int(expected_seconds or 0),
+                        "expected_seconds": int(expected_seconds or 0),
+                        "sample_count": len(queue_eta_forecast_samples),
+                    }
+                elif normal_reprice_due:
                     stable_reprice = stable_queue_eta_reprice(
                         expected_seconds,
                         queue_eta_forecast_samples,
                         observed_windows=batch_queue_forecast.get("observed_windows", 0),
+                        current_elapsed=elapsed,
+                        confirmed_fraction=live.get("confirmed_fraction"),
                         return_decision=True,
                     )
                 else:
@@ -25527,6 +26234,8 @@ def run_automatic(
                         expected_seconds,
                         queue_eta_forecast_samples,
                         observed_windows=batch_queue_forecast.get("observed_windows", 0),
+                        current_elapsed=elapsed,
+                        confirmed_fraction=live.get("confirmed_fraction"),
                     )
                 if stable_reprice.get("status") == "applied":
                     uncapped_expected = int(stable_reprice["expected_seconds"])
@@ -25539,7 +26248,10 @@ def run_automatic(
                         stable_reprice["expected_seconds"] = capped_expected
                         stable_reprice["run_upward_cap_applied"] = True
                         stable_reprice["uncapped_expected_seconds"] = uncapped_expected
-                    if capped_expected == int(expected_seconds):
+                    if (
+                        capped_expected == int(expected_seconds)
+                        and not stable_reprice.get("presentation_only")
+                    ):
                         stable_reprice = {
                             "status": "suppressed",
                             "suppression_reason": "opening_eta_upward_envelope_reached",
@@ -25562,6 +26274,9 @@ def run_automatic(
                         "raw_forecast_seconds": stable_reprice["raw_forecast_seconds"],
                         "forecast_sample_count": stable_reprice["sample_count"],
                         "material_change_seconds": stable_reprice["material_change_seconds"],
+                        "rate_reversal_limited": bool(
+                            stable_reprice.get("rate_reversal_limited")
+                        ),
                         "run_upward_cap_applied": bool(
                             stable_reprice.get("run_upward_cap_applied")
                         ),
@@ -25581,14 +26296,47 @@ def run_automatic(
                         cancel_available=live.get("cancel_available", True),
                         cancel_requested=live.get("cancel_requested", False),
                         eta_reprice_reason="owned_queue_rate",
+                        eta_reprice_context={
+                            "raw_forecast_seconds": stable_reprice.get(
+                                "raw_forecast_seconds"
+                            ),
+                            "forecast_sample_count": stable_reprice.get(
+                                "sample_count"
+                            ),
+                            "rate_reversal_limited": bool(
+                                stable_reprice.get("rate_reversal_limited")
+                            ),
+                            "phase_floor_seconds": stable_reprice.get(
+                                "phase_floor_seconds"
+                            ),
+                            "phase_floor_applied": bool(
+                                stable_reprice.get("phase_floor_applied")
+                            ),
+                            "observed_source_windows": int(
+                                batch_queue_forecast.get("observed_windows") or 0
+                            ),
+                            "source_total": int(
+                                batch_queue_forecast.get("source_total") or 0
+                            ),
+                            "fresh_records": int(
+                                batch_queue_forecast.get("known_fresh_records") or 0
+                            ),
+                        },
                         queue_forecast_expected_seconds=latest_batch_queue_forecast_seconds,
                     )
                 else:
                     append_eta_recalculation_event(
                         run_root,
-                        status="suppressed",
+                        status=(
+                            "deferred"
+                            if stable_reprice.get("status") == "deferred"
+                            else "suppressed"
+                        ),
                         reason="owned_queue_rate",
-                        suppression_reason=stable_reprice.get("suppression_reason", ""),
+                        suppression_reason=(
+                            stable_reprice.get("deferral_reason", "")
+                            or stable_reprice.get("suppression_reason", "")
+                        ),
                         elapsed_seconds=elapsed,
                         confirmed_fraction=live.get("confirmed_fraction"),
                         displayed_fraction=(
@@ -26717,6 +27465,7 @@ def run_automatic(
                 phase_end - phase_start
             ) * evidence_fraction
             eta_reprice_reason = ""
+            eta_reprice_context = None
             eta_basis_update = None
             cache_reuse_records = None
             if (
@@ -26768,12 +27517,19 @@ def run_automatic(
                                 "cached_source_windows": cached_documents,
                                 "provider_request_seconds_prior": round(timing_unit_prior, 3),
                                 "cached_attachment_tail_prior": dict(cache_attachment_prior),
+                                "remaining_work_factor": confirmed_batch_cache_remaining_factor(
+                                    cached_records,
+                                    fresh_records,
+                                ),
                                 "deferred_ocr_seconds": deferred_ocr_seconds,
                                 "ocr_observations_deferred_until_exact_plan": deferred_ocr_files,
                                 "previous_expected_seconds": previous_expected_seconds,
                                 "expected_seconds": expected_seconds,
                             }
                             eta_reprice_reason = "confirmed_batch_cache_plan"
+                            eta_reprice_context = dict(
+                                run_timing_estimate["confirmed_batch_cache_reprice"]
+                            )
                     elif deferred_ocr_seconds:
                         # With no cache hits, every unfinished record still
                         # needs normal provider work. Apply the observed OCR
@@ -26794,6 +27550,9 @@ def run_automatic(
                         )
                         eta_reprice_reason = "ocr_runtime_observed"
                         eta_basis_update = "live_observations"
+                        eta_reprice_context = dict(
+                            run_timing_estimate["ocr_runtime_reprices"][-1]
+                        )
                     else:
                         eta_basis_update = "execution_plan_confirmed"
                     # OCR that happened during preparation has now either
@@ -26876,6 +27635,7 @@ def run_automatic(
                             "confirmed_prequeue_cache_reprices", []
                         ).append(reprice_record)
                         eta_reprice_reason = "confirmed_prequeue_cache_plan"
+                        eta_reprice_context = dict(reprice_record)
             if str(report.get("timing_event") or "") == "workspace_duplicate_preflight_complete":
                 # The initial estimate must assume every prepared page record
                 # needs a Desktop queue operation. Once the read-only
@@ -26931,16 +27691,18 @@ def run_automatic(
                 cancel_requested=automatic_run_cancellation_requested(run_root),
                 activity_observed=True,
                 eta_reprice_reason=eta_reprice_reason,
+                eta_reprice_context=eta_reprice_context,
                 eta_basis=eta_basis_update,
                 progress_phase=upload_progress_phase,
                 completed_units=grouped_progress["completed_records"],
                 total_units=grouped_progress["total_records"],
                 evidence_kind="desktop_queue" if upload_progress_phase == "desktop_queue" else "exact_vector_observation" if upload_progress_phase == "identity_set" else "queue_receipt",
                 batch_completed_files=grouped_progress["completed_sources"],
-                batch_total_files=total_files,
-                batch_current_file_index=(
-                    grouped_progress["source_index"] or total_files
-                ),
+                # Queue callbacks account only for upload-eligible PDFs.
+                # Physical selections that were intentionally held or skipped
+                # stay in the terminal receipt, not this confirmation counter.
+                batch_total_files=(grouped_progress["source_total"] or total_files),
+                batch_current_file_index=0,
                 authoritative_batch_completed_files=True,
                 queue_forecast_expected_seconds=latest_batch_queue_forecast_seconds,
                 cache_reuse_records=cache_reuse_records,
@@ -27477,6 +28239,12 @@ def run_automatic(
             batch_total_files=len(summaries),
             batch_current_file_index=len(summaries),
             queue_forecast_expected_seconds=latest_batch_queue_forecast_seconds,
+            # Reassert the coordinator's exact cache plan at terminal state.
+            # Source-local snapshots are useful live detail but must never
+            # replace these batch-wide values in the durable run summary.
+            cache_reuse_records=cache_plan_context.get("batch_cached_records"),
+            cache_reuse_documents=cache_plan_context.get("batch_cached_documents"),
+            cache_total_documents=cache_plan_context.get("batch_source_total"),
         )
     if not incomplete_indexing:
         progress(0.98, desc="Finalizing run output and completion checks")

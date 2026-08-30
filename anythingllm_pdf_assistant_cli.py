@@ -24,6 +24,9 @@ from portable_paths import application_paths, ensure_application_directories, pa
 
 SERVER_MARKER_NAME = "localhost-server.json"
 SERVER_ROOT_PID_ENV = "ANYTHINGLLM_PDF_ASSISTANT_SERVER_ROOT_PID"
+AUTOMATIC_RUN_PROGRESS_NAME = "run-progress.json"
+AUTOMATIC_RUN_CANCELLATION_MARKER = ".cancel-requested.json"
+AUTOMATIC_RUN_CANCELLATION_RECOVERY = "cancellation-recovery.json"
 START_SHORTCUT_NAME = "Start AnythingLLM PDF Assistant.lnk"
 STOP_SHORTCUT_NAME = "Stop AnythingLLM PDF Assistant.lnk"
 POWERSHELL_COMMAND_TIMEOUT_SECONDS = 15
@@ -279,6 +282,138 @@ def _server_marker_path() -> Path:
     return ensure_application_directories()["config"] / SERVER_MARKER_NAME
 
 
+def _read_json_object(path: Path) -> dict:
+    """Read one local JSON object, treating absent/corrupt state as unusable."""
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _write_json_atomically(path: Path, payload: dict) -> None:
+    """Publish a recovery snapshot without exposing a partial JSON document."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _run_server_root_pid(progress: dict) -> int:
+    try:
+        return int(progress.get("server_root_pid") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _owned_active_run_roots(server_root_pid: int) -> list[Path]:
+    """Return only non-terminal runs explicitly owned by this server root.
+
+    Older run records have no owner PID and are deliberately excluded: a Stop
+    shortcut must never reinterpret an unknown historical run as its own.
+    """
+    output_root = application_paths()["automatic_outputs"]
+    try:
+        candidates = [path for path in output_root.iterdir() if path.is_dir()]
+    except OSError:
+        return []
+    owned: list[Path] = []
+    for run_root in candidates:
+        progress = _read_json_object(run_root / AUTOMATIC_RUN_PROGRESS_NAME)
+        if str(progress.get("state") or "").casefold() not in {"running", "preparing"}:
+            continue
+        if _run_server_root_pid(progress) == int(server_root_pid):
+            owned.append(run_root)
+    return owned
+
+
+def _write_server_stop_recovery(run_root: Path, server_root_pid: int, *, terminal: bool) -> None:
+    """Persist one owned run's stop evidence before or after server teardown."""
+    progress_path = run_root / AUTOMATIC_RUN_PROGRESS_NAME
+    progress = _read_json_object(progress_path)
+    now = time.time()
+    reason = "owned_local_server_stop"
+    marker_payload = {
+        "requested_at": now,
+        "reason": reason,
+        "server_root_pid": int(server_root_pid),
+    }
+    _write_json_atomically(run_root / AUTOMATIC_RUN_CANCELLATION_MARKER, marker_payload)
+    recovery_payload = {
+        "schema_version": 1,
+        "status": "cancelled" if terminal else "server_stop_requested",
+        "reason": reason,
+        "server_root_pid": int(server_root_pid),
+        "requested_at_epoch": now,
+        "cancelled_at_epoch": now if terminal else 0.0,
+        "phase": str(progress.get("phase") or "Working"),
+        "confirmed_fraction": progress.get("confirmed_fraction"),
+        "local_result": "The local assistant server stopped the active worker.",
+        "anythingllm_result": (
+            "No later PDF was submitted. A previously accepted AnythingLLM queue group may still finish "
+            "externally; exact vector confirmation remains unresolved."
+        ),
+        "resume_guidance": (
+            "Inspect this run before retrying unresolved sources. Only exact vector evidence establishes a completed source."
+        ),
+    }
+    _write_json_atomically(run_root / AUTOMATIC_RUN_CANCELLATION_RECOVERY, recovery_payload)
+    if not terminal:
+        return
+    if not progress:
+        raise OSError(f"Owned run has no readable progress record: {run_root}")
+    progress.update(
+        {
+            "state": "cancelled",
+            "phase": "Run stopped because the local assistant server stopped",
+            "details": (
+                "The local assistant server stopped the active worker. No later PDF was submitted; "
+                "previously accepted AnythingLLM work may still need exact vector confirmation."
+            ),
+            "cancel_requested": True,
+            "cancel_available": False,
+            "confirmation_in_flight": False,
+            "activity_observed": False,
+            "finished_epoch": now,
+            "updated_epoch": now,
+            "server_stop_reason": reason,
+        }
+    )
+    _write_json_atomically(progress_path, progress)
+
+
+def _prepare_owned_active_runs_for_server_stop(server_root_pid: int) -> list[Path]:
+    """Request cancellation durably before force-stopping an owned server tree."""
+    run_roots = _owned_active_run_roots(server_root_pid)
+    for run_root in run_roots:
+        _write_server_stop_recovery(run_root, server_root_pid, terminal=False)
+    return run_roots
+
+
+def _finalize_owned_runs_after_server_stop(run_roots: list[Path], server_root_pid: int) -> None:
+    for run_root in run_roots:
+        _write_server_stop_recovery(run_root, server_root_pid, terminal=True)
+
+
 def _write_server_marker(port: int) -> Path:
     marker = _server_marker_path()
     root_pid = int(os.environ.get(SERVER_ROOT_PID_ENV) or os.getpid())
@@ -509,6 +644,15 @@ def _stop() -> int:
         print("Port ownership does not match the recorded local PDF assistant; refusing to stop it.", file=sys.stderr)
         return 1
     try:
+        stopped_runs = _prepare_owned_active_runs_for_server_stop(pid)
+    except OSError as exc:
+        print(
+            "Could not retain active-run cancellation recovery; refusing to stop the owned server: "
+            f"{exc}",
+            file=sys.stderr,
+        )
+        return 1
+    try:
         stopped = subprocess.run(
             ["taskkill", "/PID", str(pid), "/T", "/F"],
             capture_output=True,
@@ -522,11 +666,21 @@ def _stop() -> int:
     if stopped.returncode != 0:
         print((stopped.stderr or stopped.stdout or "Could not stop the local server.").strip(), file=sys.stderr)
         return 1
+    try:
+        _finalize_owned_runs_after_server_stop(stopped_runs, pid)
+    except OSError as exc:
+        print(
+            "The owned server stopped, but final cancellation recovery could not be retained: "
+            f"{exc}",
+            file=sys.stderr,
+        )
+        return 1
     deadline = time.monotonic() + 12
     while time.monotonic() < deadline:
         if _port_is_available(port):
             marker.unlink(missing_ok=True)
-            print("Stopped the owned local PDF assistant server.")
+            suffix = f" Preserved cancellation recovery for {len(stopped_runs)} active run(s)." if stopped_runs else ""
+            print(f"Stopped the owned local PDF assistant server.{suffix}")
             return 0
         time.sleep(0.15)
     print("The owned server process stopped, but port %s is still in use; keeping the marker for diagnosis." % port, file=sys.stderr)

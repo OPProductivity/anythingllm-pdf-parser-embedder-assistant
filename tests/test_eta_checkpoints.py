@@ -63,6 +63,7 @@ def test_status_reprice_updates_checkpoint_and_cache_basis(tmp_path):
             confirmed_fraction=0.2,
             eta_reprice_reason="confirmed_batch_cache_plan",
             eta_basis="cache_plan_confirmed",
+            eta_reprice_context={"cached_records": 50, "fresh_records": 10},
         )
         checkpoint = json.loads(
             (tmp_path / "eta-checkpoints.json").read_text(encoding="utf-8")
@@ -87,6 +88,41 @@ def test_status_reprice_updates_checkpoint_and_cache_basis(tmp_path):
     assert events[0]["previous_expected_seconds"] == 120
     assert events[0]["new_expected_seconds"] == 90
     assert events[0]["delta_seconds"] == -30
+    assert events[0]["decision_context"] == {
+        "cached_records": 50,
+        "fresh_records": 10,
+    }
+
+
+def test_eta_suppression_retains_guard_context(tmp_path):
+    import rag_pdf_gradio_app as app
+
+    event = app.append_eta_recalculation_event(
+        tmp_path,
+        status="suppressed",
+        reason="owned_queue_rate",
+        suppression_reason="combined_cache_and_provider_queue_rate",
+        elapsed_seconds=120,
+        confirmed_fraction=.5,
+        progress_phase="desktop_queue",
+        previous_expected_seconds=900,
+        new_expected_seconds=900,
+        decision_context={
+            "queue_records": 463,
+            "cached_records": 238,
+            "fresh_records": 225,
+        },
+    )
+
+    assert event["decision_context"]["fresh_records"] == 225
+    persisted = [
+        json.loads(line)
+        for line in (tmp_path / "eta-recalculation-events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert persisted[0]["suppression_reason"] == "combined_cache_and_provider_queue_rate"
+    assert persisted[0]["decision_context"]["cached_records"] == 238
 
 
 def test_eta_ui_distinguishes_initial_and_confirmed_cache_plan():

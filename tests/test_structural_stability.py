@@ -406,7 +406,9 @@ def test_generator_close_runs_outer_stream_cleanup():
         ),
     ):
         stream = app.run_automatic_from_confirmation_stream()
-        assert next(stream) == ("preparing",)
+        acknowledgement = next(stream)
+        assert acknowledgement[4]["value"] == "Processing…"
+        assert acknowledgement[10]["value"] == "Cancel"
         stream.close()
         assert completed.wait(timeout=1)
     assert len(releases) == 1
@@ -441,7 +443,8 @@ def test_browser_stream_close_keeps_owned_confirmation_worker_running():
         app.LIVE_AUTOMATIC_RUN_STATUS = {}
         with mock.patch.object(app, "_run_automatic_from_confirmation_stream_body", body):
             stream = app.run_automatic_from_confirmation_stream()
-            assert next(stream) == ("acknowledged",)
+            acknowledgement = next(stream)
+            assert acknowledgement[4]["value"] == "Processing…"
             stream.close()
             assert worker_continued.wait(timeout=1)
         # The browser stream is no longer an ownership boundary. Its worker
@@ -489,8 +492,11 @@ def test_unexpected_owned_running_stream_exit_cannot_leave_live_status_stranded(
     try:
         app.LIVE_AUTOMATIC_RUN_STATUS = {}
         with mock.patch.object(app, "_run_automatic_from_confirmation_stream_body", body):
+            stream = app.run_automatic_from_confirmation_stream()
+            acknowledgement = next(stream)
+            assert acknowledgement[4]["value"] == "Processing…"
             with pytest.raises(RuntimeError, match="simulated stream failure"):
-                next(app.run_automatic_from_confirmation_stream())
+                next(stream)
         assert app.LIVE_AUTOMATIC_RUN_STATUS["state"] == "failed"
         assert app.LIVE_AUTOMATIC_RUN_STATUS["phase"] == "Run ended before a terminal result"
     finally:
