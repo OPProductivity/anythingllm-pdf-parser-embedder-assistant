@@ -291,12 +291,30 @@ def test_multiple_pdf_selection_keeps_both_files_in_the_pending_batch(page, loca
     confirm = page.get_by_role("button", name="Confirm and start processing")
     expect(confirm).to_be_enabled(timeout=15000)
     expect(page.get_by_role("button", name="Remove this file")).to_have_count(2)
+    expect(page.locator("#automatic-pdf-upload .rag-selected-pdf-count")).to_have_text(
+        "2 PDFs selected", timeout=15000
+    )
+    placement = page.locator("#automatic-pdf-upload").evaluate(
+        """root => {
+          const badge = root.querySelector(".rag-selected-pdf-count");
+          const rootBox = root.getBoundingClientRect();
+          const badgeBox = badge.getBoundingClientRect();
+          return {
+            centreDelta: Math.abs(
+              (badgeBox.left + badgeBox.width / 2) - (rootBox.left + rootBox.width / 2)
+            ),
+            nativeClearCount: root.querySelectorAll("button[aria-label='Clear']").length,
+          };
+        }"""
+    )
+    assert placement["centreDelta"] <= 2
+    assert placement["nativeClearCount"] == 1
 
 
-def test_multiple_pdf_transfer_lists_every_selected_name_before_local_copy_finishes(
+def test_multiple_pdf_transfer_does_not_replace_the_native_picker_before_local_copy_finishes(
     page, local_app_url, two_pdf_files
 ):
-    """Do not present the localhost transfer as partial PDF processing."""
+    """The native picker remains visible while Gradio transfers files."""
     page.goto(local_app_url)
     upload = page.locator("#automatic-pdf-upload input[type='file']")
     expect(upload).to_have_count(1, timeout=15000)
@@ -312,15 +330,15 @@ def test_multiple_pdf_transfer_lists_every_selected_name_before_local_copy_finis
           await new Promise(requestAnimationFrame);
           const root = document.querySelector("#automatic-pdf-upload");
           return {
-            pendingText: root.querySelector(".rag-pending-pdf-list")?.textContent || "",
+            pendingListPresent: Boolean(root.querySelector(".rag-pending-pdf-list")),
+            replacementActionsPresent: Boolean(root.querySelector(".rag-pending-picker-actions")),
             rootText: root.textContent || "",
           };
         }"""
     )
-    assert "Adding 2 files" in first_frame["pendingText"]
-    for path in two_pdf_files:
-        assert path.name in first_frame["pendingText"]
-    assert "Uploading 2 files" not in first_frame["rootText"]
+    assert first_frame["pendingListPresent"] is False
+    assert first_frame["replacementActionsPresent"] is False
+    assert "Adding 2 files" not in first_frame["rootText"]
 
 
 def test_six_pdf_selection_keeps_every_file_in_the_pending_batch(page, local_app_url, six_pdf_files):

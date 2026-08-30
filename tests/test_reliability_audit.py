@@ -223,6 +223,47 @@ def test_cancelled_held_queue_group_is_recovery_required_not_an_integrity_failur
     assert "AUDIT-SOURCE-STOP-003" not in codes
 
 
+def test_active_external_queue_is_recovery_required_not_a_count_contradiction(tmp_path):
+    """A timed-out receipt can still have an owned Desktop queue in motion."""
+    locations = ["custom-documents/a.json", "custom-documents/b.json"]
+    _write(tmp_path / "run-progress.json", {"state": "failed"})
+    _write(tmp_path / "batch-native-upload-report.json", {
+        "status": "reconciliation_pending", "uploaded": 2, "embedded": 0,
+        "locations": locations,
+    })
+    _write(tmp_path / "batch-embedding-ledger.json", {
+        "requested": 2, "accepted": 0,
+        "recovery": {"state": "resume_available", "remaining_locations": locations},
+        "progress_observations": [{
+            "source_queue_group_index": 1,
+            "final_queue_snapshot": {
+                "queue_records": 2,
+                "desktop_queue_current": 1,
+                "desktop_queue_completed": 0,
+                "desktop_queue_observer_state": "connected",
+            },
+        }],
+    })
+    _write(tmp_path / "source-transaction-ledger.json", {
+        "transaction_count": 1,
+        "transactions": [{
+            "source_index": 1, "planned_records": 2,
+            "state": "ambiguous_external_mutation_held", "uploaded": 2,
+            "embedded": 0, "locations": locations,
+        }],
+        "stopped_after_source_transaction": 1,
+        "stop_reason": "ambiguous_external_mutation_held",
+    })
+
+    audit = audit_run_directory(tmp_path)
+    codes = {row["code"] for row in audit["findings"]}
+
+    assert audit["audit_status"] == "recovery_required"
+    assert audit["summary"]["external_queue_reconciliation"]["required"] is True
+    assert "AUDIT-EXTERNAL-QUEUE-OBSERVATION-001" in codes
+    assert "AUDIT-CROSS-SOURCE-002" not in codes
+
+
 def test_held_queue_group_cannot_release_a_later_group(tmp_path):
     """Group-aware auditing must still reject work after the held group."""
     _green_run(tmp_path)

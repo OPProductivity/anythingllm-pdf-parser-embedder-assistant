@@ -1690,6 +1690,92 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(app.detect_unusually_slow_stages(current, history), [])
         self.assertEqual(app.unusually_slow_stage_message([]), "")
 
+    def test_shared_desktop_queue_timing_is_counted_once_for_all_participating_pdfs(self):
+        import rag_pdf_gradio_app as app
+
+        # A source-window group is mirrored in every source summary for
+        # recovery.  Its external queue duration is one measurement, not one
+        # measurement per selected PDF.
+        row = {
+            "embedding_submission_strategy": "desktop_queue",
+            "submitted_records": 36,
+            "actual_records": 36,
+            "batch_seconds": [119.627, 119.627, 119.627],
+            "batch_measurements": [
+                {
+                    "batch": 1,
+                    "records": records,
+                    "state": "accepted",
+                    "submission_seconds": 20.03,
+                    "verification_seconds": 99.573,
+                    "elapsed_seconds": 119.627,
+                }
+                for records in (3, 25, 8)
+            ],
+        }
+
+        measurements = app.timing_model_unique_batch_measurements(row)
+        self.assertEqual(len(measurements), 1)
+        self.assertEqual(measurements[0]["records"], 36)
+        stage = app._timing_row_stage_measurements(row)["anythingllm_queue"]
+        self.assertEqual(stage["units"], 36)
+        self.assertAlmostEqual(stage["seconds"], 119.627)
+        self.assertAlmostEqual(stage["seconds_per_unit"], 119.627 / 36)
+
+    def test_timing_history_prefers_one_authoritative_group_record_over_summary_copies(self):
+        import rag_pdf_gradio_app as app
+
+        captured = []
+        settings = {
+            "timing_estimate": {
+                "features": {"mode": app.MODE_NATIVE_UPLOAD_LABEL},
+                "profile": {"page_count": 36},
+            },
+            "batch_timing_measurements": [{
+                "operation_id": "one-external-operation",
+                "batch": 1,
+                "total_batches": 1,
+                "requested": 36,
+                "submission_state": "accepted",
+                "submission_seconds": 20.03,
+                "verification_seconds": 99.573,
+                "batch_elapsed_seconds": 119.627,
+                "searchability_proven": True,
+            }],
+            "source_documents": [{"path": "one.pdf", "pages": 3}] * 3,
+        }
+        summaries = [
+            {
+                "segments": records,
+                "api_embedding_update_requested": records,
+                "api_embedding_update_batches": [{
+                    "batch": 1,
+                    "requested": records,
+                    "submission_state": "accepted",
+                    "submission_seconds": 20.03,
+                    "verification_seconds": 99.573,
+                    "batch_elapsed_seconds": 119.627,
+                    "searchability_proven": True,
+                }],
+            }
+            for records in (3, 25, 8)
+        ]
+        with mock.patch.object(app, "hydrated_timing_model_history", return_value=[]), \
+             mock.patch.object(app, "_append_timing_jsonl", side_effect=lambda _path, row: captured.append(row)), \
+             mock.patch.object(app, "_read_timing_jsonl", return_value=[]):
+            row = app.record_timing_model_run(
+                Path("C:/tmp/timing-fixture"),
+                summaries,
+                {"state": "successful"},
+                settings,
+                150.0,
+            )
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(row["actual_batches"], 1)
+        self.assertEqual(row["batch_seconds"], [119.627])
+        self.assertEqual(row["batch_measurements"][0]["records"], 36)
+
     def test_ocr_withheld_terminal_phase_never_claims_searchable_vectors(self):
         import rag_pdf_gradio_app as app
 
@@ -2774,6 +2860,37 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(len(calls), 3)
         self.assertTrue(stop.stopped)
         self.assertEqual(stop.waits, [0.75, 0.75])
+
+    def test_sse_observer_stops_before_relaying_buffered_events_after_owner_returns(self):
+        """A stopped owner must not publish a second buffered SSE frame."""
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                return iter([
+                    b'data: {"type":"doc_starting","filename":"custom/a.json"}\n',
+                    b'\n',
+                    b'data: {"type":"doc_complete","filename":"custom/a.json"}\n',
+                    b'\n',
+                ])
+
+        stop = threading.Event()
+        observed = []
+        original_urlopen = pipeline.urllib.request.urlopen
+        try:
+            pipeline.urllib.request.urlopen = lambda *_args, **_kwargs: FakeResponse()
+            pipeline.listen_for_anythingllm_embed_progress(
+                "http://127.0.0.1:3001", "", "workspace", ["custom/a.json"], stop,
+                event_callback=lambda event: observed.append(event) or stop.set(),
+            )
+        finally:
+            pipeline.urllib.request.urlopen = original_urlopen
+
+        self.assertEqual([event["type"] for event in observed], ["doc_starting"])
 
     def test_automatic_timing_html_shows_one_estimate_without_a_range(self):
         import rag_pdf_gradio_app as app
@@ -4329,24 +4446,24 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(current["completed_records"], 10)
         self.assertEqual(current["fraction"], 10 / 12)
 
-    def test_direct_picker_count_is_rendered_inside_the_picker_immediately(self):
+    def test_direct_picker_count_uses_accepted_native_preview_rows(self):
         import rag_pdf_gradio_app as app
 
         self.assertIn("rag-selected-pdf-count", app.APP_CONNECTION_WATCHDOG_HEAD)
+        self.assertIn("installAutomaticPdfSelectedCount", app.APP_CONNECTION_WATCHDOG_HEAD)
+        self.assertIn("Wait for Gradio's accepted selection", app.APP_CONNECTION_WATCHDOG_HEAD)
         self.assertIn("PDF${selectedCount === 1 ? \"\" : \"s\"} selected", app.APP_CONNECTION_WATCHDOG_HEAD)
-        self.assertNotIn("automatic-selected-pdf-count", app.APP_CONNECTION_WATCHDOG_HEAD)
+        self.assertNotIn("ragPendingAutomaticPdfSelection", app.APP_CONNECTION_WATCHDOG_HEAD)
+        self.assertNotIn("rag-pending-pdf-list", app.APP_CONNECTION_WATCHDOG_HEAD)
 
-    def test_direct_picker_reserves_count_space_and_keeps_add_more_available_while_settling(self):
+    def test_direct_picker_centres_count_without_replacing_native_actions(self):
         import rag_pdf_gradio_app as app
 
-        self.assertIn("rag-pending-picker-actions", app.APP_BROWSER_THEME_HEAD)
-        self.assertIn("Add more PDF files", app.APP_BROWSER_THEME_HEAD)
-        self.assertIn("files: [...earlierFiles, ...files]", app.APP_BROWSER_THEME_HEAD)
-        self.assertIn("right: 104px", app.APP_CSS)
-        self.assertIn(
-            "#automatic-pdf-upload.rag-pdf-selection-pending .icon-button-wrapper.top-panel",
-            app.APP_CSS,
-        )
+        self.assertIn("left: 50%", app.APP_CSS)
+        self.assertIn("transform: translateX(-50%)", app.APP_CSS)
+        self.assertNotIn("rag-pending-picker-actions", app.APP_CSS)
+        self.assertNotIn("rag-pdf-selection-pending", app.APP_CSS)
+        self.assertNotIn("right: 104px", app.APP_CSS)
 
     def test_upload_count_schema_distinguishes_new_attachment_from_confirmation(self):
         import rag_pdf_gradio_app as app
@@ -9206,7 +9323,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(len(updates), 6)
         self.assertTrue(all(update == {"__type__": "update"} for update in updates))
 
-    def test_direct_picker_shows_all_browser_selected_names_during_transfer(self):
+    def test_direct_picker_leaves_native_transfer_presentation_untouched(self):
         import rag_pdf_gradio_app as app
 
         self.assertEqual("automatic-pdf-upload", next(
@@ -9214,10 +9331,10 @@ class PipelineCoreTests(unittest.TestCase):
             for component in app.demo.config["components"]
             if component.get("props", {}).get("elem_id") == "automatic-pdf-upload"
         ))
-        self.assertIn("ragPendingAutomaticPdfSelection", app.APP_BROWSER_THEME_HEAD)
-        self.assertIn('textNode.nodeValue = value.replace', app.APP_BROWSER_THEME_HEAD)
-        self.assertIn('"Adding$1"', app.APP_BROWSER_THEME_HEAD)
-        self.assertIn(".rag-pending-pdf-list", app.APP_CSS)
+        self.assertNotIn("ragPendingAutomaticPdfSelection", app.APP_BROWSER_THEME_HEAD)
+        self.assertNotIn('textNode.nodeValue = value.replace', app.APP_BROWSER_THEME_HEAD)
+        self.assertNotIn('"Adding$1"', app.APP_BROWSER_THEME_HEAD)
+        self.assertNotIn(".rag-pending-pdf-list", app.APP_CSS)
         preview = app.deferred_pdf_inspection_preview(["one.pdf", "two.pdf"], [])
         self.assertIn("PDF inspection starts after Confirm", preview)
 
@@ -16244,6 +16361,14 @@ class PipelineCoreTests(unittest.TestCase):
                     "searchability_proven": True,
                 }],
                 "runtime_events": [],
+                "progress_observation": {
+                    "final_queue_snapshot": {
+                        "queue_records": len(locations),
+                        "desktop_queue_current": len(locations),
+                        "desktop_queue_completed": len(locations),
+                        "desktop_queue_observer_state": "connected",
+                    },
+                },
                 "errors": [],
             }
 
@@ -16269,6 +16394,10 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(len(calls[0][0]), 3)
         self.assertEqual(result["embedding_update"]["submission_strategy"], "durable_bounded_pdf_queue_groups")
+        self.assertEqual(
+            result["embedding_update"]["progress_observations"][0]["final_queue_snapshot"]["queue_records"],
+            3,
+        )
         self.assertTrue(all(
             row["state"] == "exact_vectors_proven"
             for row in result["source_transactions"]
@@ -16688,6 +16817,35 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(completion, original)
         self.assertEqual(retained, audit)
         write_bundle.assert_not_called()
+
+    def test_terminal_integrity_describes_an_owned_external_queue_without_false_contradiction(self):
+        import rag_pdf_gradio_app as app
+
+        audit = {
+            "audit_status": "recovery_required",
+            "summary": {
+                "error_findings": 0,
+                "external_queue_reconciliation": {
+                    "required": True,
+                    "unresolved_records": 481,
+                },
+            },
+            "findings": [{"code": "AUDIT-EXTERNAL-QUEUE-OBSERVATION-001"}],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.object(app, "audit_run_directory", return_value=audit):
+                completion, retained = app.terminal_integrity_audit(
+                    temp_dir,
+                    {"state": "failed", "code": "AUTO-INTEGRITY-001", "message": "old contradiction"},
+                    native_run=True,
+                )
+
+        self.assertEqual(completion["state"], "warning")
+        self.assertEqual(completion["code"], "EXTERNAL-QUEUE-EVIDENCE-PENDING-001")
+        self.assertIn("No complete embedding evidence yet", completion["message"])
+        self.assertIn("481 not yet confirmed", completion["message"])
+        self.assertNotIn("contradiction", completion["message"])
+        self.assertEqual(retained, audit)
 
     def test_terminal_integrity_bundle_failure_does_not_soften_proven_contradiction(self):
         import rag_pdf_gradio_app as app

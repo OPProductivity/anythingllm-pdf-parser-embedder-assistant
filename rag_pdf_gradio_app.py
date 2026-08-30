@@ -961,172 +961,64 @@ APP_CONNECTION_WATCHDOG_HEAD = """
       syncCheckbox();
     }, true);
 
-    // Capture selected names before Gradio starts its required transfer to the
-    // localhost server. This parser-time listener is active before the File
-    // component hydrates, so all selected names can be shown together instead
-    // of appearing one-by-one as transfer responses complete.
-    const syncAutomaticPdfPickerPresentation = () => {
+    // Gradio remains the complete owner of the multi-file picker: its native
+    // controls, transfer state, and selected-file list are never replaced or
+    // hidden. Once its authoritative preview rows have mounted, add only a
+    // compact read-only count in the centre of the native header.
+    const installAutomaticPdfSelectedCount = () => {
       const automaticUpload = document.getElementById("automatic-pdf-upload");
-      if (!automaticUpload) return;
-      const nativeText = automaticUpload.textContent || "";
-      const treeWalker = document.createTreeWalker(automaticUpload, NodeFilter.SHOW_TEXT);
-      let textNode = treeWalker.nextNode();
-      while (textNode) {
-        const value = textNode.nodeValue || "";
-        if (/Uploading\\s+\\d+\\s+files?/i.test(value)) {
-          textNode.nodeValue = value.replace(/Uploading(\\s+\\d+\\s+files?)/i, "Adding$1");
-        }
-        textNode = treeWalker.nextNode();
-      }
-      const nativePreview = automaticUpload.querySelector(".file-preview");
-      // Gradio also gives its upload/clear controls aria-label values.  Count
-      // only the file-name cells; otherwise three selected PDFs can display
-      // as four because the upload button is mistaken for a file.
-      const nativePreviewNames = nativePreview
-        ? Array.from(nativePreview.querySelectorAll("td[aria-label]"))
-            .map((node) => node.getAttribute("aria-label") || "")
-            .filter((name) => /\\.pdf$/i.test(name))
-        : [];
-      const pending = window.ragPendingAutomaticPdfSelection;
-      const selectedCount = pending?.files?.length || new Set(nativePreviewNames).size;
-      const syncPendingActionRail = () => {
-        let rail = automaticUpload.querySelector(".rag-pending-picker-actions");
-        if (!pending?.files?.length) {
-          rail?.remove();
+      if (!automaticUpload) return false;
+      if (automaticUpload.dataset.selectedCountInstalled === "true") return true;
+      automaticUpload.dataset.selectedCountInstalled = "true";
+      let scheduled = false;
+      const syncCount = () => {
+        scheduled = false;
+        const nativePreview = automaticUpload.querySelector(".file-preview");
+        const selectedCount = nativePreview
+          ? Array.from(nativePreview.querySelectorAll("td[aria-label]"))
+              .map((node) => node.getAttribute("aria-label") || "")
+              .filter((name) => /\\.pdf$/i.test(name)).length
+          : 0;
+        let badge = automaticUpload.querySelector(".rag-selected-pdf-count");
+        if (!selectedCount) {
+          badge?.remove();
           return;
         }
-        if (!rail) {
-          rail = document.createElement("div");
-          rail.className = "rag-pending-picker-actions";
-          rail.setAttribute("aria-label", "Selected PDF actions");
-          automaticUpload.appendChild(rail);
+        if (!badge) {
+          badge = document.createElement("span");
+          badge.className = "rag-selected-pdf-count";
+          badge.setAttribute("role", "status");
+          badge.setAttribute("aria-live", "polite");
+          automaticUpload.appendChild(badge);
         }
-        const makeAction = (action, label, enabled) => {
-          const button = document.createElement("button");
-          button.type = "button";
-          button.className = `rag-pending-picker-action rag-pending-picker-${action}`;
-          button.setAttribute("aria-label", label);
-          button.title = label;
-          button.disabled = !enabled;
-          button.textContent = action === "add" ? "↑" : action === "reuse" ? "↻" : "×";
-          return button;
-        };
-        const fileInput = automaticUpload.querySelector('input[type="file"]');
-        const addMore = makeAction("add", "Add more PDF files", Boolean(fileInput) && !fileInput.disabled);
-        addMore.addEventListener("click", () => {
-          // Keep the native input as the one browser-owned file chooser. This
-          // retains Gradio's multi-location append behavior without a second
-          // hidden uploader or a synthetic file-list mutation.
-          if (fileInput && !fileInput.disabled) fileInput.click();
-        });
-        // The matching native controls may be unmounted while Gradio is
-        // transferring files. Retain their footprint, but do not let a clear
-        // or reuse action race the in-flight selection update.
-        rail.replaceChildren(
-          addMore,
-          makeAction("reuse", "Use selected files again", false),
-          makeAction("clear", "Clear selected files", false),
-        );
+        badge.textContent = `${selectedCount} PDF${selectedCount === 1 ? "" : "s"} selected`;
       };
-      syncPendingActionRail();
-      let countBadge = automaticUpload.querySelector(".rag-selected-pdf-count");
-      if (selectedCount) {
-        if (!countBadge) {
-          countBadge = document.createElement("span");
-          countBadge.className = "rag-selected-pdf-count";
-          countBadge.setAttribute("role", "status");
-          countBadge.setAttribute("aria-live", "polite");
-          automaticUpload.appendChild(countBadge);
-        }
-        countBadge.textContent = `${selectedCount} PDF${selectedCount === 1 ? "" : "s"} selected`;
-      } else {
-        countBadge?.remove();
-      }
-      let pendingList = automaticUpload.querySelector(".rag-pending-pdf-list");
-      if (!pending?.files?.length) {
-        automaticUpload.classList.remove("rag-pdf-selection-pending");
-        pendingList?.remove();
-        return;
-      }
-      const remainingNativeNames = new Map();
-      for (const name of nativePreviewNames) {
-        remainingNativeNames.set(name, (remainingNativeNames.get(name) || 0) + 1);
-      }
-      const allNativeRowsReady = Boolean(nativePreview) && pending.files.every((file) => {
-        const remaining = remainingNativeNames.get(file.name) || 0;
-        if (!remaining) return false;
-        remainingNativeNames.set(file.name, remaining - 1);
-        return true;
+      const scheduleCountSync = () => {
+        if (scheduled) return;
+        scheduled = true;
+        // Wait for Gradio's accepted selection to settle its native preview
+        // rows; this deliberately does not report a browser-only pre-transfer
+        // file count.
+        window.setTimeout(syncCount, 80);
+      };
+      new MutationObserver(scheduleCountSync).observe(automaticUpload, {
+        childList: true,
+        subtree: true,
       });
-      if (allNativeRowsReady) {
-        window.ragPendingAutomaticPdfSelection = null;
-        automaticUpload.classList.remove("rag-pdf-selection-pending");
-        automaticUpload.querySelector(".rag-pending-picker-actions")?.remove();
-        pendingList?.remove();
-        return;
-      }
-      automaticUpload.classList.add("rag-pdf-selection-pending");
-      if (!pendingList) {
-        pendingList = document.createElement("div");
-        pendingList.className = "rag-pending-pdf-list";
-        pendingList.setAttribute("role", "status");
-        pendingList.setAttribute("aria-live", "polite");
-        automaticUpload.appendChild(pendingList);
-      }
-      const signature = pending.files.map((file) => `${file.name}\\0${file.sizeLabel}`).join("\\0");
-      if (pendingList.dataset.signature === signature) return;
-      pendingList.dataset.signature = signature;
-      const status = document.createElement("div");
-      status.className = "rag-pending-pdf-status";
-      status.textContent = `Adding ${pending.files.length} file${pending.files.length === 1 ? "" : "s"}…`;
-      pendingList.replaceChildren(status, ...pending.files.map((file) => {
-        const row = document.createElement("div");
-        row.className = "rag-pending-pdf-row";
-        const name = document.createElement("span");
-        name.className = "rag-pending-pdf-name";
-        name.textContent = file.name;
-        const size = document.createElement("span");
-        size.className = "rag-pending-pdf-size";
-        size.textContent = file.sizeLabel;
-        row.append(name, size);
-        return row;
-      }));
+      scheduleCountSync();
+      return true;
     };
-    document.addEventListener("change", (event) => {
-      const input = event.target;
-      if (!(input instanceof HTMLInputElement)
-          || input.type !== "file"
-          || !input.closest("#automatic-pdf-upload")) return;
-      const files = Array.from(input.files || []).map((file) => ({
-        name: file.name,
-        sizeLabel: file.size >= 1048576
-          ? `${(file.size / 1048576).toFixed(1)} MB`
-          : `${Math.max(1, Math.ceil(file.size / 1024))} KB`,
-      }));
-      // Selecting from a second location while the first chooser transfer is
-      // still settling is an intentional normal workflow. Preserve the
-      // already-visible pending rows so the count/list never jumps backwards;
-      // Gradio remains the authority for the eventual server-side selection.
-      const earlierFiles = window.ragPendingAutomaticPdfSelection?.files || [];
-      window.ragPendingAutomaticPdfSelection = files.length
-        ? { files: [...earlierFiles, ...files] }
-        : null;
-      requestAnimationFrame(syncAutomaticPdfPickerPresentation);
-    }, true);
-    let pickerPresentationQueued = false;
-    const pickerPresentationObserver = new MutationObserver(() => {
-      if (pickerPresentationQueued) return;
-      pickerPresentationQueued = true;
-      requestAnimationFrame(() => {
-        pickerPresentationQueued = false;
-        syncAutomaticPdfPickerPresentation();
+    const waitForAutomaticPdfSelectedCount = () => {
+      if (installAutomaticPdfSelectedCount()) return;
+      // Gradio mounts Blocks after this head script. Observe only until this
+      // one component exists, then disconnect; selection changes themselves
+      // are watched only within the picker.
+      const mountObserver = new MutationObserver(() => {
+        if (installAutomaticPdfSelectedCount()) mountObserver.disconnect();
       });
-    });
-    pickerPresentationObserver.observe(document.documentElement, {
-      childList: true,
-      characterData: true,
-      subtree: true,
-    });
+      mountObserver.observe(document.documentElement, { childList: true, subtree: true });
+    };
+    requestAnimationFrame(waitForAutomaticPdfSelectedCount);
     let lastThemePointerToggleAt = 0;
     const toggleFromEvent = (event, { allowRecentPointer = false } = {}) => {
       const target = event.target;
@@ -3432,12 +3324,13 @@ body.dark .batch-folder-inline-notice {
 #automatic-pdf-upload > .rag-selected-pdf-count {
     position: absolute;
     top: 8px;
-    /* The native File header owns the far right edge for add/reuse/clear.
-       Reserve that whole action rail so a selected-file count cannot be
-       hidden underneath those controls at any responsive width. */
-    right: 104px;
-    z-index: 3;
-    max-width: calc(100% - 210px);
+    left: 50%;
+    transform: translateX(-50%);
+    /* Native add/reuse/clear actions remain Gradio-owned on the right. The
+       count is deliberately a centred read-only header detail, not an action
+       replacement or an extra file-list row. */
+    z-index: 1;
+    max-width: calc(100% - 240px);
     overflow: hidden;
     color: var(--body-text-color-subdued, #64748b);
     font-size: 0.82rem;
@@ -3446,92 +3339,6 @@ body.dark .batch-folder-inline-notice {
     text-overflow: ellipsis;
     white-space: nowrap;
     pointer-events: none;
-}
-.pdf-upload-input.rag-pdf-selection-pending .file-preview {
-    display: none !important;
-}
-/* Gradio briefly unmounts its header actions while it transfers a new File
-   selection. Keep an identically placed, stable action rail in that interval:
-   add-more deliberately remains live, while the actions that would mutate the
-   in-flight selection are visibly disabled until the authoritative list is
-   mounted again. */
-#automatic-pdf-upload.rag-pdf-selection-pending .icon-button-wrapper.top-panel {
-    visibility: hidden !important;
-}
-#automatic-pdf-upload > .rag-pending-picker-actions {
-    position: absolute;
-    top: 7px;
-    right: 10px;
-    z-index: 4;
-    display: inline-flex;
-    align-items: center;
-    gap: 3px;
-    min-height: 24px;
-}
-#automatic-pdf-upload .rag-pending-picker-action {
-    display: inline-grid;
-    place-items: center;
-    width: 24px;
-    height: 24px;
-    min-width: 24px;
-    min-height: 24px;
-    padding: 0;
-    border: 1px solid var(--border-color-primary, #475569);
-    border-radius: 4px;
-    background: var(--background-fill-secondary, #172033);
-    color: var(--body-text-color, #e5eefc);
-    font-size: 1rem;
-    font-weight: 600;
-    line-height: 1;
-}
-#automatic-pdf-upload .rag-pending-picker-action:not(:disabled) {
-    cursor: pointer;
-    color: var(--color-accent, #2563eb);
-}
-#automatic-pdf-upload .rag-pending-picker-action:disabled {
-    cursor: wait;
-    opacity: 0.52;
-}
-.rag-pending-pdf-list {
-    /* The count remains visible in its own reserved header line instead of
-       competing with the first immediate pending filename. */
-    padding-top: 36px;
-}
-.rag-pending-pdf-list {
-    display: grid;
-    width: 100%;
-    padding: 8px 10px;
-    gap: 1px;
-    border-radius: var(--radius-lg, 8px);
-    background: inherit;
-}
-.rag-pending-pdf-status {
-    padding: 2px 8px 5px;
-    color: var(--body-text-color-subdued, #64748b);
-    font-size: 0.88rem;
-}
-.rag-pending-pdf-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    min-width: 0;
-    padding: 7px 8px;
-    gap: 12px;
-    border-bottom: 1px solid var(--border-color-primary, rgba(148, 163, 184, 0.25));
-}
-.rag-pending-pdf-row:last-child {
-    border-bottom: 0;
-}
-.rag-pending-pdf-name {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-.rag-pending-pdf-size {
-    flex: 0 0 auto;
-    color: var(--body-text-color-subdued, #64748b);
-    font-size: 0.82rem;
 }
 /* Gradio's file preview may otherwise inherit the browser's fallback or its
    monospace metadata token. Keep the selected-file row on the same interface
@@ -14508,6 +14315,19 @@ def terminal_integrity_audit(run_root, completion, *, native_run):
             ),
         }, audit
 
+    external_queue = (audit.get("summary") or {}).get("external_queue_reconciliation") or {}
+    if bool(external_queue.get("required")):
+        unresolved = int(external_queue.get("unresolved_records") or 0)
+        return {
+            "state": "warning",
+            "code": "EXTERNAL-QUEUE-EVIDENCE-PENDING-001",
+            "message": (
+                "No complete embedding evidence yet. AnythingLLM was still processing the submitted "
+                f"page-parent records when assistant-side observation ended ({unresolved} not yet confirmed). "
+                "No upload was retried; check the workspace or Run history before resuming."
+            ),
+        }, audit
+
     if audit_write_error and str(completion.get("state") or "") == "successful":
         return {
             "state": "warning",
@@ -17356,6 +17176,56 @@ def timing_model_batch_observation_usable(row):
     )
 
 
+def timing_model_unique_batch_measurements(row):
+    """Return one timing measurement per external Desktop queue operation.
+
+    A bounded queue group is intentionally copied into each participating PDF
+    summary so that every source has self-contained recovery evidence.  Those
+    copies are *not* separate AnythingLLM operations.  Timing history must
+    therefore collapse only byte-for-byte equivalent Desktop queue snapshots
+    before learning a cadence or reporting a stage duration.
+
+    The conservative key includes the group number, operation id when
+    available, state, and every measured duration.  Distinct queue groups are
+    retained even when they happen to have a similar duration.
+    """
+    row = row if isinstance(row, dict) else {}
+    measurements = [
+        dict(item)
+        for item in (row.get("batch_measurements") or [])
+        if isinstance(item, dict)
+    ]
+    if len(measurements) < 2:
+        return measurements
+    if str(row.get("embedding_submission_strategy") or "").casefold() != "desktop_queue":
+        return measurements
+
+    unique = []
+    seen = {}
+    for measurement in measurements:
+        key = (
+            str(measurement.get("operation_id") or ""),
+            int(measurement.get("batch") or 0),
+            int(measurement.get("total_batches") or 0),
+            str(measurement.get("state") or ""),
+            round(float(measurement.get("submission_seconds") or 0.0), 6),
+            round(float(measurement.get("verification_seconds") or 0.0), 6),
+            round(float(measurement.get("elapsed_seconds") or 0.0), 6),
+        )
+        existing = seen.get(key)
+        if existing is None:
+            seen[key] = measurement
+            unique.append(measurement)
+            continue
+        # The same bounded group was projected onto another source summary.
+        # Preserve its whole external duration once, while retaining the
+        # aggregate record count that the one operation actually covered.
+        existing["records"] = int(existing.get("records") or 0) + int(
+            measurement.get("records") or 0
+        )
+    return unique
+
+
 def timing_model_batch_prior_seconds(features, history):
     """Use robust measured request time from the matching extraction regime."""
     engine = str(features.get("embedding_engine") or "").casefold()
@@ -17437,7 +17307,7 @@ def timing_model_batch_prior_seconds(features, history):
         historical_mode = str(row.get("embedding_verification_mode") or "every_batch").casefold()
         historical_interval = int(row.get("embedding_verification_interval") or 1)
         destination = exact_samples if exact_settings else family_samples
-        measurements = list(row.get("batch_measurements") or [])
+        measurements = timing_model_unique_batch_measurements(row)
         accepted_measurements = [
             measurement for measurement in measurements
             if str(measurement.get("state") or "").casefold() == "accepted"
@@ -19526,9 +19396,10 @@ def _timing_row_stage_measurements(row):
         int(row.get("page_count") or sum(int(item.get("pages") or 0) for item in documents)),
     )
     document_count = max(0, int(row.get("document_count") or len(documents)))
+    batch_measurements = timing_model_unique_batch_measurements(row)
     record_count = sum(
         max(0, int(item.get("records") or 0))
-        for item in (row.get("batch_measurements") or [])
+        for item in batch_measurements
         if isinstance(item, dict)
         and str(item.get("state") or "").casefold() == "accepted"
     )
@@ -19581,7 +19452,11 @@ def _timing_row_stage_measurements(row):
     add(
         "anythingllm_queue",
         "AnythingLLM embedding and verification",
-        sum(max(0.0, float(value or 0.0)) for value in (row.get("batch_seconds") or [])),
+        sum(
+            max(0.0, float(item.get("elapsed_seconds") or 0.0))
+            for item in batch_measurements
+        )
+        or sum(max(0.0, float(value or 0.0)) for value in (row.get("batch_seconds") or [])),
         record_count,
         "record",
         90.0,
@@ -19725,6 +19600,11 @@ def record_timing_model_run(
             int(batch_upload_timing_outcome.get("new_workspace_attachment_count") or 0),
         )
         batches = []
+        authoritative_batch_measurements = [
+            dict(batch)
+            for batch in (settings or {}).get("batch_timing_measurements") or []
+            if isinstance(batch, dict)
+        ]
         actual_records = 0
         submitted_records = 0
         existing_workspace_records = 0
@@ -19740,8 +19620,15 @@ def record_timing_model_run(
                     summary.get("post_upload_matching_vectors") or summary_records or 0
                 )
             for batch in summary.get("api_embedding_update_batches") or []:
+                if authoritative_batch_measurements:
+                    # The complete batch report is supplied below.  Per-PDF
+                    # summaries intentionally mirror the same queue group for
+                    # recovery, so they are not timing measurements here.
+                    continue
                 batches.append({
                     "batch": int(batch.get("batch") or 0),
+                    "total_batches": int(batch.get("total_batches") or 0),
+                    "operation_id": str(batch.get("operation_id") or ""),
                     "records": int(batch.get("requested") or 0),
                     "submission_seconds": round(float(batch.get("submission_seconds") or 0), 3),
                     "verification_seconds": round(float(batch.get("verification_seconds") or 0), 3),
@@ -19749,6 +19636,18 @@ def record_timing_model_run(
                     "state": str(batch.get("submission_state") or "unknown"),
                     "searchability_proven": bool(batch.get("searchability_proven")),
                 })
+        for batch in authoritative_batch_measurements:
+            batches.append({
+                "batch": int(batch.get("batch") or 0),
+                "total_batches": int(batch.get("total_batches") or 0),
+                "operation_id": str(batch.get("operation_id") or ""),
+                "records": int(batch.get("requested") or 0),
+                "submission_seconds": round(float(batch.get("submission_seconds") or 0), 3),
+                "verification_seconds": round(float(batch.get("verification_seconds") or 0), 3),
+                "elapsed_seconds": round(float(batch.get("batch_elapsed_seconds") or 0), 3),
+                "state": str(batch.get("submission_state") or "unknown"),
+                "searchability_proven": bool(batch.get("searchability_proven")),
+            })
         if not profile.get("page_count") or float(actual_seconds or 0) < 5.0:
             # Test fixtures and rejected preflight attempts are useful in their
             # own run summaries, but must never distort a user's future ETA.
@@ -28368,6 +28267,13 @@ def run_automatic(
                     or 0
                 ),
             },
+            # This is the authoritative, run-wide record of external queue
+            # operations.  Per-PDF summaries deliberately retain copies of a
+            # shared source-window group for recovery, and must not multiply
+            # that group's elapsed time in the timing history.
+            "batch_timing_measurements": list(
+                ((batch_upload_report.get("embedding_update") or {}).get("batches") or [])
+            ),
             "source_documents": [
                 {"path": str(path), "pages": int((progress_allocations[index] or {}).get("pages") or 0)}
                 for index, path in enumerate(files)

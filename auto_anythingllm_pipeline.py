@@ -10686,6 +10686,14 @@ def listen_for_anythingllm_embed_progress(
                 if isinstance(connected_event, threading.Event):
                     connected_event.set()
                 for raw_line in response:
+                    # Once the owning queue wrapper has returned, this
+                    # listener must not keep publishing a stale external
+                    # queue as though the assistant still owned a live run.
+                    # ``urlopen`` may have already buffered additional SSE
+                    # frames, so checking only the outer ``while`` allowed
+                    # progress updates to arrive after a terminal record.
+                    if stop_event.is_set():
+                        break
                     # Do not abandon bytes that urllib has already buffered
                     # just because the synchronous update returned. Its final
                     # queue event is often sent immediately before that
@@ -14906,6 +14914,11 @@ def update_workspace_embeddings_desktop_queue(
             "batches": [],
             "runtime_events": [],
             "errors": [],
+            # Keep the final queue snapshot from every owned source window.
+            # It is deliberately compact, but it lets a terminal audit tell
+            # the difference between a quiet unresolved receipt and Desktop
+            # demonstrably processing the submitted locations.
+            "progress_observations": [],
         }
         _write_embedding_batch_ledger(ledger_path, workspace_slug, aggregate)
         for window_index, window in enumerate(source_windows, start=1):
@@ -14977,6 +14990,16 @@ def update_workspace_embeddings_desktop_queue(
                 _source_window_execution=True,
             )
             child_batch = dict((child.get("batches") or [{}])[-1])
+            child_progress = child.get("progress_observation")
+            if isinstance(child_progress, dict):
+                child_batch["progress_observation"] = dict(child_progress)
+                aggregate["progress_observations"].append({
+                    "source_window_index": window_index,
+                    "source_window_total": len(source_windows),
+                    "final_queue_snapshot": dict(
+                        child_progress.get("final_queue_snapshot") or {}
+                    ),
+                })
             child_batch.update({
                 "batch": window_index,
                 "total_batches": len(source_windows),
@@ -16585,6 +16608,7 @@ def maybe_upload_segment_files_source_transactions(
             "batches": [],
             "runtime_events": [],
             "errors": [],
+            "progress_observations": [],
         },
         "source_transactions": [],
         "errors": [],
@@ -16879,9 +16903,20 @@ def maybe_upload_segment_files_source_transactions(
             aggregate["embedding_update"]["requested"] += int(queue_update.get("requested") or 0)
             aggregate["embedding_update"]["queue_records"] += int(queue_update.get("queue_records") or queue_update.get("requested") or 0)
             aggregate["embedding_update"]["planned_locations"].extend(queue_update.get("planned_locations") or queue_locations)
+            queue_progress = queue_update.get("progress_observation")
+            if isinstance(queue_progress, dict):
+                aggregate["embedding_update"]["progress_observations"].append({
+                    "source_queue_group_index": queue_group_index,
+                    "source_queue_group_total": len(queue_groups),
+                    "final_queue_snapshot": dict(
+                        queue_progress.get("final_queue_snapshot") or {}
+                    ),
+                })
             group_batches = list(queue_update.get("batches") or [])
             for batch in group_batches:
                 batch_copy = dict(batch)
+                if isinstance(queue_progress, dict):
+                    batch_copy["progress_observation"] = dict(queue_progress)
                 batch_copy.update({
                     "batch": queue_group_index,
                     "total_batches": len(queue_groups),
@@ -22229,8 +22264,34 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 )
             return reconcile_evidence(evidence)
 
+        def inspect_batch_vectors_resilient():
+            """Keep an owned, moving Desktop queue alive through one bad read.
+
+            The queue is external and asynchronous; a transient local SQLite,
+            LanceDB, or observer-shaping exception cannot safely prove that it
+            stopped.  Preserve the exception as durable diagnostic evidence,
+            retain the last good counters, and let the ordinary finite
+            reconciliation/stall policy decide the outcome on later polls.
+            """
+            try:
+                return inspect_batch_vectors()
+            except Exception as exc:
+                previous = reconciliation_tracker.get("last_fast_evidence")
+                evidence = dict(previous) if isinstance(previous, dict) else {}
+                evidence.update({
+                    "status": "transient_observation_error",
+                    "classification": "reconciliation_observer_retrying",
+                    "message": (
+                        "AnythingLLM is still being observed after a temporary local "
+                        "verification read failed; no submission was retried."
+                    ),
+                    "observation_exception_type": type(exc).__name__,
+                    "observation_error": str(exc) or "temporary verification read failed",
+                })
+                return reconcile_evidence(evidence)
+
         polling = poll_post_upload(
-            inspect_batch_vectors,
+            inspect_batch_vectors_resilient,
             interval_seconds=float(getattr(args, "post_upload_poll_interval", 2.0)),
             # A 120-second client timeout can leave Desktop still embedding a
             # four-record batch. The old 45-second observer window then

@@ -412,6 +412,29 @@ def audit_run_directory(
     recovery = embedding.get("recovery") if isinstance(embedding.get("recovery"), dict) else {}
     remaining = list(recovery.get("remaining_locations") or [])
     has_held_source = bool(source_summary.get("held_at_source"))
+    queue_observations = embedding.get("progress_observations")
+    if not isinstance(queue_observations, list):
+        queue_observations = []
+    externally_active_queue = False
+    for observation in queue_observations:
+        snapshot = (
+            observation.get("final_queue_snapshot")
+            if isinstance(observation, dict) else None
+        )
+        if not isinstance(snapshot, dict):
+            continue
+        total = _safe_int(snapshot.get("queue_records"))
+        position = max(
+            _safe_int(snapshot.get("desktop_queue_current")),
+            _safe_int(snapshot.get("desktop_queue_completed")),
+        )
+        if (
+            total > 0
+            and 0 < position < total
+            and str(snapshot.get("desktop_queue_observer_state") or "") == "connected"
+        ):
+            externally_active_queue = True
+            break
     # A cooperative cancellation can land after AnythingLLM has attached a
     # source window but before every location in that window has exact vector
     # proof.  That is deliberately a recoverable boundary, not an internal
@@ -426,6 +449,16 @@ def audit_run_directory(
         and str(recovery.get("state") or "") == "resume_available"
         and bool(remaining)
     )
+    external_queue_pending_recovery = (
+        report_status == "reconciliation_pending"
+        and has_held_source
+        and str(recovery.get("state") or "") == "resume_available"
+        and bool(remaining)
+        and externally_active_queue
+    )
+    pending_recovery_is_not_count_contradiction = (
+        cancelled_pending_recovery or external_queue_pending_recovery
+    )
     _add(findings, accepted > requested, "AUDIT-EMBEDDING-COUNT-001",
          "Accepted embedding records exceed requested records.", "batch-embedding-ledger.json")
     _add(findings, requested and requested != report_uploaded, "AUDIT-CROSS-COUNT-001",
@@ -438,6 +471,12 @@ def audit_run_directory(
             "the recovery manifest must be reviewed before resuming.",
             "batch-embedding-ledger.json",
         ))
+    elif external_queue_pending_recovery:
+        findings.append(Finding(
+            "AUDIT-EXTERNAL-QUEUE-OBSERVATION-001", "warning",
+            "AnythingLLM was still processing this run's held page-parent records when assistant-side observation ended; exact vector evidence was incomplete.",
+            "batch-embedding-ledger.json",
+        ))
     else:
         _add(findings, accepted and accepted != accepted_target, "AUDIT-CROSS-COUNT-002",
              "Embedding accepted count disagrees with the records submitted by this run.", "batch-embedding-ledger.json")
@@ -448,7 +487,7 @@ def audit_run_directory(
              "Source transaction uploaded totals disagree with the batch report.",
              "source-transaction-ledger.json")
         source_embedded_target = report_uploaded if document_summary.get("present") else report_embedded
-        if not cancelled_pending_recovery:
+        if not pending_recovery_is_not_count_contradiction:
             _add(findings, source_summary["confirmed_vector_records"] != source_embedded_target,
                  "AUDIT-CROSS-SOURCE-002",
                  "Source transaction vector totals disagree with this run's submitted-record total.",
@@ -485,7 +524,7 @@ def audit_run_directory(
     warning_count = sum(1 for item in findings if item.severity == "warning")
     audit_status = (
         "fail" if error_count
-        else "recovery_required" if cancelled_pending_recovery
+        else "recovery_required" if pending_recovery_is_not_count_contradiction
         else "active" if active
         else "pass"
     )
@@ -525,6 +564,13 @@ def audit_run_directory(
                 "exactly_confirmed_records": report_embedded,
                 "unresolved_records": max(0, report_uploaded - report_embedded),
                 "held_source": source_summary.get("held_at_source"),
+            },
+            "external_queue_reconciliation": {
+                "required": external_queue_pending_recovery,
+                "queue_was_active": externally_active_queue,
+                "newly_attached_records": report_uploaded,
+                "exactly_confirmed_records": report_embedded,
+                "unresolved_records": max(0, report_uploaded - report_embedded),
             },
             "error_findings": error_count,
             "warning_findings": warning_count,
