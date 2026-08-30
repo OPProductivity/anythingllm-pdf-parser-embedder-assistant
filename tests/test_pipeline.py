@@ -1863,26 +1863,31 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn("Two PDFs were not processed", rendered)
         self.assertNotIn("AUTO-OCR-REVIEW-PARTIAL-001", rendered)
 
-    def test_live_queue_status_labels_submitted_pdfs_until_exact_vectors_complete(self):
+    def test_live_queue_status_distinguishes_acceptance_from_exact_vectors(self):
         import rag_pdf_gradio_app as app
 
         rendered = app.automatic_live_status_html({
             "state": "running",
             "phase": "Submitting the selected PDF batch to AnythingLLM",
             "evidence_kind": "desktop_queue",
+            "batch_accepted_files": 56,
             "batch_completed_files": 54,
             "batch_total_files": 60,
             "confirmed_fraction": .75,
             "started_epoch": time.time() - 20,
             "details": "AnythingLLM queue group 16 of 18 (4 PDFs)",
         })
-        self.assertIn("PDFs submitted: 54/60 · vectors pending", rendered)
+        self.assertIn(
+            "PDFs accepted by AnythingLLM: 56/60 · vectors confirmed: 54/60",
+            rendered,
+        )
         self.assertNotIn("PDFs completed: 16/60", rendered)
 
         exact = app.automatic_live_status_html({
             "state": "running",
             "phase": "Checking workspace attachment",
             "evidence_kind": "exact_vector_observation",
+            "batch_accepted_files": 60,
             "batch_completed_files": 60,
             "batch_total_files": 60,
             "completed_units": 340,
@@ -1891,6 +1896,53 @@ class PipelineCoreTests(unittest.TestCase):
             "started_epoch": time.time() - 20,
         })
         self.assertIn("PDFs with vectors confirmed: 60/60", exact)
+
+    def test_grouped_source_progress_keeps_accepted_and_exact_source_counts_separate(self):
+        import rag_pdf_gradio_app as app
+
+        state = {}
+        app.grouped_source_window_progress(state, {
+            "timing_event": "batch_cache_lookup_completed",
+            "selected_records": 40,
+            "selected_documents": 8,
+        })
+        first_exact = app.grouped_source_window_progress(state, {
+            "timing_event": "exact_vector_reconciliation_complete",
+            "source_window_index": 1,
+            "source_window_total": 8,
+            "source_queue_group_index": 1,
+            "source_queue_group_sources": 4,
+            "queue_records": 20,
+            "desktop_queue_completed": 20,
+        })
+        current = app.grouped_source_window_progress(state, {
+            "timing_event": "queue_progress",
+            "source_window_index": 5,
+            "source_window_total": 8,
+            "source_queue_group_index": 2,
+            "source_queue_group_sources": 4,
+            "queue_records": 20,
+            "desktop_queue_completed": 7,
+        })
+        self.assertEqual(first_exact["accepted_sources"], 4)
+        self.assertEqual(first_exact["vector_confirmed_sources"], 4)
+        self.assertEqual(current["accepted_sources"], 8)
+        self.assertEqual(current["vector_confirmed_sources"], 4)
+        rendered = app.automatic_live_status_html({
+            "state": "running",
+            "phase": "Submitting the selected PDF batch to AnythingLLM",
+            "evidence_kind": "desktop_queue",
+            "batch_accepted_files": current["accepted_sources"],
+            "batch_completed_files": current["vector_confirmed_sources"],
+            "batch_total_files": current["source_total"],
+            "completed_units": current["completed_records"],
+            "total_units": current["total_records"],
+            "started_epoch": time.time() - 10,
+        })
+        self.assertIn(
+            "PDFs accepted by AnythingLLM: 8/8 · vectors confirmed: 4/8",
+            rendered,
+        )
 
     def test_ocr_hold_completion_does_not_count_exact_duplicates_as_submitted(self):
         import rag_pdf_gradio_app as app
@@ -3826,6 +3878,8 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(first["remaining_source_windows"], 37)
         self.assertEqual(repeated["remaining_provider_requests"], 2_576)
         self.assertEqual(context["observed_records"], 11)
+        self.assertEqual(first["observed_cached_records"], 11)
+        self.assertEqual(first["observed_cached_source_windows"], 1)
         self.assertFalse(context["suppress_combined_queue_rate"])
         self.assertTrue(first["cache_segments_exact"])
 
@@ -4357,7 +4411,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(second["fraction"], 16 / 30)
         self.assertEqual(second["completed_sources"], 1)
 
-    def test_grouped_source_progress_uses_exact_batch_plan_not_late_local_total(self):
+    def test_grouped_source_progress_uses_exact_batch_plan_without_crediting_cache_as_complete(self):
         import rag_pdf_gradio_app as app
 
         state = {}
@@ -4385,10 +4439,71 @@ class PipelineCoreTests(unittest.TestCase):
             "searchability_proven": True,
         })
         self.assertEqual(current["total_records"], 4263)
-        self.assertEqual(current["completed_records"], 4263)
-        self.assertEqual(current["fraction"], 1.0)
-        self.assertEqual(current["completed_sources"], 54)
+        # Reusable staged locations are a cheaper queue plan, not completed
+        # Desktop or vector work. One proved group therefore advances only
+        # its own 167 records and four PDFs.
+        self.assertEqual(current["completed_records"], 167)
+        self.assertEqual(current["fraction"], 167 / 4263)
+        self.assertEqual(current["completed_sources"], 4)
         self.assertEqual(current["source_total"], 60)
+
+    def test_grouped_source_progress_keeps_batch_denominator_when_local_callback_repeats_selected_counts(self):
+        """A local PDF/group report must never replace the all-batch x/y unit."""
+        import rag_pdf_gradio_app as app
+
+        state = {}
+        app.grouped_source_window_progress(state, {
+            "timing_event": "batch_cache_lookup_completed",
+            "selected_records": 666,
+            "selected_documents": 13,
+            "cache_eligible_records": 280,
+            "cache_eligible_documents": 7,
+        })
+        current = app.grouped_source_window_progress(state, {
+            "timing_event": "queue_progress",
+            "source_window_index": 5,
+            "source_window_total": 13,
+            "source_queue_group_index": 2,
+            "source_queue_group_sources": 4,
+            "selected_records": 28,  # local source-window count
+            "selected_documents": 1,
+            "queue_records": 507,
+            "desktop_queue_completed": 319,
+        })
+        self.assertEqual(current["completed_records"], 319)
+        self.assertEqual(current["total_records"], 666)
+        self.assertEqual(current["counter_scope"], "all_selected_queue_records")
+
+    def test_grouped_source_progress_never_double_counts_cache_and_queue_evidence(self):
+        import rag_pdf_gradio_app as app
+
+        state = {}
+        app.grouped_source_window_progress(state, {
+            "timing_event": "batch_cache_lookup_completed",
+            "selected_records": 20,
+            "selected_documents": 2,
+            "cache_eligible_records": 10,
+            "cache_eligible_documents": 1,
+        })
+        current = app.grouped_source_window_progress(state, {
+            "timing_event": "queue_progress",
+            "source_window_index": 1,
+            "source_window_total": 2,
+            "source_queue_group_index": 1,
+            "source_queue_group_sources": 1,
+            "queue_records": 10,
+            "desktop_queue_completed": 5,
+        })
+        self.assertEqual(current["completed_records"], 5)
+        self.assertEqual(current["total_records"], 20)
+        self.assertEqual(current["fraction"], .25)
+
+    def test_non_prefix_cache_positions_do_not_label_a_fresh_queue_record_as_cached(self):
+        import auto_anythingllm_pipeline as pipeline
+
+        self.assertTrue(pipeline.queue_position_is_cache_eligible(1, {1, 3}))
+        self.assertFalse(pipeline.queue_position_is_cache_eligible(2, {1, 3}))
+        self.assertTrue(pipeline.queue_position_is_cache_eligible(3, {1, 3}))
 
     def test_grouped_upload_owns_late_worker_queue_progress(self):
         import rag_pdf_gradio_app as app
@@ -4471,7 +4586,25 @@ class PipelineCoreTests(unittest.TestCase):
         report = app.explicit_upload_count_schema({"uploaded": 3, "embedded": 11})
         self.assertEqual(report["newly_attached_records"], 3)
         self.assertEqual(report["confirmed_vector_records"], 11)
+        self.assertEqual(report["vector_confirmed_records"], 11)
         self.assertIn("legacy alias", report["count_semantics"]["uploaded"])
+
+    def test_upload_count_schema_does_not_replace_explicit_zero_with_legacy_alias(self):
+        import rag_pdf_gradio_app as app
+
+        report = app.explicit_upload_count_schema({
+            "status": "complete",
+            "selected_records": 0,
+            "newly_attached_records": 0,
+            "uploaded": 9,
+            "vector_confirmed_records": 0,
+            "embedded": 9,
+        })
+        self.assertEqual(report["newly_attached_records"], 0)
+        self.assertEqual(report["vector_confirmed_records"], 0)
+        self.assertEqual(report["uploaded"], 0)
+        self.assertEqual(report["embedded"], 0)
+        self.assertEqual(report["count_alias_conflicts"][0]["legacy_key"], "uploaded")
 
     def test_success_receipt_surfaces_nonblocking_visual_text_review(self):
         import rag_pdf_gradio_app as app
@@ -5310,6 +5443,54 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(second["remaining_records"], 40)
         self.assertEqual(second["observed_windows"], 2)
 
+    def test_queue_live_evidence_weight_requires_group_and_callback_coverage(self):
+        import rag_pdf_gradio_app as app
+
+        # A large first group cannot become representative merely by having
+        # 120 completed records.  The historical lane remains the majority.
+        single_group = app.queue_eta_live_evidence_weight(120, 24, 1, 4)
+        self.assertLess(single_group["evidence_weight"], 0.5)
+        self.assertAlmostEqual(single_group["group_coverage"], 1 / 3)
+
+        # Once three queue groups and enough callbacks agree, the live run has
+        # stronger evidence than the old fixed 65 percent ceiling allowed.
+        broad = app.queue_eta_live_evidence_weight(120, 24, 3, 4)
+        self.assertEqual(broad["evidence_weight"], 0.85)
+        self.assertEqual(broad["group_coverage"], 1.0)
+
+        # One actual whole-run group has no unseen source whose cadence could
+        # invalidate the observation, so it may earn the same confidence.
+        whole_run = app.queue_eta_live_evidence_weight(120, 24, 1, 1)
+        self.assertEqual(whole_run["evidence_weight"], 0.85)
+
+        # Sparse evidence remains weak even when it came from more than one
+        # source group.
+        sparse = app.queue_eta_live_evidence_weight(12, 12, 2, 4)
+        self.assertLess(sparse["evidence_weight"], 0.1)
+
+    def test_queue_forecast_exposes_live_evidence_coverage(self):
+        import rag_pdf_gradio_app as app
+
+        context = {"prepared_records": 400}
+        forecast = app.observe_batch_queue_forecast(
+            context,
+            {
+                "source_path": "first-large.pdf",
+                "source_window_index": 1,
+                "source_window_total": 4,
+                "queue_records": 120,
+                "desktop_queue_completed": 120,
+                "desktop_queue_events_observed": 24,
+                "desktop_queue_records_per_minute": 60,
+            },
+            elapsed_seconds=120,
+            provider_request_seconds_prior=3.0,
+        )
+
+        self.assertLess(forecast["evidence_weight"], 0.5)
+        self.assertEqual(forecast["effective_event_samples"], 24)
+        self.assertAlmostEqual(forecast["group_coverage"], 1 / 3, places=4)
+
     def test_mature_queue_reprice_moves_the_eta_in_bounded_readable_steps(self):
         import rag_pdf_gradio_app as app
 
@@ -5365,7 +5546,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(stable["raw_forecast_seconds"], 820)
         self.assertEqual(stable["expected_seconds"], 820)
         # A sub-threshold change is deliberately not shown as a recalculation.
-        self.assertIsNone(app.stable_queue_eta_reprice(1_000, [940, 950, 960, 970, 980]))
+        self.assertIsNone(app.stable_queue_eta_reprice(1_000, [980, 985, 990, 995, 1_000]))
 
     def test_queue_reprice_rebases_timed_samples_and_limits_a_strong_rate_reversal(self):
         import rag_pdf_gradio_app as app
@@ -5453,6 +5634,35 @@ class PipelineCoreTests(unittest.TestCase):
             "not_a_downward_forecast",
         )
 
+    def test_early_downward_eta_reprice_uses_twenty_second_floor_or_three_percent(self):
+        import rag_pdf_gradio_app as app
+
+        # On a short run, a corroborated 25-second improvement is useful and
+        # should no longer be hidden behind the former 90-second floor.
+        applied = app.early_downward_queue_eta_reprice(
+            600,
+            [570, 575, 580, 575],
+            observed_windows=2,
+            current_elapsed=100,
+            confirmed_fraction=.5,
+        )
+        self.assertEqual(applied["status"], "applied")
+        self.assertEqual(applied["expected_seconds"], 575)
+        # A ten-second wobble remains below both the 20-second floor and the
+        # 3% proportional requirement for this estimate.
+        suppressed = app.early_downward_queue_eta_reprice(
+            600,
+            [588, 590, 592, 590],
+            observed_windows=2,
+            current_elapsed=100,
+            confirmed_fraction=.5,
+        )
+        self.assertEqual(suppressed["status"], "suppressed")
+        self.assertEqual(
+            suppressed["suppression_reason"],
+            "bounded_change_below_material_threshold",
+        )
+
     def test_representative_whole_run_queue_reprice_needs_exact_plan_and_two_agreeing_samples(self):
         import rag_pdf_gradio_app as app
 
@@ -5527,6 +5737,55 @@ class PipelineCoreTests(unittest.TestCase):
             observed_windows=2,
         )
         self.assertEqual(short_run["expected_seconds"], 397)
+
+    def test_suppressed_upward_eta_reprice_retains_vote_diagnostics(self):
+        import rag_pdf_gradio_app as app
+
+        # Three of five forecasts clear the upward threshold: this is useful
+        # evidence, but deliberately not enough to rewrite a batch ETA.
+        decision = app.stable_queue_eta_reprice(
+            779,
+            [
+                {"elapsed_seconds": 60, "forecast_seconds": 850},
+                {"elapsed_seconds": 90, "forecast_seconds": 840},
+                {"elapsed_seconds": 120, "forecast_seconds": 830},
+                {"elapsed_seconds": 150, "forecast_seconds": 700},
+                {"elapsed_seconds": 180, "forecast_seconds": 710},
+            ],
+            observed_windows=2,
+            current_elapsed=180,
+            return_decision=True,
+        )
+        self.assertEqual(
+            decision["suppression_reason"],
+            "upward_change_lacks_four_sample_consensus",
+        )
+        self.assertEqual(decision["upward_vote_count"], 3)
+        self.assertEqual(decision["upward_required_votes"], 4)
+        self.assertGreater(decision["upward_threshold_seconds"], 779)
+
+        context = app.queue_eta_decision_context(
+            [
+                {"elapsed_seconds": 60, "forecast_seconds": 850},
+                {"elapsed_seconds": 90, "forecast_seconds": 840},
+                {"elapsed_seconds": 120, "forecast_seconds": 830},
+                {"elapsed_seconds": 150, "forecast_seconds": 700},
+                {"elapsed_seconds": 180, "forecast_seconds": 710},
+            ],
+            decision,
+            {
+                "batch_cache_plan_observed": True,
+                "known_fresh_records": 452,
+                "remaining_records": 333,
+                "cache_unknown_records": 0,
+                "observed_windows": 2,
+            },
+        )
+        self.assertEqual(context["forecast_samples_retained"], 5)
+        self.assertEqual(context["forecast_samples_used"], 5)
+        self.assertEqual(context["upward_vote_count"], 3)
+        self.assertTrue(context["batch_cache_plan_observed"])
+        self.assertEqual(context["remaining_fresh_records"], 333)
 
     def test_concurrent_ingestion_progress_uses_eta_floor_and_evidence_ceiling(self):
         import rag_pdf_gradio_app as app
@@ -20345,6 +20604,61 @@ class PipelineCoreTests(unittest.TestCase):
             "batch_exact_vector_confirmation_stalled_after_queue_completion",
         )
         self.assertIn("2/3 exact page-parent vectors", captured["verification"]["message"])
+
+    def test_grouped_batch_verifier_keeps_exact_reconciliation_when_status_callback_fails(self):
+        """A Gradio/progress callback has no authority to abort an owned queue."""
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            text_file = root / "prepared.txt"
+            text_file.write_text("prepared", encoding="utf-8")
+            plan_file = root / "upload-plan.csv"
+            plan_file.write_text(
+                "filename,title,docAuthor,description,docSource,chunkSource,text_file\n"
+                "page-1.txt,Page 1,,,local-pdf://sha256/callback,callback-p0001," + str(text_file) + "\n",
+                encoding="utf-8",
+            )
+            summary = {
+                "pdf": str(root / "callback.pdf"),
+                "source_sha256": "callback",
+                "native_upload_plan": str(plan_file),
+                "native_upload_transport": "file_upload",
+            }
+            captured = {}
+
+            def fake_verify(*_args, **_kwargs):
+                return {
+                    "status": "pass",
+                    "matching_vector_rows": 1,
+                    "lancedb_matching_rows": 1,
+                    "current_upload_document_vector_count": 1,
+                    "current_upload_vector_evidence_complete": True,
+                }
+
+            def fake_upload(*_args, **kwargs):
+                captured["verification"] = kwargs["batch_verifier"]({
+                    "start_index": 0, "end_index": 1,
+                    "locations": ["custom-documents/callback.json"],
+                })
+                return {"status": "complete", "uploaded": 1, "embedded": 1,
+                    "attachment_results": [], "embedding_update": {"batches": []}}
+
+            def status_callback(message, _report):
+                if "Confirming exact workspace vectors" in str(message):
+                    raise RuntimeError("presentation failed")
+
+            with mock.patch.object(app, "maybe_upload_to_anythingllm", side_effect=fake_upload), mock.patch.object(
+                app, "verify_anythingllm_post_upload", side_effect=fake_verify
+            ):
+                app.upload_prepared_automatic_batch(
+                    [summary], api_url="http://anythingllm", api_key="key",  # pragma: allowlist secret -- synthetic upload fixture
+                    workspace_slug="workspace", run_root=root / "run",
+                    status_callback=status_callback,
+                )
+
+        self.assertEqual(captured["verification"]["status"], "pass")
+        self.assertEqual(captured["verification"]["observer_callback_errors"][0]["exception_type"], "RuntimeError")
 
     def test_grouped_upload_outcome_rewrites_staged_per_document_reports(self):
         import rag_pdf_gradio_app as app

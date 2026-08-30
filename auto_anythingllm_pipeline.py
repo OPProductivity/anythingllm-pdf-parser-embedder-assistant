@@ -33,6 +33,7 @@ import subprocess
 import tempfile
 import time
 import threading
+import traceback
 import unicodedata
 import urllib.error
 import urllib.parse
@@ -10453,6 +10454,186 @@ def find_reusable_cached_document_locations(
     return reusable
 
 
+def build_reusable_cached_document_snapshot(storage_dir):
+    """Build one read-only candidate index for incremental ETA observations.
+
+    This is deliberately *not* an upload decision.  During preparation it
+    lets the UI price cache-backed page parents as soon as their exact payload
+    is known, without scanning the SQLite document index once per PDF.  The
+    normal full ``find_reusable_cached_document_locations`` call immediately
+    before mutation remains the sole authority for cache reuse: another local
+    client may add or remove a document while preparation is in progress.
+
+    A snapshot is usable only when the attached-document SQLite index and the
+    current vector-cache directory were both read successfully.  An unavailable
+    index is intentionally reported as unavailable rather than interpreted as
+    a zero-cache plan, so an ETA never claims negative evidence it does not
+    possess.
+    """
+    snapshot = {
+        "status": "unavailable",
+        "storage_dir": str(storage_dir or ""),
+        "documents_root": "",
+        "custom_documents": "",
+        "cache_entry_names": set(),
+        "locations_by_chunk_source": {},
+        "claimed_locations": set(),
+        "created_epoch": time.time(),
+        "error": "",
+    }
+    if not storage_dir:
+        snapshot["error"] = "storage directory was not supplied"
+        return snapshot
+    con = None
+    try:
+        storage = Path(storage_dir)
+        documents_root = (storage / "documents").resolve()
+        custom_documents = (documents_root / "custom-documents").resolve()
+        cache_dir = storage / "vector-cache"
+        if (
+            not custom_documents.is_dir()
+            or not custom_documents.is_relative_to(documents_root)
+            or not cache_dir.is_dir()
+        ):
+            snapshot["error"] = "Desktop documents or vector-cache directory is unavailable"
+            return snapshot
+        db_path = storage / "anythingllm.db"
+        if not db_path.is_file():
+            snapshot["error"] = "AnythingLLM document index is unavailable"
+            return snapshot
+        cache_entry_names = {
+            path.stem for path in cache_dir.glob("*.json") if path.is_file()
+        }
+        con = sqlite_readonly_connection(db_path)
+        locations_by_chunk_source = {}
+        for docpath, raw_metadata in con.execute(
+            "select docpath, metadata from workspace_documents where docpath is not null"
+        ):
+            try:
+                metadata = (
+                    raw_metadata
+                    if isinstance(raw_metadata, dict)
+                    else json.loads(str(raw_metadata or "{}"))
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(metadata, dict):
+                continue
+            chunk_source = str(metadata.get("chunkSource") or "").strip()
+            location = str(docpath or "").replace("\\", "/").strip("/")
+            if chunk_source and location:
+                locations_by_chunk_source.setdefault(chunk_source, set()).add(location)
+        snapshot.update(
+            status="ready",
+            documents_root=str(documents_root),
+            custom_documents=str(custom_documents),
+            cache_entry_names=cache_entry_names,
+            locations_by_chunk_source=locations_by_chunk_source,
+        )
+    except (sqlite3.Error, OSError, TypeError, ValueError) as exc:
+        snapshot["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        if con is not None:
+            con.close()
+    return snapshot
+
+
+def find_reusable_cached_document_locations_from_snapshot(
+    snapshot,
+    payloads,
+    *,
+    folder_names=None,
+):
+    """Return exact cache matches using a prior read-only candidate snapshot.
+
+    The returned locations are evidence for ETA only.  The same complete
+    content/provenance digest and destination-folder checks as the authoritative
+    lookup are performed here; only the candidate index and vector-cache names
+    are intentionally frozen.  Claimed locations are kept in selection order
+    so two selected PDFs cannot both receive ETA credit for one raw document.
+    """
+    rows = list(payloads or [])
+    reusable = [""] * len(rows)
+    if not rows or not isinstance(snapshot, dict) or snapshot.get("status") != "ready":
+        return reusable
+    if folder_names is None:
+        raw_folders = ["custom-documents"] * len(rows)
+    else:
+        raw_folders = list(folder_names)
+        if len(raw_folders) != len(rows):
+            return reusable
+    expected_folders = [
+        str(folder or "custom-documents").replace("\\", "/").strip("/").casefold()
+        for folder in raw_folders
+    ]
+    try:
+        documents_root = Path(str(snapshot.get("documents_root") or "")).resolve()
+        custom_documents = Path(str(snapshot.get("custom_documents") or "")).resolve()
+        if not custom_documents.is_dir() or not custom_documents.is_relative_to(documents_root):
+            return reusable
+        cache_entry_names = set(snapshot.get("cache_entry_names") or ())
+        locations_by_chunk_source = snapshot.get("locations_by_chunk_source") or {}
+        claimed_locations = snapshot.setdefault("claimed_locations", set())
+        if not isinstance(claimed_locations, set):
+            claimed_locations = set(claimed_locations or ())
+            snapshot["claimed_locations"] = claimed_locations
+        candidates_by_key = {}
+        expected_chunk_sources = {
+            str((payload.get("metadata") or {}).get("chunkSource") or "").strip()
+            for payload in rows
+            if isinstance(payload, dict)
+        }
+        for chunk_source in sorted(value for value in expected_chunk_sources if value):
+            for location in sorted(locations_by_chunk_source.get(chunk_source) or ()):
+                if location in claimed_locations:
+                    continue
+                try:
+                    if str(uuid.uuid5(uuid.NAMESPACE_URL, location)) not in cache_entry_names:
+                        continue
+                    candidate = documents_root / Path(location)
+                    if candidate.is_symlink():
+                        continue
+                    resolved_candidate = candidate.resolve()
+                    if not resolved_candidate.is_relative_to(custom_documents):
+                        continue
+                    relative = resolved_candidate.relative_to(documents_root).as_posix()
+                    relative_folder = Path(relative).parent.as_posix().casefold()
+                    raw_document = json.loads(resolved_candidate.read_bytes())
+                    if not isinstance(raw_document, dict):
+                        continue
+                    existing_key = hashlib.sha256(
+                        json.dumps(
+                            {
+                                "pageContent": str(raw_document.get("pageContent") or ""),
+                                "title": str(raw_document.get("title") or ""),
+                                "docAuthor": str(raw_document.get("docAuthor") or ""),
+                                "description": str(raw_document.get("description") or ""),
+                                "docSource": str(raw_document.get("docSource") or ""),
+                                "chunkSource": str(raw_document.get("chunkSource") or ""),
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    candidates_by_key.setdefault(existing_key, []).append((relative, relative_folder))
+                except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                    continue
+        for index, payload in enumerate(rows):
+            expected_folder = expected_folders[index]
+            for location, actual_folder in sorted(
+                candidates_by_key.get(_page_parent_payload_reuse_key(payload), [])
+            ):
+                if actual_folder != expected_folder or location in claimed_locations:
+                    continue
+                reusable[index] = location
+                claimed_locations.add(location)
+                break
+    except (OSError, TypeError, ValueError):
+        return reusable
+    return reusable
+
+
 def find_exact_staged_document_candidates(storage_dir, payload, *, excluded_locations=None):
     """Find exact raw documents without requiring a vector-cache entry.
 
@@ -14202,7 +14383,17 @@ def _update_workspace_embeddings_batched_serial(
                     else {}
                 )
             except Exception as exc:
-                verification = {"status": "error", "error": str(exc)}
+                # A verifier must return structured evidence. Preserve the
+                # complete local traceback in the existing ledger/report so a
+                # future observer defect is diagnosable; the former one-line
+                # NoneType.get error lost the only information needed to repair
+                # a live queue recovery.
+                verification = {
+                    "status": "error",
+                    "error": str(exc),
+                    "exception_type": type(exc).__name__,
+                    "traceback": traceback.format_exc(),
+                }
             batch_report["verification_seconds"] = round(time.perf_counter() - verification_started, 4)
             batch_report["verification"] = verification
             if verification.get("reconciliation_effective_deadline_seconds") is not None:
@@ -15192,6 +15383,11 @@ def update_workspace_embeddings_desktop_queue(
                 "desktop_queue_records_per_minute": round(records_per_second * 60.0, 3) if records_per_second else None,
                 "desktop_queue_estimated_remaining_seconds": remaining_seconds,
                 "desktop_queue_cached_records": cached_records,
+                "desktop_queue_current_is_cache_eligible": bool(
+                    queue_position_is_cache_eligible(
+                        current, queue_state["cached_record_positions"]
+                    )
+                ),
                 "desktop_queue_fresh_completed": fresh_completed,
                 "desktop_queue_active_fresh_records_per_minute": (
                     round(fresh_records_per_second * 60.0, 3)
@@ -15223,7 +15419,7 @@ def update_workspace_embeddings_desktop_queue(
             )
             return f"Desktop completed {completed}/{requested} {normalized_record_label}{cache_detail}{forecast}"
         if current:
-            if cached_records >= current:
+            if bool(snapshot.get("desktop_queue_current_is_cache_eligible")):
                 return (
                     f"Desktop is reusing cached embeddings and writing {current}/{requested} "
                     f"{normalized_record_label} to this workspace"
@@ -15502,6 +15698,34 @@ def update_workspace_embeddings_desktop_queue(
         "first_queue_progress_epoch": float(queue_state.get("first_progress_epoch") or 0.0),
     }
     return result
+
+
+def reused_cached_document_count(attachment_results, reused_cached_locations):
+    """Return a document count, never a page-parent location count.
+
+    The low-level transport can serve one source or several; retain the
+    source identity whenever it is available and otherwise conservatively
+    report one document for a nonempty single-call cache reuse set.
+    """
+    source_paths = {
+        str(item.get("source_path") or "").strip()
+        for item in (attachment_results or [])
+        if isinstance(item, dict)
+        and str(item.get("status") or "") == "reused_cached_location"
+        and str(item.get("source_path") or "").strip()
+    }
+    if source_paths:
+        return len(source_paths)
+    return int(bool(reused_cached_locations))
+
+
+def queue_position_is_cache_eligible(position, cached_record_positions):
+    """Return cache status for this queue position, not a cached-count prefix."""
+    try:
+        current = int(position)
+    except (TypeError, ValueError):
+        return False
+    return current > 0 and current in set(cached_record_positions or ())
 
 
 def maybe_upload_payloads(
@@ -15793,7 +16017,13 @@ def maybe_upload_payloads(
         "embedded": embedded,
         "locations": locations,
         "reused_cached_locations": reused_cached_locations,
-        "reused_cached_documents": len(reused_cached_locations),
+        "reused_cached_record_count": len(reused_cached_locations),
+        "reused_cached_document_count": reused_cached_document_count(
+            attachment_results, reused_cached_locations
+        ),
+        "reused_cached_documents": reused_cached_document_count(
+            attachment_results, reused_cached_locations
+        ),
         "attachment_results": attachment_results,
         "embedding_update": embedding_update,
         "transport": "raw_text",
@@ -16377,7 +16607,13 @@ def maybe_upload_segment_files(
         "embedded": embedded,
         "locations": locations,
         "reused_cached_locations": reused_cached_locations,
-        "reused_cached_documents": len(reused_cached_locations),
+        "reused_cached_record_count": len(reused_cached_locations),
+        "reused_cached_document_count": reused_cached_document_count(
+            attachment_results, reused_cached_locations
+        ),
+        "reused_cached_documents": reused_cached_document_count(
+            attachment_results, reused_cached_locations
+        ),
         "cache_location_lookup": cache_location_lookup,
         "attachment_results": attachment_results,
         "embedding_update": embedding_update,
@@ -16534,6 +16770,8 @@ def maybe_upload_segment_files_source_transactions(
             {
                 "timing_event": "batch_cache_lookup_started",
                 "prepared_records": len(rows),
+                "selected_records": len(rows),
+                "selected_documents": len(grouped),
                 # The coordinator's exact batch plan is deliberately named
                 # separately from worker-local preparation totals. A later
                 # local callback can include a held or skipped PDF and must
@@ -16580,8 +16818,15 @@ def maybe_upload_segment_files_source_transactions(
             {
                 "timing_event": "batch_cache_lookup_completed",
                 "prepared_records": len(rows),
+                "selected_records": len(rows),
+                "selected_documents": len(grouped),
                 "queue_eligible_records": len(rows),
                 "queue_eligible_sources": len(grouped),
+                # Canonical plan fields. Cache eligibility is deliberately
+                # distinct from queue/vector completion: every reusable
+                # location still enters the Desktop queue for this workspace.
+                "cache_eligible_records": sum(bool(location) for location in reusable_locations),
+                "cache_eligible_documents": cached_document_count,
                 "reusable_records": sum(bool(location) for location in reusable_locations),
                 "cached_documents": cached_document_count,
                 "partially_cached_documents": partially_cached_document_count,
@@ -16594,8 +16839,19 @@ def maybe_upload_segment_files_source_transactions(
         "status": "complete",
         "uploaded": 0,
         "embedded": 0,
+        "selected_records": len(rows),
+        "selected_documents": len(grouped),
+        "cache_eligible_records": sum(bool(location) for location in reusable_locations),
+        "cache_eligible_documents": cached_document_count,
+        "existing_workspace_records": 0,
+        "queue_requested_records": 0,
+        "queue_accepted_records": 0,
+        "queue_completed_records": 0,
+        "vector_confirmed_records": 0,
         "locations": [],
         "reused_cached_locations": [],
+        "reused_cached_record_count": 0,
+        "reused_cached_document_count": 0,
         "reused_cached_documents": 0,
         "attachment_results": [],
         "embedding_update": {
@@ -16720,7 +16976,17 @@ def maybe_upload_segment_files_source_transactions(
                     if str(row.get("chunkSource") or "")
                 ],
                 "planned_records": len(source_rows),
-                    "state": "prepared",
+                "selected_records": len(source_rows),
+                "existing_workspace_records": 0,
+                "queue_requested_records": 0,
+                "queue_accepted_records": 0,
+                "queue_completed_records": 0,
+                "vector_confirmed_records": 0,
+                "cache_eligible_records": sum(
+                    1 for row in source_rows
+                    if str(row.get("_reusable_location_override") or "")
+                ),
+                "state": "prepared",
                     "mutation_scope": "current_source",
                     "source_queue_group_index": queue_group_index,
                     "source_queue_group_total": len(queue_groups),
@@ -16776,6 +17042,8 @@ def maybe_upload_segment_files_source_transactions(
                     "embedded": 0,
                     "newly_attached_records": int(child.get("uploaded") or 0),
                     "confirmed_vector_records": 0,
+                    "vector_confirmed_records": 0,
+                    "reused_cached_record_count": len(child.get("reused_cached_locations") or []),
                     "locations": list(child.get("locations") or []),
                     "errors": list(child.get("errors") or []),
                 })
@@ -16844,6 +17112,30 @@ def maybe_upload_segment_files_source_transactions(
                 if not callable(status_callback):
                     return
                 contextual = dict(report or {})
+                # Every status consumer receives canonical queue evidence.
+                # Preserve zero as an actual observation rather than falling
+                # through to an unrelated legacy alias.
+                requested_value = (
+                    contextual.get("queue_records")
+                    if "queue_records" in contextual
+                    else contextual.get("requested", 0)
+                )
+                if not isinstance(requested_value, (int, float, str)):
+                    requested_value = 0
+                try:
+                    requested_count = max(0, int(requested_value))
+                except (TypeError, ValueError):
+                    requested_count = 0
+                try:
+                    completed_value = max(
+                        0,
+                        int(contextual.get("desktop_queue_completed") or 0),
+                        int(contextual.get("desktop_queue_current") or 0),
+                    )
+                except (TypeError, ValueError):
+                    completed_value = 0
+                contextual["queue_requested_records"] = requested_count
+                contextual["queue_completed_records"] = completed_value
                 contextual.update({
                     "source_window_index": first_source_index,
                     "source_window_total": len(grouped),
@@ -16901,7 +17193,16 @@ def maybe_upload_segment_files_source_transactions(
             )
             aggregate["embedding_update"]["accepted"] += int(queue_update.get("accepted") or 0)
             aggregate["embedding_update"]["requested"] += int(queue_update.get("requested") or 0)
-            aggregate["embedding_update"]["queue_records"] += int(queue_update.get("queue_records") or queue_update.get("requested") or 0)
+            queue_record_value = (
+                queue_update.get("queue_records")
+                if "queue_records" in queue_update and queue_update.get("queue_records") is not None
+                else queue_update.get("requested", 0)
+            )
+            try:
+                queue_record_count = max(0, int(queue_record_value))
+            except (TypeError, ValueError):
+                queue_record_count = 0
+            aggregate["embedding_update"]["queue_records"] += queue_record_count
             aggregate["embedding_update"]["planned_locations"].extend(queue_update.get("planned_locations") or queue_locations)
             queue_progress = queue_update.get("progress_observation")
             if isinstance(queue_progress, dict):
@@ -16953,6 +17254,20 @@ def maybe_upload_segment_files_source_transactions(
                 source_locations = list(transaction.get("locations") or [])
                 transaction["embedded"] = len(source_locations) if queue_exact else 0
                 transaction["confirmed_vector_records"] = transaction["embedded"]
+                transaction["vector_confirmed_records"] = transaction["embedded"]
+                transaction["queue_requested_records"] = len(source_locations)
+                # A partial group receipt has no trustworthy per-source
+                # allocation. Leave the source-local count at zero until the
+                # whole group is accepted or the exact-vector verifier can
+                # identify that source's locations.
+                transaction["queue_accepted_records"] = (
+                    len(source_locations)
+                    if int(queue_update.get("accepted") or 0) == len(queue_locations)
+                    else 0
+                )
+                transaction["queue_completed_records"] = (
+                    len(source_locations) if queue_exact else 0
+                )
                 transaction["queue_group_locations"] = source_locations
                 if queue_exact:
                     transaction["state"] = "exact_vectors_proven"
@@ -16981,7 +17296,13 @@ def maybe_upload_segment_files_source_transactions(
             temporary_key_cleanup = cleanup_temporary_desktop_api_key(api_url, temporary_key_id)
 
     aggregate["temporary_key_cleanup"] = temporary_key_cleanup
-    aggregate["reused_cached_documents"] = len(aggregate["reused_cached_locations"])
+    aggregate["reused_cached_record_count"] = len(aggregate["reused_cached_locations"])
+    aggregate["reused_cached_document_count"] = sum(
+        1 for transaction in aggregate["source_transactions"]
+        if int(transaction.get("reused_cached_record_count") or 0) > 0
+    )
+    # Retained readers use this old name; it now has the name's actual unit.
+    aggregate["reused_cached_documents"] = aggregate["reused_cached_document_count"]
     states = [str(item.get("state") or "") for item in aggregate["source_transactions"]]
     if any(state == "ambiguous_external_mutation_held" for state in states):
         aggregate["status"] = "reconciliation_pending"
@@ -16995,10 +17316,29 @@ def maybe_upload_segment_files_source_transactions(
     # v1 artifacts.  Their names are ambiguous in mixed cache/new runs, so
     # every new report also publishes the exact semantics explicitly.
     aggregate["newly_attached_records"] = int(aggregate.get("uploaded") or 0)
-    aggregate["confirmed_vector_records"] = int(aggregate.get("embedded") or 0)
+    aggregate["queue_requested_records"] = int(
+        aggregate.get("embedding_update", {}).get("requested") or 0
+    )
+    aggregate["queue_accepted_records"] = int(
+        aggregate.get("embedding_update", {}).get("accepted") or 0
+    )
+    aggregate["queue_completed_records"] = sum(
+        int(transaction.get("queue_completed_records") or 0)
+        for transaction in aggregate["source_transactions"]
+    )
+    aggregate["vector_confirmed_records"] = int(aggregate.get("embedded") or 0)
+    aggregate["confirmed_vector_records"] = aggregate["vector_confirmed_records"]
     aggregate["count_semantics"] = {
         "uploaded": "legacy alias of newly_attached_records",
-        "embedded": "legacy alias of confirmed_vector_records; includes newly attached and pre-existing selected records",
+        "embedded": "legacy alias of vector_confirmed_records",
+        "selected_records": "all selected page-parent records submitted to this coordinator",
+        "selected_documents": "selected PDF source windows submitted to this coordinator",
+        "cache_eligible_records": "records with reusable staged locations; not queue completion",
+        "cache_eligible_documents": "fully cache-eligible source windows; not workspace-vector proof",
+        "queue_requested_records": "records requested from the Desktop queue",
+        "queue_accepted_records": "records with a Desktop queue acceptance receipt",
+        "queue_completed_records": "records with completed Desktop queue evidence",
+        "vector_confirmed_records": "records with exact searchable-vector proof",
     }
     persist_transactions(finalize_snapshot=True, include_aggregate_embedding=True)
     return aggregate
@@ -22048,7 +22388,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 or 0.0
             )
             if queue_total and (queue_current or queue_completed):
-                if queue_current and cached_records >= queue_current:
+                if queue_current and bool(evidence.get("desktop_queue_current_is_cache_eligible")):
                     queue_detail = (
                         "Desktop queue: reusing cached embeddings and writing "
                         f"{queue_current}/{queue_total} {upload_record_label}; "

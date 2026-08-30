@@ -150,6 +150,154 @@ def test_eta_ui_distinguishes_initial_and_confirmed_cache_plan():
     assert 'data-eta-basis="cache_plan_confirmed"' in confirmed
 
 
+def test_eta_ui_labels_a_prepared_only_cache_snapshot_without_claiming_final_plan():
+    import rag_pdf_gradio_app as app
+
+    rendered = app.automatic_run_timing_html(
+        expected_seconds=90,
+        state="running",
+        started_epoch=100,
+        now=110,
+        eta_basis="prepared_cache_snapshot",
+        cache_reuse_documents=3,
+        cache_total_documents=5,
+        cache_plan_partial=True,
+    )
+
+    assert "3 of 5 prepared documents already cache-backed" in rendered
+    assert 'data-cache-plan-partial="true"' in rendered
+
+
+def test_partial_cache_eta_keeps_unprepared_local_work_in_the_forecast():
+    import rag_pdf_gradio_app as app
+
+    early = app.prepared_cache_snapshot_eta_seconds(
+        3600,
+        120,
+        fresh_provider_requests=600,
+        cached_attachment_records=400,
+        cached_source_windows=4,
+        unprepared_records=600,
+        initial_estimated_records=1000,
+        initial_non_batch_seconds=900,
+        provider_request_seconds=2.0,
+        features={"document_count": 10},
+        cache_attachment_prior={"record_seconds": .08, "source_seconds": 3.0},
+    )
+    late = app.prepared_cache_snapshot_eta_seconds(
+        3600,
+        300,
+        fresh_provider_requests=600,
+        cached_attachment_records=400,
+        cached_source_windows=4,
+        unprepared_records=0,
+        initial_estimated_records=1000,
+        initial_non_batch_seconds=900,
+        provider_request_seconds=2.0,
+        features={"document_count": 10},
+        cache_attachment_prior={"record_seconds": .08, "source_seconds": 3.0},
+    )
+
+    assert 300 < late < early < 3600
+
+
+def test_partial_cache_sample_projects_unknown_records_from_multiple_exact_sources():
+    import rag_pdf_gradio_app as app
+
+    projection = app.prepared_cache_snapshot_projection(
+        fresh_provider_requests=4566,
+        cached_attachment_records=384,
+        unprepared_records=4564,
+        observed_records=386,
+        observed_source_windows=9,
+    )
+
+    # Nine independent PDFs are enough to inform the unknown remainder, but
+    # not enough to claim the observed near-100% record rate outright.
+    assert 0.65 < projection["conservative_cache_fraction"] < 0.75
+    assert projection["projected_cached_unprepared_records"] > 3000
+    assert projection["projected_fresh_unprepared_records"] < 1500
+
+
+def test_partial_cache_eta_uses_conservative_sample_not_all_fresh_unknowns():
+    import rag_pdf_gradio_app as app
+
+    all_fresh_unknowns = app.prepared_cache_snapshot_eta_seconds(
+        10554,
+        96,
+        fresh_provider_requests=4566,
+        cached_attachment_records=384,
+        cached_source_windows=9,
+        unprepared_records=4564,
+        initial_estimated_records=4950,
+        initial_non_batch_seconds=2026,
+        provider_request_seconds=1.722,
+        features={"document_count": 55},
+        cache_attachment_prior={"record_seconds": .08, "source_seconds": 3.0},
+    )
+    sampled = app.prepared_cache_snapshot_eta_seconds(
+        10554,
+        96,
+        fresh_provider_requests=4566,
+        cached_attachment_records=384,
+        cached_source_windows=9,
+        unprepared_records=4564,
+        initial_estimated_records=4950,
+        initial_non_batch_seconds=2026,
+        provider_request_seconds=1.722,
+        features={"document_count": 55},
+        cache_attachment_prior={"record_seconds": .08, "source_seconds": 3.0},
+        observed_records=386,
+        observed_source_windows=9,
+        remaining_source_windows=46,
+    )
+
+    assert sampled < all_fresh_unknowns
+    assert sampled > 96
+
+
+def test_downward_reprice_retains_the_existing_presentation_ratio():
+    import rag_pdf_gradio_app as app
+
+    displayed = app.reprice_presentation_expected_seconds(
+        previous_expected_seconds=10554,
+        previous_presentation_expected_seconds=7388,
+        new_expected_seconds=9885,
+        is_material_reprice=True,
+    )
+    upward = app.reprice_presentation_expected_seconds(
+        previous_expected_seconds=10554,
+        previous_presentation_expected_seconds=7388,
+        new_expected_seconds=12000,
+        is_material_reprice=True,
+    )
+
+    assert displayed < 7388
+    assert displayed == pytest.approx(6920, abs=1)
+    assert upward == 12000
+
+
+def test_live_status_renders_partial_cache_wording_after_the_durable_update():
+    import rag_pdf_gradio_app as app
+
+    with mock.patch.object(app.time, "time", return_value=110.0):
+        rendered = app.automatic_live_status_html({
+            "state": "running",
+            "phase": "Preparing PDF",
+            "confirmed_fraction": .08,
+            "started_epoch": 100.0,
+            "expected_seconds": 700,
+            "presentation_expected_seconds": 490,
+            "eta_basis": "prepared_cache_snapshot",
+            "cache_reuse_records": 384,
+            "cache_reuse_documents": 9,
+            "cache_total_documents": 55,
+            "cache_plan_partial": True,
+        })
+
+    assert "9 of 55 prepared documents already cache-backed" in rendered
+
+
 def test_exact_zero_cache_plan_does_not_claim_cached_documents():
     import rag_pdf_gradio_app as app
 

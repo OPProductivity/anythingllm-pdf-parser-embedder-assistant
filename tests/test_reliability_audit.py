@@ -264,6 +264,56 @@ def test_active_external_queue_is_recovery_required_not_a_count_contradiction(tm
     assert "AUDIT-CROSS-SOURCE-002" not in codes
 
 
+def test_held_queue_without_a_live_observer_is_recovery_not_a_contradiction(tmp_path):
+    """A lost observer cannot turn an unresolved receipt into bad arithmetic."""
+    locations = ["custom-documents/a.json", "custom-documents/b.json"]
+    _write(tmp_path / "run-progress.json", {"state": "failed"})
+    _write(tmp_path / "batch-native-upload-report.json", {
+        "status": "reconciliation_pending", "uploaded": 2, "embedded": 0,
+        "locations": locations,
+    })
+    _write(tmp_path / "batch-embedding-ledger.json", {
+        "requested": 2, "accepted": 0,
+        "recovery": {"state": "resume_available", "remaining_locations": locations},
+        "progress_observations": [],
+    })
+    _write(tmp_path / "source-transaction-ledger.json", {
+        "transaction_count": 1,
+        "transactions": [{
+            "source_index": 1, "planned_records": 2,
+            "state": "ambiguous_external_mutation_held", "uploaded": 2,
+            "embedded": 0, "locations": locations,
+        }],
+        "stopped_after_source_transaction": 1,
+        "stop_reason": "ambiguous_external_mutation_held",
+    })
+
+    audit = audit_run_directory(tmp_path)
+    codes = {row["code"] for row in audit["findings"]}
+
+    assert audit["audit_status"] == "recovery_required"
+    assert "AUDIT-CROSS-SOURCE-002" not in codes
+
+
+def test_reconciliation_pending_partial_counts_are_warning_not_integrity_failure(tmp_path):
+    """A timeout receipt is not a completed-run count invariant."""
+    locations = ["custom-documents/a.json", "custom-documents/b.json"]
+    _write(tmp_path / "run-progress.json", {"state": "failed"})
+    _write(tmp_path / "batch-native-upload-report.json", {
+        "status": "reconciliation_pending", "uploaded": 2, "embedded": 0,
+        "locations": locations,
+    })
+    _write(tmp_path / "batch-embedding-ledger.json", {
+        "requested": 2, "accepted": 0,
+        "recovery": {"state": "not_needed", "remaining_locations": []},
+    })
+
+    audit = audit_run_directory(tmp_path)
+    codes = {row["code"] for row in audit["findings"]}
+    assert "AUDIT-CROSS-COUNT-002" not in codes
+    assert "AUDIT-RECONCILIATION-PENDING-COUNT-001" in codes
+
+
 def test_held_queue_group_cannot_release_a_later_group(tmp_path):
     """Group-aware auditing must still reject work after the held group."""
     _green_run(tmp_path)
@@ -381,6 +431,81 @@ def test_mixed_existing_and_new_records_reconcile_without_false_overcount(tmp_pa
     assert audit["audit_status"] == "pass"
     assert audit["summary"]["newly_attached_records"] == 2
     assert audit["summary"]["confirmed_vector_records"] == 5
+
+
+def test_mixed_existing_and_new_records_reconcile_with_source_transaction_ledger(tmp_path):
+    """The source ledger owns only current-run queue work, not prior vectors."""
+    locations = ["custom-documents/new-1.json", "custom-documents/new-2.json"]
+    _write(tmp_path / "run-progress.json", {
+        "state": "successful", "completed_units": 5, "total_units": 5,
+    })
+    _write(tmp_path / "batch-native-upload-report.json", {
+        "status": "complete",
+        "selected_records": 5,
+        "selected_documents": 2,
+        "newly_attached_records": 2,
+        "vector_confirmed_records": 5,
+        "existing_workspace_records": 3,
+        "uploaded": 2,
+        "embedded": 5,
+        "locations": locations,
+        "document_results": {
+            "existing-source": {
+                "status": "complete", "selected_records": 3,
+                "newly_attached_records": 0, "vector_confirmed_records": 3,
+                "existing_workspace_records": 3,
+            },
+            "new-source": {
+                "status": "complete", "selected_records": 2,
+                "newly_attached_records": 2, "vector_confirmed_records": 2,
+                "existing_workspace_records": 0,
+            },
+        },
+    })
+    _write(tmp_path / "batch-embedding-ledger.json", {
+        "requested": 2, "accepted": 2,
+        "recovery": {"state": "not_needed", "remaining_locations": []},
+    })
+    _write(tmp_path / "source-transaction-ledger.json", {
+        "transaction_count": 1,
+        "transactions": [{
+            "source_index": 1, "selected_records": 2,
+            "state": "exact_vectors_proven", "newly_attached_records": 2,
+            "vector_confirmed_records": 2, "locations": locations,
+        }],
+        "stopped_after_source_transaction": None, "stop_reason": "",
+    })
+
+    audit = audit_run_directory(tmp_path)
+
+    assert audit["audit_status"] == "pass"
+    assert "AUDIT-CROSS-SOURCE-002" not in {row["code"] for row in audit["findings"]}
+
+
+def test_live_progress_trace_rejects_impossible_completed_count(tmp_path):
+    _green_run(tmp_path)
+    (tmp_path / "progress-trace.jsonl").write_text(
+        json.dumps({"completed_units": 69, "total_units": 44}) + "\n",
+        encoding="utf-8",
+    )
+
+    audit = audit_run_directory(tmp_path)
+
+    assert audit["audit_status"] == "fail"
+    assert "AUDIT-PROGRESS-TRACE-COUNT-001" in {row["code"] for row in audit["findings"]}
+
+
+def test_canonical_count_conflicting_with_legacy_alias_fails_closed(tmp_path):
+    _green_run(tmp_path)
+    report = json.loads((tmp_path / "batch-native-upload-report.json").read_text())
+    report["newly_attached_records"] = 0
+    report["vector_confirmed_records"] = 2
+    _write(tmp_path / "batch-native-upload-report.json", report)
+
+    audit = audit_run_directory(tmp_path)
+
+    assert audit["audit_status"] == "fail"
+    assert "AUDIT-COUNT-ALIAS-001" in {row["code"] for row in audit["findings"]}
 
 
 def test_existing_record_claim_without_per_pdf_evidence_fails_closed(tmp_path):

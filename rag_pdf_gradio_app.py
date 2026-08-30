@@ -95,6 +95,7 @@ from auto_anythingllm_pipeline import (
     anythingllm_resolved_state,
     build_ollama_simulation_adapter,
     build_openrouter_simulation_adapter,
+    build_reusable_cached_document_snapshot,
     compatible_output_document_directory,
     compatible_output_document_directories,
     create_validation_workspace,
@@ -108,6 +109,7 @@ from auto_anythingllm_pipeline import (
     finalize_deferred_batch_lean_retention,
     extraction_quality,
     finalize_batch_inspection_context,
+    find_reusable_cached_document_locations_from_snapshot,
     get_anythingllm_metadata_schema,
     infer_author_from_initial_pdf_pages,
     infer_author_from_samples_or_filename,
@@ -1450,12 +1452,15 @@ APP_JS = """
       timer.dataset.runState = "running";
       timer.className = "automatic-run-timing running";
       const initialLabelHasMatured = elapsedMs >= 120000;
-      const basis = timer.dataset.etaBasis === "cache_plan_confirmed"
+      const basis = ["cache_plan_confirmed", "prepared_cache_snapshot"].includes(timer.dataset.etaBasis)
         ? (() => {
             const cachedDocuments = Number(timer.dataset.cacheReuseDocuments || 0);
             const totalDocuments = Number(timer.dataset.cacheTotalDocuments || 0);
+            const partial = timer.dataset.cachePlanPartial === "true";
             return cachedDocuments > 0 && totalDocuments > 0
-              ? ` · ${cachedDocuments} of ${totalDocuments} documents already cached`
+              ? (partial
+                  ? ` · ${cachedDocuments} of ${totalDocuments} prepared documents already cache-backed`
+                  : ` · ${cachedDocuments} of ${totalDocuments} documents already cached`)
               : "";
           })()
         : ["live_observations", "execution_plan_confirmed"].includes(timer.dataset.etaBasis)
@@ -12272,13 +12277,20 @@ PRESENTATION_ETA_CONSERVATISM = 1.20
 QUEUE_ETA_MIN_COMPLETED_RECORDS = 12
 QUEUE_ETA_MIN_EVENT_SAMPLES = 12
 QUEUE_ETA_SAMPLE_INTERVAL_SECONDS = 30.0
+QUEUE_ETA_LIVE_EVIDENCE_MAX_WEIGHT = 0.85
+QUEUE_ETA_LIVE_EVIDENCE_RECORDS = 120
+QUEUE_ETA_LIVE_EVIDENCE_GROUPS = 3
 # A bounded queue group that is the *entire* proved fresh run is different
 # from the first group of a large batch: it has no unseen source whose rate
 # could invalidate the observation. Let two spaced, agreeing mature samples
 # correct that short whole-run case. Large or multi-group runs continue to use
 # the established five-sample / cross-group policy below.
 QUEUE_ETA_REPRESENTATIVE_GROUP_MIN_SAMPLES = 2
-QUEUE_ETA_REPRESENTATIVE_GROUP_REPRICE_INTERVAL_SECONDS = 90.0
+# A whole-run group has no unseen source whose rate could later invalidate the
+# observation.  Two spaced samples are available by roughly one minute, so
+# allow the bounded reprice after 70 seconds instead of holding a stale opening
+# estimate for an additional 20 seconds.
+QUEUE_ETA_REPRESENTATIVE_GROUP_REPRICE_INTERVAL_SECONDS = 70.0
 QUEUE_ETA_REPRESENTATIVE_GROUP_MAX_SAMPLE_SPREAD_RATIO = 0.25
 # A fast queue should not spend another full three-minute visibility interval
 # displaying a deliberately conservative opening estimate once it has already
@@ -12293,7 +12305,11 @@ QUEUE_ETA_EARLY_DOWNWARD_REPRICE_MIN_SAMPLES = 4
 # page-parent requests. This changes only when a forecast becomes visible; it
 # does not alter the classic estimate, timing lanes, or queue observations.
 QUEUE_ETA_REPRICE_INTERVAL_SECONDS = 180.0
-QUEUE_ETA_REPRICE_MIN_CHANGE_SECONDS = 90
+# A downward correction still needs four/five spaced, owned observations and
+# the existing coverage gates.  Twenty seconds gives short runs a useful
+# chance to improve without repainting the clock for ordinary queue jitter;
+# the proportional 3% threshold takes over on longer estimates.
+QUEUE_ETA_REPRICE_MIN_CHANGE_SECONDS = 20
 QUEUE_ETA_REPRICE_MIN_CHANGE_RATIO = 0.03
 QUEUE_ETA_MAX_CHANGE_RATIO = 0.25
 # A slower live provider is real evidence, but an isolated slow source must not
@@ -12358,17 +12374,31 @@ def grouped_source_window_progress(progress_state, report):
         source_total = max(0, int((report or {}).get("source_window_total") or 0))
         queue_group_index = max(0, int((report or {}).get("source_queue_group_index") or 0))
         queue_group_sources = max(0, int((report or {}).get("source_queue_group_sources") or 0))
-        queue_total = max(0, int((report or {}).get("queue_records") or (report or {}).get("requested") or 0))
+        queue_total = _report_nonnegative_count(
+            report, "queue_requested_records", "queue_records", "requested"
+        )
         queue_completed = max(
             0,
+            _report_nonnegative_count(report, "queue_completed_records"),
             int((report or {}).get("desktop_queue_completed") or 0),
             int((report or {}).get("desktop_queue_current") or 0),
             current_source_vector_progress_count(report, expected_records=queue_total),
         )
-        eligible_records = max(0, int((report or {}).get("queue_eligible_records") or 0))
-        eligible_sources = max(0, int((report or {}).get("queue_eligible_sources") or 0))
-        cached_records = max(0, int((report or {}).get("reusable_records") or 0))
-        cached_sources = max(0, int((report or {}).get("cached_documents") or 0))
+        eligible_records = _report_nonnegative_count(
+            report, "selected_records", "queue_eligible_records"
+        )
+        eligible_sources = _report_nonnegative_count(
+            report, "selected_documents", "queue_eligible_sources", "source_window_total"
+        )
+        # Cache eligibility is a cheaper execution plan, not completed queue
+        # or vector work. Keep it in state for wording/ETA only; it must never
+        # be added to the evidence-backed completion numerator.
+        cache_eligible_records = _report_nonnegative_count(
+            report, "cache_eligible_records", "reusable_records"
+        )
+        cache_eligible_sources = _report_nonnegative_count(
+            report, "cache_eligible_documents", "cached_documents"
+        )
     except (TypeError, ValueError):
         (
             source_index,
@@ -12379,25 +12409,34 @@ def grouped_source_window_progress(progress_state, report):
             queue_completed,
             eligible_records,
             eligible_sources,
-            cached_records,
-            cached_sources,
+            cache_eligible_records,
+            cache_eligible_sources,
         ) = (0,) * 10
-    # Only the coordinator's all-batch cache event is allowed to establish the
-    # upload denominator. ``prepared_records`` also appears in late local
-    # worker callbacks and can include held/duplicate PDFs, which previously
-    # made a complete upload look stuck at 79%.
-    if eligible_records:
-        state["eligible_records"] = eligible_records
-    if eligible_sources:
-        state["eligible_sources"] = eligible_sources
-    if cached_records:
-        state["cached_records"] = cached_records
-    if cached_sources:
-        state["cached_sources"] = cached_sources
+    # Only the coordinator's all-batch cache-plan event may establish the
+    # batch denominator. Source-window callbacks also contain
+    # ``selected_records`` and ``selected_documents``, but those values are
+    # intentionally local to one PDF/group. Replacing the all-batch
+    # denominator with one of them while retaining the accumulated numerator
+    # produced impossible trace records such as 64/28.
+    #
+    # The exact plan is immutable for a run: a later local status event may
+    # add evidence, but may never shrink or reinterpret its unit of measure.
+    is_all_batch_plan = event == "batch_cache_lookup_completed"
+    if is_all_batch_plan:
+        if eligible_records:
+            state["eligible_records"] = eligible_records
+        if eligible_sources:
+            state["eligible_sources"] = eligible_sources
+        if cache_eligible_records:
+            state["cache_eligible_records"] = cache_eligible_records
+        if cache_eligible_sources:
+            state["cache_eligible_sources"] = cache_eligible_sources
     if source_total:
         state["source_total"] = max(int(state.get("source_total") or 0), source_total)
     totals = state.setdefault("queue_group_totals", {})
     completed = state.setdefault("queue_group_completed", {})
+    accepted = state.setdefault("queue_group_accepted", {})
+    vector_confirmed = state.setdefault("queue_group_vector_confirmed", {})
     group_sources = state.setdefault("queue_group_sources", {})
     # A source-window index is merely the first PDF in a queue group. Key by
     # the explicit group id so a four-PDF group is never counted as one PDF.
@@ -12408,54 +12447,84 @@ def grouped_source_window_progress(progress_state, report):
             group_sources[group_key] = max(
                 int(group_sources.get(group_key) or 0), queue_group_sources
             )
+        # A queue event proves that Desktop owns this group even when its HTTP
+        # receipt arrived late.  A pre-submission status alone does not.
+        # Keep this source count distinct from exact-vector proof so the UI
+        # never calls an accepted, still-indexing PDF "confirmed".
+        if event in {
+            "submission_completed",
+            "first_queue_progress",
+            "queue_progress",
+            "desktop_queue_completed",
+            "batch_completed",
+            "exact_vector_observation",
+            "exact_vector_reconciliation_complete",
+            "exact_vector_reconciliation_complete_with_provider_rechunking",
+            "exact_vector_reconciliation_complete_with_workspace_duplicates",
+        } or _report_nonnegative_count(report, "queue_accepted_records", "accepted") >= queue_total:
+            accepted[group_key] = True
         completed[group_key] = min(
             totals[group_key],
             max(int(completed.get(group_key) or 0), queue_completed),
         )
-        if event in {
+        exact_vector_event = event in {
             "batch_completed",
-            "desktop_queue_completed",
             "exact_vector_reconciliation_complete",
             "exact_vector_reconciliation_complete_with_provider_rechunking",
             "exact_vector_reconciliation_complete_with_workspace_duplicates",
         } and (
             bool((report or {}).get("searchability_proven"))
             or event != "batch_completed"
-        ):
+        )
+        if exact_vector_event:
+            vector_confirmed[group_key] = True
             completed[group_key] = totals[group_key]
 
     queue_completed_records = sum(max(0, int(value or 0)) for value in completed.values())
-    cached_record_base = max(0, int(state.get("cached_records") or 0))
-    completed_records = cached_record_base + queue_completed_records
+    completed_records = queue_completed_records
     exact_eligible_records = max(0, int(state.get("eligible_records") or 0))
     denominator = (
         exact_eligible_records
         if exact_eligible_records
         else max(
             int(state.get("prepared_records") or 0),
-            sum(max(0, int(value or 0)) for value in totals.values()) + cached_record_base,
+            sum(max(0, int(value or 0)) for value in totals.values()),
         )
     )
     fraction = min(1.0, completed_records / denominator) if denominator else 0.0
-    completed_sources = max(0, int(state.get("cached_sources") or 0)) + sum(
+    accepted_sources = sum(
         max(1, int(group_sources.get(index) or 1))
-        for index, total in totals.items()
-        if total > 0 and int(completed.get(index) or 0) >= int(total)
+        for index, is_accepted in accepted.items()
+        if is_accepted and int(totals.get(index) or 0) > 0
+    )
+    vector_confirmed_sources = sum(
+        max(1, int(group_sources.get(index) or 1))
+        for index, is_confirmed in vector_confirmed.items()
+        if is_confirmed and int(totals.get(index) or 0) > 0
+    )
+    source_total_for_counts = max(
+        source_total,
+        int(state.get("source_total") or 0),
+        int(state.get("eligible_sources") or 0),
     )
     return {
         "fraction": fraction,
         "completed_records": completed_records,
         "total_records": denominator,
         "source_index": source_index,
-        "source_total": max(
-            source_total,
-            int(state.get("source_total") or 0),
-            int(state.get("eligible_sources") or 0),
-        ),
+        "source_total": source_total_for_counts,
+        "accepted_sources": min(source_total_for_counts, accepted_sources),
+        "vector_confirmed_sources": min(source_total_for_counts, vector_confirmed_sources),
+        # Compatibility field for the existing terminal path. It now means
+        # source PDFs with exact-vector proof, never merely a queue completion.
         "completed_sources": min(
-            max(source_total, int(state.get("eligible_sources") or 0)),
-            completed_sources,
+            source_total_for_counts,
+            vector_confirmed_sources,
         ),
+        # The progress pair above is always batch-wide. Persist its scope so
+        # an audit can reject a future mixed-unit trace instead of guessing
+        # from changing UI wording.
+        "counter_scope": "all_selected_queue_records",
     }
 
 
@@ -12575,6 +12644,42 @@ def _synchronized_live_automatic_status(callback):
     return wrapped
 
 
+def reprice_presentation_expected_seconds(
+    *,
+    previous_expected_seconds,
+    previous_presentation_expected_seconds,
+    new_expected_seconds,
+    is_material_reprice,
+):
+    """Keep a downward model reprice from making the visible timer jump up.
+
+    The opening display may intentionally be more optimistic than the canonical
+    model.  A cache discovery that lowers the canonical estimate must preserve
+    that existing display ratio; otherwise a *downward* reprice visibly jumps
+    upward when the raw model replaces the opening presentation clock.  A real
+    upward reprice remains explicit so slower queue evidence is not hidden.
+    """
+    previous_expected = max(0, int(previous_expected_seconds or 0))
+    previous_presentation = max(0, int(previous_presentation_expected_seconds or 0))
+    new_expected = max(0, int(new_expected_seconds or 0))
+    if not is_material_reprice:
+        return previous_presentation or new_expected
+    if (
+        previous_expected > 0
+        and previous_presentation > 0
+        and new_expected <= previous_expected
+    ):
+        presentation_ratio = min(
+            1.0,
+            max(0.0, previous_presentation / previous_expected),
+        )
+        return min(
+            previous_presentation,
+            max(0, int(math.ceil(new_expected * presentation_ratio))),
+        )
+    return new_expected
+
+
 @_synchronized_live_automatic_status
 def update_live_automatic_run_status(
     run_root=None,
@@ -12594,8 +12699,10 @@ def update_live_automatic_run_status(
     completed_units=None,
     total_units=None,
     evidence_kind=None,
+    counter_scope=None,
     eta_reprice_reason=None,
     eta_basis=None,
+    batch_accepted_files=None,
     batch_completed_files=None,
     batch_total_files=None,
     batch_current_file_index=None,
@@ -12608,6 +12715,7 @@ def update_live_automatic_run_status(
     cache_reuse_records=None,
     cache_reuse_documents=None,
     cache_total_documents=None,
+    cache_plan_partial=None,
     presentation_expected_seconds=None,
     eta_reprice_context=None,
 ):
@@ -12672,9 +12780,11 @@ def update_live_automatic_run_status(
         # A real, material reprice supersedes the opening-only display
         # adjustment. Ordinary status repaints retain their existing display
         # clock and cannot disturb either the model or the UI.
-        presentation_expected = (
-            expected if str(eta_reprice_reason or "").strip()
-            else prior_presentation_expected
+        presentation_expected = reprice_presentation_expected_seconds(
+            previous_expected_seconds=previous.get("expected_seconds"),
+            previous_presentation_expected_seconds=prior_presentation_expected,
+            new_expected_seconds=expected,
+            is_material_reprice=bool(str(eta_reprice_reason or "").strip()),
         )
     else:
         try:
@@ -12711,6 +12821,17 @@ def update_live_automatic_run_status(
     )
     if batch_total:
         batch_completed = min(batch_completed, batch_total)
+    # Submission acceptance and exact-vector proof are separate durable
+    # facts.  The former may advance while the current queue group is still
+    # being observed; never render it as vector confirmation.
+    prior_batch_accepted = _batch_count(previous.get("batch_accepted_files"))
+    incoming_batch_accepted = _batch_count(
+        batch_accepted_files,
+        prior_batch_accepted,
+    )
+    batch_accepted = max(prior_batch_accepted, incoming_batch_accepted)
+    if batch_total:
+        batch_accepted = min(batch_accepted, batch_total)
     batch_current = _batch_count(batch_current_file_index, previous.get("batch_current_file_index"))
     if batch_total > 1:
         batch_current = min(batch_current, batch_total)
@@ -12728,6 +12849,10 @@ def update_live_automatic_run_status(
     )
     if cache_total_documents:
         cache_reuse_documents = min(cache_reuse_documents, cache_total_documents)
+    if cache_plan_partial is None:
+        cache_plan_partial = bool(previous.get("cache_plan_partial"))
+    else:
+        cache_plan_partial = bool(cache_plan_partial)
     remaining_fraction = max(0.0, 1.0 - confirmed)
     # A phase earns at most a modest forecast allowance. If the phase exceeds
     # its budget, the bar waits at the cap for real evidence instead of racing
@@ -12794,10 +12919,12 @@ def update_live_automatic_run_status(
         "progress_phase": incoming_progress_phase or previous_progress_phase,
         "completed_units": completed_units if completed_units is not None else previous.get("completed_units"),
         "total_units": total_units if total_units is not None else previous.get("total_units"),
+        "batch_accepted_files": batch_accepted,
         "batch_completed_files": batch_completed,
         "batch_total_files": batch_total,
         "batch_current_file_index": batch_current,
         "evidence_kind": str(evidence_kind or previous.get("evidence_kind") or ""),
+        "counter_scope": str(counter_scope or previous.get("counter_scope") or ""),
         # A calibration exception is allowed only immediately after this
         # explicit, evidence-backed ETA reprice.  Persist the reason so a
         # later benchmark can distinguish it from an ordinary status repaint.
@@ -12843,6 +12970,7 @@ def update_live_automatic_run_status(
         "cache_reuse_records": cache_reuse_records,
         "cache_reuse_documents": cache_reuse_documents,
         "cache_total_documents": cache_total_documents,
+        "cache_plan_partial": cache_plan_partial,
         "comparable_runs": comparable_value,
         "confirmed_fraction": confirmed,
         "phase_started_epoch": now if phase_changed else float(previous.get("phase_started_epoch") or now),
@@ -13025,10 +13153,12 @@ def update_live_automatic_run_status(
                 "progress_phase": record.get("progress_phase", ""),
                 "completed_units": record.get("completed_units"),
                 "total_units": record.get("total_units"),
+                "batch_accepted_files": record.get("batch_accepted_files", 0),
                 "batch_completed_files": record.get("batch_completed_files", 0),
                 "batch_total_files": record.get("batch_total_files", 0),
                 "batch_current_file_index": record.get("batch_current_file_index", 0),
                 "evidence_kind": record.get("evidence_kind", ""),
+                "counter_scope": record.get("counter_scope", ""),
                 "eta_reprice_reason": record.get("eta_reprice_reason", ""),
                 "eta_reprice_context": record.get("eta_reprice_context", {}),
                 "details": record["details"],
@@ -13043,6 +13173,14 @@ def update_live_automatic_run_status(
                 "elapsed_percent_uncapped": round(elapsed_percent, 3),
                 "elapsed_percent_display": displayed_elapsed_time_percent(record, now),
                 "expected_seconds": expected,
+                "presentation_expected_seconds": int(
+                    record.get("presentation_expected_seconds") or expected
+                ),
+                "eta_basis": record.get("eta_basis", "initial_estimate"),
+                "cache_reuse_records": int(record.get("cache_reuse_records") or 0),
+                "cache_reuse_documents": int(record.get("cache_reuse_documents") or 0),
+                "cache_total_documents": int(record.get("cache_total_documents") or 0),
+                "cache_plan_partial": bool(record.get("cache_plan_partial")),
                 "queue_forecast_expected_seconds": int(
                     record.get("queue_forecast_expected_seconds") or 0
                 ),
@@ -13214,11 +13352,13 @@ def automatic_live_status_html(status=None):
     details = html.escape(raw_details)
     try:
         batch_total = max(0, int(record.get("batch_total_files") or 0))
+        batch_accepted = max(0, int(record.get("batch_accepted_files") or 0))
         batch_completed = max(0, int(record.get("batch_completed_files") or 0))
         batch_current = max(0, int(record.get("batch_current_file_index") or 0))
     except (TypeError, ValueError):
-        batch_total = batch_completed = batch_current = 0
+        batch_total = batch_accepted = batch_completed = batch_current = 0
     if batch_total:
+        batch_accepted = min(batch_accepted, batch_total)
         batch_completed = min(batch_completed, batch_total)
         batch_current = min(batch_current, batch_total)
         # ``batch_*_files`` counts PDFs that have reached a safe decision in
@@ -13247,7 +13387,8 @@ def automatic_live_status_html(status=None):
                 )
             else:
                 batch_label = (
-                    f"PDFs submitted: {batch_completed}/{batch_total} · vectors pending"
+                    f"PDFs accepted by AnythingLLM: {batch_accepted}/{batch_total} "
+                    f"· vectors confirmed: {batch_completed}/{batch_total}"
                 )
         elif is_submission_phase:
             batch_label = f"PDF preparation: {batch_completed}/{batch_total} ready for submission"
@@ -13308,9 +13449,17 @@ def automatic_live_status_html(status=None):
                 if remaining <= 0
                 else f"Est: {format_estimate_clock(remaining)}"
             )
-            if eta_basis == "cache_plan_confirmed" and cache_reuse_documents and cache_total_documents:
+            if (
+                eta_basis in {"cache_plan_confirmed", "prepared_cache_snapshot"}
+                and cache_reuse_documents
+                and cache_total_documents
+            ):
                 estimate_detail += (
-                    f" · {cache_reuse_documents} of {cache_total_documents} documents already cached"
+                    (
+                        f" · {cache_reuse_documents} of {cache_total_documents} prepared documents already cache-backed"
+                        if record.get("cache_plan_partial")
+                        else f" · {cache_reuse_documents} of {cache_total_documents} documents already cached"
+                    )
                 )
             elif eta_basis == "initial_estimate" and elapsed < INITIAL_ETA_LABEL_GRACE_SECONDS:
                 estimate_detail += " · initial estimate"
@@ -13484,6 +13633,7 @@ def refresh_live_automatic_run_ui(viewed_run_root=None):
             cache_reuse_records=record.get("cache_reuse_records", 0),
             cache_reuse_documents=record.get("cache_reuse_documents", 0),
             cache_total_documents=record.get("cache_total_documents", 0),
+            cache_plan_partial=record.get("cache_plan_partial", False),
         ) if state == "running" else gr.update()
         return (
             activity,
@@ -15635,6 +15785,7 @@ def automatic_run_timing_html(
     cache_reuse_records=0,
     cache_reuse_documents=0,
     cache_total_documents=0,
+    cache_plan_partial=False,
     presentation_expected_seconds=None,
 ):
     expected = max(0, int(round(float(expected_seconds or 0))))
@@ -15669,12 +15820,17 @@ def automatic_run_timing_html(
         and elapsed >= INITIAL_ETA_LABEL_GRACE_SECONDS
     )
     cache_plan_suffix = (
-        f" · {reusable_document_count} of {cache_document_total} documents already cached"
+        (
+            f" · {reusable_document_count} of {cache_document_total} prepared documents already cache-backed"
+            if cache_plan_partial
+            else f" · {reusable_document_count} of {cache_document_total} documents already cached"
+        )
         if reusable_document_count and cache_document_total
         else ""
     )
     basis_suffix = {
         "cache_plan_confirmed": cache_plan_suffix,
+        "prepared_cache_snapshot": cache_plan_suffix,
         "live_observations": "",
         "execution_plan_confirmed": "",
     }.get(
@@ -15761,6 +15917,7 @@ def automatic_run_timing_html(
         f'data-eta-basis="{html.escape(resolved_eta_basis)}" '
         f'data-cache-reuse-documents="{reusable_document_count}" '
         f'data-cache-total-documents="{cache_document_total}" '
+        f'data-cache-plan-partial="{"true" if cache_plan_partial else "false"}" '
         f'data-server-timer="{server_timer_value}" '
         f'data-run-state="{html.escape(state)}">'
         f'<strong{strong_attrs}>{html.escape(label)}</strong>'
@@ -17687,6 +17844,56 @@ def queue_evidence_eta_seconds(elapsed_seconds, queue_remaining_seconds):
     return int(math.ceil(max(elapsed + 8.0, elapsed + remaining + handoff_tail)))
 
 
+def queue_eta_live_evidence_weight(
+    completed_records,
+    observed_event_samples,
+    observed_windows,
+    source_total,
+):
+    """Weight current-run queue cadence only when its coverage earns it.
+
+    Record count alone made a large first source window look representative of
+    an entire multi-group batch. Conversely, several completed groups could
+    never outweigh the historical prior by more than 65 percent. Use the
+    product of record, callback, and group coverage instead. A genuine
+    whole-run queue group is the exception: there is no unseen group whose
+    cadence could invalidate its evidence.
+    """
+    records = max(0, int(completed_records or 0))
+    samples = max(0, int(observed_event_samples or 0))
+    windows = max(0, int(observed_windows or 0))
+    total = max(1, int(source_total or 1))
+    record_coverage = min(1.0, records / QUEUE_ETA_LIVE_EVIDENCE_RECORDS)
+    # Some older worker reports omit event samples. Retain a bounded fallback
+    # rather than silently treating their completed-record evidence as zero.
+    effective_samples = max(samples, min(records, QUEUE_ETA_MIN_EVENT_SAMPLES))
+    sample_coverage = min(1.0, effective_samples / QUEUE_ETA_MIN_EVENT_SAMPLES)
+    group_coverage = (
+        1.0
+        if total == 1
+        else min(1.0, windows / QUEUE_ETA_LIVE_EVIDENCE_GROUPS)
+    )
+    # One group can contribute useful evidence, but only a minority vote when
+    # later groups are still unseen. Three independently observed groups may
+    # become the primary timing evidence, while the historical prior remains a
+    # non-zero stabilizer.
+    group_confidence = 0.35 + 0.65 * group_coverage
+    weight = min(
+        QUEUE_ETA_LIVE_EVIDENCE_MAX_WEIGHT,
+        QUEUE_ETA_LIVE_EVIDENCE_MAX_WEIGHT
+        * record_coverage
+        * sample_coverage
+        * group_confidence,
+    )
+    return {
+        "evidence_weight": weight,
+        "record_coverage": record_coverage,
+        "sample_coverage": sample_coverage,
+        "group_coverage": group_coverage,
+        "effective_event_samples": effective_samples,
+    }
+
+
 def observe_batch_queue_forecast(
     context,
     report,
@@ -17811,14 +18018,6 @@ def observe_batch_queue_forecast(
         cache_unknown_records = remaining_records
     observed_seconds_per_record = observed_active_seconds / completed_records
     prior_seconds_per_record = max(0.1, float(provider_request_seconds_prior or 0.0))
-    # The prior remains the majority vote during the first few records. With
-    # broader evidence the current run may contribute more, but never fully
-    # replace the proven timing lane with one workload's local cadence.
-    evidence_weight = min(0.65, 0.65 * completed_records / 120.0)
-    blended_seconds_per_record = (
-        prior_seconds_per_record * (1.0 - evidence_weight)
-        + observed_seconds_per_record * evidence_weight
-    )
     source_total = max(
         1,
         int(
@@ -17834,6 +18033,17 @@ def observe_batch_queue_forecast(
             or report.get("source_window_index")
             or 1
         ),
+    )
+    confidence = queue_eta_live_evidence_weight(
+        completed_records,
+        observed_event_samples,
+        len(window_observations),
+        source_total,
+    )
+    evidence_weight = confidence["evidence_weight"]
+    blended_seconds_per_record = (
+        prior_seconds_per_record * (1.0 - evidence_weight)
+        + observed_seconds_per_record * evidence_weight
     )
     remaining_source_windows = max(0, source_total - source_index)
     remaining_seconds = (
@@ -17858,6 +18068,10 @@ def observe_batch_queue_forecast(
         "prior_seconds_per_record": round(prior_seconds_per_record, 4),
         "blended_seconds_per_record": round(blended_seconds_per_record, 4),
         "evidence_weight": round(evidence_weight, 4),
+        "record_coverage": round(confidence["record_coverage"], 4),
+        "sample_coverage": round(confidence["sample_coverage"], 4),
+        "group_coverage": round(confidence["group_coverage"], 4),
+        "effective_event_samples": int(confidence["effective_event_samples"]),
         "remaining_source_windows": remaining_source_windows,
         "cache_segmented_observation": batch_cache_plan_observed,
         "fresh_segment_coverage": max(
@@ -18034,16 +18248,20 @@ def observe_batch_prequeue_cache_plan(context, report):
     """
     state = context if isinstance(context, dict) else {}
     report = report if isinstance(report, dict) else {}
-    prepared_records = max(0, int(report.get("prepared_records") or 0))
+    prepared_records = _report_nonnegative_count(
+        report, "selected_records", "prepared_records", "queue_eligible_records"
+    )
     cached_records = min(
         prepared_records,
-        max(0, int(report.get("reusable_records") or 0)),
+        _report_nonnegative_count(report, "cache_eligible_records", "reusable_records"),
     )
     fresh_records = max(0, prepared_records - cached_records)
-    source_total = max(0, int(report.get("source_window_total") or 0))
+    source_total = _report_nonnegative_count(
+        report, "selected_documents", "source_window_total", "queue_eligible_sources"
+    )
     cached_documents = min(
         source_total,
-        max(0, int(report.get("cached_documents") or 0)),
+        _report_nonnegative_count(report, "cache_eligible_documents", "cached_documents"),
     )
     partially_cached_documents = min(
         max(0, source_total - cached_documents),
@@ -18184,6 +18402,61 @@ def phase_aware_queue_eta_floor(current_expected, elapsed_seconds, confirmed_fra
     return int(math.ceil(elapsed + QUEUE_ETA_PHASE_FLOOR_WEIGHT * current * (1.0 - confirmed)))
 
 
+def queue_eta_decision_context(forecast_samples, decision, queue_evidence):
+    """Return the compact evidence needed to audit an ETA decision later.
+
+    This deliberately records a bounded sample window rather than every queue
+    callback.  In particular, a suppressed upward correction must retain both
+    the exact number of retained samples (five through nine) and its vote
+    threshold; otherwise a later run review cannot distinguish insufficient
+    consensus from a merely conservative policy choice.
+    """
+    samples = normalized_queue_forecast_samples(forecast_samples)
+    recent = samples[-5:]
+    choice = decision if isinstance(decision, dict) else {}
+    evidence = queue_evidence if isinstance(queue_evidence, dict) else {}
+    context = {
+        "forecast_samples_retained": len(samples),
+        "forecast_samples_used": min(5, len(samples)),
+        "sample_interval_seconds": QUEUE_ETA_SAMPLE_INTERVAL_SECONDS,
+        "recent_forecasts": [
+            {
+                "elapsed_seconds": round(float(elapsed), 3),
+                "forecast_seconds": int(round(float(forecast))),
+            }
+            for elapsed, forecast, _timestamped in recent
+        ],
+        "upward_vote_count": choice.get("upward_vote_count"),
+        "upward_required_votes": choice.get("upward_required_votes"),
+        "upward_threshold_seconds": choice.get("upward_threshold_seconds"),
+        "observed_source_windows": int(evidence.get("observed_windows") or 0),
+        "source_group_total": int(evidence.get("source_total") or 0),
+        "batch_cache_plan_observed": bool(
+            evidence.get("batch_cache_plan_observed")
+        ),
+        "known_fresh_records": int(evidence.get("known_fresh_records") or 0),
+        "remaining_fresh_records": int(evidence.get("remaining_records") or 0),
+        "cache_unknown_records": int(evidence.get("cache_unknown_records") or 0),
+        "observed_queue_event_samples": int(
+            evidence.get("observed_event_samples") or 0
+        ),
+        "observed_seconds_per_record": evidence.get(
+            "observed_seconds_per_record"
+        ),
+        "prior_seconds_per_record": evidence.get("prior_seconds_per_record"),
+        "blended_seconds_per_record": evidence.get(
+            "blended_seconds_per_record"
+        ),
+        "evidence_weight": evidence.get("evidence_weight"),
+        "record_coverage": evidence.get("record_coverage"),
+        "sample_coverage": evidence.get("sample_coverage"),
+        "group_coverage": evidence.get("group_coverage"),
+        "effective_event_samples": evidence.get("effective_event_samples"),
+        "fresh_segment_coverage": evidence.get("fresh_segment_coverage"),
+    }
+    return {key: value for key, value in context.items() if value is not None}
+
+
 def stable_queue_eta_reprice(
     current_expected,
     forecast_samples,
@@ -18230,12 +18503,18 @@ def stable_queue_eta_reprice(
                 "upward_change_needs_two_source_windows",
                 raw_forecast_seconds=raw_forecast,
                 sample_count=len(samples),
+                upward_vote_count=upward_votes,
+                upward_required_votes=QUEUE_ETA_UPWARD_CONSENSUS_SAMPLES,
+                upward_threshold_seconds=upward_threshold,
             )
         if upward_votes < QUEUE_ETA_UPWARD_CONSENSUS_SAMPLES:
             return suppressed(
                 "upward_change_lacks_four_sample_consensus",
                 raw_forecast_seconds=raw_forecast,
                 sample_count=len(samples),
+                upward_vote_count=upward_votes,
+                upward_required_votes=QUEUE_ETA_UPWARD_CONSENSUS_SAMPLES,
+                upward_threshold_seconds=upward_threshold,
             )
     else:
         material_change = max(
@@ -18442,6 +18721,228 @@ def confirmed_prequeue_cache_eta_seconds(
     return int(math.ceil(min(current, max(elapsed + 8.0, candidate))))
 
 
+def prepared_cache_snapshot_projection(
+    *,
+    fresh_provider_requests,
+    cached_attachment_records,
+    unprepared_records,
+    observed_records,
+    observed_source_windows,
+):
+    """Project unprepared cache reuse from exact completed-source samples.
+
+    The observation is exact for prepared PDFs but cannot decide actual reuse
+    for future PDFs.  We therefore use a 95% Wilson lower bound, with the
+    number of independently prepared source windows as the sample size.  This
+    deliberately prevents one large cached PDF from being extrapolated as if
+    hundreds of independent PDFs had been observed.
+    """
+    fresh_total = max(0, int(fresh_provider_requests or 0))
+    cached = max(0, int(cached_attachment_records or 0))
+    observed = max(0, int(observed_records or 0))
+    unprepared = max(0, int(unprepared_records or 0))
+    source_windows = max(0, int(observed_source_windows or 0))
+    observed_fresh = max(0, fresh_total - unprepared)
+    observed_cache_fraction = min(1.0, cached / observed) if observed else 0.0
+    lower_bound = 0.0
+    if cached and observed and source_windows:
+        # 95% Wilson lower confidence bound. Source windows, rather than page
+        # records, provide the effective sample size because pages in one PDF
+        # are correlated cache evidence.
+        z = 1.96
+        n = float(source_windows)
+        denominator = 1.0 + (z * z / n)
+        centre = observed_cache_fraction + (z * z / (2.0 * n))
+        margin = z * math.sqrt(
+            (observed_cache_fraction * (1.0 - observed_cache_fraction) / n)
+            + (z * z / (4.0 * n * n))
+        )
+        lower_bound = max(0.0, min(observed_cache_fraction, (centre - margin) / denominator))
+    projected_cached = min(unprepared, int(math.floor(unprepared * lower_bound)))
+    projected_fresh = unprepared - projected_cached
+    return {
+        "observed_cache_fraction": observed_cache_fraction,
+        "conservative_cache_fraction": lower_bound,
+        "observed_fresh_records": observed_fresh,
+        "projected_cached_unprepared_records": projected_cached,
+        "projected_fresh_unprepared_records": projected_fresh,
+        "effective_fresh_provider_requests": observed_fresh + projected_fresh,
+    }
+
+
+def prepared_cache_snapshot_eta_seconds(
+    opening_expected_seconds,
+    elapsed_seconds,
+    *,
+    fresh_provider_requests,
+    cached_attachment_records,
+    cached_source_windows,
+    unprepared_records,
+    initial_estimated_records,
+    initial_non_batch_seconds,
+    provider_request_seconds,
+    features,
+    cache_attachment_prior=None,
+    observed_records=0,
+    observed_source_windows=0,
+    remaining_source_windows=0,
+):
+    """Price a partial exact cache plan without pretending preparation ended.
+
+    A completed PDF can expose its final page-parent identities long before the
+    batch-wide pre-mutation cache authority is available.  Its cache result is
+    useful ETA evidence, but only the local work *already completed* may be
+    removed from the opening model.  The remaining local-preparation budget is
+    therefore retained in proportion to the still-unprepared page-parent plan.
+
+    This function is deliberately presentation-only.  It may be rebuilt from
+    the opening estimate if a later filename collision invalidates a partial
+    observation.  It never controls which records are attached or reused.
+    """
+    opening = max(0.0, float(opening_expected_seconds or 0.0))
+    elapsed = max(0.0, float(elapsed_seconds or 0.0))
+    cached = max(0, int(cached_attachment_records or 0))
+    cached_windows = max(0, int(cached_source_windows or 0))
+    remaining_records = max(0, int(unprepared_records or 0))
+    planned_records = max(1, int(initial_estimated_records or 0))
+    request_seconds = max(1.0, float(provider_request_seconds or 0.0))
+    projection = prepared_cache_snapshot_projection(
+        fresh_provider_requests=fresh_provider_requests,
+        cached_attachment_records=cached,
+        unprepared_records=remaining_records,
+        observed_records=observed_records,
+        observed_source_windows=observed_source_windows,
+    )
+    fresh = int(projection["effective_fresh_provider_requests"])
+    prior = cache_attachment_prior if isinstance(cache_attachment_prior, dict) else {}
+    cached_record_seconds = max(
+        TIMING_MODEL_CACHE_TAIL_RECORD_SECONDS_FLOOR,
+        float(prior.get("record_seconds") or 0.0),
+    )
+    cached_source_seconds = max(
+        TIMING_MODEL_CACHE_TAIL_SOURCE_SECONDS_FLOOR,
+        float(prior.get("source_seconds") or 0.0),
+    )
+    document_count = max(1, int((features or {}).get("document_count") or 1))
+    remaining_local_seconds = max(0.0, float(initial_non_batch_seconds or 0.0)) * min(
+        1.0,
+        remaining_records / planned_records,
+    )
+    # These are the only remaining cache-specific operations known at this
+    # partial point.  Unknown PDFs retain their normal provider allowance via
+    # ``fresh_provider_requests`` and their share of local preparation above.
+    attachment_tail = (
+        max(20.0, 8.0 + max(0, document_count - 1) * 0.15)
+        + (cached + int(projection["projected_cached_unprepared_records"])) * cached_record_seconds
+        + (
+            cached_windows
+            + int(math.floor(max(0, int(remaining_source_windows or 0)) * projection["conservative_cache_fraction"]))
+        ) * cached_source_seconds
+    )
+    candidate = elapsed + remaining_local_seconds + fresh * request_seconds + attachment_tail
+    # A partial cache observation has no authority to make the run look longer
+    # than its opening all-fresh model.  Later exact plans may still correct it
+    # in either direction if a concurrent Desktop mutation changes reality.
+    return int(math.ceil(min(opening, max(elapsed + 8.0, candidate))))
+
+
+def prepared_source_cache_snapshot_report(
+    summary,
+    *,
+    storage_snapshot,
+    workspace_slug,
+    source_window_index,
+    source_window_total,
+    create_document_folders=False,
+    explicit_folder_name="",
+):
+    """Return an exact read-only cache observation for one prepared PDF.
+
+    This reconstructs the same page-parent payload identity used by the batch
+    uploader, but does not write, attach, queue, or alter the summary.  The
+    result is intentionally advisory until the coordinator repeats its full
+    exact scan immediately before the first Desktop mutation.
+    """
+    summary = summary if isinstance(summary, dict) else {}
+    source_path = str(summary.get("pdf") or "")
+    report = {
+        "timing_event": "prepared_source_cache_snapshot",
+        "source_path": source_path,
+        "source_window_index": max(1, int(source_window_index or 1)),
+        "source_window_total": max(1, int(source_window_total or source_window_index or 1)),
+        "queue_records": 0,
+        "prequeue_cached_records": 0,
+        "prequeue_fresh_records": 0,
+        "prequeue_cache_segments": [],
+        "cache_snapshot_status": str((storage_snapshot or {}).get("status") or "unavailable"),
+        "cache_snapshot_epoch": float((storage_snapshot or {}).get("created_epoch") or 0.0),
+        "eta_observation_scope": "prepared_source_exact_snapshot",
+        "filename_keys": [],
+    }
+    if report["cache_snapshot_status"] != "ready":
+        return report
+    if (
+        summary.get("app_error_code")
+        or str(summary.get("batch_upload_blocked_reason") or "").strip()
+        or str(summary.get("post_upload_classification") or "") == "selected_input_exact_duplicate_skipped"
+    ):
+        return report
+    try:
+        rows = select_upload_payloads(
+            load_upload_plan_rows(str(summary.get("native_upload_plan") or "")),
+            int(summary.get("batch_upload_limit") or 0),
+            tuple(summary.get("batch_upload_indices") or ()),
+        )
+    except (OSError, TypeError, ValueError):
+        return report
+    if not rows:
+        return report
+    source_sha = str(summary.get("source_sha256") or "")
+    folder_name = managed_anythingllm_upload_folder_name(
+        workspace_slug=workspace_slug,
+        source_title=Path(source_path or "document").stem,
+        source_sha=source_sha,
+        create_document_folders=bool(create_document_folders),
+        explicit_folder_name=explicit_folder_name,
+    )
+    valid_rows = []
+    for row in rows:
+        if not isinstance(row, dict):
+            return report
+        text_file = Path(str(row.get("text_file") or ""))
+        filename = str(row.get("filename") or "").strip()
+        if not filename or not text_file.is_file() or not str(row.get("chunkSource") or "").strip():
+            return report
+        try:
+            row = dict(row)
+            row["_validated_text_content"] = text_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return report
+        row["_anythingllm_folder_name"] = folder_name
+        valid_rows.append(row)
+    payloads = upload_plan_rows_to_expected_payloads(valid_rows)
+    locations = find_reusable_cached_document_locations_from_snapshot(
+        storage_snapshot,
+        payloads,
+        folder_names=[folder_name] * len(payloads),
+    )
+    cached_flags = [bool(location) for location in locations]
+    segments = []
+    for position, cached in enumerate(cached_flags, start=1):
+        if segments and bool(segments[-1]["cached"]) == cached:
+            segments[-1]["end"] = position
+        else:
+            segments.append({"start": position, "end": position, "cached": cached})
+    report.update(
+        queue_records=len(payloads),
+        prequeue_cached_records=sum(cached_flags),
+        prequeue_fresh_records=len(payloads) - sum(cached_flags),
+        prequeue_cache_segments=segments,
+        filename_keys=[str(row.get("filename") or "").casefold() for row in valid_rows],
+    )
+    return report
+
+
 def confirmed_batch_cache_remaining_factor(cached_records, fresh_records):
     """Return the tested remaining-work factor for an exact cache plan."""
     cached = max(0, int(cached_records or 0))
@@ -18567,8 +19068,9 @@ def timing_model_cached_attachment_tail_prior(history):
 def observe_prequeue_cache_plan(context, report, *, initial_estimated_records=0):
     """Record one source-local cache snapshot and price only proved reuse.
 
-    A grouped batch emits one snapshot per PDF. Unobserved prepared records
-    remain fresh-provider work until their own source window proves otherwise.
+    A grouped batch emits one snapshot per PDF. Unobserved records remain
+    unclassified for execution; ETA callers may use a separately bounded
+    sample projection, but only a later exact plan can authorize reuse.
     Repeated status relays for the same source are idempotent.
     """
     state = context if isinstance(context, dict) else {}
@@ -18682,6 +19184,15 @@ def observe_prequeue_cache_plan(context, report, *, initial_estimated_records=0)
         "queue_records": queue_records,
         "cached_records": cached_records,
         "fresh_records": fresh_records,
+        "observed_records": int(state.get("observed_records") or 0),
+        "observed_cached_records": int(state.get("observed_cached_records") or 0),
+        "observed_fresh_records": int(state.get("observed_fresh_records") or 0),
+        "observed_source_windows": len(observed_windows),
+        "observed_cached_source_windows": sum(
+            1
+            for plan in queue_plans.values()
+            if int((plan or {}).get("cached_records") or 0) > 0
+        ),
         "source_index": source_index,
         "source_total": source_total,
         "unobserved_records": unobserved_records,
@@ -23870,14 +24381,149 @@ def changed_source_failure_summary(pdf_path, out_dir, *, reason, expected_versio
     return summary
 
 
+def _report_nonnegative_count(report, canonical_key, *legacy_keys):
+    """Read one count without letting an explicit zero select an alias.
+
+    New reports always emit the canonical key. The legacy path remains only
+    for retained v1 evidence, where the canonical key is genuinely absent.
+    ``0`` is valid evidence and must never become a different count merely
+    because Python considers it false.
+    """
+    values = report if isinstance(report, dict) else {}
+    for key in (canonical_key, *legacy_keys):
+        if key not in values or values.get(key) is None:
+            continue
+        try:
+            return max(0, int(values.get(key)))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+    return 0
+
+
+def _report_has_explicit_count(report, key):
+    return isinstance(report, dict) and key in report and report.get(key) is not None
+
+
 def explicit_upload_count_schema(report):
-    """Attach unambiguous count names while retaining legacy report keys."""
-    result = report
-    result["newly_attached_records"] = max(0, int(result.get("uploaded") or 0))
-    result["confirmed_vector_records"] = max(0, int(result.get("embedded") or 0))
+    """Publish non-overlapping record/document evidence fields.
+
+    ``uploaded`` and ``embedded`` remain immutable compatibility aliases.
+    New consumers use the explicit fields, rather than inferring a meaning
+    from truthiness or a neighbouring lifecycle stage.
+    """
+    result = report if isinstance(report, dict) else {}
+    alias_conflicts = []
+    for canonical_key, legacy_key in (
+        ("newly_attached_records", "uploaded"),
+        ("vector_confirmed_records", "confirmed_vector_records"),
+        ("vector_confirmed_records", "embedded"),
+    ):
+        if (
+            _report_has_explicit_count(result, canonical_key)
+            and _report_has_explicit_count(result, legacy_key)
+            and _report_nonnegative_count(result, canonical_key)
+            != _report_nonnegative_count(result, legacy_key)
+        ):
+            alias_conflicts.append({
+                "canonical_key": canonical_key,
+                "legacy_key": legacy_key,
+                "canonical_value": _report_nonnegative_count(result, canonical_key),
+                "legacy_value": _report_nonnegative_count(result, legacy_key),
+            })
+    document_results = result.get("document_results")
+    document_rows = (
+        [row for row in document_results.values() if isinstance(row, dict)]
+        if isinstance(document_results, dict) else []
+    )
+    selected_from_documents = sum(
+        _report_nonnegative_count(row, "selected_records", "records")
+        for row in document_rows
+    )
+    existing_from_documents = sum(
+        _report_nonnegative_count(row, "existing_workspace_records")
+        for row in document_rows
+    )
+    queue_requested_from_documents = sum(
+        _report_nonnegative_count(row, "queue_requested_records", "queue_requested")
+        for row in document_rows
+    )
+    queue_accepted_from_documents = sum(
+        _report_nonnegative_count(row, "queue_accepted_records", "queue_accepted")
+        for row in document_rows
+    )
+    result["newly_attached_records"] = _report_nonnegative_count(
+        result, "newly_attached_records", "uploaded"
+    )
+    result["vector_confirmed_records"] = _report_nonnegative_count(
+        result, "vector_confirmed_records", "confirmed_vector_records", "embedded"
+    )
+    result["confirmed_vector_records"] = result["vector_confirmed_records"]
+    result["selected_records"] = (
+        _report_nonnegative_count(result, "selected_records", "prepared_records")
+        if _report_has_explicit_count(result, "selected_records")
+        or _report_has_explicit_count(result, "prepared_records")
+        else selected_from_documents
+    )
+    result["selected_documents"] = (
+        _report_nonnegative_count(result, "selected_documents", "prepared_documents")
+        if _report_has_explicit_count(result, "selected_documents")
+        or _report_has_explicit_count(result, "prepared_documents")
+        else len(document_rows)
+    )
+    result["existing_workspace_records"] = (
+        _report_nonnegative_count(result, "existing_workspace_records")
+        if _report_has_explicit_count(result, "existing_workspace_records")
+        else existing_from_documents
+    )
+    result["cache_eligible_records"] = _report_nonnegative_count(
+        result, "cache_eligible_records", "prepared_record_cache_reused_count"
+    )
+    result["cache_eligible_documents"] = _report_nonnegative_count(
+        result, "cache_eligible_documents"
+    )
+    result["queue_requested_records"] = (
+        _report_nonnegative_count(result, "queue_requested_records")
+        if _report_has_explicit_count(result, "queue_requested_records")
+        else queue_requested_from_documents
+    )
+    result["queue_accepted_records"] = (
+        _report_nonnegative_count(result, "queue_accepted_records")
+        if _report_has_explicit_count(result, "queue_accepted_records")
+        else queue_accepted_from_documents
+    )
+    # Completion is Desktop queue evidence only. Never substitute a cache plan
+    # or HTTP receipt. Exact vector proof independently entails completed
+    # queue work for the newly attached portion of a complete report.
+    vector_backed_queue_completion = max(
+        0, result["vector_confirmed_records"] - result["existing_workspace_records"]
+    )
+    result["queue_completed_records"] = _report_nonnegative_count(
+        result, "queue_completed_records"
+    )
+    if str(result.get("status") or "") in {"complete", "complete_with_key_cleanup_warning"}:
+        result["queue_completed_records"] = max(
+            result["queue_completed_records"], vector_backed_queue_completion
+        )
+    # Preserve legacy readers without allowing aliases to drive new code.
+    result["uploaded"] = result["newly_attached_records"]
+    result["embedded"] = result["vector_confirmed_records"]
+    if alias_conflicts:
+        # Preserve the inconsistency for the independent reliability audit;
+        # do not let schema normalisation erase evidence of a bad producer.
+        result["count_alias_conflicts"] = alias_conflicts
     result["count_semantics"] = {
+        "selected_records": "all selected page-parent records, including already indexed records",
+        "selected_documents": "all selected PDFs represented by this report",
+        "cache_eligible_records": "selected records with reusable staged document locations; not queue completion",
+        "cache_eligible_documents": "fully cache-eligible selected PDFs; not workspace-vector proof",
+        "newly_attached_records": "records this run attached to the workspace",
+        "queue_requested_records": "newly attached records requested from the AnythingLLM Desktop queue",
+        "queue_accepted_records": "records with a Desktop queue acceptance receipt",
+        "queue_completed_records": "records with completed Desktop queue evidence",
+        "existing_workspace_records": "selected records already proven searchable in this workspace before this run",
+        "vector_confirmed_records": "selected records proven searchable after combining new queue proof and pre-existing workspace proof",
         "uploaded": "legacy alias of newly_attached_records",
-        "embedded": "legacy alias of confirmed_vector_records",
+        "embedded": "legacy alias of vector_confirmed_records",
     }
     return result
 
@@ -23895,13 +24541,9 @@ def upload_report_has_complete_vector_proof(report):
     if not isinstance(report, dict) or str(report.get("status") or "").casefold() != "complete":
         return False
     try:
-        submitted = max(
-            0,
-            int(report.get("newly_attached_records") or report.get("uploaded") or 0),
-        )
-        confirmed = max(
-            0,
-            int(report.get("confirmed_vector_records") or report.get("embedded") or 0),
+        submitted = _report_nonnegative_count(report, "newly_attached_records", "uploaded")
+        confirmed = _report_nonnegative_count(
+            report, "vector_confirmed_records", "confirmed_vector_records", "embedded"
         )
     except (TypeError, ValueError):
         return False
@@ -24142,9 +24784,14 @@ def upload_prepared_automatic_batch(
                     result = {
                         "status": "complete",
                         "records": len(rows),
+                        "selected_records": len(rows),
                         "uploaded": 0,
                         "embedded": len(source_chunk_sources),
+                        "vector_confirmed_records": len(source_chunk_sources),
                         "existing_workspace_records": len(source_chunk_sources),
+                        "queue_requested_records": 0,
+                        "queue_accepted_records": 0,
+                        "queue_completed_records": 0,
                         "error": "",
                         "warning": summary["api_upload_warning"],
                         "post_status": "pass",
@@ -24375,6 +25022,31 @@ def upload_prepared_automatic_batch(
         cached_storage_report = None
         started = time.monotonic()
         last_report = {}
+        observer_callback_errors = []
+
+        def publish_verification_status(message, event):
+            """Publish observer detail without giving the UI veto power."""
+            if not callable(status_callback):
+                return
+            try:
+                status_callback(message, event)
+            except Exception as exc:
+                observer_callback_errors.append({
+                    "exception_type": type(exc).__name__,
+                    "error": str(exc),
+                    "elapsed_seconds": round(time.monotonic() - started, 3),
+                })
+                APP_LOGGER.exception("automatic queue observation status callback failed; continuing reconciliation")
+
+        def with_callback_diagnostics(result):
+            payload = dict(result) if isinstance(result, dict) else {
+                "status": "review",
+                "classification": "invalid_verifier_result",
+                "message": "The local verifier returned no structured observation; reconciliation continued.",
+            }
+            if observer_callback_errors:
+                payload["observer_callback_errors"] = list(observer_callback_errors)
+            return payload
 
         def owned_queue_snapshot():
             """Return current-run queue evidence without treating it as success."""
@@ -24435,7 +25107,7 @@ def upload_prepared_automatic_batch(
                 poll_interval_seconds=2.0,
             )
             if should_read_storage:
-                last_report = verify_anythingllm_post_upload(
+                observed_report = verify_anythingllm_post_upload(
                     storage_dir,
                     workspace_slug,
                     "",
@@ -24448,6 +25120,18 @@ def upload_prepared_automatic_batch(
                     observation_mode="fast",
                     frontend_api_url=api_url,
                 )
+                # Storage observation is advisory while Desktop is actively
+                # indexing. A malformed/empty observer result must be logged
+                # as such and retried, not become an AttributeError that ends
+                # the owned queue window.
+                if isinstance(observed_report, dict):
+                    last_report = dict(observed_report)
+                else:
+                    last_report = {
+                        "status": "review",
+                        "classification": "storage_observation_unstructured",
+                        "message": "Storage observation returned no structured result; retrying while the owned queue remains active.",
+                    }
                 cached_storage_report = dict(last_report)
                 last_storage_observation_position = queue_position
                 last_storage_observation_elapsed = elapsed
@@ -24491,9 +25175,8 @@ def upload_prepared_automatic_batch(
                 )
             )
             if exact:
-                if callable(status_callback):
-                    if current_submission_expanded:
-                        status_callback(
+                if current_submission_expanded:
+                        publish_verification_status(
                             f"Confirming exact workspace vectors (step 2 of 2): {len(expected_batch)} selected record(s) "
                             f"linked and verified as {current_submission_vectors} internal AnythingLLM vector(s)",
                             {
@@ -24505,8 +25188,8 @@ def upload_prepared_automatic_batch(
                                 "unique_identities": unique_identities,
                             },
                         )
-                    elif duplicate_identities:
-                        status_callback(
+                elif duplicate_identities:
+                        publish_verification_status(
                             f"Confirming exact workspace vectors (step 2 of 2): {current_submission_vectors}/{len(expected_batch)} "
                             f"new records indexed; {duplicate_identities} older duplicate workspace vector row(s) retained for review",
                             {
@@ -24519,8 +25202,8 @@ def upload_prepared_automatic_batch(
                                 "workspace_duplicate_vectors": duplicate_identities,
                             },
                         )
-                    else:
-                        status_callback(
+                else:
+                        publish_verification_status(
                             f"Confirming exact workspace vectors (step 2 of 2): {current_submission_vectors or unique_identities}/"
                             f"{len(expected_batch)} selected record(s) linked and verified",
                             {
@@ -24543,24 +25226,24 @@ def upload_prepared_automatic_batch(
                     and str(last_report.get("classification") or "")
                     == "desktop_drawer_layout_nested"
                 ):
-                    return {
+                    return with_callback_diagnostics({
                         **last_report,
                         "status": "pass_with_review",
                         "message": (
                             "Exact per-source vectors were confirmed. The requested document-folder layout "
                             "may be hidden by AnythingLLM Desktop's flat Documents drawer."
                         ),
-                    }
-                return last_report
+                    })
+                return with_callback_diagnostics(last_report)
             if automatic_run_cancellation_requested(run_root) or (cancel_callback and cancel_callback()):
-                return {
+                return with_callback_diagnostics({
                     **last_report,
                     "status": "timeout",
                     "classification": "batch_observation_cancelled",
                     "message": "The AnythingLLM receipt remained unresolved and exact-vector observation stopped after cancellation. No record was resubmitted.",
                     "reconciliation_elapsed_seconds": round(elapsed, 3),
                     "reconciliation_effective_deadline_seconds": effective_deadline_seconds,
-                }
+                })
             if elapsed >= effective_deadline_seconds:
                 queue_total = int(queue.get("queue_records") or len(expected_batch))
                 queue_event_age = queue.get("desktop_queue_last_event_age_seconds")
@@ -24621,7 +25304,7 @@ def upload_prepared_automatic_batch(
                             else "no owned Desktop queue evidence was available"
                         )
                     )
-                    return {
+                    return with_callback_diagnostics({
                         **last_report,
                         **queue,
                         "status": "timeout",
@@ -24638,37 +25321,36 @@ def upload_prepared_automatic_batch(
                         "reconciliation_elapsed_seconds": round(elapsed, 3),
                         "reconciliation_effective_deadline_seconds": round(effective_deadline_seconds, 3),
                         "reconciliation_deadline_extensions": deadline_extensions,
-                    }
+                    })
                 # The live queue earned an evidence-based extension. Continue
                 # the same observation loop; no request is replayed or added.
                 continue
-            if callable(status_callback):
-                if current_submission_vectors:
-                    progress_detail = (
-                        f"Checking vector evidence (step 1 of 2): {current_submission_vectors}/{len(expected_batch)} "
-                        "selected record(s) have searchable-vector evidence; exact confirmation follows"
-                    )
-                else:
-                    progress_detail = (
-                        f"Checking vector evidence (step 1 of 2): {unique_identities}/{len(expected_batch)} "
-                        "unique source identities observed; exact confirmation follows"
-                    )
-                status_callback(
-                    progress_detail,
-                    {
-                        "timing_event": "exact_vector_observation",
-                        "batch": batch_report.get("batch"),
-                        "total_batches": batch_report.get("total_batches"),
-                        "requested": len(expected_batch),
-                        "matching_vectors": current_submission_vectors or unique_identities,
-                        "raw_workspace_vectors": observed,
-                        "workspace_duplicate_vectors": duplicate_identities,
-                        "observation_status": last_report.get("status"),
-                        "reconciliation_effective_deadline_seconds": round(effective_deadline_seconds, 3),
-                        "reconciliation_deadline_extensions": deadline_extensions,
-                        **queue,
-                    },
+            if current_submission_vectors:
+                progress_detail = (
+                    f"Checking vector evidence (step 1 of 2): {current_submission_vectors}/{len(expected_batch)} "
+                    "selected record(s) have searchable-vector evidence; exact confirmation follows"
                 )
+            else:
+                progress_detail = (
+                    f"Checking vector evidence (step 1 of 2): {unique_identities}/{len(expected_batch)} "
+                    "unique source identities observed; exact confirmation follows"
+                )
+            publish_verification_status(
+                progress_detail,
+                {
+                    "timing_event": "exact_vector_observation",
+                    "batch": batch_report.get("batch"),
+                    "total_batches": batch_report.get("total_batches"),
+                    "requested": len(expected_batch),
+                    "matching_vectors": current_submission_vectors or unique_identities,
+                    "raw_workspace_vectors": observed,
+                    "workspace_duplicate_vectors": duplicate_identities,
+                    "observation_status": last_report.get("status"),
+                    "reconciliation_effective_deadline_seconds": round(effective_deadline_seconds, 3),
+                    "reconciliation_deadline_extensions": deadline_extensions,
+                    **queue,
+                },
+            )
             time.sleep(2.0)
 
     batch_root = Path(run_root)
@@ -24892,10 +25574,13 @@ def upload_prepared_automatic_batch(
             # This keeps a partial reconciliation legible without pretending
             # that older workspace vectors were newly embedded.
             "records": selected_record_count,
+            "selected_records": selected_record_count,
             "uploaded": attached_count,
             "embedded": existing_workspace_records + len(matched_sources),
+            "vector_confirmed_records": existing_workspace_records + len(matched_sources),
             "existing_workspace_records": existing_workspace_records,
             "cached_attachment_reused_records": cached_attachment_reused_count,
+            "cache_eligible_records": cached_attachment_reused_count,
             "locations": source_locations,
             "error": error,
             "warning": " ".join(part for part in (
@@ -24930,6 +25615,9 @@ def upload_prepared_automatic_batch(
             "runtime_status": "deferred_after_exact_vector_proof" if exact else "not_checked",
             "queue_requested": sum(int(batch.get("requested") or 0) for batch in queue_batches),
             "queue_accepted": sum(int(batch.get("accepted") or 0) for batch in queue_batches),
+            "queue_requested_records": sum(int(batch.get("requested") or 0) for batch in queue_batches),
+            "queue_accepted_records": sum(int(batch.get("accepted") or 0) for batch in queue_batches),
+            "queue_completed_records": len(matched_sources) if source_exact else 0,
             "queue_batches": queue_batches,
             "ledger_path": ledger_path,
             "searchability_proven": exact,
@@ -24950,8 +25638,10 @@ def upload_prepared_automatic_batch(
         document_results[source_path] = {
             "status": str(summary.get("api_upload_status") or "complete"),
             "records": int(summary.get("post_upload_expected_payloads") or summary.get("api_uploaded") or 0),
+            "selected_records": int(summary.get("post_upload_expected_payloads") or summary.get("api_uploaded") or 0),
             "uploaded": int(summary.get("api_uploaded") or 0),
             "embedded": int(summary.get("api_embedded") or 0),
+            "vector_confirmed_records": int(summary.get("api_embedded") or 0),
             "existing_workspace_records": int(summary.get("api_embedded") or 0),
             "error": str(summary.get("api_upload_error") or ""),
             "warning": str(summary.get("api_upload_warning") or ""),
@@ -24960,6 +25650,9 @@ def upload_prepared_automatic_batch(
             "runtime_status": str(summary.get("anythingllm_runtime_validation_status") or ""),
             "queue_requested": int(summary.get("api_embedding_update_requested") or 0),
             "queue_accepted": int(summary.get("api_embedding_update_accepted") or 0),
+            "queue_requested_records": int(summary.get("api_embedding_update_requested") or 0),
+            "queue_accepted_records": int(summary.get("api_embedding_update_accepted") or 0),
+            "queue_completed_records": 0,
             "queue_batches": list(summary.get("api_embedding_update_batches") or []),
             "searchability_proven": True,
         }
@@ -24982,6 +25675,37 @@ def upload_prepared_automatic_batch(
         max(0, int(result.get("embedded") or 0))
         for result in document_results.values()
     )
+    # Freeze the non-overlapping batch evidence after every per-PDF receipt is
+    # available. These fields are the only cross-artifact accounting contract;
+    # the older ``uploaded``/``embedded`` names remain aliases below.
+    report["selected_records"] = sum(
+        _report_nonnegative_count(result, "selected_records", "records")
+        for result in document_results.values()
+    )
+    report["selected_documents"] = len(document_results)
+    report["existing_workspace_records"] = sum(
+        _report_nonnegative_count(result, "existing_workspace_records")
+        for result in document_results.values()
+    )
+    report["cache_eligible_records"] = _report_nonnegative_count(
+        report, "cache_eligible_records", "prepared_record_cache_reused_count"
+    )
+    report["cache_eligible_documents"] = _report_nonnegative_count(
+        report, "cache_eligible_documents"
+    )
+    report["queue_requested_records"] = sum(
+        _report_nonnegative_count(result, "queue_requested_records", "queue_requested")
+        for result in document_results.values()
+    )
+    report["queue_accepted_records"] = sum(
+        _report_nonnegative_count(result, "queue_accepted_records", "queue_accepted")
+        for result in document_results.values()
+    )
+    report["queue_completed_records"] = sum(
+        _report_nonnegative_count(result, "queue_completed_records")
+        for result in document_results.values()
+    )
+    report["vector_confirmed_records"] = report["embedded"]
     report["cache_reuse_explanation"] = (
         "Exact cached AnythingLLM document locations were linked to this workspace; this is distinct from records already indexed in the workspace."
         if report["prepared_record_cache_reused_count"] else "No prepared-record cache reuse was needed."
@@ -25973,6 +26697,24 @@ def run_automatic(
                 eta_reprice_reason="known_duplicate_preflight",
             )
 
+    # Build this index lazily at the first durable source boundary.  It is a
+    # read-only SQLite/vector-cache snapshot used only for presentation: the
+    # authoritative full scan immediately before queue mutation is retained
+    # below.  Delaying construction avoids adding a cold-store pause before
+    # the first PDF starts preparing.
+    prepared_cache_storage_snapshot = None
+    prepared_cache_reports = {}
+    prepared_cache_filename_owners = {}
+    prepared_cache_invalid_sources = set()
+    prepared_cache_plan_context = {
+        "prepared_records": 0,
+        "observed_records": 0,
+        "observed_cached_records": 0,
+        "observed_fresh_records": 0,
+        "observed_source_windows": set(),
+        "queue_group_cache_plans": {},
+    }
+
     def record_pipeline_timing(stage, batch_report=None):
         """Record actual batch request/verification durations for later ETAs.
 
@@ -26196,6 +26938,11 @@ def run_automatic(
                         cancel_requested=live.get("cancel_requested", False),
                         eta_reprice_reason="owned_queue_rate",
                         eta_reprice_context={
+                            **queue_eta_decision_context(
+                                queue_eta_forecast_samples,
+                                stable_reprice,
+                                batch_queue_forecast,
+                            ),
                             "raw_forecast_seconds": stable_reprice.get(
                                 "raw_forecast_seconds"
                             ),
@@ -26246,6 +26993,11 @@ def run_automatic(
                         previous_expected_seconds=expected_seconds,
                         new_expected_seconds=expected_seconds,
                         raw_forecast_seconds=stable_reprice.get("raw_forecast_seconds"),
+                        decision_context=queue_eta_decision_context(
+                            queue_eta_forecast_samples,
+                            stable_reprice,
+                            batch_queue_forecast,
+                        ),
                     )
                 if normal_reprice_due or stable_reprice.get("status") == "applied":
                     last_queue_eta_recalibration_elapsed = elapsed
@@ -26431,6 +27183,191 @@ def run_automatic(
             "sample_page_parent_titles": titles[:3],
             "sample_prepared_filenames": filenames[:3],
         }
+
+    def observe_prepared_source_cache(summary, source_index):
+        """Update the ETA from one completed PDF's exact cache snapshot.
+
+        This function deliberately has no upload side effects.  A failed or
+        unavailable observation simply leaves the opening estimate in place;
+        the later coordinator scan still decides actual reuse.
+        """
+        nonlocal expected_seconds, prepared_cache_storage_snapshot
+        if not desktop_serial_queue or automatic_run_cancellation_requested(run_root):
+            return None
+        if prepared_cache_storage_snapshot is None:
+            prepared_cache_storage_snapshot = build_reusable_cached_document_snapshot(
+                default_anythingllm_storage_dir()
+            )
+        report = prepared_source_cache_snapshot_report(
+            summary,
+            storage_snapshot=prepared_cache_storage_snapshot,
+            workspace_slug=workspace_slug,
+            source_window_index=source_index,
+            source_window_total=total_files,
+            create_document_folders=anythingllm_create_document_folders,
+            explicit_folder_name=anythingllm_document_folder_name,
+        )
+        source_key = str(report.get("source_path") or source_index)
+        # A filename collision is rare, but its final resolved title differs
+        # from the single-source plan. Do not let a provisional per-source
+        # cache result claim exact ETA evidence for either colliding source.
+        for filename_key in report.get("filename_keys") or ():
+            owner = prepared_cache_filename_owners.setdefault(filename_key, source_key)
+            if owner != source_key:
+                prepared_cache_invalid_sources.update({owner, source_key})
+        report["eta_cache_snapshot_usable"] = (
+            report.get("cache_snapshot_status") == "ready"
+            and bool(report.get("queue_records"))
+            and source_key not in prepared_cache_invalid_sources
+        )
+        prepared_cache_reports[source_key] = report
+
+        # Rebuild the compact accounting context from the durable per-source
+        # observations. This makes repeated callbacks idempotent and lets a
+        # later filename collision remove its provisional evidence instead of
+        # silently retaining it in the aggregate.
+        prepared_cache_plan_context.clear()
+        prepared_cache_plan_context.update({
+            "prepared_records": 0,
+            "observed_records": 0,
+            "observed_cached_records": 0,
+            "observed_fresh_records": 0,
+            "observed_source_windows": set(),
+            "queue_group_cache_plans": {},
+        })
+        observation = None
+        for stored in sorted(
+            prepared_cache_reports.values(),
+            key=lambda value: int(value.get("source_window_index") or 0),
+        ):
+            if not stored.get("eta_cache_snapshot_usable"):
+                continue
+            observation = observe_prequeue_cache_plan(
+                prepared_cache_plan_context,
+                stored,
+                initial_estimated_records=initial_estimated_batches,
+            )
+        if observation is None:
+            return report
+        elapsed = max(0.0, time.perf_counter() - started_at)
+        observed_cached = int(observation.get("observed_cached_records") or 0)
+        observed_fresh = int(observation.get("observed_fresh_records") or 0)
+        unobserved = int(observation.get("unobserved_records") or 0)
+        observed_windows = int(observation.get("observed_source_windows") or 0)
+        cached_windows = int(observation.get("observed_cached_source_windows") or 0)
+        remaining_windows = int(observation.get("remaining_source_windows") or 0)
+        cache_projection = prepared_cache_snapshot_projection(
+            fresh_provider_requests=observed_fresh + unobserved,
+            cached_attachment_records=observed_cached,
+            unprepared_records=unobserved,
+            observed_records=int(observation.get("observed_records") or 0),
+            observed_source_windows=observed_windows,
+        )
+        report["prepared_cache_observed_records"] = int(
+            observation.get("observed_records") or 0
+        )
+        report["prepared_cache_observed_cached_records"] = observed_cached
+        report["prepared_cache_observed_cached_documents"] = cached_windows
+        candidate = prepared_cache_snapshot_eta_seconds(
+            initial_expected_seconds,
+            elapsed,
+            fresh_provider_requests=observed_fresh + unobserved,
+            cached_attachment_records=observed_cached,
+            cached_source_windows=cached_windows,
+            unprepared_records=unobserved,
+            initial_estimated_records=initial_estimated_batches,
+            initial_non_batch_seconds=initial_non_batch_seconds,
+            provider_request_seconds=timing_unit_prior,
+            features=timing_features,
+            cache_attachment_prior=cache_attachment_prior,
+            observed_records=int(observation.get("observed_records") or 0),
+            observed_source_windows=observed_windows,
+            remaining_source_windows=remaining_windows,
+        )
+        material_change = max(
+            QUEUE_ETA_REPRICE_MIN_CHANGE_SECONDS,
+            int(math.ceil(max(0, expected_seconds) * .03)),
+        )
+        previous_expected = int(expected_seconds)
+        if observed_cached and candidate <= previous_expected - material_change:
+            expected_seconds = candidate
+            run_timing_estimate["expected_seconds"] = expected_seconds
+            context = {
+                "prepared_source_windows": len(prepared_cache_reports),
+                "observed_records": int(observation.get("observed_records") or 0),
+                "cached_provider_requests": observed_cached,
+                "fresh_provider_requests": observed_fresh,
+                "unprepared_records": unobserved,
+                "observed_source_windows": observed_windows,
+                "cached_source_windows": cached_windows,
+                "observed_cache_fraction": round(
+                    float(cache_projection["observed_cache_fraction"]), 4
+                ),
+                "conservative_cache_fraction": round(
+                    float(cache_projection["conservative_cache_fraction"]), 4
+                ),
+                "projected_cached_unprepared_records": int(
+                    cache_projection["projected_cached_unprepared_records"]
+                ),
+                "projected_fresh_unprepared_records": int(
+                    cache_projection["projected_fresh_unprepared_records"]
+                ),
+                "provider_request_seconds_prior": round(timing_unit_prior, 3),
+                "remaining_local_preparation_seconds": round(
+                    initial_non_batch_seconds * min(
+                        1.0,
+                        unobserved / max(1, initial_estimated_batches),
+                    ),
+                    3,
+                ),
+                "snapshot_epoch": report.get("cache_snapshot_epoch"),
+                "authoritative_before_mutation": False,
+                "previous_expected_seconds": previous_expected,
+                "expected_seconds": expected_seconds,
+            }
+            run_timing_estimate.setdefault("prepared_cache_snapshot_reprices", []).append(context)
+            report["eta_reprice_reason"] = "prepared_source_cache_snapshot"
+            report["eta_reprice_context"] = context
+        else:
+            append_eta_recalculation_event(
+                run_root,
+                status="suppressed",
+                reason="prepared_source_cache_snapshot",
+                suppression_reason=(
+                    "no_exact_cache_hits"
+                    if not observed_cached
+                    else "bounded_change_below_material_threshold"
+                ),
+                elapsed_seconds=elapsed,
+                confirmed_fraction=float((LIVE_AUTOMATIC_RUN_STATUS or {}).get("confirmed_fraction") or 0.0),
+                displayed_fraction=(LIVE_AUTOMATIC_RUN_STATUS or {}).get("display_target_fraction"),
+                progress_phase="payloads",
+                previous_expected_seconds=previous_expected,
+                new_expected_seconds=previous_expected,
+                decision_context={
+                    "observed_records": int(observation.get("observed_records") or 0),
+                    "cached_provider_requests": observed_cached,
+                    "fresh_provider_requests": observed_fresh,
+                    "unprepared_records": unobserved,
+                    "observed_source_windows": observed_windows,
+                    "observed_cache_fraction": round(
+                        float(cache_projection["observed_cache_fraction"]), 4
+                    ),
+                    "conservative_cache_fraction": round(
+                        float(cache_projection["conservative_cache_fraction"]), 4
+                    ),
+                    "projected_cached_unprepared_records": int(
+                        cache_projection["projected_cached_unprepared_records"]
+                    ),
+                    "projected_fresh_unprepared_records": int(
+                        cache_projection["projected_fresh_unprepared_records"]
+                    ),
+                    "candidate_expected_seconds": candidate,
+                    "material_change_seconds": material_change,
+                    "snapshot_status": report.get("cache_snapshot_status"),
+                },
+            )
+        return report
 
     for file_index, file_path in enumerate(files, start=1):
         if automatic_run_cancellation_requested(run_root):
@@ -27122,6 +28059,10 @@ def run_automatic(
         # durable summary.  This count stays monotonic while the next PDF gets
         # a fresh reconciliation window; it does not reuse queue/vector x/y.
         completed_files += 1
+        prepared_cache_report = observe_prepared_source_cache(
+            summary,
+            completed_files,
+        )
         update_live_automatic_run_status(
             run_root,
             state="running",
@@ -27141,6 +28082,34 @@ def run_automatic(
             batch_current_file_index=(
                 min(total_files, completed_files + 1)
                 if completed_files < total_files else total_files
+            ),
+            cache_reuse_records=(
+                int((prepared_cache_report or {}).get("prepared_cache_observed_cached_records") or 0)
+                if (prepared_cache_report or {}).get("eta_cache_snapshot_usable")
+                else None
+            ),
+            cache_reuse_documents=(
+                int((prepared_cache_report or {}).get("prepared_cache_observed_cached_documents") or 0)
+                if int((prepared_cache_report or {}).get("prepared_cache_observed_cached_documents") or 0)
+                and (prepared_cache_report or {}).get("eta_cache_snapshot_usable")
+                else None
+            ),
+            cache_total_documents=(
+                total_files
+                if (prepared_cache_report or {}).get("eta_cache_snapshot_usable")
+                else None
+            ),
+            cache_plan_partial=bool(
+                (prepared_cache_report or {}).get("eta_cache_snapshot_usable")
+                and int((prepared_cache_report or {}).get("prepared_cache_observed_cached_documents") or 0)
+            ),
+            eta_reprice_reason=(prepared_cache_report or {}).get("eta_reprice_reason") or "",
+            eta_reprice_context=(prepared_cache_report or {}).get("eta_reprice_context") or None,
+            eta_basis=(
+                "prepared_cache_snapshot"
+                if bool((prepared_cache_report or {}).get("eta_cache_snapshot_usable"))
+                and int((prepared_cache_report or {}).get("prepared_cache_observed_cached_documents") or 0)
+                else None
             ),
         )
         # Prepared text is the operator's usable result even if upload,
@@ -27354,7 +28323,10 @@ def run_automatic(
                 "exact_vector_reconciliation_complete",
                 "exact_vector_reconciliation_complete_with_provider_rechunking",
                 "exact_vector_reconciliation_complete_with_workspace_duplicates",
-            }:
+            } or (
+                timing_event == "batch_completed"
+                and bool(report.get("searchability_proven"))
+            ):
                 upload_progress_phase = "identity_set"
             else:
                 upload_progress_phase = "queue_receipt"
@@ -27484,9 +28456,9 @@ def run_automatic(
                 source_index = cache_observation["source_index"]
                 source_total = cache_observation["source_total"]
                 unobserved_records = cache_observation["unobserved_records"]
-                remaining_provider_requests = cache_observation[
-                    "remaining_provider_requests"
-                ]
+                observed_records = cache_observation["observed_records"]
+                observed_fresh_records = cache_observation["observed_fresh_records"]
+                observed_source_windows = cache_observation["observed_source_windows"]
                 remaining_source_windows = cache_observation[
                     "remaining_source_windows"
                 ]
@@ -27501,13 +28473,29 @@ def run_automatic(
                     and not cache_plan_context.get("batch_cache_plan_observed")
                 ):
                     elapsed = max(0.0, time.perf_counter() - started_at)
+                    cache_projection = prepared_cache_snapshot_projection(
+                        fresh_provider_requests=observed_fresh_records + unobserved_records,
+                        cached_attachment_records=cached_records,
+                        unprepared_records=unobserved_records,
+                        observed_records=observed_records,
+                        observed_source_windows=observed_source_windows,
+                    )
                     repriced_expected = confirmed_prequeue_cache_eta_seconds(
                         expected_seconds,
                         elapsed,
-                        fresh_provider_requests=remaining_provider_requests,
+                        fresh_provider_requests=cache_projection[
+                            "effective_fresh_provider_requests"
+                        ],
                         provider_request_seconds=timing_unit_prior,
                         features=timing_features,
-                        cached_attachment_records=cached_records,
+                        cached_attachment_records=(
+                            cached_records
+                            + int(
+                                cache_projection[
+                                    "projected_cached_unprepared_records"
+                                ]
+                            )
+                        ),
                         remaining_source_windows=remaining_source_windows,
                         cache_attachment_prior=cache_attachment_prior,
                     )
@@ -27521,7 +28509,24 @@ def run_automatic(
                             "queue_records": queue_records,
                             "cached_provider_requests": cached_records,
                             "fresh_provider_requests": fresh_records,
-                            "unobserved_records_assumed_fresh": unobserved_records,
+                            "unprepared_records": unobserved_records,
+                            "observed_source_windows": observed_source_windows,
+                            "observed_cache_fraction": round(
+                                float(cache_projection["observed_cache_fraction"]), 4
+                            ),
+                            "conservative_cache_fraction": round(
+                                float(cache_projection["conservative_cache_fraction"]), 4
+                            ),
+                            "projected_cached_unprepared_records": int(
+                                cache_projection[
+                                    "projected_cached_unprepared_records"
+                                ]
+                            ),
+                            "projected_fresh_unprepared_records": int(
+                                cache_projection[
+                                    "projected_fresh_unprepared_records"
+                                ]
+                            ),
                             "remaining_source_windows": remaining_source_windows,
                             "provider_request_seconds_prior": round(timing_unit_prior, 3),
                             "cached_attachment_tail_prior": dict(cache_attachment_prior),
@@ -27596,6 +28601,8 @@ def run_automatic(
                 completed_units=grouped_progress["completed_records"],
                 total_units=grouped_progress["total_records"],
                 evidence_kind="desktop_queue" if upload_progress_phase == "desktop_queue" else "exact_vector_observation" if upload_progress_phase == "identity_set" else "queue_receipt",
+                counter_scope=grouped_progress["counter_scope"],
+                batch_accepted_files=grouped_progress["accepted_sources"],
                 batch_completed_files=grouped_progress["completed_sources"],
                 # Queue callbacks account only for upload-eligible PDFs.
                 # Physical selections that were intentionally held or skipped
@@ -27614,6 +28621,9 @@ def run_automatic(
                     source_total
                     if timing_event == "batch_cache_lookup_completed"
                     else None
+                ),
+                cache_plan_partial=(
+                    False if timing_event == "batch_cache_lookup_completed" else None
                 ),
                 presentation_expected_seconds=(
                     expected_seconds if (cache_reuse_records or 0) > 0 else None
@@ -28131,8 +29141,18 @@ def run_automatic(
             cancel_requested=False,
             activity_observed=True,
             progress_phase="reporting",
-            completed_units=int(batch_upload_report.get("confirmed_vector_records") or batch_upload_report.get("embedded") or 0),
-            total_units=int(batch_upload_report.get("newly_attached_records") or batch_upload_report.get("uploaded") or 0),
+            completed_units=_report_nonnegative_count(
+                batch_upload_report,
+                "vector_confirmed_records",
+                "confirmed_vector_records",
+                "embedded",
+            ),
+            total_units=_report_nonnegative_count(
+                batch_upload_report,
+                "selected_records",
+                "newly_attached_records",
+                "uploaded",
+            ),
             evidence_kind="exact_vector_completion",
             batch_completed_files=len(summaries),
             batch_total_files=len(summaries),

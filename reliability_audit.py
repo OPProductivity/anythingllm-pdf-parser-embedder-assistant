@@ -45,6 +45,92 @@ def _safe_int(value: Any) -> int:
         return 0
 
 
+def _canonical_count(mapping: dict[str, Any], canonical_key: str, *legacy_keys: str) -> int:
+    """Read a canonical count without treating an explicit zero as absent."""
+    values = mapping if isinstance(mapping, dict) else {}
+    for key in (canonical_key, *legacy_keys):
+        if key not in values or values.get(key) is None:
+            continue
+        return max(0, _safe_int(values.get(key)))
+    return 0
+
+
+def _audit_count_aliases(
+    mapping: dict[str, Any], findings: list[Finding], artifact: str, *, scope: str
+) -> None:
+    """Fail closed if a retained canonical count contradicts its alias."""
+    retained_conflicts = mapping.get("count_alias_conflicts") if isinstance(mapping, dict) else None
+    if isinstance(retained_conflicts, list) and retained_conflicts:
+        findings.append(Finding(
+            "AUDIT-COUNT-ALIAS-001", "error",
+            f"{scope} retained {len(retained_conflicts)} count-alias conflict(s) during schema normalisation.",
+            artifact,
+        ))
+    for canonical_key, legacy_key in (
+        ("newly_attached_records", "uploaded"),
+        ("vector_confirmed_records", "confirmed_vector_records"),
+        ("vector_confirmed_records", "embedded"),
+    ):
+        if (
+            canonical_key in mapping and mapping.get(canonical_key) is not None
+            and legacy_key in mapping and mapping.get(legacy_key) is not None
+            and _safe_int(mapping.get(canonical_key)) != _safe_int(mapping.get(legacy_key))
+        ):
+            findings.append(Finding(
+                "AUDIT-COUNT-ALIAS-001", "error",
+                f"{scope} has conflicting {canonical_key} and legacy {legacy_key} values.",
+                artifact,
+            ))
+
+
+def _audit_progress_trace(root: Path, findings: list[Finding]) -> dict[str, int | bool]:
+    """Check every retained live x/y checkpoint, not only final status."""
+    path = root / "progress-trace.jsonl"
+    if not path.is_file():
+        return {"present": False, "entries": 0, "count_violations": 0}
+    try:
+        if path.stat().st_size > MAX_ARTIFACT_BYTES:
+            findings.append(Finding(
+                "AUDIT-PROGRESS-TRACE-TOO-LARGE-001", "error",
+                f"Progress trace exceeds the {MAX_ARTIFACT_BYTES}-byte audit safety limit.",
+                path.name,
+            ))
+            return {"present": True, "entries": 0, "count_violations": 0}
+        entries = violations = 0
+        for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            if not line.strip():
+                continue
+            entries += 1
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                findings.append(Finding(
+                    "AUDIT-PROGRESS-TRACE-UNREADABLE-001", "error",
+                    f"Progress trace line {line_number} is not valid JSON.", path.name,
+                ))
+                continue
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("completed_units") is None or entry.get("total_units") is None:
+                continue
+            completed = _safe_int(entry.get("completed_units"))
+            total = _safe_int(entry.get("total_units"))
+            if total > 0 and completed > total:
+                violations += 1
+                findings.append(Finding(
+                    "AUDIT-PROGRESS-TRACE-COUNT-001", "error",
+                    f"Progress trace line {line_number} has impossible completed/total units ({completed}/{total}).",
+                    path.name,
+                ))
+        return {"present": True, "entries": entries, "count_violations": violations}
+    except (OSError, UnicodeError) as exc:
+        findings.append(Finding(
+            "AUDIT-PROGRESS-TRACE-UNREADABLE-001", "error",
+            f"Progress trace cannot be read ({type(exc).__name__}).", path.name,
+        ))
+        return {"present": True, "entries": 0, "count_violations": 0}
+
+
 def _identity(value: Any) -> str:
     text = str(value or "")
     if not text:
@@ -163,10 +249,13 @@ def _audit_source_transactions(
 
     for row in transactions:
         index = _safe_int(row.get("source_index"))
+        _audit_count_aliases(row, findings, artifact, scope=f"Source transaction {index}")
         state = str(row.get("state") or "")
-        planned = _safe_int(row.get("planned_records"))
-        uploaded = _safe_int(row.get("uploaded"))
-        embedded = _safe_int(row.get("embedded"))
+        planned = _canonical_count(row, "selected_records", "planned_records")
+        uploaded = _canonical_count(row, "newly_attached_records", "uploaded")
+        embedded = _canonical_count(
+            row, "vector_confirmed_records", "confirmed_vector_records", "embedded"
+        )
         locations = [str(value) for value in (row.get("locations") or []) if str(value)]
         later_released = bool(row.get("later_sources_released"))
         suffix = f" Source {index}."
@@ -205,9 +294,17 @@ def _audit_source_transactions(
         "declared_sources": declared,
         "retained_sources": len(transactions),
         "state_counts": dict(sorted(Counter(states).items())),
-        "planned_records": sum(_safe_int(row.get("planned_records")) for row in transactions),
-        "newly_attached_records": sum(_safe_int(row.get("uploaded")) for row in transactions),
-        "confirmed_vector_records": sum(_safe_int(row.get("embedded")) for row in transactions),
+        "planned_records": sum(
+            _canonical_count(row, "selected_records", "planned_records") for row in transactions
+        ),
+        "newly_attached_records": sum(
+            _canonical_count(row, "newly_attached_records", "uploaded") for row in transactions
+        ),
+        "confirmed_vector_records": sum(
+            _canonical_count(
+                row, "vector_confirmed_records", "confirmed_vector_records", "embedded"
+            ) for row in transactions
+        ),
         "location_count": sum(len(row.get("locations") or []) for row in transactions),
         "held_at_source": stop_index or None,
     }
@@ -230,9 +327,14 @@ def _audit_document_results(
     selected = attached = existing = confirmed = 0
     inferred_existing_rows = 0
     for index, row in enumerate(rows, start=1):
-        records = _safe_int(row.get("records"))
-        uploaded = _safe_int(row.get("uploaded"))
-        embedded = _safe_int(row.get("embedded"))
+        _audit_count_aliases(
+            row, findings, "batch-native-upload-report.json", scope=f"PDF result {index}"
+        )
+        records = _canonical_count(row, "selected_records", "records")
+        uploaded = _canonical_count(row, "newly_attached_records", "uploaded")
+        embedded = _canonical_count(
+            row, "vector_confirmed_records", "confirmed_vector_records", "embedded"
+        )
         has_explicit_existing = "existing_workspace_records" in row
         existing_records = _safe_int(row.get("existing_workspace_records"))
         status = str(row.get("status") or "")
@@ -338,10 +440,15 @@ def audit_run_directory(
         }
 
     report = artifacts.get("batch-native-upload-report.json", {})
+    _audit_count_aliases(
+        report, findings, "batch-native-upload-report.json", scope="Batch upload report"
+    )
     report_status = str(report.get("status") or "")
     document_summary = _audit_document_results(report, findings)
-    report_uploaded = _safe_int(report.get("uploaded"))
-    report_embedded = _safe_int(report.get("embedded"))
+    report_uploaded = _canonical_count(report, "newly_attached_records", "uploaded")
+    report_embedded = _canonical_count(
+        report, "vector_confirmed_records", "confirmed_vector_records", "embedded"
+    )
     documented_existing = _safe_int(document_summary.get("existing_workspace_records"))
     documented_existing_only = bool(
         document_summary.get("present")
@@ -456,9 +563,18 @@ def audit_run_directory(
         and bool(remaining)
         and externally_active_queue
     )
-    pending_recovery_is_not_count_contradiction = (
-        cancelled_pending_recovery or external_queue_pending_recovery
+    # A durable held source means the external queue receipt is unresolved.
+    # Attached-record totals can therefore be nonzero while exact vector proof
+    # remains zero. That is a recovery boundary, not a contradiction: the
+    # source ledger must still reconcile attached records with the native
+    # report, but vector totals must be compared with vector totals below.
+    held_pending_recovery = (
+        report_status == "reconciliation_pending"
+        and has_held_source
+        and str(recovery.get("state") or "") == "resume_available"
+        and bool(remaining)
     )
+    pending_recovery_is_not_count_contradiction = held_pending_recovery
     _add(findings, accepted > requested, "AUDIT-EMBEDDING-COUNT-001",
          "Accepted embedding records exceed requested records.", "batch-embedding-ledger.json")
     _add(findings, requested and requested != report_uploaded, "AUDIT-CROSS-COUNT-001",
@@ -477,6 +593,16 @@ def audit_run_directory(
             "AnythingLLM was still processing this run's held page-parent records when assistant-side observation ended; exact vector evidence was incomplete.",
             "batch-embedding-ledger.json",
         ))
+    elif report_status == "reconciliation_pending":
+        # The receipt is explicitly unresolved, so its accepted counter is
+        # necessarily a partial observation rather than a completed-run
+        # invariant. Keep the discrepancy visible without falsely converting
+        # a live/recoverable external queue into an internal integrity fault.
+        findings.append(Finding(
+            "AUDIT-RECONCILIATION-PENDING-COUNT-001", "warning",
+            "AnythingLLM receipt reconciliation is still pending; accepted and submitted totals are not compared until the held queue group reaches a terminal observation.",
+            "batch-embedding-ledger.json",
+        ))
     else:
         _add(findings, accepted and accepted != accepted_target, "AUDIT-CROSS-COUNT-002",
              "Embedding accepted count disagrees with the records submitted by this run.", "batch-embedding-ledger.json")
@@ -486,12 +612,14 @@ def audit_run_directory(
              "AUDIT-CROSS-SOURCE-001",
              "Source transaction uploaded totals disagree with the batch report.",
              "source-transaction-ledger.json")
-        source_embedded_target = report_uploaded if document_summary.get("present") else report_embedded
-        if not pending_recovery_is_not_count_contradiction:
-            _add(findings, source_summary["confirmed_vector_records"] != source_embedded_target,
-                 "AUDIT-CROSS-SOURCE-002",
-                 "Source transaction vector totals disagree with this run's submitted-record total.",
-                 "source-transaction-ledger.json")
+        # Source transactions cover only the current run's queue work. Fully
+        # indexed PDFs are intentionally absent from that ledger, so subtract
+        # their explicitly documented proof before comparing vector evidence.
+        source_vector_target = max(0, report_embedded - documented_existing)
+        _add(findings, source_summary["confirmed_vector_records"] != source_vector_target,
+             "AUDIT-CROSS-SOURCE-002",
+             "Source transaction vector totals disagree with the batch report's current-run confirmed-vector total.",
+             "source-transaction-ledger.json")
         _add(findings, has_held_source and str(recovery.get("state") or "") != "resume_available",
              "AUDIT-RECOVERY-001", "A held source has no resumable recovery state.",
              "batch-embedding-ledger.json")
@@ -519,6 +647,7 @@ def audit_run_directory(
     _add(findings, total_units > 0 and completed_units > total_units,
          "AUDIT-PROGRESS-COUNT-001", "Completed progress units exceed total units.",
          "run-progress.json")
+    progress_trace = _audit_progress_trace(root, findings)
 
     error_count = sum(1 for item in findings if item.severity == "error")
     warning_count = sum(1 for item in findings if item.severity == "warning")
@@ -541,7 +670,16 @@ def audit_run_directory(
             ),
             "source_transactions": source_summary,
             "upload_status": report_status,
+            "selected_records": _canonical_count(report, "selected_records"),
+            "selected_documents": _canonical_count(report, "selected_documents"),
+            "cache_eligible_records": _canonical_count(report, "cache_eligible_records"),
+            "cache_eligible_documents": _canonical_count(report, "cache_eligible_documents"),
             "newly_attached_records": report_uploaded,
+            "queue_requested_records": _canonical_count(report, "queue_requested_records"),
+            "queue_accepted_records": _canonical_count(report, "queue_accepted_records"),
+            "queue_completed_records": _canonical_count(report, "queue_completed_records"),
+            "existing_workspace_records": documented_existing,
+            "vector_confirmed_records": report_embedded,
             "confirmed_vector_records": report_embedded,
             # Backward-compatible aliases for older report readers. New code
             # should use the explicit names above.
@@ -549,11 +687,13 @@ def audit_run_directory(
             "confirmed_records": report_embedded,
             "count_semantics": {
                 "newly_attached_records": "records attached to the workspace by this run",
-                "confirmed_vector_records": "all selected records proven searchable, including safe reuse",
+                "vector_confirmed_records": "all selected records proven searchable, including safe reuse",
+                "confirmed_vector_records": "legacy alias of vector_confirmed_records",
                 "uploaded_records": "legacy alias of newly_attached_records",
                 "confirmed_records": "legacy alias of confirmed_vector_records",
             },
             "document_results": document_summary,
+            "progress_trace": progress_trace,
             "embedding_requested": requested,
             "embedding_accepted": accepted,
             "recovery_state": str(recovery.get("state") or ""),

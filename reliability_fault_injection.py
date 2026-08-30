@@ -287,23 +287,28 @@ SCENARIOS = {
     "definite_rejection_then_success": {
         "expected_requests": [1, 2],
         "expected_actions": ["preserve_rejection_and_continue", "preserve_completed"],
+        "expected_audit_status": "pass",
     },
     "lost_response_after_acceptance": {
         "expected_requests": [1],
         "expected_actions": ["hold_for_reconciliation"],
+        "expected_audit_status": "recovery_required",
     },
     "connection_refused_before_request": {
         "expected_requests": [],
         "expected_actions": ["hold_for_reconciliation"],
         "no_server": True,
+        "expected_audit_status": "recovery_required",
     },
     "delayed_vectors": {
         "expected_requests": [1],
         "expected_actions": ["preserve_completed"],
+        "expected_audit_status": "pass",
     },
     "sqlite_busy_then_vectors": {
         "expected_requests": [1],
         "expected_actions": ["preserve_completed"],
+        "expected_audit_status": "pass",
     },
 }
 
@@ -393,7 +398,7 @@ def run_transport_fault_acceptance(output_root: str | Path) -> dict[str, Any]:
             client.returncode == 0
             and requests == expected["expected_requests"]
             and actions == expected["expected_actions"]
-            and audit.get("audit_status") == "pass"
+            and audit.get("audit_status") == expected["expected_audit_status"]
         )
         results.append({
             "scenario": scenario,
@@ -404,6 +409,7 @@ def run_transport_fault_acceptance(output_root: str | Path) -> dict[str, Any]:
             "restart_actions": actions,
             "expected_restart_actions": expected["expected_actions"],
             "integrity_audit": audit.get("audit_status"),
+            "expected_integrity_audit": expected["expected_audit_status"],
             "mutation_acceptances": sum(
                 1 for row in journal_rows if row.get("event") == "mutation_accepted"
             ),

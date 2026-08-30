@@ -64,10 +64,16 @@ def build_phase_timing_breakdown(events):
             # ``requested``. Both describe the same completed Desktop queue
             # batch; accepting either prevents a truthful 7-record receipt
             # from being rendered as "0 records" in the run timing report.
-            queue["records_submitted"] += max(
-                0,
-                int(raw_event.get("records") or raw_event.get("requested") or 0),
+            record_value = (
+                raw_event.get("records")
+                if "records" in raw_event and raw_event.get("records") is not None
+                else raw_event.get("requested", 0)
             )
+            try:
+                record_count = max(0, int(record_value))
+            except (TypeError, ValueError):
+                record_count = 0
+            queue["records_submitted"] += record_count
             for key in ("batch_elapsed_seconds", "submission_seconds", "verification_seconds"):
                 queue[key] += max(0.0, float(raw_event.get(key) or 0.0))
 

@@ -10,7 +10,9 @@ from auto_anythingllm_pipeline import (
     _anythingllm_embed_event_matches_locations,
     _anythingllm_vector_cache_hit,
     anythingllm_embed_progress_message,
+    build_reusable_cached_document_snapshot,
     find_reusable_cached_document_locations,
+    find_reusable_cached_document_locations_from_snapshot,
     listen_for_anythingllm_embed_progress,
     observe_indexed_source_identity_hint,
     parse_anythingllm_embed_progress_event,
@@ -207,6 +209,64 @@ def test_cached_reuse_uses_desktop_index_and_ignores_unattached_orphan(tmp_path)
     assert find_reusable_cached_document_locations(tmp_path, [payload]) == [location]
 
 
+def test_readonly_cache_snapshot_reuses_exact_indexed_payload_without_rescanning_store(tmp_path):
+    location = "custom-documents/indexed-page-parent.json"
+    document = {
+        "pageContent": "Exact indexed text.",
+        "title": "Example title",
+        "docAuthor": "Example author",
+        "description": "PDF page: 1.",
+        "docSource": "local-pdf://sha256/indexed",
+        "chunkSource": "page-parent://indexed-p0001",
+    }
+    document_path = tmp_path / "documents" / location
+    document_path.parent.mkdir(parents=True)
+    document_path.write_text(json.dumps(document), encoding="utf-8")
+    cache_dir = tmp_path / "vector-cache"
+    cache_dir.mkdir()
+    (cache_dir / f"{uuid.uuid5(uuid.NAMESPACE_URL, location)}.json").write_text(
+        "[]", encoding="utf-8"
+    )
+    con = sqlite3.connect(tmp_path / "anythingllm.db")
+    try:
+        con.execute("create table workspace_documents (docpath text, metadata text)")
+        con.execute(
+            "insert into workspace_documents (docpath, metadata) values (?, ?)",
+            (location, json.dumps({"chunkSource": document["chunkSource"]})),
+        )
+        con.commit()
+    finally:
+        con.close()
+    payload = {
+        "textContent": document["pageContent"],
+        "metadata": {
+            key: document[key]
+            for key in ("title", "docAuthor", "description", "docSource", "chunkSource")
+        },
+    }
+
+    snapshot = build_reusable_cached_document_snapshot(tmp_path)
+
+    assert snapshot["status"] == "ready"
+    assert find_reusable_cached_document_locations_from_snapshot(
+        snapshot, [payload], folder_names=["custom-documents"]
+    ) == [location]
+    # One raw location may only support one selected page-parent plan.
+    assert find_reusable_cached_document_locations_from_snapshot(
+        snapshot, [payload], folder_names=["custom-documents"]
+    ) == [""]
+
+
+def test_readonly_cache_snapshot_with_no_desktop_index_withholds_negative_eta_evidence(tmp_path):
+    (tmp_path / "documents" / "custom-documents").mkdir(parents=True)
+    (tmp_path / "vector-cache").mkdir()
+
+    snapshot = build_reusable_cached_document_snapshot(tmp_path)
+
+    assert snapshot["status"] == "unavailable"
+    assert "index" in snapshot["error"]
+
+
 def test_progress_listener_filters_unrelated_workspace_queue_events():
     expected = {"custom-documents/expected-p001-s01.txt"}
     matched = set()
@@ -269,6 +329,13 @@ def test_sse_listener_observes_only_the_submitted_document_paths():
     server_thread.start()
     stop_event = threading.Event()
     observed = []
+    observed_expected = threading.Event()
+
+    def capture_event(event):
+        observed.append(event)
+        if event.get("type") == "doc_complete":
+            observed_expected.set()
+
     listener = threading.Thread(
         target=listen_for_anythingllm_embed_progress,
         args=(
@@ -278,12 +345,16 @@ def test_sse_listener_observes_only_the_submitted_document_paths():
             ["custom-documents/expected.txt"],
             stop_event,
         ),
-        kwargs={"event_callback": observed.append},
+        kwargs={"event_callback": capture_event},
         daemon=True,
     )
     try:
         listener.start()
         assert server.sent.wait(1)
+        # The listener is deliberately cancellable. Stopping it immediately
+        # after the server flushes bytes races the client parser and tests no
+        # transport invariant. Wait for the matching event we are asserting.
+        assert observed_expected.wait(1)
         stop_event.set()
         server.release.set()
         listener.join(1)
