@@ -218,7 +218,7 @@ def compatible_output_filename(parent, preferred_stem, suffix, *, fallback="arti
 # of being added as two serial durations. The former 16--78% allocation
 # compressed exact-vector evidence into a 78% ceiling and made ordinary runs
 # jump from that ceiling to terminal success. Keep the modern ownership model,
-# but restore a wide 16--94% shared lane and reserve real late-stage space for
+# but restore a wide 16--96% shared lane and reserve real late-stage space for
 # retrieval, validation, and reporting.
 AUTOMATIC_UPLOAD_PHASE_RANGES = {
     "metadata": (0.0000, 0.0190),
@@ -227,9 +227,9 @@ AUTOMATIC_UPLOAD_PHASE_RANGES = {
     "payloads": (0.1080, 0.1340),
     "attachments": (0.1340, 0.1500),
     "queue_receipt": (0.1500, 0.1600),
-    "desktop_queue": (0.1600, 0.9400),
-    "identity_set": (0.1600, 0.9400),
-    "retrieval_sample": (0.9400, 0.9700),
+    "desktop_queue": (0.1600, 0.9600),
+    "identity_set": (0.1600, 0.9600),
+    "retrieval_sample": (0.9600, 0.9700),
     "validation": (0.9700, 0.9800),
     "reporting": (0.9800, 1.0000),
 }

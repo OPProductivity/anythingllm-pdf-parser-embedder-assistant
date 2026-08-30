@@ -4780,13 +4780,13 @@ class PipelineCoreTests(unittest.TestCase):
                 total_units=46,
                 evidence_kind="exact_vector_observation",
                 expected_seconds=240,
-                confirmed_fraction=.94,
+                confirmed_fraction=.96,
             )
         finally:
             app.LIVE_AUTOMATIC_RUN_STATUS = original
 
-        self.assertEqual(record["display_anchor_fraction"], .94)
-        self.assertEqual(app.paced_progress_percent(record, record["updated_epoch"]), 94)
+        self.assertEqual(record["display_anchor_fraction"], .96)
+        self.assertEqual(app.paced_progress_percent(record, record["updated_epoch"]), 96)
 
     def test_warning_progress_never_claims_unconfirmed_work_is_complete(self):
         import rag_pdf_gradio_app as app
@@ -21012,9 +21012,9 @@ class TimingAndInspectionSafetyTests(unittest.TestCase):
     def test_upload_protocol_uses_one_shared_ingestion_range_for_queue_and_vectors(self):
         ranges = pipeline.AUTOMATIC_UPLOAD_PHASE_RANGES
         self.assertAlmostEqual(ranges["queue_receipt"][1], .16)
-        self.assertEqual(ranges["desktop_queue"], (.16, .94))
-        self.assertEqual(ranges["identity_set"], (.16, .94))
-        self.assertAlmostEqual(ranges["retrieval_sample"][0], .94)
+        self.assertEqual(ranges["desktop_queue"], (.16, .96))
+        self.assertEqual(ranges["identity_set"], (.16, .96))
+        self.assertAlmostEqual(ranges["retrieval_sample"][0], .96)
         self.assertAlmostEqual(ranges["validation"][0], .97)
         self.assertAlmostEqual(ranges["reporting"][0], .98)
         self.assertEqual(ranges["reporting"][1], 1.0)

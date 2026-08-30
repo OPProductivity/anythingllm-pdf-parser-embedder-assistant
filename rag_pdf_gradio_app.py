@@ -12540,7 +12540,7 @@ def grouped_source_window_progress(progress_state, report):
 
     AnythingLLM reports queue positions relative to the current PDF.  The UI
     progress bar is relative to the entire prepared batch.  Keeping the small
-    accumulator in the outer run callback preserves the established 16--94%
+    accumulator in the outer run callback preserves the established 16--96%
     queue/identity lane while preventing PDF 2 from appearing to restart at
     PDF 1's local position (or being hidden forever by the monotonic bar).
     """
@@ -23986,7 +23986,7 @@ def explicit_upload_count_schema(report):
 def upload_report_has_complete_vector_proof(report):
     """Return whether a grouped upload has proved every submitted vector.
 
-    The grouped source-window observer legitimately owns the 16--94% ingestion
+    The grouped source-window observer legitimately owns the 16--96% ingestion
     lane while records are in flight. Once its final exact-vector receipt is
     durable, however, leaving the live status below the reporting tail falsely
     suggests that upload work is still outstanding. This helper is
@@ -25883,7 +25883,7 @@ def run_automatic(
             automatic_phase_rank = phase_rank
         if prepare_and_upload and phase_name in AUTOMATIC_UPLOAD_PHASE_RANGES:
             # UploadPhaseReporter already emits the canonical whole-run
-            # allocation (for example the Desktop queue's 16--94% range).
+            # allocation (for example the Desktop queue's 16--96% range).
             # It must not be scaled a second time into this PDF's local
             # preparation share.
             confirmed_fraction = source_fraction
