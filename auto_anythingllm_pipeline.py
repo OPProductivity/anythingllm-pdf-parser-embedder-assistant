@@ -13542,10 +13542,15 @@ ANYTHINGLLM_EMBEDDING_RECONCILIATION_TIMEOUT_SECONDS = 480.0
 ANYTHINGLLM_EMBEDDING_RECONCILIATION_PROGRESS_GRACE_SECONDS = 90.0
 ANYTHINGLLM_EMBEDDING_RECONCILIATION_STALL_SECONDS = 90.0
 # A connected, owned Desktop queue is the primary source of truth while it is
-# actively writing.  Reopening its SQLite/LanceDB state every two seconds adds
-# needless reader pressure.  Inspect on a new owned queue position, with this
-# sparse safety cadence to retain vector evidence if an event is delayed.
-ANYTHINGLLM_HEALTHY_QUEUE_STORAGE_OBSERVATION_INTERVAL_SECONDS = 20.0
+# actively writing.  A fast observer used to reopen SQLite/LanceDB for *every*
+# new page-parent position, then every two seconds whenever one record took
+# longer than the UI heartbeat.  That competed directly with Desktop's writer.
+# SSE never promises the exact instant at which a row becomes queryable, so do
+# not manufacture that precision with repeated storage reads.  Read exact
+# vector evidence after Desktop's terminal event, or after a genuinely quiet
+# queue requires recovery.  Once a quiet queue has been observed, this is its
+# maximum re-observation cadence; an active queue performs no periodic reads.
+ANYTHINGLLM_QUIET_QUEUE_STORAGE_OBSERVATION_INTERVAL_SECONDS = 20.0
 # Keep the durable ledger useful for recovery without making every historical
 # Desktop SSE event part of an ever-growing JSON document rewritten after each
 # source window. The count preserves audit scale; the tail preserves the most
@@ -13643,30 +13648,78 @@ def storage_observation_due_for_queue(
 ):
     """Decide whether a status poll should reopen mutable local vector storage.
 
-    A healthy current-run queue gets one exact read per newly observed queue
-    position plus a sparse safety read.  All uncertain, quiet, or completed
-    queues retain normal exact-vector observation so recovery never relies on
-    stale SSE alone.
+    The owned SSE queue is the live source of truth while Desktop is writing.
+    It earns *no* periodic vector-store read: ``doc_complete`` is not an
+    atomic vector-commit signal, so intermediate reads add contention without
+    giving a reliable transition.  All quiet, uncertain, or completed queues
+    retain exact-vector observation so recovery never relies on stale SSE.
     """
     queue = dict(queue or {})
-    position = max(
-        int(queue.get("desktop_queue_completed") or 0),
-        int(queue.get("desktop_queue_current") or 0),
+    try:
+        previous_observation_elapsed = float(
+            str(last_observation_elapsed_seconds or 0.0)
+        )
+    except (TypeError, ValueError):
+        previous_observation_elapsed = 0.0
+    elapsed_since_observation = max(
+        0.0,
+        float(elapsed_seconds or 0.0)
+        - previous_observation_elapsed,
     )
-    if not healthy_owned_desktop_queue(
-        queue,
-        expected_records,
-        poll_interval_seconds=poll_interval_seconds,
+    total = max(0, int(queue.get("queue_records") or expected_records or 0))
+    current = max(0, int(queue.get("desktop_queue_current") or 0))
+    completed = max(0, int(queue.get("desktop_queue_completed") or 0))
+    observer_state = str(queue.get("desktop_queue_observer_state") or "")
+    raw_event_age = queue.get("desktop_queue_last_event_age_seconds")
+    if raw_event_age is None:
+        event_age = None
+    else:
+        try:
+            event_age = float(str(raw_event_age))
+        except (TypeError, ValueError):
+            event_age = None
+    active_owned_queue = bool(
+        total > 0
+        and completed < total
+        and 0 < current <= total
+        and observer_state == "connected"
+    )
+    if active_owned_queue and (
+        event_age is None
+        or event_age < ANYTHINGLLM_EMBEDDING_RECONCILIATION_STALL_SECONDS
     ):
-        return True
-    if not has_cached_evidence or position > int(last_observation_position or -1):
-        return True
-    if last_observation_elapsed_seconds is None:
-        return True
-    return (
-        float(elapsed_seconds or 0.0) - float(last_observation_elapsed_seconds)
-        >= ANYTHINGLLM_HEALTHY_QUEUE_STORAGE_OBSERVATION_INTERVAL_SECONDS
-    )
+        # A current record may take much longer than the UI heartbeat.  Leave
+        # its writer alone until it is terminal or the existing stall policy
+        # has genuine reason to investigate.
+        return False
+    if active_owned_queue:
+        # The owned record has been quiet for the real reconciliation-stall
+        # interval.  Inspect once, then keep recovery observation calm rather
+        # than turning an uncertain state into a two-second reader storm.
+        return bool(
+            not has_cached_evidence
+            or last_observation_elapsed_seconds is None
+            or elapsed_since_observation
+            >= ANYTHINGLLM_QUIET_QUEUE_STORAGE_OBSERVATION_INTERVAL_SECONDS
+        )
+    if (
+        total > 0
+        and completed < total
+        and observer_state in {"connected", "reconnecting"}
+    ):
+        # The queue has not yet emitted a current record, or the observer has
+        # lost that position.  A small cadence is useful for receipt recovery,
+        # but it remains separate from a healthy writer.
+        return bool(
+            not has_cached_evidence
+            or last_observation_elapsed_seconds is None
+            or elapsed_since_observation
+            >= ANYTHINGLLM_QUIET_QUEUE_STORAGE_OBSERVATION_INTERVAL_SECONDS
+        )
+    # The queue is terminal, disconnected, or no longer attributable to this
+    # run. Resume ordinary exact-vector polling for recovery instead of
+    # trusting a stale observer snapshot.
+    return True
 # Temporary validation uses one shorter, shared observation budget. Its
 # per-batch checkpoint and final document check observe the same Desktop work;
 # they must not add independent 45- and 180-second waits.
@@ -15461,14 +15514,19 @@ def update_workspace_embeddings_desktop_queue(
         cache_hit = event_location in preexisting_cached_locations
         event["vector_cache_hit"] = cache_hit
         first_queue_progress = False
+        inter_event_gap_seconds = None
         with queue_state_lock:
+            previous_event = float(queue_state["last_event_monotonic"] or 0.0)
+            event_now = time.monotonic()
+            if previous_event:
+                inter_event_gap_seconds = max(0.0, event_now - previous_event)
             if event_type == "doc_complete":
                 queue_state["completed"] = max(queue_state["completed"], position)
             elif event_type in {"doc_starting", "chunk_progress"}:
                 queue_state["current"] = max(queue_state["current"], position)
             queue_state["last_event_type"] = event_type
             queue_state["events_observed"] += 1
-            queue_state["last_event_monotonic"] = time.monotonic()
+            queue_state["last_event_monotonic"] = event_now
             if cache_hit and position > 0:
                 queue_state["cached_record_positions"].add(position)
             completed = min(total, max(0, int(queue_state["completed"])))
@@ -15523,12 +15581,12 @@ def update_workspace_embeddings_desktop_queue(
                 message = (
                     f"AnythingLLM Desktop queue: record {current}/{total} is reusing cached embeddings; "
                     f"writing its page-parent record to this workspace; "
-                    f"{completed}/{total} completed; searchable-vector confirmation follows"
+                    f"{completed}/{total} completed"
                 )
             else:
                 message = (
-                    f"AnythingLLM Desktop queue: embedding {current}/{total} {normalized_record_label}; "
-                    f"{completed}/{total} completed; searchable-vector confirmation follows"
+                    f"AnythingLLM Desktop queue: {completed}/{total} {normalized_record_label} embeddings complete; "
+                    f"embedding record {current}"
                 )
         elif event_type == "all_complete":
             message = (
@@ -15551,6 +15609,18 @@ def update_workspace_embeddings_desktop_queue(
                 "desktop_events_observed": completed,
                 "desktop_current_record": current,
                 "desktop_queue_vector_cache_hit": cache_hit,
+                # A slow gap is a measured observer fact, not a guessed
+                # provider diagnosis. Emit it only when the next owned event
+                # arrives, which adds no polling or extra Desktop work.
+                "desktop_queue_inter_event_gap_seconds": (
+                    round(inter_event_gap_seconds, 3)
+                    if inter_event_gap_seconds is not None
+                    else None
+                ),
+                "desktop_queue_slow_event_gap": bool(
+                    inter_event_gap_seconds is not None
+                    and inter_event_gap_seconds >= 10.0
+                ),
                 **snapshot,
                 "queue_completion_fraction": completed / total,
             },
@@ -15582,7 +15652,7 @@ def update_workspace_embeddings_desktop_queue(
         if normalized.startswith("Submitting AnythingLLM batch"):
             normalized = (
                 f"Submitting AnythingLLM sequential queue ({requested} {normalized_record_label}); "
-                f"{queue_summary}; searchable-vector confirmation follows"
+                f"{queue_summary}"
             )
         elif normalized.startswith("AnythingLLM batch") and "submission accepted" in normalized:
             normalized = (

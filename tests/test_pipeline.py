@@ -5738,6 +5738,44 @@ class PipelineCoreTests(unittest.TestCase):
         )
         self.assertEqual(short_run["expected_seconds"], 397)
 
+    def test_large_exact_fresh_group_can_earn_bounded_single_group_upward_reprice(self):
+        import rag_pdf_gradio_app as app
+
+        evidence = {
+            "batch_cache_plan_observed": True,
+            "observed_windows": 1,
+            "active_fresh_group_records": 409,
+            "active_fresh_group_coverage": .50,
+            "active_fresh_group_event_samples": 6,
+        }
+        self.assertTrue(
+            app.batch_queue_forecast_has_large_fresh_group_for_upward_reprice(
+                evidence
+            )
+        )
+        forecasts = [1_800, 1_820, 1_840, 1_860, 1_880]
+        blocked = app.stable_queue_eta_reprice(
+            1_000, forecasts, observed_windows=1, return_decision=True
+        )
+        self.assertEqual(
+            blocked["suppression_reason"], "upward_change_needs_two_source_windows"
+        )
+        allowed = app.stable_queue_eta_reprice(
+            1_000,
+            forecasts,
+            observed_windows=1,
+            allow_single_large_fresh_group_increase=True,
+            return_decision=True,
+        )
+        self.assertEqual(allowed["status"], "applied")
+        self.assertEqual(allowed["expected_seconds"], 1_050)
+        self.assertTrue(allowed["single_large_fresh_group_exception"])
+        self.assertFalse(
+            app.batch_queue_forecast_has_large_fresh_group_for_upward_reprice(
+                {**evidence, "active_fresh_group_coverage": .44}
+            )
+        )
+
     def test_suppressed_upward_eta_reprice_retains_vote_diagnostics(self):
         import rag_pdf_gradio_app as app
 
@@ -17238,10 +17276,11 @@ class PipelineCoreTests(unittest.TestCase):
             pipeline.post_json = original_post
             pipeline.start_anythingllm_embed_progress_listener = original_listener
 
-        self.assertTrue(any("embedding 3/5 page-parent files" in message for message in statuses))
+        self.assertTrue(any("embedding record 3" in message for message in statuses))
         self.assertTrue(any("3/5 page-parent files completed" in message for message in statuses))
         self.assertTrue(any("Desktop completed 3/5 page-parent files" in message for message in statuses))
         self.assertFalse(any("Desktop event stream observed" in message for message in statuses))
+        self.assertFalse(any("Confirming searchable vectors next" in message for message in statuses))
 
     def test_desktop_queue_reports_exact_vector_cache_reuse(self):
         original_post = pipeline.post_json
@@ -21575,18 +21614,18 @@ class TimingAndInspectionSafetyTests(unittest.TestCase):
             _changed, reused = pipeline.get_batch_inspection_context(args, storage, "other-workspace")
             self.assertFalse(reused)
 
-    def test_healthy_queue_skips_repeated_storage_reads_but_keeps_exact_safety_checks(self):
+    def test_healthy_queue_defers_storage_reads_until_terminal_safety_checks(self):
         queue = {
-            "queue_records": 25,
-            "desktop_queue_current": 7,
-            "desktop_queue_completed": 6,
+            "queue_records": 100,
+            "desktop_queue_current": 1,
+            "desktop_queue_completed": 0,
             "desktop_queue_observer_state": "connected",
             "desktop_queue_last_event_age_seconds": 2,
         }
         common = {
-            "expected_records": 25,
+            "expected_records": 100,
             "has_cached_evidence": True,
-            "last_observation_position": 7,
+            "last_observation_position": 1,
             "last_observation_elapsed_seconds": 40,
         }
         self.assertFalse(
@@ -21594,17 +21633,31 @@ class TimingAndInspectionSafetyTests(unittest.TestCase):
                 queue, elapsed_seconds=45, **common
             )
         )
-        self.assertTrue(
+        self.assertFalse(
             pipeline.storage_observation_due_for_queue(
-                {**queue, "desktop_queue_current": 8}, elapsed_seconds=45, **common
+                {**queue, "desktop_queue_current": 2}, elapsed_seconds=45, **common
+            )
+        )
+        self.assertFalse(
+            pipeline.storage_observation_due_for_queue(
+                {
+                    **queue,
+                    "desktop_queue_current": (
+                        99
+                    ),
+                },
+                elapsed_seconds=400,
+                **common,
             )
         )
         self.assertTrue(
             pipeline.storage_observation_due_for_queue(
-                queue,
-                elapsed_seconds=(
-                    40 + pipeline.ANYTHINGLLM_HEALTHY_QUEUE_STORAGE_OBSERVATION_INTERVAL_SECONDS
-                ),
+                {
+                    **queue,
+                    "desktop_queue_current": 100,
+                    "desktop_queue_completed": 100,
+                },
+                elapsed_seconds=45,
                 **common,
             )
         )
@@ -21613,6 +21666,72 @@ class TimingAndInspectionSafetyTests(unittest.TestCase):
                 {**queue, "desktop_queue_observer_state": "quiet"}, elapsed_seconds=45, **common
             )
         )
+
+    def test_slow_connected_queue_waits_for_real_stall_then_uses_calm_recovery_reads(self):
+        queue = {
+            "queue_records": 500,
+            "desktop_queue_current": 119,
+            "desktop_queue_completed": 118,
+            "desktop_queue_observer_state": "connected",
+            # Older than the normal healthy-heartbeat threshold, but below
+            # the actual reconciliation-stall threshold.
+            "desktop_queue_last_event_age_seconds": 34,
+        }
+        common = {
+            "expected_records": 500,
+            "has_cached_evidence": True,
+            "last_observation_position": 119,
+            "last_observation_elapsed_seconds": 100,
+        }
+        self.assertFalse(
+            pipeline.storage_observation_due_for_queue(
+                queue, elapsed_seconds=110, **common
+            )
+        )
+        self.assertTrue(
+            pipeline.storage_observation_due_for_queue(
+                {
+                    **queue,
+                    "desktop_queue_last_event_age_seconds": (
+                        pipeline.ANYTHINGLLM_EMBEDDING_RECONCILIATION_STALL_SECONDS
+                    ),
+                },
+                elapsed_seconds=(
+                    100 + pipeline.ANYTHINGLLM_EMBEDDING_RECONCILIATION_STALL_SECONDS
+                ),
+                **common,
+            )
+        )
+
+    def test_large_healthy_queue_bounds_storage_reader_pressure(self):
+        """A page-parent stream must not reopen vector storage per record."""
+        total = 376
+        observed_position = -1
+        observed_elapsed = None
+        reads = 0
+        for position in range(1, total + 1):
+            queue = {
+                "queue_records": total,
+                "desktop_queue_current": position,
+                "desktop_queue_completed": position - 1,
+                "desktop_queue_observer_state": "connected",
+                "desktop_queue_last_event_age_seconds": 1,
+            }
+            if pipeline.storage_observation_due_for_queue(
+                queue,
+                total,
+                has_cached_evidence=reads > 0,
+                last_observation_position=observed_position,
+                elapsed_seconds=position,
+                last_observation_elapsed_seconds=observed_elapsed,
+            ):
+                reads += 1
+                observed_position = position
+                observed_elapsed = position
+        # The final active record is not a completion proof; the surrounding
+        # reconciliation performs that mandatory exact read.  Live observation
+        # does not touch storage while all 376 queue records keep moving.
+        self.assertEqual(reads, 0)
 
     def test_exact_vector_proof_with_deferred_live_retrieval_is_successful(self):
         import rag_pdf_gradio_app as app

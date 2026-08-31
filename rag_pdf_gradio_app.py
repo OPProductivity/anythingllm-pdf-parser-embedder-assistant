@@ -1456,11 +1456,16 @@ APP_JS = """
         ? (() => {
             const cachedDocuments = Number(timer.dataset.cacheReuseDocuments || 0);
             const totalDocuments = Number(timer.dataset.cacheTotalDocuments || 0);
+            const cachedRecords = Number(timer.dataset.cacheReuseRecords || 0);
+            const totalRecords = Number(timer.dataset.cacheTotalRecords || 0);
             const partial = timer.dataset.cachePlanPartial === "true";
             return cachedDocuments > 0 && totalDocuments > 0
-              ? (partial
+              ? ((partial
                   ? ` · ${cachedDocuments} of ${totalDocuments} prepared documents already cache-backed`
                   : ` · ${cachedDocuments} of ${totalDocuments} documents already cached`)
+                 + (cachedRecords > 0 && totalRecords > 0
+                    ? ` · ${cachedRecords.toLocaleString()} of ${totalRecords.toLocaleString()} page records cache-backed`
+                    : ""))
               : "";
           })()
         : ["live_observations", "execution_plan_confirmed"].includes(timer.dataset.etaBasis)
@@ -12328,6 +12333,14 @@ QUEUE_ETA_MAX_UPWARD_RUN_MIN_SECONDS = 180
 QUEUE_ETA_MAX_UPWARD_RUN_MAX_SECONDS = 900
 QUEUE_ETA_MIN_WINDOWS_FOR_INCREASE = 2
 QUEUE_ETA_UPWARD_CONSENSUS_SAMPLES = 4
+# One oversized, proved-fresh Desktop group can contain hundreds of records.
+# Its mature rate is meaningful enough to make a *small, bounded* upward ETA
+# correction even before a second group opens, but only after substantial
+# within-group coverage. This is deliberately not a shortcut for ordinary
+# small first groups.
+QUEUE_ETA_LARGE_FRESH_GROUP_MIN_RECORDS_FOR_UPWARD_REPRICE = 256
+QUEUE_ETA_LARGE_FRESH_GROUP_MIN_COVERAGE_FOR_UPWARD_REPRICE = .45
+QUEUE_ETA_LARGE_FRESH_GROUP_MIN_EVENT_SAMPLES_FOR_UPWARD_REPRICE = 5
 # This protects real unfinished pipeline work from being erased by one
 # downward queue-rate sample. It was replayed against retained terminal runs.
 QUEUE_ETA_PHASE_FLOOR_WEIGHT = .75
@@ -12715,9 +12728,11 @@ def update_live_automatic_run_status(
     cache_reuse_records=None,
     cache_reuse_documents=None,
     cache_total_documents=None,
+    cache_total_records=None,
     cache_plan_partial=None,
     presentation_expected_seconds=None,
     eta_reprice_context=None,
+    diagnostic_context=None,
 ):
     """Persist progress evidence plus a deliberately capped time-based estimate.
 
@@ -12837,6 +12852,10 @@ def update_live_automatic_run_status(
         batch_current = min(batch_current, batch_total)
     prior_cache_reuse_records = _batch_count(previous.get("cache_reuse_records"))
     cache_reuse_records = _batch_count(cache_reuse_records, prior_cache_reuse_records)
+    prior_cache_total_records = _batch_count(previous.get("cache_total_records"))
+    cache_total_records = _batch_count(cache_total_records, prior_cache_total_records)
+    if cache_total_records:
+        cache_reuse_records = min(cache_reuse_records, cache_total_records)
     prior_cache_reuse_documents = _batch_count(previous.get("cache_reuse_documents"))
     cache_reuse_documents = _batch_count(
         cache_reuse_documents,
@@ -12934,6 +12953,11 @@ def update_live_automatic_run_status(
             if isinstance(eta_reprice_context, dict)
             else {}
         ),
+        "diagnostic_context": (
+            dict(diagnostic_context)
+            if isinstance(diagnostic_context, dict)
+            else {}
+        ),
         "eta_basis": resolved_eta_basis,
         "details": str(details or ""),
         # Stable internal identifiers belong in durable evidence, not inside
@@ -12968,6 +12992,7 @@ def update_live_automatic_run_status(
         # enough to set it: the UI may only signal cache acceleration after a
         # proven reusable record count is available.
         "cache_reuse_records": cache_reuse_records,
+        "cache_total_records": cache_total_records,
         "cache_reuse_documents": cache_reuse_documents,
         "cache_total_documents": cache_total_documents,
         "cache_plan_partial": cache_plan_partial,
@@ -13161,6 +13186,7 @@ def update_live_automatic_run_status(
                 "counter_scope": record.get("counter_scope", ""),
                 "eta_reprice_reason": record.get("eta_reprice_reason", ""),
                 "eta_reprice_context": record.get("eta_reprice_context", {}),
+                "diagnostic_context": record.get("diagnostic_context", {}),
                 "details": record["details"],
                 "confirmed_percent": round(float(record["confirmed_fraction"]) * 100.0, 3),
                 "visible_progress_percent": paced_progress_percent(record, now),
@@ -13178,6 +13204,7 @@ def update_live_automatic_run_status(
                 ),
                 "eta_basis": record.get("eta_basis", "initial_estimate"),
                 "cache_reuse_records": int(record.get("cache_reuse_records") or 0),
+                "cache_total_records": int(record.get("cache_total_records") or 0),
                 "cache_reuse_documents": int(record.get("cache_reuse_documents") or 0),
                 "cache_total_documents": int(record.get("cache_total_documents") or 0),
                 "cache_plan_partial": bool(record.get("cache_plan_partial")),
@@ -13209,6 +13236,7 @@ def update_live_automatic_run_status(
                     trace_entry["state"],
                     trace_phase_marker,
                     trace_entry["eta_reprice_reason"],
+                    trace_entry["diagnostic_context"].get("inter_event_gap_seconds"),
                     visible_percent,
                     # A post-completion diagnostic can stay at the same UI
                     # percent while its own x/y proof advances. Retain every
@@ -13454,12 +13482,12 @@ def automatic_live_status_html(status=None):
                 and cache_reuse_documents
                 and cache_total_documents
             ):
-                estimate_detail += (
-                    (
-                        f" · {cache_reuse_documents} of {cache_total_documents} prepared documents already cache-backed"
-                        if record.get("cache_plan_partial")
-                        else f" · {cache_reuse_documents} of {cache_total_documents} documents already cached"
-                    )
+                estimate_detail += cache_plan_timing_suffix(
+                    cache_reuse_documents=cache_reuse_documents,
+                    cache_total_documents=cache_total_documents,
+                    cache_reuse_records=_status_count(record.get("cache_reuse_records")),
+                    cache_total_records=_status_count(record.get("cache_total_records")),
+                    partial=bool(record.get("cache_plan_partial")),
                 )
             elif eta_basis == "initial_estimate" and elapsed < INITIAL_ETA_LABEL_GRACE_SECONDS:
                 estimate_detail += " · initial estimate"
@@ -13631,6 +13659,7 @@ def refresh_live_automatic_run_ui(viewed_run_root=None):
                 "queue_forecast_expected_seconds", 0
             ),
             cache_reuse_records=record.get("cache_reuse_records", 0),
+            cache_total_records=record.get("cache_total_records", 0),
             cache_reuse_documents=record.get("cache_reuse_documents", 0),
             cache_total_documents=record.get("cache_total_documents", 0),
             cache_plan_partial=record.get("cache_plan_partial", False),
@@ -15766,6 +15795,43 @@ def opening_eta_presentation_seconds(expected_seconds, *, exact_cache_reuse_reco
     return max(1, int(math.ceil(expected * OPENING_NONCACHE_ETA_DISPLAY_FACTOR)))
 
 
+def cache_plan_timing_suffix(
+    *,
+    cache_reuse_documents=0,
+    cache_total_documents=0,
+    cache_reuse_records=0,
+    cache_total_records=0,
+    partial=False,
+):
+    """Return compact, record-aware wording for proven cache progress.
+
+    A document count alone is misleading when a small number of very large
+    PDFs hold most of the page-parent records.  The records are exact cache
+    evidence; they are displayed alongside the document count but never used
+    here to decide cache reuse or ETA ownership.
+    """
+    try:
+        documents = max(0, int(cache_reuse_documents or 0))
+        total_documents = max(0, int(cache_total_documents or 0))
+        records = max(0, int(cache_reuse_records or 0))
+        total_records = max(0, int(cache_total_records or 0))
+    except (TypeError, ValueError):
+        return ""
+    if not documents or not total_documents:
+        return ""
+    document_text = (
+        f"{documents} of {total_documents} prepared documents already cache-backed"
+        if partial
+        else f"{documents} of {total_documents} documents already cached"
+    )
+    record_text = (
+        f" · {records:,} of {total_records:,} page records cache-backed"
+        if records and total_records
+        else ""
+    )
+    return f" · {document_text}{record_text}"
+
+
 def automatic_run_timing_html(
     expected_seconds=0,
     source="",
@@ -15785,6 +15851,7 @@ def automatic_run_timing_html(
     cache_reuse_records=0,
     cache_reuse_documents=0,
     cache_total_documents=0,
+    cache_total_records=0,
     cache_plan_partial=False,
     presentation_expected_seconds=None,
 ):
@@ -15819,14 +15886,12 @@ def automatic_run_timing_html(
         and resolved_eta_basis == "initial_estimate"
         and elapsed >= INITIAL_ETA_LABEL_GRACE_SECONDS
     )
-    cache_plan_suffix = (
-        (
-            f" · {reusable_document_count} of {cache_document_total} prepared documents already cache-backed"
-            if cache_plan_partial
-            else f" · {reusable_document_count} of {cache_document_total} documents already cached"
-        )
-        if reusable_document_count and cache_document_total
-        else ""
+    cache_plan_suffix = cache_plan_timing_suffix(
+        cache_reuse_documents=reusable_document_count,
+        cache_total_documents=cache_document_total,
+        cache_reuse_records=reusable_record_count,
+        cache_total_records=cache_total_records,
+        partial=cache_plan_partial,
     )
     basis_suffix = {
         "cache_plan_confirmed": cache_plan_suffix,
@@ -15917,6 +15982,8 @@ def automatic_run_timing_html(
         f'data-eta-basis="{html.escape(resolved_eta_basis)}" '
         f'data-cache-reuse-documents="{reusable_document_count}" '
         f'data-cache-total-documents="{cache_document_total}" '
+        f'data-cache-reuse-records="{reusable_record_count}" '
+        f'data-cache-total-records="{max(0, int(cache_total_records or 0))}" '
         f'data-cache-plan-partial="{"true" if cache_plan_partial else "false"}" '
         f'data-server-timer="{server_timer_value}" '
         f'data-run-state="{html.escape(state)}">'
@@ -18082,6 +18149,32 @@ def observe_batch_queue_forecast(
             ]
             or [0.0]
         ),
+        "active_fresh_group_records": (
+            int(window_observations.get(source_key, {}).get("queue_total") or 0)
+            if batch_cache_plan_observed
+            else 0
+        ),
+        "active_fresh_group_coverage": (
+            round(
+                max(
+                    0.0,
+                    float(
+                        window_observations.get(source_key, {}).get(
+                            "fresh_segment_coverage"
+                        )
+                        or 0.0
+                    ),
+                ),
+                4,
+            )
+            if batch_cache_plan_observed
+            else 0.0
+        ),
+        "active_fresh_group_event_samples": (
+            int(window_observations.get(source_key, {}).get("event_samples") or 0)
+            if batch_cache_plan_observed
+            else 0
+        ),
     }
 
 
@@ -18103,6 +18196,26 @@ def batch_queue_forecast_is_mature(forecast):
     )
 
 
+def batch_queue_forecast_has_large_fresh_group_for_upward_reprice(forecast):
+    """Return whether one exact fresh group has earned bounded slow-rate use.
+
+    This is intentionally more restrictive than ordinary queue maturity. It
+    does not say the group predicts later PDFs; it merely permits the existing
+    5%-per-step, 20%-per-run ceiling to acknowledge sustained slow evidence
+    instead of holding a knowingly impossible opening ETA until another group
+    happens to start.
+    """
+    evidence = forecast if isinstance(forecast, dict) else {}
+    return bool(
+        evidence.get("batch_cache_plan_observed")
+        and int(evidence.get("observed_windows") or 0) == 1
+        and int(evidence.get("active_fresh_group_records") or 0)
+        >= QUEUE_ETA_LARGE_FRESH_GROUP_MIN_RECORDS_FOR_UPWARD_REPRICE
+        and max(0.0, float(evidence.get("active_fresh_group_coverage") or 0.0))
+        >= QUEUE_ETA_LARGE_FRESH_GROUP_MIN_COVERAGE_FOR_UPWARD_REPRICE
+        and int(evidence.get("active_fresh_group_event_samples") or 0)
+        >= QUEUE_ETA_LARGE_FRESH_GROUP_MIN_EVENT_SAMPLES_FOR_UPWARD_REPRICE
+    )
 def batch_queue_forecast_has_broad_downward_coverage(forecast):
     """Return whether a downward queue ETA reprice covers enough batch work.
 
@@ -18453,6 +18566,14 @@ def queue_eta_decision_context(forecast_samples, decision, queue_evidence):
         "group_coverage": evidence.get("group_coverage"),
         "effective_event_samples": evidence.get("effective_event_samples"),
         "fresh_segment_coverage": evidence.get("fresh_segment_coverage"),
+        "active_fresh_group_records": evidence.get("active_fresh_group_records"),
+        "active_fresh_group_coverage": evidence.get("active_fresh_group_coverage"),
+        "active_fresh_group_event_samples": evidence.get(
+            "active_fresh_group_event_samples"
+        ),
+        "single_large_fresh_group_exception": choice.get(
+            "single_large_fresh_group_exception"
+        ),
     }
     return {key: value for key, value in context.items() if value is not None}
 
@@ -18464,6 +18585,7 @@ def stable_queue_eta_reprice(
     observed_windows=1,
     current_elapsed=None,
     confirmed_fraction=None,
+    allow_single_large_fresh_group_increase=False,
     return_decision=False,
 ):
     """Return a material bounded reprice from spaced, corroborated samples.
@@ -18498,7 +18620,10 @@ def stable_queue_eta_reprice(
         )
         upward_threshold = current + material_change
         upward_votes = sum(forecast >= upward_threshold for _, forecast, _ in samples[-5:])
-        if int(observed_windows or 0) < QUEUE_ETA_MIN_WINDOWS_FOR_INCREASE:
+        if (
+            int(observed_windows or 0) < QUEUE_ETA_MIN_WINDOWS_FOR_INCREASE
+            and not allow_single_large_fresh_group_increase
+        ):
             return suppressed(
                 "upward_change_needs_two_source_windows",
                 raw_forecast_seconds=raw_forecast,
@@ -18566,6 +18691,9 @@ def stable_queue_eta_reprice(
         "rate_reversal_limited": rate_reversal_limited,
         "phase_floor_seconds": phase_floor_seconds,
         "phase_floor_applied": phase_floor_applied,
+        "single_large_fresh_group_exception": bool(
+            raw_forecast > current and allow_single_large_fresh_group_increase
+        ),
     }
 
 
@@ -25019,6 +25147,13 @@ def upload_prepared_automatic_batch(
         last_vector_progress_elapsed = None
         last_storage_observation_position = -1
         last_storage_observation_elapsed = None
+        storage_observation_count = 0
+        storage_observation_total_seconds = 0.0
+        storage_observation_max_seconds = 0.0
+        storage_observation_last_seconds = None
+        quiet_queue_recovery_observation_count = 0
+        quiet_queue_recovery_last_position = 0
+        quiet_queue_recovery_last_event_age_seconds = None
         cached_storage_report = None
         started = time.monotonic()
         last_report = {}
@@ -25044,6 +25179,33 @@ def upload_prepared_automatic_batch(
                 "classification": "invalid_verifier_result",
                 "message": "The local verifier returned no structured observation; reconciliation continued.",
             }
+            # This is measurement only.  It gives the terminal group ledger
+            # enough evidence to distinguish time spent in our local observer
+            # from time spent between Desktop queue events, without producing
+            # a per-poll diagnostic file or changing queue ownership.
+            payload["storage_observation_count"] = storage_observation_count
+            payload["storage_observation_total_seconds"] = round(
+                storage_observation_total_seconds, 3
+            )
+            payload["storage_observation_max_seconds"] = round(
+                storage_observation_max_seconds, 3
+            )
+            payload["storage_observation_last_seconds"] = (
+                round(storage_observation_last_seconds, 3)
+                if storage_observation_last_seconds is not None
+                else None
+            )
+            payload["quiet_queue_recovery_observation_count"] = (
+                quiet_queue_recovery_observation_count
+            )
+            payload["quiet_queue_recovery_last_position"] = (
+                quiet_queue_recovery_last_position
+            )
+            payload["quiet_queue_recovery_last_event_age_seconds"] = (
+                round(quiet_queue_recovery_last_event_age_seconds, 3)
+                if quiet_queue_recovery_last_event_age_seconds is not None
+                else None
+            )
             if observer_callback_errors:
                 payload["observer_callback_errors"] = list(observer_callback_errors)
             return payload
@@ -25097,6 +25259,19 @@ def upload_prepared_automatic_batch(
                 int(queue.get("desktop_queue_completed") or 0),
                 int(queue.get("desktop_queue_current") or 0),
             )
+            queue_total = int(queue.get("queue_records") or len(expected_batch))
+            try:
+                queue_event_age = float(queue.get("desktop_queue_last_event_age_seconds"))
+            except (TypeError, ValueError):
+                queue_event_age = None
+            quiet_queue_recovery = bool(
+                queue_total > 0
+                and queue_position < queue_total
+                and int(queue.get("desktop_queue_current") or 0) > 0
+                and str(queue.get("desktop_queue_observer_state") or "") == "connected"
+                and queue_event_age is not None
+                and queue_event_age >= ANYTHINGLLM_EMBEDDING_RECONCILIATION_STALL_SECONDS
+            )
             should_read_storage = storage_observation_due_for_queue(
                 queue,
                 len(expected_batch),
@@ -25107,19 +25282,35 @@ def upload_prepared_automatic_batch(
                 poll_interval_seconds=2.0,
             )
             if should_read_storage:
-                observed_report = verify_anythingllm_post_upload(
-                    storage_dir,
-                    workspace_slug,
-                    "",
-                    expected_batch,
-                    upload_locations=list(batch_report.get("locations") or []),
-                    # A live batch observer needs count progress while Desktop
-                    # is writing. This is still exact evidence, but a healthy
-                    # owned queue is not forced to reopen SQLite/LanceDB every
-                    # two seconds when its position has not changed.
-                    observation_mode="fast",
-                    frontend_api_url=api_url,
-                )
+                if quiet_queue_recovery:
+                    quiet_queue_recovery_observation_count += 1
+                    quiet_queue_recovery_last_position = queue_position
+                    quiet_queue_recovery_last_event_age_seconds = queue_event_age
+                storage_observation_started = time.perf_counter()
+                try:
+                    observed_report = verify_anythingllm_post_upload(
+                        storage_dir,
+                        workspace_slug,
+                        "",
+                        expected_batch,
+                        upload_locations=list(batch_report.get("locations") or []),
+                        # A live batch observer needs count progress while Desktop
+                        # is writing. This is still exact evidence, but a healthy
+                        # owned queue is not forced to reopen SQLite/LanceDB every
+                        # two seconds when its position has not changed.
+                        observation_mode="fast",
+                        frontend_api_url=api_url,
+                    )
+                finally:
+                    storage_observation_last_seconds = max(
+                        0.0, time.perf_counter() - storage_observation_started
+                    )
+                    storage_observation_count += 1
+                    storage_observation_total_seconds += storage_observation_last_seconds
+                    storage_observation_max_seconds = max(
+                        storage_observation_max_seconds,
+                        storage_observation_last_seconds,
+                    )
                 # Storage observation is advisory while Desktop is actively
                 # indexing. A malformed/empty observer result must be logged
                 # as such and retried, not become an AttributeError that ends
@@ -25325,20 +25516,47 @@ def upload_prepared_automatic_batch(
                 # The live queue earned an evidence-based extension. Continue
                 # the same observation loop; no request is replayed or added.
                 continue
-            if current_submission_vectors:
+            queue_active_for_vector_deferral = bool(
+                int(queue.get("queue_records") or len(expected_batch)) > 0
+                and queue_position < int(queue.get("queue_records") or len(expected_batch))
+                and int(queue.get("desktop_queue_current") or 0) > 0
+                and str(queue.get("desktop_queue_observer_state") or "") == "connected"
+            )
+            if (
+                bool(last_report.get("storage_observation_deferred"))
+                and queue_active_for_vector_deferral
+            ):
+                # Desktop's own queue callback already provides the useful
+                # live status.  Do not replace it every two seconds with a
+                # reminder that vector confirmation is deferred; nothing has
+                # been checked and the replacement causes visible flapping.
+                time.sleep(2.0)
+                continue
+            elif quiet_queue_recovery:
+                visible_vectors = current_submission_vectors or unique_identities
                 progress_detail = (
-                    f"Checking vector evidence (step 1 of 2): {current_submission_vectors}/{len(expected_batch)} "
-                    "selected record(s) have searchable-vector evidence; exact confirmation follows"
+                    f"Desktop queue has been quiet for {queue_event_age:.0f}s at record "
+                    f"{queue_position}/{queue_total}; exact vector check found "
+                    f"{visible_vectors}/{len(expected_batch)} selected record(s) currently searchable. "
+                    "No upload was retried."
                 )
+                timing_event = "exact_vector_observation_quiet_queue_recovery"
+            elif current_submission_vectors:
+                progress_detail = (
+                    f"Checking exact vector evidence: {current_submission_vectors}/{len(expected_batch)} "
+                    "selected record(s) currently searchable"
+                )
+                timing_event = "exact_vector_observation"
             else:
                 progress_detail = (
-                    f"Checking vector evidence (step 1 of 2): {unique_identities}/{len(expected_batch)} "
-                    "unique source identities observed; exact confirmation follows"
+                    f"Checking exact vector evidence: {unique_identities}/{len(expected_batch)} "
+                    "selected source identities currently searchable"
                 )
+                timing_event = "exact_vector_observation"
             publish_verification_status(
                 progress_detail,
                 {
-                    "timing_event": "exact_vector_observation",
+                    "timing_event": timing_event,
                     "batch": batch_report.get("batch"),
                     "total_batches": batch_report.get("total_batches"),
                     "requested": len(expected_batch),
@@ -25348,6 +25566,11 @@ def upload_prepared_automatic_batch(
                     "observation_status": last_report.get("status"),
                     "reconciliation_effective_deadline_seconds": round(effective_deadline_seconds, 3),
                     "reconciliation_deadline_extensions": deadline_extensions,
+                    "quiet_queue_recovery_observation": quiet_queue_recovery,
+                    "quiet_queue_recovery_record": queue_position if quiet_queue_recovery else None,
+                    "quiet_queue_recovery_event_age_seconds": (
+                        round(queue_event_age, 3) if quiet_queue_recovery else None
+                    ),
                     **queue,
                 },
             )
@@ -26706,6 +26929,11 @@ def run_automatic(
     prepared_cache_reports = {}
     prepared_cache_filename_owners = {}
     prepared_cache_invalid_sources = set()
+    # Source-local cache snapshots can arrive one PDF at a time. Retain the
+    # best exact presentation candidate across harmless sub-threshold updates;
+    # otherwise several real cache wins can each be discarded before their
+    # combined change becomes visible.
+    prepared_cache_lowest_candidate = None
     prepared_cache_plan_context = {
         "prepared_records": 0,
         "observed_records": 0,
@@ -26868,6 +27096,11 @@ def run_automatic(
                         observed_windows=batch_queue_forecast.get("observed_windows", 0),
                         current_elapsed=elapsed,
                         confirmed_fraction=live.get("confirmed_fraction"),
+                        allow_single_large_fresh_group_increase=(
+                            batch_queue_forecast_has_large_fresh_group_for_upward_reprice(
+                                batch_queue_forecast
+                            )
+                        ),
                         return_decision=True,
                     )
                 else:
@@ -27192,6 +27425,7 @@ def run_automatic(
         the later coordinator scan still decides actual reuse.
         """
         nonlocal expected_seconds, prepared_cache_storage_snapshot
+        nonlocal prepared_cache_lowest_candidate
         if not desktop_serial_queue or automatic_run_cancellation_requested(run_root):
             return None
         if prepared_cache_storage_snapshot is None:
@@ -27284,13 +27518,26 @@ def run_automatic(
             observed_source_windows=observed_windows,
             remaining_source_windows=remaining_windows,
         )
-        material_change = max(
-            QUEUE_ETA_REPRICE_MIN_CHANGE_SECONDS,
-            int(math.ceil(max(0, expected_seconds) * .03)),
-        )
+        # This is exact, source-local cache evidence, not a noisy queue-rate
+        # forecast. It may safely use a smaller display gate than the generic
+        # 3%/20-second queue rule. The retained low-water mark makes several
+        # small completed cache snapshots cumulative rather than invisible.
         previous_expected = int(expected_seconds)
-        if observed_cached and candidate <= previous_expected - material_change:
-            expected_seconds = candidate
+        if observed_cached:
+            prepared_cache_lowest_candidate = min(
+                int(prepared_cache_lowest_candidate)
+                if prepared_cache_lowest_candidate is not None
+                else candidate,
+                candidate,
+            )
+        best_candidate = (
+            int(prepared_cache_lowest_candidate)
+            if prepared_cache_lowest_candidate is not None
+            else candidate
+        )
+        material_change = max(10, int(math.ceil(max(0, previous_expected) * .01)))
+        if observed_cached and best_candidate <= previous_expected - material_change:
+            expected_seconds = best_candidate
             run_timing_estimate["expected_seconds"] = expected_seconds
             context = {
                 "prepared_source_windows": len(prepared_cache_reports),
@@ -27322,6 +27569,9 @@ def run_automatic(
                 ),
                 "snapshot_epoch": report.get("cache_snapshot_epoch"),
                 "authoritative_before_mutation": False,
+                "candidate_expected_seconds": candidate,
+                "best_candidate_expected_seconds": best_candidate,
+                "material_change_seconds": material_change,
                 "previous_expected_seconds": previous_expected,
                 "expected_seconds": expected_seconds,
             }
@@ -27363,6 +27613,7 @@ def run_automatic(
                         cache_projection["projected_fresh_unprepared_records"]
                     ),
                     "candidate_expected_seconds": candidate,
+                    "best_candidate_expected_seconds": best_candidate,
                     "material_change_seconds": material_change,
                     "snapshot_status": report.get("cache_snapshot_status"),
                 },
@@ -28320,6 +28571,7 @@ def run_automatic(
                 upload_progress_phase = "desktop_queue"
             elif timing_event in {
                 "exact_vector_observation",
+                "exact_vector_observation_quiet_queue_recovery",
                 "exact_vector_reconciliation_complete",
                 "exact_vector_reconciliation_complete_with_provider_rechunking",
                 "exact_vector_reconciliation_complete_with_workspace_duplicates",
@@ -28339,6 +28591,54 @@ def run_automatic(
             eta_reprice_context = None
             eta_basis_update = None
             cache_reuse_records = None
+            queue_diagnostic_context = None
+            if bool(report.get("desktop_queue_slow_event_gap")):
+                queue_diagnostic_context = {
+                    "kind": "desktop_queue_slow_event_gap",
+                    "inter_event_gap_seconds": report.get(
+                        "desktop_queue_inter_event_gap_seconds"
+                    ),
+                    "event_type": str(report.get("desktop_queue_event_type") or ""),
+                    "current_record": _report_nonnegative_count(
+                        report, "desktop_current_record", "desktop_queue_current"
+                    ),
+                    "completed_records": _report_nonnegative_count(
+                        report, "desktop_queue_completed", "queue_completed_records"
+                    ),
+                    "total_records": _report_nonnegative_count(
+                        report, "queue_records", "requested"
+                    ),
+                    "observer_state": str(
+                        report.get("desktop_queue_observer_state") or "unknown"
+                    ),
+                    "cache_eligible": bool(
+                        report.get("desktop_queue_vector_cache_hit")
+                    ),
+                }
+            elif bool(report.get("quiet_queue_recovery_observation")):
+                queue_diagnostic_context = {
+                    "kind": "quiet_queue_recovery_observation",
+                    "current_record": _report_nonnegative_count(
+                        report,
+                        "quiet_queue_recovery_record",
+                        "desktop_current_record",
+                        "desktop_queue_current",
+                    ),
+                    "total_records": _report_nonnegative_count(
+                        report, "queue_records", "requested"
+                    ),
+                    "event_age_seconds": report.get(
+                        "quiet_queue_recovery_event_age_seconds"
+                    ),
+                    "matching_vectors": _report_nonnegative_count(
+                        report,
+                        "matching_vectors",
+                        "current_upload_document_vector_count",
+                    ),
+                    "observer_state": str(
+                        report.get("desktop_queue_observer_state") or "unknown"
+                    ),
+                }
             if (
                 timing_event == "batch_cache_lookup_completed"
                 and desktop_serial_queue
@@ -28622,12 +28922,18 @@ def run_automatic(
                     if timing_event == "batch_cache_lookup_completed"
                     else None
                 ),
+                cache_total_records=(
+                    prepared_records
+                    if timing_event == "batch_cache_lookup_completed"
+                    else None
+                ),
                 cache_plan_partial=(
                     False if timing_event == "batch_cache_lookup_completed" else None
                 ),
                 presentation_expected_seconds=(
                     expected_seconds if (cache_reuse_records or 0) > 0 else None
                 ),
+                diagnostic_context=queue_diagnostic_context,
             )
 
         grouped_upload_progress_active = True
@@ -29162,6 +29468,7 @@ def run_automatic(
             # Source-local snapshots are useful live detail but must never
             # replace these batch-wide values in the durable run summary.
             cache_reuse_records=cache_plan_context.get("batch_cached_records"),
+            cache_total_records=cache_plan_context.get("prepared_records"),
             cache_reuse_documents=cache_plan_context.get("batch_cached_documents"),
             cache_total_documents=cache_plan_context.get("batch_source_total"),
         )

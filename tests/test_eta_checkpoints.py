@@ -168,6 +168,26 @@ def test_eta_ui_labels_a_prepared_only_cache_snapshot_without_claiming_final_pla
     assert 'data-cache-plan-partial="true"' in rendered
 
 
+def test_eta_ui_cache_wording_shows_exact_record_share_when_known():
+    import rag_pdf_gradio_app as app
+
+    rendered = app.automatic_run_timing_html(
+        expected_seconds=90,
+        state="running",
+        started_epoch=100,
+        now=110,
+        eta_basis="cache_plan_confirmed",
+        cache_reuse_documents=33,
+        cache_total_documents=42,
+        cache_reuse_records=1758,
+        cache_total_records=2935,
+    )
+
+    assert "33 of 42 documents already cached" in rendered
+    assert "1,758 of 2,935 page records cache-backed" in rendered
+    assert 'data-cache-total-records="2935"' in rendered
+
+
 def test_partial_cache_eta_keeps_unprepared_local_work_in_the_forecast():
     import rag_pdf_gradio_app as app
 
