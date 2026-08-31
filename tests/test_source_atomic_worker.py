@@ -124,6 +124,25 @@ def test_existing_patch_requires_desktop_restart_until_a_new_root_is_observed(tm
     assert waiting["reason"] == "anythingllm_desktop_not_running"
 
 
+def test_desktop_restart_observer_accepts_live_cim_datetime_output(tmp_path, monkeypatch):
+    executable = tmp_path / "AnythingLLM.exe"
+    executable.write_bytes(b"desktop")
+    monkeypatch.setattr(source_atomic.os, "name", "nt")
+    completed = mock.Mock(
+        returncode=0,
+        stdout='"2026-08-31T18:30:00.0000000Z"',
+    )
+    monkeypatch.setattr(source_atomic.subprocess, "run", lambda *_args, **_kwargs: completed)
+
+    active, reason = source_atomic._desktop_root_started_after(
+        executable,
+        1788190000.0,
+    )
+
+    assert active is True
+    assert reason == ""
+
+
 def test_installer_refuses_unexpected_worker_hash(tmp_path):
     worker = tmp_path / "embedding-worker.js"
     worker.write_text(_fixture_worker(), encoding="utf-8")

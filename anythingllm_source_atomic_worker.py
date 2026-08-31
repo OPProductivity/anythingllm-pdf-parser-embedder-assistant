@@ -170,7 +170,10 @@ def _desktop_root_started_after(
         "$target='" + quoted_executable + "';"
         "$roots=Get-CimInstance Win32_Process -Filter \"Name='AnythingLLM.exe'\" | "
         "Where-Object { $_.ExecutablePath -eq $target } | "
-        "ForEach-Object { [Management.ManagementDateTimeConverter]::ToDateTime($_.CreationDate).ToUniversalTime().ToString('o') };"
+        # Get-CimInstance already materializes CreationDate as DateTime.  The
+        # older ManagementDateTimeConverter expects a DMTF string and would
+        # otherwise discard every live Desktop process.
+        "ForEach-Object { ([datetime]$_.CreationDate).ToUniversalTime().ToString('o') };"
         "$roots | ConvertTo-Json -Compress"
     )
     try:

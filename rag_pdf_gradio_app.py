@@ -14671,6 +14671,21 @@ def terminal_integrity_audit(run_root, completion, *, native_run):
         audit_write_error = exc
         APP_LOGGER.exception("terminal integrity audit result could not be retained")
 
+    # A user-requested cancellation intentionally leaves a source window
+    # incomplete.  Its reconciliation findings remain useful audit evidence,
+    # but must not overwrite the cancellation receipt or imply that the user
+    # needs to repair a completed run.  The recovery manifest remains the
+    # actionable record for a later resume.
+    if str(completion.get("state") or "").casefold() == "cancelled":
+        if audit.get("audit_status") == "fail":
+            finding_count = int((audit.get("summary") or {}).get("error_findings") or 0)
+            APP_LOGGER.info(
+                "terminal integrity audit retained %s cancellation-time finding(s) without reclassifying the cancellation",
+                finding_count,
+                extra={"run_id": root.name, "event": "terminal_integrity_cancelled_audit_retained"},
+            )
+        return dict(completion), audit
+
     if audit.get("audit_status") == "fail":
         bundle = None
         bundle_error = None

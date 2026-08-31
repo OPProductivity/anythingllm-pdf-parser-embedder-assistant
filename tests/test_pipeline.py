@@ -17269,6 +17269,33 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(retained, audit)
         write_bundle.assert_not_called()
 
+    def test_terminal_integrity_failure_preserves_user_cancelled_outcome(self):
+        """Cancellation findings stay in the retained audit, not the receipt."""
+        import rag_pdf_gradio_app as app
+
+        audit = {
+            "audit_status": "fail",
+            "summary": {"error_findings": 1},
+            "findings": [{"code": "AUDIT-CROSS-COUNT-001"}],
+        }
+        original = {
+            "state": "cancelled",
+            "code": "CANCELLED-RECONCILIATION-REQUIRED",
+            "message": "Cancellation completed at a safe checkpoint.",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                mock.patch.object(app, "audit_run_directory", return_value=audit),
+                mock.patch.object(app, "write_failure_bundle") as write_bundle,
+            ):
+                completion, retained = app.terminal_integrity_audit(
+                    temp_dir, original, native_run=True,
+                )
+
+        self.assertEqual(completion, original)
+        self.assertEqual(retained, audit)
+        write_bundle.assert_not_called()
+
     def test_terminal_integrity_describes_an_owned_external_queue_without_false_contradiction(self):
         import rag_pdf_gradio_app as app
 
