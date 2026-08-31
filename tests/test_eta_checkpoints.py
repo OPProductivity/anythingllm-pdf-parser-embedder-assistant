@@ -94,6 +94,39 @@ def test_status_reprice_updates_checkpoint_and_cache_basis(tmp_path):
     }
 
 
+def test_first_live_status_reprice_retains_opening_remaining_discount(tmp_path):
+    import rag_pdf_gradio_app as app
+
+    original_status = app.LIVE_AUTOMATIC_RUN_STATUS
+    try:
+        app.LIVE_AUTOMATIC_RUN_STATUS = {}
+        with mock.patch.object(app.time, "time", return_value=100.0):
+            app.update_live_automatic_run_status(
+                tmp_path,
+                state="running",
+                phase="Preparing",
+                expected_seconds=435,
+                presentation_expected_seconds=305,
+                confirmed_fraction=0.1,
+                eta_basis="initial_estimate",
+            )
+        with mock.patch.object(app.time, "time", return_value=105.0):
+            status = app.update_live_automatic_run_status(
+                tmp_path,
+                state="running",
+                phase="Desktop queue",
+                expected_seconds=453,
+                confirmed_fraction=0.2,
+                eta_reprice_reason="ocr_runtime_observed",
+                eta_basis="live_observations",
+            )
+    finally:
+        app.LIVE_AUTOMATIC_RUN_STATUS = original_status
+
+    assert status["expected_seconds"] == 453
+    assert status["presentation_expected_seconds"] == pytest.approx(318, abs=1)
+
+
 def test_eta_suppression_retains_guard_context(tmp_path):
     import rag_pdf_gradio_app as app
 
@@ -295,6 +328,65 @@ def test_downward_reprice_retains_the_existing_presentation_ratio():
     assert displayed < 7388
     assert displayed == pytest.approx(6920, abs=1)
     assert upward == 12000
+
+
+def test_live_reprices_preserve_the_remaining_opening_discount_without_a_later_cliff():
+    import rag_pdf_gradio_app as app
+
+    first_live = app.reprice_presentation_expected_seconds(
+        previous_expected_seconds=435,
+        previous_presentation_expected_seconds=305,
+        new_expected_seconds=453,
+        is_material_reprice=True,
+        preserve_existing_remaining_discount=True,
+        elapsed_seconds=5,
+    )
+    later_live = app.reprice_presentation_expected_seconds(
+        previous_expected_seconds=2362,
+        previous_presentation_expected_seconds=1656,
+        new_expected_seconds=2452,
+        is_material_reprice=True,
+        preserve_existing_remaining_discount=True,
+        elapsed_seconds=1290,
+    )
+
+    assert first_live == pytest.approx(318, abs=1)
+    # Regression: a ninety-second model adjustment previously exposed the
+    # entire hidden opening discount and visibly jumped by thirteen minutes.
+    assert later_live == pytest.approx(1687, abs=1)
+    assert later_live - 1656 < 90
+
+
+def test_live_vector_zero_snapshot_does_not_replace_useful_queue_status():
+    import rag_pdf_gradio_app as app
+
+    assert not app.should_publish_vector_observation_status(
+        quiet_queue_recovery=False,
+        current_submission_vectors=0,
+        unique_identities=0,
+    )
+    assert app.should_publish_vector_observation_status(
+        quiet_queue_recovery=False,
+        current_submission_vectors=1,
+        unique_identities=0,
+    )
+    assert not app.should_publish_vector_observation_status(
+        quiet_queue_recovery=False,
+        current_submission_vectors=1,
+        unique_identities=0,
+        previous_signature=(1, 0),
+    )
+    assert app.should_publish_vector_observation_status(
+        quiet_queue_recovery=False,
+        current_submission_vectors=2,
+        unique_identities=0,
+        previous_signature=(1, 0),
+    )
+    assert app.should_publish_vector_observation_status(
+        quiet_queue_recovery=True,
+        current_submission_vectors=0,
+        unique_identities=0,
+    )
 
 
 def test_live_status_renders_partial_cache_wording_after_the_durable_update():

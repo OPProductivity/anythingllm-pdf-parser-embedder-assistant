@@ -1,4 +1,5 @@
 import io
+import http.server
 import json
 import os
 import re
@@ -31,6 +32,84 @@ import anythingllm_persistence  # noqa: E402
 
 
 pytestmark = pytest.mark.offline_deterministic
+
+
+class FakeJsonPostResponseTracker:
+    """Deterministic stand-in for the production controlled HTTP tracker."""
+
+    def __init__(self, action):
+        self.completed = threading.Event()
+        self.response_read_abandoned = threading.Event()
+        self._action = action
+        self._outcome = {}
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self.thread.start()
+        return self
+
+    def _run(self):
+        try:
+            outcome = self._action(self.response_read_abandoned)
+            self._outcome = dict(outcome or {})
+        except Exception as exc:
+            self._outcome = {"kind": "exception", "exception": exc}
+        finally:
+            self.completed.set()
+
+    def wait(self, timeout=None):
+        return self.completed.wait(timeout=timeout)
+
+    def outcome(self):
+        return dict(self._outcome)
+
+    def close_response_read(self):
+        self.response_read_abandoned.set()
+
+    def join(self, timeout=None):
+        self.thread.join(timeout=timeout)
+
+    def is_alive(self):
+        return self.thread.is_alive()
+
+
+def fake_json_post_tracker(action):
+    """Return the same factory shape used by the controlled production POST."""
+
+    def factory(_url, body, **_kwargs):
+        return FakeJsonPostResponseTracker(
+            lambda response_read_abandoned: action(dict(body or {}), response_read_abandoned)
+        ).start()
+
+    return factory
+
+
+def fake_json_post_tracker_from_post(post):
+    """Adapt legacy ``post_json`` fixture functions to the new one-shot transport.
+
+    The production path deliberately owns a cancellable socket rather than
+    calling ``post_json``. Older offline tests mocked only the old helper;
+    this adapter makes their intended synthetic HTTP result explicit without
+    weakening production transport ownership.
+    """
+    def factory(url, body, *, api_key=None, timeout=None, **_kwargs):
+        def action(_response_read_abandoned):
+            try:
+                status, response_text = post(url, body, api_key=api_key, timeout=timeout)
+            except urllib.error.HTTPError as exc:
+                return {
+                    "kind": "http_response",
+                    "status": int(exc.code),
+                    "response_text": pipeline._read_http_error_body(exc),
+                }
+            return {
+                "kind": "http_response",
+                "status": int(status),
+                "response_text": str(response_text or ""),
+            }
+        return FakeJsonPostResponseTracker(action).start()
+
+    return factory
 
 
 class PipelineCoreTests(unittest.TestCase):
@@ -3811,6 +3890,28 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertLess(exact_plan, 1_400)
         self.assertGreater(exact_plan, 191)
 
+    def test_exact_all_fresh_plan_does_not_readd_completed_ocr_as_future_work(self):
+        import rag_pdf_gradio_app as app
+
+        # Two 791-page PDFs each selected one OCR target page in the reproduced
+        # run. Their local preparation had already elapsed by this checkpoint;
+        # an all-fresh plan may refine remaining provider work but must never
+        # add all 1,582 physical pages as a new OCR future.
+        exact_plan = app.confirmed_batch_execution_plan_eta_seconds(
+            4_876,
+            203,
+            fresh_provider_requests=1_718,
+            provider_request_seconds=2.285,
+            features={"document_count": 9},
+            cached_attachment_records=0,
+            source_total=9,
+            cached_documents=0,
+            cache_attachment_prior={},
+        )
+
+        self.assertEqual(exact_plan, 4_141)
+        self.assertLess(exact_plan, 4_876)
+
     def test_exact_batch_plan_applies_cache_mix_only_to_future_work(self):
         import rag_pdf_gradio_app as app
 
@@ -4819,6 +4920,41 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(record["batch_completed_files"], 7)
         self.assertEqual(record["batch_total_files"], 8)
         self.assertEqual(record["batch_current_file_index"], 8)
+
+    def test_grouped_queue_keeps_preparation_and_vector_confirmation_separate(self):
+        import rag_pdf_gradio_app as app
+
+        original = app.LIVE_AUTOMATIC_RUN_STATUS
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                app.LIVE_AUTOMATIC_RUN_STATUS = {}
+                app.update_live_automatic_run_status(
+                    temp_dir,
+                    state="running",
+                    phase="All PDF processing finished — completing the batch",
+                    batch_completed_files=8,
+                    batch_total_files=8,
+                )
+                record = app.update_live_automatic_run_status(
+                    temp_dir,
+                    state="running",
+                    phase="Submitting the selected PDF batch to AnythingLLM",
+                    evidence_kind="desktop_queue",
+                    batch_prepared_files=8,
+                    batch_vector_confirmed_files=0,
+                    batch_completed_files=0,
+                    batch_total_files=8,
+                    authoritative_batch_completed_files=True,
+                )
+        finally:
+            app.LIVE_AUTOMATIC_RUN_STATUS = original
+
+        self.assertEqual(record["batch_prepared_files"], 8)
+        self.assertEqual(record["batch_completed_files"], 8)
+        self.assertEqual(record["batch_vector_confirmed_files"], 0)
+        rendered = app.automatic_live_status_html(record)
+        self.assertIn("PDFs accepted by AnythingLLM: 0/8", rendered)
+        self.assertIn("vectors confirmed: 0/8", rendered)
 
     def test_progress_label_never_uses_estimate_text_as_a_second_progress_bar(self):
         import rag_pdf_gradio_app as app
@@ -5837,6 +5973,18 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertAlmostEqual(
             app.concurrent_ingestion_progress_fraction(.90, 20, 40),
             20 / (40 * app.PRESENTATION_ETA_CONSERVATISM) + .05,
+        )
+        # A cache plan or live reprice may replace the opening-only display
+        # discount. The evidence ceiling must follow that visible clock rather
+        # than applying a second hidden 30% discount.
+        self.assertAlmostEqual(
+            app.concurrent_ingestion_progress_fraction(
+                .90,
+                20,
+                40,
+                presentation_expected_seconds=40,
+            ),
+            .55,
         )
         self.assertEqual(app.concurrent_ingestion_progress_fraction(.90, 20, 0), .9)
 
@@ -16351,6 +16499,7 @@ class PipelineCoreTests(unittest.TestCase):
         ]
         calls = []
         original_post = pipeline.post_json
+        original_tracker = pipeline.start_json_post_response_tracker
         try:
             def fake_post(url, body, api_key=None, **_kwargs):
                 calls.append((url, body))
@@ -16359,6 +16508,7 @@ class PipelineCoreTests(unittest.TestCase):
                 return 200, json.dumps({"success": True})
 
             pipeline.post_json = fake_post
+            pipeline.start_json_post_response_tracker = fake_json_post_tracker_from_post(fake_post)
             report = pipeline.maybe_upload_payloads(
                 "http://anythingllm",
                 "key",
@@ -16368,6 +16518,7 @@ class PipelineCoreTests(unittest.TestCase):
             )
         finally:
             pipeline.post_json = original_post
+            pipeline.start_json_post_response_tracker = original_tracker
         uploaded_titles = [body["metadata"]["title"] for url, body in calls if url.endswith("/raw-text")]
         self.assertEqual(uploaded_titles, ["segment-0", "segment-2"])
         self.assertTrue(
@@ -16488,6 +16639,7 @@ class PipelineCoreTests(unittest.TestCase):
 
     def test_desktop_queue_submits_every_location_once_and_keeps_final_verification(self):
         original_post = pipeline.post_json
+        original_tracker = pipeline.start_json_post_response_tracker
         calls = []
         statuses = []
         locations = [f"custom-documents/segment-{index}.json" for index in range(12)]
@@ -16497,6 +16649,7 @@ class PipelineCoreTests(unittest.TestCase):
                 return 200, json.dumps({"success": True})
 
             pipeline.post_json = fake_post
+            pipeline.start_json_post_response_tracker = fake_json_post_tracker_from_post(fake_post)
             result = pipeline.update_workspace_embeddings_desktop_queue(
                 "http://anythingllm",
                 "key",
@@ -16510,6 +16663,7 @@ class PipelineCoreTests(unittest.TestCase):
             )
         finally:
             pipeline.post_json = original_post
+            pipeline.start_json_post_response_tracker = original_tracker
 
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][1]["adds"], locations)
@@ -17229,6 +17383,7 @@ class PipelineCoreTests(unittest.TestCase):
 
     def test_desktop_queue_relays_per_file_progress_without_late_generic_overwrite(self):
         original_post = pipeline.post_json
+        original_tracker = pipeline.start_json_post_response_tracker
         original_listener = pipeline.start_anythingllm_embed_progress_listener
         statuses = []
         locations = [f"custom-documents/page-parent-{index}.txt" for index in range(5)]
@@ -17260,6 +17415,9 @@ class PipelineCoreTests(unittest.TestCase):
 
             pipeline.start_anythingllm_embed_progress_listener = fake_listener
             pipeline.post_json = lambda *_args, **_kwargs: (200, json.dumps({"success": True}))
+            pipeline.start_json_post_response_tracker = fake_json_post_tracker(
+                lambda _body, _abandoned: {"kind": "http_response", "status": 200, "response_text": "{}"}
+            )
             pipeline.update_workspace_embeddings_desktop_queue(
                 "http://anythingllm",
                 "key",
@@ -17274,6 +17432,7 @@ class PipelineCoreTests(unittest.TestCase):
             )
         finally:
             pipeline.post_json = original_post
+            pipeline.start_json_post_response_tracker = original_tracker
             pipeline.start_anythingllm_embed_progress_listener = original_listener
 
         self.assertTrue(any("embedding record 3" in message for message in statuses))
@@ -17284,6 +17443,7 @@ class PipelineCoreTests(unittest.TestCase):
 
     def test_desktop_queue_reports_exact_vector_cache_reuse(self):
         original_post = pipeline.post_json
+        original_tracker = pipeline.start_json_post_response_tracker
         original_listener = pipeline.start_anythingllm_embed_progress_listener
         statuses = []
         reports = []
@@ -17320,7 +17480,10 @@ class PipelineCoreTests(unittest.TestCase):
 
                 pipeline.start_anythingllm_embed_progress_listener = fake_listener
                 pipeline.post_json = lambda *_args, **_kwargs: (200, json.dumps({"success": True}))
-                pipeline.update_workspace_embeddings_desktop_queue(
+                pipeline.start_json_post_response_tracker = fake_json_post_tracker(
+                    lambda _body, _abandoned: {"kind": "http_response", "status": 200, "response_text": "{}"}
+                )
+                result = pipeline.update_workspace_embeddings_desktop_queue(
                     "http://anythingllm",
                     "key",
                     "queue-workspace",
@@ -17334,13 +17497,487 @@ class PipelineCoreTests(unittest.TestCase):
                 )
             finally:
                 pipeline.post_json = original_post
+                pipeline.start_json_post_response_tracker = original_tracker
                 pipeline.start_anythingllm_embed_progress_listener = original_listener
 
         assert any("reusing cached embeddings" in message for message in statuses)
         assert any(report.get("desktop_queue_vector_cache_hit") is True for report in reports)
+        # The listener emitted its event before POST. It is useful progress
+        # display, but must not be promoted to a receipt for this request.
+        self.assertEqual(
+            result["batches"][0]["acceptance_basis"],
+            "http_2xx_submission_only",
+        )
+
+    def test_owned_queue_receipt_avoids_waiting_for_late_http_response(self):
+        """A matching post-POST queue event is a receipt, not vector proof."""
+        original_post = pipeline.post_json
+        original_tracker = pipeline.start_json_post_response_tracker
+        original_listener = pipeline.start_anythingllm_embed_progress_listener
+        post_started = threading.Event()
+        location = "custom-documents/receipt-race.txt"
+
+        class FakeThread:
+            def join(self, timeout=None):
+                return None
+
+        try:
+            def fake_post(*_args, **_kwargs):
+                post_started.set()
+                time.sleep(0.30)
+                return 200, json.dumps({"success": True})
+
+            def fake_tracker(_body, response_read_abandoned):
+                post_started.set()
+                if response_read_abandoned.wait(timeout=0.30):
+                    return {"kind": "response_read_abandoned"}
+                return {"kind": "http_response", "status": 200, "response_text": "{}"}
+
+            def fake_listener(*_args, **kwargs):
+                observer = kwargs.get("observer_callback")
+
+                def emit_owned_event():
+                    post_started.wait(timeout=0.20)
+                    observer({
+                        "type": "doc_starting",
+                        "filename": location,
+                        "docIndex": 0,
+                        "totalDocs": 1,
+                    })
+
+                threading.Thread(target=emit_owned_event, daemon=True).start()
+                connected = threading.Event()
+                connected.set()
+                return {
+                    "stop_event": threading.Event(),
+                    "thread": FakeThread(),
+                    "connected_event": connected,
+                    "events": [],
+                    "errors": [],
+                }
+
+            pipeline.post_json = fake_post
+            pipeline.start_json_post_response_tracker = fake_json_post_tracker(fake_tracker)
+            pipeline.start_anythingllm_embed_progress_listener = fake_listener
+            started = time.perf_counter()
+            result = pipeline.update_workspace_embeddings_desktop_queue(
+                "http://anythingllm",
+                "key",
+                "queue-workspace",
+                [location],
+                batch_verifier=lambda report: {
+                    "status": "pass",
+                    "matching_vector_rows": len(report["locations"]),
+                },
+            )
+            elapsed = time.perf_counter() - started
+        finally:
+            pipeline.post_json = original_post
+            pipeline.start_json_post_response_tracker = original_tracker
+            pipeline.start_anythingllm_embed_progress_listener = original_listener
+
+        batch = result["batches"][0]
+        self.assertLess(elapsed, 0.20, batch)
+        self.assertEqual(batch["acceptance_basis"], "owned_desktop_queue_event_before_http_receipt")
+        self.assertEqual(batch["receipt_state"], "owned_queue_event_observed")
+        self.assertTrue(batch["http_response_pending_at_queue_receipt"])
+        self.assertTrue(batch["request_thread_terminated"])
+        self.assertEqual(batch["http_response_state"], "response_read_closed_after_owned_queue_receipt")
+        self.assertIsNone(batch["submission_seconds"])
+        self.assertGreater(batch["queue_receipt_seconds"], 0.0)
+        self.assertTrue(batch["searchability_proven"])
+        self.assertLess(batch["receipt_wait_seconds"], 0.20)
+
+    def test_controlled_tracker_closes_a_real_blocked_http_response_read(self):
+        """Receipt release must not retain a 20-second background socket."""
+        request_received = threading.Event()
+        release_server = threading.Event()
+
+        class SlowResponseHandler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                request_received.set()
+                release_server.wait(timeout=1.0)
+                try:
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"{}")
+                except OSError:
+                    pass
+
+            def log_message(self, _format, *_args):
+                return
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), SlowResponseHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            tracker = pipeline.start_json_post_response_tracker(
+                f"http://127.0.0.1:{server.server_port}/update-embeddings",
+                {"adds": ["custom-documents/a.json"], "deletes": []},
+                api_key="test-key",  # pragma: allowlist secret
+                timeout=20.0,
+            )
+            self.assertTrue(request_received.wait(timeout=1.0))
+            tracker.close_response_read()
+            tracker.join(timeout=1.0)
+            self.assertFalse(tracker.is_alive())
+            self.assertEqual(tracker.outcome().get("kind"), "response_read_abandoned")
+        finally:
+            release_server.set()
+            server.shutdown()
+            server.server_close()
+
+    def test_controlled_tracker_reads_an_explicit_rate_limit_response(self):
+        """The cancellable transport must retain a real 429 before receipt."""
+        class RateLimitHandler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                body = b'{"error":"rate limited"}'
+                self.send_response(429)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format, *_args):
+                return
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), RateLimitHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            tracker = pipeline.start_json_post_response_tracker(
+                f"http://127.0.0.1:{server.server_port}/update-embeddings",
+                {"adds": ["custom-documents/a.json"], "deletes": []},
+                api_key="test-key",  # pragma: allowlist secret
+                timeout=2.0,
+            )
+            self.assertTrue(tracker.wait(timeout=1.0))
+            self.assertFalse(tracker.is_alive())
+            outcome = tracker.outcome()
+            self.assertEqual(outcome["kind"], "http_response")
+            self.assertEqual(outcome["status"], 429)
+            self.assertIn("rate limited", outcome["response_text"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_owned_queue_receipt_never_unblocks_later_source_without_vectors(self):
+        """Queue admission is safe receipt evidence, not a source completion."""
+        original_post = pipeline.post_json
+        original_tracker = pipeline.start_json_post_response_tracker
+        original_listener = pipeline.start_anythingllm_embed_progress_listener
+        post_started = threading.Event()
+        calls = []
+        locations = [
+            "custom-documents/receipt-source-a.txt",
+            "custom-documents/receipt-source-b.txt",
+        ]
+
+        class FakeThread:
+            def join(self, timeout=None):
+                return None
+
+        try:
+            def fake_post(_url, body, **_kwargs):
+                calls.append(list(body["adds"]))
+                post_started.set()
+                time.sleep(0.15)
+                return 200, "{}"
+
+            def fake_tracker(body, response_read_abandoned):
+                calls.append(list(body["adds"]))
+                post_started.set()
+                if response_read_abandoned.wait(timeout=0.15):
+                    return {"kind": "response_read_abandoned"}
+                return {"kind": "http_response", "status": 200, "response_text": "{}"}
+
+            def fake_listener(_url, _key, _workspace, expected, **kwargs):
+                observer = kwargs.get("observer_callback")
+
+                def emit_owned_event():
+                    post_started.wait(timeout=0.20)
+                    observer({
+                        "type": "doc_starting",
+                        "filename": expected[0],
+                        "docIndex": 0,
+                        "totalDocs": len(expected),
+                    })
+
+                threading.Thread(target=emit_owned_event, daemon=True).start()
+                connected = threading.Event()
+                connected.set()
+                return {
+                    "stop_event": threading.Event(),
+                    "thread": FakeThread(),
+                    "connected_event": connected,
+                    "events": [],
+                    "errors": [],
+                }
+
+            pipeline.post_json = fake_post
+            pipeline.start_json_post_response_tracker = fake_json_post_tracker(fake_tracker)
+            pipeline.start_anythingllm_embed_progress_listener = fake_listener
+            result = pipeline.update_workspace_embeddings_desktop_queue(
+                "http://anythingllm",
+                "key",
+                "queue-workspace",
+                locations,
+                location_sources=[
+                    {"location": locations[0], "source_path": "first.pdf"},
+                    {"location": locations[1], "source_path": "second.pdf"},
+                ],
+                batch_verifier=lambda _report: {"status": "timeout"},
+            )
+            time.sleep(0.20)
+        finally:
+            pipeline.post_json = original_post
+            pipeline.start_json_post_response_tracker = original_tracker
+            pipeline.start_anythingllm_embed_progress_listener = original_listener
+
+        self.assertEqual(calls, [[locations[0]]])
+        self.assertEqual(result["stopped_after_source_window"], 1)
+        first = result["batches"][0]
+        self.assertEqual(first["acceptance_basis"], "owned_desktop_queue_event_before_http_receipt")
+        self.assertFalse(first["searchability_proven"])
+
+    def test_owned_queue_receipt_records_an_incomplete_response_reader_release(self):
+        """A rare reader-release miss is auditable but never replayed."""
+        original_tracker = pipeline.start_json_post_response_tracker
+        original_listener = pipeline.start_anythingllm_embed_progress_listener
+        location = "custom-documents/stubborn-reader.json"
+        tracker_started = threading.Event()
+
+        class StubbornTracker:
+            def wait(self, timeout=None):
+                time.sleep(min(float(timeout or 0), 0.001))
+                return False
+
+            def close_response_read(self):
+                return None
+
+            def join(self, timeout=None):
+                return None
+
+            def outcome(self):
+                return {"kind": "response_read_abandoned"}
+
+            def is_alive(self):
+                return True
+
+        class FakeThread:
+            def join(self, timeout=None):
+                return None
+
+        try:
+            def fake_listener(*_args, **kwargs):
+                observer = kwargs.get("observer_callback")
+
+                def emit_owned_event():
+                    tracker_started.wait(timeout=0.20)
+                    observer({
+                        "type": "doc_starting", "filename": location,
+                        "docIndex": 0, "totalDocs": 1,
+                    })
+
+                threading.Thread(target=emit_owned_event, daemon=True).start()
+                connected = threading.Event()
+                connected.set()
+                return {
+                    "stop_event": threading.Event(), "thread": FakeThread(),
+                    "connected_event": connected, "events": [], "errors": [],
+                }
+
+            pipeline.start_json_post_response_tracker = lambda *_args, **_kwargs: (
+                tracker_started.set() or StubbornTracker()
+            )
+            pipeline.start_anythingllm_embed_progress_listener = fake_listener
+            result = pipeline.update_workspace_embeddings_desktop_queue(
+                "http://anythingllm", "key", "queue-workspace", [location],
+                batch_verifier=lambda report: {
+                    "status": "pass", "matching_vector_rows": len(report["locations"]),
+                },
+            )
+        finally:
+            pipeline.start_json_post_response_tracker = original_tracker
+            pipeline.start_anythingllm_embed_progress_listener = original_listener
+
+        batch = result["batches"][0]
+        self.assertTrue(batch["http_response_pending_at_queue_receipt"])
+        self.assertFalse(batch["request_thread_terminated"])
+        self.assertTrue(any(
+            event.get("event") == "owned_queue_response_reader_release_incomplete"
+            for event in result["runtime_events"]
+        ))
+
+    def test_owned_queue_receipt_late_429_is_evidence_not_a_second_submission(self):
+        """A response observed after queue ownership can never enter retry logic."""
+        original_tracker = pipeline.start_json_post_response_tracker
+        original_listener = pipeline.start_anythingllm_embed_progress_listener
+        location = "custom-documents/late-rate-limit.txt"
+        post_started = threading.Event()
+        calls = []
+
+        class FakeThread:
+            def join(self, timeout=None):
+                return None
+
+        try:
+            def fake_tracker(body, response_read_abandoned):
+                calls.append(list(body["adds"]))
+                post_started.set()
+                response_read_abandoned.wait(timeout=0.20)
+                # This deliberately models the formerly unsafe ordering:
+                # Desktop has started the queue but its late route response is
+                # a 429. The receipt must make that status non-retryable.
+                return {"kind": "http_response", "status": 429, "response_text": "Too Many Requests"}
+
+            def fake_listener(*_args, **kwargs):
+                observer = kwargs.get("observer_callback")
+
+                def emit_owned_event():
+                    post_started.wait(timeout=0.20)
+                    observer({
+                        "type": "doc_starting",
+                        "filename": location,
+                        "docIndex": 0,
+                        "totalDocs": 1,
+                    })
+
+                threading.Thread(target=emit_owned_event, daemon=True).start()
+                connected = threading.Event()
+                connected.set()
+                return {
+                    "stop_event": threading.Event(), "thread": FakeThread(),
+                    "connected_event": connected, "events": [], "errors": [],
+                }
+
+            pipeline.start_json_post_response_tracker = fake_json_post_tracker(fake_tracker)
+            pipeline.start_anythingllm_embed_progress_listener = fake_listener
+            result = pipeline.update_workspace_embeddings_desktop_queue(
+                "http://anythingllm", "key", "queue-workspace", [location],
+                batch_verifier=lambda report: {
+                    "status": "pass", "matching_vector_rows": len(report["locations"]),
+                },
+            )
+        finally:
+            pipeline.start_json_post_response_tracker = original_tracker
+            pipeline.start_anythingllm_embed_progress_listener = original_listener
+
+        self.assertEqual(calls, [[location]])
+        batch = result["batches"][0]
+        self.assertEqual(batch["acceptance_basis"], "owned_desktop_queue_event_before_http_receipt")
+        self.assertEqual(batch["late_http_outcome"]["status"], 429)
+        self.assertEqual(result["errors"], [])
+
+    def test_owned_queue_receipt_is_persisted_before_vector_observation(self):
+        """A crash during observation must retain the no-replay receipt fact."""
+        original_tracker = pipeline.start_json_post_response_tracker
+        original_listener = pipeline.start_anythingllm_embed_progress_listener
+        location = "custom-documents/durable-receipt.txt"
+        post_started = threading.Event()
+
+        class FakeThread:
+            def join(self, timeout=None):
+                return None
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger_path = Path(temp_dir) / "embedding-batch-ledger.json"
+            persisted = {}
+            persisted_manifest = {}
+            try:
+                def fake_tracker(_body, response_read_abandoned):
+                    post_started.set()
+                    response_read_abandoned.wait(timeout=0.20)
+                    return {"kind": "response_read_abandoned"}
+
+                def fake_listener(*_args, **kwargs):
+                    observer = kwargs.get("observer_callback")
+
+                    def emit_owned_event():
+                        post_started.wait(timeout=0.20)
+                        observer({
+                            "type": "doc_starting", "filename": location,
+                            "docIndex": 0, "totalDocs": 1,
+                        })
+
+                    threading.Thread(target=emit_owned_event, daemon=True).start()
+                    connected = threading.Event()
+                    connected.set()
+                    return {
+                        "stop_event": threading.Event(), "thread": FakeThread(),
+                        "connected_event": connected, "events": [], "errors": [],
+                    }
+
+                def verifier(_report):
+                    persisted.update(json.loads(ledger_path.read_text(encoding="utf-8")))
+                    manifest_path = ledger_path.with_name("resume-embedding-manifest.json")
+                    persisted_manifest.update(
+                        json.loads(manifest_path.read_text(encoding="utf-8"))
+                    )
+                    return {"status": "pass", "matching_vector_rows": 1}
+
+                pipeline.start_json_post_response_tracker = fake_json_post_tracker(fake_tracker)
+                pipeline.start_anythingllm_embed_progress_listener = fake_listener
+                pipeline.update_workspace_embeddings_desktop_queue(
+                    "http://anythingllm", "key", "queue-workspace", [location],
+                    ledger_path=ledger_path, batch_verifier=verifier,
+                )
+            finally:
+                pipeline.start_json_post_response_tracker = original_tracker
+                pipeline.start_anythingllm_embed_progress_listener = original_listener
+
+        inflight = persisted["inflight_batch"]
+        self.assertEqual(inflight["receipt_state"], "owned_queue_event_observed")
+        self.assertEqual(inflight["acceptance_basis"], "owned_desktop_queue_event_before_http_receipt")
+        self.assertFalse(inflight["searchability_proven"])
+        self.assertEqual(persisted_manifest["recovery"]["state"], "observation_required")
+        self.assertTrue(persisted_manifest["recovery"]["resubmission_forbidden"])
+        self.assertEqual(persisted_manifest["recovery"]["remaining_locations"], [location])
+
+    def test_receipt_observer_rate_limit_retry_is_durable_and_safe_before_receipt(self):
+        original_tracker = pipeline.start_json_post_response_tracker
+        original_listener = pipeline.start_anythingllm_embed_progress_listener
+        original_delay = pipeline.ANYTHINGLLM_EMBEDDING_RATE_LIMIT_RETRY_SECONDS
+        calls = []
+        try:
+            def fake_tracker(_body, _response_read_abandoned):
+                calls.append(1)
+                if len(calls) == 1:
+                    return {"kind": "http_response", "status": 429, "response_text": "Too Many Requests"}
+                return {"kind": "http_response", "status": 200, "response_text": "{}"}
+
+            class FakeThread:
+                def join(self, timeout=None):
+                    return None
+
+            pipeline.ANYTHINGLLM_EMBEDDING_RATE_LIMIT_RETRY_SECONDS = 0.0
+            pipeline.start_json_post_response_tracker = fake_json_post_tracker(fake_tracker)
+            pipeline.start_anythingllm_embed_progress_listener = lambda *_args, **_kwargs: {
+                "stop_event": threading.Event(), "thread": FakeThread(),
+                "connected_event": threading.Event(), "events": [], "errors": [],
+            }
+            result = pipeline.update_workspace_embeddings_desktop_queue(
+                "http://anythingllm", "key", "queue-workspace", ["custom-documents/rate-limit.txt"],
+                batch_verifier=lambda report: {
+                    "status": "pass", "matching_vector_rows": len(report["locations"]),
+                },
+            )
+        finally:
+            pipeline.ANYTHINGLLM_EMBEDDING_RATE_LIMIT_RETRY_SECONDS = original_delay
+            pipeline.start_json_post_response_tracker = original_tracker
+            pipeline.start_anythingllm_embed_progress_listener = original_listener
+
+        self.assertEqual(calls, [1, 1])
+        self.assertEqual(result["batches"][0]["rate_limit_retry_count"], 1)
+        self.assertTrue(any(event.get("event") == "rate_limit_retry" for event in result["runtime_events"]))
 
     def test_desktop_queue_does_not_replay_an_uncertain_full_list_submission(self):
         original_post = pipeline.post_json
+        original_tracker = pipeline.start_json_post_response_tracker
         calls = []
         locations = ["custom-documents/a.json", "custom-documents/b.json"]
         try:
@@ -17349,6 +17986,9 @@ class PipelineCoreTests(unittest.TestCase):
                 raise TimeoutError("timed out")
 
             pipeline.post_json = timeout_post
+            pipeline.start_json_post_response_tracker = fake_json_post_tracker(
+                lambda _body, _abandoned: (calls.append(1) and {}) or (_ for _ in ()).throw(TimeoutError("timed out"))
+            )
             result = pipeline.update_workspace_embeddings_desktop_queue(
                 "http://anythingllm",
                 "key",
@@ -17361,6 +18001,7 @@ class PipelineCoreTests(unittest.TestCase):
             )
         finally:
             pipeline.post_json = original_post
+            pipeline.start_json_post_response_tracker = original_tracker
 
         self.assertEqual(calls, [1])
         self.assertEqual(result["accepted"], len(locations))
@@ -17381,11 +18022,15 @@ class PipelineCoreTests(unittest.TestCase):
     def test_timeout_review_observation_without_exact_vectors_remains_resumable(self):
         """A locked/read-only review result cannot recover a timed-out queue."""
         original_post = pipeline.post_json
+        original_tracker = pipeline.start_json_post_response_tracker
         locations = ["custom-documents/a.json", "custom-documents/b.json"]
         with tempfile.TemporaryDirectory() as tmpdir:
             ledger = Path(tmpdir) / "embedding-batch-ledger.json"
             try:
                 pipeline.post_json = lambda *_args, **_kwargs: (_ for _ in ()).throw(TimeoutError("timed out"))
+                pipeline.start_json_post_response_tracker = fake_json_post_tracker(
+                    lambda _body, _abandoned: (_ for _ in ()).throw(TimeoutError("timed out"))
+                )
                 result = pipeline.update_workspace_embeddings_desktop_queue(
                     "http://anythingllm",
                     "key",
@@ -17400,6 +18045,7 @@ class PipelineCoreTests(unittest.TestCase):
                 )
             finally:
                 pipeline.post_json = original_post
+                pipeline.start_json_post_response_tracker = original_tracker
             manifest = json.loads((ledger.with_name("resume-embedding-manifest.json")).read_text(encoding="utf-8"))
 
         self.assertEqual(result["accepted"], 0)
@@ -17433,6 +18079,36 @@ class PipelineCoreTests(unittest.TestCase):
             batch["acceptance_basis"] == "exact_vectors_preexisted_before_submission"
             for batch in result["batches"]
         ))
+        self.assertTrue(all(
+            batch["reconciliation_seconds"] == 0.0
+            and batch["exact_vector_observation_seconds"] == 0.0
+            and batch["verification_seconds"] == 0.0
+            for batch in result["batches"]
+        ))
+
+    def test_embedding_reconciliation_keeps_queue_wait_and_local_vector_read_separate(self):
+        original_post = pipeline.post_json
+        try:
+            pipeline.post_json = lambda *_args, **_kwargs: (200, "{}")
+            result = pipeline.update_workspace_embeddings_batched(
+                "http://anythingllm",
+                "key",
+                "safe-workspace",
+                ["custom-documents/segment-1.json"],
+                verification_mode="every_batch",
+                batch_verifier=lambda _batch: {
+                    "status": "pass",
+                    "matching_vector_rows": 1,
+                    "storage_observation_total_seconds": 0.125,
+                },
+            )
+        finally:
+            pipeline.post_json = original_post
+
+        batch = result["batches"][0]
+        self.assertIn("reconciliation_seconds", batch)
+        self.assertEqual(batch["verification_seconds"], batch["reconciliation_seconds"])
+        self.assertEqual(batch["exact_vector_observation_seconds"], 0.125)
 
     def test_slow_warmup_switches_remaining_requests_to_single_record_mode(self):
         original_post = pipeline.post_json
@@ -17498,10 +18174,13 @@ class PipelineCoreTests(unittest.TestCase):
     def test_queue_http_error_is_held_as_ambiguous_not_misreported_as_rejected(self):
         """urllib raises HTTPError; it must not unlock a later source window."""
         original_post = pipeline.post_json
+        original_tracker = pipeline.start_json_post_response_tracker
         try:
-            pipeline.post_json = lambda *_args, **_kwargs: (_ for _ in ()).throw(
-                urllib.error.HTTPError("http://anythingllm/api", 400, "bad request", {}, None)
-            )
+            def fake_post(*_args, **_kwargs):
+                raise urllib.error.HTTPError("http://anythingllm/api", 400, "bad request", {}, None)
+
+            pipeline.post_json = fake_post
+            pipeline.start_json_post_response_tracker = fake_json_post_tracker_from_post(fake_post)
             result = pipeline.update_workspace_embeddings_desktop_queue(
                 "http://anythingllm",
                 "key",
@@ -17511,6 +18190,7 @@ class PipelineCoreTests(unittest.TestCase):
             )
         finally:
             pipeline.post_json = original_post
+            pipeline.start_json_post_response_tracker = original_tracker
 
         batch = result["batches"][0]
         self.assertEqual(batch["submission_state"], "unresolved")
@@ -18305,6 +18985,7 @@ class PipelineCoreTests(unittest.TestCase):
         original_create = pipeline.create_temporary_desktop_api_key
         original_delete = pipeline.delete_temporary_desktop_api_key
         original_post = pipeline.post_json
+        original_tracker = pipeline.start_json_post_response_tracker
         original_resolve = pipeline.resolve_anythingllm_api_key
         calls = []
         try:
@@ -18327,6 +19008,7 @@ class PipelineCoreTests(unittest.TestCase):
                 return 200, json.dumps({"success": True})
 
             pipeline.post_json = fake_post
+            pipeline.start_json_post_response_tracker = fake_json_post_tracker_from_post(fake_post)
             report = pipeline.maybe_upload_payloads(
                 "http://127.0.0.1:3001",
                 "",
@@ -18338,6 +19020,7 @@ class PipelineCoreTests(unittest.TestCase):
             pipeline.create_temporary_desktop_api_key = original_create
             pipeline.delete_temporary_desktop_api_key = original_delete
             pipeline.post_json = original_post
+            pipeline.start_json_post_response_tracker = original_tracker
             pipeline.resolve_anythingllm_api_key = original_resolve
 
         self.assertEqual(report["status"], "complete")
@@ -18402,6 +19085,39 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(calls, [("http://127.0.0.1:3001", "managed-secret", "safe-workspace", ["custom/segment-6.json"])])
         self.assertEqual(result["status"], "submitted")
         self.assertEqual(result["authentication"], "managed_local_service_key")
+
+    def test_observation_only_recovery_never_replays_owned_locations(self):
+        """An owned queue receipt offers reconciliation, never a second POST."""
+        import rag_pdf_gradio_app as app
+
+        location = "custom/owned-segment.json"
+        manifest = {
+            "workspace_slug": "safe-workspace",
+            "recovery": {
+                "state": "observation_required",
+                "remaining_locations": [location],
+                "resubmission_forbidden": True,
+            },
+        }
+        with (
+            mock.patch.object(app, "latest_resume_manifest", return_value=(Path("owned-manifest.json"), manifest)),
+            mock.patch.object(
+                app,
+                "persist_reconciled_resume_manifest",
+                return_value=([location], {"reconciled_locations": 0}),
+            ),
+            mock.patch.object(
+                app,
+                "submit_embedding_resume_manifest",
+                side_effect=AssertionError("owned locations must not be resubmitted"),
+            ),
+        ):
+            status_html, update = app.resume_latest_embedding_manifest(
+                "http://anythingllm", "key", "safe-workspace"
+            )
+
+        self.assertIn("already-owned", status_html)
+        self.assertIn("no resubmission", str(update.get("value") or ""))
 
     def test_resume_reconciles_late_timed_out_batch_before_resubmission(self):
         import rag_pdf_gradio_app as app
@@ -18531,6 +19247,7 @@ class PipelineCoreTests(unittest.TestCase):
             ]
             original_post_multipart = pipeline.post_multipart_form
             original_post_json = pipeline.post_json
+            original_tracker = pipeline.start_json_post_response_tracker
             calls = []
             try:
                 def fake_post_multipart(url, fields, file_field_name, file_path, api_key=None, timeout=120, file_bytes=None):
@@ -18543,6 +19260,7 @@ class PipelineCoreTests(unittest.TestCase):
 
                 pipeline.post_multipart_form = fake_post_multipart
                 pipeline.post_json = fake_post_json
+                pipeline.start_json_post_response_tracker = fake_json_post_tracker_from_post(fake_post_json)
                 report = pipeline.maybe_upload_to_anythingllm(
                     "http://anythingllm",
                     "key",
@@ -18555,6 +19273,7 @@ class PipelineCoreTests(unittest.TestCase):
             finally:
                 pipeline.post_multipart_form = original_post_multipart
                 pipeline.post_json = original_post_json
+                pipeline.start_json_post_response_tracker = original_tracker
 
             self.assertEqual(report["status"], "complete")
             self.assertEqual(report["transport"], "file_upload")
@@ -18583,6 +19302,7 @@ class PipelineCoreTests(unittest.TestCase):
                 )
             original_multipart = pipeline.post_multipart_form
             original_json = pipeline.post_json
+            original_tracker = pipeline.start_json_post_response_tracker
             multipart_calls = []
             embedding_calls = []
             try:
@@ -18597,6 +19317,7 @@ class PipelineCoreTests(unittest.TestCase):
 
                 pipeline.post_multipart_form = fake_multipart
                 pipeline.post_json = fake_json
+                pipeline.start_json_post_response_tracker = fake_json_post_tracker_from_post(fake_json)
                 report = pipeline.maybe_upload_to_anythingllm(
                     "http://anythingllm",
                     "key",
@@ -18612,6 +19333,7 @@ class PipelineCoreTests(unittest.TestCase):
             finally:
                 pipeline.post_multipart_form = original_multipart
                 pipeline.post_json = original_json
+                pipeline.start_json_post_response_tracker = original_tracker
 
         self.assertEqual(multipart_calls, [row["filename"] for row in upload_rows])
         self.assertEqual(len(embedding_calls), 1)
@@ -18638,6 +19360,7 @@ class PipelineCoreTests(unittest.TestCase):
             ]
             original_multipart = pipeline.post_multipart_form
             original_json = pipeline.post_json
+            original_tracker = pipeline.start_json_post_response_tracker
             multipart_calls = []
             queue_calls = []
             try:
@@ -18653,6 +19376,7 @@ class PipelineCoreTests(unittest.TestCase):
 
                 pipeline.post_multipart_form = fake_multipart
                 pipeline.post_json = fake_json
+                pipeline.start_json_post_response_tracker = fake_json_post_tracker_from_post(fake_json)
                 report = pipeline.maybe_upload_to_anythingllm(
                     "http://anythingllm", "key", [], workspace_slug="workspace",
                     upload_transport="file_upload", upload_plan_rows=rows,
@@ -18665,6 +19389,7 @@ class PipelineCoreTests(unittest.TestCase):
             finally:
                 pipeline.post_multipart_form = original_multipart
                 pipeline.post_json = original_json
+                pipeline.start_json_post_response_tracker = original_tracker
 
         self.assertEqual(multipart_calls, ["first.txt", "second.txt"])
         self.assertEqual(queue_calls, [{"adds": ["custom-documents/first.json"], "deletes": []}])
@@ -18693,6 +19418,7 @@ class PipelineCoreTests(unittest.TestCase):
                 })
             original_multipart = pipeline.post_multipart_form
             original_json = pipeline.post_json
+            original_tracker = pipeline.start_json_post_response_tracker
             queue_calls = []
             try:
                 def fake_multipart(*_args, **kwargs):
@@ -18702,7 +19428,12 @@ class PipelineCoreTests(unittest.TestCase):
                     return 200, json.dumps({"location": f"custom-documents/{name}.json"})
 
                 pipeline.post_multipart_form = fake_multipart
-                pipeline.post_json = lambda _url, body, **_kwargs: queue_calls.append(body) or (200, "{}")
+                def fake_json(_url, body, **_kwargs):
+                    queue_calls.append(body)
+                    return 200, "{}"
+
+                pipeline.post_json = fake_json
+                pipeline.start_json_post_response_tracker = fake_json_post_tracker_from_post(fake_json)
                 report = pipeline.maybe_upload_to_anythingllm(
                     "http://anythingllm", "key", [], workspace_slug="workspace",
                     upload_transport="file_upload", upload_plan_rows=rows,
@@ -18720,6 +19451,7 @@ class PipelineCoreTests(unittest.TestCase):
             finally:
                 pipeline.post_multipart_form = original_multipart
                 pipeline.post_json = original_json
+                pipeline.start_json_post_response_tracker = original_tracker
 
         self.assertEqual(
             queue_calls,
@@ -18826,6 +19558,7 @@ class PipelineCoreTests(unittest.TestCase):
                 })
             original_multipart = pipeline.post_multipart_form
             original_json = pipeline.post_json
+            original_tracker = pipeline.start_json_post_response_tracker
             queue_calls = []
             try:
                 def fake_multipart(*_args, **kwargs):
@@ -18838,7 +19571,12 @@ class PipelineCoreTests(unittest.TestCase):
                     return 200, json.dumps({"success": True})
 
                 pipeline.post_multipart_form = fake_multipart
-                pipeline.post_json = lambda _url, body, **_kwargs: queue_calls.append(body) or (200, "{}")
+                def fake_json(_url, body, **_kwargs):
+                    queue_calls.append(body)
+                    return 200, "{}"
+
+                pipeline.post_json = fake_json
+                pipeline.start_json_post_response_tracker = fake_json_post_tracker_from_post(fake_json)
                 report = pipeline.maybe_upload_to_anythingllm(
                     "http://anythingllm", "key", [], workspace_slug="workspace",
                     upload_transport="file_upload", upload_plan_rows=rows,
@@ -18847,6 +19585,7 @@ class PipelineCoreTests(unittest.TestCase):
             finally:
                 pipeline.post_multipart_form = original_multipart
                 pipeline.post_json = original_json
+                pipeline.start_json_post_response_tracker = original_tracker
 
         # The local staged-document reconciliation restores exact attachment
         # locations, but a bare 2xx embedding receipt is not vector evidence.
@@ -18883,12 +19622,17 @@ class PipelineCoreTests(unittest.TestCase):
             ]
             original_post_multipart = pipeline.post_multipart_form
             original_post_json = pipeline.post_json
+            original_tracker = pipeline.start_json_post_response_tracker
             try:
                 pipeline.post_multipart_form = lambda *_args, **_kwargs: (
                     200,
                     json.dumps({"documents": [{"location": "custom-documents/sample-p0001-s00001.json"}]}),
                 )
-                pipeline.post_json = lambda *_args, **_kwargs: (200, json.dumps({"success": True}))
+                def fake_post_json(*_args, **_kwargs):
+                    return 200, json.dumps({"success": True})
+
+                pipeline.post_json = fake_post_json
+                pipeline.start_json_post_response_tracker = fake_json_post_tracker_from_post(fake_post_json)
                 report = pipeline.maybe_upload_to_anythingllm(
                     "http://anythingllm",
                     "key",
@@ -18903,6 +19647,7 @@ class PipelineCoreTests(unittest.TestCase):
             finally:
                 pipeline.post_multipart_form = original_post_multipart
                 pipeline.post_json = original_post_json
+                pipeline.start_json_post_response_tracker = original_tracker
 
             self.assertEqual(report["status"], "complete")
             self.assertEqual(report["locations"], ["custom-documents/Original-PDF-abc12345/sample-p0001-s00001.json"])  # pragma: allowlist secret -- synthetic folder fixture
@@ -18928,6 +19673,7 @@ class PipelineCoreTests(unittest.TestCase):
             }]
             original_post_multipart = pipeline.post_multipart_form
             original_post_json = pipeline.post_json
+            original_tracker = pipeline.start_json_post_response_tracker
             json_bodies = []
             try:
                 pipeline.post_multipart_form = lambda *_args, **_kwargs: (
@@ -18938,6 +19684,7 @@ class PipelineCoreTests(unittest.TestCase):
                     json_bodies.append(body)
                     return 200, json.dumps({"success": True})
                 pipeline.post_json = fake_post_json
+                pipeline.start_json_post_response_tracker = fake_json_post_tracker_from_post(fake_post_json)
                 report = pipeline.maybe_upload_to_anythingllm(
                     "http://anythingllm",
                     "key",
@@ -18951,6 +19698,7 @@ class PipelineCoreTests(unittest.TestCase):
             finally:
                 pipeline.post_multipart_form = original_post_multipart
                 pipeline.post_json = original_post_json
+                pipeline.start_json_post_response_tracker = original_tracker
 
             self.assertEqual(report["status"], "complete")
             self.assertEqual(report["locations"], ["custom-documents/drawer-visible.json"])
@@ -18976,6 +19724,7 @@ class PipelineCoreTests(unittest.TestCase):
                 )
             original_post_multipart = pipeline.post_multipart_form
             original_post_json = pipeline.post_json
+            original_tracker = pipeline.start_json_post_response_tracker
             calls = []
             try:
                 def fake_post_multipart(
@@ -18991,6 +19740,7 @@ class PipelineCoreTests(unittest.TestCase):
 
                 pipeline.post_multipart_form = fake_post_multipart
                 pipeline.post_json = fake_post_json
+                pipeline.start_json_post_response_tracker = fake_json_post_tracker_from_post(fake_post_json)
                 report = pipeline.maybe_upload_to_anythingllm(
                     "http://anythingllm",
                     "key",
@@ -19003,6 +19753,7 @@ class PipelineCoreTests(unittest.TestCase):
             finally:
                 pipeline.post_multipart_form = original_post_multipart
                 pipeline.post_json = original_post_json
+                pipeline.start_json_post_response_tracker = original_tracker
 
             uploaded_files = [call[1] for call in calls if call[0] == "multipart"]
             self.assertEqual(uploaded_files, ["sample-p0001-s00000.txt", "sample-p0001-s00002.txt"])
@@ -20431,12 +21182,17 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(verifier_calls[0][2]["observation_mode"], "fast")
         self.assertEqual(report["document_results"][str(root / "range.pdf")]["records"], 1)
 
-    def test_grouped_batch_verifier_extends_only_for_a_live_owned_queue(self):
-        """A long Desktop queue must not lose its receipt at the 480s boundary."""
+    def test_grouped_batch_verifier_accepts_one_complete_owned_queue_snapshot(self):
+        """A complete queue result is not re-observed merely for a synthetic clock."""
         import rag_pdf_gradio_app as app
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
+            # This is a completed queue fixture, not a synthetic 480-second
+            # reconciliation loop. The deadline-extension policy has direct
+            # tests; this test verifies that a grouped completed result is
+            # accepted without needlessly replaying its verifier.
+            total_records = 20
             text_file = root / "prepared.txt"
             text_file.write_text("prepared", encoding="utf-8")
             plan_file = root / "upload-plan.csv"
@@ -20445,7 +21201,7 @@ class PipelineCoreTests(unittest.TestCase):
             ]
             rows.extend(
                 f"page-{index}.txt,Page {index},,,local-pdf://sha256/queue,queue-p{index:04d},{text_file}"
-                for index in range(1, 1001)
+                for index in range(1, total_records + 1)
             )
             plan_file.write_text("\n".join(rows) + "\n", encoding="utf-8")
             summary = {
@@ -20454,11 +21210,10 @@ class PipelineCoreTests(unittest.TestCase):
                 "native_upload_plan": str(plan_file),
                 "native_upload_transport": "file_upload",
             }
-            clock = [0.0]
             verify_calls = [0]
             statuses = []
             queue = {
-                "queue_records": 1000,
+                "queue_records": total_records,
                 "completed": 0,
                 "current": 1,
                 "events_observed": 1,
@@ -20472,68 +21227,43 @@ class PipelineCoreTests(unittest.TestCase):
 
             def fake_verify(_storage, _workspace, _source_sha, payloads, **_kwargs):
                 verify_calls[0] += 1
-                if verify_calls[0] == 2:
-                    queue.update({
-                        "current": 2,
-                        "events_observed": 2,
-                        "last_event_monotonic": clock[0],
-                        "last_progress_monotonic": clock[0],
-                        "last_progress_position": 2,
-                    })
-                if verify_calls[0] >= 4:
-                    return {
-                        "status": "pass",
-                        "matching_vector_rows": len(payloads),
-                        "identity_set_checked": True,
-                        "identity_set_complete": True,
-                        "current_upload_vector_evidence_complete": True,
-                        "current_upload_document_vector_count": len(payloads),
-                        "observed_chunk_sources": [
-                            payload["metadata"]["chunkSource"] for payload in payloads
-                        ],
-                    }
-                return {"status": "partial_vector_coverage", "matching_vector_rows": 1}
+                return {
+                    "status": "pass",
+                    "matching_vector_rows": len(payloads),
+                    "identity_set_checked": True,
+                    "identity_set_complete": True,
+                    "current_upload_vector_evidence_complete": True,
+                    "current_upload_document_vector_count": len(payloads),
+                    "observed_chunk_sources": [
+                        payload["metadata"]["chunkSource"] for payload in payloads
+                    ],
+                }
 
             def fake_upload(*_args, **kwargs):
                 verifier = kwargs["batch_verifier"]
                 verification = verifier({
                     "start_index": 0,
-                    "end_index": 1000,
-                    "locations": [f"custom-documents/page-{index}.json" for index in range(1, 1001)],
+                    "end_index": total_records,
+                    "locations": [f"custom-documents/page-{index}.json" for index in range(1, total_records + 1)],
                     "desktop_queue_observer": queue,
                 })
                 return {
-                    "status": "complete", "uploaded": 1000, "embedded": 1000,
+                    "status": "complete", "uploaded": total_records, "embedded": total_records,
                     "attachment_results": [{
                         "source_path": str(root / "queue.pdf"),
                         "chunk_source": f"queue-p{index:04d}",
                         "location": f"custom-documents/page-{index}.json",
                         "status": "attached", "error": "",
-                    } for index in range(1, 1001)],
-                    "embedding_update": {"requested": 1000, "accepted": 1000, "batches": [{
+                    } for index in range(1, total_records + 1)],
+                    "embedding_update": {"requested": total_records, "accepted": total_records, "batches": [{
                         "submission_state": "accepted", "searchability_proven": True,
-                        "locations": [f"custom-documents/page-{index}.json" for index in range(1, 1001)],
+                        "locations": [f"custom-documents/page-{index}.json" for index in range(1, total_records + 1)],
                         "verification": verification,
                     }]},
                 }
 
-            def fake_sleep(_seconds):
-                # Reach the original boundary in one observation interval;
-                # then permit one ordinary update after its earned extension.
-                clock[0] = 480.0 if clock[0] == 0.0 else clock[0] + 2.0
-                next_position = min(1000, int(queue["current"]) + 1)
-                queue.update({
-                    "current": next_position,
-                    "events_observed": int(queue["events_observed"]) + 1,
-                    "last_event_monotonic": clock[0],
-                    "last_progress_monotonic": clock[0],
-                    "last_progress_position": next_position,
-                })
-
             with mock.patch.object(app, "maybe_upload_to_anythingllm", side_effect=fake_upload), mock.patch.object(
                 app, "verify_anythingllm_post_upload", side_effect=fake_verify
-            ), mock.patch.object(app.time, "monotonic", side_effect=lambda: clock[0]), mock.patch.object(
-                app.time, "sleep", side_effect=fake_sleep
             ):
                 report = app.upload_prepared_automatic_batch(
                     [summary], api_url="http://anythingllm", api_key="key",  # pragma: allowlist secret -- synthetic upload fixture
@@ -20542,11 +21272,8 @@ class PipelineCoreTests(unittest.TestCase):
                 )
 
         self.assertEqual(report["status"], "complete")
-        self.assertGreaterEqual(verify_calls[0], 4)
-        self.assertTrue(any(
-            int(detail.get("reconciliation_deadline_extensions") or 0) >= 1
-            for detail in statuses
-        ))
+        self.assertEqual(verify_calls[0], 1)
+        self.assertTrue(statuses)
 
     def test_grouped_batch_verifier_holds_when_queue_completes_but_source_vectors_stop(self):
         """Earlier workspace vectors must not keep a completed held source alive."""
@@ -21633,6 +22360,16 @@ class TimingAndInspectionSafetyTests(unittest.TestCase):
                 queue, elapsed_seconds=45, **common
             )
         )
+        # The first live observation seeds the cached evidence used by the
+        # later no-read path. Without it the reconciliation poller would try
+        # to copy a missing evidence object while the Desktop writer is healthy.
+        self.assertTrue(
+            pipeline.storage_observation_due_for_queue(
+                queue,
+                elapsed_seconds=45,
+                **{**common, "has_cached_evidence": False},
+            )
+        )
         self.assertFalse(
             pipeline.storage_observation_due_for_queue(
                 {**queue, "desktop_queue_current": 2}, elapsed_seconds=45, **common
@@ -21703,6 +22440,82 @@ class TimingAndInspectionSafetyTests(unittest.TestCase):
             )
         )
 
+    def test_recent_reconnecting_queue_does_not_resume_vector_store_reads(self):
+        """A heartbeat-less SSE reconnect is not a Desktop queue stall."""
+        queue = {
+            "queue_records": 772,
+            "desktop_queue_current": 68,
+            "desktop_queue_completed": 67,
+            "desktop_queue_observer_state": "reconnecting",
+            "desktop_queue_last_event_age_seconds": 24,
+        }
+        common = {
+            "expected_records": 772,
+            "has_cached_evidence": True,
+            "last_observation_position": 67,
+            "last_observation_elapsed_seconds": 100,
+        }
+        self.assertFalse(
+            pipeline.storage_observation_due_for_queue(
+                queue, elapsed_seconds=124, **common
+            )
+        )
+        self.assertTrue(
+            pipeline.storage_observation_due_for_queue(
+                {
+                    **queue,
+                    "desktop_queue_last_event_age_seconds": (
+                        pipeline.ANYTHINGLLM_EMBEDDING_RECONCILIATION_STALL_SECONDS
+                    ),
+                },
+                elapsed_seconds=(
+                    100 + pipeline.ANYTHINGLLM_EMBEDDING_RECONCILIATION_STALL_SECONDS
+                ),
+                **common,
+            )
+        )
+
+    def test_reconnecting_stream_with_new_record_events_never_spins_vector_reads(self):
+        """Exercise a long slow-record stream, not just one reconnect sample."""
+        total = 772
+        common = {
+            "expected_records": total,
+            "has_cached_evidence": True,
+            "last_observation_position": 0,
+            "last_observation_elapsed_seconds": 0,
+        }
+        # A no-heartbeat SSE client can reconnect between every record.  Each
+        # matching position is still fresh liveness evidence, so none of these
+        # 160 status polls may compete with the Desktop vector writer.
+        reads = 0
+        for position in range(1, 161):
+            queue = {
+                "queue_records": total,
+                "desktop_queue_current": position,
+                "desktop_queue_completed": position - 1,
+                "desktop_queue_observer_state": "reconnecting",
+                "desktop_queue_last_event_age_seconds": 4,
+            }
+            reads += int(pipeline.storage_observation_due_for_queue(
+                queue,
+                elapsed_seconds=position * 6,
+                **common,
+            ))
+        self.assertEqual(reads, 0)
+
+        # A genuine evidence gap remains recoverable; the guard does not turn
+        # an SSE reconnect into blind trust.
+        self.assertTrue(pipeline.storage_observation_due_for_queue(
+            {
+                **queue,
+                "desktop_queue_last_event_age_seconds": (
+                    pipeline.ANYTHINGLLM_EMBEDDING_RECONCILIATION_STALL_SECONDS
+                ),
+            },
+            elapsed_seconds=160 * 6 + pipeline.ANYTHINGLLM_EMBEDDING_RECONCILIATION_STALL_SECONDS,
+            **common,
+        ))
+
     def test_large_healthy_queue_bounds_storage_reader_pressure(self):
         """A page-parent stream must not reopen vector storage per record."""
         total = 376
@@ -21728,10 +22541,12 @@ class TimingAndInspectionSafetyTests(unittest.TestCase):
                 reads += 1
                 observed_position = position
                 observed_elapsed = position
-        # The final active record is not a completion proof; the surrounding
-        # reconciliation performs that mandatory exact read.  Live observation
-        # does not touch storage while all 376 queue records keep moving.
-        self.assertEqual(reads, 0)
+        # The first live snapshot establishes the exact local identity mapping
+        # needed by later SSE-only queue observations. The final active record
+        # remains not-complete proof, and the surrounding reconciliation still
+        # owns the mandatory exact terminal read. A healthy 376-record queue
+        # therefore performs exactly one, not one per record, storage read.
+        self.assertEqual(reads, 1)
 
     def test_exact_vector_proof_with_deferred_live_retrieval_is_successful(self):
         import rag_pdf_gradio_app as app

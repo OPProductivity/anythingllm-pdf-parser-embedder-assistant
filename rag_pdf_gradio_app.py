@@ -59,6 +59,7 @@ from prepared_batch_recovery import (
     write_prepared_batch_checkpoint,
 )
 from anythingllm_compatibility import characterize as characterize_anythingllm_compatibility
+from anythingllm_source_atomic_worker import ensure_source_atomic_embedding_worker
 from portable_paths import ensure_application_directories, package_resource_path
 from run_request import LOCAL_ONLY, NATIVE_UPLOAD, RunRequest
 from automatic_defaults import (
@@ -7903,7 +7904,7 @@ def latest_resume_manifest(workspace_slug):
         recovery = manifest.get("recovery") or {}
         if not isinstance(recovery, dict):
             continue
-        if recovery.get("state") == "resume_available":
+        if recovery.get("state") in {"resume_available", "observation_required"}:
             return path, manifest
     return None, None
 
@@ -7917,10 +7918,18 @@ def latest_resume_manifest_html(workspace_slug):
         source_summary = (
             f" across {len(rows)} PDF(s)" if rows else ""
         )
+        observation_only = str(recovery.get("state") or "") == "observation_required"
+        title = "Exact-vector observation required" if observation_only else "Embedding recovery ready"
+        detail = (
+            f'{html.escape(str(remaining_locations))} already-owned prepared page record(s){source_summary} require exact-vector observation. '
+            'No resubmission will be offered; check current vector evidence before deciding anything else.'
+            if observation_only else
+            f'{html.escape(str(remaining_locations))} prepared page record(s){source_summary} remain unresolved. '
+            'Resume submits only those records. Skip marks selected PDFs out of this recovery plan and keeps their local evidence.'
+        )
         return (
-                '<div class="metadata-summary"><section class="metadata-file"><div class="metadata-file-name">Embedding recovery ready</div>'
-                f'<div class="metadata-status">{html.escape(str(remaining_locations))} prepared page record(s){source_summary} remain unresolved. '
-                'Resume submits only those records. Skip marks selected PDFs out of this recovery plan and keeps their local evidence.</div>'
+                f'<div class="metadata-summary"><section class="metadata-file"><div class="metadata-file-name">{title}</div>'
+                f'<div class="metadata-status">{detail}</div>'
                 f'<div class="metadata-status"><code>{html.escape(str(path))}</code></div></section></div>'
             )
     return '<div class="artifact-placeholder">No interrupted embedding recovery manifest was found for this workspace.</div>'
@@ -7989,7 +7998,14 @@ def recovery_remaining_source_rows(manifest, *, manifest_path=None):
 def latest_resume_manifest_controls(workspace_slug):
     """Render recovery status and safe source-local Skip choices together."""
     path, manifest = latest_resume_manifest(workspace_slug)
-    rows = recovery_remaining_source_rows(manifest, manifest_path=path) if manifest else []
+    observation_only = bool(
+        manifest
+        and str((manifest.get("recovery") or {}).get("state") or "") == "observation_required"
+    )
+    rows = (
+        [] if observation_only else
+        recovery_remaining_source_rows(manifest, manifest_path=path) if manifest else []
+    )
     choices = [
         (f"{row['filename']} — {row['record_count']} unresolved page record(s)", row["source_key"])
         for row in rows
@@ -8001,7 +8017,10 @@ def latest_resume_manifest_controls(workspace_slug):
         # Keep the component mounted while hidden. Its handler still validates
         # the selection and queue state immediately before any manifest change.
         gr.update(visible=visible, interactive=visible, value="Skip selected PDFs"),
-        gr.update(interactive=bool(path and manifest)),
+        gr.update(
+            value=("Check exact vector evidence" if observation_only else "Resume pending embedding batches"),
+            interactive=bool(path and manifest),
+        ),
     )
 
 
@@ -8014,6 +8033,13 @@ def skip_pending_recovery_sources(api_url, api_key, workspace_slug, selected_sou
             gr.update(choices=[], value=[], visible=False),
             gr.update(visible=False),
             gr.update(),
+        )
+    if str((manifest.get("recovery") or {}).get("state") or "") == "observation_required":
+        return (
+            latest_resume_manifest_html(workspace_slug),
+            gr.update(choices=[], value=[], visible=False),
+            gr.update(visible=False, interactive=False),
+            gr.update(value="Already-owned records cannot be skipped or replayed; check exact vector evidence", variant="secondary"),
         )
     selected = {str(value) for value in (selected_source_keys or []) if str(value).strip()}
     rows = recovery_remaining_source_rows(manifest, manifest_path=path)
@@ -8142,6 +8168,7 @@ def reconcile_resume_manifest_late_vectors(manifest):
     """
     recovery = manifest.get("recovery") or {}
     remaining = [str(item) for item in recovery.get("remaining_locations") or [] if str(item).strip()]
+    observation_only = str(recovery.get("state") or "") == "observation_required"
     failed_batch = next(
         (
             batch for batch in (manifest.get("batches") or [])
@@ -8149,10 +8176,14 @@ def reconcile_resume_manifest_late_vectors(manifest):
         ),
         None,
     )
-    candidates = [
-        str(item) for item in ((failed_batch or {}).get("locations") or [])
-        if str(item) in remaining
-    ]
+    candidates = (
+        list(remaining)
+        if observation_only else
+        [
+            str(item) for item in ((failed_batch or {}).get("locations") or [])
+            if str(item) in remaining
+        ]
+    )
     if not candidates:
         return remaining, {"status": "not_applicable", "reconciled_locations": 0}
 
@@ -8243,6 +8274,7 @@ def persist_reconciled_resume_manifest(path, manifest):
         }
         if not locations:
             recovery["state"] = "not_needed"
+            recovery["resubmission_forbidden"] = False
             recovery["operator_note"] = (
                 "Exact attachment-to-vector reconciliation confirmed all locations; "
                 "no resume is required."
@@ -8570,6 +8602,24 @@ def resume_latest_embedding_manifest(api_url, api_key, workspace_slug):
     path, manifest = latest_resume_manifest(workspace_slug)
     if not path or not manifest:
         return latest_resume_manifest_html(workspace_slug), gr.update(value="No recovery manifest", variant="secondary")
+    recovery = dict(manifest.get("recovery") or {})
+    if str(recovery.get("state") or "") == "observation_required":
+        remaining, reconciliation = persist_reconciled_resume_manifest(path, manifest)
+        if not remaining:
+            return (
+                latest_resume_manifest_html(workspace_slug),
+                gr.update(value="Exact vector evidence confirmed — no resubmission", variant="secondary"),
+            )
+        return (
+            latest_resume_manifest_html(workspace_slug),
+            gr.update(
+                value=(
+                    f"Exact vector evidence is still incomplete for {len(remaining)} owned record(s); "
+                    "no resubmission was performed"
+                ),
+                variant="secondary",
+            ),
+        )
     result = submit_embedding_resume_manifest(path, manifest, api_url, api_key, workspace_slug)
     if result.get("status") == "rejected_workspace":
         return '<div class="artifact-placeholder"><strong>Recovery manifest rejected.</strong> It does not match the selected safe workspace.</div>', gr.update(value="Recovery manifest rejected", variant="stop")
@@ -12242,11 +12292,23 @@ def observed_phase_timing_lines(summary):
     batches = int(queue.get("batches_completed") or 0)
     if batches:
         records = int(queue.get("records_submitted") or 0)
+        submission_seconds = float(queue.get("submission_seconds") or 0.0)
+        queue_receipt_seconds = float(queue.get("queue_receipt_seconds") or 0.0)
+        receipt_detail = (
+            f"HTTP submission {format_run_duration(submission_seconds)}"
+            if submission_seconds > 0.0
+            else (
+                f"Desktop queue receipt {format_run_duration(queue_receipt_seconds)}; "
+                "client response read released after queue ownership"
+                if queue_receipt_seconds > 0.0
+                else "no completed HTTP submission receipt"
+            )
+        )
         lines.append(
             "Observed AnythingLLM Desktop queue: "
             f"{format_run_duration(queue.get('batch_elapsed_seconds', 0))} across "
             f"{batches} completed batch(es), {records} record(s); "
-            f"submission {format_run_duration(queue.get('submission_seconds', 0))}, "
+            f"{receipt_detail}, "
             f"verification {format_run_duration(queue.get('verification_seconds', 0))}"
         )
     if lines:
@@ -12575,7 +12637,13 @@ def current_source_vector_progress_count(report, *, expected_records=None):
     return min(observed, expected) if expected else observed
 
 
-def concurrent_ingestion_progress_fraction(evidence_fraction, elapsed_seconds, expected_seconds):
+def concurrent_ingestion_progress_fraction(
+    evidence_fraction,
+    elapsed_seconds,
+    expected_seconds,
+    *,
+    presentation_expected_seconds=None,
+):
     """Combine owned queue/vector evidence with the current elapsed/ETA pair.
 
     This is used only when a real ingestion callback arrives. The ETA caps
@@ -12588,7 +12656,15 @@ def concurrent_ingestion_progress_fraction(evidence_fraction, elapsed_seconds, e
     expected = max(0.0, float(expected_seconds or 0.0))
     if expected <= 0.0:
         return evidence
-    presentation_expected = expected * PRESENTATION_ETA_CONSERVATISM
+    # Use the displayed ETA once an exact cache plan or live reprice has
+    # changed it. Reapplying the opening-only discount here would let the
+    # progress bar outrun the clock the operator is actually seeing.
+    try:
+        presentation_expected = max(0.0, float(presentation_expected_seconds))
+    except (TypeError, ValueError):
+        presentation_expected = expected * PRESENTATION_ETA_CONSERVATISM
+    if presentation_expected <= 0.0:
+        presentation_expected = expected
     elapsed_share = min(
         .95,
         max(0.0, float(elapsed_seconds or 0.0) / presentation_expected),
@@ -12663,14 +12739,16 @@ def reprice_presentation_expected_seconds(
     previous_presentation_expected_seconds,
     new_expected_seconds,
     is_material_reprice,
+    preserve_existing_remaining_discount=False,
+    elapsed_seconds=0.0,
 ):
-    """Keep a downward model reprice from making the visible timer jump up.
+    """Keep a model reprice from needlessly jolting the visible timer.
 
     The opening display may intentionally be more optimistic than the canonical
-    model.  A cache discovery that lowers the canonical estimate must preserve
-    that existing display ratio; otherwise a *downward* reprice visibly jumps
-    upward when the raw model replaces the opening presentation clock.  A real
-    upward reprice remains explicit so slower queue evidence is not hidden.
+    model. Preserve that discount against the *remaining* work, not the whole
+    elapsed-plus-remaining total. This lets the discount naturally disappear as
+    work completes and prevents a small later raw-model increase from exposing
+    the entire hidden opening discount in one visible jump.
     """
     previous_expected = max(0, int(previous_expected_seconds or 0))
     previous_presentation = max(0, int(previous_presentation_expected_seconds or 0))
@@ -12680,17 +12758,60 @@ def reprice_presentation_expected_seconds(
     if (
         previous_expected > 0
         and previous_presentation > 0
-        and new_expected <= previous_expected
+        and (
+            new_expected <= previous_expected
+            or preserve_existing_remaining_discount
+        )
     ):
+        elapsed = max(0.0, float(elapsed_seconds or 0.0))
+        previous_remaining = max(0.0, previous_expected - elapsed)
+        previous_display_remaining = max(0.0, previous_presentation - elapsed)
         presentation_ratio = min(
             1.0,
-            max(0.0, previous_presentation / previous_expected),
+            max(0.0, previous_display_remaining / previous_remaining)
+            if previous_remaining
+            else 1.0,
         )
-        return min(
-            previous_presentation,
-            max(0, int(math.ceil(new_expected * presentation_ratio))),
+        repriced_presentation = max(
+            0,
+            int(math.ceil(
+                elapsed + max(0.0, new_expected - elapsed) * presentation_ratio
+            )),
+        )
+        # A downward model reprice must not make the visible clock move
+        # backwards. Upward observations still appear, but only in proportion
+        # to the remaining-work discount already shown to the user.
+        return (
+            min(previous_presentation, repriced_presentation)
+            if new_expected <= previous_expected
+            else repriced_presentation
         )
     return new_expected
+
+
+def should_publish_vector_observation_status(
+    *,
+    quiet_queue_recovery,
+    current_submission_vectors,
+    unique_identities,
+    previous_signature=None,
+):
+    """Return whether a live exact-vector observation adds user-facing evidence.
+
+    A zero-result read beside an owned Desktop queue is frequently just a
+    snapshot race: the Desktop event has advanced beyond the last browser
+    repaint, while LanceDB has not materialized the record yet.  Replacing the
+    useful queue status with ``0/N`` in that gap is misleading.  A quiet-queue
+    recovery is different: the operator explicitly needs the observed zero or
+    partial result to understand the recovery boundary.
+    """
+    if quiet_queue_recovery:
+        return True
+    current_signature = (
+        max(0, int(current_submission_vectors or 0)),
+        max(0, int(unique_identities or 0)),
+    )
+    return max(current_signature) > 0 and current_signature != previous_signature
 
 
 @_synchronized_live_automatic_status
@@ -12717,6 +12838,8 @@ def update_live_automatic_run_status(
     eta_basis=None,
     batch_accepted_files=None,
     batch_completed_files=None,
+    batch_prepared_files=None,
+    batch_vector_confirmed_files=None,
     batch_total_files=None,
     batch_current_file_index=None,
     authoritative_batch_completed_files=False,
@@ -12787,19 +12910,33 @@ def update_live_automatic_run_status(
         if incoming_progress_phase else str(phase or "Working") != str(previous.get("phase") or "")
     )
     expected = max(0, int(expected_seconds or previous.get("expected_seconds") or 0))
+    try:
+        presentation_elapsed_seconds = max(
+            0.0,
+            now - float(previous.get("started_epoch") or now),
+        )
+    except (TypeError, ValueError):
+        presentation_elapsed_seconds = 0.0
     prior_presentation_expected = max(
         0,
         int(previous.get("presentation_expected_seconds") or expected),
     )
     if presentation_expected_seconds is None:
-        # A real, material reprice supersedes the opening-only display
-        # adjustment. Ordinary status repaints retain their existing display
-        # clock and cannot disturb either the model or the UI.
+        # Ordinary status repaints retain their existing display clock. For an
+        # all-fresh plan, retain the deliberately optimistic opening discount
+        # against remaining work through subsequent evidence-based reprices.
+        # A complete cache plan is exact workload evidence and therefore
+        # replaces that opening presentation model.
         presentation_expected = reprice_presentation_expected_seconds(
             previous_expected_seconds=previous.get("expected_seconds"),
             previous_presentation_expected_seconds=prior_presentation_expected,
             new_expected_seconds=expected,
             is_material_reprice=bool(str(eta_reprice_reason or "").strip()),
+            preserve_existing_remaining_discount=(
+                bool(str(eta_reprice_reason or "").strip())
+                and not bool(cache_plan_partial is False and cache_reuse_records)
+            ),
+            elapsed_seconds=presentation_elapsed_seconds,
         )
     else:
         try:
@@ -12823,19 +12960,41 @@ def update_live_automatic_run_status(
 
     prior_batch_total = _batch_count(previous.get("batch_total_files"))
     batch_total = _batch_count(batch_total_files, prior_batch_total)
-    prior_batch_completed = _batch_count(previous.get("batch_completed_files"))
-    incoming_batch_completed = _batch_count(batch_completed_files, prior_batch_completed)
-    # Local preparation and confirmed AnythingLLM queue work are different
-    # facts.  During the authoritative grouped queue lane, replace the earlier
-    # preparation count with the exact confirmed-source count instead of
-    # preserving a misleading "all PDFs completed" high-water mark.
-    batch_completed = (
-        incoming_batch_completed
-        if authoritative_batch_completed_files
-        else max(prior_batch_completed, incoming_batch_completed)
+    # A source can be locally prepared, accepted into the Desktop queue, and
+    # later exact-vector confirmed. These are durable but different facts.
+    # The old single ``batch_completed_files`` field was reused for both local
+    # preparation and vector proof, so it visibly reset from N to 0 at the
+    # grouped-queue handoff. Retain the legacy field as preparation progress
+    # and expose vector confirmation explicitly to the queue renderer.
+    prior_batch_prepared = _batch_count(
+        previous.get("batch_prepared_files"),
+        previous.get("batch_completed_files"),
     )
+    incoming_batch_prepared = _batch_count(
+        batch_prepared_files,
+        _batch_count(batch_completed_files, prior_batch_prepared),
+    )
+    batch_prepared = max(prior_batch_prepared, incoming_batch_prepared)
+    prior_batch_vector_confirmed = _batch_count(
+        previous.get("batch_vector_confirmed_files")
+    )
+    incoming_batch_vector_confirmed = _batch_count(
+        batch_vector_confirmed_files,
+        (
+            batch_completed_files
+            if authoritative_batch_completed_files
+            else prior_batch_vector_confirmed
+        ),
+    )
+    batch_vector_confirmed = max(
+        prior_batch_vector_confirmed,
+        incoming_batch_vector_confirmed,
+    )
+    batch_completed = batch_prepared
     if batch_total:
         batch_completed = min(batch_completed, batch_total)
+        batch_prepared = min(batch_prepared, batch_total)
+        batch_vector_confirmed = min(batch_vector_confirmed, batch_total)
     # Submission acceptance and exact-vector proof are separate durable
     # facts.  The former may advance while the current queue group is still
     # being observed; never render it as vector confirmation.
@@ -12940,6 +13099,8 @@ def update_live_automatic_run_status(
         "total_units": total_units if total_units is not None else previous.get("total_units"),
         "batch_accepted_files": batch_accepted,
         "batch_completed_files": batch_completed,
+        "batch_prepared_files": batch_prepared,
+        "batch_vector_confirmed_files": batch_vector_confirmed,
         "batch_total_files": batch_total,
         "batch_current_file_index": batch_current,
         "evidence_kind": str(evidence_kind or previous.get("evidence_kind") or ""),
@@ -13138,6 +13299,12 @@ def update_live_automatic_run_status(
                 progress_phase=record.get("progress_phase"),
                 previous_expected_seconds=previous_expected,
                 new_expected_seconds=expected,
+                previous_presentation_expected_seconds=(
+                    previous.get("presentation_expected_seconds")
+                ),
+                presentation_expected_seconds=(
+                    record.get("presentation_expected_seconds")
+                ),
                 decision_context=record.get("eta_reprice_context"),
             )
         if terminal_state:
@@ -13180,6 +13347,10 @@ def update_live_automatic_run_status(
                 "total_units": record.get("total_units"),
                 "batch_accepted_files": record.get("batch_accepted_files", 0),
                 "batch_completed_files": record.get("batch_completed_files", 0),
+                "batch_prepared_files": record.get("batch_prepared_files", 0),
+                "batch_vector_confirmed_files": record.get(
+                    "batch_vector_confirmed_files", 0
+                ),
                 "batch_total_files": record.get("batch_total_files", 0),
                 "batch_current_file_index": record.get("batch_current_file_index", 0),
                 "evidence_kind": record.get("evidence_kind", ""),
@@ -13382,12 +13553,26 @@ def automatic_live_status_html(status=None):
         batch_total = max(0, int(record.get("batch_total_files") or 0))
         batch_accepted = max(0, int(record.get("batch_accepted_files") or 0))
         batch_completed = max(0, int(record.get("batch_completed_files") or 0))
+        batch_prepared = max(
+            0,
+            int(record.get("batch_prepared_files") or batch_completed),
+        )
+        batch_vector_confirmed = max(
+            0,
+            int(
+                record.get("batch_vector_confirmed_files")
+                if record.get("batch_vector_confirmed_files") is not None
+                else batch_completed
+            ),
+        )
         batch_current = max(0, int(record.get("batch_current_file_index") or 0))
     except (TypeError, ValueError):
-        batch_total = batch_accepted = batch_completed = batch_current = 0
+        batch_total = batch_accepted = batch_completed = batch_prepared = batch_vector_confirmed = batch_current = 0
     if batch_total:
         batch_accepted = min(batch_accepted, batch_total)
         batch_completed = min(batch_completed, batch_total)
+        batch_prepared = min(batch_prepared, batch_total)
+        batch_vector_confirmed = min(batch_vector_confirmed, batch_total)
         batch_current = min(batch_current, batch_total)
         # ``batch_*_files`` counts PDFs that have reached a safe decision in
         # this batch. A PDF can be safely skipped before parsing, so calling
@@ -13400,26 +13585,25 @@ def automatic_live_status_html(status=None):
         }
         if is_desktop_queue:
             try:
-                evidence_completed = max(0, int(record.get("completed_units") or 0))
                 evidence_total = max(0, int(record.get("total_units") or 0))
             except (TypeError, ValueError):
-                evidence_completed = evidence_total = 0
+                evidence_total = 0
             exact_vectors_complete = (
                 str(record.get("evidence_kind") or "") == "exact_vector_observation"
-                and evidence_completed >= evidence_total
+                and batch_vector_confirmed >= batch_total
                 and evidence_total > 0
             )
             if exact_vectors_complete:
                 batch_label = (
-                    f"PDFs with vectors confirmed: {batch_completed}/{batch_total}"
+                    f"PDFs with vectors confirmed: {batch_vector_confirmed}/{batch_total}"
                 )
             else:
                 batch_label = (
                     f"PDFs accepted by AnythingLLM: {batch_accepted}/{batch_total} "
-                    f"· vectors confirmed: {batch_completed}/{batch_total}"
+                    f"· vectors confirmed: {batch_vector_confirmed}/{batch_total}"
                 )
         elif is_submission_phase:
-            batch_label = f"PDF preparation: {batch_completed}/{batch_total} ready for submission"
+            batch_label = f"PDF preparation: {batch_prepared}/{batch_total} ready for submission"
         elif terminal_state:
             # Terminal selected-file accounting is not the same fact as vector
             # confirmation. The terminal receipt names submitted, duplicate,
@@ -13432,8 +13616,8 @@ def automatic_live_status_html(status=None):
                 raw_phase,
                 flags=re.I,
             )
-            batch_label = f"PDFs completed: {batch_completed}/{batch_total}"
-            if batch_current and batch_completed < batch_total:
+            batch_label = f"PDFs completed: {batch_prepared}/{batch_total}"
+            if batch_current and batch_prepared < batch_total:
                 batch_label += f" · Current PDF: {batch_current}/{batch_total}"
             if page_match:
                 batch_label += (
@@ -14059,7 +14243,7 @@ def recover_automatic_run(
                 manifest_path = Path(group["ledger_path"]).with_name("resume-embedding-manifest.json")
                 manifest = _read_automatic_run_json(manifest_path)
                 recovery_state = str((manifest.get("recovery") or {}).get("state") or "") if manifest else ""
-                if recovery_state == "resume_available":
+                if recovery_state in {"resume_available", "observation_required"}:
                     remaining, reconciliation = persist_reconciled_resume_manifest(manifest_path, manifest)
                     row["reconciliation"] = {
                         "status": reconciliation.get("status"),
@@ -14070,6 +14254,13 @@ def recover_automatic_run(
                         row.update(
                             status="all_locations_confirmed_no_action",
                             message="Exact attachment-to-vector reconciliation confirmed every retained location; no queue action or resume was needed.",
+                        )
+                        result["groups"].append(row)
+                        continue
+                    if recovery_state == "observation_required":
+                        row.update(
+                            status="owned_receipt_vectors_still_pending",
+                            message="This batch already entered the Desktop queue. Exact vectors remain pending; no automatic resubmission was attempted.",
                         )
                         result["groups"].append(row)
                         continue
@@ -14364,6 +14555,8 @@ def append_eta_recalculation_event(
     progress_phase,
     previous_expected_seconds,
     new_expected_seconds,
+    previous_presentation_expected_seconds=None,
+    presentation_expected_seconds=None,
     displayed_fraction=None,
     raw_forecast_seconds=None,
     suppression_reason="",
@@ -14404,6 +14597,19 @@ def append_eta_recalculation_event(
         "progress_phase": str(progress_phase or ""),
         "previous_expected_seconds": previous_expected,
         "new_expected_seconds": new_expected,
+        # The raw timing model and the browser-facing clock can differ by
+        # design. Persist both so a later audit can detect a presentation
+        # cliff instead of mistaking it for a normal model reprice.
+        "previous_presentation_expected_seconds": (
+            max(0, int(previous_presentation_expected_seconds))
+            if previous_presentation_expected_seconds is not None
+            else None
+        ),
+        "presentation_expected_seconds": (
+            max(0, int(presentation_expected_seconds))
+            if presentation_expected_seconds is not None
+            else None
+        ),
         "delta_seconds": new_expected - previous_expected,
         "previous_remaining_seconds": max(0, int(round(previous_expected - elapsed))),
         "new_remaining_seconds": max(0, int(round(new_expected - elapsed))),
@@ -17433,7 +17639,12 @@ def timing_model_unique_batch_measurements(row):
             int(measurement.get("total_batches") or 0),
             str(measurement.get("state") or ""),
             round(float(measurement.get("submission_seconds") or 0.0), 6),
-            round(float(measurement.get("verification_seconds") or 0.0), 6),
+            round(float(
+                measurement.get("reconciliation_seconds")
+                if measurement.get("reconciliation_seconds") is not None
+                else measurement.get("verification_seconds") or 0.0
+            ), 6),
+            round(float(measurement.get("exact_vector_observation_seconds") or 0.0), 6),
             round(float(measurement.get("elapsed_seconds") or 0.0), 6),
         )
         existing = seen.get(key)
@@ -20270,6 +20481,24 @@ def record_timing_model_run(
                     "operation_id": str(batch.get("operation_id") or ""),
                     "records": int(batch.get("requested") or 0),
                     "submission_seconds": round(float(batch.get("submission_seconds") or 0), 3),
+                    "queue_receipt_seconds": round(float(batch.get("queue_receipt_seconds") or 0), 3),
+                    "http_response_seconds": (
+                        round(float(batch.get("http_response_seconds")), 3)
+                        if batch.get("http_response_seconds") is not None else None
+                    ),
+                    "http_response_state": str(batch.get("http_response_state") or ""),
+                    # ``verification_seconds`` is retained in the raw group
+                    # report as a legacy alias. Timing history uses the
+                    # canonical reconciliation name and separately preserves
+                    # the small amount of local vector-store read time.
+                    "reconciliation_seconds": round(float(
+                        batch.get("reconciliation_seconds")
+                        if batch.get("reconciliation_seconds") is not None
+                        else batch.get("verification_seconds") or 0
+                    ), 3),
+                    "exact_vector_observation_seconds": round(float(
+                        batch.get("exact_vector_observation_seconds") or 0
+                    ), 3),
                     "verification_seconds": round(float(batch.get("verification_seconds") or 0), 3),
                     "elapsed_seconds": round(float(batch.get("batch_elapsed_seconds") or 0), 3),
                     "state": str(batch.get("submission_state") or "unknown"),
@@ -20282,6 +20511,20 @@ def record_timing_model_run(
                 "operation_id": str(batch.get("operation_id") or ""),
                 "records": int(batch.get("requested") or 0),
                 "submission_seconds": round(float(batch.get("submission_seconds") or 0), 3),
+                "queue_receipt_seconds": round(float(batch.get("queue_receipt_seconds") or 0), 3),
+                "http_response_seconds": (
+                    round(float(batch.get("http_response_seconds")), 3)
+                    if batch.get("http_response_seconds") is not None else None
+                ),
+                "http_response_state": str(batch.get("http_response_state") or ""),
+                "reconciliation_seconds": round(float(
+                    batch.get("reconciliation_seconds")
+                    if batch.get("reconciliation_seconds") is not None
+                    else batch.get("verification_seconds") or 0
+                ), 3),
+                "exact_vector_observation_seconds": round(float(
+                    batch.get("exact_vector_observation_seconds") or 0
+                ), 3),
                 "verification_seconds": round(float(batch.get("verification_seconds") or 0), 3),
                 "elapsed_seconds": round(float(batch.get("batch_elapsed_seconds") or 0), 3),
                 "state": str(batch.get("submission_state") or "unknown"),
@@ -20416,7 +20659,15 @@ def record_timing_model_run(
             "actual_batches": len(batches),
             "batch_seconds": [row["elapsed_seconds"] for row in batches if row["elapsed_seconds"] > 0],
             "batch_submission_seconds": [row["submission_seconds"] for row in batches if row["submission_seconds"] > 0],
+            # Backward-compatible history field. Its canonical counterpart
+            # makes clear that the duration includes Desktop queue waiting.
             "batch_verification_seconds": [row["verification_seconds"] for row in batches if row["verification_seconds"] > 0],
+            "batch_reconciliation_seconds": [row["reconciliation_seconds"] for row in batches if row["reconciliation_seconds"] > 0],
+            "batch_exact_vector_observation_seconds": [
+                row["exact_vector_observation_seconds"]
+                for row in batches
+                if row["exact_vector_observation_seconds"] > 0
+            ],
             "batch_measurements": batches,
             "document_timing": document_timing,
             "profile": profile,
@@ -20463,6 +20714,22 @@ def record_timing_model_event(run_root, stage, batch_report=None):
         "total_batches": int(batch.get("total_batches") or 0),
         "records": int(batch.get("requested") or 0),
         "submission_seconds": round(float(batch.get("submission_seconds") or 0), 3),
+        "queue_receipt_seconds": round(float(batch.get("queue_receipt_seconds") or 0), 3),
+        "http_response_seconds": (
+            round(float(batch.get("http_response_seconds")), 3)
+            if batch.get("http_response_seconds") is not None else None
+        ),
+        "http_response_state": str(batch.get("http_response_state") or ""),
+        "reconciliation_seconds": round(float(
+            batch.get("reconciliation_seconds")
+            if batch.get("reconciliation_seconds") is not None
+            else batch.get("verification_seconds") or 0
+        ), 3),
+        "exact_vector_observation_seconds": round(float(
+            batch.get("exact_vector_observation_seconds") or 0
+        ), 3),
+        # Legacy timeline readers use this alias. New diagnostics should read
+        # reconciliation_seconds and exact_vector_observation_seconds.
         "verification_seconds": round(float(batch.get("verification_seconds") or 0), 3),
         "batch_elapsed_seconds": round(float(batch.get("batch_elapsed_seconds") or 0), 3),
         "phase_elapsed_seconds": round(float(batch.get("phase_elapsed_seconds") or 0), 3),
@@ -24690,6 +24957,7 @@ def upload_prepared_automatic_batch(
     existing_workspace_duplicate_policy=WORKSPACE_DUPLICATE_POLICY_SKIP,
     status_callback=None,
     cancel_callback=None,
+    source_atomic_worker_authority=None,
 ):
     """Attach staged records, then queue each eligible PDF in source order.
 
@@ -25157,6 +25425,7 @@ def upload_prepared_automatic_batch(
         cached_storage_report = None
         started = time.monotonic()
         last_report = {}
+        last_published_vector_observation_signature = None
         observer_callback_errors = []
 
         def publish_verification_status(message, event):
@@ -25520,7 +25789,13 @@ def upload_prepared_automatic_batch(
                 int(queue.get("queue_records") or len(expected_batch)) > 0
                 and queue_position < int(queue.get("queue_records") or len(expected_batch))
                 and int(queue.get("desktop_queue_current") or 0) > 0
-                and str(queue.get("desktop_queue_observer_state") or "") == "connected"
+                # The SSE endpoint has no server heartbeat, so a normal slow
+                # record can leave the client reconnecting between events.
+                # The most recent matching Desktop event remains sufficient to
+                # leave the writer alone until the real stall boundary.
+                and str(queue.get("desktop_queue_observer_state") or "") in {"connected", "reconnecting"}
+                and queue_event_age is not None
+                and queue_event_age < ANYTHINGLLM_EMBEDDING_RECONCILIATION_STALL_SECONDS
             )
             if (
                 bool(last_report.get("storage_observation_deferred"))
@@ -25530,6 +25805,18 @@ def upload_prepared_automatic_batch(
                 # live status.  Do not replace it every two seconds with a
                 # reminder that vector confirmation is deferred; nothing has
                 # been checked and the replacement causes visible flapping.
+                time.sleep(2.0)
+                continue
+            if not should_publish_vector_observation_status(
+                quiet_queue_recovery=quiet_queue_recovery,
+                current_submission_vectors=current_submission_vectors,
+                unique_identities=unique_identities,
+                previous_signature=last_published_vector_observation_signature,
+            ):
+                # Keep the last useful Desktop queue status visible while a
+                # just-finished queue group materializes its first vector
+                # rows. A later positive exact observation, quiet recovery,
+                # or terminal reconciliation result supplies the next fact.
                 time.sleep(2.0)
                 continue
             elif quiet_queue_recovery:
@@ -25545,12 +25832,6 @@ def upload_prepared_automatic_batch(
                 progress_detail = (
                     f"Checking exact vector evidence: {current_submission_vectors}/{len(expected_batch)} "
                     "selected record(s) currently searchable"
-                )
-                timing_event = "exact_vector_observation"
-            else:
-                progress_detail = (
-                    f"Checking exact vector evidence: {unique_identities}/{len(expected_batch)} "
-                    "selected source identities currently searchable"
                 )
                 timing_event = "exact_vector_observation"
             publish_verification_status(
@@ -25574,7 +25855,54 @@ def upload_prepared_automatic_batch(
                     **queue,
                 },
             )
+            if not quiet_queue_recovery:
+                last_published_vector_observation_signature = (
+                    max(0, int(current_submission_vectors or 0)),
+                    max(0, int(unique_identities or 0)),
+                )
             time.sleep(2.0)
+
+    # Patch only the exact Desktop worker build that was already qualified by
+    # this run's full mutation-contract report.  A mismatch is a deliberate
+    # no-op: the established source-window path continues unchanged.
+    if transport == "file_upload":
+        source_atomic_worker = ensure_source_atomic_embedding_worker(
+            dict(source_atomic_worker_authority or {})
+        )
+    else:
+        source_atomic_worker = {
+            "status": "disabled",
+            "enabled": False,
+            "reason": "source_atomic_worker_requires_native_file_upload",
+        }
+    if callable(status_callback):
+        if source_atomic_worker.get("enabled"):
+            status_callback(
+                "AnythingLLM v1.16.1 source-atomic provider staging is active after the Desktop restart (serial batches of up to 36 chunks)",
+                {
+                    "timing_event": "source_atomic_worker_active",
+                    "source_atomic_worker": dict(source_atomic_worker),
+                },
+            )
+        elif source_atomic_worker.get("restart_required"):
+            status_callback(
+                "AnythingLLM Desktop must be restarted before source-atomic provider staging can take effect; this run uses the established queue path",
+                {
+                    "timing_event": "source_atomic_worker_restart_required",
+                    "source_atomic_worker": dict(source_atomic_worker),
+                },
+            )
+        elif str(source_atomic_worker.get("reason") or "") not in {
+            "native_mutation_contract_not_qualified",
+            "source_atomic_worker_requires_native_file_upload",
+        }:
+            status_callback(
+                "AnythingLLM is using the established queue path; source-atomic provider staging is not enabled for this Desktop build",
+                {
+                    "timing_event": "source_atomic_worker_not_enabled",
+                    "source_atomic_worker": dict(source_atomic_worker),
+                },
+            )
 
     batch_root = Path(run_root)
     batch_root.mkdir(parents=True, exist_ok=True)
@@ -25613,6 +25941,10 @@ def upload_prepared_automatic_batch(
             f"page-parent record(s) from {len(grouped_rows)} selected PDF(s)"
         ),
     )
+    # Keep installer authority and the worker's provider-batch observations
+    # in the existing native upload report/ledger rather than creating a new
+    # artifact family for a single implementation detail.
+    report["source_atomic_worker"] = dict(source_atomic_worker)
     batch_reports = list((report.get("embedding_update") or {}).get("batches") or [])
     searchable = bool(batch_reports) and all(
         bool(batch.get("searchability_proven")) for batch in batch_reports
@@ -25745,6 +26077,13 @@ def upload_prepared_automatic_batch(
                 "submission_state": batch.get("submission_state"),
                 "searchability_proven": source_exact,
                 "submission_seconds": batch.get("submission_seconds", 0),
+                "reconciliation_seconds": batch.get(
+                    "reconciliation_seconds",
+                    batch.get("verification_seconds", 0),
+                ),
+                "exact_vector_observation_seconds": batch.get(
+                    "exact_vector_observation_seconds", 0
+                ),
                 "verification_seconds": batch.get("verification_seconds", 0),
                 "batch_elapsed_seconds": batch.get("batch_elapsed_seconds", 0),
             }
@@ -26165,6 +26504,9 @@ def run_automatic(
     workspace_slug = (workspace_slug or "").strip() if prepare_and_upload else ""
     resolved_api_url = (api_url or "").strip() if prepare_and_upload else ""
     batch_compatibility_authority = {}
+    # The compact authority belongs in prepared metadata. The guarded worker
+    # installer additionally needs the full already-qualified Desktop report.
+    batch_compatibility_report = {}
     if prepare_and_upload:
         preferred_api_url = resolved_api_url or DEFAULT_ANYTHINGLLM_API_URL
         api_resolution = detect_anythingllm_api_url(
@@ -26396,6 +26738,7 @@ def run_automatic(
         batch_compatibility_authority = compact_native_mutation_authority(
             compatibility_report
         )
+        batch_compatibility_report = dict(compatibility_report)
 
     local_choice = normalize_simulation_choice(local_check_mode)
     progress(0.004, desc="Checking retrieval simulation settings")
@@ -26994,13 +27337,19 @@ def run_automatic(
             except (TypeError, ValueError):
                 remaining_seconds = None
             elapsed = time.time() - float(live.get("started_epoch") or time.time())
+            # A connected Desktop observer can legitimately emit a status
+            # callback before it has a usable rate (for example, immediately
+            # after reconnecting or while a wholly cache-backed segment is
+            # active).  That is absence of ETA evidence, not a callback
+            # failure.  Keep the downstream decision context empty and let
+            # its existing maturity checks suppress a reprice.
             batch_queue_forecast = observe_batch_queue_forecast(
                 cache_plan_context,
                 report,
                 elapsed_seconds=elapsed,
                 provider_request_seconds_prior=timing_unit_prior,
                 initial_estimated_records=initial_estimated_batches,
-            )
+            ) or {}
             batch_queue_rate_is_mature = batch_queue_forecast_is_mature(
                 batch_queue_forecast
             )
@@ -28587,6 +28936,32 @@ def run_automatic(
             grouped_confirmed_fraction = phase_start + (
                 phase_end - phase_start
             ) * evidence_fraction
+            if upload_progress_phase in {"desktop_queue", "identity_set"} and expected_seconds:
+                # The grouped Desktop callback used to bypass the same
+                # evidence-versus-visible-clock ceiling used by structured
+                # worker callbacks. A large first source could therefore
+                # consume most of the progress lane by record count even when
+                # its later peer was taking far longer. This remains
+                # evidence-driven; it merely prevents a live x/y counter from
+                # running materially ahead of the ETA shown to the operator.
+                live_for_progress = dict(LIVE_AUTOMATIC_RUN_STATUS or {})
+                try:
+                    queue_elapsed_seconds = max(
+                        0.0,
+                        time.time() - float(
+                            live_for_progress.get("started_epoch") or time.time()
+                        ),
+                    )
+                except (TypeError, ValueError):
+                    queue_elapsed_seconds = 0.0
+                grouped_confirmed_fraction = concurrent_ingestion_progress_fraction(
+                    grouped_confirmed_fraction,
+                    queue_elapsed_seconds,
+                    expected_seconds,
+                    presentation_expected_seconds=(
+                        live_for_progress.get("presentation_expected_seconds")
+                    ),
+                )
             eta_reprice_reason = ""
             eta_reprice_context = None
             eta_basis_update = None
@@ -28658,74 +29033,70 @@ def run_automatic(
                     deferred_ocr_files = len(
                         run_timing_estimate.get("ocr_runtime_surcharges", [])
                     )
-                    if cached_records:
-                        # Cache evidence changes the future work materially:
-                        # preparation (including OCR) is already elapsed, and
-                        # the exact fresh/cache plan is now the authority for
-                        # the remaining Desktop queue.
-                        eta_basis_update = "cache_plan_confirmed"
-                        elapsed = max(0.0, time.perf_counter() - started_at)
-                        repriced_expected = confirmed_batch_execution_plan_eta_seconds(
-                            expected_seconds,
-                            elapsed,
-                            fresh_provider_requests=fresh_records,
-                            provider_request_seconds=timing_unit_prior,
-                            features=timing_features,
-                            cached_attachment_records=cached_records,
-                            source_total=source_total,
-                            cached_documents=cached_documents,
-                            cache_attachment_prior=cache_attachment_prior,
-                        )
-                        if repriced_expected + 5 < int(expected_seconds):
-                            previous_expected_seconds = int(expected_seconds)
-                            expected_seconds = repriced_expected
-                            run_timing_estimate["expected_seconds"] = expected_seconds
-                            run_timing_estimate["confirmed_batch_cache_reprice"] = {
-                                "prepared_records": prepared_records,
-                                "cached_provider_requests": cached_records,
-                                "fresh_provider_requests": fresh_records,
-                                "remaining_source_windows": source_total,
-                                "cached_source_windows": cached_documents,
-                                "provider_request_seconds_prior": round(timing_unit_prior, 3),
-                                "cached_attachment_tail_prior": dict(cache_attachment_prior),
-                                "remaining_work_factor": confirmed_batch_cache_remaining_factor(
-                                    cached_records,
-                                    fresh_records,
-                                ),
-                                "deferred_ocr_seconds": deferred_ocr_seconds,
-                                "ocr_observations_deferred_until_exact_plan": deferred_ocr_files,
-                                "previous_expected_seconds": previous_expected_seconds,
-                                "expected_seconds": expected_seconds,
-                            }
-                            eta_reprice_reason = "confirmed_batch_cache_plan"
-                            eta_reprice_context = dict(
-                                run_timing_estimate["confirmed_batch_cache_reprice"]
-                            )
-                    elif deferred_ocr_seconds:
-                        # With no cache hits, every unfinished record still
-                        # needs normal provider work. Apply the observed OCR
-                        # correction once now that the all-fresh execution
-                        # plan is proven, rather than jumping repeatedly while
-                        # local preparation is still discovering pages.
+                    # Local preparation, including selected OCR pages, is
+                    # already in elapsed wall time. The exact fresh/cache plan
+                    # must therefore reprice only future Desktop work for both
+                    # cache and all-fresh runs. Previously the no-cache branch
+                    # added an OCR allowance here a second time and, worse,
+                    # priced a one-page OCR decision as every physical page of
+                    # a large PDF.
+                    elapsed = max(0.0, time.perf_counter() - started_at)
+                    repriced_expected = confirmed_batch_execution_plan_eta_seconds(
+                        expected_seconds,
+                        elapsed,
+                        fresh_provider_requests=fresh_records,
+                        provider_request_seconds=timing_unit_prior,
+                        features=timing_features,
+                        cached_attachment_records=cached_records,
+                        source_total=source_total,
+                        cached_documents=cached_documents,
+                        cache_attachment_prior=cache_attachment_prior,
+                    )
+                    eta_basis_update = (
+                        "cache_plan_confirmed"
+                        if cached_records else "execution_plan_confirmed"
+                    )
+                    if repriced_expected + 5 < int(expected_seconds):
                         previous_expected_seconds = int(expected_seconds)
-                        expected_seconds = previous_expected_seconds + deferred_ocr_seconds
+                        expected_seconds = repriced_expected
                         run_timing_estimate["expected_seconds"] = expected_seconds
+                        run_timing_estimate["confirmed_batch_execution_plan_reprice"] = {
+                            "prepared_records": prepared_records,
+                            "cached_provider_requests": cached_records,
+                            "fresh_provider_requests": fresh_records,
+                            "remaining_source_windows": source_total,
+                            "cached_source_windows": cached_documents,
+                            "provider_request_seconds_prior": round(timing_unit_prior, 3),
+                            "cached_attachment_tail_prior": dict(cache_attachment_prior),
+                            "remaining_work_factor": confirmed_batch_cache_remaining_factor(
+                                cached_records,
+                                fresh_records,
+                            ),
+                            "deferred_ocr_seconds": deferred_ocr_seconds,
+                            "ocr_observations_deferred_until_exact_plan": deferred_ocr_files,
+                            "previous_expected_seconds": previous_expected_seconds,
+                            "expected_seconds": expected_seconds,
+                        }
+                        eta_reprice_reason = (
+                            "confirmed_batch_cache_plan"
+                            if cached_records else "confirmed_batch_execution_plan"
+                        )
+                        eta_reprice_context = dict(
+                            run_timing_estimate["confirmed_batch_execution_plan_reprice"]
+                        )
+                    if deferred_ocr_seconds:
+                        # Retain diagnostic evidence of observed OCR so a
+                        # timing investigation can explain preparation cost,
+                        # but do not add it to the post-preparation ETA.
                         run_timing_estimate.setdefault("ocr_runtime_reprices", []).append(
                             {
                                 "checkpoint": "exact_execution_plan",
                                 "observed_ocr_files": deferred_ocr_files,
-                                "added_seconds": deferred_ocr_seconds,
+                                "observed_seconds_not_readded": deferred_ocr_seconds,
                                 "expected_seconds": expected_seconds,
-                                "display_policy": "applied_after_zero_cache_plan",
+                                "display_policy": "represented_by_elapsed_preparation",
                             }
                         )
-                        eta_reprice_reason = "ocr_runtime_observed"
-                        eta_basis_update = "live_observations"
-                        eta_reprice_context = dict(
-                            run_timing_estimate["ocr_runtime_reprices"][-1]
-                        )
-                    else:
-                        eta_basis_update = "execution_plan_confirmed"
                     # OCR that happened during preparation has now either
                     # informed the all-fresh correction or been represented
                     # by elapsed time in the cache-aware reprice. Never carry
@@ -28903,6 +29274,8 @@ def run_automatic(
                 evidence_kind="desktop_queue" if upload_progress_phase == "desktop_queue" else "exact_vector_observation" if upload_progress_phase == "identity_set" else "queue_receipt",
                 counter_scope=grouped_progress["counter_scope"],
                 batch_accepted_files=grouped_progress["accepted_sources"],
+                batch_prepared_files=completed_files,
+                batch_vector_confirmed_files=grouped_progress["completed_sources"],
                 batch_completed_files=grouped_progress["completed_sources"],
                 # Queue callbacks account only for upload-eligible PDFs.
                 # Physical selections that were intentionally held or skipped
@@ -28949,6 +29322,7 @@ def run_automatic(
                 existing_workspace_duplicate_policy=existing_workspace_duplicate_policy,
                 status_callback=report_grouped_upload_status,
                 cancel_callback=lambda root=run_root: automatic_run_cancellation_requested(root),
+                source_atomic_worker_authority=batch_compatibility_report,
             )
             _write_automatic_run_json(batch_upload_report_path, batch_upload_report)
             downloadable.append(str(batch_upload_report_path))

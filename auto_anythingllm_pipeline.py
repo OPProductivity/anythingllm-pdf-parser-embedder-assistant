@@ -26,7 +26,9 @@ import mimetypes
 import os
 import random
 import re
+import select
 import shutil
+import socket
 import sqlite3
 import statistics
 import subprocess
@@ -39,6 +41,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import ssl
 from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass, asdict
@@ -10135,6 +10138,222 @@ def post_json(url, body, api_key=None, timeout: float = ANYTHINGLLM_HTTP_RESPONS
         return response.status, response.read().decode("utf-8", errors="replace")
 
 
+class _JsonPostResponseTracker:
+    """Own one JSON POST and allow its *response read* to be abandoned safely.
+
+    Desktop begins its durable queue work before its synchronous route handler
+    returns.  Once a path-correlated queue event proves that the request body
+    crossed that boundary, the client should not occupy a response socket just
+    to learn a late status.  ``urllib`` does not expose the underlying socket
+    while it is blocked in ``urlopen``, so this narrow transport keeps the
+    connection handle under explicit ownership.  It never retries: retry
+    policy remains with the caller, which can distinguish an explicit refusal
+    from a request that Desktop has already started processing.
+    """
+
+    def __init__(self, url, body, *, api_key=None, timeout=ANYTHINGLLM_HTTP_RESPONSE_TIMEOUT_SECONDS):
+        self.url = str(url)
+        self.body = dict(body or {})
+        self.api_key = api_key
+        self.timeout = max(1.0, float(timeout or 1.0))
+        self.completed = threading.Event()
+        self.response_read_abandoned = threading.Event()
+        self._socket_lock = threading.Lock()
+        self._socket = None
+        self._outcome_lock = threading.Lock()
+        self._outcome = {}
+        self.thread = threading.Thread(
+            target=self._run,
+            name="anythingllm-embedding-http-response",
+            daemon=True,
+        )
+
+    def start(self):
+        self.thread.start()
+        return self
+
+    def _set_outcome(self, outcome):
+        with self._outcome_lock:
+            self._outcome = dict(outcome or {})
+
+    def outcome(self):
+        with self._outcome_lock:
+            return dict(self._outcome)
+
+    def wait(self, timeout=None):
+        return self.completed.wait(timeout=timeout)
+
+    def is_alive(self):
+        return self.thread.is_alive()
+
+    def join(self, timeout=None):
+        self.thread.join(timeout=timeout)
+
+    def close_response_read(self):
+        """Release a blocked response read after a durable queue receipt.
+
+        This must only be called once Desktop has emitted the path-correlated
+        event for this POST.  Closing earlier would make the mutation boundary
+        ambiguous; closing here cannot turn that known mutation into a retry.
+        """
+        self.response_read_abandoned.set()
+        with self._socket_lock:
+            owned_socket = self._socket
+        if owned_socket is not None:
+            # A select-driven socket reader is deliberately used below rather
+            # than ``HTTPConnection.getresponse()``. On Windows, closing an
+            # HTTPConnection in a different thread is not guaranteed to wake
+            # a blocking response read. Shutting down this owned socket wakes
+            # the reader deterministically without waiting for Desktop's
+            # synchronous handler deadline.
+            try:
+                owned_socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                owned_socket.close()
+            except OSError:
+                pass
+
+    @staticmethod
+    def _response_from_bytes(buffer):
+        """Return parsed response parts once HTTP headers are available.
+
+        The update-embeddings route's status is the only transport decision
+        needed by the caller (a 429 may receive the one durable retry).  We
+        retain a declared small body for diagnostics, but do not wait for an
+        unbounded streamed response. The caller continues this same
+        cancellable select loop only when ``Content-Length`` makes completion
+        exact.
+        """
+        separator_index = buffer.find(b"\r\n\r\n")
+        separator_size = 4
+        if separator_index < 0:
+            separator_index = buffer.find(b"\n\n")
+            separator_size = 2
+        if separator_index < 0:
+            return None
+        header_bytes = buffer[:separator_index]
+        body_bytes = buffer[separator_index + separator_size:]
+        header_lines = header_bytes.splitlines()
+        if not header_lines:
+            raise ValueError("AnythingLLM returned an HTTP response without a status line.")
+        status_parts = header_lines[0].decode("iso-8859-1", errors="replace").split()
+        if len(status_parts) < 2 or not status_parts[1].isdigit():
+            raise ValueError("AnythingLLM returned an invalid HTTP status line.")
+        content_length = None
+        for line in header_lines[1:]:
+            try:
+                key, value = line.decode("iso-8859-1", errors="replace").split(":", 1)
+            except ValueError:
+                continue
+            if key.strip().casefold() != "content-length":
+                continue
+            try:
+                content_length = max(0, int(value.strip()))
+            except ValueError:
+                content_length = None
+            break
+        return int(status_parts[1]), body_bytes, content_length
+
+    def _run(self):
+        owned_socket = None
+        try:
+            parsed = urllib.parse.urlsplit(self.url)
+            scheme = str(parsed.scheme or "").casefold()
+            if scheme not in {"http", "https"} or not parsed.hostname:
+                raise ValueError("AnythingLLM JSON request requires an absolute http(s) URL.")
+            port = parsed.port or (443 if scheme == "https" else 80)
+            owned_socket = socket.create_connection((parsed.hostname, port), timeout=self.timeout)
+            if scheme == "https":
+                owned_socket = ssl.create_default_context().wrap_socket(
+                    owned_socket,
+                    server_hostname=parsed.hostname,
+                )
+            with self._socket_lock:
+                self._socket = owned_socket
+            data = json.dumps(self.body).encode("utf-8")
+            target = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+            host_header = parsed.hostname if parsed.port is None else f"{parsed.hostname}:{parsed.port}"
+            headers = [
+                f"POST {target} HTTP/1.1",
+                f"Host: {host_header}",
+                "Content-Type: application/json",
+                f"Content-Length: {len(data)}",
+                "Connection: close",
+            ]
+            if self.api_key:
+                headers.append(f"Authorization: Bearer {self.api_key}")
+            owned_socket.sendall(("\r\n".join(headers) + "\r\n\r\n").encode("ascii") + data)
+            deadline = time.monotonic() + self.timeout
+            response_buffer = b""
+            while True:
+                if self.response_read_abandoned.is_set():
+                    self._set_outcome({"kind": "response_read_abandoned"})
+                    return
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Timed out waiting for AnythingLLM's HTTP response.")
+                readable, _, _ = select.select([owned_socket], [], [], min(0.05, remaining))
+                if not readable:
+                    continue
+                response_chunk = owned_socket.recv(65536)
+                if not response_chunk:
+                    parsed_response = self._response_from_bytes(response_buffer)
+                    if parsed_response is None:
+                        raise ConnectionError("AnythingLLM closed the HTTP response before sending headers.")
+                    status, body_bytes, _content_length = parsed_response
+                    self._set_outcome({
+                        "kind": "http_response",
+                        "status": status,
+                        "response_text": body_bytes.decode("utf-8", errors="replace"),
+                    })
+                    return
+                response_buffer += response_chunk
+                parsed_response = self._response_from_bytes(response_buffer)
+                if parsed_response is not None:
+                    status, body_bytes, content_length = parsed_response
+                    if content_length is not None and len(body_bytes) < content_length:
+                        # The body is still arriving, but this loop remains
+                        # interruptible every 50 ms by an owned queue receipt.
+                        continue
+                    self._set_outcome({
+                        "kind": "http_response",
+                        "status": status,
+                        "response_text": body_bytes.decode("utf-8", errors="replace"),
+                    })
+                    return
+        except Exception as exc:
+            if self.response_read_abandoned.is_set():
+                self._set_outcome({
+                    "kind": "response_read_abandoned",
+                    "exception_type": type(exc).__name__,
+                })
+            else:
+                self._set_outcome({"kind": "exception", "exception": exc})
+        finally:
+            if owned_socket is not None:
+                try:
+                    owned_socket.close()
+                except OSError:
+                    pass
+            self.completed.set()
+
+
+def start_json_post_response_tracker(url, body, *, api_key=None, timeout=ANYTHINGLLM_HTTP_RESPONSE_TIMEOUT_SECONDS):
+    """Start one controllable JSON POST response observation.
+
+    Kept as a small factory so failure-boundary tests can substitute a
+    deterministic tracker without altering the production transport.
+    """
+    return _JsonPostResponseTracker(
+        url,
+        body,
+        api_key=api_key,
+        timeout=timeout,
+    ).start()
+
+
 def _normalized_anythingllm_document_location(value):
     """Compare Desktop document locations without changing the stored path.
 
@@ -10765,6 +10984,23 @@ def anythingllm_embed_progress_message(event):
             if total
             else "AnythingLLM Desktop queue started; record total not yet confirmed"
         )
+    if event_type == "source_staging_started":
+        records = int((event or {}).get("recordCount") or 0)
+        batch_size = int((event or {}).get("provider_batch_size") or 0)
+        return (
+            f"AnythingLLM is staging {records} page-parent record(s) in serial provider batches of up to {batch_size}"
+            if records and batch_size
+            else "AnythingLLM started source-atomic provider staging"
+        )
+    if event_type == "source_staging_provider_batch":
+        batch_index = int((event or {}).get("batchIndex") or 0) + 1
+        chunks = int((event or {}).get("chunkCount") or 0)
+        elapsed_ms = int((event or {}).get("elapsed_ms") or 0)
+        return f"AnythingLLM provider batch {batch_index} embedded {chunks} chunk(s) in {elapsed_ms / 1000.0:.2f}s"
+    if event_type == "source_rejected_before_commit":
+        return "AnythingLLM rejected this PDF before namespace commit; later independent PDFs may continue"
+    if event_type == "source_commit_ambiguous":
+        return "AnythingLLM namespace commit became ambiguous; later source windows are withheld"
     if event_type == "doc_starting":
         if bool((event or {}).get("vector_cache_hit")):
             return (
@@ -13525,11 +13761,10 @@ ANYTHINGLLM_EMBEDDING_SUBMISSION_TIMEOUT_CAP_SECONDS = 480.0
 ANYTHINGLLM_EMBEDDING_SUBMISSION_TIMEOUT_SAFETY_FACTOR = 1.75
 ANYTHINGLLM_EMBEDDING_SUBMISSION_TIMEOUT_SETUP_SECONDS = 30.0
 # ``update-embeddings`` is synchronous in Desktop even though its work is an
-# asynchronous queue.  Waiting for the HTTP response for a whole document
-# therefore made the normal path blind for the first four minutes of a long
-# queue.  This is only a receipt deadline: after it expires we reconcile the
-# already-submitted queue through SSE and exact local vector evidence, without
-# issuing a duplicate request.
+# asynchronous queue. A path-correlated queue event now releases the normal
+# path immediately into exact-vector reconciliation. This remains the bounded
+# fallback receipt deadline only when both the HTTP response and owned queue
+# evidence are absent; it never authorizes a duplicate request.
 ANYTHINGLLM_DESKTOP_QUEUE_RECEIPT_TIMEOUT_SECONDS = 20.0
 # A timed-out HTTP response is not an embedding verdict. Give the exact-vector
 # reconciler enough time to observe slow sequential provider work, while still
@@ -13556,6 +13791,9 @@ ANYTHINGLLM_QUIET_QUEUE_STORAGE_OBSERVATION_INTERVAL_SECONDS = 20.0
 # source window. The count preserves audit scale; the tail preserves the most
 # recent diagnostic context.
 ANYTHINGLLM_EMBEDDING_RUNTIME_EVENT_TAIL_LIMIT = 96
+# Provider-batch timing stays inside the existing queue evidence. Keep only a
+# bounded tail so a large source cannot make every ledger rewrite grow.
+ANYTHINGLLM_SOURCE_ATOMIC_PROVIDER_BATCH_TAIL_LIMIT = 256
 
 
 def healthy_owned_desktop_queue(queue, expected_records=0, *, poll_interval_seconds=2.0):
@@ -13682,26 +13920,25 @@ def storage_observation_due_for_queue(
         total > 0
         and completed < total
         and 0 < current <= total
-        and observer_state == "connected"
+        # A Desktop stream has no heartbeat. Its five-second client read
+        # boundary therefore closes and reconnects during perfectly ordinary
+        # slow records. The last matching queue event is the liveness fact; a
+        # transient stream reconnect must not reopen SQLite/LanceDB and compete
+        # with that still-active writer.
+        and observer_state in {"connected", "reconnecting"}
+        and event_age is not None
+        and event_age < ANYTHINGLLM_EMBEDDING_RECONCILIATION_STALL_SECONDS
     )
-    if active_owned_queue and (
-        event_age is None
-        or event_age < ANYTHINGLLM_EMBEDDING_RECONCILIATION_STALL_SECONDS
-    ):
+    if active_owned_queue:
         # A current record may take much longer than the UI heartbeat.  Leave
         # its writer alone until it is terminal or the existing stall policy
-        # has genuine reason to investigate.
-        return False
-    if active_owned_queue:
-        # The owned record has been quiet for the real reconciliation-stall
-        # interval.  Inspect once, then keep recovery observation calm rather
-        # than turning an uncertain state into a two-second reader storm.
-        return bool(
-            not has_cached_evidence
-            or last_observation_elapsed_seconds is None
-            or elapsed_since_observation
-            >= ANYTHINGLLM_QUIET_QUEUE_STORAGE_OBSERVATION_INTERVAL_SECONDS
-        )
+        # has genuine reason to investigate.  The one exception is the first
+        # local snapshot: the status poll needs a real evidence mapping before
+        # it can reuse cached evidence on subsequent SSE-only iterations.
+        # Returning False with no snapshot used to make the caller copy None,
+        # which then surfaced as a transient observer error and re-entered
+        # recovery reads later in a healthy queue.
+        return not has_cached_evidence
     if (
         total > 0
         and completed < total
@@ -13918,14 +14155,36 @@ def _write_embedding_batch_ledger(ledger_path, workspace_slug, result):
         "unresolved", "rejected", "verification_failed", "cancelled_before_submission"
     }:
         failed_batch = inflight_batch
-    if failed_batch:
-        failed_at = int(failed_batch.get("start_index") or 0)
+    # A queue receipt proves that Desktop has crossed the mutation boundary,
+    # but it is deliberately weaker than exact-vector proof. Preserve that
+    # state as observation-only recovery rather than mislabeling it complete
+    # or offering the owned locations for replay after a process death.
+    observation_batch = next(
+        (
+            batch
+            for batch in [*payload["batches"], inflight_batch]
+            if isinstance(batch, dict)
+            and str(batch.get("submission_state") or "") == "accepted"
+            and not bool(batch.get("searchability_proven"))
+            and str(batch.get("receipt_state") or "") == "owned_queue_event_observed"
+        ),
+        None,
+    )
+    recovery_batch = failed_batch or observation_batch
+    observation_only_recovery = bool(observation_batch and not failed_batch)
+    if recovery_batch:
+        failed_at = int(recovery_batch.get("start_index") or 0)
         # A cooperative cancellation deliberately does not materialize batches
         # after the first unsubmitted one. Keep the complete original plan in
         # memory long enough to make recovery exact; deriving pending work from
         # the recorded batches alone would lose every never-created later batch.
         planned_locations = list(result.get("planned_locations") or [])
-        if planned_locations:
+        if observation_only_recovery:
+            pending = [
+                str(location) for location in (recovery_batch.get("locations") or [])
+                if str(location).strip()
+            ]
+        elif planned_locations:
             pending = planned_locations[failed_at:]
         else:
             pending = []
@@ -13942,11 +14201,11 @@ def _write_embedding_batch_ledger(ledger_path, workspace_slug, result):
             and str(batch.get("submission_state") or "") == "accepted"
             for location in (batch.get("locations") or [])
         }
-        if accepted_after_failure:
+        if accepted_after_failure and not observation_only_recovery:
             pending = [location for location in pending if str(location) not in accepted_after_failure]
         confirmed_locations = {
             str(location)
-            for location in ((failed_batch.get("verification") or {}).get("confirmed_locations") or [])
+            for location in ((recovery_batch.get("verification") or {}).get("confirmed_locations") or [])
             if str(location)
         }
         if confirmed_locations:
@@ -13982,19 +14241,24 @@ def _write_embedding_batch_ledger(ledger_path, workspace_slug, result):
                 "locations": group["locations"],
             })
         payload["recovery"] = {
-            "state": "resume_available",
-            "from_batch": failed_batch.get("batch"),
+            "state": "observation_required" if observation_only_recovery else "resume_available",
+            "from_batch": recovery_batch.get("batch"),
             "remaining_locations": pending,
             "remaining_sources": remaining_sources,
             "skipped_sources": list((payload.get("recovery") or {}).get("skipped_sources") or []),
             "accepted_concurrent_locations": sorted(accepted_after_failure),
-            "operator_note": "Review the failed batch before explicitly resuming. The original run was not retried automatically.",
+            "resubmission_forbidden": observation_only_recovery,
+            "operator_note": (
+                "Desktop had already emitted an owned queue receipt. Reconcile these locations using exact vectors; do not resubmit them."
+                if observation_only_recovery
+                else "Review the failed batch before explicitly resuming. The original run was not retried automatically."
+            ),
         }
     else:
         payload["recovery"] = {"state": "not_needed", "remaining_locations": []}
     write_json(ledger_path, payload)
     resume_path = ledger_path.with_name("resume-embedding-manifest.json")
-    if failed_batch or resume_path.exists():
+    if recovery_batch or resume_path.exists():
         # Overwrite a stale interim recovery file with ``not_needed`` once a
         # formerly ambiguous batch has been reconciled successfully.
         write_json(resume_path, payload)
@@ -14018,6 +14282,7 @@ def _update_workspace_embeddings_batched_serial(
     adaptive_single_record_threshold_seconds=60.0,
     submission_timeout_override=None,
     location_sources=None,
+    receipt_observer=None,
 ):
     """Submit a bounded sequence of embedding updates and retain partial progress.
 
@@ -14046,6 +14311,108 @@ def _update_workspace_embeddings_batched_serial(
             # Keep the UI's cancellation authority responsive without adding
             # a new request or retry policy during the backoff period.
             time.sleep(min(0.25, remaining))
+
+    def submit_with_owned_receipt_observation(batch, batch_number, timeout_seconds):
+        """Submit exactly one request and return early on an owned queue receipt.
+
+        Desktop can start the matching queue long before its synchronous HTTP
+        handler returns.  The old implementation waited for the whole client
+        deadline even when the already-running SSE observer had proved that
+        this exact batch was inside Desktop's queue.  That was safe but made
+        a healthy multi-source run pay the deadline once per source window.
+
+        An owned queue event is sufficient *only* to move from waiting for an
+        HTTP receipt into the existing exact-vector reconciliation.  It is
+        never success proof and it never authorizes a second submission.  The
+        request thread remains read-only after its body was sent; later source
+        windows remain gated by exact vector proof for this source.
+        """
+        submission_started_monotonic = time.monotonic()
+        receipt_context = {
+            "batch": batch_number,
+            "locations": list(batch),
+        }
+        observer_arm_error = ""
+        if receipt_observer is not None:
+            try:
+                # Arm the observer before the request thread can cause a
+                # Desktop event. The observer records an event-generation
+                # watermark here; any event already present is deliberately
+                # not receipt evidence for this POST.
+                receipt_observer(submission_started_monotonic, dict(receipt_context))
+            except Exception as exc:
+                # Preserve this only in the in-memory receipt outcome. The
+                # caller still falls back to the HTTP boundary, but a test or
+                # later diagnostic can distinguish an observer fault from a
+                # genuinely quiet queue.
+                observer_arm_error = str(exc)
+
+        # Exactly one HTTP attempt belongs to this tracker.  Rate-limit retry
+        # policy stays in the owner below, where its lifecycle, ledger, and
+        # cancellation state are durable.  In particular, a late 429 after an
+        # owned queue receipt cannot silently re-submit a request Desktop has
+        # already begun processing.
+        request_tracker = start_json_post_response_tracker(
+            endpoint,
+            {"adds": batch, "deletes": []},
+            api_key=api_key,
+            timeout=max(1, int(math.ceil(timeout_seconds))),
+        )
+        # The direct HTTP response remains the preferred receipt.  Poll the
+        # existing observer only while it is still pending; this adds no new
+        # API work and returns immediately for normal fast 2xx responses.
+        while not request_tracker.wait(timeout=0.05):
+            if receipt_observer is None:
+                continue
+            try:
+                evidence = receipt_observer(
+                    submission_started_monotonic,
+                    dict(receipt_context),
+                )
+            except Exception:
+                # The queue observer is advisory. A consumer-side relay
+                # fault must fall back to the ordinary HTTP receipt deadline.
+                evidence = None
+            if not isinstance(evidence, dict) or not evidence:
+                continue
+            observed_after_seconds = max(
+                0.0, time.monotonic() - submission_started_monotonic
+            )
+            # The request body has already crossed the known mutation
+            # boundary. Stop consuming the late synchronous response instead
+            # of retaining a daemon socket for the old 20-second deadline.
+            # The exact-vector reconciler remains the completion authority.
+            # Snapshot this *before* closing the response read.  It answers
+            # the useful diagnostic question ("was HTTP still pending when
+            # Desktop ownership was proven?"); ``request_thread_terminated``
+            # below separately records whether the deliberate release worked.
+            http_pending_at_queue_receipt = request_tracker.is_alive()
+            request_tracker.close_response_read()
+            request_tracker.join(timeout=0.75)
+            late_outcome = request_tracker.outcome()
+            return {
+                "kind": "owned_queue_evidence",
+                "evidence": dict(evidence),
+                "receipt_wait_seconds": round(observed_after_seconds, 4),
+                "http_response_state": (
+                    "response_read_closed_after_owned_queue_receipt"
+                    if not late_outcome or late_outcome.get("kind") == "response_read_abandoned"
+                    else "http_response_observed_after_owned_queue_receipt"
+                ),
+                "late_http_outcome": late_outcome,
+                "http_request_pending": http_pending_at_queue_receipt,
+                "request_thread_terminated": not request_tracker.is_alive(),
+                "observer_arm_error": observer_arm_error,
+            }
+        outcome = request_tracker.outcome()
+        if observer_arm_error:
+            outcome["observer_arm_error"] = observer_arm_error
+        outcome["receipt_wait_seconds"] = round(
+            max(0.0, time.monotonic() - submission_started_monotonic), 4
+        )
+        outcome["http_request_pending"] = False
+        outcome["request_thread_terminated"] = True
+        return outcome
 
     try:
         normalized_batch_size = max(1, int(batch_size or ANYTHINGLLM_EMBEDDING_UPDATE_BATCH_SIZE))
@@ -14187,6 +14554,12 @@ def _update_workspace_embeddings_batched_serial(
                     "acceptance_basis": "exact_vectors_preexisted_before_submission",
                     "searchability_proven": True,
                     "submission_seconds": 0.0,
+                    # Canonical timing names distinguish the whole
+                    # post-receipt reconciliation window from actual local
+                    # vector-store reads. Keep verification_seconds for
+                    # historical ledgers and consumers.
+                    "reconciliation_seconds": 0.0,
+                    "exact_vector_observation_seconds": 0.0,
                     "verification_seconds": 0.0,
                     "verification": preflight_evidence,
                     "batch_elapsed_seconds": round(time.perf_counter() - batch_started, 4),
@@ -14219,7 +14592,183 @@ def _update_workspace_embeddings_batched_serial(
         try:
             submission_started = time.perf_counter()
             rate_limit_retries = 0
-            while True:
+            receipt_outcome = None
+            submission_request_completed = False
+            receipt_proven_by_owned_queue = False
+            if receipt_observer is not None:
+                while True:
+                    receipt_outcome = submit_with_owned_receipt_observation(
+                        batch,
+                        batch_number,
+                        submission_timeout_seconds,
+                    )
+                    batch_report["receipt_wait_seconds"] = float(
+                        receipt_outcome.get("receipt_wait_seconds") or 0.0
+                    )
+                    if receipt_outcome.get("observer_arm_error"):
+                        batch_report["receipt_observer_error"] = str(
+                            receipt_outcome["observer_arm_error"]
+                        )
+                        result["runtime_events"].append({
+                            "event": "desktop_queue_receipt_observer_arm_failed",
+                            "batch": batch_number,
+                            "error": batch_report["receipt_observer_error"],
+                        })
+                    if receipt_outcome.get("kind") == "owned_queue_evidence":
+                        # This is a narrow receipt fact: a path-correlated Desktop
+                        # event emitted after this POST began. It gets the run out
+                        # of the synchronous HTTP wait, but does not lower the
+                        # later exact-vector or source-window boundary.
+                        late_http_outcome = dict(receipt_outcome.get("late_http_outcome") or {})
+                        if "response_text" in late_http_outcome:
+                            # Queue receipts are common enough that their
+                            # diagnostic tail must remain bounded. The HTTP
+                            # response is evidence only after ownership has
+                            # been established; it must not grow the durable
+                            # ledger with an unbounded server error page.
+                            late_http_outcome["response_text"] = str(
+                                late_http_outcome.get("response_text") or ""
+                            )[:500]
+                        batch_report.update({
+                            "accepted": len(batch),
+                            "submission_state": "accepted",
+                            "acceptance_basis": "owned_desktop_queue_event_before_http_receipt",
+                            "receipt_state": "owned_queue_event_observed",
+                            "receipt_evidence": dict(receipt_outcome.get("evidence") or {}),
+                            "queue_receipt_seconds": batch_report["receipt_wait_seconds"],
+                            # No HTTP-response duration exists when we have closed
+                            # the response read. Do not pollute ETA history with a
+                            # queue-event latency disguised as submission time.
+                            "submission_seconds": None,
+                            "http_response_seconds": None,
+                            "http_response_state": str(
+                                receipt_outcome.get("http_response_state")
+                                or "response_read_closed_after_owned_queue_receipt"
+                            ),
+                            "http_response_pending_at_queue_receipt": bool(
+                                receipt_outcome.get("http_request_pending")
+                            ),
+                            "request_thread_terminated": bool(
+                                receipt_outcome.get("request_thread_terminated")
+                            ),
+                            "searchability_proven": False,
+                        })
+                        if late_http_outcome:
+                            batch_report["late_http_outcome"] = late_http_outcome
+                            late_status = late_http_outcome.get("status")
+                            try:
+                                late_status = int(str(late_status))
+                            except (TypeError, ValueError):
+                                late_status = None
+                            if late_status is not None:
+                                batch_report["late_http_status"] = late_status
+                        result["accepted"] += len(batch)
+                        set_embedding_batch_lifecycle(
+                            batch_report,
+                            "awaiting_observation",
+                            "Desktop emitted an owned queue event; exact vector evidence is still required.",
+                        )
+                        receipt_event = {
+                            "event": "owned_queue_receipt_before_http_response",
+                            "batch": batch_number,
+                            "receipt_wait_seconds": batch_report["receipt_wait_seconds"],
+                            "evidence": dict(batch_report["receipt_evidence"]),
+                            "http_response_state": batch_report["http_response_state"],
+                            "request_thread_terminated": batch_report["request_thread_terminated"],
+                        }
+                        if late_http_outcome:
+                            receipt_event["late_http_outcome"] = late_http_outcome
+                            if batch_report.get("late_http_status") is not None:
+                                receipt_event["late_http_status"] = batch_report["late_http_status"]
+                        result["runtime_events"].append(receipt_event)
+                        if not batch_report["request_thread_terminated"]:
+                            # This is not a retry trigger: the owned queue
+                            # receipt still makes replay unsafe. Record the
+                            # rare release failure explicitly so a later run
+                            # audit can distinguish it from Desktop slowness
+                            # or a normal completed response reader.
+                            result["runtime_events"].append({
+                                "event": "owned_queue_response_reader_release_incomplete",
+                                "batch": batch_number,
+                                "message": (
+                                    "The client response reader was still alive after its bounded release; "
+                                    "no retry was attempted because Desktop queue ownership was already proven."
+                                ),
+                            })
+                        # This durable write is intentionally before vector
+                        # observation: a process death must retain the fact that
+                        # replay is unsafe, even though success is unproven.
+                        result["inflight_batch"] = dict(batch_report)
+                        _write_embedding_batch_ledger(ledger_path, workspace_slug, result)
+                        receipt_proven_by_owned_queue = True
+                        break
+                    if receipt_outcome.get("kind") == "exception":
+                        receipt_exception = receipt_outcome.get("exception")
+                        if isinstance(receipt_exception, BaseException):
+                            raise receipt_exception
+                        raise RuntimeError("receipt tracker reported an invalid exception outcome")
+                    status = int(receipt_outcome.get("status") or 0)
+                    response_text = str(receipt_outcome.get("response_text") or "")
+                    if (
+                        status != 429
+                        or rate_limit_retries >= ANYTHINGLLM_EMBEDDING_RATE_LIMIT_MAX_RETRIES
+                    ):
+                        submission_request_completed = True
+                        break
+                    rate_limit_retries += 1
+                    batch_report["rate_limit_retry_count"] = rate_limit_retries
+                    batch_report["rate_limit_retry_seconds"] = ANYTHINGLLM_EMBEDDING_RATE_LIMIT_RETRY_SECONDS
+                    retry_message = (
+                        "AnythingLLM explicitly rate-limited this serial request; "
+                        f"waiting {ANYTHINGLLM_EMBEDDING_RATE_LIMIT_RETRY_SECONDS:.0f} seconds before its one safe retry."
+                    )
+                    set_embedding_batch_lifecycle(batch_report, "rate_limited_waiting_retry", retry_message)
+                    result["runtime_events"].append({
+                        "event": "rate_limit_retry",
+                        "batch": batch_number,
+                        "retry_count": rate_limit_retries,
+                        "retry_seconds": ANYTHINGLLM_EMBEDDING_RATE_LIMIT_RETRY_SECONDS,
+                    })
+                    result["inflight_batch"] = dict(batch_report)
+                    _write_embedding_batch_ledger(ledger_path, workspace_slug, result)
+                    if callable(status_callback):
+                        status_callback(
+                            (
+                                f"AnythingLLM rate-limited batch {batch_number}; retrying once in "
+                                f"{ANYTHINGLLM_EMBEDDING_RATE_LIMIT_RETRY_SECONDS:.0f} seconds at one active request"
+                            ),
+                            dict(batch_report),
+                        )
+                    if wait_for_rate_limit_retry_or_cancellation():
+                        batch_report["submission_state"] = "cancelled_before_retry"
+                        batch_report["error"] = "The operator requested a stop before the rate-limited batch was retried."
+                        set_embedding_batch_lifecycle(
+                            batch_report,
+                            "cancelled_before_retry",
+                            batch_report["error"],
+                        )
+                        result["errors"].append({
+                            "endpoint": "operator-cancellation",
+                            "batch": batch_number,
+                            "error": batch_report["error"],
+                        })
+                        result["inflight_batch"] = dict(batch_report)
+                        _write_embedding_batch_ledger(ledger_path, workspace_slug, result)
+                        submission_request_completed = True
+                        status, response_text = 429, ""
+                        break
+                    set_embedding_batch_lifecycle(
+                        batch_report,
+                        "submitted",
+                        "Retrying the explicitly refused request at one active request.",
+                    )
+                    result["inflight_batch"] = dict(batch_report)
+                    _write_embedding_batch_ledger(ledger_path, workspace_slug, result)
+            while (
+                not receipt_proven_by_owned_queue
+                and not submission_request_completed
+                and batch_report.get("submission_state") != "cancelled_before_retry"
+            ):
                 try:
                     status, response_text = post_json(
                         endpoint,
@@ -14288,9 +14837,16 @@ def _update_workspace_embeddings_batched_serial(
                 )
                 result["inflight_batch"] = dict(batch_report)
                 _write_embedding_batch_ledger(ledger_path, workspace_slug, result)
-            batch_report["http_status"] = status
+            if not receipt_proven_by_owned_queue:
+                batch_report["http_status"] = status
             if batch_report["submission_state"] == "cancelled_before_retry":
                 batch_report["submission_seconds"] = round(time.perf_counter() - submission_started, 4)
+            elif receipt_proven_by_owned_queue:
+                # The SSE receipt has already established queue ownership.
+                # Keep its distinct basis rather than overwriting it with an
+                # imagined HTTP success that we have deliberately not waited
+                # for.
+                pass
             elif 200 <= status < 300:
                 batch_report["accepted"] = len(batch)
                 batch_report["submission_state"] = "accepted"
@@ -14332,7 +14888,9 @@ def _update_workspace_embeddings_batched_serial(
                     "rejected" if batch_report["submission_state"] == "rejected" else "reconciliation_pending",
                     batch_report["error"],
                 )
-            batch_report["submission_seconds"] = round(time.perf_counter() - submission_started, 4)
+            if not receipt_proven_by_owned_queue:
+                batch_report["submission_seconds"] = round(time.perf_counter() - submission_started, 4)
+                batch_report["http_response_seconds"] = batch_report["submission_seconds"]
         except Exception as exc:
             outcome = classify_anythingllm_mutation_outcome(
                 stage="workspace_queue",
@@ -14447,8 +15005,26 @@ def _update_workspace_embeddings_batched_serial(
                     "exception_type": type(exc).__name__,
                     "traceback": traceback.format_exc(),
                 }
-            batch_report["verification_seconds"] = round(time.perf_counter() - verification_started, 4)
+            reconciliation_seconds = round(
+                time.perf_counter() - verification_started, 4
+            )
+            # ``batch_verifier`` owns the entire period after an accepted or
+            # uncertain receipt: it may wait for Desktop queue progress as
+            # well as read the local vector store.  Calling that whole period
+            # a vector-read time obscures the real source of a delay.
+            batch_report["reconciliation_seconds"] = reconciliation_seconds
+            batch_report["verification_seconds"] = reconciliation_seconds
             batch_report["verification"] = verification
+            try:
+                exact_vector_observation_seconds = max(
+                    0.0,
+                    float(verification.get("storage_observation_total_seconds") or 0.0),
+                )
+            except (TypeError, ValueError):
+                exact_vector_observation_seconds = 0.0
+            batch_report["exact_vector_observation_seconds"] = round(
+                exact_vector_observation_seconds, 4
+            )
             if verification.get("reconciliation_effective_deadline_seconds") is not None:
                 # Preserve the active, evidence-backed deadline in the
                 # durable ledger so the document-level final read does not
@@ -14467,6 +15043,40 @@ def _update_workspace_embeddings_batched_serial(
                 or 0
             )
             exact_vector_coverage = verification_observed >= len(batch)
+            safe_source_rejection = bool(verification.get("safe_source_rejection"))
+            if safe_source_rejection:
+                # This is the only non-success verifier outcome that can let
+                # a later PDF continue. The guarded worker emitted an
+                # explicit pre-namespace rejection and the live queue
+                # snapshot proves no document write began. Do not reuse this
+                # branch for an accepted, delayed, or ambiguous receipt.
+                prior_accepted = int(batch_report.get("accepted") or 0)
+                batch_report.update({
+                    "submission_state": "rejected",
+                    "accepted": 0,
+                    "searchability_proven": False,
+                    "acceptance_basis": "source_atomic_rejected_before_namespace_commit",
+                    "error": str(
+                        verification.get("message")
+                        or "AnythingLLM rejected this source before namespace commit."
+                    ),
+                })
+                if prior_accepted:
+                    result["accepted"] = max(0, int(result["accepted"] or 0) - prior_accepted)
+                result["errors"].append(
+                    {
+                        "endpoint": "source-atomic-precommit-rejection",
+                        "batch": batch_number,
+                        "status": "source_atomic_precommit_rejection",
+                        "error": batch_report["error"],
+                        "may_continue_later_sources": True,
+                    }
+                )
+                set_embedding_batch_lifecycle(
+                    batch_report,
+                    "source_rejected_before_namespace_commit",
+                    batch_report["error"],
+                )
             # ``pass_with_review`` means an inspection layer could not make a
             # clean storage assertion (for example, SQLite was locked while
             # Desktop was writing). It is never proof that this batch's exact
@@ -14477,13 +15087,23 @@ def _update_workspace_embeddings_batched_serial(
                 verification_status in {"pass", "pass_with_review"}
                 and exact_vector_coverage
             )
-            if not was_unresolved and batch_report["searchability_proven"]:
+            if (
+                not safe_source_rejection
+                and not was_unresolved
+                and batch_report["searchability_proven"]
+            ):
                 set_embedding_batch_lifecycle(
                     batch_report,
                     "vector_observed",
                     "Exact vector evidence was observed after the accepted submission.",
                 )
-            if was_unresolved and (
+            if safe_source_rejection:
+                # The durable lifecycle above carries the only safe
+                # continuation fact. Do not fall into timeout or generic
+                # verification-failure branches, both of which correctly
+                # represent an ambiguous remote mutation in all other cases.
+                pass
+            elif was_unresolved and (
                 batch_report["searchability_proven"]
                 or verification_status == "workspace_attached_pending_vectors"
             ):
@@ -14614,6 +15234,17 @@ def _update_workspace_embeddings_batched_serial(
                 ),
             }
             result["deferred_verification_batches"].append(batch_number)
+        # Batches which are deliberately deferred to a later checkpoint still
+        # record an explicit zero reconciliation duration. This avoids a
+        # missing field being mistaken for unmeasured local vector-read time.
+        batch_report.setdefault("reconciliation_seconds", 0.0)
+        batch_report.setdefault("exact_vector_observation_seconds", 0.0)
+        # Legacy readers use verification_seconds for the same full
+        # reconciliation duration. Retain it as an alias while new artifacts
+        # use the canonical field above.
+        batch_report.setdefault(
+            "verification_seconds", batch_report["reconciliation_seconds"]
+        )
         batch_report["batch_elapsed_seconds"] = round(time.perf_counter() - batch_started, 4)
         batch_report["timing_event"] = "batch_completed"
         result["batches"].append(batch_report)
@@ -14638,10 +15269,20 @@ def _update_workspace_embeddings_batched_serial(
                     message = f"AnythingLLM batch {batch_number} is searchable; proceeding to the next batch"
                 status_callback(message, dict(batch_report))
             else:
-                status_callback(
-                    f"AnythingLLM batch {batch_number} is {batch_report['submission_state']}; later batches were not submitted",
-                    dict(batch_report),
-                )
+                if (
+                    batch_report["submission_state"] == "rejected"
+                    and batch_report.get("acceptance_basis")
+                    == "source_atomic_rejected_before_namespace_commit"
+                ):
+                    status_callback(
+                        "AnythingLLM rejected this PDF before namespace commit; independent later PDFs remain eligible",
+                        dict(batch_report),
+                    )
+                else:
+                    status_callback(
+                        f"AnythingLLM batch {batch_number} is {batch_report['submission_state']}; later batches were not submitted",
+                        dict(batch_report),
+                    )
         # If the one-record warm-up itself is slow, keep all later requests at
         # one record. This adds request boundaries but does not add embedding
         # work because AnythingLLM processes the documents sequentially.
@@ -14693,6 +15334,7 @@ def update_workspace_embeddings_batched(
     initial_concurrent_batches=ANYTHINGLLM_EMBEDDING_INITIAL_CONCURRENT_BATCHES,
     submission_timeout_override=None,
     location_sources=None,
+    receipt_observer=None,
 ):
     """Submit bounded embedding requests.
 
@@ -14720,6 +15362,7 @@ def update_workspace_embeddings_batched(
             adaptive_single_record_threshold_seconds=adaptive_single_record_threshold_seconds,
             submission_timeout_override=submission_timeout_override,
             location_sources=location_sources,
+            receipt_observer=receipt_observer,
         )
 
     unique_locations = list(dict.fromkeys(str(location) for location in locations if location))
@@ -15368,6 +16011,17 @@ def update_workspace_embeddings_desktop_queue(
         "fresh_segment_first_position": 0,
         "fresh_segment_last_position": 0,
         "fresh_segment_progress_samples": 0,
+        # Source-atomic worker evidence never advances the Desktop receipt or
+        # completion counters. It explains provider time without pretending a
+        # staged vector has reached the AnythingLLM namespace.
+        "source_atomic_provider_batches": [],
+        "source_atomic_provider_batch_count": 0,
+        "source_atomic_provider_chunk_count": 0,
+        "source_atomic_provider_elapsed_ms": 0,
+        "source_atomic_staging_started": False,
+        "source_atomic_staging_finished": False,
+        "source_atomic_precommit_rejection": {},
+        "source_atomic_commit_ambiguity": {},
     }
 
     def queue_snapshot():
@@ -15398,6 +16052,10 @@ def update_workspace_embeddings_desktop_queue(
             fresh_first_position = int(queue_state["fresh_segment_first_position"] or 0)
             fresh_last_position = int(queue_state["fresh_segment_last_position"] or 0)
             fresh_samples = max(0, int(queue_state["fresh_segment_progress_samples"] or 0))
+            provider_batches = list(queue_state["source_atomic_provider_batches"] or [])
+            provider_batch_count = max(0, int(queue_state["source_atomic_provider_batch_count"] or 0))
+            provider_chunk_count = max(0, int(queue_state["source_atomic_provider_chunk_count"] or 0))
+            provider_elapsed_ms = max(0, int(queue_state["source_atomic_provider_elapsed_ms"] or 0))
             records_per_second = 0.0
             if last_progress_at > first_progress_at and last_progress_position > first_progress_position:
                 records_per_second = (last_progress_position - first_progress_position) / (
@@ -15449,6 +16107,14 @@ def update_workspace_embeddings_desktop_queue(
                 "desktop_queue_active_fresh_segment_start": fresh_first_position,
                 "desktop_queue_active_fresh_segment_end": fresh_last_position,
                 "desktop_queue_active_fresh_segment_samples": fresh_samples,
+                "source_atomic_staging_started": bool(queue_state["source_atomic_staging_started"]),
+                "source_atomic_staging_finished": bool(queue_state["source_atomic_staging_finished"]),
+                "source_atomic_provider_batch_count": provider_batch_count,
+                "source_atomic_provider_chunk_count": provider_chunk_count,
+                "source_atomic_provider_elapsed_ms": provider_elapsed_ms,
+                "source_atomic_provider_batches": provider_batches,
+                "source_atomic_precommit_rejection": dict(queue_state["source_atomic_precommit_rejection"] or {}),
+                "source_atomic_commit_ambiguity": dict(queue_state["source_atomic_commit_ambiguity"] or {}),
             }
 
     def queue_activity_summary():
@@ -15499,6 +16165,103 @@ def update_workspace_embeddings_desktop_queue(
         """
         event = dict(event or {})
         event_type = str(event.get("type") or "").strip()
+        source_atomic_event = event_type in {
+            "source_staging_started",
+            "source_staging_provider_batch",
+            "source_staging_finished",
+            "source_rejected_before_commit",
+            "source_commit_ambiguous",
+            "source_committed",
+        }
+        if source_atomic_event:
+            with queue_state_lock:
+                event_now = time.monotonic()
+                previous_event = float(queue_state["last_event_monotonic"] or 0.0)
+                inter_event_gap_seconds = (
+                    max(0.0, event_now - previous_event) if previous_event else None
+                )
+                queue_state["last_event_type"] = event_type
+                queue_state["events_observed"] += 1
+                queue_state["last_event_monotonic"] = event_now
+                if event_type == "source_staging_started":
+                    queue_state["source_atomic_staging_started"] = True
+                elif event_type == "source_staging_finished":
+                    queue_state["source_atomic_staging_finished"] = True
+                elif event_type == "source_staging_provider_batch":
+                    try:
+                        batch_index = max(0, int(event.get("batchIndex") or 0))
+                        chunk_count = max(0, int(event.get("chunkCount") or 0))
+                        elapsed_ms = max(0, int(event.get("elapsed_ms") or 0))
+                        provider_batch_size = max(
+                            0, int(event.get("provider_batch_size") or 0)
+                        )
+                    except (TypeError, ValueError):
+                        batch_index, chunk_count, elapsed_ms, provider_batch_size = 0, 0, 0, 0
+                    provider_batch = {
+                        "batch_index": batch_index,
+                        "chunk_count": chunk_count,
+                        "elapsed_ms": elapsed_ms,
+                        "provider_batch_size": provider_batch_size,
+                    }
+                    queue_state["source_atomic_provider_batches"] = (
+                        list(queue_state["source_atomic_provider_batches"] or []) + [provider_batch]
+                    )[-ANYTHINGLLM_SOURCE_ATOMIC_PROVIDER_BATCH_TAIL_LIMIT:]
+                    queue_state["source_atomic_provider_batch_count"] = max(
+                        int(queue_state["source_atomic_provider_batch_count"] or 0),
+                        batch_index + 1,
+                    )
+                    queue_state["source_atomic_provider_chunk_count"] = (
+                        int(queue_state["source_atomic_provider_chunk_count"] or 0) + chunk_count
+                    )
+                    queue_state["source_atomic_provider_elapsed_ms"] = (
+                        int(queue_state["source_atomic_provider_elapsed_ms"] or 0) + elapsed_ms
+                    )
+                elif event_type == "source_rejected_before_commit":
+                    queue_state["source_atomic_precommit_rejection"] = {
+                        "source_key": str(event.get("sourceKey") or ""),
+                        "filename": str(event.get("filename") or ""),
+                        "error": str(event.get("error") or ""),
+                    }
+                elif event_type == "source_commit_ambiguous":
+                    queue_state["source_atomic_commit_ambiguity"] = {
+                        "source_key": str(event.get("sourceKey") or ""),
+                        "filename": str(event.get("filename") or ""),
+                        "error": str(event.get("error") or ""),
+                    }
+            snapshot = queue_snapshot()
+            if callable(status_callback) and event_type != "source_committed":
+                if event_type == "source_staging_started":
+                    message = anythingllm_embed_progress_message(event)
+                    timing_event = "source_atomic_staging_started"
+                elif event_type == "source_staging_provider_batch":
+                    message = anythingllm_embed_progress_message(event)
+                    timing_event = "source_atomic_provider_batch_completed"
+                elif event_type == "source_staging_finished":
+                    message = (
+                        "AnythingLLM finished provider staging; committing this PDF to the workspace"
+                        if bool(event.get("success"))
+                        else "AnythingLLM provider staging failed before namespace commit"
+                    )
+                    timing_event = "source_atomic_staging_finished"
+                elif event_type == "source_rejected_before_commit":
+                    message = anythingllm_embed_progress_message(event)
+                    timing_event = "source_atomic_precommit_rejected"
+                else:
+                    message = anythingllm_embed_progress_message(event)
+                    timing_event = "source_atomic_commit_ambiguous"
+                status_callback(
+                    message,
+                    {
+                        "timing_event": timing_event,
+                        "desktop_queue_event_type": event_type,
+                        "desktop_queue_inter_event_gap_seconds": (
+                            round(inter_event_gap_seconds, 3)
+                            if inter_event_gap_seconds is not None else None
+                        ),
+                        **snapshot,
+                    },
+                )
+            return
         try:
             position = int((event or {}).get("docIndex") or 0) + 1
         except (TypeError, ValueError):
@@ -15643,6 +16406,51 @@ def update_workspace_embeddings_desktop_queue(
             queue_state["observer_failures"] = int(health.get("failures") or 0)
             queue_state["observer_reason"] = str(health.get("reason") or "")
 
+    def owned_desktop_queue_receipt(submission_started_monotonic, _batch_report):
+        """Return only a newly observed, path-correlated queue admission fact.
+
+        The listener itself already filters event filenames to this source
+        window.  This second gate prevents a stale pre-POST event from being
+        mistaken for a receipt of the current request.  It deliberately does
+        not use cache rows or generic observer connectivity as receipt proof.
+        """
+        with queue_state_lock:
+            receipt_baseline = queue_state.get("receipt_event_baseline")
+            receipt_started = float(queue_state.get("receipt_started_monotonic") or 0.0)
+            requested_start = float(submission_started_monotonic or 0.0)
+            if requested_start > receipt_started:
+                # Arm exactly once for this request. Event generations are
+                # more robust than a timestamp-only comparison under a fast
+                # loopback request where the observer and POST threads are
+                # scheduled in the same clock tick.
+                queue_state["receipt_started_monotonic"] = requested_start
+                queue_state["receipt_event_baseline"] = int(
+                    queue_state.get("events_observed") or 0
+                )
+                return None
+            progress_at = float(queue_state.get("last_progress_monotonic") or 0.0)
+            progress_position = max(
+                int(queue_state.get("completed") or 0),
+                int(queue_state.get("current") or 0),
+            )
+            event_type = str(queue_state.get("last_event_type") or "")
+            event_count = int(queue_state.get("events_observed") or 0)
+        if (
+            progress_position <= 0
+            or event_count <= int(receipt_baseline or 0)
+            or event_type not in {"doc_starting", "chunk_progress", "doc_complete"}
+        ):
+            return None
+        return {
+            "kind": "path_correlated_desktop_queue_progress",
+            "event_type": event_type,
+            "progress_position": progress_position,
+            "events_observed": event_count,
+            "observed_after_submission_seconds": round(
+                max(0.0, progress_at - float(submission_started_monotonic)), 4
+            ),
+        }
+
     def desktop_queue_status(message, report):
         if not callable(status_callback):
             return
@@ -15696,11 +16504,24 @@ def update_workspace_embeddings_desktop_queue(
     # without changing the one-request FIFO submission boundary.
     progress_listener["connected_event"].wait(timeout=0.75)
     def queue_aware_batch_verifier(batch_report):
-        if not callable(batch_verifier):
-            return {}
         # A mutable, JSON-safe snapshot lets the vector observer report live
         # SSE queue evidence in its own status line.  It does not make SSE a
         # success signal and does not alter queue ownership.
+        snapshot = queue_snapshot()
+        precommit_rejection = source_atomic_precommit_rejection(snapshot)
+        if precommit_rejection is not None:
+            return {
+                "status": "source_atomic_precommit_rejection",
+                "safe_source_rejection": True,
+                "message": (
+                    "AnythingLLM rejected this PDF before namespace commit: "
+                    f"{precommit_rejection['error']}"
+                ),
+                "source_atomic_rejection": precommit_rejection,
+                "desktop_queue_observer": snapshot,
+            }
+        if not callable(batch_verifier):
+            return {}
         contextual_report = dict(batch_report)
         contextual_report["desktop_queue_observer"] = queue_state
         verification = batch_verifier(contextual_report)
@@ -15728,6 +16549,7 @@ def update_workspace_embeddings_desktop_queue(
             concurrent_batch_limit=1,
             submission_timeout_override=ANYTHINGLLM_DESKTOP_QUEUE_RECEIPT_TIMEOUT_SECONDS,
             location_sources=location_sources,
+            receipt_observer=owned_desktop_queue_receipt,
         )
     finally:
         progress_listener["stop_event"].set()
@@ -15796,6 +16618,29 @@ def queue_position_is_cache_eligible(position, cached_record_positions):
     except (TypeError, ValueError):
         return False
     return current > 0 and current in set(cached_record_positions or ())
+
+
+def source_atomic_precommit_rejection(queue_snapshot):
+    """Return safe source-local rejection evidence, or ``None``.
+
+    A source can be skipped only when the patched worker explicitly reports a
+    failure *before* it began namespace writes.  Any document-start/completion
+    evidence or commit ambiguity is a remote mutation boundary and therefore
+    remains a stop condition for later sources.
+    """
+    queue = dict(queue_snapshot or {})
+    rejection = dict(queue.get("source_atomic_precommit_rejection") or {})
+    if not rejection:
+        return None
+    if dict(queue.get("source_atomic_commit_ambiguity") or {}):
+        return None
+    if int(queue.get("desktop_queue_current") or 0) > 0:
+        return None
+    if int(queue.get("desktop_queue_completed") or 0) > 0:
+        return None
+    if not str(rejection.get("error") or "").strip():
+        return None
+    return rejection
 
 
 def maybe_upload_payloads(
