@@ -10158,6 +10158,10 @@ class _JsonPostResponseTracker:
         self.timeout = max(1.0, float(timeout or 1.0))
         self.completed = threading.Event()
         self.response_read_abandoned = threading.Event()
+        self._deadline_lock = threading.Lock()
+        self._request_started_monotonic = time.monotonic()
+        self._response_deadline_monotonic = 0.0
+        self._activity_lease_count = 0
         self._socket_lock = threading.Lock()
         self._socket = None
         self._outcome_lock = threading.Lock()
@@ -10210,10 +10214,33 @@ class _JsonPostResponseTracker:
                 owned_socket.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
-            try:
-                owned_socket.close()
-            except OSError:
-                pass
+
+    def grant_response_activity_lease(self, *, idle_seconds, max_total_seconds):
+        """Extend a pending response read only while owned work is advancing.
+
+        This is deliberately narrower than increasing the ordinary HTTP
+        timeout.  A source-atomic provider-batch event proves that Desktop is
+        still working on this exact request; it earns one short no-activity
+        lease, capped from request start.  A quiet request receives no lease.
+        """
+        now = time.monotonic()
+        idle = max(0.1, float(idle_seconds or 0.1))
+        total_cap = max(self.timeout, float(max_total_seconds or self.timeout))
+        with self._deadline_lock:
+            started = float(self._request_started_monotonic or now)
+            current = float(self._response_deadline_monotonic or (started + self.timeout))
+            cap = started + total_cap
+            granted_deadline = min(cap, max(current, now + idle))
+            changed = granted_deadline > current + 0.0001
+            self._response_deadline_monotonic = granted_deadline
+            if changed:
+                self._activity_lease_count += 1
+            return {
+                "granted": changed,
+                "lease_count": self._activity_lease_count,
+                "deadline_from_start_seconds": round(max(0.0, granted_deadline - started), 4),
+                "cap_from_start_seconds": round(total_cap, 4),
+            }
 
     @staticmethod
     def _response_from_bytes(buffer):
@@ -10285,12 +10312,17 @@ class _JsonPostResponseTracker:
             if self.api_key:
                 headers.append(f"Authorization: Bearer {self.api_key}")
             owned_socket.sendall(("\r\n".join(headers) + "\r\n\r\n").encode("ascii") + data)
-            deadline = time.monotonic() + self.timeout
+            with self._deadline_lock:
+                self._response_deadline_monotonic = (
+                    self._request_started_monotonic + self.timeout
+                )
             response_buffer = b""
             while True:
                 if self.response_read_abandoned.is_set():
                     self._set_outcome({"kind": "response_read_abandoned"})
                     return
+                with self._deadline_lock:
+                    deadline = float(self._response_deadline_monotonic)
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError("Timed out waiting for AnythingLLM's HTTP response.")
@@ -13772,6 +13804,14 @@ ANYTHINGLLM_EMBEDDING_SUBMISSION_TIMEOUT_SETUP_SECONDS = 30.0
 # fallback receipt deadline only when both the HTTP response and owned queue
 # evidence are absent; it never authorizes a duplicate request.
 ANYTHINGLLM_DESKTOP_QUEUE_RECEIPT_TIMEOUT_SECONDS = 20.0
+# Source-atomic staging is synchronous inside the Desktop route and can span
+# several real provider batches before the first ``doc_*`` queue event. A
+# matching staging event therefore earns a short activity lease on the
+# *existing* response read. The cap is not a blind wait: without another
+# owned provider-batch event the ordinary 20-second quiet boundary remains in
+# force, and successful routes still return immediately.
+ANYTHINGLLM_SOURCE_ATOMIC_RECEIPT_ACTIVITY_LEASE_SECONDS = 20.0
+ANYTHINGLLM_SOURCE_ATOMIC_RECEIPT_MAX_SECONDS = 90.0
 # A timed-out HTTP response is not an embedding verdict. Give the exact-vector
 # reconciler enough time to observe slow sequential provider work, while still
 # retaining a finite circuit-breaker boundary.
@@ -14364,6 +14404,7 @@ def _update_workspace_embeddings_batched_serial(
             api_key=api_key,
             timeout=max(1, int(math.ceil(timeout_seconds))),
         )
+        source_atomic_activity_leases = []
         # The direct HTTP response remains the preferred receipt.  Poll the
         # existing observer only while it is still pending; this adds no new
         # API work and returns immediately for normal fast 2xx responses.
@@ -14384,6 +14425,31 @@ def _update_workspace_embeddings_batched_serial(
             observed_after_seconds = max(
                 0.0, time.monotonic() - submission_started_monotonic
             )
+            if str(evidence.get("kind") or "") == "source_atomic_staging_activity":
+                # Staging is active, but it is not yet the namespace queue
+                # receipt that permits closing the response socket. Let the
+                # current response reader renew the bounded read lease and
+                # keep observing the *same* HTTP request.
+                grant: dict[str, Any] = {}
+                lease = getattr(request_tracker, "grant_response_activity_lease", None)
+                if callable(lease):
+                    try:
+                        raw_grant = lease(
+                            idle_seconds=ANYTHINGLLM_SOURCE_ATOMIC_RECEIPT_ACTIVITY_LEASE_SECONDS,
+                            max_total_seconds=ANYTHINGLLM_SOURCE_ATOMIC_RECEIPT_MAX_SECONDS,
+                        )
+                        if isinstance(raw_grant, dict):
+                            grant = dict(raw_grant)
+                    except Exception as exc:
+                        grant = {"granted": False, "error": str(exc)}
+                source_atomic_activity_leases.append({
+                    "event_type": str(evidence.get("event_type") or ""),
+                    "observed_after_submission_seconds": float(
+                        evidence.get("observed_after_submission_seconds") or 0.0
+                    ),
+                    **grant,
+                })
+                continue
             # The request body has already crossed the known mutation
             # boundary. Stop consuming the late synchronous response instead
             # of retaining a daemon socket for the old 20-second deadline.
@@ -14409,6 +14475,7 @@ def _update_workspace_embeddings_batched_serial(
                 "http_request_pending": http_pending_at_queue_receipt,
                 "request_thread_terminated": not request_tracker.is_alive(),
                 "observer_arm_error": observer_arm_error,
+                "source_atomic_activity_leases": source_atomic_activity_leases,
             }
         outcome = request_tracker.outcome()
         if observer_arm_error:
@@ -14418,6 +14485,7 @@ def _update_workspace_embeddings_batched_serial(
         )
         outcome["http_request_pending"] = False
         outcome["request_thread_terminated"] = True
+        outcome["source_atomic_activity_leases"] = source_atomic_activity_leases
         return outcome
 
     try:
@@ -14611,6 +14679,22 @@ def _update_workspace_embeddings_batched_serial(
                     batch_report["receipt_wait_seconds"] = float(
                         receipt_outcome.get("receipt_wait_seconds") or 0.0
                     )
+                    source_atomic_activity_leases = list(
+                        receipt_outcome.get("source_atomic_activity_leases") or []
+                    )
+                    if source_atomic_activity_leases:
+                        batch_report["source_atomic_receipt_activity_count"] = len(
+                            source_atomic_activity_leases
+                        )
+                        batch_report["source_atomic_receipt_last_activity"] = dict(
+                            source_atomic_activity_leases[-1]
+                        )
+                        for activity in source_atomic_activity_leases:
+                            result["runtime_events"].append({
+                                "event": "source_atomic_response_read_activity_lease",
+                                "batch": batch_number,
+                                **dict(activity),
+                            })
                     if receipt_outcome.get("observer_arm_error"):
                         batch_report["receipt_observer_error"] = str(
                             receipt_outcome["observer_arm_error"]
@@ -14621,8 +14705,9 @@ def _update_workspace_embeddings_batched_serial(
                             "error": batch_report["receipt_observer_error"],
                         })
                     if receipt_outcome.get("kind") == "owned_queue_evidence":
-                        # This is a narrow receipt fact: a path-correlated Desktop
-                        # event emitted after this POST began. It gets the run out
+                        # This is a narrow ownership fact: a path-correlated
+                        # Desktop queue or strict source-atomic staging event
+                        # emitted after this POST began. It gets the run out
                         # of the synchronous HTTP wait, but does not lower the
                         # later exact-vector or source-window boundary.
                         late_http_outcome = dict(receipt_outcome.get("late_http_outcome") or {})
@@ -14635,12 +14720,13 @@ def _update_workspace_embeddings_batched_serial(
                             late_http_outcome["response_text"] = str(
                                 late_http_outcome.get("response_text") or ""
                             )[:500]
+                        receipt_evidence = dict(receipt_outcome.get("evidence") or {})
                         batch_report.update({
                             "accepted": len(batch),
                             "submission_state": "accepted",
                             "acceptance_basis": "owned_desktop_queue_event_before_http_receipt",
                             "receipt_state": "owned_queue_event_observed",
-                            "receipt_evidence": dict(receipt_outcome.get("evidence") or {}),
+                            "receipt_evidence": receipt_evidence,
                             "queue_receipt_seconds": batch_report["receipt_wait_seconds"],
                             # No HTTP-response duration exists when we have closed
                             # the response read. Do not pollute ETA history with a
@@ -16030,6 +16116,63 @@ def update_workspace_embeddings_desktop_queue(
         "source_atomic_commit_ambiguity": {},
     }
 
+    def merge_source_atomic_provider_batches(raw_batches, *, source_key=""):
+        """Merge provider timing by durable source+batch identity.
+
+        Desktop's SSE relay may coalesce an intermediate notification under
+        load. The patched terminal staging event carries the complete small
+        per-source batch list, so use it to restore a missing individual
+        event. Never add totals blindly: a terminal replay must not double
+        count provider time or chunks already observed live.
+        """
+        normalized = []
+        fallback_source = str(source_key or "")
+        for raw in raw_batches or []:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                batch_index = int(raw.get("batchIndex", raw.get("batch_index", -1)))
+                chunk_count = max(0, int(raw.get("chunkCount", raw.get("chunk_count", 0)) or 0))
+                elapsed_ms = max(0, int(raw.get("elapsed_ms") or 0))
+                provider_batch_size = max(
+                    0, int(raw.get("provider_batch_size") or 0)
+                )
+            except (TypeError, ValueError):
+                continue
+            if batch_index < 0:
+                continue
+            item_source = str(raw.get("sourceKey") or raw.get("source_key") or fallback_source)
+            normalized.append({
+                "source_key": item_source,
+                "batch_index": batch_index,
+                "chunk_count": chunk_count,
+                "elapsed_ms": elapsed_ms,
+                "provider_batch_size": provider_batch_size,
+            })
+        if not normalized:
+            return
+        by_identity = {
+            (str(item.get("source_key") or ""), int(item.get("batch_index") or 0)): dict(item)
+            for item in queue_state["source_atomic_provider_batches"] or []
+            if isinstance(item, dict)
+        }
+        for item in normalized:
+            by_identity[(item["source_key"], item["batch_index"])] = item
+        ordered = sorted(
+            by_identity.values(),
+            key=lambda item: (str(item.get("source_key") or ""), int(item.get("batch_index") or 0)),
+        )
+        queue_state["source_atomic_provider_batches"] = ordered[
+            -ANYTHINGLLM_SOURCE_ATOMIC_PROVIDER_BATCH_TAIL_LIMIT:
+        ]
+        queue_state["source_atomic_provider_batch_count"] = len(ordered)
+        queue_state["source_atomic_provider_chunk_count"] = sum(
+            int(item.get("chunk_count") or 0) for item in ordered
+        )
+        queue_state["source_atomic_provider_elapsed_ms"] = sum(
+            int(item.get("elapsed_ms") or 0) for item in ordered
+        )
+
     def queue_snapshot():
         with queue_state_lock:
             completed = min(requested, max(0, int(queue_state["completed"])))
@@ -16194,34 +16337,17 @@ def update_workspace_embeddings_desktop_queue(
                     queue_state["source_atomic_staging_started"] = True
                 elif event_type == "source_staging_finished":
                     queue_state["source_atomic_staging_finished"] = True
+                    # The terminal event is a compact server-side replay of
+                    # this source's provider batches. It restores any SSE
+                    # notification that was coalesced while retaining exact
+                    # source-local identity.
+                    merge_source_atomic_provider_batches(
+                        event.get("providerBatches") or event.get("provider_batches") or [],
+                        source_key=str(event.get("sourceKey") or ""),
+                    )
                 elif event_type == "source_staging_provider_batch":
-                    try:
-                        batch_index = max(0, int(event.get("batchIndex") or 0))
-                        chunk_count = max(0, int(event.get("chunkCount") or 0))
-                        elapsed_ms = max(0, int(event.get("elapsed_ms") or 0))
-                        provider_batch_size = max(
-                            0, int(event.get("provider_batch_size") or 0)
-                        )
-                    except (TypeError, ValueError):
-                        batch_index, chunk_count, elapsed_ms, provider_batch_size = 0, 0, 0, 0
-                    provider_batch = {
-                        "batch_index": batch_index,
-                        "chunk_count": chunk_count,
-                        "elapsed_ms": elapsed_ms,
-                        "provider_batch_size": provider_batch_size,
-                    }
-                    queue_state["source_atomic_provider_batches"] = (
-                        list(queue_state["source_atomic_provider_batches"] or []) + [provider_batch]
-                    )[-ANYTHINGLLM_SOURCE_ATOMIC_PROVIDER_BATCH_TAIL_LIMIT:]
-                    queue_state["source_atomic_provider_batch_count"] = max(
-                        int(queue_state["source_atomic_provider_batch_count"] or 0),
-                        batch_index + 1,
-                    )
-                    queue_state["source_atomic_provider_chunk_count"] = (
-                        int(queue_state["source_atomic_provider_chunk_count"] or 0) + chunk_count
-                    )
-                    queue_state["source_atomic_provider_elapsed_ms"] = (
-                        int(queue_state["source_atomic_provider_elapsed_ms"] or 0) + elapsed_ms
+                    merge_source_atomic_provider_batches(
+                        [event], source_key=str(event.get("sourceKey") or "")
                     )
                 elif event_type == "source_rejected_before_commit":
                     queue_state["source_atomic_precommit_rejection"] = {
@@ -16417,12 +16543,16 @@ def update_workspace_embeddings_desktop_queue(
             queue_state["observer_reason"] = str(health.get("reason") or "")
 
     def owned_desktop_queue_receipt(submission_started_monotonic, _batch_report):
-        """Return only a newly observed, path-correlated queue admission fact.
+        """Return newly observed receipt or source-staging activity evidence.
 
         The listener itself already filters event filenames to this source
         window.  This second gate prevents a stale pre-POST event from being
-        mistaken for a receipt of the current request.  It deliberately does
-        not use cache rows or generic observer connectivity as receipt proof.
+        mistaken for a receipt of the current request.  Ordinary Desktop
+        ``doc_*`` events prove queue admission. The strict source-atomic
+        route has a real pre-queue stage: its matching staging events do not
+        yet prove namespace admission, but they earn a short response-read
+        activity lease. Exact vector observation remains the success
+        authority in both paths.
         """
         with queue_state_lock:
             receipt_baseline = queue_state.get("receipt_event_baseline")
@@ -16437,17 +16567,51 @@ def update_workspace_embeddings_desktop_queue(
                 queue_state["receipt_event_baseline"] = int(
                     queue_state.get("events_observed") or 0
                 )
+                queue_state["source_atomic_receipt_activity_baseline"] = int(
+                    queue_state.get("events_observed") or 0
+                )
                 return None
             progress_at = float(queue_state.get("last_progress_monotonic") or 0.0)
+            event_at = float(queue_state.get("last_event_monotonic") or 0.0)
             progress_position = max(
                 int(queue_state.get("completed") or 0),
                 int(queue_state.get("current") or 0),
             )
             event_type = str(queue_state.get("last_event_type") or "")
             event_count = int(queue_state.get("events_observed") or 0)
+            source_atomic_staging_started = bool(
+                queue_state.get("source_atomic_staging_started")
+            )
+            source_atomic_activity_baseline = int(
+                queue_state.get("source_atomic_receipt_activity_baseline") or 0
+            )
+        if (
+            event_count <= int(receipt_baseline or 0)
+        ):
+            return None
+        observed_after_seconds = round(
+            max(
+                0.0,
+                (event_at if source_atomic_staging_started else progress_at)
+                - float(submission_started_monotonic),
+            ),
+            4,
+        )
+        if source_atomic_staging_started and event_type in {
+            "source_staging_started",
+            "source_staging_provider_batch",
+            "source_staging_finished",
+        } and event_count > source_atomic_activity_baseline:
+            with queue_state_lock:
+                queue_state["source_atomic_receipt_activity_baseline"] = event_count
+            return {
+                "kind": "source_atomic_staging_activity",
+                "event_type": event_type,
+                "events_observed": event_count,
+                "observed_after_submission_seconds": observed_after_seconds,
+            }
         if (
             progress_position <= 0
-            or event_count <= int(receipt_baseline or 0)
             or event_type not in {"doc_starting", "chunk_progress", "doc_complete"}
         ):
             return None
@@ -16456,9 +16620,7 @@ def update_workspace_embeddings_desktop_queue(
             "event_type": event_type,
             "progress_position": progress_position,
             "events_observed": event_count,
-            "observed_after_submission_seconds": round(
-                max(0.0, progress_at - float(submission_started_monotonic)), 4
-            ),
+            "observed_after_submission_seconds": observed_after_seconds,
         }
 
     def desktop_queue_status(message, report):

@@ -45,6 +45,11 @@ def test_hybrid_patch_keeps_legacy_branch_and_is_idempotent():
 
     assert source_atomic.SOURCE_ATOMIC_PATCH_ID in patched
     assert source_atomic.SOURCE_ATOMIC_OPENROUTER_GATE in patched
+    configured_cap = source_atomic.SOURCE_ATOMIC_DEFAULT_PROVIDER_BATCH_SIZE
+    assert (
+        f'SOURCE_ATOMIC_EMBED_BATCH_SIZE||"{configured_cap}",10)||{configured_cap}'
+        in patched
+    )
     assert "legacyWorkerBehavior=true" in patched
     assert source_atomic.patch_v1161_embedding_worker_source(patched) == patched
 

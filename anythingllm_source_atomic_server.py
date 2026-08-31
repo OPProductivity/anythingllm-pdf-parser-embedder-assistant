@@ -41,11 +41,11 @@ for(let [p,u]of e.entries()){
 }
 let{SystemSettings:S}=x(),l=P().getEmbeddingEngineSelection(),T=Xt().TextSplitter,
   z=T.determineMaxChunkSize(await S.getValueOrFallback({label:"text_splitter_chunk_size"}),l?.embeddingMaxChunkLength),
-  C=await S.getValueOrFallback({label:"text_splitter_chunk_overlap"},20),B=Math.min(64,Math.max(1,Number.parseInt(process.env.SOURCE_ATOMIC_EMBED_BATCH_SIZE||"36",10)||36));
+  C=await S.getValueOrFallback({label:"text_splitter_chunk_overlap"},20),B=Math.min(64,Math.max(1,Number.parseInt(process.env.SOURCE_ATOMIC_EMBED_BATCH_SIZE||"__SOURCE_ATOMIC_DEFAULT_PROVIDER_BATCH_SIZE__",10)||__SOURCE_ATOMIC_DEFAULT_PROVIDER_BATCH_SIZE__));
 for(let [N,R]of d){
   let A=Date.now(),H=R[0]?.filename||"";
   o(s.slug,{type:"source_staging_started",workspaceSlug:s.slug,sourceKey:N,filename:H,recordCount:R.length,provider_batch_size:B,concurrency:1});
-  let V=[],E=null;
+  let V=[],E=null,Q=[];
   try{
     for(let G=0;G<R.length;G++){
       let W=R[G],{pageContent:X,...Y}=W.raw,J=await new T({chunkSize:z,chunkOverlap:C,chunkHeaderMeta:T.buildHeaderMeta(Y),chunkPrefix:l?.embeddingPrefix}).splitText(X);
@@ -55,7 +55,7 @@ for(let [N,R]of d){
     for(let W=0;W<G.length;W+=B){
       let X=G.slice(W,W+B),Y=Math.floor(W/B),J=Date.now(),K=await l.embedChunks(X.map(L=>L.text));
       if(!K||K.length!==X.length||!K.every(L=>Array.isArray(L)))throw new Error("embedding response did not match source-atomic batch");
-      o(s.slug,{type:"source_staging_provider_batch",workspaceSlug:s.slug,sourceKey:N,filename:H,batchIndex:Y,chunkCount:X.length,recordCount:R.length,elapsed_ms:Date.now()-J,provider_batch_size:B});
+      let Z={batchIndex:Y,chunkCount:X.length,elapsed_ms:Date.now()-J,provider_batch_size:B};Q.push(Z);o(s.slug,{type:"source_staging_provider_batch",workspaceSlug:s.slug,sourceKey:N,filename:H,recordCount:R.length,...Z});
       for(let L=0;L<X.length;L++)X[L].item.vectors[X[L].chunkIndex]=K[L]
     }
     for(let W of V){
@@ -64,7 +64,7 @@ for(let [N,R]of d){
       o(s.slug,{type:"source_staging_record",workspaceSlug:s.slug,sourceKey:N,filename:W.record.filename,chunkCount:W.texts.length,elapsed_ms:Date.now()-A})
     }
   }catch(G){E=G?.message||String(G)}
-  o(s.slug,{type:"source_staging_finished",workspaceSlug:s.slug,sourceKey:N,filename:H,recordCount:R.length,elapsed_ms:Date.now()-A,success:E===null,provider_batch_size:B});
+  o(s.slug,{type:"source_staging_finished",workspaceSlug:s.slug,sourceKey:N,filename:H,recordCount:R.length,elapsed_ms:Date.now()-A,success:E===null,provider_batch_size:B,providerBatches:Q});
   if(E!==null){for(let G of R){i.push(G.filename),c.add(E),o(s.slug,{type:"doc_failed",...G.progress,error:"Source rejected before namespace commit: "+E})}o(s.slug,{type:"source_rejected_before_commit",workspaceSlug:s.slug,sourceKey:N,filename:H,error:E});continue}
   for(let G of V){
     let W=G.record,X=o8(),{pageContent:Y,...J}=W.raw,K={docId:X,filename:W.filename.split(/[/\\]/).pop(),docpath:W.filename,workspaceId:s.id,metadata:JSON.stringify(J)};
@@ -76,7 +76,10 @@ for(let [N,R]of d){
   o(s.slug,{type:"source_committed",workspaceSlug:s.slug,sourceKey:N,filename:H,recordCount:R.length});
 }
 return global.__embeddingProgress=null,o(s.slug,{type:"all_complete",workspaceSlug:s.slug,userId:t,totalDocs:e.length,embedded:a.length,failed:i.length,embeddedFiles:a,failedFiles:i}),await a8.sendTelemetry("documents_embedded_in_workspace",{LLMSelection:process.env.LLM_PROVIDER||"openai",Embedder:process.env.EMBEDDING_ENGINE||"inherit",VectorDbSelection:process.env.VECTOR_DB||"lancedb",TTSSelection:process.env.TTS_PROVIDER||"native",LLMModel:c8()}),await jM.logEvent("workspace_documents_added",{workspaceName:s?.name||"Unknown Workspace",numberOfDocuments:e.length},t),{failedToEmbed:i,errors:Array.from(c),embedded:a};
-'''
+'''.replace(
+    "__SOURCE_ATOMIC_DEFAULT_PROVIDER_BATCH_SIZE__",
+    str(SOURCE_ATOMIC_DEFAULT_PROVIDER_BATCH_SIZE),
+)
 
 
 def _server_path(report: dict[str, Any]) -> Path | None:
@@ -134,7 +137,34 @@ def ensure_source_atomic_embedding_server(compatibility_report: dict[str, Any]) 
             return result
         expected = _sha256_bytes(patch_v1161_server_source(backup.read_bytes().decode("utf-8")).encode("utf-8"))
         if current_hash != expected:
-            result["reason"] = "source_atomic_server_hash_mismatch"
+            # A changed, explicitly recorded source-atomic configuration (for
+            # example a revised provider-batch cap) may legitimately have the
+            # same patch id but a different generated server hash.  Rebuild it
+            # only from the verified pristine backup; never overwrite an
+            # unrecognised patched server.
+            try:
+                previous_manifest = json.loads(manifest.read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError):
+                previous_manifest = {}
+            known_previous_patch = (
+                isinstance(previous_manifest, dict)
+                and str(previous_manifest.get("patch_id") or "") == SOURCE_ATOMIC_SERVER_PATCH_ID
+                and str(previous_manifest.get("original_server_sha256") or "")
+                == V1161_SERVER_SHA256
+                and str(previous_manifest.get("patched_server_sha256") or "") == current_hash
+            )
+            if not known_previous_patch:
+                result["reason"] = "source_atomic_server_hash_mismatch"
+                return result
+            rebuilt = patch_v1161_server_source(backup.read_bytes().decode("utf-8")).encode("utf-8")
+            _atomic_write(target, rebuilt)
+            written_hash = _sha256_bytes(target.read_bytes())
+            if written_hash != expected:
+                _atomic_write(target, current)
+                result["reason"] = "source_atomic_server_reconfigure_write_hash_mismatch_restored"
+                return result
+            _atomic_write(manifest, json.dumps({"patch_id": SOURCE_ATOMIC_SERVER_PATCH_ID,"desktop_version":"1.16.1","native_contract":V1161_NATIVE_CONTRACT_ID,"provider":"openrouter","provider_batch_size":SOURCE_ATOMIC_DEFAULT_PROVIDER_BATCH_SIZE,"original_server_sha256":V1161_SERVER_SHA256,"patched_server_sha256":written_hash,"restart_required_since_epoch":target.stat().st_mtime}, indent=2, sort_keys=True).encode("utf-8"))
+            result.update(status="restart_required", reason="anythingllm_desktop_restart_required_after_source_atomic_reconfigure", installed=True, restart_required=True, server_sha256=written_hash)
             return result
         executable = Path(str(dict(compatibility_report.get("characterization") or {}).get("desktop_executable") or ""))
         active, activation_reason, restart_required = _activation_state_for_installed_worker(executable, target, manifest)

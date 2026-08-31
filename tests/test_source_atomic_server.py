@@ -1,4 +1,5 @@
 import hashlib
+import json
 import sys
 from pathlib import Path
 
@@ -35,6 +36,11 @@ def test_server_patch_is_idempotent_and_keeps_non_openrouter_branch():
     assert source_atomic_server.SOURCE_ATOMIC_SERVER_PATCH_ID in patched
     assert source_atomic_server.OPENROUTER_GATE in patched
     assert "source_staging_provider_batch" in patched
+    configured_cap = source_atomic_server.SOURCE_ATOMIC_DEFAULT_PROVIDER_BATCH_SIZE
+    assert (
+        f'SOURCE_ATOMIC_EMBED_BATCH_SIZE||"{configured_cap}",10)||{configured_cap}'
+        in patched
+    )
     assert "let legacy=true" in patched
     assert source_atomic_server.patch_v1161_server_source(patched) == patched
 
@@ -75,3 +81,41 @@ def test_server_installer_refuses_unknown_server_hash(tmp_path):
 
     assert result["status"] == "disabled"
     assert result["reason"] == "v1_16_1_server_hash_not_matched"
+
+
+def test_server_installer_reconfigures_a_known_previous_patch(tmp_path, monkeypatch):
+    resources = tmp_path / "resources" / "backend"
+    resources.mkdir(parents=True)
+    server = resources / "server.js"
+    original = _server_fixture()
+    server.write_text(original, encoding="utf-8")
+    baseline = hashlib.sha256(server.read_bytes()).hexdigest()
+    monkeypatch.setattr(source_atomic_server, "V1161_SERVER_SHA256", baseline)
+    executable = tmp_path / "AnythingLLM.exe"
+    executable.write_bytes(b"desktop")
+
+    expected = source_atomic_server.patch_v1161_server_source(original)
+    old_generated_patch = expected.replace('||"36",10)||36', '||"28",10)||28')
+    assert old_generated_patch != expected
+    server.write_text(old_generated_patch, encoding="utf-8")
+    (resources / "server.js.pdf-assistant-v1161.backup").write_text(original, encoding="utf-8")
+    (resources / "server.js.pdf-assistant-source-atomic.json").write_text(
+        json.dumps(
+            {
+                "patch_id": source_atomic_server.SOURCE_ATOMIC_SERVER_PATCH_ID,
+                "original_server_sha256": baseline,
+                "patched_server_sha256": hashlib.sha256(server.read_bytes()).hexdigest(),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = source_atomic_server.ensure_source_atomic_embedding_server(_report(executable))
+
+    assert result["status"] == "restart_required"
+    assert result["reason"] == "anythingllm_desktop_restart_required_after_source_atomic_reconfigure"
+    assert server.read_text(encoding="utf-8") == expected
+    manifest = json.loads(
+        (resources / "server.js.pdf-assistant-source-atomic.json").read_text(encoding="utf-8")
+    )
+    assert manifest["provider_batch_size"] == 36

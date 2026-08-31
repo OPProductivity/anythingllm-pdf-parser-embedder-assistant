@@ -66,6 +66,14 @@ class FakeJsonPostResponseTracker:
     def close_response_read(self):
         self.response_read_abandoned.set()
 
+    def grant_response_activity_lease(self, *, idle_seconds, max_total_seconds):
+        return {
+            "granted": True,
+            "lease_count": 1,
+            "deadline_from_start_seconds": float(max_total_seconds),
+            "cap_from_start_seconds": float(max_total_seconds),
+        }
+
     def join(self, timeout=None):
         self.thread.join(timeout=timeout)
 
@@ -17899,6 +17907,104 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(batch["acceptance_basis"], "owned_desktop_queue_event_before_http_receipt")
         self.assertEqual(batch["late_http_outcome"]["status"], 429)
         self.assertEqual(result["errors"], [])
+
+    def test_source_atomic_staging_activity_extends_response_until_doc_progress(self):
+        """Large staged sources earn a lease but not a premature receipt.
+
+        The source-atomic route emits an owned staging event before it writes
+        the first page-parent record. It must keep the response socket open
+        while staging is active; a later document event provides the normal
+        no-replay receipt.
+        """
+        original_tracker = pipeline.start_json_post_response_tracker
+        original_listener = pipeline.start_anythingllm_embed_progress_listener
+        location = "custom-documents/source-atomic-staging-receipt.txt"
+        post_started = threading.Event()
+
+        class FakeThread:
+            def join(self, timeout=None):
+                return None
+
+        try:
+            def fake_tracker(_body, response_read_abandoned):
+                post_started.set()
+                response_read_abandoned.wait(timeout=1.0)
+                return {"kind": "response_read_abandoned"}
+
+            def fake_listener(*_args, **kwargs):
+                observer = kwargs.get("observer_callback")
+
+                def emit_owned_staging():
+                    post_started.wait(timeout=0.20)
+                    observer({
+                        "type": "source_staging_started",
+                        "filename": location,
+                        "recordCount": 300,
+                        "provider_batch_size": 36,
+                    })
+                    observer({
+                        "type": "source_staging_provider_batch",
+                        "filename": location,
+                        "sourceKey": "probe.pdf",
+                        "batchIndex": 0,
+                        "chunkCount": 36,
+                        "elapsed_ms": 100,
+                        "provider_batch_size": 36,
+                    })
+                    # Simulate a coalesced second SSE batch: the terminal
+                    # source event must restore it without double-counting
+                    # the already-observed first batch.
+                    observer({
+                        "type": "source_staging_finished",
+                        "filename": location,
+                        "sourceKey": "probe.pdf",
+                        "recordCount": 72,
+                        "success": True,
+                        "providerBatches": [
+                            {"batchIndex": 0, "chunkCount": 36, "elapsed_ms": 100, "provider_batch_size": 36},
+                            {"batchIndex": 1, "chunkCount": 36, "elapsed_ms": 200, "provider_batch_size": 36},
+                        ],
+                    })
+                    time.sleep(0.12)
+                    observer({
+                        "type": "doc_starting",
+                        "filename": location,
+                        "docIndex": 0,
+                        "totalDocs": 1,
+                    })
+
+                threading.Thread(target=emit_owned_staging, daemon=True).start()
+                connected = threading.Event()
+                connected.set()
+                return {
+                    "stop_event": threading.Event(), "thread": FakeThread(),
+                    "connected_event": connected, "events": [], "errors": [],
+                }
+
+            pipeline.start_json_post_response_tracker = fake_json_post_tracker(fake_tracker)
+            pipeline.start_anythingllm_embed_progress_listener = fake_listener
+            result = pipeline.update_workspace_embeddings_desktop_queue(
+                "http://anythingllm", "key", "queue-workspace", [location],
+                batch_verifier=lambda report: {
+                    "status": "pass", "matching_vector_rows": len(report["locations"]),
+                },
+            )
+        finally:
+            pipeline.start_json_post_response_tracker = original_tracker
+            pipeline.start_anythingllm_embed_progress_listener = original_listener
+
+        batch = result["batches"][0]
+        self.assertEqual(batch["acceptance_basis"], "owned_desktop_queue_event_before_http_receipt")
+        self.assertEqual(batch["receipt_state"], "owned_queue_event_observed")
+        self.assertTrue(batch["searchability_proven"])  # proof supplied by verifier
+        snapshot = result["progress_observation"]["final_queue_snapshot"]
+        self.assertEqual(snapshot["source_atomic_provider_batch_count"], 2)
+        self.assertEqual(snapshot["source_atomic_provider_chunk_count"], 72)
+        self.assertEqual(snapshot["source_atomic_provider_elapsed_ms"], 300)
+        self.assertTrue(any(
+            event.get("event") == "source_atomic_response_read_activity_lease"
+            for event in result["runtime_events"]
+        ), result["runtime_events"])
 
     def test_owned_queue_receipt_is_persisted_before_vector_observation(self):
         """A crash during observation must retain the no-replay receipt fact."""

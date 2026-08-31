@@ -57,9 +57,9 @@ let {SystemSettings:c}=j(),l=P().getEmbeddingEngineSelection(),u=it().TextSplitt
   d=u.determineMaxChunkSize(await c.getValueOrFallback({label:"text_splitter_chunk_size"}),l?.embeddingMaxChunkLength),
   p=await c.getValueOrFallback({label:"text_splitter_chunk_overlap"},20),m=Z().storeVectorResult;
 for(let [f,y] of n){
-  let __sourceAtomicStarted=Date.now(),__sourceAtomicBatchSize=Math.min(64,Math.max(1,Number.parseInt(process.env.SOURCE_ATOMIC_EMBED_BATCH_SIZE||"36",10)||36)),__sourceAtomicFilename=y[0]?.filename||"";
+  let __sourceAtomicStarted=Date.now(),__sourceAtomicBatchSize=Math.min(64,Math.max(1,Number.parseInt(process.env.SOURCE_ATOMIC_EMBED_BATCH_SIZE||"__SOURCE_ATOMIC_DEFAULT_PROVIDER_BATCH_SIZE__",10)||__SOURCE_ATOMIC_DEFAULT_PROVIDER_BATCH_SIZE__)),__sourceAtomicFilename=y[0]?.filename||"";
   xr({type:"source_staging_started",workspaceSlug:on,sourceKey:f,filename:__sourceAtomicFilename,recordCount:y.length,provider_batch_size:__sourceAtomicBatchSize,concurrency:1});
-  let _=new Array(y.length),v=null;
+  let _=new Array(y.length),v=null,__sourceAtomicProviderBatches=[];
   try{
     let A=[];
     for(let S=0;S<y.length;S++){
@@ -70,7 +70,7 @@ for(let [f,y] of n){
     for(let T=0;T<S.length;T+=__sourceAtomicBatchSize){
       let L=S.slice(T,T+__sourceAtomicBatchSize),I=Math.floor(T/__sourceAtomicBatchSize),O=Date.now(),V=await l.embedChunks(L.map(H=>H.text));
       if(!V||V.length!==L.length||!V.every(H=>Array.isArray(H)))throw new Error("embedding response did not match source-atomic batch");
-      xr({type:"source_staging_provider_batch",workspaceSlug:on,sourceKey:f,filename:__sourceAtomicFilename,batchIndex:I,chunkCount:L.length,recordCount:y.length,elapsed_ms:Date.now()-O,provider_batch_size:__sourceAtomicBatchSize});
+      let D={batchIndex:I,chunkCount:L.length,elapsed_ms:Date.now()-O,provider_batch_size:__sourceAtomicBatchSize};__sourceAtomicProviderBatches.push(D);xr({type:"source_staging_provider_batch",workspaceSlug:on,sourceKey:f,filename:__sourceAtomicFilename,recordCount:y.length,...D});
       for(let H=0;H<L.length;H++)L[H].item.vectors[L[H].chunkIndex]=V[H]
     }
     for(let T of A){
@@ -78,7 +78,7 @@ for(let [f,y] of n){
       xr({type:"source_staging_record",workspaceSlug:on,sourceKey:f,filename:T.entry.filename,recordIndex:T.recordIndex,chunkCount:T.texts.length,elapsed_ms:Date.now()-__sourceAtomicStarted})
     }
   }catch(A){v={error:A?.message||String(A)}}
-  xr({type:"source_staging_finished",workspaceSlug:on,sourceKey:f,filename:__sourceAtomicFilename,recordCount:y.length,elapsed_ms:Date.now()-__sourceAtomicStarted,success:v===null,provider_batch_size:__sourceAtomicBatchSize});
+  xr({type:"source_staging_finished",workspaceSlug:on,sourceKey:f,filename:__sourceAtomicFilename,recordCount:y.length,elapsed_ms:Date.now()-__sourceAtomicStarted,success:v===null,provider_batch_size:__sourceAtomicBatchSize,providerBatches:__sourceAtomicProviderBatches});
   if(v!==null){
     for(let A of y){xr({type:"doc_failed",workspaceSlug:on,userId:Ts,filename:A.filename,error:"Source rejected before namespace commit: "+v.error});r.push(A.raw?.title||A.filename)}
     xr({type:"source_rejected_before_commit",workspaceSlug:on,sourceKey:f,filename:__sourceAtomicFilename,error:v.error});continue;
@@ -105,7 +105,10 @@ for(let [f,y] of n){
 global.__embeddingProgress=null,Jo=!1;
 if(Nr.length>0){await ah();return}
 xr({type:"all_complete",workspaceSlug:on,userId:Ts,totalDocs:e.length,embedded:t.length,failed:r.length,embeddedFiles:t,failedFiles:r}),process.exit(0);return;
-'''
+'''.replace(
+    "__SOURCE_ATOMIC_DEFAULT_PROVIDER_BATCH_SIZE__",
+    str(SOURCE_ATOMIC_DEFAULT_PROVIDER_BATCH_SIZE),
+)
 
 
 def _sha256_bytes(value: bytes) -> str:
