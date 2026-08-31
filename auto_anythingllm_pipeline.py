@@ -10984,6 +10984,12 @@ def anythingllm_embed_progress_message(event):
             if total
             else "AnythingLLM Desktop queue started; record total not yet confirmed"
         )
+    if event_type == "source_atomic_gate_observed":
+        return (
+            "AnythingLLM source-atomic staging gate is active"
+            if bool((event or {}).get("enabled"))
+            else "AnythingLLM source-atomic staging gate is inactive; using the verified legacy queue path"
+        )
     if event_type == "source_staging_started":
         records = int((event or {}).get("recordCount") or 0)
         batch_size = int((event or {}).get("provider_batch_size") or 0)
@@ -16166,6 +16172,7 @@ def update_workspace_embeddings_desktop_queue(
         event = dict(event or {})
         event_type = str(event.get("type") or "").strip()
         source_atomic_event = event_type in {
+            "source_atomic_gate_observed",
             "source_staging_started",
             "source_staging_provider_batch",
             "source_staging_finished",
@@ -16230,7 +16237,10 @@ def update_workspace_embeddings_desktop_queue(
                     }
             snapshot = queue_snapshot()
             if callable(status_callback) and event_type != "source_committed":
-                if event_type == "source_staging_started":
+                if event_type == "source_atomic_gate_observed":
+                    message = anythingllm_embed_progress_message(event)
+                    timing_event = "source_atomic_gate_observed"
+                elif event_type == "source_staging_started":
                     message = anythingllm_embed_progress_message(event)
                     timing_event = "source_atomic_staging_started"
                 elif event_type == "source_staging_provider_batch":

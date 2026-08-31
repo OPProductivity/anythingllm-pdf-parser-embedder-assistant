@@ -44,9 +44,66 @@ def test_hybrid_patch_keeps_legacy_branch_and_is_idempotent():
     patched = source_atomic.patch_v1161_embedding_worker_source(_fixture_worker())
 
     assert source_atomic.SOURCE_ATOMIC_PATCH_ID in patched
-    assert 'process.env.EMBEDDING_ENGINE==="openrouter"' in patched
+    assert source_atomic.SOURCE_ATOMIC_OPENROUTER_GATE in patched
     assert "legacyWorkerBehavior=true" in patched
     assert source_atomic.patch_v1161_embedding_worker_source(patched) == patched
+
+
+def test_current_patch_migrates_only_the_exact_known_v1_worker(tmp_path, monkeypatch):
+    worker = tmp_path / "embedding-worker.js"
+    original = _fixture_worker()
+    worker.write_text(original, encoding="utf-8")
+    executable = tmp_path / "AnythingLLM.exe"
+    executable.write_bytes(b"desktop")
+    report = _qualified_report(executable)
+
+    backup = worker.with_name(f"{worker.name}.pdf-assistant-v1161.backup")
+    backup.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(
+        source_atomic,
+        "V1161_EMBEDDING_WORKER_SHA256",
+        hashlib.sha256(backup.read_bytes()).hexdigest(),
+    )
+    legacy = source_atomic._legacy_v1_patched_worker_source(
+        backup.read_bytes().decode("utf-8")
+    )
+    worker.write_bytes(legacy.encode("utf-8"))
+
+    migrated = source_atomic.ensure_source_atomic_embedding_worker(report, worker_path=worker)
+
+    assert migrated["status"] == "restart_required", migrated
+    assert migrated["upgraded_from_patch_id"] == source_atomic.SOURCE_ATOMIC_LEGACY_PATCH_ID
+    patched = worker.read_text(encoding="utf-8")
+    assert source_atomic.SOURCE_ATOMIC_PATCH_ID in patched
+    assert source_atomic.SOURCE_ATOMIC_OPENROUTER_GATE in patched
+
+
+def test_current_patch_migrates_only_the_exact_known_v2_worker(tmp_path, monkeypatch):
+    worker = tmp_path / "embedding-worker.js"
+    original = _fixture_worker()
+    worker.write_text(original, encoding="utf-8")
+    executable = tmp_path / "AnythingLLM.exe"
+    executable.write_bytes(b"desktop")
+    report = _qualified_report(executable)
+    backup = worker.with_name(f"{worker.name}.pdf-assistant-v1161.backup")
+    backup.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(
+        source_atomic,
+        "V1161_EMBEDDING_WORKER_SHA256",
+        hashlib.sha256(backup.read_bytes()).hexdigest(),
+    )
+    previous = source_atomic._previous_v2_patched_worker_source(
+        backup.read_bytes().decode("utf-8")
+    )
+    worker.write_bytes(previous.encode("utf-8"))
+
+    migrated = source_atomic.ensure_source_atomic_embedding_worker(report, worker_path=worker)
+
+    assert migrated["status"] == "restart_required", migrated
+    assert migrated["upgraded_from_patch_id"] == source_atomic.SOURCE_ATOMIC_PREVIOUS_PATCH_ID
+    patched = worker.read_text(encoding="utf-8")
+    assert source_atomic.SOURCE_ATOMIC_PATCH_ID in patched
+    assert "source_atomic_gate_observed" in patched
 
 
 def test_installer_is_a_noop_without_exact_v1161_authority(tmp_path):

@@ -17,7 +17,9 @@ from anythingllm_compatibility import (
 )
 
 
-SOURCE_ATOMIC_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_v1"
+SOURCE_ATOMIC_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_v3"
+SOURCE_ATOMIC_LEGACY_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_v1"
+SOURCE_ATOMIC_PREVIOUS_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_v2"
 SOURCE_ATOMIC_DEFAULT_PROVIDER_BATCH_SIZE = 36
 SOURCE_ATOMIC_MAX_PROVIDER_BATCH_SIZE = 64
 V1161_EMBEDDING_WORKER_SHA256 = (
@@ -25,6 +27,15 @@ V1161_EMBEDDING_WORKER_SHA256 = (
 )
 WORKER_FUNCTION_PREFIX = "async function ah(){"
 WORKER_FUNCTION_FOLLOWER = 'process.on("message",async s=>{'
+SOURCE_ATOMIC_OPENROUTER_GATE = (
+    'String(process.env.EMBEDDING_ENGINE||"")'
+    ".replace(/^['\"]|['\"]$/g,\"\").trim().toLowerCase()===\"openrouter\""
+)
+SOURCE_ATOMIC_LEGACY_OPENROUTER_GATE = 'process.env.EMBEDDING_ENGINE==="openrouter"'
+SOURCE_ATOMIC_GATE_PREAMBLE = r'''
+let __sourceAtomicConfiguredEngine=String(process.env.EMBEDDING_ENGINE||"").replace(/^['"]|['"]$/g,"").trim().toLowerCase();
+xr({type:"source_atomic_gate_observed",workspaceSlug:on,filename:Nr[0]||"",configuredEngine:__sourceAtomicConfiguredEngine,enabled:__sourceAtomicConfiguredEngine==="openrouter"});
+'''
 
 
 # Filled below with the OpenRouter-only branch that is inserted inside the
@@ -117,10 +128,23 @@ def _atomic_write(path: Path, payload: bytes) -> None:
             pass
 
 
-def patch_v1161_embedding_worker_source(source: str) -> str:
-    """Return a hybrid worker whose non-OpenRouter branch remains legacy."""
-    if SOURCE_ATOMIC_PATCH_ID in source:
-        return source
+def _render_v1161_embedding_worker_source(
+    source: str,
+    *,
+    patch_id: str,
+    openrouter_gate: str,
+    gate_preamble: str = "",
+) -> str:
+    """Render a precisely anchored hybrid worker from the pristine v1.16.1 file."""
+    if any(
+        patch_id in source
+        for patch_id in (
+            SOURCE_ATOMIC_PATCH_ID,
+            SOURCE_ATOMIC_LEGACY_PATCH_ID,
+            SOURCE_ATOMIC_PREVIOUS_PATCH_ID,
+        )
+    ):
+        raise ValueError("Embedding worker is already patched and cannot be rendered again.")
     start = source.find(WORKER_FUNCTION_PREFIX)
     end = source.find(WORKER_FUNCTION_FOLLOWER, start)
     if start < 0 or end < 0:
@@ -132,11 +156,41 @@ def patch_v1161_embedding_worker_source(source: str) -> str:
     legacy_body = original_function[len(WORKER_FUNCTION_PREFIX):final_brace]
     patched_function = (
         f"{WORKER_FUNCTION_PREFIX}"
-        f'if(process.env.EMBEDDING_ENGINE==="openrouter"){{/*{SOURCE_ATOMIC_PATCH_ID}*/'
+        f"{gate_preamble}if({openrouter_gate}){{/*{patch_id}*/"
         f"{SOURCE_ATOMIC_OPENROUTER_BODY}}}"
         f"{legacy_body}}}"
     )
     return f"{source[:start]}{patched_function}{source[end:]}"
+
+
+def patch_v1161_embedding_worker_source(source: str) -> str:
+    """Return a hybrid worker whose non-OpenRouter branch remains legacy."""
+    if SOURCE_ATOMIC_PATCH_ID in source:
+        return source
+    return _render_v1161_embedding_worker_source(
+        source,
+        patch_id=SOURCE_ATOMIC_PATCH_ID,
+        openrouter_gate=SOURCE_ATOMIC_OPENROUTER_GATE,
+        gate_preamble=SOURCE_ATOMIC_GATE_PREAMBLE,
+    )
+
+
+def _legacy_v1_patched_worker_source(source: str) -> str:
+    """Recreate the exact known v1 patch solely to migrate it safely."""
+    return _render_v1161_embedding_worker_source(
+        source,
+        patch_id=SOURCE_ATOMIC_LEGACY_PATCH_ID,
+        openrouter_gate=SOURCE_ATOMIC_LEGACY_OPENROUTER_GATE,
+    )
+
+
+def _previous_v2_patched_worker_source(source: str) -> str:
+    """Recreate the exact known v2 patch solely to migrate it safely."""
+    return _render_v1161_embedding_worker_source(
+        source,
+        patch_id=SOURCE_ATOMIC_PREVIOUS_PATCH_ID,
+        openrouter_gate=SOURCE_ATOMIC_OPENROUTER_GATE,
+    )
 
 
 def _worker_path_from_report(compatibility_report: dict[str, Any]) -> Path | None:
@@ -287,7 +341,11 @@ def ensure_source_atomic_embedding_worker(
         "backup_path": str(backup),
         "manifest_path": str(manifest),
     })
-    if SOURCE_ATOMIC_PATCH_ID in current_text:
+    if (
+        SOURCE_ATOMIC_PATCH_ID in current_text
+        or SOURCE_ATOMIC_LEGACY_PATCH_ID in current_text
+        or SOURCE_ATOMIC_PREVIOUS_PATCH_ID in current_text
+    ):
         if not backup.is_file():
             result["reason"] = "source_atomic_worker_backup_missing"
             return result
@@ -299,10 +357,75 @@ def ensure_source_atomic_embedding_worker(
         if _sha256_bytes(original) != V1161_EMBEDDING_WORKER_SHA256:
             result["reason"] = "source_atomic_worker_backup_hash_mismatch"
             return result
-        expected_hash = _sha256_bytes(
-            patch_v1161_embedding_worker_source(original.decode("utf-8")).encode("utf-8")
+        original_text = original.decode("utf-8")
+        desired_patch = patch_v1161_embedding_worker_source(original_text).encode("utf-8")
+        desired_hash = _sha256_bytes(desired_patch)
+        known_predecessors = {
+            SOURCE_ATOMIC_LEGACY_PATCH_ID: _sha256_bytes(
+                _legacy_v1_patched_worker_source(original_text).encode("utf-8")
+            ),
+            SOURCE_ATOMIC_PREVIOUS_PATCH_ID: _sha256_bytes(
+                _previous_v2_patched_worker_source(original_text).encode("utf-8")
+            ),
+        }
+        upgraded_from_patch_id = next(
+            (
+                patch_id
+                for patch_id, expected_hash in known_predecessors.items()
+                if current_hash == expected_hash
+            ),
+            "",
         )
-        if current_hash != expected_hash:
+        if upgraded_from_patch_id:
+            # Every migration is byte-for-byte exact. It changes only a
+            # known assistant-owned revision, retains the pristine Desktop
+            # backup, and requires a new Desktop process before activation.
+            try:
+                _atomic_write(target, desired_patch)
+                written_hash = _sha256_bytes(target.read_bytes())
+                if written_hash != desired_hash:
+                    _atomic_write(target, current)
+                    result["reason"] = "source_atomic_worker_upgrade_hash_mismatch_restored"
+                    return result
+                manifest_payload = {
+                    "patch_id": SOURCE_ATOMIC_PATCH_ID,
+                    "desktop_version": "1.16.1",
+                    "native_contract": V1161_NATIVE_CONTRACT_ID,
+                    "provider": "openrouter",
+                    "provider_batch_size": SOURCE_ATOMIC_DEFAULT_PROVIDER_BATCH_SIZE,
+                    "original_worker_sha256": _sha256_bytes(original),
+                    "patched_worker_sha256": written_hash,
+                    "restart_required_since_epoch": target.stat().st_mtime,
+                    "upgraded_from_patch_id": upgraded_from_patch_id,
+                }
+                _atomic_write(
+                    manifest,
+                    json.dumps(manifest_payload, indent=2, sort_keys=True).encode("utf-8"),
+                )
+            except (OSError, UnicodeError, ValueError) as exc:
+                try:
+                    if target.exists() and _sha256_bytes(target.read_bytes()) != current_hash:
+                        _atomic_write(target, current)
+                except OSError:
+                    result["reason"] = (
+                        f"source_atomic_worker_upgrade_error_restore_failed:{type(exc).__name__}"
+                    )
+                    return result
+                result["reason"] = f"source_atomic_worker_upgrade_error:{type(exc).__name__}"
+                return result
+            result.update(
+                {
+                    "status": "restart_required",
+                    "reason": "anythingllm_desktop_restart_required",
+                    "enabled": False,
+                    "installed": True,
+                    "restart_required": True,
+                    "worker_sha256": written_hash,
+                    "upgraded_from_patch_id": upgraded_from_patch_id,
+                }
+            )
+            return result
+        if current_hash != desired_hash:
             result["reason"] = "source_atomic_worker_hash_mismatch"
             return result
         executable = Path(

@@ -59,7 +59,7 @@ from prepared_batch_recovery import (
     write_prepared_batch_checkpoint,
 )
 from anythingllm_compatibility import characterize as characterize_anythingllm_compatibility
-from anythingllm_source_atomic_worker import ensure_source_atomic_embedding_worker
+from anythingllm_source_atomic_server import ensure_source_atomic_embedding_server
 from portable_paths import ensure_application_directories, package_resource_path
 from run_request import LOCAL_ONLY, NATIVE_UPLOAD, RunRequest
 from automatic_defaults import (
@@ -25881,7 +25881,7 @@ def upload_prepared_automatic_batch(
     # this run's full mutation-contract report.  A mismatch is a deliberate
     # no-op: the established source-window path continues unchanged.
     if transport == "file_upload":
-        source_atomic_worker = ensure_source_atomic_embedding_worker(
+        source_atomic_worker = ensure_source_atomic_embedding_server(
             dict(source_atomic_worker_authority or {})
         )
     else:
