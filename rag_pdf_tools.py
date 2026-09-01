@@ -62,7 +62,11 @@ UNSTRUCTURED_OCR_PAGE_TIMEOUT_SECONDS_MAX = 1800
 # The cache contains prepared element text, including the conservative
 # category cleanup below. Increment this whenever prepared text changes so an
 # older noisy OCR cache is never silently reused as current output.
-UNSTRUCTURED_OCR_CACHE_SCHEMA_VERSION = 19
+# Schema 20 changes photographed-spread OCR from one full-page reading stream
+# to fold-gated left/right reading regions.  Reusing a schema-19 result here
+# can silently restore the old interleaved reading order, so this is a content
+# compatibility boundary rather than a cosmetic cache bump.
+UNSTRUCTURED_OCR_CACHE_SCHEMA_VERSION = 20
 # A photographed page benefits from a small, deterministic outer-margin crop
 # before OCR.  It removes scanner borders and handwritten marginalia without
 # changing the source-page identity or trying to reconstruct a new PDF.
@@ -1326,22 +1330,6 @@ def photographed_page_ocr_regions(page, runtime):
 
     pix = page.get_pixmap(matrix=fitz.Matrix(PHOTOGRAPHED_PAGE_OCR_DPI / 72, PHOTOGRAPHED_PAGE_OCR_DPI / 72), alpha=False)
     image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-    embedded_fraction = embedded_scanned_image_fraction(page)
-    if embedded_fraction:
-        text = _ocr_photographed_crop(image, embedded_fraction, tesseract, ImageOps)
-        if len(text) >= 80:
-            return [{
-                "text": text,
-                "reading_region": "embedded_scanned_document",
-                "reading_region_index": 1,
-                "reading_region_count": 1,
-                "source_column_index": 1,
-                "ocr_method": "tesseract_embedded_scanned_document_crop",
-                "annotations_excluded": "embedded_image_bounds_and_outer_margin_crop",
-                "crop_fraction": list(embedded_fraction),
-            }]
-    if not photographed_page_visual_signal(page, image, ImageStat):
-        return []
     width, height = image.size
     # A wide, image-only rotated page can be an open-book photograph. OCR both
     # halves separately only when each produces substantial prose; this keeps
@@ -1398,6 +1386,28 @@ def photographed_page_ocr_regions(page, runtime):
                 }
                 for (name, index, fraction), text in zip(spread_specs, region_texts)
             ]
+
+    # A photographed two-page spread is commonly stored as one substantial
+    # embedded image.  It must pass through the fold-gated split above before
+    # the generic embedded-scan fast path, otherwise both book pages are OCRed
+    # as one interleaved reading stream.  Ordinary embedded scans and
+    # landscape pages without a strong fold retain the established path.
+    embedded_fraction = embedded_scanned_image_fraction(page)
+    if embedded_fraction:
+        text = _ocr_photographed_crop(image, embedded_fraction, tesseract, ImageOps)
+        if len(text) >= 80:
+            return [{
+                "text": text,
+                "reading_region": "embedded_scanned_document",
+                "reading_region_index": 1,
+                "reading_region_count": 1,
+                "source_column_index": 1,
+                "ocr_method": "tesseract_embedded_scanned_document_crop",
+                "annotations_excluded": "embedded_image_bounds_and_outer_margin_crop",
+                "crop_fraction": list(embedded_fraction),
+            }]
+    if not photographed_page_visual_signal(page, image, ImageStat):
+        return []
 
 
     left, top, right, bottom = PHOTOGRAPHED_PAGE_CROP
@@ -1474,7 +1484,13 @@ def photographed_page_visual_signal(page, image, image_stat):
 
 
 def photographed_fold_gutter_fraction(image, image_stat):
-    """Locate a strong central fold shadow, returning ``None`` when uncertain."""
+    """Locate a strong central fold shadow or clean facing-page gutter.
+
+    Some book scans have a dark binding shadow; others have a bright strip of
+    paper between two text blocks.  Either signal must be vertically
+    continuous and contrast with text-bearing bands on both outer sides.
+    Width alone is never sufficient.
+    """
     gray = image.convert("L")
     width, height = gray.size
     if width / max(height, 1) < 1.22:
@@ -1490,13 +1506,23 @@ def photographed_fold_gutter_fraction(image, image_stat):
 
     candidates = [(fraction, stripe_mean(fraction)) for fraction in [0.34 + step * .01 for step in range(33)]]
     fraction, darkness = min(candidates, key=lambda item: item[1])
-    side_baseline = sorted([stripe_mean(.16), stripe_mean(.24), stripe_mean(.76), stripe_mean(.84)])[1:3]
+    side_values = [stripe_mean(.16), stripe_mean(.24), stripe_mean(.76), stripe_mean(.84)]
+    side_baseline = sorted(side_values)[1:3]
     baseline = sum(side_baseline) / max(len(side_baseline), 1)
     # A true photographed fold is a vertically continuous shadow. Requiring
     # this contrast avoids splitting ordinary landscape pages or columns.
-    if darkness > baseline - max(18.0, baseline * .10):
-        return None
-    return round(fraction, 3)
+    if darkness <= baseline - max(18.0, baseline * .10):
+        return round(fraction, 3)
+    light_fraction, lightness = max(candidates, key=lambda item: item[1])
+    left_content = min(stripe_mean(.24), stripe_mean(.38))
+    right_content = min(stripe_mean(.70), stripe_mean(.82))
+    if (
+        lightness >= 248.0
+        and lightness >= left_content + 18.0
+        and lightness >= right_content + 18.0
+    ):
+        return round(light_fraction, 3)
+    return None
 
 
 def photographed_spread_crop_specs(width, height, gutter_fraction=None):

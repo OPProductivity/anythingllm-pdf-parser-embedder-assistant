@@ -3486,6 +3486,22 @@ def detect_body_start(pages, stats, outline=None, include_front_matter=False):
 
     outline_start = detect_body_start_from_outline(outline, include_front_matter=include_front_matter)
     if outline_start:
+        outline_page = max(1, int(outline_start[0] or 1))
+        page_count = max([int(page.get("page") or 0) for page in pages] or [len(stats), 1])
+        earlier_substantive = [
+            stat
+            for stat in stats
+            if stat.pdf_page < outline_page
+            and stat.words >= 120
+            and stat.sentence_marks >= 3
+        ]
+        if outline_page > max(3, math.ceil(page_count * .55)) and earlier_substantive:
+            # A technically valid PDF outline can still be a malformed export
+            # that points only to a link appendix or late heading.  Never let
+            # that metadata silently discard most of a prose document when
+            # multiple earlier pages contain sentence-dense text.
+            first_nonempty = next((s.pdf_page for s in stats if not s.is_empty), 1)
+            return first_nonempty, "late_outline_start_conflicts_with_earlier_prose"
         return outline_start
 
     page_by_num = {int(page.get("page") or 0): page for page in pages}
@@ -6139,6 +6155,7 @@ def is_reliable_structure_reference(quality, pdf_page_count):
         int(quality.get("included_pages") or 0) >= material_pages
         and int(quality.get("included_words") or 0) >= max(500, page_count * 150)
         and str(quality.get("scanned_likelihood") or "").casefold() == "low"
+        and str(quality.get("text_integrity_status") or "not_flagged").casefold() != "review"
     )
 
 
@@ -6467,6 +6484,18 @@ def explainable_ocr_coverage_disagreement(selected, candidates, profile, ocr_evi
         for candidate in candidates
     )
     base_checks["native_text_layer_absent"] = native_layer_absent
+    native_layer_unusable = native_layer_absent or any(
+        str(candidate.get("backend") or "").casefold() == "pymupdf"
+        and not candidate.get("error")
+        and (
+            int((candidate.get("quality") or {}).get("included_pages") or 0) < page_count
+            or float((candidate.get("quality") or {}).get("average_words_per_page") or 0.0) < 120.0
+            or str((candidate.get("quality") or {}).get("text_integrity_status") or "").casefold()
+            == "review"
+        )
+        for candidate in candidates
+    )
+    base_checks["native_text_layer_unusable"] = native_layer_unusable
 
     materially_shorter_peers = []
     weak_shorter_peers = []
@@ -6491,7 +6520,7 @@ def explainable_ocr_coverage_disagreement(selected, candidates, profile, ocr_evi
         materially_shorter_peers.append(peer)
         if (
             peer["ocr_layout_artifact_ratio"] >= 0.01
-            or peer["average_words_per_page"] < 100.0
+            or peer["average_words_per_page"] < 120.0
             or peer["scanned_likelihood"].casefold() == "high"
         ):
             weak_shorter_peers.append(peer)
@@ -6499,7 +6528,16 @@ def explainable_ocr_coverage_disagreement(selected, candidates, profile, ocr_evi
     base_checks["shorter_peer_has_objective_weakness"] = bool(materially_shorter_peers) and (
         len(weak_shorter_peers) == len(materially_shorter_peers)
     )
-    accepted = all(base_checks.values())
+    # ``native_text_layer_absent`` is retained as useful diagnostic detail,
+    # but a sparse, partial, or systematically corrupted native layer is the
+    # same recovery condition for this decision. Every other strict check,
+    # including clean full-page OCR and weak shorter peers, remains required.
+    decision_checks = {
+        key: value
+        for key, value in base_checks.items()
+        if key != "native_text_layer_absent"
+    }
+    accepted = all(decision_checks.values())
     return {
         "accepted": accepted,
         "reason": (
@@ -11006,9 +11044,21 @@ def parse_anythingllm_embed_progress_event(payload):
 
 def anythingllm_embed_progress_message(event):
     """Return a compact user-facing description of a known Desktop event."""
+    def event_int(name, default=0):
+        """Parse advisory SSE fields without letting malformed telemetry escape.
+
+        The queue feed is observational.  A malformed value may make a
+        counter less precise, but it must never interrupt the owned request
+        or hide the original event/retry evidence.
+        """
+        try:
+            return int((event or {}).get(name) or default)
+        except (TypeError, ValueError):
+            return int(default)
+
     event_type = str((event or {}).get("type") or "").strip()
-    total = int((event or {}).get("totalDocs") or 0)
-    index = int((event or {}).get("docIndex") or 0) + 1
+    total = event_int("totalDocs")
+    index = event_int("docIndex") + 1
     record_position = f"{index}/{total}" if total else f"{index}; total not yet confirmed"
     if event_type == "batch_starting":
         return (
@@ -11023,18 +11073,92 @@ def anythingllm_embed_progress_message(event):
             else "AnythingLLM source-atomic staging gate is inactive; using the verified legacy queue path"
         )
     if event_type == "source_staging_started":
-        records = int((event or {}).get("recordCount") or 0)
-        batch_size = int((event or {}).get("provider_batch_size") or 0)
+        records = event_int("recordCount")
+        batch_size = event_int("provider_batch_size")
         return (
             f"AnythingLLM is staging {records} page-parent record(s) in serial provider batches of up to {batch_size}"
             if records and batch_size
             else "AnythingLLM started source-atomic provider staging"
         )
+    if event_type == "source_staging_source_plan":
+        records = event_int("recordCount")
+        cache_hits = event_int("cacheResolvedRecordCount")
+        provider_records = event_int("providerRequiredRecordCount")
+        provider_chunks = event_int("providerChunkCount")
+        return (
+            f"AnythingLLM resolved native cache for {cache_hits}/{records} page-parent record(s); "
+            f"{provider_records} record(s), {provider_chunks} chunk(s) require provider staging"
+        )
+    if event_type == "source_staging_cache_resolved":
+        index = event_int("recordIndex") + 1
+        records = event_int("recordCount")
+        return (
+            f"AnythingLLM resolved native cached vectors for source record {index}/{records}; "
+            "attaching it to this workspace"
+        )
     if event_type == "source_staging_provider_batch":
-        batch_index = int((event or {}).get("batchIndex") or 0) + 1
-        chunks = int((event or {}).get("chunkCount") or 0)
-        elapsed_ms = int((event or {}).get("elapsed_ms") or 0)
-        return f"AnythingLLM provider batch {batch_index} embedded {chunks} chunk(s) in {elapsed_ms / 1000.0:.2f}s"
+        batch_index = event_int("batchIndex") + 1
+        chunks = event_int("chunkCount")
+        elapsed_ms = event_int("elapsed_ms")
+        attempts = max(1, event_int("attempt_count", 1))
+        retry_delay_ms = max(0, event_int("retry_delay_ms"))
+        retry_note = (
+            f" after {attempts} attempts and {retry_delay_ms / 1000.0:.1f}s controlled retry delay"
+            if attempts > 1 else ""
+        )
+        return (
+            f"AnythingLLM provider batch {batch_index} embedded {chunks} chunk(s) "
+            f"in {elapsed_ms / 1000.0:.2f}s{retry_note}"
+        )
+    if event_type == "source_staging_provider_batch_attempt":
+        batch_index = event_int("batchIndex") + 1
+        attempt = event_int("attempt", 1)
+        chunks = event_int("chunkCount")
+        timeout_ms = max(0, event_int("request_timeout_ms"))
+        retry_suffix = " (attempt 2)" if attempt > 1 else ""
+        return (
+            f"AnythingLLM provider batch {batch_index} started for {chunks} chunk(s)"
+            f"{retry_suffix} (request boundary {timeout_ms / 1000.0:.0f}s)"
+        )
+    if event_type == "source_staging_provider_batch_attempt_completed":
+        batch_index = event_int("batchIndex") + 1
+        attempt = event_int("attempt", 1)
+        chunks = event_int("chunkCount")
+        elapsed_ms = max(0, event_int("elapsed_ms"))
+        retry_suffix = " (attempt 2)" if attempt > 1 else ""
+        return (
+            f"AnythingLLM provider batch {batch_index} completed {chunks} chunk(s) "
+            f"in {elapsed_ms / 1000.0:.2f}s{retry_suffix}"
+        )
+    if event_type == "source_staging_provider_batch_waiting":
+        batch_index = event_int("batchIndex") + 1
+        attempt = event_int("attempt", 1)
+        elapsed_ms = max(0, event_int("elapsed_ms"))
+        retry_suffix = " (attempt 2)" if attempt > 1 else ""
+        return (
+            f"AnythingLLM provider batch {batch_index} is still awaiting an embedding response"
+            f"{retry_suffix} ({elapsed_ms / 1000.0:.0f}s elapsed)"
+        )
+    if event_type == "source_staging_provider_batch_retrying":
+        batch_index = event_int("batchIndex") + 1
+        attempt = event_int("attempt", 1)
+        next_attempt = event_int("next_attempt", attempt + 1)
+        delay_ms = max(0, event_int("retry_delay_ms"))
+        status = event_int("http_status")
+        reason = f"HTTP {status}" if status else str((event or {}).get("error_class") or "connection timeout")
+        return (
+            f"AnythingLLM provider batch {batch_index}: {reason}; retrying once "
+            f"(attempt {next_attempt}) after {delay_ms / 1000.0:.1f}s"
+        )
+    if event_type == "source_staging_provider_batch_attempt_failed":
+        batch_index = event_int("batchIndex") + 1
+        attempt = event_int("attempt", 1)
+        status = event_int("http_status")
+        reason = f"HTTP {status}" if status else str((event or {}).get("error_class") or "provider error")
+        retry_suffix = " (attempt 2)" if attempt > 1 else ""
+        return f"AnythingLLM provider batch {batch_index} failed ({reason}){retry_suffix}"
+    if event_type == "source_staging_record":
+        return "AnythingLLM completed provider staging for one page-parent record"
     if event_type == "source_rejected_before_commit":
         return "AnythingLLM rejected this PDF before namespace commit; later independent PDFs may continue"
     if event_type == "source_commit_ambiguous":
@@ -11047,8 +11171,8 @@ def anythingllm_embed_progress_message(event):
             )
         return f"AnythingLLM Desktop queue: embedding record {record_position}"
     if event_type == "chunk_progress":
-        done = int((event or {}).get("chunksProcessed") or 0)
-        chunks = int((event or {}).get("totalChunks") or 0)
+        done = event_int("chunksProcessed")
+        chunks = event_int("totalChunks")
         chunk_position = f"{done}/{chunks}" if chunks else f"{done}; total not yet confirmed"
         return f"AnythingLLM Desktop queue: record {record_position}, chunks {chunk_position}"
     if event_type == "doc_complete":
@@ -13301,11 +13425,15 @@ def upload_block_reason_for_readiness(selected: dict) -> str:
     }
     if "needs_unstructured_or_ocr" in reasons:
         return "needs_unstructured_or_ocr"
+    if "unresolved_corrupted_text_layer" in reasons:
+        return "unresolved_corrupted_text_layer"
     ocr_assisted = (
         str((selected or {}).get("backend") or "").casefold() == "unstructured"
         and str((selected or {}).get("unstructured_strategy") or "").casefold()
         in {"hi_res", "ocr_only"}
     )
+    if "photographed_spread_requires_manual_review" in reasons and ocr_assisted:
+        return "photographed_spread_requires_manual_review"
     if "backend_text_coverage_disagreement" in reasons and ocr_assisted:
         return "ocr_backend_text_coverage_disagreement"
     return ""
@@ -13330,6 +13458,18 @@ def ocr_upload_hold_guidance(block_reason: str, readiness_reasons=()):
             "next_steps": [
                 "Open the readiness report and layout-region review.",
                 "Confirm the reading order at the photographed-page folds before retrying.",
+            ],
+        }
+    if reason == "unresolved_corrupted_text_layer":
+        return {
+            "code": "AUTO-TEXT-LAYER-REVIEW-001",
+            "message": (
+                "AnythingLLM upload was withheld: the PDF text layer is systematically corrupted, "
+                "and the OCR comparison did not produce a trustworthy replacement. No upload was sent."
+            ),
+            "next_steps": [
+                "Open the candidate extraction reports and compare the native and OCR text.",
+                "Use a verified OCRed copy or an explicit extraction override only after checking the prose.",
             ],
         }
     if reason == "ocr_backend_text_coverage_disagreement":
@@ -16110,6 +16250,8 @@ def update_workspace_embeddings_desktop_queue(
         "source_atomic_provider_batch_count": 0,
         "source_atomic_provider_chunk_count": 0,
         "source_atomic_provider_elapsed_ms": 0,
+        "source_atomic_provider_retry_count": 0,
+        "source_atomic_provider_last_retry": {},
         "source_atomic_staging_started": False,
         "source_atomic_staging_finished": False,
         "source_atomic_precommit_rejection": {},
@@ -16205,6 +16347,8 @@ def update_workspace_embeddings_desktop_queue(
             provider_batch_count = max(0, int(queue_state["source_atomic_provider_batch_count"] or 0))
             provider_chunk_count = max(0, int(queue_state["source_atomic_provider_chunk_count"] or 0))
             provider_elapsed_ms = max(0, int(queue_state["source_atomic_provider_elapsed_ms"] or 0))
+            provider_retry_count = max(0, int(queue_state["source_atomic_provider_retry_count"] or 0))
+            provider_last_retry = dict(queue_state["source_atomic_provider_last_retry"] or {})
             records_per_second = 0.0
             if last_progress_at > first_progress_at and last_progress_position > first_progress_position:
                 records_per_second = (last_progress_position - first_progress_position) / (
@@ -16262,6 +16406,8 @@ def update_workspace_embeddings_desktop_queue(
                 "source_atomic_provider_chunk_count": provider_chunk_count,
                 "source_atomic_provider_elapsed_ms": provider_elapsed_ms,
                 "source_atomic_provider_batches": provider_batches,
+                "source_atomic_provider_retry_count": provider_retry_count,
+                "source_atomic_provider_last_retry": provider_last_retry,
                 "source_atomic_precommit_rejection": dict(queue_state["source_atomic_precommit_rejection"] or {}),
                 "source_atomic_commit_ambiguity": dict(queue_state["source_atomic_commit_ambiguity"] or {}),
             }
@@ -16317,7 +16463,15 @@ def update_workspace_embeddings_desktop_queue(
         source_atomic_event = event_type in {
             "source_atomic_gate_observed",
             "source_staging_started",
+            "source_staging_source_plan",
+            "source_staging_cache_resolved",
+            "source_staging_record",
             "source_staging_provider_batch",
+            "source_staging_provider_batch_attempt",
+            "source_staging_provider_batch_waiting",
+            "source_staging_provider_batch_attempt_completed",
+            "source_staging_provider_batch_attempt_failed",
+            "source_staging_provider_batch_retrying",
             "source_staging_finished",
             "source_rejected_before_commit",
             "source_commit_ambiguous",
@@ -16335,6 +16489,14 @@ def update_workspace_embeddings_desktop_queue(
                 queue_state["last_event_monotonic"] = event_now
                 if event_type == "source_staging_started":
                     queue_state["source_atomic_staging_started"] = True
+                elif event_type == "source_staging_source_plan":
+                    queue_state["source_atomic_source_plan"] = {
+                        "source_key": str(event.get("sourceKey") or ""),
+                        "records": event.get("recordCount"),
+                        "cache_resolved_records": event.get("cacheResolvedRecordCount"),
+                        "provider_required_records": event.get("providerRequiredRecordCount"),
+                        "provider_chunks": event.get("providerChunkCount"),
+                    }
                 elif event_type == "source_staging_finished":
                     queue_state["source_atomic_staging_finished"] = True
                     # The terminal event is a compact server-side replay of
@@ -16349,6 +16511,22 @@ def update_workspace_embeddings_desktop_queue(
                     merge_source_atomic_provider_batches(
                         [event], source_key=str(event.get("sourceKey") or "")
                     )
+                elif event_type == "source_staging_provider_batch_retrying":
+                    def event_int(name: str) -> int:
+                        try:
+                            return int(event.get(name) or 0)
+                        except (TypeError, ValueError):
+                            return 0
+
+                    queue_state["source_atomic_provider_retry_count"] += 1
+                    queue_state["source_atomic_provider_last_retry"] = {
+                        "source_key": str(event.get("sourceKey") or ""),
+                        "batch_index": event_int("batchIndex"),
+                        "attempt": event_int("attempt"),
+                        "http_status": event_int("http_status"),
+                        "error_class": str(event.get("error_class") or ""),
+                        "retry_delay_ms": max(0, event_int("retry_delay_ms")),
+                    }
                 elif event_type == "source_rejected_before_commit":
                     queue_state["source_atomic_precommit_rejection"] = {
                         "source_key": str(event.get("sourceKey") or ""),
@@ -16362,16 +16540,46 @@ def update_workspace_embeddings_desktop_queue(
                         "error": str(event.get("error") or ""),
                     }
             snapshot = queue_snapshot()
-            if callable(status_callback) and event_type != "source_committed":
+            # A source emits one ``source_staging_record`` event per prepared
+            # page-parent record. It is useful durable activity evidence, but
+            # echoing every one into the live description would replace the
+            # meaningful queue x/y status dozens of times. Handle it above so
+            # it is never called "unrecognized", then deliberately keep the
+            # displayed message unchanged.
+            if callable(status_callback) and event_type not in {
+                "source_committed",
+                "source_staging_record",
+            }:
                 if event_type == "source_atomic_gate_observed":
                     message = anythingllm_embed_progress_message(event)
                     timing_event = "source_atomic_gate_observed"
                 elif event_type == "source_staging_started":
                     message = anythingllm_embed_progress_message(event)
                     timing_event = "source_atomic_staging_started"
+                elif event_type == "source_staging_source_plan":
+                    message = anythingllm_embed_progress_message(event)
+                    timing_event = "source_atomic_source_plan"
+                elif event_type == "source_staging_cache_resolved":
+                    message = anythingllm_embed_progress_message(event)
+                    timing_event = "source_atomic_cache_resolved"
                 elif event_type == "source_staging_provider_batch":
                     message = anythingllm_embed_progress_message(event)
                     timing_event = "source_atomic_provider_batch_completed"
+                elif event_type == "source_staging_provider_batch_attempt":
+                    message = anythingllm_embed_progress_message(event)
+                    timing_event = "source_atomic_provider_batch_attempt_started"
+                elif event_type == "source_staging_provider_batch_waiting":
+                    message = anythingllm_embed_progress_message(event)
+                    timing_event = "source_atomic_provider_batch_waiting"
+                elif event_type == "source_staging_provider_batch_attempt_completed":
+                    message = anythingllm_embed_progress_message(event)
+                    timing_event = "source_atomic_provider_batch_attempt_completed"
+                elif event_type == "source_staging_provider_batch_attempt_failed":
+                    message = anythingllm_embed_progress_message(event)
+                    timing_event = "source_atomic_provider_batch_attempt_failed"
+                elif event_type == "source_staging_provider_batch_retrying":
+                    message = anythingllm_embed_progress_message(event)
+                    timing_event = "source_atomic_provider_batch_retrying"
                 elif event_type == "source_staging_finished":
                     message = (
                         "AnythingLLM finished provider staging; committing this PDF to the workspace"
@@ -16394,6 +16602,20 @@ def update_workspace_embeddings_desktop_queue(
                             round(inter_event_gap_seconds, 3)
                             if inter_event_gap_seconds is not None else None
                         ),
+                        # Keep the per-attempt identity and cache/source plan
+                        # in the run timeline.  These are evidence fields, not
+                        # queue-completion counters.
+                        "source_atomic_source_key": str(event.get("sourceKey") or ""),
+                        "source_atomic_filename": str(event.get("filename") or ""),
+                        "source_atomic_batch_index": event.get("batchIndex"),
+                        "source_atomic_attempt": event.get("attempt"),
+                        "source_atomic_attempt_id": str(event.get("attempt_id") or ""),
+                        "source_atomic_chunk_count": event.get("chunkCount"),
+                        "source_atomic_request_timeout_ms": event.get("request_timeout_ms"),
+                        "source_atomic_elapsed_ms": event.get("elapsed_ms"),
+                        "source_atomic_cache_resolved_records": event.get("cacheResolvedRecordCount"),
+                        "source_atomic_provider_required_records": event.get("providerRequiredRecordCount"),
+                        "source_atomic_provider_chunks": event.get("providerChunkCount"),
                         **snapshot,
                     },
                 )
@@ -16599,7 +16821,15 @@ def update_workspace_embeddings_desktop_queue(
         )
         if source_atomic_staging_started and event_type in {
             "source_staging_started",
+            "source_staging_source_plan",
+            "source_staging_cache_resolved",
+            "source_staging_record",
             "source_staging_provider_batch",
+            "source_staging_provider_batch_attempt",
+            "source_staging_provider_batch_waiting",
+            "source_staging_provider_batch_attempt_completed",
+            "source_staging_provider_batch_attempt_failed",
+            "source_staging_provider_batch_retrying",
             "source_staging_finished",
         } and event_count > source_atomic_activity_baseline:
             with queue_state_lock:
@@ -21675,6 +21905,14 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                     else None
                 ),
             )
+            report_upload_phase(
+                "candidate_evaluation",
+                f"Evaluating {backend} text quality, coverage, and reading order",
+                completed_units=backend_index,
+                total_units=max(1, len(backend_names)),
+                fallback_fraction=backend_index / max(1, len(backend_names)),
+                evidence_kind="candidate_evaluation_started",
+            )
             layout_evidence = {
                 "status": "not_applied",
                 "reason": "Positioned native-line cleanup is currently limited to the native PyMuPDF backend.",
@@ -21733,6 +21971,15 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 )
             elif backend == "unstructured":
                 pages, layout_evidence = remove_verified_photographed_ocr_running_headers(pages)
+                layout_evidence["photographed_spread_page_count"] = sum(
+                    1
+                    for page in pages
+                    if any(
+                        int(region.get("reading_region_count") or 1) == 2
+                        for region in (page.get("reading_regions") or [])
+                        if isinstance(region, dict)
+                    )
+                )
                 native_peer = next(
                     (
                         candidate for candidate in candidates
@@ -22451,15 +22698,22 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         readiness_reasons.append("implausibly_low_text_coverage")
     if quality.get("replacement_chars", 0) > max(20, int(quality.get("included_chars", 0) * 0.005)):
         readiness_reasons.append("excessive_replacement_characters")
+    severe_fragmentation = (
+        str(quality.get("text_integrity_status") or "").casefold() == "review"
+        and int(quality.get("fragmented_single_letter_token_count") or 0) >= 100
+        and int(quality.get("fragmented_page_count") or 0)
+        >= max(3, math.ceil(int(quality.get("included_pages") or 0) * .50))
+        and float(quality.get("fragmented_single_letter_token_ratio") or 0.0) >= .05
+    )
+    if severe_fragmentation:
+        readiness_reasons.append("unresolved_corrupted_text_layer")
     if selected.get("native_chunk_eval", {}).get("status") != "pass":
         readiness_reasons.append("native_header_metadata_does_not_survive_chunk_simulation")
-    # The column-first recovery keeps citations tied to the original physical
-    # PDF page. A photographed spread is useful layout-review evidence, but
-    # it is not itself evidence that the chosen text is unsafe. Preserve the
-    # observation in the report; only demonstrated text-quality failures can
-    # withhold an otherwise complete PDF from AnythingLLM.
-    if int(layout_evidence.get("photographed_spread_page_count") or 0) >= 2:
-        readiness_reasons.append("photographed_spread_requires_manual_review")
+    # Fold-gated photographed spreads are already represented as ordered
+    # left/right regions tied to the original physical PDF page. Preserve the
+    # count in layout evidence, but do not turn successful split recovery into
+    # its own upload veto. The normal text-quality and backend-disagreement
+    # checks below remain authoritative.
 
     # A UI preflight is deliberately only a three-page native sample. It must
     # not block an otherwise usable text PDF. Once the real extraction agrees

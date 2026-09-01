@@ -42,6 +42,16 @@ def test_server_patch_is_idempotent_and_keeps_non_openrouter_branch():
         in patched
     )
     assert "let legacy=true" in patched
+    assert "maxRetries:0" in patched
+    assert "source_staging_provider_batch_retrying" in patched
+    # A cache hit must be decided before direct provider staging.  Otherwise a
+    # run can report cache reuse only after paying for a fresh request.
+    assert "cachedVectorInformation:U" in patched
+    assert "await U(W.filename)" in patched
+    assert "source_staging_cache_resolved" in patched
+    assert "source_staging_source_plan" in patched
+    assert "V.filter(W=>!W.cacheResolved)" in patched
+    assert "if(W.cacheResolved)continue" in patched
     assert source_atomic_server.patch_v1161_server_source(patched) == patched
 
 
@@ -119,3 +129,80 @@ def test_server_installer_reconfigures_a_known_previous_patch(tmp_path, monkeypa
         (resources / "server.js.pdf-assistant-source-atomic.json").read_text(encoding="utf-8")
     )
     assert manifest["provider_batch_size"] == 36
+    assert manifest["provider_retry_policy"]["maximum_attempts"] == 2
+
+
+def test_server_installer_migrates_manifest_bound_v1_patch(tmp_path, monkeypatch):
+    resources = tmp_path / "resources" / "backend"
+    resources.mkdir(parents=True)
+    server = resources / "server.js"
+    original = _server_fixture()
+    server.write_text(original, encoding="utf-8")
+    baseline = hashlib.sha256(server.read_bytes()).hexdigest()
+    monkeypatch.setattr(source_atomic_server, "V1161_SERVER_SHA256", baseline)
+    executable = tmp_path / "AnythingLLM.exe"
+    executable.write_bytes(b"desktop")
+    expected = source_atomic_server.patch_v1161_server_source(original)
+    previous = expected.replace(
+        source_atomic_server.SOURCE_ATOMIC_SERVER_PATCH_ID,
+        source_atomic_server.SOURCE_ATOMIC_PREVIOUS_SERVER_PATCH_ID,
+    )
+    server.write_text(previous, encoding="utf-8")
+    (resources / "server.js.pdf-assistant-v1161.backup").write_text(original, encoding="utf-8")
+    manifest_path = resources / "server.js.pdf-assistant-source-atomic.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "patch_id": source_atomic_server.SOURCE_ATOMIC_PREVIOUS_SERVER_PATCH_ID,
+                "original_server_sha256": baseline,
+                "patched_server_sha256": hashlib.sha256(server.read_bytes()).hexdigest(),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    migrated = source_atomic_server.ensure_source_atomic_embedding_server(_report(executable))
+
+    assert migrated["status"] == "restart_required", migrated
+    assert server.read_text(encoding="utf-8") == expected
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["patch_id"] == source_atomic_server.SOURCE_ATOMIC_SERVER_PATCH_ID
+    assert manifest["provider_retry_policy"]["retry_delay_cap_ms"] == 5_000
+
+
+def test_server_installer_migrates_manifest_bound_v2_patch(tmp_path, monkeypatch):
+    resources = tmp_path / "resources" / "backend"
+    resources.mkdir(parents=True)
+    server = resources / "server.js"
+    original = _server_fixture()
+    server.write_text(original, encoding="utf-8")
+    baseline = hashlib.sha256(server.read_bytes()).hexdigest()
+    monkeypatch.setattr(source_atomic_server, "V1161_SERVER_SHA256", baseline)
+    executable = tmp_path / "AnythingLLM.exe"
+    executable.write_bytes(b"desktop")
+    expected = source_atomic_server.patch_v1161_server_source(original)
+    previous = expected.replace(
+        source_atomic_server.SOURCE_ATOMIC_SERVER_PATCH_ID,
+        "anythingllm_pdf_assistant_source_atomic_server_v2",
+    )
+    server.write_text(previous, encoding="utf-8")
+    (resources / "server.js.pdf-assistant-v1161.backup").write_text(original, encoding="utf-8")
+    manifest_path = resources / "server.js.pdf-assistant-source-atomic.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "patch_id": "anythingllm_pdf_assistant_source_atomic_server_v2",
+                "original_server_sha256": baseline,
+                "patched_server_sha256": hashlib.sha256(server.read_bytes()).hexdigest(),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    migrated = source_atomic_server.ensure_source_atomic_embedding_server(_report(executable))
+
+    assert migrated["status"] == "restart_required", migrated
+    assert server.read_text(encoding="utf-8") == expected
+    assert json.loads(manifest_path.read_text(encoding="utf-8"))["patch_id"] == (
+        source_atomic_server.SOURCE_ATOMIC_SERVER_PATCH_ID
+    )

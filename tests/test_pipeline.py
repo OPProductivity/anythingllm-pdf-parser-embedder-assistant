@@ -981,6 +981,138 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(manifest["runtime"]["status"], "deferred_native_text_clear")
         self.assertEqual(calls, [])
 
+    def test_automatic_ocr_preflight_reports_each_source_without_changing_its_result(self):
+        import rag_pdf_gradio_app as app
+
+        original_profile = app.automatic_timing_document_profile
+        original_coverage = app.automatic_full_native_text_coverage
+        events = []
+        try:
+            app.automatic_timing_document_profile = lambda files, **_kwargs: {
+                "page_count": 2, "sampled_pages": 2, "mean_chars_per_page": 1000,
+                "image_density": 0, "sparse_fraction": 0, "ocr_risk_bucket": "low",
+            }
+            app.automatic_full_native_text_coverage = lambda _path: {
+                "status": "verified", "page_count": 2, "low_text_pages": [],
+                "image_backed_low_text_pages": [], "blank_pages": [],
+                "sparse_native_text_pages": [], "visible_vector_low_text_pages": [],
+            }
+            manifest = app.automatic_ocr_preflight_manifest(
+                ["first.pdf", "second.pdf"],
+                progress_callback=events.append,
+            )
+        finally:
+            app.automatic_timing_document_profile = original_profile
+            app.automatic_full_native_text_coverage = original_coverage
+
+        self.assertEqual(manifest["status"], "clear")
+        self.assertEqual(
+            [(event["state"], event["source_index"], event["source_total"])
+            for event in events],
+            [
+                ("source_started", 1, 2),
+                ("identity_checked", 1, 2),
+                ("profile_complete", 1, 2),
+                ("coverage_started", 1, 2),
+                ("coverage_complete", 1, 2),
+                ("source_completed", 1, 2),
+                ("source_started", 2, 2),
+                ("identity_checked", 2, 2),
+                ("profile_complete", 2, 2),
+                ("coverage_started", 2, 2),
+                ("coverage_complete", 2, 2),
+                ("source_completed", 2, 2),
+                ("manifest_complete", 2, 2),
+            ],
+        )
+        self.assertEqual(events[2]["page_count"], 2)
+        self.assertEqual(events[-1]["checked_sources"], 2)
+
+    def test_automatic_ocr_preflight_progress_callback_failure_is_non_fatal(self):
+        import rag_pdf_gradio_app as app
+
+        original_profile = app.automatic_timing_document_profile
+        original_coverage = app.automatic_full_native_text_coverage
+        callback_calls = []
+        try:
+            app.automatic_timing_document_profile = lambda files, **_kwargs: {
+                "page_count": 1, "sampled_pages": 1, "mean_chars_per_page": 900,
+                "image_density": 0, "sparse_fraction": 0, "ocr_risk_bucket": "low",
+            }
+            app.automatic_full_native_text_coverage = lambda _path: {
+                "status": "verified", "page_count": 1, "low_text_pages": [],
+                "image_backed_low_text_pages": [], "blank_pages": [],
+                "sparse_native_text_pages": [], "visible_vector_low_text_pages": [],
+            }
+
+            def broken_callback(event):
+                callback_calls.append(event["state"])
+                raise RuntimeError("display unavailable")
+
+            manifest = app.automatic_ocr_preflight_manifest(
+                ["text.pdf"], progress_callback=broken_callback
+            )
+        finally:
+            app.automatic_timing_document_profile = original_profile
+            app.automatic_full_native_text_coverage = original_coverage
+
+        self.assertEqual(manifest["status"], "clear")
+        self.assertIn("manifest_complete", callback_calls)
+
+    def test_preparing_status_renders_one_progress_line_and_initial_estimate(self):
+        import rag_pdf_gradio_app as app
+
+        rendered = app.automatic_live_status_html({
+            "state": "preparing",
+            "phase": "Pre-flight",
+            "details": "legacy detail",
+            "expected_seconds": 754,
+            "preflight_status": {
+                "current_step": "4/9 PDF(s) fully checked: source identity, page sampling, all-page <coverage>, and OCR policy.",
+            },
+        })
+
+        self.assertIn("automatic-run-preflight-history", rendered)
+        self.assertIn("automatic-run-preflight-current", rendered)
+        self.assertIn("4/9 PDF(s) fully checked", rendered)
+        self.assertIn("all-page &lt;coverage&gt;", rendered)
+        self.assertIn("Est: 12m34s · initial estimate", rendered)
+        self.assertIn('class="automatic-run-progress-timing-estimate"', rendered)
+        self.assertIn("font-size: 0.92em", app.APP_CSS)
+        self.assertIn("font-variant-numeric: tabular-nums", app.APP_CSS)
+        self.assertNotIn("Current outcomes", rendered)
+        self.assertNotIn("sampling representative pages", rendered)
+        self.assertNotIn("legacy detail", rendered)
+
+        calculating = app.automatic_live_status_html({
+            "state": "preparing",
+            "phase": "Pre-flight",
+            "preflight_status": {"current_step": "0/9 PDF(s) fully checked"},
+        })
+        self.assertIn("Est: calculating…", calculating)
+
+    def test_preflight_presentation_disappears_when_actual_run_stages_begin(self):
+        import rag_pdf_gradio_app as app
+
+        rendered = app.automatic_live_status_html({
+            "state": "running",
+            "phase": "Extracting PDF",
+            "details": "PDF 1/2 — extracting pages",
+            "confirmed_fraction": 0.08,
+            "expected_seconds": 120,
+            "started_epoch": 100,
+            "preflight_status": {
+                "current_step": "This pre-flight text must disappear",
+                "summary_lines": ["2/2 PDFs pre-flighted"],
+            },
+        })
+
+        self.assertIn('data-run-state="running"', rendered)
+        self.assertIn("Extracting PDF", rendered)
+        self.assertNotIn("automatic-run-preflight-current", rendered)
+        self.assertNotIn("This pre-flight text must disappear", rendered)
+        self.assertNotIn("2/2 PDFs pre-flighted", rendered)
+
     def test_automatic_ocr_preflight_defers_runtime_for_sparse_image_pages(self):
         import rag_pdf_gradio_app as app
 
@@ -2918,6 +3050,26 @@ class PipelineCoreTests(unittest.TestCase):
             )
         )
 
+    def test_source_local_ocr_hold_skips_irrelevant_global_storage_audit(self):
+        import rag_pdf_gradio_app as app
+
+        summaries = [
+            {
+                "pdf": "held-spread.pdf",
+                "api_upload_status": "skipped_needs_ocr_review",
+                "api_upload_warning": "Reading order at a photographed fold is unresolved.",
+            },
+            {
+                "pdf": "ready.pdf",
+                "api_upload_status": "complete",
+                "post_upload_verification_status": "pass",
+                "anythingllm_runtime_validation_status": "deferred_after_exact_vector_proof",
+            },
+        ]
+        completion = app.automatic_completion(summaries, True)
+        self.assertEqual(completion["code"], "AUTO-OCR-REVIEW-PARTIAL-001")
+        self.assertFalse(app.automatic_batch_diagnostics_required(summaries, True))
+
     def test_queue_progress_never_displays_a_false_zero_denominator(self):
         message = pipeline.anythingllm_embed_progress_message(
             {"type": "chunk_progress", "docIndex": 0, "totalDocs": 0, "chunksProcessed": 1, "totalChunks": 0}
@@ -2938,6 +3090,59 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn("327/663", message)
         self.assertIn("327/663", observation)
         self.assertIn("queue active", observation)
+
+    def test_source_atomic_completion_and_native_cache_events_have_distinct_messages(self):
+        completed = pipeline.anythingllm_embed_progress_message(
+            {
+                "type": "source_staging_provider_batch_attempt_completed",
+                "batchIndex": 2,
+                "attempt": 1,
+                "chunkCount": 36,
+                "elapsed_ms": 912,
+            }
+        )
+        planned = pipeline.anythingllm_embed_progress_message(
+            {
+                "type": "source_staging_source_plan",
+                "recordCount": 4,
+                "cacheResolvedRecordCount": 3,
+                "providerRequiredRecordCount": 1,
+                "providerChunkCount": 12,
+            }
+        )
+
+        self.assertIn("completed 36 chunk(s)", completed)
+        self.assertNotIn("unrecognized", completed)
+        self.assertIn("native cache for 3/4", planned)
+        self.assertIn("1 record(s), 12 chunk(s) require provider staging", planned)
+
+    def test_source_atomic_first_attempt_label_does_not_advertise_a_retry(self):
+        first = pipeline.anythingllm_embed_progress_message(
+            {
+                "type": "source_staging_provider_batch_attempt",
+                "batchIndex": 0,
+                "attempt": 1,
+                "chunkCount": 36,
+                "request_timeout_ms": 35_000,
+            }
+        )
+        retry = pipeline.anythingllm_embed_progress_message(
+            {
+                "type": "source_staging_provider_batch_attempt",
+                "batchIndex": 0,
+                "attempt": 2,
+                "chunkCount": 36,
+                "request_timeout_ms": 20_000,
+            }
+        )
+        record = pipeline.anythingllm_embed_progress_message(
+            {"type": "source_staging_record"}
+        )
+
+        self.assertIn("provider batch 1 started", first)
+        self.assertNotIn("attempt", first)
+        self.assertIn("(attempt 2)", retry)
+        self.assertNotIn("unrecognized", record)
 
     def test_sse_observer_survives_idle_disconnects_until_owner_stops_it(self):
         """A restarted Desktop must not lose its queue observer after two idle reads."""
@@ -3731,7 +3936,11 @@ class PipelineCoreTests(unittest.TestCase):
                 "expected_seconds": 12,
                 "source": "test",
             }
-            settings, report, _warnings, allowed = app.validated_automatic_run_settings(ordered)
+            status_events = []
+            settings, report, _warnings, allowed = app.validated_automatic_run_settings(
+                ordered,
+                preflight_progress_callback=status_events.append,
+            )
         finally:
             app.validate_pdf_inputs = original_validate
             app.estimate_automatic_run = original_estimate
@@ -3740,6 +3949,12 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertTrue(allowed)
         self.assertEqual(settings["new_workspace_name"], pipeline.lancedb_safe_workspace_name(requested))
         self.assertEqual(len(settings["new_workspace_name"]), pipeline.LANCEDB_WORKSPACE_NAME_LIMIT)
+        event_states = [event["state"] for event in status_events]
+        self.assertIn("request_validation_started", event_states)
+        self.assertIn("request_validation_complete", event_states)
+        self.assertIn("estimate_started", event_states)
+        self.assertIn("estimate_complete", event_states)
+        self.assertIn("confirmation_validation_complete", event_states)
 
     def test_cache_plan_progress_text_never_reuses_a_prior_sources_counts(self):
         import rag_pdf_gradio_app as app
@@ -4851,10 +5066,17 @@ class PipelineCoreTests(unittest.TestCase):
         css = Path(app.__file__).read_text(encoding="utf-8")
         self.assertIn("height: calc(8px + 11em + 2px);", css)
         self.assertIn("min-height: 11em;", css)
-        self.assertIn("grid-template-rows: 1.25em minmax(0, 1fr) 3.75em;", css)
+        self.assertIn(".automatic-run-activity.ready .automatic-run-progress-label", css)
+        self.assertIn("grid-template-rows: 1.25em minmax(0, 1fr) auto;", css)
         self.assertIn("overflow-y: auto;", css)
-        self.assertIn("min-height: 3.75em;", css)
-        self.assertIn("max-height: 3.75em;", css)
+        self.assertIn("align-self: end;", css)
+        self.assertIn("min-height: 0;", css)
+        self.assertIn("max-height: none;", css)
+        self.assertIn(".automatic-run-activity.running .automatic-run-batch-timing", css)
+        self.assertIn(".automatic-run-activity.preparing .automatic-run-preflight-history", css)
+        self.assertIn("transform: translateY(18px);", css)
+        self.assertIn(".automatic-run-activity.running .automatic-run-progress-timing-estimate", css)
+        self.assertIn("font-size: 1.1em;", css)
         self.assertIn(".automatic-run-batch-timing .automatic-run-progress-timing", css)
         self.assertIn("margin-left: 0;", css)
 
@@ -5995,6 +6217,22 @@ class PipelineCoreTests(unittest.TestCase):
             .55,
         )
         self.assertEqual(app.concurrent_ingestion_progress_fraction(.90, 20, 0), .9)
+
+    def test_long_owned_preparation_can_use_elapsed_share_but_not_outrun_sources(self):
+        import rag_pdf_gradio_app as app
+
+        self.assertAlmostEqual(
+            app.concurrent_preparation_progress_fraction(.13, 300, 1_150, .925),
+            300 / 1_150,
+        )
+        self.assertEqual(
+            app.concurrent_preparation_progress_fraction(.13, 900, 1_000, .20),
+            .13,
+        )
+        self.assertEqual(
+            app.concurrent_preparation_progress_fraction(.13, 20, 0, 1.0),
+            .13,
+        )
 
     def test_in_run_eta_recalibration_does_not_treat_one_cold_batch_as_steady_cadence(self):
         import rag_pdf_gradio_app as app
@@ -8236,6 +8474,95 @@ class PipelineCoreTests(unittest.TestCase):
 
         self.assertEqual([row["run_key"] for row in rows], ["first", "second"])
 
+    def test_timing_history_reader_uses_only_the_requested_tail(self):
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "timing.jsonl"
+            path.write_text(
+                "".join(json.dumps({"run_key": f"run-{index}", "payload": "x" * 4096}) + "\n" for index in range(80)),
+                encoding="utf-8",
+            )
+            rows = app._read_timing_jsonl(path, limit=3)
+
+        self.assertEqual([row["run_key"] for row in rows], ["run-77", "run-78", "run-79"])
+
+    def test_global_timing_event_migration_preserves_only_model_learning_rows(self):
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "timing-events.jsonl"
+            path.write_text(
+                "\n".join([
+                    json.dumps({
+                        "recorded_at": "2026-08-20T12:00:00",
+                        "run_key": "run-a",
+                        "event": "queue_progress",
+                        "stage": "Desktop queue",
+                        "desktop_queue_completed": 25,
+                        "desktop_queue_total": 100,
+                        "unused_wide_field": "x" * 200,
+                    }),
+                    json.dumps({
+                        "recorded_at": "2026-08-20T12:01:00",
+                        "run_key": "run-a",
+                        "event": "phase_completed",
+                        "stage": "anythingllm_batch_read_only_inspection",
+                        "phase_elapsed_seconds": 7.25,
+                        "desktop_queue_completed": 100,
+                        "unused_wide_field": "y" * 200,
+                    }),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            result = app.compact_timing_model_event_history(path, retain_archive=False)
+            rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(result["status"], "compacted")
+        self.assertEqual(result["source_records"], 2)
+        self.assertEqual(result["learning_records"], 1)
+        self.assertEqual(rows, [{
+            "event": "phase_completed",
+            "phase_elapsed_seconds": 7.25,
+            "recorded_at": "2026-08-20T12:01:00",
+            "run_key": "run-a",
+            "schema_version": app.TIMING_MODEL_EVENT_HISTORY_SCHEMA_VERSION,
+            "stage": "anythingllm_batch_read_only_inspection",
+        }])
+
+    def test_repeated_timing_counters_stay_per_run_not_in_global_learning_history(self):
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "run"
+            timing_dir = Path(temp_dir) / "timing-model"
+            original_dir = app.TIMING_MODEL_DIR
+            original_events = app.TIMING_MODEL_EVENTS_PATH
+            try:
+                app.TIMING_MODEL_DIR = timing_dir
+                app.TIMING_MODEL_EVENTS_PATH = timing_dir / "timing-events.jsonl"
+                app.TIMING_MODEL_EVENT_COMPACTION_DONE.clear()
+                app.record_timing_model_event(root, "Embedding", {
+                    "timing_event": "queue_progress",
+                    "batch": 1,
+                    "desktop_queue_completed": 10,
+                    "queue_records": 100,
+                })
+                app.record_timing_model_event(root, "Embedding", {
+                    "timing_event": "phase_completed",
+                    "phase_elapsed_seconds": 12.5,
+                })
+            finally:
+                app.TIMING_MODEL_DIR = original_dir
+                app.TIMING_MODEL_EVENTS_PATH = original_events
+                app.TIMING_MODEL_EVENT_COMPACTION_DONE.clear()
+
+            global_rows = [json.loads(line) for line in (timing_dir / "timing-events.jsonl").read_text(encoding="utf-8").splitlines()]
+            per_run_rows = [json.loads(line) for line in (root / "timing-evidence-timeline.jsonl").read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual([row["event"] for row in global_rows], ["phase_completed"])
+        self.assertEqual([row["event"] for row in per_run_rows], ["queue_progress", "phase_completed"])
+
     def test_per_run_timing_timeline_stays_valid_under_overlapping_callbacks(self):
         import rag_pdf_gradio_app as app
 
@@ -8347,6 +8674,9 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn(".icon-button-wrapper.top-panel", app.APP_JS)
         self.assertIn('M3 12a9 9 0 1 0 3-6.7', app.APP_CSS)
         self.assertIn("wireAutomaticRunTimer", app.APP_JS)
+        self.assertIn("ragConfirmPresentationBound", app.APP_JS)
+        self.assertIn("Starting processing…", app.APP_JS)
+        self.assertIn("}, true);", app.APP_JS)
         self.assertNotIn("RUN_TIMER_START_JS", Path(app.__file__).read_text(encoding="utf-8"))
 
     def test_numeric_dropdown_update_keeps_custom_values_and_presets(self):
@@ -9241,13 +9571,46 @@ class PipelineCoreTests(unittest.TestCase):
     def test_pending_selection_shows_inert_action_controls_before_metadata_finishes(self):
         import rag_pdf_gradio_app as app
 
-        confirm, cancel = app.automatic_selection_pending_action_states(["example.pdf"], [])
+        confirm, cancel, activity = app.automatic_selection_pending_action_states(["example.pdf"], [])
 
         self.assertTrue(confirm["visible"])
         self.assertFalse(confirm["interactive"])
         self.assertEqual(confirm["value"], "Confirm and start processing")
         self.assertTrue(cancel["visible"])
         self.assertFalse(cancel["interactive"])
+        self.assertIn('data-run-state="selection_preparing"', activity["value"])
+        self.assertIn("1 PDF(s) accepted", activity["value"])
+
+    def test_selection_preparing_status_is_browser_owned_and_escapes_detail(self):
+        import rag_pdf_gradio_app as app
+
+        rendered = app.automatic_selection_preparing_status_html(
+            ["one.pdf", "two.pdf"], [], detail="Inspecting <selection>"
+        )
+
+        self.assertIn('data-run-state="selection_preparing"', rendered)
+        self.assertIn("Selection preview in progress", rendered)
+        self.assertIn("Inspecting &lt;selection&gt;", rendered)
+        self.assertNotIn("Overall progress: 0%", rendered)
+
+    def test_selection_begin_exposes_preview_status_without_starting_run(self):
+        import rag_pdf_gradio_app as app
+
+        original = dict(app.LIVE_AUTOMATIC_RUN_STATUS or {})
+        try:
+            app.LIVE_AUTOMATIC_RUN_STATUS.clear()
+            result = app.automatic_selection_begin_state(
+                {"state": "idle", "revision": 0}, "", ["one.pdf"], [], {}
+            )
+            observed_live_status = dict(app.LIVE_AUTOMATIC_RUN_STATUS or {})
+        finally:
+            app.LIVE_AUTOMATIC_RUN_STATUS.clear()
+            app.LIVE_AUTOMATIC_RUN_STATUS.update(original)
+
+        self.assertEqual(len(result), 7)
+        self.assertEqual(result[0]["state"], "pending")
+        self.assertIn('data-run-state="selection_preparing"', result[6]["value"])
+        self.assertEqual(observed_live_status, {})
 
     def test_advanced_backend_menu_includes_automatic_and_explicit_tesseract_ocr(self):
         import rag_pdf_gradio_app as app
@@ -9329,7 +9692,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn("Filmography", headings)
         self.assertEqual(sum(item.casefold() == "references" for item in headings), 1)
 
-    def test_selected_pdf_reset_keeps_global_run_unowned_and_renders_ready(self):
+    def test_selected_pdf_reset_keeps_global_run_unowned_and_renders_selection_preview(self):
         import rag_pdf_gradio_app as app
 
         app.LIVE_AUTOMATIC_RUN_STATUS = {}
@@ -9338,7 +9701,8 @@ class PipelineCoreTests(unittest.TestCase):
         # Selection preparation is browser-owned; reserving process-global run
         # ownership here could lock Confirm before an actual run exists.
         self.assertEqual(app.LIVE_AUTOMATIC_RUN_STATUS, {})
-        self.assertIn("Ready — Confirm", updates[0]["value"])
+        self.assertIn('data-run-state="selection_preparing"', updates[0]["value"])
+        self.assertIn("restoring settings and preparing the confirmation preview", updates[0]["value"])
         app.LIVE_AUTOMATIC_RUN_STATUS = {}
 
     def test_automatic_confirmation_uses_declared_chunk_overlap_field(self):
@@ -9582,7 +9946,7 @@ class PipelineCoreTests(unittest.TestCase):
                 "output_root_override": temp_dir,
             }
             try:
-                app.validated_automatic_run_settings = lambda values: (settings, None, [], True)
+                app.validated_automatic_run_settings = lambda values, **_kwargs: (settings, None, [], True)
                 app.run_automatic_from_confirmation = lambda *args, **kwargs: terminal
                 stream = app.run_automatic_from_confirmation_stream(*([None] * len(app.AUTOMATIC_RUN_FIELDS)))
                 preprocessing = next(stream)
@@ -9613,7 +9977,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertTrue(started[10]["interactive"])
         self.assertFalse(started[11]["visible"])
         self.assertEqual(observed_state["state"], "preparing")
-        self.assertEqual(observed_state["phase"], "Pre-processing complete — starting pipeline")
+        self.assertEqual(observed_state["phase"], "Pre-flight complete — starting run workspace")
         self.assertEqual(len(completed), 12)
         self.assertEqual(completed[9]["value"], "Processing successful ✓")
         self.assertEqual(completed[9]["variant"], "huggingface")
@@ -11467,6 +11831,39 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertTrue(result["accepted"])
         self.assertEqual(result["reason"], "clean_complete_ocr_recovery_from_absent_native_layer")
 
+    def test_clean_spread_ocr_can_replace_a_sparse_native_text_layer(self):
+        selected = {
+            "backend": "unstructured",
+            "segments": [{"pdf_page": page, "text": "body"} for page in range(1, 8)],
+            "quality": {
+                "included_pages": 7,
+                "included_words": 3_500,
+                "included_chars": 21_000,
+                "average_words_per_page": 500.0,
+                "replacement_chars": 0,
+                "ocr_layout_artifact_ratio": 0.0,
+            },
+            "native_chunk_eval": {"status": "pass"},
+        }
+        sparse_native = {
+            "backend": "pymupdf",
+            "segments": [{"pdf_page": 1}],
+            "quality": {
+                "included_pages": 1,
+                "included_words": 80,
+                "average_words_per_page": 80.0,
+                "scanned_likelihood": "possible",
+            },
+        }
+        result = pipeline.explainable_ocr_coverage_disagreement(
+            selected,
+            [sparse_native, selected],
+            {"pdf_page_count": 7},
+            {"used": True, "evidence": "unstructured_hi_res"},
+        )
+        self.assertTrue(result["accepted"])
+        self.assertTrue(result["checks"]["native_text_layer_unusable"])
+
     def test_clean_substantial_peer_keeps_ocr_coverage_disagreement_blocking(self):
         selected = {
             "backend": "unstructured",
@@ -12975,6 +13372,31 @@ class PipelineCoreTests(unittest.TestCase):
     def test_custom_range_control_is_editable_only_for_one_pdf_and_confirmation_keeps_reason(self):
         import rag_pdf_gradio_app as app
 
+        empty_scope, empty_range = app.native_upload_scope_batch_guard(
+            app.NATIVE_UPLOAD_SCOPE_CUSTOM_LABEL,
+            [],
+            [],
+            app.SEGMENT_PAGE_LIMIT_LABEL,
+        )
+        self.assertEqual(empty_scope["choices"], [app.NATIVE_UPLOAD_SCOPE_ALL_LABEL])
+        self.assertEqual(empty_scope["value"], app.NATIVE_UPLOAD_SCOPE_ALL_LABEL)
+        self.assertFalse(empty_range["visible"])
+        self.assertFalse(empty_range["interactive"])
+
+        single_all_scope, single_all_range = app.native_upload_scope_batch_guard(
+            app.NATIVE_UPLOAD_SCOPE_ALL_LABEL,
+            ["C:/single.pdf"],
+            [],
+            app.SEGMENT_PAGE_LIMIT_LABEL,
+        )
+        self.assertEqual(single_all_scope["choices"], [
+            app.NATIVE_UPLOAD_SCOPE_ALL_LABEL,
+            app.NATIVE_UPLOAD_SCOPE_CUSTOM_LABEL,
+        ])
+        self.assertEqual(single_all_scope["value"], app.NATIVE_UPLOAD_SCOPE_ALL_LABEL)
+        self.assertFalse(single_all_range["visible"])
+        self.assertFalse(single_all_range["interactive"])
+
         single_scope, single_range = app.native_upload_scope_batch_guard(
             app.NATIVE_UPLOAD_SCOPE_CUSTOM_LABEL,
             ["C:/single.pdf"],
@@ -13783,12 +14205,33 @@ class PipelineCoreTests(unittest.TestCase):
         selected["unstructured_strategy"] = "fast"
         self.assertEqual(pipeline.upload_block_reason_for_readiness(selected), "")
 
+    def test_upload_readiness_blocks_a_systematically_corrupted_native_text_layer(self):
+        selected = {
+            "backend": "pymupdf",
+            "readiness_reasons": ["unresolved_corrupted_text_layer"],
+        }
+        self.assertEqual(
+            pipeline.upload_block_reason_for_readiness(selected),
+            "unresolved_corrupted_text_layer",
+        )
+        guidance = pipeline.ocr_upload_hold_guidance(
+            "unresolved_corrupted_text_layer", selected["readiness_reasons"]
+        )
+        self.assertEqual(guidance["code"], "AUTO-TEXT-LAYER-REVIEW-001")
+        self.assertIn("systematically corrupted", guidance["message"])
+
     def test_photographed_spread_is_reported_but_not_an_upload_veto(self):
         selected = {
             "backend": "pymupdf",
             "readiness_reasons": ["photographed_spread_requires_manual_review"],
         }
         self.assertEqual(pipeline.upload_block_reason_for_readiness(selected), "")
+        selected.update(backend="unstructured", unstructured_strategy="hi_res")
+        self.assertEqual(
+            pipeline.upload_block_reason_for_readiness(selected),
+            "photographed_spread_requires_manual_review",
+        )
+        selected.update(backend="pymupdf", unstructured_strategy="")
         selected["readiness_reasons"].append("needs_unstructured_or_ocr")
         self.assertEqual(
             pipeline.upload_block_reason_for_readiness(selected),
@@ -16134,6 +16577,14 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertGreater(gutter, .46)
         self.assertLess(gutter, .54)
 
+        bright_gutter = Image.new("L", (900, 400), color=220)
+        draw = ImageDraw.Draw(bright_gutter)
+        draw.rectangle((430, 0, 470, 400), fill=255)
+        gutter = rag_pdf_tools.photographed_fold_gutter_fraction(bright_gutter, ImageStat)
+        self.assertIsNotNone(gutter)
+        self.assertGreater(gutter, .46)
+        self.assertLess(gutter, .54)
+
     def test_unrotated_photo_gate_requires_uneven_dark_border_evidence(self):
         from PIL import Image, ImageDraw, ImageStat
         import rag_pdf_tools
@@ -17920,6 +18371,7 @@ class PipelineCoreTests(unittest.TestCase):
         original_listener = pipeline.start_anythingllm_embed_progress_listener
         location = "custom-documents/source-atomic-staging-receipt.txt"
         post_started = threading.Event()
+        status_messages = []
 
         class FakeThread:
             def join(self, timeout=None):
@@ -17950,6 +18402,28 @@ class PipelineCoreTests(unittest.TestCase):
                         "chunkCount": 36,
                         "elapsed_ms": 100,
                         "provider_batch_size": 36,
+                    })
+                    observer({
+                        "type": "source_staging_provider_batch_retrying",
+                        "filename": location,
+                        "sourceKey": "probe.pdf",
+                        "batchIndex": "not-a-number",
+                        "attempt": "1",
+                        "http_status": "429",
+                        "error_class": "RateLimitError",
+                        "retry_delay_ms": "250",
+                    })
+                    # This event is deliberately high-frequency. It must
+                    # extend the owned source-staging activity lease without
+                    # surfacing a generic "unrecognized progress event" in
+                    # the browser callback.
+                    observer({
+                        "type": "source_staging_record",
+                        "filename": location,
+                        "sourceKey": "probe.pdf",
+                        "chunkCount": 1,
+                        "elapsed_ms": 260,
+                        "cacheResolution": "provider_staged",
                     })
                     # Simulate a coalesced second SSE batch: the terminal
                     # source event must restore it without double-counting
@@ -17988,6 +18462,7 @@ class PipelineCoreTests(unittest.TestCase):
                 batch_verifier=lambda report: {
                     "status": "pass", "matching_vector_rows": len(report["locations"]),
                 },
+                status_callback=lambda message, _report: status_messages.append(str(message)),
             )
         finally:
             pipeline.start_json_post_response_tracker = original_tracker
@@ -18001,6 +18476,11 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(snapshot["source_atomic_provider_batch_count"], 2)
         self.assertEqual(snapshot["source_atomic_provider_chunk_count"], 72)
         self.assertEqual(snapshot["source_atomic_provider_elapsed_ms"], 300)
+        self.assertEqual(snapshot["source_atomic_provider_retry_count"], 1)
+        self.assertEqual(snapshot["source_atomic_provider_last_retry"]["batch_index"], 0)
+        self.assertEqual(snapshot["source_atomic_provider_last_retry"]["retry_delay_ms"], 250)
+        self.assertFalse(any("unrecognized progress event" in message for message in status_messages))
+        self.assertFalse(any("one page-parent record" in message for message in status_messages))
         self.assertTrue(any(
             event.get("event") == "source_atomic_response_read_activity_lease"
             for event in result["runtime_events"]
@@ -20753,6 +21233,19 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(start_page, 3)
         self.assertEqual(reason, "opening_heading")
 
+    def test_late_outline_start_cannot_discard_most_of_a_prose_document(self):
+        pages = [
+            {"page": page, "text": "Dense argumentative prose sentence. " * 90}
+            for page in range(1, 24)
+        ]
+        outline = [{"level": 1, "title": "Introduction", "pdf_page": 21}]
+        stats = [pipeline.page_stats_for(page) for page in pages]
+
+        start_page, reason = pipeline.detect_body_start(pages, stats, outline=outline)
+
+        self.assertEqual(start_page, 1)
+        self.assertEqual(reason, "late_outline_start_conflicts_with_earlier_prose")
+
     def test_include_front_matter_starts_at_the_first_nonempty_page(self):
         pages = [
             {"page": 1, "text": "Title page\n\n" + ("Front matter prose. " * 50)},
@@ -20831,6 +21324,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertTrue(pipeline.is_reliable_structure_reference(quality, 12))
         self.assertFalse(pipeline.is_reliable_structure_reference({**quality, "included_words": 700}, 12))
         self.assertFalse(pipeline.is_reliable_structure_reference({**quality, "scanned_likelihood": "high"}, 12))
+        self.assertFalse(pipeline.is_reliable_structure_reference({**quality, "text_integrity_status": "review"}, 12))
 
     def test_prepared_pdf_text_filename_is_source_named_and_windows_safe(self):
         self.assertEqual(

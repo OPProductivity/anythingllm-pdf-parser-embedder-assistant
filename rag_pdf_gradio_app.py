@@ -200,6 +200,20 @@ TIMING_MODEL_RUNS_PATH = TIMING_MODEL_DIR / "timing-runs.jsonl"
 TIMING_MODEL_EVENTS_PATH = TIMING_MODEL_DIR / "timing-events.jsonl"
 DESKTOP_REFRESH_EVENTS_PATH = TIMING_MODEL_DIR / "desktop-refresh-events.jsonl"
 TIMING_MODEL_SUMMARY_PATH = TIMING_MODEL_DIR / "timing-model-summary.json"
+TIMING_MODEL_EVENT_HISTORY_SCHEMA_VERSION = 2
+# The global ETA model currently consumes only completed-phase durations. Full
+# queue, attachment, cache, and vector counter streams remain beside each run,
+# where they are useful for diagnosis without making every future ETA parse an
+# ever-growing copy of operational telemetry.
+TIMING_MODEL_GLOBAL_LEARNING_EVENTS = frozenset({"phase_completed"})
+TIMING_MODEL_EVENT_HISTORY_FIELDS = (
+    "schema_version",
+    "recorded_at",
+    "run_key",
+    "event",
+    "stage",
+    "phase_elapsed_seconds",
+)
 # A deliberate timing-history reset archives old observations but leaves their
 # output folders intact for ordinary run inspection.  This marker prevents the
 # optional summary backfill from silently teaching those archived runs to the
@@ -209,6 +223,8 @@ TIMING_MODEL_BACKFILL_CUTOVER_PATH = TIMING_MODEL_DIR / "timing-history-cutover.
 # read/prune/append sequence serial in this process so retention never races
 # an append and a partial malformed line does not poison future audits.
 PERSISTED_HISTORY_LOCK = threading.RLock()
+TIMING_MODEL_EVENT_COMPACTION_LOCK = threading.RLock()
+TIMING_MODEL_EVENT_COMPACTION_DONE = set()
 # Retention is intentionally outside the timing-event hot path. Desktop can
 # emit an observation every couple of seconds during a large queue; parsing a
 # growing year of JSONL before every append would turn harmless audit history
@@ -1480,13 +1496,19 @@ APP_JS = """
     render();
   };
   const wireAutomaticRunTimer = () => {
-    const host = document.getElementById("confirm-automatic-run-button");
-    const button = host?.querySelector("button") || host;
-    if (!button || button.dataset.ragRunTimerBound === "true") return;
-    button.dataset.ragRunTimerBound = "true";
-    button.addEventListener("click", () => {
+    const beginConfirmPresentation = (button) => {
       const shouldAcknowledge = !button.disabled
         && /confirm and start processing/i.test(button.textContent || "");
+      if (!shouldAcknowledge || button.dataset.ragClientConfirmPending === "true") return;
+      // This must run during capture, before Gradio's target-phase handler
+      // starts its queued request. A bubbling listener can arrive after Gradio
+      // has disabled or replaced the control, which leaves the click looking
+      // inert for several seconds even though the server has accepted it.
+      button.dataset.ragClientConfirmPending = "true";
+      button.setAttribute("aria-busy", "true");
+      button.disabled = true;
+      button.textContent = "Processing…";
+      button.classList.add("rag-run-processing", "rag-confirm-submitting");
       // The confirmation screen's ETA is a planning preview, not a
       // run-owned countdown.  Do not let it keep ticking after the click:
       // the first displayed run estimate must come from the worker's durable
@@ -1502,20 +1524,27 @@ APP_JS = """
         timer.dataset.expectedSeconds = "0";
         timer.innerHTML = "<strong>Est: calculating…</strong>";
       }
-      // Gradio's streaming callback yields before PDF inspection, but the
-      // request itself can still spend several seconds reaching that first
-      // server update. A microtask runs after the current click has propagated
-      // to Gradio, so this acknowledgement cannot prevent submission and is
-      // visible in the same browser frame.
-      queueMicrotask(() => {
-        if (!shouldAcknowledge) return;
-        button.dataset.ragClientConfirmPending = "true";
-        button.setAttribute("aria-busy", "true");
-        button.disabled = true;
-        button.textContent = "Processing…";
-        button.classList.add("rag-run-processing", "rag-confirm-submitting");
-      });
-    });
+      // Keep the fixed activity panel informative during the unavoidable
+      // browser-to-server hand-off. This is a client acknowledgement only;
+      // it does not claim that files or AnythingLLM have been changed.
+      const activity = document.querySelector(".automatic-run-activity");
+      const label = activity?.querySelector(".automatic-run-progress-label");
+      if (activity && label && activity.dataset.runState === "ready") {
+        activity.className = "automatic-run-activity preparing";
+        activity.dataset.runState = "preparing";
+        activity.dataset.cancelAvailable = "false";
+        activity.dataset.cancelRequested = "false";
+        label.innerHTML = "<strong>Overall progress: 0%</strong> <span>Starting processing…</span>";
+      }
+    };
+    if (document.documentElement.dataset.ragConfirmPresentationBound === "true") return;
+    document.documentElement.dataset.ragConfirmPresentationBound = "true";
+    document.addEventListener("click", (event) => {
+      const target = event.target instanceof Element
+        ? event.target.closest("#confirm-automatic-run-button button")
+        : null;
+      if (target) beginConfirmPresentation(target);
+    }, true);
   };
   const syncAutomaticRunTimer = () => {
     const timer = document.getElementById("automatic-run-timing");
@@ -4313,6 +4342,7 @@ body.dark .automatic-run-timing.cache-reuse-confirmed strong {
 .automatic-run-activity.warning { color: #a16207; }
 .automatic-run-activity.failed { color: #b91c1c; }
 .automatic-run-activity.ready { color: var(--body-text-color-subdued, #64748b); }
+.automatic-run-activity.selection-preparing { color: var(--body-text-color-subdued, #64748b); }
 .automatic-run-activity {
     /* Reserve the complete progress surface from Ready through terminal
        state. Previously only the inner running label had a minimum height,
@@ -4395,15 +4425,16 @@ body.dark .automatic-run-timing.cache-reuse-confirmed strong {
        scroll without changing either the card or surrounding controls. */
     height: 11em;
     min-height: 11em;
-    grid-template-rows: 1.25em minmax(0, 1fr) 3.75em;
+    grid-template-rows: 1.25em minmax(0, 1fr) auto;
 }
 .automatic-run-progress-label span { font-variant-numeric: tabular-nums; }
 .automatic-run-batch-timing {
-    /* Keep the PDF receipt, elapsed clock, and estimate in three stable rows
-       at the bottom of the card. This makes the status easy to scan without
-       leaving a misleading blank strip below it. */
-    min-height: 3.75em;
-    max-height: 3.75em;
+    /* The outer card remains fixed-height, while this lane uses only its
+       natural receipt/timer height and sits against the bottom edge. A fixed
+       3.75em lane left a conspicuous blank strip beneath Est during a run. */
+    align-self: end;
+    min-height: 0;
+    max-height: none;
     overflow: hidden;
     color: var(--body-text-color-subdued, #94a3b8);
     font-size: 0.92em;
@@ -4411,23 +4442,74 @@ body.dark .automatic-run-timing.cache-reuse-confirmed strong {
     padding-left: 0;
     text-indent: 0;
 }
+/* Ready-state ETA still lives in the separate 18px timer host immediately
+   below this card. During running/terminal states that host stays mounted to
+   preserve the page geometry, but its child is intentionally hidden because
+   ETA/Completed is rendered in the durable receipt lane above. Let that lane
+   occupy the retained 18px visually, instead of leaving an empty line under
+   Est. This changes paint position only: grid sizing and surrounding controls
+   remain fixed through every state transition. */
+.automatic-run-activity.running,
+.automatic-run-activity.preparing,
+.automatic-run-activity.successful,
+.automatic-run-activity.warning,
+.automatic-run-activity.failed,
+.automatic-run-activity.cancelled {
+    overflow: visible;
+}
+.automatic-run-activity.preparing .automatic-run-preflight-history {
+    /* Confirmed pre-flight renders its ETA inside the activity card while the
+       same 18px legacy timer host remains mounted below. Occupy that retained
+       lane just like the durable running receipt does. Selection preview and
+       Ready keep their external timer and are deliberately unaffected. */
+    transform: translateY(18px);
+}
+.automatic-run-activity.running .automatic-run-batch-timing,
+.automatic-run-activity.successful .automatic-run-batch-timing,
+.automatic-run-activity.warning .automatic-run-batch-timing,
+.automatic-run-activity.failed .automatic-run-batch-timing,
+.automatic-run-activity.cancelled .automatic-run-batch-timing {
+    transform: translateY(18px);
+}
 .automatic-run-batch-count { display: inline; }
-.automatic-run-activity.preparing .automatic-run-progress-label {
-    display: block;
+.automatic-run-activity.ready .automatic-run-progress-label,
+.automatic-run-activity.preparing .automatic-run-progress-label,
+.automatic-run-activity.selection-preparing .automatic-run-progress-label {
+    display: grid;
     /* Confirmation already owns the run. Reserve the same status-card height
        now so the first worker update cannot push the surrounding controls. */
+    height: 11em;
     min-height: 11em;
+    grid-template-rows: 1.25em minmax(0, 1fr) auto;
     padding-top: 3px;
     line-height: 1.2;
 }
-.automatic-run-activity.preparing .automatic-run-progress-label strong,
-.automatic-run-activity.preparing .automatic-run-progress-label span {
-    display: block;
+.automatic-run-preflight-title {
+    grid-row: 1;
+    grid-column: 1 / -1;
+    min-width: 0;
 }
-.automatic-run-activity.preparing .automatic-run-progress-label span {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+.automatic-run-preflight-history {
+    grid-row: 3;
+    grid-column: 1 / -1;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-wrap: anywhere;
+    color: var(--body-text-color-subdued, #94a3b8);
+    /* Match the ready-state and active-run timer typography exactly. */
+    font-size: 0.92em;
+    line-height: 1.25;
+    font-variant-numeric: tabular-nums;
+    padding: 2px 0;
+}
+.automatic-run-preflight-history div + div { margin-top: 2px; }
+.automatic-run-preflight-current {
+    grid-row: 2;
+    grid-column: 1 / -1;
+    min-width: 0;
+    overflow-wrap: anywhere;
+    padding-top: 3px;
+    align-self: start;
 }
 .automatic-run-progress-timing {
     display: inline;
@@ -4446,6 +4528,13 @@ body.dark .automatic-run-timing.cache-reuse-confirmed strong {
 .automatic-run-progress-timing-estimate {
     color: inherit;
     font-weight: 700;
+}
+.automatic-run-activity.running .automatic-run-progress-timing-estimate {
+    /* The receipt lane is intentionally compact, but the live estimate is
+       the primary glanceable value. Restore it to approximately the normal
+       activity-text size without enlarging PDFs completed or Elapsed. */
+    font-size: 1.1em;
+    line-height: 1.1;
 }
 .automatic-run-progress-timing.cache-reuse-confirmed .automatic-run-progress-timing-estimate {
     color: #15803d;
@@ -6576,8 +6665,8 @@ def current_anythingllm_engine_value():
     return (embed.get("engine") or "").strip()
 
 
-def current_anythingllm_chunk_size_value():
-    state = anythingllm_resolved_state(default_anythingllm_storage_dir(), runtime_verify=False)
+def current_anythingllm_chunk_size_value(resolved_state=None):
+    state = resolved_state or anythingllm_resolved_state(default_anythingllm_storage_dir(), runtime_verify=False)
     chunk = state["chunking"]
     try:
         return str(int(chunk.get("chunk_size") or 512))
@@ -6585,8 +6674,8 @@ def current_anythingllm_chunk_size_value():
         return "512"
 
 
-def current_anythingllm_chunk_overlap_value():
-    state = anythingllm_resolved_state(default_anythingllm_storage_dir(), runtime_verify=False)
+def current_anythingllm_chunk_overlap_value(resolved_state=None):
+    state = resolved_state or anythingllm_resolved_state(default_anythingllm_storage_dir(), runtime_verify=False)
     chunk = state["chunking"]
     try:
         return str(int(chunk.get("chunk_overlap") or 75))
@@ -7393,7 +7482,7 @@ def automatic_run_processing_settings(values):
     }
 
 
-def builtin_automatic_run_setting_values(pdf_files=None, folder_pdf_files=None):
+def builtin_automatic_run_setting_values(pdf_files=None, folder_pdf_files=None, *, resolved_anythingllm_state=None):
     """Return factory defaults before a private future-run profile is applied."""
     return {
         "pdf_files": pdf_files,
@@ -7442,8 +7531,8 @@ def builtin_automatic_run_setting_values(pdf_files=None, folder_pdf_files=None):
         "unstructured_strategy": "auto",
         "generate_inline_fallback": True,
         "inherit_anythingllm_settings": True,
-        "anythingllm_chunk_size": current_anythingllm_chunk_size_value(),
-        "anythingllm_chunk_overlap": current_anythingllm_chunk_overlap_value(),
+        "anythingllm_chunk_size": current_anythingllm_chunk_size_value(resolved_anythingllm_state),
+        "anythingllm_chunk_overlap": current_anythingllm_chunk_overlap_value(resolved_anythingllm_state),
         "auto_apply_recommended_settings": False,
         "download_full_folder": False,
         "download_segments_folder": False,
@@ -7459,9 +7548,13 @@ def normalized_automatic_output_mode(value):
     )
 
 
-def fresh_automatic_run_setting_values(pdf_files=None, folder_pdf_files=None):
+def fresh_automatic_run_setting_values(pdf_files=None, folder_pdf_files=None, *, resolved_anythingllm_state=None):
     """Return defaults for a new selection, never values from the prior run."""
-    builtin = builtin_automatic_run_setting_values(pdf_files, folder_pdf_files)
+    builtin = builtin_automatic_run_setting_values(
+        pdf_files,
+        folder_pdf_files,
+        resolved_anythingllm_state=resolved_anythingllm_state,
+    )
     saved = load_automatic_defaults(builtin)
     effective = builtin | saved["defaults"]
     effective["mode"] = normalized_automatic_output_mode(effective.get("mode"))
@@ -7605,7 +7698,19 @@ def request_automatic_default_editor_cancel(editor_state, *values):
 
 def refresh_automatic_run_estimate_for_fresh_selection(pdf_files=None, folder_pdf_files=None, folder_manifest=None):
     """Refresh ETA after the selection reset with only the fresh defaults."""
-    defaults = fresh_automatic_run_setting_values(pdf_files, folder_pdf_files)
+    # Resolve the immutable Desktop splitter snapshot once for this callback.
+    # The previous path independently characterized the same installation four
+    # times while the Confirm button waited, including repeated subprocess
+    # version probes that could not produce different values within one ETA.
+    resolved_state = anythingllm_resolved_state(
+        default_anythingllm_storage_dir(),
+        runtime_verify=False,
+    )
+    defaults = fresh_automatic_run_setting_values(
+        pdf_files,
+        folder_pdf_files,
+        resolved_anythingllm_state=resolved_state,
+    )
     return refresh_automatic_run_estimate(
         defaults["pdf_files"],
         defaults["folder_pdf_files"],
@@ -7623,6 +7728,7 @@ def refresh_automatic_run_estimate_for_fresh_selection(pdf_files=None, folder_pd
         folder_manifest=folder_manifest,
         api_url=defaults.get("api_url", ""),
         inherit_anythingllm_settings=defaults.get("inherit_anythingllm_settings"),
+        resolved_anythingllm_state=resolved_state,
     )
 
 
@@ -12080,7 +12186,7 @@ def automatic_selection_action_states(
             return (
                 gr.update(value="Confirm and start processing", interactive=False, variant="primary"),
                 gr.update(value="Cancel", interactive=False, visible=True),
-                gr.update(value=automatic_live_status_html({"state": "ready"}), visible=True),
+                gr.update(value=automatic_selection_preparing_status_html(pdf_files, folder_pdf_files), visible=True),
             )
     return (
         automatic_process_button_state(pdf_files, folder_pdf_files, folder_manifest),
@@ -12106,7 +12212,30 @@ def automatic_selection_pending_action_states(pdf_files=None, folder_pdf_files=N
             variant="primary",
         ),
         gr.update(value="Cancel", interactive=False, visible=True),
+        gr.update(
+            value=automatic_selection_preparing_status_html(pdf_files, folder_pdf_files),
+            visible=True,
+        ),
     )
+
+
+def automatic_selection_preparing_status_html(pdf_files=None, folder_pdf_files=None, *, detail=""):
+    """Render browser-owned picker work without creating a run lifecycle."""
+    selected_count = len(unique_local_path_strings(
+        normalize_file_list(pdf_files) + normalize_file_list(folder_pdf_files)
+    ))
+    current_detail = str(detail or "").strip()
+    if not current_detail:
+        current_detail = (
+            f"{selected_count} PDF(s) accepted — synchronizing selection settings, metadata, and estimate"
+            if selected_count
+            else "Waiting for the selected files, then building the preview"
+        )
+    return automatic_live_status_html({
+        "state": "selection_preparing",
+        "phase": "Preparing selection preview",
+        "details": current_detail,
+    })
 
 
 def _automatic_selection_begin_state(
@@ -12147,6 +12276,7 @@ def _automatic_selection_begin_state(
                 gr.update(),
                 gr.update(),
                 gr.update(),
+                gr.update(),
             )
     try:
         revision = max(0, int(state.get("revision") or 0)) + 1
@@ -12162,7 +12292,7 @@ def _automatic_selection_begin_state(
         # Returning a File value can cause some Gradio releases to emit a
         # second change for that identical value. It is an acknowledgement
         # replay, not a new selection transaction.
-        return state, str(_viewed_run_root or ""), gr.update(), gr.update(), gr.update(), gr.update()
+        return state, str(_viewed_run_root or ""), gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
     return (
         {
             "state": "pending",
@@ -12184,6 +12314,18 @@ def _automatic_selection_begin_state(
             variant="primary",
         ),
         gr.update(value="Cancel", interactive=False, visible=True),
+        gr.update(
+            value=automatic_selection_preparing_status_html(
+                pdf_files,
+                folder_pdf_files,
+                detail=(
+                    "Waiting for the folder choice; PDF discovery and preview will run next"
+                    if selection_not_yet_chosen
+                    else "Selected files received — synchronizing the preview before Confirm becomes available"
+                ),
+            ),
+            visible=True,
+        ),
     )
 
 
@@ -12670,6 +12812,41 @@ def concurrent_ingestion_progress_fraction(
         max(0.0, float(elapsed_seconds or 0.0) / presentation_expected),
     )
     return min(.95, min(evidence, elapsed_share + .05))
+
+
+def concurrent_preparation_progress_fraction(
+    evidence_fraction,
+    elapsed_seconds,
+    expected_seconds,
+    completed_source_share,
+    *,
+    presentation_expected_seconds=None,
+):
+    """Keep lengthy owned preparation from looking nearly idle.
+
+    Structured extraction callbacks remain the trigger; elapsed time alone
+    never moves the bar.  The lift is bounded both by the fraction of selected
+    sources that have actually reached this preparation checkpoint and by a
+    50% ceiling, leaving the entire latter half for Desktop ingestion and the
+    durable reporting tail.  Quick ordinary preparation therefore retains
+    its existing evidence percentages, while a genuinely long local phase no
+    longer spends half the run visually parked near 13%.
+    """
+    evidence = max(0.0, min(.50, float(evidence_fraction or 0.0)))
+    expected = max(0.0, float(expected_seconds or 0.0))
+    if expected <= 0.0:
+        return evidence
+    try:
+        presentation_expected = max(0.0, float(presentation_expected_seconds))
+    except (TypeError, ValueError):
+        presentation_expected = expected
+    if presentation_expected <= 0.0:
+        presentation_expected = expected
+    elapsed_share = min(.50, max(0.0, float(elapsed_seconds or 0.0) / presentation_expected))
+    source_ceiling = min(.50, max(0.0, float(completed_source_share or 0.0)) * .50)
+    return max(evidence, min(elapsed_share, source_ceiling))
+
+
 def raw_paced_progress_fraction(record, now=None):
     """Return the evidence-plus-time target before display smoothing."""
     now = time.time() if now is None else float(now)
@@ -12856,6 +13033,7 @@ def update_live_automatic_run_status(
     presentation_expected_seconds=None,
     eta_reprice_context=None,
     diagnostic_context=None,
+    preflight_status=None,
 ):
     """Persist progress evidence plus a deliberately capped time-based estimate.
 
@@ -13118,6 +13296,11 @@ def update_live_automatic_run_status(
             dict(diagnostic_context)
             if isinstance(diagnostic_context, dict)
             else {}
+        ),
+        "preflight_status": (
+            dict(preflight_status)
+            if isinstance(preflight_status, dict)
+            else dict(previous.get("preflight_status") or {})
         ),
         "eta_basis": resolved_eta_basis,
         "details": str(details or ""),
@@ -13519,12 +13702,46 @@ def automatic_live_status_html(status=None):
             '<div class="automatic-run-progress" role="progressbar" aria-label="Overall run progress" '
             'aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">'
             '<div class="automatic-run-progress-fill" style="width: 0%"></div></div>'
-            '<div class="automatic-run-progress-label"><strong>Overall progress: 0%</strong> '
-            '<span>Ready — Confirm to begin processing.</span></div></div>'
+            '<div class="automatic-run-progress-label">'
+            '<strong class="automatic-run-preflight-title">Overall progress: 0%</strong>'
+            '<div class="automatic-run-preflight-history"></div>'
+            '<div class="automatic-run-preflight-current">Ready — Confirm to begin processing.</div>'
+            '</div></div>'
+        )
+    if state == "selection_preparing":
+        phase = html.escape(str(record.get("phase") or "Preparing selection preview"))
+        details = html.escape(str(record.get("details") or "Synchronizing the selected files."))
+        return (
+            '<div class="automatic-run-activity selection-preparing" '
+            'data-run-state="selection_preparing" data-cancel-available="false" '
+            'data-cancel-requested="false">'
+            '<div class="automatic-run-progress" role="progressbar" '
+            'aria-label="Selection preview preparation" aria-valuemin="0" '
+            'aria-valuemax="100" aria-valuenow="0">'
+            '<div class="automatic-run-progress-fill" style="width: 0%"></div></div>'
+            '<div class="automatic-run-progress-label">'
+            f'<strong class="automatic-run-preflight-title">Selection preview in progress · {phase}</strong>'
+            '<div class="automatic-run-preflight-history"></div>'
+            f'<div class="automatic-run-preflight-current">{details}</div>'
+            '</div></div>'
         )
     if state == "preparing":
         phase = html.escape(str(record.get("phase") or "Pre-processing"))
         details = html.escape(str(record.get("details") or "Preparing the confirmed document run."))
+        preflight_status = record.get("preflight_status")
+        preflight_status = preflight_status if isinstance(preflight_status, dict) else {}
+        current_step = html.escape(
+            str(preflight_status.get("current_step") or details or "Preparing the confirmed document run.")
+        )
+        try:
+            preflight_expected_seconds = max(0, int(record.get("expected_seconds") or 0))
+        except (TypeError, ValueError):
+            preflight_expected_seconds = 0
+        preflight_estimate = (
+            f"Est: {format_estimate_clock(preflight_expected_seconds)} · initial estimate"
+            if preflight_expected_seconds
+            else "Est: calculating…"
+        )
         cancel_available = "true" if record.get("cancel_available", False) else "false"
         cancel_requested = "true" if record.get("cancel_requested", False) else "false"
         return (
@@ -13533,8 +13750,11 @@ def automatic_live_status_html(status=None):
             '<div class="automatic-run-progress" role="progressbar" aria-label="Overall run progress" '
             'aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">'
             '<div class="automatic-run-progress-fill" style="width: 0%"></div></div>'
-            '<div class="automatic-run-progress-label"><strong>Overall progress: 0%</strong> '
-            f'<span>{phase} — {details}</span></div></div>'
+            '<div class="automatic-run-progress-label">'
+            f'<strong class="automatic-run-preflight-title">Overall progress: 0% · {phase}</strong>'
+            f'<div class="automatic-run-preflight-history"><strong class="automatic-run-progress-timing-estimate">{html.escape(preflight_estimate)}</strong></div>'
+            f'<div class="automatic-run-preflight-current">{current_step}</div>'
+            '</div></div>'
         )
     raw_phase = str(record.get("phase") or "Working")
     phase = html.escape(raw_phase)
@@ -13951,8 +14171,20 @@ def reset_automatic_run_presentation(pdf_files=None, folder_pdf_files=None):
     # prevents the independent status timer from mistaking an ordinary file
     # selection for a confirmed run and permanently disabling Confirm.
     LIVE_AUTOMATIC_RUN_STATUS = {}
+    selection_paths_present = bool(
+        normalize_file_list(pdf_files) or normalize_file_list(folder_pdf_files)
+    )
+    activity_html = (
+        automatic_selection_preparing_status_html(
+            pdf_files,
+            folder_pdf_files,
+            detail="Selected files accepted — restoring settings and preparing the confirmation preview",
+        )
+        if selection_paths_present
+        else automatic_live_status_html({"state": "ready"})
+    )
     return (
-        gr.update(value=automatic_live_status_html({"state": "ready"}), visible=True),
+        gr.update(value=activity_html, visible=True),
         gr.update(value=automatic_run_timing_html(state="ready")),
         # The retired review control stays mounted but invisible to preserve
         # the long-lived Gradio output contract without a second action.
@@ -16226,6 +16458,140 @@ def _append_timing_jsonl(path, record):
         APP_LOGGER.warning("could not persist timing-model record: %s", exc)
 
 
+def compact_global_timing_event(record):
+    """Return the minimal historical row actually consumed by the ETA model."""
+    source = dict(record or {})
+    event_name = str(source.get("event") or "")
+    if event_name not in TIMING_MODEL_GLOBAL_LEARNING_EVENTS:
+        return None
+    return {
+        "schema_version": TIMING_MODEL_EVENT_HISTORY_SCHEMA_VERSION,
+        "recorded_at": str(source.get("recorded_at") or ""),
+        "run_key": str(source.get("run_key") or ""),
+        "event": event_name,
+        "stage": str(source.get("stage") or ""),
+        "phase_elapsed_seconds": round(float(source.get("phase_elapsed_seconds") or 0), 3),
+    }
+
+
+def _timing_event_history_schema_path(path):
+    return Path(path).with_name(f"{Path(path).stem}-schema.json")
+
+
+def compact_timing_model_event_history(path=None, *, retain_archive=True):
+    """Migrate the old wide global event stream without losing learned timings.
+
+    Per-run timelines retain the detailed counter evidence. The global file is
+    rebuilt from completed-phase observations because those are the only event
+    rows read by ``timing_stage_prior_seconds``. A compressed one-time archive
+    preserves the pre-migration file for manual audit without putting it back
+    on the preview hot path.
+    """
+    history_path = Path(path or TIMING_MODEL_EVENTS_PATH)
+    schema_path = _timing_event_history_schema_path(history_path)
+    result = {
+        "status": "not_needed",
+        "source_records": 0,
+        "learning_records": 0,
+        "source_bytes": 0,
+        "compacted_bytes": 0,
+        "archive": "",
+    }
+    with TIMING_MODEL_EVENT_COMPACTION_LOCK, PERSISTED_HISTORY_LOCK:
+        try:
+            if schema_path.exists():
+                marker = json.loads(schema_path.read_text(encoding="utf-8"))
+                if int(marker.get("schema_version") or 0) >= TIMING_MODEL_EVENT_HISTORY_SCHEMA_VERSION:
+                    return dict(result, status="already_compact")
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+        if not history_path.exists():
+            history_path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(schema_path, json.dumps({
+                "schema_version": TIMING_MODEL_EVENT_HISTORY_SCHEMA_VERSION,
+                "migrated_at": datetime.now().isoformat(timespec="seconds"),
+                "source_records": 0,
+                "learning_records": 0,
+            }, indent=2))
+            return dict(result, status="initialized")
+        temporary_path = None
+        archive_path = None
+        source_records = 0
+        learning_records = 0
+        source_bytes = history_path.stat().st_size
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=history_path.parent,
+                prefix=f".{history_path.name}.",
+                suffix=".compact.tmp",
+                delete=False,
+            ) as handle:
+                temporary_path = Path(handle.name)
+                with history_path.open("r", encoding="utf-8") as source_handle:
+                    for line in source_handle:
+                        if not line.strip():
+                            continue
+                        source_records += 1
+                        try:
+                            compact = compact_global_timing_event(json.loads(line))
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            compact = None
+                        if compact is None:
+                            continue
+                        handle.write(json.dumps(compact, ensure_ascii=False, sort_keys=True) + "\n")
+                        learning_records += 1
+                handle.flush()
+                os.fsync(handle.fileno())
+            if retain_archive and source_bytes:
+                stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+                archive_path = history_path.with_name(f"{history_path.stem}-legacy-wide-{stamp}.zip")
+                with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+                    archive.write(history_path, arcname=history_path.name)
+            os.replace(temporary_path, history_path)
+            temporary_path = None
+            compacted_bytes = history_path.stat().st_size
+            marker = {
+                "schema_version": TIMING_MODEL_EVENT_HISTORY_SCHEMA_VERSION,
+                "migrated_at": datetime.now().isoformat(timespec="seconds"),
+                "source_records": source_records,
+                "learning_records": learning_records,
+                "source_bytes": source_bytes,
+                "compacted_bytes": compacted_bytes,
+                "archive": str(archive_path or ""),
+                "global_policy": "completed_phase_learning_rows_only; detailed counters remain per run",
+            }
+            atomic_write_text(schema_path, json.dumps(marker, indent=2))
+            APP_LOGGER.info(
+                "compacted global timing-event history from %s records/%s bytes to %s records/%s bytes",
+                source_records,
+                source_bytes,
+                learning_records,
+                compacted_bytes,
+            )
+            return dict(marker, status="compacted")
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+
+def ensure_compact_timing_model_event_history(path=None):
+    """Run the versioned migration at most once per event-history path."""
+    history_path = Path(path or TIMING_MODEL_EVENTS_PATH)
+    try:
+        key = str(history_path.resolve()).casefold()
+    except OSError:
+        key = str(history_path.absolute()).casefold()
+    with TIMING_MODEL_EVENT_COMPACTION_LOCK:
+        if key in TIMING_MODEL_EVENT_COMPACTION_DONE:
+            return {"status": "already_checked"}
+        result = compact_timing_model_event_history(history_path)
+        if result.get("status") != "error":
+            TIMING_MODEL_EVENT_COMPACTION_DONE.add(key)
+        return result
+
+
 def _maybe_prune_background_jsonl(path, *, now=None):
     """Run retention once per path per day, never once per queue observation."""
     timestamp = time.time() if now is None else float(now)
@@ -16253,13 +16619,45 @@ def _maybe_prune_background_jsonl(path, *, now=None):
     return result
 
 
+def _tail_jsonl_lines(path, limit):
+    """Read a bounded logical tail without loading a multi-megabyte history."""
+    history_path = Path(path)
+    wanted = max(1, int(limit))
+    block_size = 256 * 1024
+    chunks = []
+    newline_count = 0
+    with history_path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        position = handle.tell()
+        while position > 0 and newline_count <= wanted:
+            size = min(block_size, position)
+            position -= size
+            handle.seek(position)
+            chunk = handle.read(size)
+            chunks.append(chunk)
+            newline_count += chunk.count(b"\n")
+    data = b"".join(reversed(chunks))
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    # When a bounded read started in the middle of a record, discard that
+    # partial first line. UTF-8 replacement is therefore never model input.
+    if position > 0 and lines:
+        lines = lines[1:]
+    return lines[-wanted:]
+
+
 def _read_timing_jsonl(path, limit=240):
     history_path = Path(path)
     if not history_path.exists():
         return []
     try:
+        try:
+            is_global_event_history = history_path.resolve() == Path(TIMING_MODEL_EVENTS_PATH).resolve()
+        except OSError:
+            is_global_event_history = str(history_path.absolute()).casefold() == str(Path(TIMING_MODEL_EVENTS_PATH).absolute()).casefold()
+        if is_global_event_history:
+            ensure_compact_timing_model_event_history(history_path)
         with PERSISTED_HISTORY_LOCK:
-            lines = history_path.read_text(encoding="utf-8").splitlines()
+            lines = _tail_jsonl_lines(history_path, limit)
         rows = []
         malformed = 0
         for line in lines:
@@ -16550,7 +16948,13 @@ def automatic_full_native_text_coverage(path):
     return result
 
 
-def automatic_ocr_preflight_manifest(files, *, backend_mode="Automatic", unstructured_strategy="auto"):
+def automatic_ocr_preflight_manifest(
+    files,
+    *,
+    backend_mode="Automatic",
+    unstructured_strategy="auto",
+    progress_callback=None,
+):
     """Build one run-scoped OCR-risk manifest before confirmation.
 
     It samples three representative pages for timing, then checks native text
@@ -16564,14 +16968,44 @@ def automatic_ocr_preflight_manifest(files, *, backend_mode="Automatic", unstruc
     but do not trigger a whole-document OCR import.
     """
     rows = []
-    for raw_path in files or []:
+    source_paths = list(files or [])
+    source_total = len(source_paths)
+
+    def publish(stage, source_index=0, path=None, **fields):
+        """Emit coarse observational stages without influencing preflight."""
+        if not callable(progress_callback):
+            return
+        try:
+            progress_callback({
+                "state": stage,
+                "source_index": max(0, int(source_index or 0)),
+                "source_total": source_total,
+                "path": str(path or ""),
+                **fields,
+            })
+        except Exception:
+            # UI status is advisory. A failed repaint must never weaken the
+            # immutable preflight or make Confirm fail spuriously.
+            APP_LOGGER.debug("automatic OCR preflight status callback failed", exc_info=True)
+
+    for source_index, raw_path in enumerate(source_paths, start=1):
         path = Path(raw_path)
+        publish("source_started", source_index, path)
         try:
             source_version = local_source_version(path)
         except OSError:
             source_version = {}
+        publish("identity_checked", source_index, path)
         profile = automatic_timing_document_profile([path], page_sample_limit=3)
         risk = automatic_ocr_preflight_risk(profile)
+        page_count = max(0, int(profile.get("page_count") or 0))
+        publish(
+            "profile_complete", source_index, path,
+            page_count=page_count,
+            sampled_pages=max(0, int(profile.get("sampled_pages") or 0)),
+        )
+        publish("coverage_started", source_index, path, page_count=page_count)
+        coverage_origin = "checked"
         try:
             # A large folder preview already read every physical page. Its
             # short-lived exact-version snapshot is independent of the small
@@ -16580,8 +17014,16 @@ def automatic_ocr_preflight_manifest(files, *, backend_mode="Automatic", unstruc
             coverage = batch_native_inspection_coverage(path)
             if coverage is None:
                 coverage = pdf_picker_native_inspection(path)["coverage"]
+            else:
+                coverage_origin = "batch_cache"
         except Exception:
             coverage = automatic_full_native_text_coverage(path)
+            coverage_origin = "fallback_check"
+        publish(
+            "coverage_complete", source_index, path,
+            page_count=max(0, int(coverage.get("page_count") or page_count)),
+            coverage_origin=coverage_origin,
+        )
         low_text_pages = list(coverage.get("low_text_pages") or [])
         image_backed_low_text_pages = list(coverage.get("image_backed_low_text_pages") or [])
         blank_pages = list(coverage.get("blank_pages") or [])
@@ -16653,6 +17095,7 @@ def automatic_ocr_preflight_manifest(files, *, backend_mode="Automatic", unstruc
                 else "Use native text; no document-wide OCR evidence"
             ),
         })
+        publish("source_completed", source_index, path, risk=risk, page_count=page_count)
     normalized_backend = str(backend_mode or "Automatic").casefold()
     normalized_strategy = str(unstructured_strategy or "auto").casefold()
     likely = [row for row in rows if row["risk"] == "likely"]
@@ -16669,6 +17112,7 @@ def automatic_ocr_preflight_manifest(files, *, backend_mode="Automatic", unstruc
         "tesseract_available": None,
     }
     if likely or targeted or ocr_explicit:
+        publish("ocr_runtime_started")
         try:
             runtime = dict(unstructured_runtime_status("hi_res"))
             runtime["status"] = (
@@ -16683,6 +17127,7 @@ def automatic_ocr_preflight_manifest(files, *, backend_mode="Automatic", unstruc
                 "tesseract_available": False,
                 "error": f"{type(exc).__name__}: {exc}",
             }
+        publish("ocr_runtime_complete", runtime_status=str(runtime.get("status") or "unknown"))
     warnings = []
     guidance = []
     if likely:
@@ -16734,7 +17179,7 @@ def automatic_ocr_preflight_manifest(files, *, backend_mode="Automatic", unstruc
         )
     if ocr_explicit and runtime.get("status") != "ready":
         warnings.append("The selected Unstructured OCR strategy cannot run until both Unstructured and Tesseract are available.")
-    return {
+    manifest = {
         "schema_version": 2,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "sample_policy": "three_evenly_spaced_native_pages_per_pdf",
@@ -16750,6 +17195,13 @@ def automatic_ocr_preflight_manifest(files, *, backend_mode="Automatic", unstruc
         "guidance": guidance,
         "status": "blocked" if ocr_explicit and runtime.get("status") != "ready" else ("warning" if warnings else "clear"),
     }
+    publish(
+        "manifest_complete",
+        source_index=source_total,
+        checked_sources=source_total,
+        manifest_status=manifest["status"],
+    )
+    return manifest
 
 
 def automatic_timing_profile_document_limit(files):
@@ -19998,6 +20450,7 @@ def estimate_automatic_run(
     local_check_mode="",
     profile_document_limit=None,
     ocr_preflight_manifest=None,
+    resolved_anythingllm_state=None,
 ):
     # Backfill can scan historic artifacts. It belongs to startup/diagnostic
     # maintenance (``timing_model_html``), never to the Confirm/ETA path.
@@ -20013,8 +20466,8 @@ def estimate_automatic_run(
         # the active Desktop splitter now so the ETA sees the same ceiling the
         # segment harmonizer will actually enforce. Leave ``None`` untouched
         # for lightweight UI refreshes that only know their visible controls.
-        effective_chunk_size = current_anythingllm_chunk_size_value()
-        effective_chunk_overlap = current_anythingllm_chunk_overlap_value()
+        effective_chunk_size = current_anythingllm_chunk_size_value(resolved_anythingllm_state)
+        effective_chunk_overlap = current_anythingllm_chunk_overlap_value(resolved_anythingllm_state)
     simulation_engine, simulation_model = timing_local_simulation_identity(local_check_mode)
     features = timing_model_features(
         profile, mode, native_upload_scope,
@@ -20756,6 +21209,20 @@ def record_timing_model_event(run_root, stage, batch_report=None):
         "desktop_queue_records_per_minute": batch.get("desktop_queue_records_per_minute"),
         "desktop_queue_estimated_remaining_seconds": batch.get("desktop_queue_estimated_remaining_seconds"),
         "desktop_queue_observer_state": str(batch.get("desktop_queue_observer_state") or ""),
+        # Source-atomic events are not ordinary queue counters.  Preserve the
+        # causal identity needed to reconstruct an individual provider
+        # request, while intentionally omitting PDF text and API material.
+        "source_atomic_source_key": str(batch.get("source_atomic_source_key") or ""),
+        "source_atomic_filename": str(batch.get("source_atomic_filename") or ""),
+        "source_atomic_batch_index": batch.get("source_atomic_batch_index"),
+        "source_atomic_attempt": batch.get("source_atomic_attempt"),
+        "source_atomic_attempt_id": str(batch.get("source_atomic_attempt_id") or ""),
+        "source_atomic_chunk_count": batch.get("source_atomic_chunk_count"),
+        "source_atomic_request_timeout_ms": batch.get("source_atomic_request_timeout_ms"),
+        "source_atomic_elapsed_ms": batch.get("source_atomic_elapsed_ms"),
+        "source_atomic_cache_resolved_records": batch.get("source_atomic_cache_resolved_records"),
+        "source_atomic_provider_required_records": batch.get("source_atomic_provider_required_records"),
+        "source_atomic_provider_chunks": batch.get("source_atomic_provider_chunks"),
         "submission_state": str(batch.get("submission_state") or ""),
         "backend": str(batch.get("backend") or ""),
         "candidate_success": bool(batch.get("candidate_success")),
@@ -20799,7 +21266,14 @@ def record_timing_model_event(run_root, stage, batch_report=None):
     should_persist = semantic_boundary or due_for_timing_snapshot
     if not should_persist:
         return False
-    _append_timing_jsonl(TIMING_MODEL_EVENTS_PATH, event)
+    # Only model-consumed learning boundaries belong in the global history.
+    # The full event still goes to this run's own timeline below. Previously,
+    # every changing x/y counter was copied globally as a wide row even though
+    # no ETA reader consumed it; that made preview latency grow with history.
+    compact_learning_event = compact_global_timing_event(event)
+    if compact_learning_event is not None:
+        ensure_compact_timing_model_event_history(TIMING_MODEL_EVENTS_PATH)
+        _append_timing_jsonl(TIMING_MODEL_EVENTS_PATH, compact_learning_event)
     # The aggregate model is useful for future estimates, but it forces an
     # operator investigating one slow PDF to sift through unrelated runs.
     # Keep a parallel, privacy-minimal timeline beside that run's artifacts.
@@ -20842,6 +21316,7 @@ def refresh_automatic_run_estimate(
     folder_manifest=None,
     api_url="",
     inherit_anythingllm_settings=None,
+    resolved_anythingllm_state=None,
     *,
     profile_document_limit=None,
 ):
@@ -20898,6 +21373,7 @@ def refresh_automatic_run_estimate(
         inherit_anythingllm_settings=inherit_anythingllm_settings,
         local_check_mode=local_check_mode,
         profile_document_limit=effective_profile_document_limit,
+        resolved_anythingllm_state=resolved_anythingllm_state,
     )
     if int((estimate.get("profile") or {}).get("missing_inputs") or 0) > 0:
         # This is a non-authoritative UI race, not a source-preflight result.
@@ -21690,6 +22166,15 @@ def automatic_batch_diagnostics_required(
         "AUTO-DOCUMENT-LIST-OBSERVATION-001",
     }:
         return True
+    if completion.get("code") in {
+        "AUTO-OCR-REVIEW-PARTIAL-001",
+        "AUTO-LAYOUT-REVIEW-PARTIAL-001",
+    }:
+        # These are source-local pre-upload holds. Submitted sources already
+        # have exact vector evidence, while held sources never mutated the
+        # workspace; a global LanceDB scan cannot resolve their OCR/layout
+        # question and only adds an alarming, irrelevant terminal phase.
+        return False
     return completion.get("state") != "successful"
 
 
@@ -22009,7 +22494,7 @@ def automatic_confirmation_failure_response(code, title, details, next_steps=Non
     )
 
 
-def validated_automatic_run_settings(values):
+def validated_automatic_run_settings(values, *, preflight_progress_callback=None):
     """Build one canonical automatic-run settings dictionary from UI values.
 
     Both Review and Confirm use this function.  Confirm deliberately receives
@@ -22017,6 +22502,14 @@ def validated_automatic_run_settings(values):
     its request self-contained and prevents a lost client-side State update
     from turning a visible Confirm click into a no-op.
     """
+    def publish_confirmation_stage(stage, **fields):
+        if not callable(preflight_progress_callback):
+            return
+        try:
+            preflight_progress_callback({"state": stage, **fields})
+        except Exception:
+            APP_LOGGER.debug("automatic confirmation status callback failed", exc_info=True)
+
     core_values = tuple(values[: len(AUTOMATIC_RUN_FIELDS)])
     settings = dict(zip(AUTOMATIC_RUN_FIELDS, core_values, strict=True))
     requested_workspace_name = (
@@ -22108,6 +22601,7 @@ def validated_automatic_run_settings(values):
         files,
         backend_mode=settings.get("backend_mode", "Automatic"),
         unstructured_strategy=settings.get("unstructured_strategy", "auto"),
+        progress_callback=preflight_progress_callback,
     )
     settings["ocr_preflight_manifest"] = ocr_preflight_manifest
     if settings["mode"] != MODE_NATIVE_UPLOAD_LABEL:
@@ -22129,6 +22623,7 @@ def validated_automatic_run_settings(values):
     # the CLI before an ETA is displayed or a run folder is reserved.  Keep
     # the resulting object local: runtime callbacks, resolved credentials, and
     # timing evidence deliberately remain outside this user-intent contract.
+    publish_confirmation_stage("request_validation_started", source_total=len(files))
     try:
         RunRequest.from_automatic_settings(
             settings,
@@ -22155,6 +22650,8 @@ def validated_automatic_run_settings(values):
             [],
             False,
         )
+    publish_confirmation_stage("request_validation_complete", source_total=len(files))
+    publish_confirmation_stage("estimate_started", source_total=len(files))
     estimate = estimate_automatic_run(
         files,
         settings["mode"],
@@ -22176,6 +22673,11 @@ def validated_automatic_run_settings(values):
     settings["estimate_source"] = estimate["source"]
     settings["estimate_comparable_runs"] = estimate.get("comparable_runs", 0)
     settings["timing_estimate"] = estimate
+    publish_confirmation_stage(
+        "estimate_complete",
+        source_total=len(files),
+        expected_seconds=max(0, int(estimate.get("expected_seconds") or 0)),
+    )
     warnings = []
     if (
         settings.get("batch_metadata_shared_fields_ignored")
@@ -22205,6 +22707,12 @@ def validated_automatic_run_settings(values):
         "blocked" in warning.casefold() or "custom upload range is invalid" in warning.casefold()
         for warning in warnings
     ) and ocr_preflight_manifest.get("status") != "blocked"
+    publish_confirmation_stage(
+        "confirmation_validation_complete",
+        source_total=len(files),
+        allowed=bool(allowed),
+        warning_count=len(warnings),
+    )
     return settings, None, warnings, allowed
 
 
@@ -22319,6 +22827,13 @@ def dispatch_confirmed_automatic_run(settings, *, progress):
         ocr_preflight_manifest=settings.get("ocr_preflight_manifest"),
         estimate_comparable_runs=settings.get("estimate_comparable_runs"),
         run_root_override=str(settings.get("_reserved_run_root") or "") or None,
+        confirmed_files=list(settings.get("files") or []),
+        confirmation_preflight_elapsed_seconds=settings.get(
+            "_confirmation_preflight_elapsed_seconds", 0.0
+        ),
+        confirmation_preflight_status_events=settings.get(
+            "_confirmation_preflight_status_events", []
+        ),
         retain_detailed_evidence=bool(settings.get("retain_detailed_evidence")),
         preflight_compatibility_report=settings.get("_preflight_compatibility_report"),
         progress=progress,
@@ -22617,8 +23132,115 @@ def _run_automatic_from_confirmation_stream_body(
     # transient browser stream replacement cannot hide the first click.
     if not _confirmation_preclaimed:
         yield automatic_preprocessing_started_response()
+    preflight_started_at = time.perf_counter()
+    preflight_status_events = []
+    preflight_completed_sources = set()
+
+    def preflight_progress_line(source_total):
+        checked = len(preflight_completed_sources)
+        return (
+            f"{checked}/{source_total} PDF(s) fully checked: source identity, page sampling, "
+            "all-page native coverage, and OCR policy."
+        )
+
+    def report_confirmation_preflight(event):
+        """Publish the otherwise invisible full-PDF preflight as it runs.
+
+        The all-page native-text scan is still required for the targeted-OCR
+        contract.  Reporting it source-by-source avoids the former silent
+        10--20 second window between the Confirm acknowledgement and the
+        first durable pipeline description.
+        """
+        payload = dict(event or {})
+        source_index = max(0, int(payload.get("source_index") or 0))
+        source_total = max(0, int(payload.get("source_total") or 0))
+        source_name = Path(str(payload.get("path") or "selected PDF")).name
+        state = str(payload.get("state") or "updated").casefold()
+        page_count = max(0, int(payload.get("page_count") or 0))
+        source_prefix = f"PDF {source_index}/{source_total}" if source_total else "Batch"
+        if state == "source_started":
+            detail = f"{source_prefix} — verifying source identity for {source_name}"
+        elif state == "identity_checked":
+            detail = f"{source_prefix} — sampling representative pages for timing and text/image signals"
+        elif state == "profile_complete":
+            detail = f"{source_prefix} — preparing the all-page coverage inspection for {page_count} page(s)"
+        elif state == "coverage_started":
+            detail = (
+                f"{source_prefix} — inspecting all {page_count} page(s) for native text and OCR signals"
+                if page_count else f"{source_prefix} — inspecting all pages for native text and OCR signals"
+            )
+        elif state == "coverage_complete":
+            reused = str(payload.get("coverage_origin") or "") == "batch_cache"
+            detail = (
+                f"{source_prefix} — exact picker coverage reused; counting low-text, image-backed, blank, and sparse pages"
+                if reused else f"{source_prefix} — coverage available; counting low-text, image-backed, blank, and sparse pages"
+            )
+        elif state == "source_completed":
+            if source_index not in preflight_completed_sources:
+                preflight_completed_sources.add(source_index)
+            detail = f"{source_prefix} — recording the source-specific coverage and OCR decision for {source_name}"
+        elif state == "ocr_runtime_started":
+            detail = "Batch — checking that the required OCR runtime is available"
+        elif state == "ocr_runtime_complete":
+            detail = "Batch — OCR runtime capability check complete"
+        elif state == "manifest_complete":
+            detail = f"Pre-flight source checks complete for {source_total} PDF(s) — summarizing the manifest"
+        elif state == "request_validation_started":
+            detail = "Validating the immutable run request and cross-field compatibility"
+        elif state == "request_validation_complete":
+            detail = "Run request validated — preparing the reviewed time estimate"
+        elif state == "estimate_started":
+            detail = "Calculating the initial estimate from pages, OCR evidence, segmentation, and upload scope"
+        elif state == "estimate_complete":
+            detail = "Initial estimate calculated — checking warnings and start eligibility"
+        elif state == "confirmation_validation_complete":
+            detail = "Pre-flight complete — reserving run output and handing off to PDF preparation"
+        else:
+            detail = f"{source_prefix} — pre-flight checks are continuing"
+        if state.startswith("ocr_runtime_"):
+            phase = "Pre-flight: checking OCR capability"
+        elif state.startswith("request_validation_"):
+            phase = "Pre-flight: validating run request"
+        elif state.startswith("estimate_"):
+            phase = "Pre-flight: calculating run estimate"
+        elif state == "confirmation_validation_complete":
+            phase = "Pre-flight: completing start checks"
+        else:
+            phase = "Pre-flight: inspecting selected PDFs"
+        preflight_status_events.append({
+            "elapsed_seconds": round(max(0.0, time.perf_counter() - preflight_started_at), 3),
+            "state": state or "updated",
+            "source_index": source_index,
+            "source_total": source_total,
+            "source_name": source_name,
+            "risk": str(payload.get("risk") or ""),
+            "page_count": page_count,
+            "coverage_origin": str(payload.get("coverage_origin") or ""),
+        })
+        del preflight_status_events[:-96]
+        update_live_automatic_run_status(
+            state="preparing",
+            phase=phase,
+            expected_seconds=max(0, int(payload.get("expected_seconds") or 0)),
+            details=detail,
+            confirmed_fraction=0.0,
+            cancel_available=False,
+            confirmation_in_flight=True,
+            confirmation_owner_token=confirmation_owner_token,
+            preflight_status={
+                "current_step": preflight_progress_line(source_total),
+                "event_count": len(preflight_status_events),
+            },
+        )
     try:
-        settings, validation_report, _warnings, allowed = validated_automatic_run_settings(values)
+        settings, validation_report, _warnings, allowed = validated_automatic_run_settings(
+            values,
+            preflight_progress_callback=report_confirmation_preflight,
+        )
+        settings["_confirmation_preflight_elapsed_seconds"] = round(
+            max(0.0, time.perf_counter() - preflight_started_at), 3
+        )
+        settings["_confirmation_preflight_status_events"] = list(preflight_status_events)
         if len(values) > len(AUTOMATIC_RUN_FIELDS) + 1:
             settings["retain_detailed_evidence"] = bool(
                 values[len(AUTOMATIC_RUN_FIELDS) + 1]
@@ -22704,9 +23326,16 @@ def _run_automatic_from_confirmation_stream_body(
         update_live_automatic_run_status(
             reserved_run_root,
             state="preparing",
-            phase="Pre-processing complete — starting pipeline",
+            phase="Pre-flight complete — starting run workspace",
             expected_seconds=settings.get("expected_seconds", 0),
-            details="Run folder reserved; cancellation is available while the pipeline starts.",
+            details=(
+                f"Native text and OCR signals were checked for {len(settings.get('files') or [])} selected PDF(s). "
+                "Run output is reserved; PDF preparation begins next."
+            ),
+            preflight_status={
+                "current_step": preflight_progress_line(len(settings.get("files") or [])),
+                "event_count": len(preflight_status_events),
+            },
             confirmed_fraction=0.0,
             cancel_available=True,
         )
@@ -22719,9 +23348,16 @@ def _run_automatic_from_confirmation_stream_body(
     if not settings.get("_reserved_run_root"):
         update_live_automatic_run_status(
             state="preparing",
-            phase="Pre-processing complete — starting pipeline",
+            phase="Pre-flight complete — starting run workspace",
             expected_seconds=settings.get("expected_seconds", 0),
-            details="Native text coverage and OCR-risk checks completed.",
+            details=(
+                f"Native text and OCR signals were checked for {len(settings.get('files') or [])} selected PDF(s). "
+                "Starting the pipeline."
+            ),
+            preflight_status={
+                "current_step": preflight_progress_line(len(settings.get("files") or [])),
+                "event_count": len(preflight_status_events),
+            },
             confirmed_fraction=0.0,
             cancel_available=False,
         )
@@ -23194,10 +23830,11 @@ def native_upload_scope_batch_guard(
     selected_files = list(dict.fromkeys(
         normalize_file_list(pdf_files) + normalize_file_list(folder_pdf_files)
     ))
-    is_batch = len(selected_files) > 1
+    selected_count = len(selected_files)
+    is_single_pdf = selected_count == 1
     supports_custom_range = native_upload_custom_range_supported(segment_mode_value)
     custom = (
-        not is_batch
+        is_single_pdf
         and supports_custom_range
         and str(scope or "") == NATIVE_UPLOAD_SCOPE_CUSTOM_LABEL
     )
@@ -23205,14 +23842,18 @@ def native_upload_scope_batch_guard(
         NATIVE_UPLOAD_SCOPE_CUSTOM_LABEL if custom else NATIVE_UPLOAD_SCOPE_ALL_LABEL
     )
     choices = [NATIVE_UPLOAD_SCOPE_ALL_LABEL]
-    if not is_batch and supports_custom_range:
+    if is_single_pdf and supports_custom_range:
         choices.append(NATIVE_UPLOAD_SCOPE_CUSTOM_LABEL)
     return (
         gr.update(choices=choices, value=effective_scope),
         gr.update(
             value="",
-            visible=not is_batch and supports_custom_range,
-            interactive=not is_batch and supports_custom_range,
+            # Eligibility belongs in the scope choices. The range editor
+            # itself appears only after the user selects Custom range; showing
+            # it for the default All-segments scope caused a 111px completion
+            # jump at the end of every single-PDF preview.
+            visible=custom,
+            interactive=custom,
         ),
     )
 
@@ -26336,6 +26977,9 @@ def run_automatic(
     ocr_preflight_manifest=None,
     estimate_comparable_runs=None,
     run_root_override=None,
+    confirmed_files=None,
+    confirmation_preflight_elapsed_seconds=0.0,
+    confirmation_preflight_status_events=None,
     retain_detailed_evidence=False,
     preflight_compatibility_report=None,
     existing_workspace_duplicate_policy=WORKSPACE_DUPLICATE_POLICY_SKIP,
@@ -26346,7 +26990,19 @@ def run_automatic(
     # the evidence-aware calls below. Do not add a second renderer-local
     # high-water mark here: that would conceal a legitimate new attempt or
     # recovery transition from the canonical durable status model.
-    started_at = time.perf_counter()
+    # The visible run starts on Confirm, not after the confirmation worker has
+    # completed its all-page OCR-risk scan.  Keep ETA recalculation evidence
+    # on that same clock so its event timestamps cannot drift backwards from
+    # the timer the operator is reading.
+    with LIVE_AUTOMATIC_RUN_STATUS_LOCK:
+        live_status_snapshot = dict(LIVE_AUTOMATIC_RUN_STATUS or {})
+    live_start_epoch = float(live_status_snapshot.get("started_epoch") or 0.0)
+    elapsed_before_pipeline = (
+        max(0.0, time.time() - live_start_epoch)
+        if live_start_epoch > 0.0
+        else max(0.0, float(confirmation_preflight_elapsed_seconds or 0.0))
+    )
+    started_at = time.perf_counter() - elapsed_before_pipeline
     resolved_segment_mode = pipeline_segment_mode(segment_mode)
     resolved_custom_page_group_sizes = (
         parse_custom_page_group_sizes(custom_page_group_sizes)
@@ -26371,8 +27027,22 @@ def run_automatic(
     latest_readiness_html = native_upload_readiness_html(initial_native_upload_readiness_report())
     progress(0.01, desc="Validating PDF input")
     direct_inputs = normalize_file_list(pdf_files)
-    folder_inspection = inspect_uploaded_pdf_candidates(folder_pdf_files)
-    combined_inputs = direct_inputs + folder_inspection["pdf_candidates"]
+    confirmed_input_paths = unique_local_path_strings(
+        normalize_file_list(confirmed_files)
+    )
+    # Confirm already produced an immutable, header-validated selection. Do
+    # not repeat a folder inspection after the click just to recreate that
+    # same list. Retain one cheap header/path validation so a PDF removed in
+    # the short hand-off interval is still rejected before any workspace work.
+    if confirmed_input_paths:
+        # Use the canonical empty schema rather than a local abbreviated
+        # dictionary: final reporting consumes the diagnostic keys even when
+        # a confirmed selection makes a second picker inspection unnecessary.
+        folder_inspection = inspect_uploaded_pdf_candidates([])
+        combined_inputs = confirmed_input_paths
+    else:
+        folder_inspection = inspect_uploaded_pdf_candidates(folder_pdf_files)
+        combined_inputs = direct_inputs + folder_inspection["pdf_candidates"]
     if folder_inspection["raw_entries"] and not folder_inspection["pdf_candidates"] and not direct_inputs:
         progress(None)
         validation_report = no_pdf_in_folder_report(folder_pdf_files)
@@ -26436,6 +27106,21 @@ def run_automatic(
     run_timing_estimate["initial_expected_seconds"] = expected_seconds
     run_timing_estimate["initial_estimate_formula"] = str(run_timing_estimate.get("formula") or "")
     run_timing_estimate["initial_estimate_features"] = dict(run_timing_estimate.get("features") or {})
+    run_timing_estimate["confirmation_preflight_seconds"] = round(
+        max(0.0, float(confirmation_preflight_elapsed_seconds or 0.0)), 3
+    )
+    preflight_status_rows = [
+        event
+        for event in (confirmation_preflight_status_events or [])
+        if isinstance(event, dict)
+    ]
+    run_timing_estimate["confirmation_preflight_event_count"] = len(
+        preflight_status_rows
+    )
+    run_timing_estimate["confirmation_preflight_sources_checked"] = max(
+        (int(event.get("source_index") or 0) for event in preflight_status_rows),
+        default=0,
+    )
 
     try:
         progress(0.025, desc="Creating output folder")
@@ -26453,6 +27138,21 @@ def run_automatic(
                 "final_expected_seconds": expected_seconds,
             },
         )
+        if confirmation_preflight_elapsed_seconds:
+            record_timing_model_event(
+                run_root,
+                "confirmation_preflight",
+                {
+                    "timing_event": "confirmation_preflight_completed",
+                    "phase_elapsed_seconds": max(
+                        0.0, float(confirmation_preflight_elapsed_seconds or 0.0)
+                    ),
+                    "source_progress_events": len(preflight_status_rows),
+                    "sources_checked": run_timing_estimate[
+                        "confirmation_preflight_sources_checked"
+                    ],
+                },
+            )
         _write_automatic_run_json(run_root / "output-capacity-preflight.json", batch_capacity)
         APP_LOGGER.info(
             "automatic run output folder created",
@@ -27113,6 +27813,26 @@ def run_automatic(
         # it cannot take x/y evidence more than five points above that share.
         # This happens only on a real owned callback, never as an unattended
         # timer fill during a stalled queue.
+        if phase_name in {"metadata", "extraction", "candidate_evaluation", "payloads"} and expected_seconds:
+            live = dict(LIVE_AUTOMATIC_RUN_STATUS or {})
+            started_epoch = float(live.get("started_epoch") or 0.0)
+            if started_epoch > 0.0 and total_files:
+                local_lane_end = max(
+                    .001,
+                    AUTOMATIC_UPLOAD_PHASE_RANGES["payloads"][1],
+                )
+                current_source_share = min(1.0, source_fraction / local_lane_end)
+                completed_source_share = min(
+                    1.0,
+                    (max(0, file_index - 1) + current_source_share) / total_files,
+                )
+                confirmed_fraction = concurrent_preparation_progress_fraction(
+                    confirmed_fraction,
+                    max(0.0, time.time() - started_epoch),
+                    expected_seconds,
+                    completed_source_share,
+                    presentation_expected_seconds=live.get("presentation_expected_seconds"),
+                )
         if phase_name in {"desktop_queue", "identity_set"} and expected_seconds:
             live = dict(LIVE_AUTOMATIC_RUN_STATUS or {})
             started_epoch = float(live.get("started_epoch") or 0.0)
@@ -29828,8 +30548,9 @@ def run_automatic(
             phase="Finalizing run output and completion checks",
             expected_seconds=expected_seconds,
             details=(
-                "All selected source windows have exact searchable-vector evidence; "
-                "writing final run evidence."
+                f"All {len(batch_upload_report.get('source_transactions') or [])} "
+                "submitted source windows have exact searchable-vector evidence; "
+                "writing final run evidence for every selected PDF."
             ),
             confirmed_fraction=AUTOMATIC_UPLOAD_PHASE_RANGES["reporting"][0],
             cancel_available=False,
@@ -30472,7 +31193,11 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                             label="PDF page range (Custom range only)",
                             placeholder="1-3, 4, 9, 12-30",
                             info="Enter comma-separated PDF page numbers or inclusive ranges. Page - preserve automatically and Whole-page chunks only.",
-                            visible=True,
+                            # A custom range is meaningful only after exactly
+                            # one PDF is selected. Starting hidden also keeps a
+                            # late zero-selection callback from adding a 111px
+                            # field while the preview chain enables Confirm.
+                            visible=False,
                             lines=1,
                             max_lines=1,
                         )
@@ -31595,6 +32320,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     auto_mode,
                     confirm_automatic_run_button,
                     cancel_automatic_run_button,
+                    automatic_run_activity,
                 ],
                 show_progress="minimal",
                 queue=False,
@@ -31646,7 +32372,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
             ).then(
                 fn=automatic_selection_pending_action_states,
                 inputs=[auto_pdfs, auto_folder_pdfs],
-                outputs=[confirm_automatic_run_button, cancel_automatic_run_button],
+                outputs=[confirm_automatic_run_button, cancel_automatic_run_button, automatic_run_activity],
                 show_progress="hidden",
                 queue=False,
             ).then(
@@ -31725,6 +32451,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     auto_mode,
                     confirm_automatic_run_button,
                     cancel_automatic_run_button,
+                    automatic_run_activity,
                 ],
                 show_progress="hidden",
                 queue=False,
@@ -31785,7 +32512,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
             ).then(
                 fn=automatic_selection_pending_action_states,
                 inputs=[auto_pdfs, auto_folder_pdfs],
-                outputs=[confirm_automatic_run_button, cancel_automatic_run_button],
+                outputs=[confirm_automatic_run_button, cancel_automatic_run_button, automatic_run_activity],
                 show_progress="hidden",
                 queue=False,
             ).then(
@@ -31818,6 +32545,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     auto_mode,
                     confirm_automatic_run_button,
                     cancel_automatic_run_button,
+                    automatic_run_activity,
                 ],
                 show_progress="hidden",
                 queue=False,
@@ -31880,7 +32608,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
             ).then(
                 fn=automatic_selection_pending_action_states,
                 inputs=[auto_pdfs, auto_folder_pdfs],
-                outputs=[confirm_automatic_run_button, cancel_automatic_run_button],
+                outputs=[confirm_automatic_run_button, cancel_automatic_run_button, automatic_run_activity],
                 show_progress="hidden",
                 queue=False,
             ).then(
@@ -31946,6 +32674,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     auto_mode,
                     confirm_automatic_run_button,
                     cancel_automatic_run_button,
+                    automatic_run_activity,
                 ],
                 show_progress="hidden",
                 queue=False,
@@ -31990,7 +32719,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
             ).then(
                 fn=automatic_selection_pending_action_states,
                 inputs=[auto_pdfs, auto_folder_pdfs],
-                outputs=[confirm_automatic_run_button, cancel_automatic_run_button],
+                outputs=[confirm_automatic_run_button, cancel_automatic_run_button, automatic_run_activity],
                 show_progress="hidden",
                 queue=False,
             ).then(
