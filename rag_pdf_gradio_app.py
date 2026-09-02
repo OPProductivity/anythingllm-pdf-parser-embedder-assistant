@@ -11828,11 +11828,18 @@ def run_advanced_diagnostics(
         summary = legacy_summary_from_run(controlled_run)
         summary["run_control"] = controlled_run.to_dict()
     except Exception as exc:
-        classified = classify_pipeline_exception(exc)
+        classified = classify_pipeline_exception(
+            exc, stage="source_preparation", source_path=pdf_path,
+        )
         try:
             summary = write_failure_package(pdf_path, output_dir, exc, args)
             summary["app_error_code"] = classified["code"]
             summary["app_error_title"] = classified["title"]
+            for key in (
+                "error_stage", "error_outcome", "error_scope", "error_category",
+                "error_dimensions_schema",
+            ):
+                summary[key] = classified[key]
         except Exception as failure_exc:
             raise gr.Error(
                 f"Advanced diagnostic preparation failed: {exc}. Failure evidence could not be written: {failure_exc}"
@@ -13014,6 +13021,10 @@ def update_live_automatic_run_status(
     confirmation_owner_token=None,
     completion_code=None,
     not_processed_pdf_count=None,
+    error_stage=None,
+    error_outcome=None,
+    error_scope=None,
+    error_category=None,
     queue_forecast_expected_seconds=None,
     cache_reuse_records=None,
     cache_reuse_documents=None,
@@ -13301,6 +13312,15 @@ def update_live_automatic_run_status(
             completion_code
             if completion_code is not None
             else previous.get("completion_code") or ""
+        ),
+        "error_stage": str(error_stage if error_stage is not None else previous.get("error_stage") or ""),
+        "error_outcome": str(error_outcome if error_outcome is not None else previous.get("error_outcome") or ""),
+        "error_scope": str(error_scope if error_scope is not None else previous.get("error_scope") or ""),
+        "error_category": str(error_category if error_category is not None else previous.get("error_category") or ""),
+        "error_dimensions_schema": (
+            "anythingllm_pdf_error_dimensions_v1"
+            if any(value is not None for value in (error_stage, error_outcome, error_scope, error_category))
+            else str(previous.get("error_dimensions_schema") or "")
         ),
         "not_processed_pdf_count": (
             max(0, int(not_processed_pdf_count))
@@ -13978,6 +13998,11 @@ def automatic_completion_from_durable_record(record):
         "message": message,
         "code": recovered_code,
         "not_processed_pdf_count": max(0, int(record.get("not_processed_pdf_count") or 0)),
+        "error_stage": str(record.get("error_stage") or ""),
+        "error_outcome": str(record.get("error_outcome") or ""),
+        "error_scope": str(record.get("error_scope") or ""),
+        "error_category": str(record.get("error_category") or ""),
+        "error_dimensions_schema": str(record.get("error_dimensions_schema") or ""),
     }
 
 
@@ -14855,6 +14880,27 @@ def append_eta_recalculation_event(
     return record
 
 
+def _terminal_audit_error_families(audit):
+    """Group audit errors by what they prove, not merely by severity."""
+    families = {"contradiction": [], "recovery": [], "telemetry": [], "evidence": [], "other": []}
+    for finding in audit.get("findings") or []:
+        if str(finding.get("severity") or "error").casefold() != "error":
+            continue
+        code = str(finding.get("code") or "")
+        if code.startswith("AUDIT-PROGRESS-"):
+            family = "telemetry"
+        elif code.startswith("AUDIT-RECOVERY-"):
+            family = "recovery"
+        elif code.startswith("AUDIT-NATIVE-ARTIFACT-") or code.startswith("AUDIT-ARTIFACT-"):
+            family = "evidence"
+        elif code.startswith(("AUDIT-CROSS-", "AUDIT-COUNT-", "AUDIT-TERMINAL-CLASSIFICATION-")):
+            family = "contradiction"
+        else:
+            family = "other"
+        families[family].append(finding)
+    return families
+
+
 def terminal_integrity_audit(run_root, completion, *, native_run):
     """Reconcile durable terminal evidence without changing AnythingLLM.
 
@@ -14876,14 +14922,14 @@ def terminal_integrity_audit(run_root, completion, *, native_run):
         # outcome. It does mean a nominal success is not fully certified.
         APP_LOGGER.exception("terminal integrity audit could not run")
         if str(completion.get("state") or "") == "successful":
-            return {
+            return with_error_dimensions({
                 "state": "warning",
                 "code": "AUTO-INTEGRITY-AUDIT-UNAVAILABLE-001",
                 "message": (
                     "The PDF result completed, but the independent terminal evidence audit "
                     f"could not run ({type(exc).__name__}). No upload was retried."
                 ),
-            }, {}
+            }), {}
         return dict(completion), {}
 
     audit_write_error = None
@@ -14916,31 +14962,50 @@ def terminal_integrity_audit(run_root, completion, *, native_run):
         except OSError as exc:
             bundle_error = exc
             APP_LOGGER.exception("terminal integrity failure bundle could not be retained")
-        finding_count = int((audit.get("summary") or {}).get("error_findings") or 0)
+        families = _terminal_audit_error_families(audit)
+        finding_count = sum(len(items) for items in families.values())
+        contradiction_count = len(families["contradiction"]) + len(families["other"])
         APP_LOGGER.error(
-            "terminal integrity audit found %s contradiction(s)",
-            finding_count,
+            "terminal evidence audit found %s error finding(s), including %s data contradiction(s)",
+            finding_count, contradiction_count,
             extra={"run_id": root.name, "event": "terminal_integrity_failure"},
         )
-        return {
-            "state": "failed",
-            "code": "AUTO-INTEGRITY-001",
+        if contradiction_count:
+            code = "AUTO-DATA-RECONCILIATION-001"
+            state = "failed"
+            lead = f"Internal evidence contains {contradiction_count} canonical count or identity contradiction(s)."
+        elif families["recovery"]:
+            code = "AUTO-RECOVERY-EVIDENCE-INCOMPLETE-001"
+            state = "warning"
+            lead = f"Processing ended, but {len(families['recovery'])} recovery-evidence requirement(s) are incomplete."
+        elif families["telemetry"]:
+            code = "AUTO-TELEMETRY-INCONSISTENT-001"
+            state = "warning"
+            lead = f"Processing ended, but {len(families['telemetry'])} progress-telemetry record(s) are inconsistent."
+        else:
+            code = "AUTO-AUDIT-EVIDENCE-INCOMPLETE-001"
+            state = "warning"
+            lead = f"Processing ended, but {finding_count} audit-evidence artifact(s) are incomplete."
+        return with_error_dimensions({
+            "state": state,
+            "code": code,
+            "original_completion": dict(completion),
+            "audit_error_families": {name: len(items) for name, items in families.items()},
             "message": (
-                f"Internal run evidence has {finding_count} reconciliation contradiction(s). "
-                "No upload was retried. Review Run history before resuming unresolved sources."
+                lead + " The original processing outcome is retained in Run history; no upload was retried."
                 + (
                     f" A compact diagnostic bundle was retained as {bundle.name}."
                     if bundle else
-                    " The compact diagnostic bundle could not be retained; the integrity failure still stands."
+                    " The compact diagnostic bundle could not be retained."
                     if bundle_error or audit_write_error else ""
                 )
             ),
-        }, audit
+        }), audit
 
     external_queue = (audit.get("summary") or {}).get("external_queue_reconciliation") or {}
     if bool(external_queue.get("required")):
         unresolved = int(external_queue.get("unresolved_records") or 0)
-        return {
+        return with_error_dimensions({
             "state": "warning",
             "code": "EXTERNAL-QUEUE-EVIDENCE-PENDING-001",
             "message": (
@@ -14948,17 +15013,17 @@ def terminal_integrity_audit(run_root, completion, *, native_run):
                 f"page-parent records when assistant-side observation ended ({unresolved} not yet confirmed). "
                 "No upload was retried; check the workspace or Run history before resuming."
             ),
-        }, audit
+        }), audit
 
     if audit_write_error and str(completion.get("state") or "") == "successful":
-        return {
+        return with_error_dimensions({
             "state": "warning",
             "code": "AUTO-INTEGRITY-AUDIT-UNAVAILABLE-001",
             "message": (
                 "The PDF result completed and the independent evidence check passed, but its "
                 f"audit record could not be retained ({type(audit_write_error).__name__}). No upload was retried."
             ),
-        }, audit
+        }), audit
     return dict(completion), audit
 
 
@@ -21624,7 +21689,74 @@ def cancellation_unresolved_record_count(batch_upload_report):
     return len({str(location).strip().casefold() for location in locations if str(location).strip()})
 
 
-def automatic_completion(summaries, prepare_and_upload):
+ERROR_DIMENSIONS_BY_CODE = {
+    "AUTO-PDF-001": ("source_input", "source_missing", "source", "source_file_missing"),
+    "AUTO-PDF-002": ("source_input", "source_locked", "source", "pdf_encrypted"),
+    "AUTO-PDF-003": ("source_input", "source_invalid", "source", "pdf_structure_invalid"),
+    "AUTO-EXTRACT-001": ("extraction", "extraction_exhausted", "source", "no_usable_text"),
+    "AUTO-EXTRACT-002": ("extraction", "extractor_failed", "source", "pymupdf_failed"),
+    "AUTO-EXTRACT-003": ("extraction", "extractor_failed", "source", "unstructured_failed"),
+    "AUTO-DEPENDENCY-MISSING-001": ("dependency", "dependency_unavailable", "runtime", "dependency_missing"),
+    "AUTO-TEMP-ARTIFACT-MISSING-001": ("local_preparation", "evidence_missing", "source", "temporary_artifact_missing"),
+    "AUTO-SIM-004": ("optional_retrieval_simulation", "validation_failed", "diagnostic", "simulation_embedding_failed"),
+    "AUTO-PROVIDER-AUTH-001": ("provider_embedding", "rejected_before_mutation", "queue_group", "provider_authentication_rejected"),
+    "AUTO-PROVIDER-TIMEOUT-001": ("provider_embedding", "rejected_before_mutation", "source", "source_provider_timeout_precommit"),
+    "AUTO-IO-001": ("local_io", "operation_blocked", "artifact", "filesystem_permission_denied"),
+    "AUTO-IO-002": ("local_io", "operation_failed", "artifact", "filesystem_io_error"),
+    "AUTO-DISK-SPACE-001": ("local_io", "capacity_exhausted", "run", "disk_space_exhausted"),
+    "AUTO-NETWORK-TIMEOUT-001": ("runtime_transport", "transport_timeout", "request", "network_timeout"),
+    "AUTO-PIPELINE-001": ("pipeline", "operation_failed", "run", "unclassified_pipeline_failure"),
+    "AUTO-EMBEDDING-SUBMISSION-001": ("desktop_submission", "submission_rejected", "queue_group", "desktop_submission_failed"),
+    "AUTO-EMBEDDING-SOURCE-PRECOMMIT-001": ("provider_embedding", "rejected_before_mutation", "source", "source_provider_rejected_precommit"),
+    "AUTO-EMBEDDING-PARTIAL-001": ("vector_confirmation", "partially_confirmed", "queue_group", "exact_partial_vector_coverage"),
+    "AUTO-EMBEDDING-RECONCILE-001": ("desktop_submission", "external_outcome_unknown", "queue_group", "submission_outcome_unknown"),
+    "EXTERNAL-QUEUE-EVIDENCE-PENDING-001": ("desktop_queue", "externally_active", "queue_group", "external_queue_still_active"),
+    "AUTO-EMBEDDING-VERIFY-001": ("vector_confirmation", "confirmation_absent", "queue_group", "vector_confirmation_unavailable"),
+    "AUTO-OCR-REVIEW-001": ("ocr_reconciliation", "deliberately_withheld", "source", "ocr_evidence_disagreement"),
+    "AUTO-OCR-REVIEW-PARTIAL-001": ("ocr_reconciliation", "partially_withheld", "batch", "ocr_evidence_disagreement_partial"),
+    "AUTO-PDF-REVIEW-001": ("source_preparation", "partially_withheld", "batch", "heterogeneous_source_holds"),
+    "AUTO-SOURCE-CHANGED-001": ("source_input", "rejected_before_mutation", "source", "source_changed_after_confirmation"),
+    "AUTO-STORAGE-AUDIT-UNAVAILABLE-001": ("storage_audit", "validation_unavailable", "diagnostic", "storage_audit_unavailable"),
+    "AUTO-STORAGE-WRITE-ACTIVE-001": ("storage_audit", "external_write_active", "workspace", "storage_write_still_active"),
+    "AUTO-METADATA-VISIBILITY-001": ("metadata_validation", "visibility_incomplete", "diagnostic", "metadata_visibility_incomplete"),
+    "AUTO-DOCUMENT-LIST-OBSERVATION-001": ("document_list_validation", "visibility_incomplete", "diagnostic", "document_list_rows_unconfirmed"),
+    "AUTO-RETRIEVAL-DEFERRED-001": ("optional_runtime_validation", "validation_deferred", "diagnostic", "retrieval_probe_deferred_after_vector_proof"),
+    "AUTO-RETRIEVAL-RUNTIME-001": ("optional_runtime_validation", "validation_timed_out", "diagnostic", "retrieval_probe_transient_timeout"),
+    "AUTO-RETRIEVAL-AUTH-001": ("optional_runtime_validation", "validation_blocked", "diagnostic", "retrieval_probe_authentication_blocked"),
+    "AUTO-RETRIEVAL-VERIFY-001": ("vector_retrieval_validation", "validation_failed", "diagnostic", "live_vector_search_failed"),
+    "AUTO-RETRIEVAL-CHAT-001": ("chat_citation_validation", "validation_failed", "diagnostic", "chat_source_citation_mismatch"),
+    "AUTO-RETRIEVAL-UNVERIFIED-001": ("optional_runtime_validation", "validation_inconclusive", "diagnostic", "retrieval_probe_inconclusive"),
+    "AUTO-WORKSPACE-DUPLICATES-001": ("workspace_hygiene", "advisory", "workspace", "preexisting_duplicate_vectors"),
+    "AUTO-POSTRUN-PROVIDER-CREDENTIAL-001": ("provider_configuration", "future_use_blocked", "workspace", "credential_rejected_after_vector_proof"),
+    "AUTO-OUTPUT-RETENTION-001": ("local_housekeeping", "cleanup_incomplete", "artifact", "local_output_cleanup_incomplete"),
+    "AUTO-LOCAL-EXPORT-PROMOTION-001": ("local_reporting", "export_incomplete", "artifact", "compact_export_promotion_failed"),
+    "AUTO-DATA-RECONCILIATION-001": ("terminal_evidence_audit", "data_contradiction", "run", "canonical_count_or_identity_contradiction"),
+    "AUTO-RECOVERY-EVIDENCE-INCOMPLETE-001": ("terminal_evidence_audit", "recovery_evidence_incomplete", "run", "recovery_evidence_incomplete"),
+    "AUTO-TELEMETRY-INCONSISTENT-001": ("terminal_evidence_audit", "telemetry_invalid", "diagnostic", "progress_telemetry_inconsistent"),
+    "AUTO-AUDIT-EVIDENCE-INCOMPLETE-001": ("terminal_evidence_audit", "audit_evidence_incomplete", "artifact", "audit_artifact_missing"),
+    "AUTO-INTEGRITY-AUDIT-UNAVAILABLE-001": ("terminal_evidence_audit", "audit_unavailable", "diagnostic", "audit_observer_unavailable"),
+}
+
+
+def with_error_dimensions(result, *, stage=None, outcome=None, scope=None, category=None):
+    """Attach orthogonal semantics without letting a legacy label drive logic."""
+    enriched = dict(result or {})
+    code = str(enriched.get("code") or enriched.get("diagnostic_code") or "")
+    if not code and str(enriched.get("state") or "") == "successful":
+        defaults = ("completion", "completed", "run", "none")
+    else:
+        defaults = ERROR_DIMENSIONS_BY_CODE.get(
+            code, ("pipeline", "operation_failed", "run", "unclassified_pipeline_failure")
+        )
+    enriched["error_stage"] = str(stage or enriched.get("error_stage") or defaults[0])
+    enriched["error_outcome"] = str(outcome or enriched.get("error_outcome") or defaults[1])
+    enriched["error_scope"] = str(scope or enriched.get("error_scope") or defaults[2])
+    enriched["error_category"] = str(category or enriched.get("error_category") or defaults[3])
+    enriched["error_dimensions_schema"] = "anythingllm_pdf_error_dimensions_v1"
+    return enriched
+
+
+def _automatic_completion_decision(summaries, prepare_and_upload):
     preparation_failures = [summary for summary in summaries if summary.get("app_error_code")]
     if not prepare_and_upload:
         if preparation_failures:
@@ -21667,8 +21799,17 @@ def automatic_completion(summaries, prepare_and_upload):
     # separate failed submission in the same run.  This can happen after an
     # interrupted batch has already produced a local OCR hold for one PDF.
     hard_upload_failures = []
+    source_precommit_rejections = []
     for summary in summaries:
         status = summary.get("api_upload_status")
+        error_classification = str(summary.get("api_upload_error_classification") or "")
+        if error_classification in {
+            "source_atomic_provider_rejected_before_commit",
+            "source_provider_rejected_precommit",
+            "source_provider_timeout_precommit",
+        }:
+            source_precommit_rejections.append(summary)
+            continue
         if status in {
             "",
             None,
@@ -21722,6 +21863,24 @@ def automatic_completion(summaries, prepare_and_upload):
         if summary.get("anythingllm_embedder_warning_code") == "AUTO-OPENROUTER-KEY-REVERIFY-001"
     ]
     if credential_reverification:
+        vectors_already_proven = all(
+            str(summary.get("api_upload_status") or "") in {
+                "complete", "complete_with_key_cleanup_warning", "skipped_exact_duplicate",
+            }
+            and str(summary.get("post_upload_verification_status") or "") in REVIEWABLE_POST_UPLOAD_STATUSES
+            for summary in summaries
+        )
+        if vectors_already_proven:
+            return {
+                "state": "successful",
+                "diagnostic_code": "AUTO-POSTRUN-PROVIDER-CREDENTIAL-001",
+                "receipt": automatic_completion_receipt(summaries),
+                "message": (
+                    automatic_completion_success_message(summaries)
+                    + " The provider credential was rejected by a later diagnostic; existing vectors remain proven, "
+                    "but future embedding requests require a corrected credential."
+                ),
+            }
         return {
             "state": "failed",
             "code": "AUTO-OPENROUTER-KEY-REVERIFY-001",
@@ -21768,8 +21927,8 @@ def automatic_completion(summaries, prepare_and_upload):
     )
     if upload_ok and post_searchable_with_caveat and workspace_duplicate_advisory:
         return {
-            "state": "warning",
-            "code": "AUTO-WORKSPACE-DUPLICATES-001",
+            "state": "successful",
+            "diagnostic_code": "AUTO-WORKSPACE-DUPLICATES-001",
             "message": (
                 "This submission was indexed exactly. The selected workspace also contains "
                 "older duplicate vectors for the same source identities. No automatic retry or deletion was performed; "
@@ -21803,7 +21962,11 @@ def automatic_completion(summaries, prepare_and_upload):
                 "diagnostic_code": "AUTO-STORAGE-WRITE-ACTIVE-001",
                 "message": "Upload and live retrieval succeeded. AnythingLLM was still writing during the final storage audit. Prepared files remain available; run the saved verification after Desktop becomes idle.",
             }
-        if any(status == "review" for status in post_statuses):
+        review_classifications = {
+            str(summary.get("post_upload_classification") or "") for summary in summaries
+            if str(summary.get("post_upload_verification_status") or "") == "review"
+        }
+        if review_classifications and all("metadata" in value for value in review_classifications):
             return {
                 "state": "successful",
                 "diagnostic_code": "AUTO-METADATA-VISIBILITY-001",
@@ -21942,6 +22105,33 @@ def automatic_completion(summaries, prepare_and_upload):
                 "history to reconcile, resume, or skip only unresolved PDFs."
             ),
         }
+    if source_precommit_rejections:
+        names = ", ".join(
+            Path(str(summary.get("pdf") or "document")).name
+            for summary in source_precommit_rejections[:3]
+        )
+        suffix = "" if len(source_precommit_rejections) <= 3 else f" (+{len(source_precommit_rejections) - 3} more)"
+        completed_count = sum(
+            str(summary.get("api_upload_status") or "") in {
+                "complete", "complete_with_key_cleanup_warning", "skipped_exact_duplicate",
+            }
+            for summary in summaries
+        )
+        total_count = max(1, len(summaries))
+        detail = str(
+            source_precommit_rejections[0].get("api_upload_error")
+            or "The embedding provider rejected this source before any part of its request was committed."
+        )
+        return {
+            "state": "warning" if completed_count else "failed",
+            "code": "AUTO-EMBEDDING-SOURCE-PRECOMMIT-001",
+            "confirmed_fraction": completed_count / total_count,
+            "message": (
+                f"{completed_count} PDF(s) reached a safe completed outcome. "
+                f"{len(source_precommit_rejections)} PDF(s) were rejected before provider commit: {names}{suffix}. "
+                f"{detail} Later eligible PDFs were allowed to continue; no ambiguous request was replayed."
+            ),
+        }
     if ocr_withheld or preparation_withheld:
         withheld = []
         withheld_ids = set()
@@ -21998,6 +22188,17 @@ def automatic_completion(summaries, prepare_and_upload):
         return {
             "state": "warning",
             "not_processed_pdf_count": len(withheld),
+            "source_error_categories": [
+                {
+                    "pdf": Path(str(summary.get("pdf") or "document")).name,
+                    "category": str(
+                        summary.get("error_category")
+                        or ("ocr_evidence_disagreement" if summary in ocr_withheld else "source_preparation_failed")
+                    ),
+                    "code": str(summary.get("app_error_code") or ""),
+                }
+                for summary in withheld
+            ],
             "code": (
                 "AUTO-OCR-REVIEW-001"
                 if ocr_withheld and not preparation_withheld and not submitted_count
@@ -22029,14 +22230,10 @@ def automatic_completion(summaries, prepare_and_upload):
             or "AnythingLLM did not confirm the embedding submission."
         )
         upload_error_classification = str(first.get("api_upload_error_classification") or "")
-        if (
-            "timed out" in upload_error.casefold()
-            or "timeout" in upload_error.casefold()
-            or upload_error_classification in {
+        if upload_error_classification in {
                 "client_timeout_submission_unknown",
                 "client_transport_submission_unknown",
-            }
-        ):
+            }:
             return {
                 # A client deadline followed by a bounded, inconclusive
                 # observation window is not an embedding rejection. Keep the
@@ -22064,6 +22261,11 @@ def automatic_completion(summaries, prepare_and_upload):
     }
 
 
+def automatic_completion(summaries, prepare_and_upload):
+    """Return a completion carrying canonical stage/outcome/scope/category."""
+    return with_error_dimensions(_automatic_completion_decision(summaries, prepare_and_upload))
+
+
 def automatic_completion_phase(completion, prepare_and_upload):
     """Choose a terminal phase that makes only evidence-backed claims.
 
@@ -22082,6 +22284,8 @@ def automatic_completion_phase(completion, prepare_and_upload):
         return "Preparation complete — AnythingLLM verification pending"
     if code == "AUTO-EMBEDDING-PARTIAL-001":
         return "Partial embedding completed — recovery available"
+    if code == "AUTO-EMBEDDING-SOURCE-PRECOMMIT-001":
+        return "Later PDFs continued — one or more sources were rejected before provider commit"
     if code == "AUTO-OCR-REVIEW-PARTIAL-001":
         return "Eligible PDFs ready — remaining PDFs not processed"
     if code == "AUTO-OCR-REVIEW-001":
@@ -22091,11 +22295,13 @@ def automatic_completion_phase(completion, prepare_and_upload):
         # OCR review, live retrieval, reconciliation, and drawer visibility
         # are distinct outcomes; the former generic label falsely attributed
         # every warning to the Desktop Documents list.
-        message = str(completion.get("message") or "").casefold()
-        if "document-list" in message or "document list" in message:
+        category = str(completion.get("error_category") or "")
+        if category == "document_list_rows_unconfirmed":
             return "Searchable vectors verified — document-list rows unconfirmed"
-        if code in {"AUTO-RETRIEVAL-VERIFY-001", "AUTO-RETRIEVAL-CHAT-001"}:
-            return "Vectors stored — live retrieval check failed"
+        if code == "AUTO-RETRIEVAL-VERIFY-001":
+            return "Vectors stored — live vector search failed"
+        if code == "AUTO-RETRIEVAL-CHAT-001":
+            return "Vector search completed — chat did not cite the expected source"
         if code == "AUTO-RETRIEVAL-AUTH-001":
             return "Vectors stored — retrieval credential unavailable"
         if code == "AUTO-RETRIEVAL-UNVERIFIED-001":
@@ -22163,6 +22369,8 @@ def automatic_terminal_confirmed_fraction(completion):
     code = str(completion.get("code") or "")
     if state == "successful":
         return 1.0
+    if completion.get("confirmed_fraction") is not None:
+        return completion.get("confirmed_fraction")
     if state == "warning" and code != "AUTO-EMBEDDING-RECONCILE-001":
         return 1.0
     return completion.get("confirmed_fraction")
@@ -22909,6 +23117,9 @@ def run_automatic_from_confirmation(*values, progress=gr.Progress(track_tqdm=Fal
                 state="preparing",
                 phase="Pre-processing: creating document workspace",
                 expected_seconds=confirmed_settings.get("expected_seconds", 0),
+                presentation_expected_seconds=opening_eta_presentation_seconds(
+                    confirmed_settings.get("expected_seconds", 0)
+                ),
                 details="Creating the isolated AnythingLLM workspace before document processing.",
                 confirmed_fraction=0.0,
                 cancel_available=False,
@@ -23193,6 +23404,9 @@ def _run_automatic_from_confirmation_stream_body(
             state="preparing",
             phase=phase,
             expected_seconds=max(0, int(payload.get("expected_seconds") or 0)),
+            presentation_expected_seconds=opening_eta_presentation_seconds(
+                max(0, int(payload.get("expected_seconds") or 0))
+            ),
             details=detail,
             confirmed_fraction=0.0,
             cancel_available=False,
@@ -23299,14 +23513,14 @@ def _run_automatic_from_confirmation_stream_body(
             state="preparing",
             phase="Pre-flight complete — starting run workspace",
             expected_seconds=settings.get("expected_seconds", 0),
+            presentation_expected_seconds=opening_eta_presentation_seconds(
+                settings.get("expected_seconds", 0)
+            ),
             details=(
                 f"Native text and OCR signals were checked for {len(settings.get('files') or [])} selected PDF(s). "
                 "Run output is reserved; PDF preparation begins next."
             ),
-            preflight_status={
-                "current_step": preflight_progress_line(len(settings.get("files") or [])),
-                "event_count": len(preflight_status_events),
-            },
+            preflight_status={},
             confirmed_fraction=0.0,
             cancel_available=True,
         )
@@ -23321,14 +23535,14 @@ def _run_automatic_from_confirmation_stream_body(
             state="preparing",
             phase="Pre-flight complete — starting run workspace",
             expected_seconds=settings.get("expected_seconds", 0),
+            presentation_expected_seconds=opening_eta_presentation_seconds(
+                settings.get("expected_seconds", 0)
+            ),
             details=(
                 f"Native text and OCR signals were checked for {len(settings.get('files') or [])} selected PDF(s). "
                 "Starting the pipeline."
             ),
-            preflight_status={
-                "current_step": preflight_progress_line(len(settings.get("files") or [])),
-                "event_count": len(preflight_status_events),
-            },
+            preflight_status={},
             confirmed_fraction=0.0,
             cancel_available=False,
         )
@@ -24789,114 +25003,112 @@ def resolve_simulation_run(local_choice, custom_ollama_model, ollama_url):
     }
 
 
-def classify_pipeline_exception(exc):
+def classify_pipeline_exception(exc, *, stage="source_preparation", source_path=None):
+    """Classify only evidence specific to the stage; never infer from incidental prose."""
     message = str(exc)
     lower = message.casefold()
-    if isinstance(exc, FileNotFoundError) or "no such file" in lower or "cannot find the file" in lower:
-        return {
-            "code": "AUTO-PDF-001",
-            "title": "PDF file was not available when preparation started",
-            "details": [message],
-            "next_steps": [
-                "Upload the PDF again.",
-                "Avoid moving or deleting the temporary upload while preparation is running.",
-            ],
-        }
-    if "password" in lower or "encrypted" in lower or "decrypt" in lower:
-        return {
-            "code": "AUTO-PDF-002",
-            "title": "PDF appears encrypted or password-protected",
-            "details": [message],
-            "next_steps": [
-                "Open the PDF in a viewer and export or save an unlocked copy.",
-                "Retry with the unlocked copy so the extraction backend can read the text layer.",
-            ],
-        }
-    if "cannot open" in lower or "xref" in lower or "trailer" in lower or "damaged" in lower or "corrupt" in lower:
-        return {
-            "code": "AUTO-PDF-003",
-            "title": "PDF could not be parsed reliably",
-            "details": [message],
-            "next_steps": [
-                "Open the PDF in a viewer and re-save/export a fresh copy.",
-                "If it was downloaded from the web, download it again and rerun preparation.",
-            ],
-        }
-    if "no extraction backend produced usable segments" in lower or "low_text" in lower or "scanned" in lower or "ocr" in lower:
-        return {
-            "code": "AUTO-EXTRACT-001",
-            "title": "No usable text segments were extracted",
-            "details": [
-                message,
-                "This usually means the PDF is scanned/image-only, very low-text, corrupt, or dominated by non-prose pages.",
-            ],
-            "next_steps": [
-                "Run OCR first, then upload the OCRed PDF.",
-                "Try Unstructured/deep extraction if the PDF is layout-heavy rather than scanned.",
-                "Check the failure report for per-backend word counts and empty-page counts.",
-            ],
-        }
-    if "pymupdf" in lower or "fitz" in lower:
-        return {
-            "code": "AUTO-EXTRACT-002",
-            "title": "PyMuPDF extraction failed",
-            "details": [message],
-            "next_steps": [
-                "Try deep extraction so Unstructured can be attempted if available.",
-                "Re-save the PDF if it may contain malformed objects.",
-            ],
-        }
-    if "unstructured" in lower:
-        return {
-            "code": "AUTO-EXTRACT-003",
-            "title": "Unstructured extraction failed or is unavailable",
-            "details": [message],
-            "next_steps": [
-                "Install or repair Unstructured only if deep extraction is needed.",
-                "Use the PyMuPDF/PyMuPDF4LLM candidate output if it already passes readiness checks.",
-            ],
-        }
-    if "ollama" in lower or "openrouter" in lower or "embedding" in lower or "embeddings" in lower or "/api/embed" in lower:
-        return {
-            "code": "AUTO-SIM-004",
-            "title": "Retrieval simulation failed during embedding",
-            "details": [message],
-            "next_steps": [
-                "Choose None if you only want the prepared output files.",
-                "Choose an installed embedding model from the dropdown for local tests.",
-                "If OpenRouter is selected through AnythingLLM, verify the localhost app .env file and network access.",
-            ],
-        }
-    if isinstance(exc, PermissionError) or "permission" in lower or "access is denied" in lower:
-        return {
-            "code": "AUTO-IO-001",
-            "title": "The output folder or source file was blocked by permissions",
-            "details": [message],
-            "next_steps": [
-                "Close programs that may have locked the file.",
-                "Check write access to the configured application output folder.",
-            ],
-        }
-    if isinstance(exc, OSError) or "path too long" in lower or "disk" in lower or "space" in lower:
-        return {
-            "code": "AUTO-IO-002",
-            "title": "File-system error while preparing output",
-            "details": [message],
-            "next_steps": [
-                "Check free disk space.",
-                "Try a shorter output path if Windows path length may be involved.",
-                "Close files from the output folder before rerunning.",
-            ],
-        }
-    return {
-        "code": "AUTO-PIPELINE-001",
-        "title": "Automatic preparation failed",
-        "details": [message],
-        "next_steps": [
-            "Open the generated failure report if one was written.",
-            "Use the Automatic and Advanced tabs to isolate whether this is extraction, segmentation, metadata, or retrieval simulation.",
-        ],
-    }
+    filename = str(getattr(exc, "filename", "") or "")
+
+    def result(code, title, next_steps, **dimensions):
+        return with_error_dimensions(
+            {"code": code, "title": title, "details": [message], "next_steps": next_steps},
+            **dimensions,
+        )
+
+    source_missing = False
+    if isinstance(exc, FileNotFoundError) and source_path and filename:
+        try:
+            source_missing = Path(filename).resolve(strict=False) == Path(source_path).resolve(strict=False)
+        except OSError:
+            source_missing = filename.casefold() == str(source_path).casefold()
+    if source_missing:
+        return result(
+            "AUTO-PDF-001", "PDF file was not available when preparation started",
+            ["Select the PDF again.", "Do not move or delete it while preparation is running."],
+        )
+    if isinstance(exc, FileNotFoundError):
+        missing_name = Path(filename).name if filename else ""
+        dependency_shaped = not missing_name or missing_name.casefold().endswith((".exe", ".dll"))
+        return result(
+            "AUTO-DEPENDENCY-MISSING-001" if dependency_shaped else "AUTO-TEMP-ARTIFACT-MISSING-001",
+            "A required extraction dependency was unavailable" if dependency_shaped else "A required preparation artifact was missing",
+            ["Inspect the retained per-source failure evidence before retrying."],
+            stage="dependency" if dependency_shaped else stage,
+            outcome="dependency_unavailable" if dependency_shaped else "evidence_missing",
+            scope="runtime" if dependency_shaped else "source",
+            category="dependency_missing" if dependency_shaped else "temporary_artifact_missing",
+        )
+    if isinstance(exc, TimeoutError):
+        return result(
+            "AUTO-NETWORK-TIMEOUT-001", "A runtime request timed out",
+            ["Use the stage-specific run evidence to determine whether an external mutation occurred before retrying."],
+            stage=stage, outcome="transport_timeout", scope="request", category="network_timeout",
+        )
+    if isinstance(exc, PermissionError):
+        return result(
+            "AUTO-IO-001", "A local file operation was blocked by permissions",
+            ["Close programs that may have locked the named file.", "Check access to the named source or output path."],
+        )
+    if stage in {"source_input", "source_preparation"} and (
+        "password-protected pdf" in lower
+        or "pdf is encrypted" in lower
+        or "pdf password" in lower
+        or "cannot decrypt pdf" in lower
+    ):
+        return result(
+            "AUTO-PDF-002", "PDF is encrypted or password-protected",
+            ["Open the PDF in a viewer and export an unlocked copy."],
+        )
+    if stage in {"source_input", "source_preparation", "extraction"} and any(
+        token in lower for token in ("xref", "trailer", "malformed pdf", "damaged pdf", "corrupt pdf")
+    ):
+        return result(
+            "AUTO-PDF-003", "PDF structure could not be parsed reliably",
+            ["Open the PDF in a viewer and re-save or download a fresh copy."],
+        )
+    if "no extraction backend produced usable segments" in lower:
+        return result(
+            "AUTO-EXTRACT-001", "No extraction backend produced usable text",
+            ["Inspect the per-backend word counts and OCR decision evidence."],
+        )
+    if stage == "extraction" and ("pymupdf" in lower or "fitz" in lower):
+        return result(
+            "AUTO-EXTRACT-002", "PyMuPDF extraction failed",
+            ["Inspect whether another extractor completed before treating this as terminal."],
+        )
+    if stage == "extraction" and "unstructured" in lower:
+        return result(
+            "AUTO-EXTRACT-003", "Unstructured extraction failed or was unavailable",
+            ["Inspect whether another extraction candidate already passed readiness checks."],
+        )
+    if stage == "optional_retrieval_simulation" and any(
+        token in lower for token in ("ollama", "openrouter", "embedding", "/api/embed")
+    ):
+        return result(
+            "AUTO-SIM-004", "Optional retrieval simulation could not embed its probe",
+            ["Disable the optional simulation or inspect its configured provider."],
+        )
+    if stage == "provider_embedding" and any(token in lower for token in ("401", "403", "unauthorized", "forbidden", "api key")):
+        return result(
+            "AUTO-PROVIDER-AUTH-001", "The embedding provider rejected authentication",
+            ["Verify the embedding credential before retrying only the uncommitted source."],
+        )
+    if isinstance(exc, OSError):
+        winerror = getattr(exc, "winerror", None)
+        if winerror == 112 or "no space left on device" in lower or "disk full" in lower:
+            return result(
+                "AUTO-DISK-SPACE-001", "Local storage capacity was exhausted",
+                ["Free disk space, then retry only work that lacks durable completion evidence."],
+            )
+        return result(
+            "AUTO-IO-002", "A local file-system operation failed",
+            ["Inspect the named path and retained failure evidence."],
+        )
+    return result(
+        "AUTO-PIPELINE-001", "Automatic preparation failed",
+        ["Open the retained failure report; its canonical stage identifies the responsible subsystem."],
+        stage=stage,
+    )
 
 
 def _batch_upload_hold_message(block_reason, readiness_reasons=()):
@@ -25381,6 +25593,11 @@ def changed_source_failure_summary(pdf_path, out_dir, *, reason, expected_versio
         "app_error_code": "AUTO-SOURCE-CHANGED-001",
         "app_error_title": "Selected PDF changed after confirmation",
         "app_error_message": str(reason or "source_version_changed"),
+        "error_stage": "source_input",
+        "error_outcome": "rejected_before_mutation",
+        "error_scope": "source",
+        "error_category": "source_changed_after_confirmation",
+        "error_dimensions_schema": "anythingllm_pdf_error_dimensions_v1",
         "app_error_next_steps": [
             "Review the PDF, select it again, and run that source separately.",
             "Other unchanged PDFs in this batch may continue.",
@@ -25561,6 +25778,52 @@ def upload_report_has_complete_vector_proof(report):
     except (TypeError, ValueError):
         return False
     return submitted > 0 and confirmed >= submitted
+
+
+def partition_precommit_rejected_vector_expectation(expected_payloads, locations, observer):
+    """Partition all clean source rejections from a mixed source-atomic group."""
+    payloads = list(expected_payloads or [])
+    location_rows = list(locations or [])
+    raw = observer if isinstance(observer, dict) else {}
+    rejections = [
+        dict(rejection)
+        for rejection in (raw.get("source_atomic_precommit_rejections") or [])
+        if isinstance(rejection, dict)
+    ]
+    if not rejections:
+        rejection = dict(raw.get("source_atomic_precommit_rejection") or {})
+        if rejection:
+            rejections.append(rejection)
+    rejection_by_key = {
+        str(rejection.get("source_key") or "").strip(): rejection
+        for rejection in rejections
+        if str(rejection.get("source_key") or "").strip()
+    }
+    ambiguity = dict(raw.get("source_atomic_commit_ambiguity") or {})
+    rejection_by_key.pop(str(ambiguity.get("source_key") or "").strip(), None)
+    if not rejection_by_key:
+        return payloads, location_rows, {}
+    kept_payloads = []
+    kept_locations = []
+    rejected_locations = []
+    for index, payload in enumerate(payloads):
+        location = location_rows[index] if index < len(location_rows) else ""
+        if str((payload or {}).get("docSource") or "").strip() in rejection_by_key:
+            if location:
+                rejected_locations.append(location)
+            continue
+        kept_payloads.append(payload)
+        if location:
+            kept_locations.append(location)
+    if not rejected_locations:
+        return payloads, location_rows, {}
+    return kept_payloads, kept_locations, {
+        "source_keys": sorted(rejection_by_key),
+        "rejections": [rejection_by_key[key] for key in sorted(rejection_by_key)],
+        "rejected_locations": rejected_locations,
+        "rejected_records": len(rejected_locations),
+        "remaining_vector_expectation": len(kept_payloads),
+    }
 
 
 def upload_prepared_automatic_batch(
@@ -26017,6 +26280,40 @@ def upload_prepared_automatic_batch(
             start = max(0, int(batch_report.get("start_index") or 0))
             end = max(start, int(batch_report.get("end_index") or start))
             expected_batch = expected_payloads[start:end]
+        original_expected_batch = list(expected_batch)
+        original_locations = list(batch_report.get("locations") or [])
+        active_vector_locations = list(original_locations)
+        precommit_rejected_sources = set()
+        precommit_rejected_locations = []
+
+        def apply_source_local_precommit_rejection():
+            """Remove only a worker-proven, pre-commit source from vector expectations.
+
+            The Desktop request can contain several source-atomic PDFs. A clean
+            provider rejection for one source means its locations can never gain
+            vectors, while already committed siblings remain independently
+            verifiable. Keeping the rejected locations in the denominator made
+            reconciliation wait until its full deadline for impossible vectors.
+            """
+            nonlocal expected_batch, active_vector_locations, precommit_rejected_sources, precommit_rejected_locations
+            raw = batch_report.get("desktop_queue_observer")
+            if not isinstance(raw, dict):
+                return
+            kept_payloads, kept_locations, rejection = (
+                partition_precommit_rejected_vector_expectation(
+                    original_expected_batch, original_locations, raw
+                )
+            )
+            source_keys = set(rejection.get("source_keys") or [])
+            if not source_keys or source_keys == precommit_rejected_sources:
+                return
+            expected_batch = kept_payloads
+            active_vector_locations = kept_locations
+            precommit_rejected_sources = source_keys
+            precommit_rejected_locations = list(rejection["rejected_locations"])
+            batch_report["source_atomic_precommit_rejections"] = list(
+                rejection["rejections"]
+            )
         # This verifier partitions a shared workspace queue back into the
         # selected PDFs.  It must retain the pipeline's reconciliation
         # contract: a lost HTTP receipt is not a rejection, and an actively
@@ -26095,6 +26392,10 @@ def upload_prepared_automatic_batch(
             )
             if observer_callback_errors:
                 payload["observer_callback_errors"] = list(observer_callback_errors)
+            if precommit_rejected_sources:
+                payload["source_atomic_precommit_rejections"] = list(
+                    batch_report.get("source_atomic_precommit_rejections") or []
+                )
             return payload
 
         def owned_queue_snapshot():
@@ -26102,7 +26403,15 @@ def upload_prepared_automatic_batch(
             raw = batch_report.get("desktop_queue_observer")
             if not isinstance(raw, dict):
                 return {}
-            total = max(0, int(raw.get("queue_records") or len(expected_batch)))
+            # Once one source is proven rejected before commit, the effective
+            # queue denominator excludes its impossible vector locations. The
+            # raw Desktop counter still describes the original request and is
+            # retained separately in the observer evidence.
+            total = (
+                len(expected_batch)
+                if precommit_rejected_sources
+                else max(0, int(raw.get("queue_records") or len(expected_batch)))
+            )
             completed = min(total, max(0, int(raw.get("completed") or 0)))
             current = min(total, max(0, int(raw.get("current") or 0)))
             last_event = float(raw.get("last_event_monotonic") or 0.0)
@@ -26137,9 +26446,16 @@ def upload_prepared_automatic_batch(
                     if records_per_second > 0.0 and position < total else None
                 ),
                 "queue_records": total,
+                "desktop_queue_original_records": max(
+                    0, int(raw.get("queue_records") or len(original_expected_batch))
+                ),
+                "source_atomic_precommit_rejected_records": len(
+                    precommit_rejected_locations
+                ),
             }
 
         while True:
+            apply_source_local_precommit_rejection()
             elapsed = time.monotonic() - started
             queue = owned_queue_snapshot()
             queue_position = max(
@@ -26180,7 +26496,7 @@ def upload_prepared_automatic_batch(
                         workspace_slug,
                         "",
                         expected_batch,
-                        upload_locations=list(batch_report.get("locations") or []),
+                        upload_locations=list(active_vector_locations),
                         # A live batch observer needs count progress while Desktop
                         # is writing. This is still exact evidence, but a healthy
                         # owned queue is not forced to reopen SQLite/LanceDB every
@@ -26564,6 +26880,12 @@ def upload_prepared_automatic_batch(
     # artifact family for a single implementation detail.
     report["source_atomic_worker"] = dict(source_atomic_worker)
     batch_reports = list((report.get("embedding_update") or {}).get("batches") or [])
+    source_transaction_by_path = {
+        str(transaction.get("source_path") or ""): dict(transaction)
+        for transaction in (report.get("source_transactions") or [])
+        if isinstance(transaction, dict)
+        and str(transaction.get("source_path") or "").strip()
+    }
     searchable = bool(batch_reports) and all(
         bool(batch.get("searchability_proven")) for batch in batch_reports
     )
@@ -26619,6 +26941,8 @@ def upload_prepared_automatic_batch(
     )
     ledger_path = str(Path(run_root) / "batch-embedding-ledger.json")
     for summary, rows, _source_sha, source_path in grouped_rows:
+        source_transaction = source_transaction_by_path.get(source_path, {})
+        source_transaction_state = str(source_transaction.get("state") or "")
         existing_workspace_records = max(
             0,
             int(summary.get("_workspace_existing_selected_records") or 0),
@@ -26670,14 +26994,17 @@ def upload_prepared_automatic_batch(
         }
         matched_sources = (
             expected_sources
-            if searchable
+            if searchable and source_transaction_state != "source_queue_rejected_without_remote_mutation"
             else (expected_sources & (observed_sources | source_confirmed_sources))
         )
         # The aggregate submission can remain unresolved after an earlier
         # source has already reached exact current-upload proof.  Preserve
         # that source-local fact in its own queue receipt instead of copying
         # the aggregate ``searchable`` flag into every sibling result.
-        source_exact = bool(expected_sources) and len(matched_sources) == len(expected_sources)
+        source_exact = bool(expected_sources) and (
+            source_transaction_state == "exact_vectors_proven"
+            or len(matched_sources) == len(expected_sources)
+        )
         attached_complete = len(source_attachments) == len(rows) and all(
             str(attachment.get("status") or "") in {"attached", "attached_reconciled", "reused_cached_location"}
             for attachment in source_attachments
@@ -26886,6 +27213,11 @@ def upload_prepared_automatic_batch(
         for result in document_results.values()
     )
     report["vector_confirmed_records"] = report["embedded"]
+    # Keep retained v1 aliases immutable mirrors at the producer boundary.
+    # Calling the schema normalizer with a stale earlier-stage alias caused a
+    # false count contradiction even though the canonical per-document total
+    # was correct.
+    report["confirmed_vector_records"] = report["vector_confirmed_records"]
     report["cache_reuse_explanation"] = (
         "Exact cached AnythingLLM document locations were linked to this workspace; this is distinct from records already indexed in the workspace."
         if report["prepared_record_cache_reused_count"] else "No prepared-record cache reuse was needed."
@@ -27252,9 +27584,12 @@ def run_automatic(
             elif phase == "waiting_for_runtime":
                 live_phase = "Waiting for AnythingLLM Desktop to become ready"
                 details = "Desktop was launched; local preparation will begin as soon as its API responds."
-            elif phase in {"ready_after_start", "ready"}:
+            elif phase == "ready_after_start":
                 live_phase = "AnythingLLM Desktop is ready; starting local preparation"
                 details = "Desktop is responding again. Continuing this confirmed run."
+            elif phase == "ready":
+                live_phase = "AnythingLLM Desktop is ready; starting local preparation"
+                details = "Desktop is ready. Continuing this confirmed run."
             elif phase == "start_failed":
                 live_phase = "AnythingLLM Desktop could not be started"
                 details = "The automatic Desktop launch did not succeed; review the runtime status before retrying."
@@ -27265,6 +27600,9 @@ def run_automatic(
                 state="running",
                 phase=live_phase,
                 expected_seconds=expected_seconds,
+                presentation_expected_seconds=opening_eta_presentation_seconds(
+                    expected_seconds
+                ),
                 details=details,
                 confirmed_fraction=AUTOMATIC_RUN_PREFLIGHT_DISPLAY_END,
                 cancel_available=False,
@@ -29274,7 +29612,9 @@ def run_automatic(
             ):
                 flat_no_logs_exports.append(out_dir)
         except Exception as exc:
-            classified_error = classify_pipeline_exception(exc)
+            classified_error = classify_pipeline_exception(
+                exc, stage="source_preparation", source_path=pdf_path,
+            )
             # A local worker can fail after Desktop accepted an embedding
             # request. Schedule only that run's bounded recovery path, and
             # only for transport/runtime-shaped failures. The recovery worker
@@ -29293,6 +29633,11 @@ def run_automatic(
                 summary["app_error_title"] = classified_error["title"]
                 summary["app_error_message"] = str(exc)
                 summary["app_error_next_steps"] = classified_error["next_steps"]
+                summary["error_stage"] = classified_error["error_stage"]
+                summary["error_outcome"] = classified_error["error_outcome"]
+                summary["error_scope"] = classified_error["error_scope"]
+                summary["error_category"] = classified_error["error_category"]
+                summary["error_dimensions_schema"] = classified_error["error_dimensions_schema"]
                 summary["automatic_recovery_scheduled"] = recovery_scheduled
                 try:
                     failure_marker = write_failed_preparation_marker(
@@ -30590,14 +30935,14 @@ def run_automatic(
         completion["state"] == "successful"
         and batch_retention_report.get("status") == "retained_for_review"
     ):
-        completion = {
+        completion = with_error_dimensions({
             "state": "warning",
             "code": "AUTO-OUTPUT-RETENTION-001",
             "message": (
                 "AnythingLLM upload and vector verification succeeded, but compact local-output cleanup "
                 "did not finish. Detailed source artifacts were retained; no upload was repeated."
             ),
-        }
+        })
     flat_no_logs_complete = (
         flat_no_logs_output
         and completion["state"] == "successful"
@@ -30614,13 +30959,14 @@ def run_automatic(
             )
         except (OSError, FileNotFoundError) as exc:
             flat_no_logs_complete = False
-            completion = {
+            completion = with_error_dimensions({
                 "state": "warning",
+                "code": "AUTO-LOCAL-EXPORT-PROMOTION-001",
                 "message": (
                     "The local files were prepared, but their compact export could not be promoted. "
                     f"Detailed staging output was retained for review: {exc}"
                 ),
-            }
+            }, stage="local_reporting", outcome="export_incomplete", scope="artifact", category="compact_export_promotion_failed")
     completion, terminal_audit = terminal_integrity_audit(
         run_root,
         completion,
@@ -30726,6 +31072,10 @@ def run_automatic(
         ),
         completion_code=completion.get("code"),
         not_processed_pdf_count=completion.get("not_processed_pdf_count"),
+        error_stage=completion.get("error_stage"),
+        error_outcome=completion.get("error_outcome"),
+        error_scope=completion.get("error_scope"),
+        error_category=completion.get("error_category"),
         # A partial terminal result owns an exact selected-record coverage
         # fraction. Preserve it instead of leaving the previous phase-budget
         # percentage on screen (for example, 80% beside a proven 289/322).

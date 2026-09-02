@@ -17,11 +17,12 @@ from anythingllm_compatibility import (
 )
 
 
-SOURCE_ATOMIC_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_v5"
+SOURCE_ATOMIC_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_v6"
 SOURCE_ATOMIC_LEGACY_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_v1"
 SOURCE_ATOMIC_PREVIOUS_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_v2"
 SOURCE_ATOMIC_PREVIOUS_V3_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_v3"
 SOURCE_ATOMIC_PREVIOUS_V4_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_v4"
+SOURCE_ATOMIC_PREVIOUS_V5_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_v5"
 SOURCE_ATOMIC_DEFAULT_PROVIDER_BATCH_SIZE = 36
 SOURCE_ATOMIC_MAX_PROVIDER_BATCH_SIZE = 64
 # The direct OpenRouter-compatible request is deliberately bounded below the
@@ -58,7 +59,7 @@ SOURCE_ATOMIC_PROVIDER_POLICY_HELPER = r'''
 let __sourceAtomicFirstAttemptTimeoutMs=__SOURCE_ATOMIC_PROVIDER_FIRST_ATTEMPT_TIMEOUT_MS__,__sourceAtomicRecoveryAttemptTimeoutMs=__SOURCE_ATOMIC_PROVIDER_RECOVERY_ATTEMPT_TIMEOUT_MS__,__sourceAtomicRetryDelayCapMs=__SOURCE_ATOMIC_PROVIDER_RETRY_DELAY_CAP_MS__,__sourceAtomicWaitHeartbeatMs=__SOURCE_ATOMIC_PROVIDER_WAIT_HEARTBEAT_MS__,__sourceAtomicSleep=(ms)=>new Promise(resolve=>setTimeout(resolve,ms));
 let __sourceAtomicHeaderValue=(error,name)=>{let headers=error?.headers||error?.response?.headers||{},lower=String(name||"").toLowerCase();try{if(typeof headers?.get==="function")return headers.get(name)||headers.get(lower)||""}catch(_){}return headers?.[name]||headers?.[lower]||""};
 let __sourceAtomicErrorStatus=(error)=>{let status=Number(error?.status||error?.response?.status||0);return Number.isFinite(status)&&status>0?status:0};
-let __sourceAtomicRetryable=(error)=>{if(error?.__sourceAtomicNoRetry)return false;let status=__sourceAtomicErrorStatus(error);if([408,409,429].includes(status)||status>=500)return true;if(status)return false;let name=String(error?.name||"");return name.includes("Connection")||name.includes("Timeout")||name==="AbortError"||name==="TypeError"};
+let __sourceAtomicRetryable=(error)=>{if(error?.__sourceAtomicNoRetry)return false;let status=__sourceAtomicErrorStatus(error);if([408,409,429].includes(status)||status>=500)return true;if(status)return false;let name=String(error?.name||""),message=String(error?.message||"").toLowerCase();return name.includes("Connection")||name.includes("Timeout")||name==="AbortError"||name==="TypeError"||message.includes("timed out")||message.includes("timeout")||message.includes("connection reset")||message.includes("socket hang up")||message.includes("fetch failed")};
 let __sourceAtomicRetryDelayMs=(error)=>{let retryAfterMs=Number.parseFloat(__sourceAtomicHeaderValue(error,"retry-after-ms")),retryAfter=String(__sourceAtomicHeaderValue(error,"retry-after")||"").trim(),delay=0;if(Number.isFinite(retryAfterMs)&&retryAfterMs>=0)delay=retryAfterMs;else if(retryAfter){let seconds=Number.parseFloat(retryAfter);if(Number.isFinite(seconds)&&seconds>=0)delay=seconds*1000;else{let dateMs=Date.parse(retryAfter);if(Number.isFinite(dateMs))delay=Math.max(0,dateMs-Date.now())}}if(!Number.isFinite(delay)||delay<=0)delay=500;return Math.min(__sourceAtomicRetryDelayCapMs,Math.max(0,Math.round(delay)))};
 let __sourceAtomicErrorDetail=(error)=>({error_class:String(error?.name||error?.constructor?.name||"Error"),http_status:__sourceAtomicErrorStatus(error),message:String(error?.message||"provider request failed").slice(0,500)});
 let __sourceAtomicAttemptId=(context,attempt)=>`${String(context?.sourceKey||"source")}:${Number(context?.batchIndex||0)}:${attempt}`;
@@ -203,6 +204,7 @@ def _render_v1161_embedding_worker_source(
             SOURCE_ATOMIC_PREVIOUS_PATCH_ID,
             SOURCE_ATOMIC_PREVIOUS_V3_PATCH_ID,
             SOURCE_ATOMIC_PREVIOUS_V4_PATCH_ID,
+            SOURCE_ATOMIC_PREVIOUS_V5_PATCH_ID,
         )
     ):
         raise ValueError("Embedding worker is already patched and cannot be rendered again.")
@@ -409,6 +411,7 @@ def ensure_source_atomic_embedding_worker(
         or SOURCE_ATOMIC_PREVIOUS_PATCH_ID in current_text
         or SOURCE_ATOMIC_PREVIOUS_V3_PATCH_ID in current_text
         or SOURCE_ATOMIC_PREVIOUS_V4_PATCH_ID in current_text
+        or SOURCE_ATOMIC_PREVIOUS_V5_PATCH_ID in current_text
     ):
         if not backup.is_file():
             result["reason"] = "source_atomic_worker_backup_missing"
@@ -442,9 +445,9 @@ def ensure_source_atomic_embedding_worker(
         )
         if not upgraded_from_patch_id and any(
             patch_id in current_text
-            for patch_id in (SOURCE_ATOMIC_PREVIOUS_V3_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V4_PATCH_ID)
+            for patch_id in (SOURCE_ATOMIC_PREVIOUS_V3_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V4_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V5_PATCH_ID)
         ):
-            # v3/v4 were immediately preceding, hash-gated revisions. Their
+            # v3-v5 were preceding, hash-gated revisions. Their
             # generated bodies are intentionally not reconstructed from
             # mutable live code; require the prior assistant manifest to bind
             # this exact file to the pristine v1.16.1 backup instead.
@@ -455,7 +458,7 @@ def ensure_source_atomic_embedding_worker(
             if (
                 isinstance(previous_manifest, dict)
                 and str(previous_manifest.get("patch_id") or "")
-                in {SOURCE_ATOMIC_PREVIOUS_V3_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V4_PATCH_ID}
+                in {SOURCE_ATOMIC_PREVIOUS_V3_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V4_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V5_PATCH_ID}
                 and str(previous_manifest.get("original_worker_sha256") or "")
                 == _sha256_bytes(original)
                 and str(previous_manifest.get("patched_worker_sha256") or "")

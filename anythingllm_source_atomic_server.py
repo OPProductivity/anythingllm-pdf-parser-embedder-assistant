@@ -19,14 +19,15 @@ from anythingllm_source_atomic_worker import (
 )
 
 
-SOURCE_ATOMIC_SERVER_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_server_v3"
-# v3 changes the execution semantics: a native cache lookup now occurs before
-# direct provider staging.  Older injected bodies must be rebuilt from the
-# verified pristine backup instead of being edited in place.
+SOURCE_ATOMIC_SERVER_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_server_v4"
+# Every revision changes guarded execution semantics (v3 added native cache
+# lookup; v4 hardens timeout classification). Older injected bodies are always
+# rebuilt from the verified pristine backup instead of being edited in place.
 SOURCE_ATOMIC_PREVIOUS_SERVER_PATCH_IDS = frozenset(
     {
         "anythingllm_pdf_assistant_source_atomic_server_v1",
         "anythingllm_pdf_assistant_source_atomic_server_v2",
+        "anythingllm_pdf_assistant_source_atomic_server_v3",
     }
 )
 # Kept as a compatibility alias for callers/tests that only need the oldest

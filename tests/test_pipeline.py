@@ -1911,7 +1911,11 @@ class PipelineCoreTests(unittest.TestCase):
         completion = app.automatic_completion([expired_openrouter_key], True)
         self.assertEqual(completion["code"], "AUTO-OPENROUTER-KEY-REVERIFY-001")
         self.assertIn("Update it in AnythingLLM Settings", completion["message"])
-        metadata_review = dict(successful_upload, post_upload_verification_status="review")
+        metadata_review = dict(
+            successful_upload,
+            post_upload_verification_status="review",
+            post_upload_classification="native_metadata_visibility_review",
+        )
         metadata_completion = app.automatic_completion([metadata_review], True)
         self.assertEqual(metadata_completion["state"], "successful")
         self.assertEqual(metadata_completion["diagnostic_code"], "AUTO-METADATA-VISIBILITY-001")
@@ -1972,12 +1976,59 @@ class PipelineCoreTests(unittest.TestCase):
 
         self.assertEqual(
             app.automatic_completion_phase(retrieval, True),
-            "Vectors stored — live retrieval check failed",
+            "Vectors stored — live vector search failed",
         )
         self.assertEqual(
             app.automatic_completion_phase(generic, True),
             "Run completed with a diagnostic notice",
         )
+
+    def test_pipeline_exception_classifier_does_not_treat_workspace_as_disk_space(self):
+        import rag_pdf_gradio_app as app
+
+        result = app.classify_pipeline_exception(
+            RuntimeError("AnythingLLM workspace observation timed out"), stage="desktop_queue",
+        )
+        self.assertEqual(result["code"], "AUTO-PIPELINE-001")
+        self.assertEqual(result["error_stage"], "desktop_queue")
+        self.assertNotEqual(result["error_category"], "filesystem_io_error")
+
+    def test_pipeline_exception_classifier_distinguishes_source_and_dependency_missing(self):
+        import rag_pdf_gradio_app as app
+
+        source = app.classify_pipeline_exception(
+            FileNotFoundError(2, "missing", "C:/sources/paper.pdf"),
+            stage="source_input", source_path="C:/sources/paper.pdf",
+        )
+        dependency = app.classify_pipeline_exception(
+            FileNotFoundError(2, "missing", "tesseract.exe"),
+            stage="extraction", source_path="C:/sources/paper.pdf",
+        )
+        self.assertEqual(source["error_category"], "source_file_missing")
+        self.assertEqual(dependency["error_category"], "dependency_missing")
+
+    def test_source_precommit_rejection_is_source_local_and_retains_fraction(self):
+        import rag_pdf_gradio_app as app
+
+        completion = app.automatic_completion([
+            {
+                "pdf": "C:/sources/a.pdf", "api_upload_status": "complete",
+                "post_upload_verification_status": "pass",
+                "anythingllm_runtime_validation_status": "pass",
+            },
+            {
+                "pdf": "C:/sources/b.pdf", "api_upload_status": "error",
+                "api_upload_error": "provider rejected request before commit",
+                "api_upload_error_classification": "source_atomic_provider_rejected_before_commit",
+                "post_upload_verification_status": "not_checked_no_upload",
+                "anythingllm_runtime_validation_status": "not_checked_no_upload",
+            },
+        ], True)
+        self.assertEqual(completion["state"], "warning")
+        self.assertEqual(completion["code"], "AUTO-EMBEDDING-SOURCE-PRECOMMIT-001")
+        self.assertEqual(completion["error_scope"], "source")
+        self.assertEqual(app.automatic_terminal_confirmed_fraction(completion), 0.5)
+        self.assertIn("Later eligible PDFs were allowed to continue", completion["message"])
 
     def test_automatic_extraction_summary_reports_selected_lanes_and_exact_targeted_pages(self):
         import rag_pdf_gradio_app as app
@@ -17817,8 +17868,51 @@ class PipelineCoreTests(unittest.TestCase):
                 )
 
         self.assertEqual(completion["state"], "failed")
-        self.assertEqual(completion["code"], "AUTO-INTEGRITY-001")
+        self.assertEqual(completion["code"], "AUTO-DATA-RECONCILIATION-001")
+        self.assertEqual(completion["error_category"], "canonical_count_or_identity_contradiction")
         self.assertEqual(retained, audit)
+
+    def test_terminal_integrity_recovery_evidence_gap_is_not_called_a_data_contradiction(self):
+        import rag_pdf_gradio_app as app
+
+        audit = {
+            "audit_status": "fail",
+            "summary": {"error_findings": 1},
+            "findings": [{"severity": "error", "code": "AUDIT-RECOVERY-001"}],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                mock.patch.object(app, "audit_run_directory", return_value=audit),
+                mock.patch.object(app, "write_failure_bundle", return_value=None),
+            ):
+                completion, _ = app.terminal_integrity_audit(
+                    temp_dir, {"state": "successful", "message": "ready"}, native_run=True,
+                )
+
+        self.assertEqual(completion["state"], "warning")
+        self.assertEqual(completion["code"], "AUTO-RECOVERY-EVIDENCE-INCOMPLETE-001")
+        self.assertNotIn("contradiction", completion["message"])
+
+    def test_terminal_integrity_telemetry_gap_does_not_invalidate_vectors(self):
+        import rag_pdf_gradio_app as app
+
+        audit = {
+            "audit_status": "fail",
+            "summary": {"error_findings": 1},
+            "findings": [{"severity": "error", "code": "AUDIT-PROGRESS-TRACE-COUNT-001"}],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                mock.patch.object(app, "audit_run_directory", return_value=audit),
+                mock.patch.object(app, "write_failure_bundle", return_value=None),
+            ):
+                completion, _ = app.terminal_integrity_audit(
+                    temp_dir, {"state": "successful", "message": "ready"}, native_run=True,
+                )
+
+        self.assertEqual(completion["state"], "warning")
+        self.assertEqual(completion["code"], "AUTO-TELEMETRY-INCONSISTENT-001")
+        self.assertEqual(completion["original_completion"]["state"], "successful")
 
     def test_terminal_integrity_observer_failure_does_not_erase_a_pipeline_failure(self):
         import rag_pdf_gradio_app as app
@@ -17905,7 +17999,7 @@ class PipelineCoreTests(unittest.TestCase):
             with mock.patch.object(app, "audit_run_directory", return_value=audit):
                 completion, retained = app.terminal_integrity_audit(
                     temp_dir,
-                    {"state": "failed", "code": "AUTO-INTEGRITY-001", "message": "old contradiction"},
+                    {"state": "failed", "code": "AUTO-DATA-RECONCILIATION-001", "message": "old contradiction"},
                     native_run=True,
                 )
 
@@ -17934,7 +18028,7 @@ class PipelineCoreTests(unittest.TestCase):
                 )
 
         self.assertEqual(completion["state"], "failed")
-        self.assertEqual(completion["code"], "AUTO-INTEGRITY-001")
+        self.assertEqual(completion["code"], "AUTO-DATA-RECONCILIATION-001")
         self.assertIn("could not be retained", completion["message"])
         self.assertEqual(retained, audit)
 
@@ -20224,6 +20318,171 @@ class PipelineCoreTests(unittest.TestCase):
         journal_states = [event["transaction"]["state"] for event in transaction_events]
         self.assertIn("source_rejected_without_remote_mutation", journal_states)
         self.assertGreaterEqual(journal_states.count("ambiguous_external_mutation_held"), 2)
+
+    def test_mixed_group_precommit_rejection_removes_only_failed_source_from_vector_target(self):
+        import rag_pdf_gradio_app as app
+
+        payloads = [
+            {"docSource": "local-pdf://sha256/good-a"},
+            {"docSource": "local-pdf://sha256/bad"},
+            {"docSource": "local-pdf://sha256/bad"},
+            {"docSource": "local-pdf://sha256/good-b"},
+        ]
+        locations = ["a.json", "bad-1.json", "bad-2.json", "b.json"]
+        kept, kept_locations, rejection = app.partition_precommit_rejected_vector_expectation(
+            payloads,
+            locations,
+            {
+                "source_atomic_precommit_rejection": {
+                    "source_key": "local-pdf://sha256/bad",
+                    "error": "Request timed out.",
+                }
+            },
+        )
+
+        self.assertEqual(
+            [row["docSource"] for row in kept],
+            ["local-pdf://sha256/good-a", "local-pdf://sha256/good-b"],
+        )
+        self.assertEqual(kept_locations, ["a.json", "b.json"])
+        self.assertEqual(rejection["rejected_locations"], ["bad-1.json", "bad-2.json"])
+        self.assertEqual(rejection["remaining_vector_expectation"], 2)
+
+        kept, kept_locations, rejection = app.partition_precommit_rejected_vector_expectation(
+            payloads,
+            locations,
+            {
+                "source_atomic_precommit_rejections": [
+                    {"source_key": "local-pdf://sha256/good-a", "error": "timeout"},
+                    {"source_key": "local-pdf://sha256/bad", "error": "timeout"},
+                ]
+            },
+        )
+        self.assertEqual(
+            [row["docSource"] for row in kept],
+            ["local-pdf://sha256/good-b"],
+        )
+        self.assertEqual(kept_locations, ["b.json"])
+        self.assertEqual(rejection["rejected_records"], 3)
+        self.assertEqual(len(rejection["rejections"]), 2)
+
+        untouched = app.partition_precommit_rejected_vector_expectation(
+            payloads,
+            locations,
+            {
+                "source_atomic_precommit_rejection": {
+                    "source_key": "local-pdf://sha256/bad",
+                    "error": "Request timed out.",
+                },
+                "source_atomic_commit_ambiguity": {
+                    "source_key": "local-pdf://sha256/bad",
+                    "error": "write may have begun",
+                },
+            },
+        )
+        self.assertEqual(untouched, (payloads, locations, {}))
+
+    def test_mixed_queue_group_credits_proven_siblings_and_continues_after_precommit_rejection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rows = []
+            for name in ("a", "bad", "bad2", "d", "later"):
+                text = root / f"{name}.txt"
+                text.write_text(name, encoding="utf-8")
+                rows.append({
+                    "filename": text.name,
+                    "text_file": str(text),
+                    "docSource": f"local-pdf://sha256/{name}",
+                    "chunkSource": f"page-parent://{name}",
+                    "_automatic_source_path": f"C:/sources/{name}.pdf",
+                })
+
+            def fake_attach(_api, _key, source_rows, **_kwargs):
+                row = source_rows[0]
+                location = f"custom-documents/{Path(row['text_file']).stem}.json"
+                return {
+                    "status": "attached_pending_queue",
+                    "uploaded": 1,
+                    "locations": [location],
+                    "reused_cached_locations": [],
+                    "errors": [],
+                    "attachment_results": [{
+                        "status": "attached",
+                        "location": location,
+                        "source_path": row["_automatic_source_path"],
+                        "filename": row["filename"],
+                    }],
+                }
+
+            queue_calls = []
+
+            def fake_queue(_api, _key, _workspace, locations, **_kwargs):
+                queue_calls.append(list(locations))
+                if "custom-documents/bad.json" in locations:
+                    visible = [
+                        value for value in locations
+                        if not value.endswith("bad.json") and not value.endswith("bad2.json")
+                    ]
+                    rejections = [
+                        {
+                            "source_key": f"local-pdf://sha256/{name}",
+                            "filename": f"custom-documents/{name}.json",
+                            "error": "source-atomic provider attempt 2/2 failed: Request timed out.",
+                        }
+                        for name in ("bad", "bad2")
+                    ]
+                else:
+                    visible = list(locations)
+                    rejections = []
+                return {
+                    "accepted": len(locations),
+                    "requested": len(locations),
+                    "queue_records": len(locations),
+                    "planned_locations": list(locations),
+                    "errors": [],
+                    "runtime_events": [],
+                    "batches": [{
+                        "submission_state": "accepted",
+                        "searchability_proven": True,
+                        "locations": list(locations),
+                        "verification": {
+                            "status": "pass",
+                            "current_upload_locations_with_vectors": visible,
+                            "source_atomic_precommit_rejections": rejections,
+                        },
+                    }],
+                    "progress_observation": {
+                        "final_queue_snapshot": {
+                            "source_atomic_precommit_rejections": rejections,
+                        },
+                    },
+                }
+
+            with (
+                mock.patch.object(pipeline, "resolve_anythingllm_api_key", return_value=("key", "provided")),
+                mock.patch.object(pipeline, "find_reusable_cached_document_locations", return_value=[""] * 5),
+                mock.patch.object(pipeline, "snapshot_staged_document_locations", return_value=set()),
+                mock.patch.object(pipeline, "maybe_upload_segment_files", side_effect=fake_attach),
+                mock.patch.object(pipeline, "update_workspace_embeddings_desktop_queue", side_effect=fake_queue),
+            ):
+                report = pipeline.maybe_upload_segment_files_source_transactions(
+                    "http://anythingllm",
+                    "key",
+                    rows,
+                    workspace_slug="workspace",
+                    embedding_ledger_path=root / "batch-embedding-ledger.json",
+                )
+
+        self.assertEqual(len(queue_calls), 2)
+        states = {row["source_filename"]: row["state"] for row in report["source_transactions"]}
+        self.assertEqual(states["bad.pdf"], "source_queue_rejected_without_remote_mutation")
+        self.assertEqual(states["bad2.pdf"], "source_queue_rejected_without_remote_mutation")
+        self.assertEqual(states["later.pdf"], "exact_vectors_proven")
+        self.assertEqual(
+            sum(row["vector_confirmed_records"] for row in report["source_transactions"]),
+            3,
+        )
+        self.assertNotEqual(report["status"], "reconciliation_pending")
 
     def test_attachment_success_without_location_holds_later_sources_and_never_reports_complete(self):
         """A 2xx without a durable location is an unknown mutation, not success.

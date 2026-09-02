@@ -111,6 +111,34 @@ let __sourceAtomicEmit=(event)=>emitted.push(event);
     assert "source_staging_provider_batch_waiting" not in probe["events"]
 
 
+def test_generated_provider_policy_retries_generic_error_with_timeout_message():
+    """OpenAI-compatible clients can surface a timeout as plain ``Error``."""
+    probe = _run_provider_policy_probe(
+        """
+let emitted=[],calls=[];
+global.setInterval=()=>1;global.clearInterval=()=>{};
+global.setTimeout=(callback)=>{queueMicrotask(callback);return 1};
+let l={openai:{embeddings:{create:async(request,options)=>{
+  calls.push(options);
+  if(calls.length===1)throw new Error("Request timed out.");
+  return {data:request.input.map((text,index)=>({embedding:[index,text.length]}))}
+}}}};
+let __sourceAtomicEmit=(event)=>emitted.push(event);
+"""
+        + source_atomic.SOURCE_ATOMIC_PROVIDER_POLICY_HELPER
+        + """
+(async()=>{let result=await __sourceAtomicEmbedBatch(["one"],{batchIndex:0,sourceKey:"probe"});console.log(JSON.stringify({calls,attemptCount:result.attemptCount,events:emitted.map(event=>event.type)}))})().catch(error=>{console.error(error);process.exit(1)});
+"""
+    )
+
+    assert probe["attemptCount"] == 2
+    assert probe["calls"] == [
+        {"maxRetries": 0, "timeout": 35_000},
+        {"maxRetries": 0, "timeout": 20_000},
+    ]
+    assert probe["events"].count("source_staging_provider_batch_retrying") == 1
+
+
 def test_generated_provider_policy_never_retries_bad_request_and_heartbeats_active_request():
     probe = _run_provider_policy_probe(
         """

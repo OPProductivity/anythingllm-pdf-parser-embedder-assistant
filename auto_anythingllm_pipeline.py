@@ -6392,8 +6392,10 @@ def is_unstructured_runtime_failure(error):
     """Identify failures safe to suppress for the rest of one batch only."""
     text = str(error or "").casefold()
     return any(token in text for token in (
-        "tesseract", "unstructured pdf support is not available",
-        "unstructured-inference", "onnxruntime", "detectron2", "no module named",
+        "tesseract.exe was not found", "tesseract was not found", "tesseract is not installed",
+        "unstructured pdf support is not available",
+        "no module named 'unstructured", "no module named 'onnxruntime",
+        "no module named 'detectron2",
     ))
 
 
@@ -7486,7 +7488,10 @@ def write_failure_package(pdf_path: Path, out_root: Path, exc, args=None):
     if "no extraction backend produced usable segments" in error_text.casefold():
         diagnostic_code = "PDF_OCR_REQUIRED_OR_NO_TEXT_LAYER"
         diagnostic_action = "Run OCR or inspect whether the PDF contains extractable body text."
-    elif "password" in error_text.casefold() or "encrypted" in error_text.casefold():
+    elif any(
+        token in error_text.casefold()
+        for token in ("password-protected pdf", "pdf is encrypted", "pdf password", "cannot decrypt pdf")
+    ):
         diagnostic_code = "PDF_ENCRYPTED_PASSWORD_REQUIRED"
         diagnostic_action = "Export an unlocked PDF copy."
     else:
@@ -12240,9 +12245,16 @@ def classify_anythingllm_mutation_outcome(*, stage, status=None, response_text="
         status = int(getattr(exception, "code", 0) or 0)
         body = _read_http_error_body(exception)
     elif exception is not None:
+        reason = getattr(exception, "reason", None)
+        timeout_exception = isinstance(exception, (TimeoutError, socket.timeout)) or isinstance(
+            reason, (TimeoutError, socket.timeout)
+        )
         return {
             "category": "ambiguous_external_mutation",
-            "classification": "client_transport_submission_unknown",
+            "classification": (
+                "client_timeout_submission_unknown"
+                if timeout_exception else "client_transport_submission_unknown"
+            ),
             "scope": "current_mutation_lane",
             "may_continue_later_sources": False,
             "http_status": None,
@@ -15137,12 +15149,11 @@ def _update_workspace_embeddings_batched_serial(
                 exception=exc,
             )
             exception_text = outcome.get("error") or str(exc)
-            timeout_like = "timed out" in exception_text.casefold() or "timeout" in exception_text.casefold()
+            timeout_like = outcome.get("classification") == "client_timeout_submission_unknown"
             error = {
                 "error": exception_text,
                 "endpoint": "update-embeddings",
                 "batch": batch_number,
-                "classification": "client_timeout_submission_unknown" if timeout_like else "client_transport_submission_unknown",
                 **outcome,
             }
             # A short HTTP receipt deadline is a hand-off observation point,
@@ -16263,6 +16274,7 @@ def update_workspace_embeddings_desktop_queue(
         "source_atomic_staging_started": False,
         "source_atomic_staging_finished": False,
         "source_atomic_precommit_rejection": {},
+        "source_atomic_precommit_rejections": {},
         "source_atomic_commit_ambiguity": {},
     }
 
@@ -16417,6 +16429,10 @@ def update_workspace_embeddings_desktop_queue(
                 "source_atomic_provider_retry_count": provider_retry_count,
                 "source_atomic_provider_last_retry": provider_last_retry,
                 "source_atomic_precommit_rejection": dict(queue_state["source_atomic_precommit_rejection"] or {}),
+                "source_atomic_precommit_rejections": [
+                    dict(rejection)
+                    for rejection in (queue_state["source_atomic_precommit_rejections"] or {}).values()
+                ],
                 "source_atomic_commit_ambiguity": dict(queue_state["source_atomic_commit_ambiguity"] or {}),
             }
 
@@ -16536,11 +16552,15 @@ def update_workspace_embeddings_desktop_queue(
                         "retry_delay_ms": max(0, event_int("retry_delay_ms")),
                     }
                 elif event_type == "source_rejected_before_commit":
-                    queue_state["source_atomic_precommit_rejection"] = {
+                    rejection = {
                         "source_key": str(event.get("sourceKey") or ""),
                         "filename": str(event.get("filename") or ""),
                         "error": str(event.get("error") or ""),
                     }
+                    queue_state["source_atomic_precommit_rejection"] = rejection
+                    rejection_key = rejection["source_key"] or rejection["filename"]
+                    if rejection_key:
+                        queue_state["source_atomic_precommit_rejections"][rejection_key] = rejection
                 elif event_type == "source_commit_ambiguous":
                     queue_state["source_atomic_commit_ambiguity"] = {
                         "source_key": str(event.get("sourceKey") or ""),
@@ -18575,9 +18595,86 @@ def maybe_upload_segment_files_source_transactions(
                 str(batch.get("submission_state") or "") == "rejected"
                 for batch in group_batches
             )
+            observed_vector_locations = {
+                _normalized_anythingllm_document_location(location)
+                for batch in group_batches
+                for location in (
+                    (batch.get("verification") or {}).get(
+                        "current_upload_locations_with_vectors"
+                    )
+                    or []
+                )
+                if _normalized_anythingllm_document_location(location)
+            }
+            final_queue_snapshot = dict(
+                (queue_progress or {}).get("final_queue_snapshot") or {}
+            )
+            precommit_rejections = [
+                dict(rejection)
+                for rejection in (
+                    final_queue_snapshot.get("source_atomic_precommit_rejections") or []
+                )
+                if isinstance(rejection, dict)
+            ]
+            if not precommit_rejections:
+                single_rejection = dict(
+                    final_queue_snapshot.get("source_atomic_precommit_rejection") or {}
+                )
+                if single_rejection:
+                    precommit_rejections.append(single_rejection)
+            if not precommit_rejections:
+                for batch in group_batches:
+                    verification = batch.get("verification") or {}
+                    candidates = verification.get(
+                        "source_atomic_precommit_rejections"
+                    ) or []
+                    precommit_rejections.extend(
+                        dict(candidate)
+                        for candidate in candidates
+                        if isinstance(candidate, dict)
+                    )
+                    if not candidates:
+                        candidate = dict(
+                            verification.get("source_atomic_precommit_rejection") or {}
+                        )
+                        if candidate:
+                            precommit_rejections.append(candidate)
+                    if precommit_rejections:
+                        break
+            rejection_by_source_key = {
+                str(rejection.get("source_key") or "").strip(): rejection
+                for rejection in precommit_rejections
+                if str(rejection.get("source_key") or "").strip()
+            }
+            rejected_source_keys = set(rejection_by_source_key)
+            # A verifier can truthfully prove every *remaining* location after
+            # a clean source rejection. That is not whole-group success: the
+            # rejected source must retain zero vectors and its own error.
+            if rejected_source_keys:
+                queue_exact = False
+            group_sources_resolved = True
             for transaction, _child in pending_queue_sources:
                 source_locations = list(transaction.get("locations") or [])
-                transaction["embedded"] = len(source_locations) if queue_exact else 0
+                normalized_source_locations = {
+                    _normalized_anythingllm_document_location(location)
+                    for location in source_locations
+                    if _normalized_anythingllm_document_location(location)
+                }
+                source_exact = bool(normalized_source_locations) and (
+                    normalized_source_locations <= observed_vector_locations
+                )
+                expected_source_key = (
+                    f"local-pdf://sha256/{transaction.get('source_sha256')}"
+                    if str(transaction.get("source_sha256") or "").strip()
+                    else ""
+                )
+                source_precommit_rejected = bool(
+                    rejected_source_keys
+                    and expected_source_key
+                    and expected_source_key in rejected_source_keys
+                    and not (normalized_source_locations & observed_vector_locations)
+                )
+                transaction["embedded"] = len(source_locations) if (queue_exact or source_exact) else 0
                 transaction["confirmed_vector_records"] = transaction["embedded"]
                 transaction["vector_confirmed_records"] = transaction["embedded"]
                 transaction["queue_requested_records"] = len(source_locations)
@@ -18591,21 +18688,42 @@ def maybe_upload_segment_files_source_transactions(
                     else 0
                 )
                 transaction["queue_completed_records"] = (
-                    len(source_locations) if queue_exact else 0
+                    len(source_locations) if (queue_exact or source_exact) else 0
                 )
                 transaction["queue_group_locations"] = source_locations
-                if queue_exact:
+                if queue_exact or source_exact:
                     transaction["state"] = "exact_vectors_proven"
                     aggregate["embedded"] += transaction["embedded"]
-                elif queue_rejected:
+                elif queue_rejected or source_precommit_rejected:
                     transaction["state"] = "source_queue_rejected_without_remote_mutation"
                     transaction["later_sources_released"] = True
+                    if source_precommit_rejected:
+                        source_error = {
+                            "category": "source_local_rejection",
+                            "classification": "source_atomic_provider_rejected_before_commit",
+                            "source_path": str(transaction.get("source_path") or ""),
+                            "source_key": expected_source_key,
+                            "may_continue_later_sources": True,
+                            "error": str(
+                                rejection_by_source_key.get(expected_source_key, {}).get("error")
+                                or "AnythingLLM rejected this PDF before namespace commit."
+                            ),
+                        }
+                        transaction["errors"] = list(transaction.get("errors") or []) + [source_error]
+                        aggregate["errors"].append(source_error)
+                        aggregate["embedding_update"]["errors"].append(source_error)
                 else:
                     transaction["state"] = "ambiguous_external_mutation_held"
                     transaction["later_sources_released"] = False
-                transaction["errors"] = list(transaction.get("errors") or []) + queue_errors
+                    group_sources_resolved = False
+                transaction["errors"] = list(transaction.get("errors") or []) + [
+                    error for error in queue_errors
+                    if not str(error.get("source_path") or "").strip()
+                    or str(error.get("source_path") or "").strip()
+                    == str(transaction.get("source_path") or "").strip()
+                ]
                 persist_transactions(transaction)
-            if queue_exact or queue_rejected:
+            if queue_exact or queue_rejected or group_sources_resolved:
                 if hold_after_queue_group:
                     stop_submission = True
                     break
@@ -19736,7 +19854,11 @@ def inspect_native_metadata_count(
             )
         result["status"] = "complete"
     except Exception as exc:
-        result["status"] = "database_busy" if "lock" in str(exc).casefold() or "busy" in str(exc).casefold() else "error"
+        database_busy = isinstance(exc, sqlite3.OperationalError) and any(
+            token in str(exc).casefold()
+            for token in ("database is locked", "database is busy", "database table is locked")
+        )
+        result["status"] = "database_busy" if database_busy else "error"
         result["error"] = str(exc)
     return result
 
