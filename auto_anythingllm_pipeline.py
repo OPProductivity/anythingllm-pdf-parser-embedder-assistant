@@ -81,7 +81,6 @@ from rag_pdf_tools import (
     get_backend_pages,
     normalize_text,
     pymupdf4llm_execution_evidence,
-    pymupdf4llm_ocr_page_workers,
     safe_stem,
     unstructured_execution_evidence,
     unstructured_runtime_status,
@@ -5431,26 +5430,133 @@ def simulated_chunks(text, chunk_size=1000, overlap=140):
     return chunks
 
 
+BACKEND_COVERAGE_DISAGREEMENT_RATIO = 0.35
+DOCUMENT_WIDE_OCR_PAGE_RATIO = 0.60
+POSSIBLE_SCAN_PAGE_RATIO = 0.20
+SPARSE_IMAGE_REVIEW_PAGE_RATIO = 0.25
+FRAGMENT_CLUSTER_MIN_LETTERS = 5
+FRAGMENT_PAGE_MIN_CLUSTER_TOKENS = 12
+FRAGMENT_PAGE_MIN_CLUSTER_LINES = 3
+FRAGMENT_PAGE_MIN_CLUSTER_RATIO = 0.08
+FRAGMENT_DOCUMENT_MIN_PAGE_RATIO = 0.60
+FRAGMENT_DOCUMENT_MIN_CLUSTER_RATIO = 0.06
+FRAGMENT_DOCUMENT_MIN_CLUSTER_LINES_PER_PAGE = 2
+OUTLINE_FALLBACK_MIN_AGREEING_BACKENDS = 2
+
+
 def text_integrity_metrics(text):
-    """Detect sustained broken-word fragments without penalising normal prose.
+    """Report contextual broken-word evidence without declaring prose corrupt.
 
     A PDF can expose a nominal text layer while its positioned glyphs are
     unusable for retrieval (``t o``, ``m y``, ``b e`` across many lines). A
-    few one-letter tokens are normal in prose, verse, variables, and names;
-    this reports only a sustained pattern across a substantial text sample.
+    lexical count alone cannot distinguish that failure from initials, dotted
+    abbreviations, variables, Roman numerals, citations, verse, or deliberately
+    letter-spaced headings. Preserve punctuation and Unicode context, and
+    separately report the stronger signal of five-or-more consecutive
+    isolated letters. Callers must still treat that signal as review evidence,
+    not proof of corruption.
     """
-    tokens = re.findall(r"[A-Za-z]+(?:['\u2019][A-Za-z]+)?", str(text or ""))
-    suspicious = [
-        token for token in tokens
-        if len(token) == 1 and token.casefold() not in {"a", "i"}
+    content = unicodedata.normalize("NFC", str(text or ""))
+    word_pattern = re.compile(
+        r"[^\W\d_]+(?:['\u2019-][^\W\d_]+)?",
+        flags=re.UNICODE,
+    )
+
+    def is_contextual_fragment(token, start, end):
+        if len(token) != 1 or token.casefold() in {"a", "i"}:
+            return False
+        before = content[start - 1] if start else ""
+        after = content[end] if end < len(content) else ""
+        # Dotted initials/abbreviations (``J.``, ``U.S.``), citation labels
+        # (``p.``), and year suffixes (``2017a``) retain decisive context that
+        # the old punctuation-stripping tokenizer destroyed.
+        return not (
+            before == "."
+            or after == "."
+            or before.isdigit()
+            or after.isdigit()
+        )
+
+    tokens = list(word_pattern.finditer(content))
+    contextual = [
+        match
+        for match in tokens
+        if is_contextual_fragment(match.group(0), *match.span())
     ]
+    clustered = []
+    cluster_line_count = 0
+    offset = 0
+    for line in content.splitlines(keepends=True):
+        run = []
+        for match in word_pattern.finditer(line):
+            start, end = offset + match.start(), offset + match.end()
+            if is_contextual_fragment(match.group(0), start, end):
+                run.append(match.group(0))
+                continue
+            if len(run) >= FRAGMENT_CLUSTER_MIN_LETTERS:
+                clustered.extend(run)
+                cluster_line_count += 1
+            run = []
+        if len(run) >= FRAGMENT_CLUSTER_MIN_LETTERS:
+            clustered.extend(run)
+            cluster_line_count += 1
+        offset += len(line)
     total = len(tokens)
-    count = len(suspicious)
+    count = len(contextual)
+    cluster_count = len(clustered)
     return {
         "word_tokens": total,
         "fragmented_single_letter_token_count": count,
         "fragmented_single_letter_token_ratio": round(count / max(total, 1), 4),
+        "fragmented_cluster_token_count": cluster_count,
+        "fragmented_cluster_token_ratio": round(cluster_count / max(total, 1), 4),
+        "fragmented_cluster_line_count": cluster_line_count,
+        "text_integrity_interpretation": (
+            "ambiguous_fragmentation_pattern" if cluster_count else "not_observed"
+        ),
     }
+
+
+def page_has_sustained_fragmentation(metrics):
+    metrics = metrics or {}
+    return (
+        int(metrics.get("fragmented_cluster_token_count") or 0)
+        >= FRAGMENT_PAGE_MIN_CLUSTER_TOKENS
+        and int(metrics.get("fragmented_cluster_line_count") or 0)
+        >= FRAGMENT_PAGE_MIN_CLUSTER_LINES
+        and float(metrics.get("fragmented_cluster_token_ratio") or 0.0)
+        >= FRAGMENT_PAGE_MIN_CLUSTER_RATIO
+    )
+
+
+def document_has_sustained_fragmentation(quality):
+    quality = quality or {}
+    pages = max(1, int(quality.get("included_pages") or 0))
+    required_pages = max(1, math.ceil(pages * FRAGMENT_DOCUMENT_MIN_PAGE_RATIO))
+    return (
+        int(quality.get("fragmented_page_count") or 0) >= required_pages
+        and float(quality.get("fragmented_cluster_token_ratio") or 0.0)
+        >= FRAGMENT_DOCUMENT_MIN_CLUSTER_RATIO
+        and int(quality.get("fragmented_cluster_line_count") or 0)
+        >= max(
+            FRAGMENT_PAGE_MIN_CLUSTER_LINES,
+            pages * FRAGMENT_DOCUMENT_MIN_CLUSTER_LINES_PER_PAGE,
+        )
+    )
+
+
+def has_corroborated_outline_disagreement(candidates):
+    """Require independent native agreement before an outline warning escalates."""
+    evaluated = [candidate for candidate in (candidates or []) if not candidate.get("error")]
+    untrusted = [
+        candidate for candidate in evaluated
+        if str((candidate.get("outline_validation") or {}).get("reliability") or "").casefold()
+        == "untrusted"
+    ]
+    return (
+        len(untrusted) >= OUTLINE_FALLBACK_MIN_AGREEING_BACKENDS
+        and len(untrusted) == len(evaluated)
+    )
 
 
 def _reconciliation_text_tokens(text):
@@ -5460,44 +5566,6 @@ def _reconciliation_text_tokens(text):
         r"[A-Za-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u00ff]+(?:['\u2019-][A-Za-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u00ff]+)?",
         content.casefold(),
     )
-
-
-def _reconciliation_token_key(value):
-    return re.sub(r"[^a-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u00ff]", "", str(value or "").casefold())
-
-
-def _reconciliation_case_like(replacement, source):
-    if str(source).isupper():
-        return str(replacement).upper()
-    if str(source).istitle():
-        return str(replacement).title()
-    return str(replacement).lower() if str(source).islower() else str(replacement)
-
-
-def _reconciliation_mask_category_labels(text):
-    """Blank category labels without moving text offsets used for repairs."""
-    return re.sub(
-        r"(?m)^\[[A-Za-z][A-Za-z0-9_]*\]\s*",
-        lambda match: " " * len(match.group(0)),
-        str(text or ""),
-    )
-
-
-def _reconciliation_word_spans(text):
-    """Return OCR word spans after excluding Unstructured category labels."""
-    masked = _reconciliation_mask_category_labels(text)
-    return [
-        {
-            "start": match.start(),
-            "end": match.end(),
-            "word": match.group(0),
-            "key": _reconciliation_token_key(match.group(0)),
-        }
-        for match in re.finditer(
-            r"[A-Za-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u00ff]+(?:['\u2019-][A-Za-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u00ff]+)?",
-            masked,
-        )
-    ]
 
 
 def _native_raw_reconciliation_text(native_page, fallback_text=""):
@@ -5576,150 +5644,6 @@ def recover_native_page_heading(native_page, ocr_text, fallback_native_text=""):
     return f"{prefix}\n\n{text}".strip(), {"action": "prefixed_missing_heading", "to": heading}
 
 
-def correct_ocr_words_from_native_page(native_text, ocr_text, native_raw_text=""):
-    """Correct only uniquely corroborated OCR words, preserving OCR layout.
-
-    A native layer may preserve a word that OCR almost recognises, even if its
-    reading order is poor. This function intentionally does not use a spelling
-    dictionary or invent missing prose. It replaces an OCR token only where a
-    unique native token on that same physical page is a very close match with
-    a shared initial and a substantial shared ending. Those anchors admit
-    ``seqtuesque`` -> ``statuesque`` while rejecting broad semantic guesses.
-    """
-    native_evidence_text = str(native_raw_text or native_text or "")
-    native_words = re.findall(
-        r"[A-Za-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u00ff]+(?:['\u2019-][A-Za-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u00ff]+)?",
-        native_evidence_text,
-    )
-    native_by_key = {}
-    for word in native_words:
-        key = _reconciliation_token_key(word)
-        if key:
-            native_by_key.setdefault(key, []).append(word)
-    unique_native = {
-        key: values[0]
-        for key, values in native_by_key.items()
-        if len(key) >= 5 and len(values) == 1
-    }
-    replacements_by_span = {}
-
-    def add_replacement(start, end, source, replacement, similarity, method):
-        if start in replacements_by_span or replacement.casefold() == source.casefold():
-            return
-        replacements_by_span[start] = {
-            "start": start,
-            "end": end,
-            "from": source,
-            "to": replacement,
-            "similarity": round(similarity, 4),
-            "method": method,
-        }
-
-    ocr_words = _reconciliation_word_spans(ocr_text)
-    safe_unpunctuated_contractions = {
-        "ive", "youre", "youll", "theyre", "theyll", "weve", "dont", "cant",
-        "wont", "isnt", "arent",
-        "wasnt", "werent", "havent", "hasnt", "hadnt", "didnt", "doesnt",
-        "couldnt", "wouldnt", "shouldnt", "theres", "whos", "whats",
-    }
-    for word_row in ocr_words:
-        source = word_row["word"]
-        source_key = word_row["key"]
-        native_same_key = unique_native.get(source_key)
-        if (
-            native_same_key
-            and source_key in safe_unpunctuated_contractions
-            and re.search(r"['\u2019-]", native_same_key)
-            and not re.search(r"['\u2019-]", source)
-        ):
-            add_replacement(
-                word_row["start"], word_row["end"], source,
-                _reconciliation_case_like(native_same_key, source), 1.0,
-                "native_contraction_surface",
-            )
-        if len(source_key) < 5 or source_key in unique_native:
-            continue
-        candidates = []
-        for candidate_key, candidate_word in unique_native.items():
-            if abs(len(candidate_key) - len(source_key)) > 2:
-                continue
-            similarity = SequenceMatcher(None, source_key, candidate_key, autojunk=False).ratio()
-            common_suffix = 0
-            for left, right in zip(reversed(source_key), reversed(candidate_key)):
-                if left != right:
-                    break
-                common_suffix += 1
-            if (
-                similarity >= 0.80
-                and source_key[:1] == candidate_key[:1]
-                and common_suffix >= 3
-            ):
-                candidates.append((similarity, candidate_word, candidate_key))
-        if len(candidates) != 1:
-            continue
-        similarity, candidate_word, _ = candidates[0]
-        replacement = _reconciliation_case_like(candidate_word, source)
-        if replacement.casefold() == source.casefold():
-            continue
-        add_replacement(
-            word_row["start"], word_row["end"], source, replacement,
-            similarity, "unique_native_fuzzy_word",
-        )
-
-    # The original native text can be visually ordered even when its prepared
-    # semantic transcript is not.  Use SequenceMatcher only for a one-word
-    # replacement bracketed by a matching local anchor, then retain a native
-    # word only when it is at least as complete and unique on that page.  This
-    # fixes e.g. ``put -> but`` and ``aside -> inside`` without a dictionary
-    # or a semantic-language guess.
-    native_ordered_words = [
-        {
-            "word": word,
-            "key": _reconciliation_token_key(word),
-        }
-        for word in native_words
-        if _reconciliation_token_key(word)
-    ]
-    ocr_keys = [row["key"] for row in ocr_words]
-    native_keys = [row["key"] for row in native_ordered_words]
-    opcodes = SequenceMatcher(None, ocr_keys, native_keys, autojunk=False).get_opcodes()
-    for opcode_index, (tag, i1, i2, j1, j2) in enumerate(opcodes):
-        if tag != "replace" or i2 - i1 != 1 or j2 - j1 != 1:
-            continue
-        previous_equal = opcode_index > 0 and opcodes[opcode_index - 1][0] == "equal"
-        following_equal = opcode_index + 1 < len(opcodes) and opcodes[opcode_index + 1][0] == "equal"
-        if not (previous_equal or following_equal):
-            continue
-        source_row = ocr_words[i1]
-        source_key = source_row["key"]
-        candidate_word = native_ordered_words[j1]["word"]
-        candidate_key = native_ordered_words[j1]["key"]
-        if (
-            len(source_key) < 3
-            or len(candidate_key) < len(source_key)
-            or len(candidate_key) > len(source_key) + 2
-            or len(native_by_key.get(candidate_key, [])) != 1
-        ):
-            continue
-        similarity = SequenceMatcher(None, source_key, candidate_key, autojunk=False).ratio()
-        if similarity < 0.65:
-            continue
-        add_replacement(
-            source_row["start"], source_row["end"], source_row["word"],
-            _reconciliation_case_like(candidate_word, source_row["word"]),
-            similarity, "ordered_native_anchor",
-        )
-    replacements = list(replacements_by_span.values())
-    corrected = str(ocr_text or "")
-    for replacement in reversed(replacements):
-        corrected = (
-            corrected[:replacement["start"]]
-            + replacement["to"]
-            + corrected[replacement["end"]:]
-        )
-    return corrected, replacements
-
-
 def reconcile_native_ocr_pages(native_pages, ocr_pages):
     """Make one non-duplicated, page-local native/OCR transcript.
 
@@ -5728,8 +5652,8 @@ def reconcile_native_ocr_pages(native_pages, ocr_pages):
     that would create duplicate retrieval passages. Select native when its
     page-local evidence decisively beats fragmented OCR; select OCR when
     native is absent; otherwise preserve the observed OCR line/category
-    structure as a conservative tie-breaker, applying only uniquely
-    corroborated native word repairs.
+    structure as a conservative tie-breaker. The selected page text is never
+    mutated by token-level native/OCR spelling or punctuation guesses.
     """
     native_by_page = {
         int(page.get("page") or 0): page
@@ -5748,12 +5672,8 @@ def reconcile_native_ocr_pages(native_pages, ocr_pages):
         ocr = ocr_by_page.get(page_number)
         native_text = str((native or {}).get("text") or "")
         ocr_text = str((ocr or {}).get("text") or "")
-        native_raw_text = _native_raw_reconciliation_text(native, native_text)
         corrected_ocr_text, heading_recovery = recover_native_page_heading(
             native, ocr_text, native_text
-        )
-        corrected_ocr_text, lexical_corrections = correct_ocr_words_from_native_page(
-            native_text, corrected_ocr_text, native_raw_text
         )
         if ocr and corrected_ocr_text != ocr_text:
             ocr = {**ocr, "text": corrected_ocr_text}
@@ -5781,8 +5701,8 @@ def reconcile_native_ocr_pages(native_pages, ocr_pages):
         elif native_text and ocr_text:
             native_words = len(native_tokens)
             ocr_words = len(ocr_tokens)
-            native_fragments = int(native_integrity["fragmented_single_letter_token_count"])
-            ocr_fragments = int(ocr_integrity["fragmented_single_letter_token_count"])
+            native_fragments = int(native_integrity["fragmented_cluster_token_count"])
+            ocr_fragments = int(ocr_integrity["fragmented_cluster_token_count"])
             # Do not switch merely because two clean versions differ in a few
             # words. A native replacement requires comparable coverage, a
             # material mismatch, and at least three fewer broken fragments.
@@ -5791,7 +5711,13 @@ def reconcile_native_ocr_pages(native_pages, ocr_pages):
                 and similarity < 0.55
                 and native_fragments + 3 <= ocr_fragments
             )
-            if native_is_clearly_better:
+            native_is_effectively_missing = (
+                native_words <= 5
+                and ocr_words >= max(80, native_words * 20)
+            )
+            if native_is_effectively_missing:
+                decision = "ocr_used_native_page_inadequate"
+            elif native_is_clearly_better:
                 decision = "native_used_ocr_page_fragmented"
                 selected_page = native
         if not selected_page:
@@ -5802,16 +5728,15 @@ def reconcile_native_ocr_pages(native_pages, ocr_pages):
             "native_word_count": len(native_tokens),
             "ocr_word_count": len(ocr_tokens),
             "token_sequence_similarity": round(similarity, 4),
-            "native_fragment_count": int(native_integrity["fragmented_single_letter_token_count"]),
-            "ocr_fragment_count": int(ocr_integrity["fragmented_single_letter_token_count"]),
+            "native_fragment_count": int(native_integrity["fragmented_cluster_token_count"]),
+            "ocr_fragment_count": int(ocr_integrity["fragmented_cluster_token_count"]),
             "native_heading_recovery": heading_recovery,
-            "native_word_corrections": lexical_corrections,
         }
         reconciled.append(page_row)
         decisions.append({"page": page_number, **page_row["native_ocr_reconciliation"]})
     return reconciled, {
         "status": "applied" if decisions else "not_available",
-        "method": "page_local_evidence_reconciliation_v2",
+        "method": "page_local_evidence_reconciliation_v3",
         "selection_policy": (
             "page-local evidence; preserve OCR structure only as the "
             "conservative tie-breaker"
@@ -5978,7 +5903,9 @@ def extraction_quality(pages, stats, start_page, end_page):
         1
         for page in pages
         if int(page.get("page") or 0) in included_page_numbers
-        and text_integrity_metrics(page.get("text") or "").get("fragmented_single_letter_token_count", 0) >= 3
+        and page_has_sustained_fragmentation(
+            text_integrity_metrics(page.get("text") or "")
+        )
     )
     chars = sum(s.chars for s in included)
     words = sum(s.words for s in included)
@@ -5997,10 +5924,9 @@ def extraction_quality(pages, stats, start_page, end_page):
     # output is not equivalent to readable prose. Count only unmistakable
     # extractor artefacts so ordinary punctuation, citations, and source text
     # are never penalised.
+    layout_syntax_count = included_text.count("|") + included_text.count("_")
     ocr_layout_artifact_count = (
-        included_text.count("|")
-        + included_text.count("_")
-        + included_text.count("<br>") * 2
+        included_text.count("<br>") * 2
         + included_text.count("**==> picture") * 8
         + included_text.count("**----- Start of picture text -----**") * 8
         + included_text.count("**----- End of picture text -----**") * 8
@@ -6008,18 +5934,20 @@ def extraction_quality(pages, stats, start_page, end_page):
     ocr_layout_artifact_ratio = round(
         ocr_layout_artifact_count / max(len(included_text), 1), 4
     )
+    layout_syntax_ratio = round(layout_syntax_count / max(len(included_text), 1), 4)
     scanned_likelihood = (
         "high"
-        if included and (empty + image_heavy_low_text_pages) / len(included) >= 0.6
+        if included and (empty + image_heavy_low_text_pages) / len(included) >= DOCUMENT_WIDE_OCR_PAGE_RATIO
         else "possible"
-        if included and (empty + image_heavy_low_text_pages) / len(included) >= 0.2
+        if included and (empty + image_heavy_low_text_pages) / len(included) >= POSSIBLE_SCAN_PAGE_RATIO
         else "low"
     )
-    fragmented_text = (
-        int(integrity["fragmented_single_letter_token_count"]) >= max(18, int(integrity["word_tokens"]) // 30)
-        and float(integrity["fragmented_single_letter_token_ratio"]) >= 0.035
-        and fragmented_page_count >= 2
-    )
+    fragmented_text = document_has_sustained_fragmentation({
+        "included_pages": len(included),
+        "fragmented_page_count": fragmented_page_count,
+        "fragmented_cluster_token_ratio": integrity["fragmented_cluster_token_ratio"],
+        "fragmented_cluster_line_count": integrity["fragmented_cluster_line_count"],
+    })
     return {
         "included_pages": len(included),
         "included_chars": chars,
@@ -6036,13 +5964,19 @@ def extraction_quality(pages, stats, start_page, end_page):
         "average_words_per_page": avg_words_per_page,
         "ocr_layout_artifact_count": ocr_layout_artifact_count,
         "ocr_layout_artifact_ratio": ocr_layout_artifact_ratio,
+        "layout_syntax_count": layout_syntax_count,
+        "layout_syntax_ratio": layout_syntax_ratio,
         "fragmented_single_letter_token_count": integrity["fragmented_single_letter_token_count"],
         "fragmented_single_letter_token_ratio": integrity["fragmented_single_letter_token_ratio"],
+        "fragmented_cluster_token_count": integrity["fragmented_cluster_token_count"],
+        "fragmented_cluster_token_ratio": integrity["fragmented_cluster_token_ratio"],
+        "fragmented_cluster_line_count": integrity["fragmented_cluster_line_count"],
         "fragmented_page_count": fragmented_page_count,
         # This is a review signal, not a proof that OCR will be better. Verse,
         # art catalogues, and low-quality embedded OCR can benefit from a
         # comparison while still having a more useful native result.
         "text_integrity_status": "review" if fragmented_text else "not_flagged",
+        "text_integrity_interpretation": integrity["text_integrity_interpretation"],
         "scanned_likelihood": scanned_likelihood,
     }
 
@@ -6102,7 +6036,8 @@ def has_complete_native_text_candidate(candidates, pdf_page_count, ocr_preflight
     sparse_image_review_only = (
         coverage.get("status") == "verified"
         and len(coverage.get("image_backed_low_text_pages") or []) > 0
-        and len(coverage.get("image_backed_low_text_pages") or []) / page_count <= 0.25
+        and len(coverage.get("image_backed_low_text_pages") or []) / page_count
+        <= SPARSE_IMAGE_REVIEW_PAGE_RATIO
     )
     minimum_words = max(500, page_count * 150)
     for candidate in candidates or []:
@@ -6258,6 +6193,107 @@ def automatic_visual_text_ocr_targets(ocr_preflight_hint, pdf_page_count=0):
     }
 
 
+def automatic_page_local_ocr_plan(ocr_preflight_hint, candidates=None, pdf_page_count=0):
+    """Classify physical pages without promoting one weak majority to whole-PDF OCR.
+
+    Automatic mode preserves healthy native pages. It OCRs only pages with
+    direct raster/empty-layer evidence or matching page-level evidence from a
+    completed native candidate. Pages with sparse but real native text remain
+    uncertain rather than being silently replaced.
+    """
+    coverage = dict((ocr_preflight_hint or {}).get("full_native_text_coverage") or {})
+    try:
+        page_count = int(coverage.get("page_count") or pdf_page_count or 0)
+    except (TypeError, ValueError):
+        page_count = 0
+    required = set()
+    uncertain = set()
+    evidence = {}
+
+    if str(coverage.get("status") or "").casefold() == "verified":
+        for row in coverage.get("image_backed_low_text_pages") or []:
+            try:
+                page = int(row.get("page") or 0)
+                chars = int(row.get("native_text_characters") or 0)
+                area = float(row.get("largest_image_area_ratio") or 0.0)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if page < 1 or (page_count and page > page_count):
+                continue
+            if chars <= 24 and area >= 0.28:
+                required.add(page)
+                evidence[page] = "image_backed_effectively_empty_native_page"
+            elif chars < 160 and area >= 0.50:
+                uncertain.add(page)
+                evidence[page] = "image_backed_sparse_native_page"
+        for row in coverage.get("visible_vector_low_text_pages") or []:
+            try:
+                page = int(row.get("page") or 0)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if page >= 1 and (not page_count or page <= page_count):
+                required.add(page)
+                evidence[page] = "visible_vector_page_without_native_text"
+
+    # Full extraction has stronger per-page word/image evidence than the
+    # representative preview. Require agreement from two native candidates
+    # when possible; a single candidate may be the only survivor of a backend
+    # failure, in which case an empty image page is still direct evidence.
+    page_votes = Counter()
+    candidate_count = 0
+    for candidate in candidates or []:
+        if candidate.get("error"):
+            continue
+        candidate_count += 1
+        for row in candidate.get("page_stats") or []:
+            try:
+                page = int(row.get("pdf_page") or 0)
+                words = int(row.get("words") or 0)
+                images = int(row.get("image_count") or 0)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if page >= 1 and images > 0 and words < 40:
+                page_votes[page] += 1
+    needed_votes = 2 if candidate_count >= 2 else 1
+    for page, votes in page_votes.items():
+        if votes >= needed_votes:
+            required.add(page)
+            uncertain.discard(page)
+            evidence[page] = "native_candidates_agree_image_page_has_inadequate_text"
+
+    aggregate_high = any(
+        not candidate.get("error")
+        and str((candidate.get("quality") or {}).get("scanned_likelihood") or "").casefold() == "high"
+        for candidate in candidates or []
+    )
+    if aggregate_high and page_count and not required:
+        # Older/direct callers may not supply the UI's all-page coverage rows.
+        # With no page-local evidence to distinguish islands, every physical
+        # page is unresolved; still express that as an explicit targeted set
+        # so Automatic mode uses checkpoints rather than a monolithic request.
+        required.update(range(1, page_count + 1))
+        for page in required:
+            evidence[page] = "aggregate_scan_evidence_without_page_profile"
+
+    classes = {
+        page: (
+            "ocr_required" if page in required
+            else "uncertain" if page in uncertain
+            else "native_good"
+        )
+        for page in range(1, page_count + 1)
+    }
+    return {
+        "status": "page_local_plan_ready" if page_count else "page_local_plan_unavailable",
+        "page_count": page_count,
+        "ocr_required_pages": sorted(required),
+        "uncertain_pages": sorted(uncertain - required),
+        "native_good_pages": [page for page, value in classes.items() if value == "native_good"],
+        "page_classification": classes,
+        "evidence": {str(page): evidence[page] for page in sorted(evidence)},
+    }
+
+
 def has_document_wide_ocr_evidence(candidates, ocr_preflight_hint=None, pdf_page_count=0):
     """Whether candidate evidence warrants OCRing an entire PDF.
 
@@ -6270,11 +6306,17 @@ def has_document_wide_ocr_evidence(candidates, ocr_preflight_hint=None, pdf_page
     """
     # Targeted recovery is intentionally not promoted to whole-document OCR.
     # The separate evidence object tells the runner to OCR only these pages.
+    plan = automatic_page_local_ocr_plan(
+        ocr_preflight_hint, candidates, pdf_page_count
+    )
+    if bool(plan.get("ocr_required_pages")) and (
+        len(plan["ocr_required_pages"]) >= max(1, int(plan.get("page_count") or 0))
+    ):
+        return True
     return any(
-        str((candidate.get("quality") or {}).get("scanned_likelihood") or "").casefold()
-        == "high"
-        for candidate in (candidates or [])
-        if not candidate.get("error")
+        not candidate.get("error")
+        and str((candidate.get("quality") or {}).get("scanned_likelihood") or "").casefold() == "high"
+        for candidate in candidates or []
     )
 
 
@@ -6304,7 +6346,10 @@ def resolve_unstructured_strategy(
         if int((candidate.get("quality") or {}).get("included_words") or 0) > 0
     ]
     if len(word_counts) >= 2:
-        coverage_disagreement = (max(word_counts) - min(word_counts)) / max(word_counts) > 0.35
+        coverage_disagreement = (
+            (max(word_counts) - min(word_counts)) / max(word_counts)
+            > BACKEND_COVERAGE_DISAGREEMENT_RATIO
+        )
 
     if requested in {"fast", "hi_res", "ocr_only"}:
         if requested in {"hi_res", "ocr_only"} and not runtime_probe.get("tesseract_available"):
@@ -6655,13 +6700,8 @@ def write_provenance_review_manifest(
     quality = selected.get("quality") or {}
     selected_backend = str(selected.get("backend") or "")
     ocr_execution = dict(selected.get("pymupdf4llm_execution") or {})
-    legacy_ocr_workers = (
-        pymupdf4llm_ocr_page_workers()
-        if selected_backend.casefold() == "pymupdf4llm"
-        else 0
-    )
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "review_scope": "single_fresh_preparation_run",
         "source": {
             "source_id": source_meta.get("source_id", ""),
@@ -6681,14 +6721,6 @@ def write_provenance_review_manifest(
             "scanned_likelihood": quality.get("scanned_likelihood", ""),
             "ocr_assistance_observed": bool(ocr_evidence.get("used")),
             "ocr_assistance_evidence": ocr_evidence.get("evidence", "not_observed"),
-            # Preserve the v1 fields for existing artifact-review tooling.
-            # The execution object below is additive evidence of what happened
-            # in this specific run; the legacy field remains a configured
-            # global worker setting, exactly as it was before this addition.
-            "pymupdf4llm_ocr_page_workers": legacy_ocr_workers,
-            "ocr_page_workers_scope": (
-                "global_process_isolated_setting" if legacy_ocr_workers else "not_applicable"
-            ),
             "pymupdf4llm_execution": ocr_execution,
         },
         "review_artifacts": {
@@ -7001,6 +7033,14 @@ def build_run_diagnostics(
     if quality.get("scanned_likelihood") == "high":
         if ocr_assisted_selection:
             add("PDF_IMAGE_HEAVY_OCR_USED", "info", "extraction", "Most included pages appear image-heavy, and the selected OCR-assisted extraction path was used.", "Review the OCR output on difficult pages, but no extra OCR pass is required before upload.")
+        elif "ocr_or_text_layer_failure_likely" not in set(selected.get("readiness_reasons") or []):
+            add(
+                "PDF_IMAGE_HEAVY_SPARSE_LAYOUT",
+                "info",
+                "extraction",
+                "The document is image-heavy or sparse, but no objective missing-text page was established.",
+                "No OCR retry is required solely because of low word density.",
+            )
         else:
             add("PDF_OCR_REQUIRED", "error", "extraction", "Most included pages have little text and appear image-heavy.", "Run page-aware OCR, then prepare the OCRed PDF.")
     if quality.get("text_integrity_status") == "review":
@@ -7010,10 +7050,10 @@ def build_run_diagnostics(
             "extraction",
             (
                 "The nominal text layer contains "
-                f"{quality.get('fragmented_single_letter_token_count', 0)} broken one-letter fragments "
+                f"{quality.get('fragmented_cluster_token_count', 0)} clustered isolated-letter tokens "
                 f"across {quality.get('fragmented_page_count', 0)} page(s)."
             ),
-            "Automatic will compare OCR when available. Keep the native output if OCR adds more errors than it resolves.",
+            "This is ambiguous review evidence, not proof of corruption. Automatic will compare independent extraction evidence when available.",
         )
     elif quality.get("scanned_likelihood") == "possible":
         material_pages = max(
@@ -7190,7 +7230,13 @@ def build_run_diagnostics(
                 action,
             )
         else:
-            add("BACKEND_TEXT_COVERAGE_DISAGREEMENT", "error", "backend_selection", f"Backend word counts differ by {selected['backend_word_disagreement']:.1%}.", "Compare candidate extraction reports before upload.")
+            add(
+                "BACKEND_TEXT_COVERAGE_DIFFERENCE_AMBIGUOUS",
+                "warning",
+                "backend_selection",
+                f"Backend word counts differ by {selected['backend_word_disagreement']:.1%}; word count alone does not establish lost or corrupted text.",
+                "The candidate reports retain page coverage, layout, and provenance evidence for review; this difference alone does not withhold upload.",
+            )
     for candidate in candidates:
         if candidate.get("error"):
             code = "UNSTRUCTURED_UNAVAILABLE_OR_FAILED" if candidate.get("backend") == "unstructured" else "EXTRACTION_BACKEND_FAILED"
@@ -10131,30 +10177,6 @@ def read_validation_workspace_template(storage_dir: Path):
             con.close()
         except Exception:
             pass
-    return result
-
-
-def update_workspace_runtime_template_sqlite(storage_dir: Path, workspace_slug: str, template: dict):
-    """Reject the retired direct-SQLite workspace-template shortcut.
-
-    Workspace creation and configuration must use an observed AnythingLLM API
-    contract.  Writing a freshly-created row through SQLite looked harmless,
-    but it bypassed Desktop validation and became version-dependent without a
-    reliable recovery path.  Keep this compatibility seam as an explicit
-    refusal so older callers cannot silently revive the behavior.
-    """
-    result = {
-        "status": "blocked",
-        "write_method": "none",
-        "workspace_slug": workspace_slug,
-        "verified": False,
-        "applied": {},
-        "error": "direct_workspace_sqlite_writes_retired",
-        "message": (
-            "Workspace template copying is not applied because direct SQLite writes are retired. "
-            "The API-created workspace keeps AnythingLLM's own settings."
-        ),
-    }
     return result
 
 
@@ -13432,8 +13454,6 @@ def upload_block_reason_for_readiness(selected: dict) -> str:
         and str((selected or {}).get("unstructured_strategy") or "").casefold()
         in {"hi_res", "ocr_only"}
     )
-    if "photographed_spread_requires_manual_review" in reasons and ocr_assisted:
-        return "photographed_spread_requires_manual_review"
     if "backend_text_coverage_disagreement" in reasons and ocr_assisted:
         return "ocr_backend_text_coverage_disagreement"
     return ""
@@ -13448,18 +13468,6 @@ def ocr_upload_hold_guidance(block_reason: str, readiness_reasons=()):
     """
     reason = str(block_reason or "").strip()
     reasons = {str(item).strip() for item in (readiness_reasons or ()) if str(item).strip()}
-    if reason == "photographed_spread_requires_manual_review":
-        return {
-            "code": "AUTO-LAYOUT-REVIEW-001",
-            "message": (
-                "AnythingLLM upload was withheld: repeated photographed spreads can hide or reorder text at the page fold. "
-                "No upload was sent. Inspect the prepared text and layout-region review before retrying."
-            ),
-            "next_steps": [
-                "Open the readiness report and layout-region review.",
-                "Confirm the reading order at the photographed-page folds before retrying.",
-            ],
-        }
     if reason == "unresolved_corrupted_text_layer":
         return {
             "code": "AUTO-TEXT-LAYER-REVIEW-001",
@@ -21813,6 +21821,18 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             ocr_preflight_hint=ocr_preflight_hint,
             pdf_page_count=profile.get("pdf_page_count"),
         )
+        if (
+            backend == "unstructured"
+            and automatic_targeted_ocr_pages
+            and str(requested_unstructured_strategy or "auto").casefold() == "auto"
+            and active_unstructured.get("runtime", {}).get("tesseract_available")
+        ):
+            active_unstructured = {
+                **active_unstructured,
+                "resolved": "hi_res",
+                "runtime": {**active_unstructured["runtime"], "ocr_required": True},
+                "reason": "ocr_enabled_for_page_local_candidate_evidence",
+            }
         profile["unstructured_runtime"] = {
             **active_unstructured["runtime"],
             "requested_strategy": active_unstructured["requested"],
@@ -22502,7 +22522,11 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 for candidate in evaluated
                 if int(candidate.get("quality", {}).get("included_words") or 0) > 0
             ]
-            if len(word_counts) >= 2 and (max(word_counts) - min(word_counts)) / max(word_counts) > 0.35:
+            if (
+                len(word_counts) >= 2
+                and (max(word_counts) - min(word_counts)) / max(word_counts)
+                > BACKEND_COVERAGE_DISAGREEMENT_RATIO
+            ):
                 if has_complete_native_text_candidate(
                     candidates,
                     profile.get("pdf_page_count"),
@@ -22513,8 +22537,18 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                     )
                 else:
                     auto_unstructured_reasons.append("default_backends_disagree_on_text_coverage")
-            if has_document_wide_ocr_evidence(evaluated):
-                auto_unstructured_reasons.append("default_backends_show_low_text_or_image_heavy_pages")
+            page_local_ocr_plan = automatic_page_local_ocr_plan(
+                ocr_preflight_hint,
+                evaluated,
+                profile.get("pdf_page_count"),
+            )
+            if page_local_ocr_plan.get("ocr_required_pages"):
+                auto_unstructured_reasons.append(
+                    "default_backends_identify_page_local_ocr_requirements"
+                )
+                automatic_targeted_ocr_pages = list(
+                    page_local_ocr_plan["ocr_required_pages"]
+                )
             if any(
                 str((candidate.get("quality") or {}).get("text_integrity_status") or "").casefold()
                 == "review"
@@ -22532,11 +22566,15 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 auto_unstructured_suppressed_reasons.append(
                     "sparse_or_mixed_pages_do_not_require_document_wide_ocr"
                 )
-            if any(
+            if has_corroborated_outline_disagreement(evaluated):
+                auto_unstructured_reasons.append("outline_and_extracted_headings_disagree")
+            elif any(
                 candidate.get("outline_validation", {}).get("reliability") == "untrusted"
                 for candidate in evaluated
             ):
-                auto_unstructured_reasons.append("outline_and_extracted_headings_disagree")
+                auto_unstructured_suppressed_reasons.append(
+                    "single_backend_outline_warning_not_enough_for_fallback"
+                )
             if preflight_visual_text_targets.get("page_numbers"):
                 # The UI's all-page inspection found a real visual-text gap:
                 # a materially raster-backed page whose native text layer is
@@ -22554,9 +22592,9 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 # word identity on every healthy page, OCR only the known
                 # visual-text gaps, then let the established reconciliation
                 # produce the candidate that contains their union.
-                automatic_targeted_ocr_pages = list(
-                    preflight_visual_text_targets["page_numbers"]
-                )
+                automatic_targeted_ocr_pages = sorted(set(
+                    automatic_targeted_ocr_pages
+                ).union(preflight_visual_text_targets["page_numbers"]))
             if auto_unstructured_reasons:
                 backend_names.append("unstructured")
 
@@ -22569,6 +22607,11 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         "recovered_page_numbers": [],
         "reason": "not_applicable",
     }
+    automatic_page_local_plan = automatic_page_local_ocr_plan(
+        ocr_preflight_hint,
+        viable,
+        profile.get("pdf_page_count"),
+    )
     target_page_numbers = set(automatic_targeted_ocr_pages)
     if target_page_numbers:
         def candidate_page_number(row):
@@ -22591,7 +22634,10 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 for row in (candidate.get("native_ocr_reconciliation") or {}).get("pages") or []
                 if isinstance(row, dict)
                 and candidate_page_number(row) in target_page_numbers
-                and str(row.get("decision") or "") == "ocr_used_native_page_missing"
+                and str(row.get("decision") or "") in {
+                    "ocr_used_native_page_missing",
+                    "ocr_used_native_page_inadequate",
+                }
                 and page_text_by_number.get(candidate_page_number(row), "")
             )
             if recovered_page_numbers:
@@ -22693,20 +22739,19 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     if literal_fail:
         readiness_reasons.append("exact_literal_probe_failed")
     if quality.get("scanned_likelihood") == "high":
-        readiness_reasons.append("ocr_or_text_layer_failure_likely")
-    if quality.get("included_pages", 0) >= 10 and quality.get("average_words_per_page", 0) < 30:
-        readiness_reasons.append("implausibly_low_text_coverage")
+        readiness_reasons.append("image_heavy_sparse_layout")
     if quality.get("replacement_chars", 0) > max(20, int(quality.get("included_chars", 0) * 0.005)):
         readiness_reasons.append("excessive_replacement_characters")
-    severe_fragmentation = (
+    ambiguous_fragmentation = (
         str(quality.get("text_integrity_status") or "").casefold() == "review"
-        and int(quality.get("fragmented_single_letter_token_count") or 0) >= 100
-        and int(quality.get("fragmented_page_count") or 0)
-        >= max(3, math.ceil(int(quality.get("included_pages") or 0) * .50))
-        and float(quality.get("fragmented_single_letter_token_ratio") or 0.0) >= .05
+        and document_has_sustained_fragmentation(quality)
     )
-    if severe_fragmentation:
-        readiness_reasons.append("unresolved_corrupted_text_layer")
+    if ambiguous_fragmentation:
+        # Lexical shape is not proof of a corrupt PDF text layer. It may be
+        # letter-spaced typography, citations, verse, variables, or extraction
+        # damage. Preserve the evidence for review and candidate comparison,
+        # but never make this heuristic alone an upload veto.
+        readiness_reasons.append("ambiguous_fragmented_text_pattern")
     if selected.get("native_chunk_eval", {}).get("status") != "pass":
         readiness_reasons.append("native_header_metadata_does_not_survive_chunk_simulation")
     # Fold-gated photographed spreads are already represented as ordered
@@ -22720,13 +22765,26 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     # that coverage is inadequate, however, spell out the missing capability
     # and prevent an unreliable payload from entering AnythingLLM.
     ocr_preflight_hint = getattr(args, "ocr_preflight_hint", {}) or {}
+    sparse_document_layout = (
+        quality.get("included_pages", 0) >= 10
+        and quality.get("average_words_per_page", 0) < 30
+    )
+    if sparse_document_layout:
+        readiness_reasons.append("sparse_document_layout")
+    objective_visual_text_gap = bool(
+        (ocr_preflight_hint.get("visual_text_targets") or {}).get("page_numbers")
+        or ocr_preflight_hint.get("page_numbers")
+    )
+    materially_empty_pages = int(quality.get("empty_pages") or 0) >= max(
+        1,
+        math.ceil(int(quality.get("included_pages") or 0) * .20),
+    )
     insufficient_native_text = (
         quality.get("scanned_likelihood") == "high"
-        or (
-            quality.get("included_pages", 0) >= 10
-            and quality.get("average_words_per_page", 0) < 30
-        )
+        and (objective_visual_text_gap or materially_empty_pages)
     )
+    if insufficient_native_text:
+        readiness_reasons.append("ocr_or_text_layer_failure_likely")
     if insufficient_native_text and not unstructured_runtime_probe:
         with measured_pipeline_phase(args, "unstructured_runtime_capability_probe"):
             unstructured_runtime_probe = dict(unstructured_runtime_status("hi_res"))
@@ -22769,7 +22827,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     }
     if len(viable_word_counts) >= 2:
         backend_word_disagreement = (max(viable_word_counts) - min(viable_word_counts)) / max(viable_word_counts)
-        if backend_word_disagreement > 0.35:
+        if backend_word_disagreement > BACKEND_COVERAGE_DISAGREEMENT_RATIO:
             backend_word_disagreement_resolution = explainable_ocr_coverage_disagreement(
                 selected,
                 candidates,
@@ -22783,7 +22841,12 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                     profile,
                 )
             if not backend_word_disagreement_resolution["accepted"]:
-                readiness_reasons.append("backend_text_coverage_disagreement")
+                # Word-count disagreement can reflect tables, captions,
+                # marginalia, bibliography handling, or duplicated layout
+                # syntax. It is evidence for review, not proof that either
+                # candidate lost text. Objective page gaps and OCR failures are
+                # represented by their own readiness reasons above.
+                readiness_reasons.append("ambiguous_backend_text_coverage_difference")
 
     selected["readiness_status"] = "needs_review" if readiness_reasons else "ready"
     selected["readiness_reasons"] = readiness_reasons
@@ -25048,8 +25111,22 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         "reasons": sorted(set(auto_unstructured_reasons)),
         "suppressed_reasons": sorted(set(auto_unstructured_suppressed_reasons)),
         "visual_text_target_evidence": dict(preflight_visual_text_targets),
+        "page_local_ocr_plan": dict(automatic_page_local_plan),
         "targeted_page_numbers": list(automatic_targeted_ocr_pages),
         "targeted_selection": dict(automatic_targeted_ocr_selection),
+        "threshold_policy": {
+            "coverage_disagreement_ratio": BACKEND_COVERAGE_DISAGREEMENT_RATIO,
+            "document_wide_ocr_page_ratio": DOCUMENT_WIDE_OCR_PAGE_RATIO,
+            "possible_scan_page_ratio": POSSIBLE_SCAN_PAGE_RATIO,
+            "sparse_image_review_page_ratio": SPARSE_IMAGE_REVIEW_PAGE_RATIO,
+            "fragment_cluster_min_letters": FRAGMENT_CLUSTER_MIN_LETTERS,
+            "fragment_page_min_cluster_tokens": FRAGMENT_PAGE_MIN_CLUSTER_TOKENS,
+            "fragment_page_min_cluster_lines": FRAGMENT_PAGE_MIN_CLUSTER_LINES,
+            "fragment_page_min_cluster_ratio": FRAGMENT_PAGE_MIN_CLUSTER_RATIO,
+            "fragment_document_min_page_ratio": FRAGMENT_DOCUMENT_MIN_PAGE_RATIO,
+            "fragment_document_min_cluster_ratio": FRAGMENT_DOCUMENT_MIN_CLUSTER_RATIO,
+            "outline_fallback_min_agreeing_backends": OUTLINE_FALLBACK_MIN_AGREEING_BACKENDS,
+        },
         "user_requested": bool(args.deep_extraction),
     }
     profile["automatic_candidate_shortcuts"] = sorted(set(automatic_candidate_shortcuts))

@@ -18,10 +18,12 @@ import importlib.util
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import shutil
 import site
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -59,6 +61,8 @@ UNSTRUCTURED_OCR_PAGE_WORKERS_MAX = 4
 UNSTRUCTURED_OCR_PAGE_TIMEOUT_SECONDS_DEFAULT = 240
 UNSTRUCTURED_OCR_PAGE_TIMEOUT_SECONDS_MIN = 30
 UNSTRUCTURED_OCR_PAGE_TIMEOUT_SECONDS_MAX = 1800
+UNSTRUCTURED_OCR_PAGE_GROUP_SIZE_DEFAULT = 12
+UNSTRUCTURED_OCR_PAGE_GROUP_SIZE_MAX = 32
 # The cache contains prepared element text, including the conservative
 # category cleanup below. Increment this whenever prepared text changes so an
 # older noisy OCR cache is never silently reused as current output.
@@ -554,12 +558,52 @@ def unstructured_ocr_page_timeout_seconds() -> int:
     )
 
 
+def unstructured_ocr_page_group_size() -> int:
+    """Return the bounded checkpoint group size for page-local OCR."""
+    raw = os.environ.get(
+        "RAG_PDF_UNSTRUCTURED_OCR_PAGE_GROUP_SIZE",
+        str(UNSTRUCTURED_OCR_PAGE_GROUP_SIZE_DEFAULT),
+    )
+    try:
+        requested = int(str(raw).strip())
+    except (TypeError, ValueError):
+        requested = UNSTRUCTURED_OCR_PAGE_GROUP_SIZE_DEFAULT
+    return max(1, min(UNSTRUCTURED_OCR_PAGE_GROUP_SIZE_MAX, requested))
+
+
+def _consecutive_ocr_page_groups(page_numbers, group_size=None):
+    """Split ordered pages into bounded consecutive checkpoint groups."""
+    cap = max(1, int(group_size or unstructured_ocr_page_group_size()))
+    groups = []
+    active = []
+    for page_number in sorted(set(int(page) for page in page_numbers or [])):
+        if active and (page_number != active[-1] + 1 or len(active) >= cap):
+            groups.append(active)
+            active = []
+        active.append(page_number)
+    if active:
+        groups.append(active)
+    return groups
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+@lru_cache(maxsize=128)
+def _file_sha256_for_version(path_text: str, size: int, mtime_ns: int) -> str:
+    """Hash one immutable observed file version once per process."""
+    return _file_sha256(Path(path_text))
+
+
+def _versioned_file_sha256(path: Path) -> str:
+    source = Path(path)
+    stat = source.stat()
+    return _file_sha256_for_version(str(source.resolve()), int(stat.st_size), int(stat.st_mtime_ns))
 
 
 def _unstructured_package_version() -> str:
@@ -615,7 +659,7 @@ def _unstructured_ocr_cache_identity(pdf_path: Path, strategy: str, runtime: dic
         tesseract_identity = {"path": str(tesseract_path), "missing": True}
     return {
         "schema_version": UNSTRUCTURED_OCR_CACHE_SCHEMA_VERSION,
-        "source_sha256": _file_sha256(source),
+        "source_sha256": _versioned_file_sha256(source),
         "strategy": str(strategy or "").casefold(),
         "unstructured_version": _unstructured_package_version(),
         "backend_module_origin": str((runtime or {}).get("backend_module_origin") or ""),
@@ -741,12 +785,81 @@ def _pymupdf4llm_one_page(pdf_path_text: str, page_index: int, ocr_dpi: int | No
     options = {"pages": [page_index], "page_chunks": True}
     if ocr_dpi:
         options["ocr_dpi"] = ocr_dpi
-    chunks = pymupdf4llm.to_markdown(pdf_path_text, **options)
+    try:
+        chunks = pymupdf4llm.to_markdown(pdf_path_text, **options)
+        geometry_recovery = None
+    except ValueError as exc:
+        if "rect is infinite or empty" not in str(exc).casefold():
+            raise
+        chunks, geometry_recovery = _pymupdf4llm_retry_without_invalid_page_annotations(
+            pymupdf4llm,
+            pdf_path_text,
+            page_index,
+            ocr_dpi,
+        )
     if len(chunks) != 1:
         raise RuntimeError(f"Expected one OCR chunk for page {page_index + 1}, received {len(chunks)}")
     chunk = chunks[0]
     text = chunk.get("text", "") if isinstance(chunk, dict) else str(chunk)
-    return {"page": page_index + 1, "text": text, "kind": "markdown_page"}
+    result = {"page": page_index + 1, "text": text, "kind": "markdown_page"}
+    if geometry_recovery:
+        result["pymupdf4llm_geometry_recovery"] = geometry_recovery
+    return result
+
+
+def _pymupdf4llm_retry_without_invalid_page_annotations(
+    pymupdf4llm,
+    pdf_path_text: str,
+    page_index: int,
+    ocr_dpi: int | None,
+):
+    """Retry one page from a temporary copy after removing impossible annotations.
+
+    Some otherwise readable PDFs contain highlight rectangles at the signed
+    32-bit coordinate limits. PyMuPDF4LLM rejects those rectangles before it
+    can inspect the page. The source PDF is never changed: this recovery copies
+    one physical page, removes only non-finite, empty, or million-point
+    annotation rectangles, and makes exactly one retry for the failed page.
+    The complete temporary copy is necessary because some annotations retain
+    cross-object references when a single page is copied in isolation.
+    """
+    with tempfile.TemporaryDirectory(prefix="rag-pymupdf4llm-geometry-") as temp_dir:
+        page_path = Path(temp_dir) / "sanitized-source.pdf"
+        removed = []
+        with fitz.open(pdf_path_text) as source:
+            for source_page_index, copied_page in enumerate(source):
+                for annotation in list(copied_page.annots() or []):
+                    rect = annotation.rect
+                    values = (rect.x0, rect.y0, rect.x1, rect.y1)
+                    invalid = (
+                        rect.is_infinite
+                        or rect.is_empty
+                        or not all(math.isfinite(value) for value in values)
+                        or max(abs(value) for value in values) > 1_000_000
+                    )
+                    if not invalid:
+                        continue
+                    removed.append({
+                        "source_page": source_page_index + 1,
+                        "type": str(annotation.type[1] or annotation.type[0]),
+                        "rect": [float(value) for value in values],
+                    })
+                    copied_page.delete_annot(annotation)
+            if not removed:
+                raise ValueError(
+                    "PyMuPDF4LLM reported invalid page geometry, but no invalid annotation was found."
+                )
+            source.save(page_path, garbage=1, deflate=True)
+        options = {"pages": [page_index], "page_chunks": True}
+        if ocr_dpi:
+            options["ocr_dpi"] = ocr_dpi
+        chunks = pymupdf4llm.to_markdown(str(page_path), **options)
+    return chunks, {
+        "status": "temporary_page_copy_succeeded",
+        "source_page": page_index + 1,
+        "removed_invalid_annotations": removed,
+        "source_pdf_modified": False,
+    }
 
 
 class Pymupdf4llmWorkerIsolationError(RuntimeError):
@@ -1513,6 +1626,28 @@ def photographed_fold_gutter_fraction(image, image_stat):
     # this contrast avoids splitting ordinary landscape pages or columns.
     if darkness <= baseline - max(18.0, baseline * .10):
         return round(fraction, 3)
+    # A grey binding shadow can be much less dramatic in the whole-height
+    # average while remaining visible in nearly every horizontal band. Accept
+    # that weaker contrast only with strong vertical continuity. This is much
+    # harder for body text, an illustration edge, or a short stain to satisfy.
+    band_deltas = []
+    for band_index in range(8):
+        band_top = int(height * (.12 + band_index * .0975))
+        band_bottom = int(height * (.12 + (band_index + 1) * .0975))
+
+        def band_mean(at_fraction):
+            center = int(width * at_fraction)
+            left = max(0, center - stripe_half_width)
+            right = min(width, center + stripe_half_width)
+            return float(
+                image_stat.Stat(gray.crop((left, band_top, right, band_bottom))).mean[0]
+            )
+
+        local_baseline = (band_mean(max(.28, fraction - .055)) + band_mean(min(.72, fraction + .055))) / 2
+        band_deltas.append(local_baseline - band_mean(fraction))
+    continuous_grey_shadow = sum(delta >= 7.0 for delta in band_deltas) >= 7
+    if continuous_grey_shadow and statistics.median(band_deltas) >= 10.0:
+        return round(fraction, 3)
     light_fraction, lightness = max(candidates, key=lambda item: item[1])
     left_content = min(stripe_mean(.24), stripe_mean(.38))
     right_content = min(stripe_mean(.70), stripe_mean(.82))
@@ -1758,6 +1893,7 @@ def _parallel_unstructured_ocr_pages(
     page_numbers=None,
     page_timeout_seconds=None,
     progress_callback=None,
+    completed_page_callback=None,
 ):
     """Extract OCR pages in isolated processes and reassemble source order.
 
@@ -1793,11 +1929,14 @@ def _parallel_unstructured_ocr_pages(
             # heartbeat for the parent process.
             pending = {}
             submitted_at = {}
+            checkpoint_groups = _consecutive_ocr_page_groups(expected_pages)
+            group_position = 0
+            active_group = checkpoint_groups[0]
             next_page_position = 0
 
             def submit_next_page():
                 nonlocal next_page_position
-                source_page_number = expected_pages[next_page_position]
+                source_page_number = active_group[next_page_position]
                 source_page_index = source_page_number - 1
                 future = executor.submit(
                     _unstructured_one_page,
@@ -1811,7 +1950,7 @@ def _parallel_unstructured_ocr_pages(
                 submitted_at[future] = time.monotonic()
                 next_page_position += 1
 
-            while len(pending) < active_worker_count and next_page_position < len(expected_pages):
+            while len(pending) < active_worker_count and next_page_position < len(active_group):
                 submit_next_page()
             while pending:
                 done, _ = wait(set(pending), timeout=0.25, return_when=FIRST_COMPLETED)
@@ -1835,9 +1974,19 @@ def _parallel_unstructured_ocr_pages(
                         ) from exc
                     pages.append(result["page_row"])
                     element_rows.extend(result["element_rows"])
+                    if callable(completed_page_callback):
+                        completed_page_callback(
+                            result["page_row"], result["element_rows"], page_count
+                        )
                     if callable(progress_callback):
                         progress_callback(len(pages), len(expected_pages))
-                    while len(pending) < active_worker_count and next_page_position < len(expected_pages):
+                    while len(pending) < active_worker_count and next_page_position < len(active_group):
+                        submit_next_page()
+                if not pending and group_position + 1 < len(checkpoint_groups):
+                    group_position += 1
+                    active_group = checkpoint_groups[group_position]
+                    next_page_position = 0
+                    while len(pending) < active_worker_count and next_page_position < len(active_group):
                         submit_next_page()
                 timed_out = [
                     pending[future] + 1
@@ -1871,6 +2020,8 @@ def _parallel_unstructured_ocr_pages(
             "strategy": strategy,
             "page_scope": "targeted_visual_text_pages" if requested_pages else "whole_document",
             "targeted_page_numbers": requested_pages or [],
+            "checkpoint_group_size": unstructured_ocr_page_group_size(),
+            "checkpoint_group_count": len(_consecutive_ocr_page_groups(expected_pages)),
         }
     return pages, page_count, element_rows
 
@@ -1930,6 +2081,26 @@ def get_pages_with_unstructured(
                 if source_page_count == 1 and target_page_numbers in (None, [1])
                 else None
             )
+        cached_page_results = {}
+        if target_page_numbers and cache_dir:
+            for page_number in target_page_numbers:
+                page_cached = load_unstructured_ocr_cache(
+                    pdf_path, resolved_strategy, runtime, cache_dir,
+                    page_numbers=[page_number],
+                )
+                if page_cached is not None:
+                    cached_page_results[page_number] = page_cached
+            missing_target_pages = [
+                page for page in target_page_numbers if page not in cached_page_results
+            ]
+            if not missing_target_pages:
+                pages = [cached_page_results[page][0][0] for page in target_page_numbers]
+                element_rows = [
+                    row for page in target_page_numbers for row in cached_page_results[page][2]
+                ]
+                return pages, source_page_count, element_rows
+        else:
+            missing_target_pages = target_page_numbers
         if photographed_result is not None:
             pages = [photographed_result["page_row"]]
             page_count = 1
@@ -1958,15 +2129,39 @@ def get_pages_with_unstructured(
             return pages, page_count, element_rows
         workers = unstructured_ocr_page_workers()
         if source_page_count > 1:
-            pages, page_count, element_rows = _parallel_unstructured_ocr_pages(
+            cached_page_count = len(cached_page_results)
+
+            def checkpoint_completed_page(page_row, page_elements, physical_page_count):
+                save_unstructured_ocr_cache(
+                    pdf_path, resolved_strategy, runtime, cache_dir,
+                    [page_row], physical_page_count, page_elements,
+                    page_numbers=[int(page_row.get("page") or 0)],
+                )
+
+            def report_fresh_progress(completed, total):
+                if callable(progress_callback):
+                    progress_callback(cached_page_count + completed, cached_page_count + total)
+
+            fresh_pages, page_count, fresh_element_rows = _parallel_unstructured_ocr_pages(
                 pdf_path,
                 source_page_count,
                 resolved_strategy,
                 workers,
                 runtime,
-                page_numbers=target_page_numbers,
-                progress_callback=progress_callback,
+                page_numbers=missing_target_pages,
+                progress_callback=report_fresh_progress,
+                completed_page_callback=checkpoint_completed_page,
             )
+            pages = [
+                *(cached_page_results[page][0][0] for page in sorted(cached_page_results)),
+                *fresh_pages,
+            ]
+            pages.sort(key=lambda row: int(row.get("page") or 0))
+            element_rows = [
+                *(row for page in sorted(cached_page_results) for row in cached_page_results[page][2]),
+                *fresh_element_rows,
+            ]
+            element_rows.sort(key=lambda row: (int(row.get("pdf_page") or 0), int(row.get("element_index") or 0)))
             cache_path = save_unstructured_ocr_cache(
                 pdf_path,
                 resolved_strategy,
@@ -1979,7 +2174,14 @@ def get_pages_with_unstructured(
             )
             if cache_path:
                 for page in pages:
-                    page["unstructured_execution"]["cache_path"] = cache_path
+                    page.setdefault("unstructured_execution", {
+                        "mode": "page_local_checkpoint_assembly",
+                        "requested_workers": int(workers),
+                        "actual_workers": min(int(workers), len(target_page_numbers or [])),
+                        "strategy": resolved_strategy,
+                        "page_scope": "targeted_visual_text_pages" if target_page_numbers else "whole_document",
+                        "targeted_page_numbers": target_page_numbers or [],
+                    })["cache_path"] = cache_path
             return pages, page_count, element_rows
 
     elements = _unstructured_partition_elements(pdf_path, resolved_strategy, runtime)

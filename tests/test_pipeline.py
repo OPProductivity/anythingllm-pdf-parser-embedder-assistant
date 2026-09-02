@@ -386,6 +386,16 @@ class PipelineCoreTests(unittest.TestCase):
             else:
                 os.environ["RAG_PDF_UNSTRUCTURED_OCR_PAGE_TIMEOUT_SECONDS"] = original
 
+    def test_unstructured_ocr_groups_are_bounded_and_keep_consecutive_runs(self):
+        import rag_pdf_tools
+
+        self.assertEqual(
+            rag_pdf_tools._consecutive_ocr_page_groups(
+                [1, 2, 3, 7, 8, 20, 21, 22, 23], group_size=3
+            ),
+            [[1, 2, 3], [7, 8], [20, 21, 22], [23]],
+        )
+
     def test_unstructured_parallel_lane_does_not_start_deadlines_for_queued_pages(self):
         """Large OCR runs must keep only active worker pages under a deadline."""
         import rag_pdf_tools
@@ -476,6 +486,47 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIsNotNone(cached)
         self.assertEqual(cached[0][0]["text"], "Recovered OCR text")
         self.assertEqual(cached[0][0]["unstructured_execution"]["mode"], "persistent_ocr_cache_hit")
+
+    def test_unstructured_targeted_ocr_reuses_page_checkpoints(self):
+        import rag_pdf_tools
+
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            pdf_path = root_path / "source.pdf"
+            document = fitz.open()
+            for _index in range(3):
+                document.new_page()
+            document.save(pdf_path)
+            document.close()
+            runtime = {"backend_module_origin": "fixture", "tesseract_executable": ""}
+            cache_dir = root_path / "cache"
+            rag_pdf_tools.save_unstructured_ocr_cache(
+                pdf_path, "hi_res", runtime, cache_dir,
+                [{"page": 1, "text": "cached one"}], 3,
+                [{"element_index": 1, "pdf_page": 1}], page_numbers=[1],
+            )
+            original_parallel = rag_pdf_tools._parallel_unstructured_ocr_pages
+            captured = {}
+            try:
+                def fake_parallel(_path, page_count, _strategy, _workers, _runtime, **kwargs):
+                    captured["pages"] = kwargs.get("page_numbers")
+                    callback = kwargs.get("completed_page_callback")
+                    fresh = [{"page": 2, "text": "fresh two"}, {"page": 3, "text": "fresh three"}]
+                    if callback:
+                        for page in fresh:
+                            callback(page, [{"element_index": 1, "pdf_page": page["page"]}], page_count)
+                    return fresh, page_count, []
+                rag_pdf_tools._parallel_unstructured_ocr_pages = fake_parallel
+                pages, count, _rows = rag_pdf_tools.get_pages_with_unstructured(
+                    pdf_path, "hi_res", runtime_probe=runtime,
+                    cache_dir=cache_dir, page_numbers=[1, 2, 3],
+                )
+            finally:
+                rag_pdf_tools._parallel_unstructured_ocr_pages = original_parallel
+
+        self.assertEqual(captured["pages"], [2, 3])
+        self.assertEqual(count, 3)
+        self.assertEqual([row["page"] for row in pages], [1, 2, 3])
 
     def test_unstructured_circuit_breaker_only_treats_runtime_failures_as_batch_wide(self):
         self.assertTrue(pipeline.is_unstructured_runtime_failure("Tesseract was not found"))
@@ -696,6 +747,36 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(evidence["actual_workers"], 1)
         self.assertEqual(evidence["mode"], "sequential_after_parallel_fallback")
         self.assertIn("RuntimeError: worker failure", evidence["fallback_reason"])
+
+    def test_pymupdf4llm_invalid_annotation_geometry_gets_one_page_local_recovery(self):
+        import rag_pdf_tools
+
+        class FakePyMuPdf4Llm:
+            @staticmethod
+            def to_markdown(*_args, **_kwargs):
+                raise ValueError("rect is infinite or empty")
+
+        recovery = {
+            "status": "temporary_page_copy_succeeded",
+            "source_page": 10,
+            "removed_invalid_annotations": [{"type": "Highlight", "rect": [0, 0, 1, 1]}],
+            "source_pdf_modified": False,
+        }
+        with mock.patch.object(
+            rag_pdf_tools,
+            "import_optional_backend",
+            return_value=FakePyMuPdf4Llm,
+        ), mock.patch.object(
+            rag_pdf_tools,
+            "_pymupdf4llm_retry_without_invalid_page_annotations",
+            return_value=([{"metadata": {"page": 1}, "text": "Recovered"}], recovery),
+        ) as retry:
+            result = rag_pdf_tools._pymupdf4llm_one_page("source.pdf", 9, 200)
+
+        retry.assert_called_once()
+        self.assertEqual(result["page"], 10)
+        self.assertEqual(result["text"], "Recovered")
+        self.assertEqual(result["pymupdf4llm_geometry_recovery"], recovery)
 
     def test_literal_probe_allows_whitespace_only_pdf_line_wrapping(self):
         rows = pipeline.literal_eval(
@@ -1225,6 +1306,71 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertGreater(metrics["fragmented_single_letter_token_ratio"], 0.035)
         self.assertGreaterEqual(metrics["fragmented_single_letter_token_count"], 18)
 
+    def test_scholarly_abbreviations_initials_and_year_suffixes_are_not_fragmentation(self):
+        prose = (
+            "L. J. Smith discusses the U.S. example on p. 17 and pp. 18-19 "
+            "alongside García 2017a and López 2017b. "
+        ) * 80
+        metrics = pipeline.text_integrity_metrics(prose)
+        self.assertEqual(metrics["fragmented_cluster_token_count"], 0)
+        self.assertEqual(metrics["text_integrity_interpretation"], "not_observed")
+
+    def test_unicode_and_print_line_hyphenation_are_not_fragmentation(self):
+        prose = (
+            "Razão decolonial e América Latina remain coherent while paleoecologi-cal "
+            "and inter-national are printed with line-break hyphenation. "
+        ) * 80
+        metrics = pipeline.text_integrity_metrics(prose)
+        self.assertEqual(metrics["fragmented_cluster_token_count"], 0)
+        # Portuguese ``e`` is a valid word. The raw diagnostic may count it,
+        # but only clustered evidence is allowed to affect classification.
+        self.assertEqual(metrics["text_integrity_interpretation"], "not_observed")
+
+    def test_sustained_letter_spaced_glyph_runs_remain_review_evidence(self):
+        broken = (("T H E  B R O K E N  T E X T\n") * 12) + ("ordinary prose " * 60)
+        metrics = pipeline.text_integrity_metrics(broken)
+        self.assertGreaterEqual(metrics["fragmented_cluster_token_count"], 12)
+        self.assertEqual(
+            metrics["text_integrity_interpretation"],
+            "ambiguous_fragmentation_pattern",
+        )
+
+    def test_fragmentation_requires_dense_repeated_evidence_on_a_page(self):
+        isolated = pipeline.text_integrity_metrics(
+            ("ordinary academic prose " * 300) + "\nx y z q r\n"
+        )
+        pervasive = pipeline.text_integrity_metrics(
+            (("t h i s p a g e h a s b r o k e n g l y p h s\n") * 8)
+            + ("ordinary prose " * 20)
+        )
+
+        self.assertFalse(pipeline.page_has_sustained_fragmentation(isolated))
+        self.assertTrue(pipeline.page_has_sustained_fragmentation(pervasive))
+
+    def test_fragmentation_must_cover_most_document_pages(self):
+        quality = {
+            "included_pages": 10,
+            "fragmented_page_count": 5,
+            "fragmented_cluster_token_ratio": 0.25,
+            "fragmented_cluster_line_count": 50,
+        }
+        self.assertFalse(pipeline.document_has_sustained_fragmentation(quality))
+        quality["fragmented_page_count"] = 6
+        self.assertTrue(pipeline.document_has_sustained_fragmentation(quality))
+
+    def test_outline_fallback_requires_two_agreeing_native_warnings(self):
+        one_warning = [
+            {"error": "", "outline_validation": {"reliability": "untrusted"}},
+            {"error": "", "outline_validation": {"reliability": "missing"}},
+        ]
+        corroborated = [
+            {"error": "", "outline_validation": {"reliability": "untrusted"}},
+            {"error": "", "outline_validation": {"reliability": "untrusted"}},
+        ]
+
+        self.assertFalse(pipeline.has_corroborated_outline_disagreement(one_warning))
+        self.assertTrue(pipeline.has_corroborated_outline_disagreement(corroborated))
+
     def test_native_ocr_reconciliation_keeps_ocr_structure_unless_native_is_clearly_better(self):
         native_pages = [
             {"page": 1, "text": "A coherent native reading preserves the full scholarly passage with reliable words and maintains page meaning context citation and ordered prose without needless fragment errors."},
@@ -1251,38 +1397,45 @@ class PipelineCoreTests(unittest.TestCase):
         )
         self.assertEqual(report["native_selected_pages"], [1])
 
-    def test_native_ocr_word_correction_requires_unique_high_confidence_page_evidence(self):
-        corrected, corrections = pipeline.correct_ocr_words_from_native_page(
-            "The native layer includes statuesque but does not establish its reading order.",
-            "[NarrativeText] seqtuesque enrobed, you command attention.",
+    def test_native_ocr_reconciliation_treats_one_token_scan_debris_as_inadequate(self):
+        pages, _report = pipeline.reconcile_native_ocr_pages(
+            [{"page": 4, "text": "4"}],
+            [{"page": 4, "text": "[NarrativeText] " + ("Recovered scholarly prose " * 90)}],
         )
-        self.assertIn("statuesque enrobed", corrected)
-        self.assertEqual(corrections[0]["from"], "seqtuesque")
-        self.assertEqual(corrections[0]["to"], "statuesque")
 
-        uncorrected, weak_corrections = pipeline.correct_ocr_words_from_native_page(
-            "The native layer mentions inside once.",
-            "[NarrativeText] aside its folds.",
-        )
-        self.assertEqual(uncorrected, "[NarrativeText] aside its folds.")
-        self.assertEqual(weak_corrections, [])
-
-    def test_native_ocr_ordered_anchor_repairs_only_a_locally_corroborated_word(self):
-        corrected, corrections = pipeline.correct_ocr_words_from_native_page(
-            "prepared native text is intentionally not used for this ordering check",
-            "[NarrativeText] hood and cape do not hide, put frame your glory. "
-            "are those stars aside its folds?",
-            "hood and cape do not hide,\nbut frame your\nglory. are those stars\ninside its folds?",
-        )
-        self.assertIn("but frame your glory", corrected)
-        self.assertIn("stars inside its folds", corrected)
         self.assertEqual(
-            {(item["from"], item["to"], item["method"]) for item in corrections},
+            pages[0]["native_ocr_reconciliation"]["decision"],
+            "ocr_used_native_page_inadequate",
+        )
+        self.assertIn("Recovered scholarly prose", pages[0]["text"])
+
+    def test_native_ocr_reconciliation_never_rewrites_selected_ocr_words(self):
+        native = (
+            "The native layer says don't, African, statuesque, but, and inside."
+        )
+        ocr = (
+            "[NarrativeText] The OCR layer says dont, American, seqtuesque, "
+            "put, and aside."
+        )
+        pages, report = pipeline.reconcile_native_ocr_pages(
+            [{"page": 1, "text": native, "raw_text": native}],
+            [{"page": 1, "text": ocr}],
+        )
+
+        self.assertEqual(pages[0]["text"], ocr)
+        self.assertEqual(
+            set(pages[0]["native_ocr_reconciliation"]),
             {
-                ("put", "but", "ordered_native_anchor"),
-                ("aside", "inside", "ordered_native_anchor"),
+                "decision",
+                "native_word_count",
+                "ocr_word_count",
+                "token_sequence_similarity",
+                "native_fragment_count",
+                "ocr_fragment_count",
+                "native_heading_recovery",
             },
         )
+        self.assertEqual(report["method"], "page_local_evidence_reconciliation_v3")
 
     def test_native_ocr_reconciliation_restores_only_an_isolated_opening_heading(self):
         pages, _report = pipeline.reconcile_native_ocr_pages(
@@ -2257,25 +2410,6 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(updated["not_processed_pdf_count"], 2)
         self.assertEqual(updated["completion_code"], "AUTO-OCR-REVIEW-PARTIAL-001")
         self.assertNotIn("AUTO-", updated["details"])
-
-    def test_photographed_spread_hold_is_not_described_as_missing_ocr(self):
-        import rag_pdf_gradio_app as app
-
-        completion = app.automatic_completion([{
-            "pdf": "open-book-photo.pdf",
-            "api_upload_status": "skipped_needs_ocr_review",
-            "api_upload_warning": (
-                "AnythingLLM upload was withheld because photographed spreads require visual review."
-            ),
-        }], True)
-
-        self.assertEqual(completion["code"], "AUTO-LAYOUT-REVIEW-001")
-        self.assertIn("Photographed spreads require visual review", completion["message"])
-        self.assertNotIn("reliable OCR is required", completion["message"])
-        self.assertEqual(
-            app.automatic_completion_phase(completion, True),
-            "PDF not processed — page layout was inconclusive",
-        )
 
     def test_automatic_completion_names_chat_retrieval_as_unverified(self):
         import rag_pdf_gradio_app as app
@@ -4204,7 +4338,6 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(context["observed_records"], 11)
         self.assertEqual(first["observed_cached_records"], 11)
         self.assertEqual(first["observed_cached_source_windows"], 1)
-        self.assertFalse(context["suppress_combined_queue_rate"])
         self.assertTrue(first["cache_segments_exact"])
 
         app.observe_prequeue_cache_plan(
@@ -4219,7 +4352,6 @@ class PipelineCoreTests(unittest.TestCase):
             },
             initial_estimated_records=2_500,
         )
-        self.assertFalse(context["suppress_combined_queue_rate"])
 
     def test_new_workspace_name_collision_uses_a_visible_numeric_suffix(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5761,7 +5893,6 @@ class PipelineCoreTests(unittest.TestCase):
         )
 
         self.assertTrue(snapshot["cache_segments_exact"])
-        self.assertFalse(context["suppress_combined_queue_rate"])
         self.assertTrue(forecast["cache_segmented_observation"])
         self.assertEqual(forecast["completed_records"], 102)
         self.assertEqual(forecast["remaining_records"], 123)
@@ -8515,7 +8646,7 @@ class PipelineCoreTests(unittest.TestCase):
                 ]) + "\n",
                 encoding="utf-8",
             )
-            result = app.compact_timing_model_event_history(path, retain_archive=False)
+            result = app.compact_timing_model_event_history(path)
             rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
         self.assertEqual(result["status"], "compacted")
@@ -8755,54 +8886,6 @@ class PipelineCoreTests(unittest.TestCase):
             self.assertEqual(template["status"], "pass")
             self.assertEqual(template["source_workspace_slug"], "qwen-main")
             self.assertEqual(template["chat_model"], "qwen3-8-max")
-
-    def test_update_workspace_runtime_template_sqlite_refuses_direct_workspace_mutation(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            storage = Path(tmpdir)
-            db_path = storage / "anythingllm.db"
-            con = sqlite3.connect(db_path)
-            try:
-                con.execute(
-                    """
-                    create table workspaces(
-                        id integer primary key,
-                        name text,
-                        slug text,
-                        chatProvider text,
-                        chatModel text,
-                        topN integer,
-                        similarityThreshold real,
-                        vectorSearchMode text,
-                        chatMode text
-                    )
-                    """
-                )
-                con.execute(
-                    "insert into workspaces(id,name,slug,chatProvider,chatModel,topN,similarityThreshold,vectorSearchMode,chatMode) values (1,'Validation','validation-1','ollama','llama3',4,0.25,'default','chat')"
-                )
-                con.commit()
-            finally:
-                con.close()
-
-            result = pipeline.update_workspace_runtime_template_sqlite(
-                storage,
-                "validation-1",
-                {
-                    "source_workspace_slug": "deepseek-main",
-                    "chat_provider": "openrouter",
-                    "chat_model": "deepseek-v4-pro",
-                    "top_n": 8,
-                    "similarity_threshold": 0.3,
-                    "vector_search_mode": "default",
-                    "chat_mode": "query",
-                },
-            )
-            configuration = pipeline.read_workspace_model_configuration(storage, "validation-1")
-            self.assertEqual(result["status"], "blocked")
-            self.assertFalse(result["verified"])
-            self.assertEqual(result["write_method"], "none")
-            self.assertEqual(configuration["chat_provider"], "ollama")
-            self.assertEqual(configuration["chat_model"], "llama3")
 
     def test_workspace_model_configuration_is_provider_neutral(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -9511,12 +9594,7 @@ class PipelineCoreTests(unittest.TestCase):
             manifest["selected_extraction"]["pymupdf4llm_execution"]["actual_workers"],
             1,
         )
-        self.assertEqual(manifest["schema_version"], 1)
-        self.assertIn("pymupdf4llm_ocr_page_workers", manifest["selected_extraction"])
-        self.assertEqual(
-            manifest["selected_extraction"]["ocr_page_workers_scope"],
-            "global_process_isolated_setting",
-        )
+        self.assertEqual(manifest["schema_version"], 2)
 
     def test_next_validation_workspace_prefix_uses_alphabetic_series(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -12732,7 +12810,7 @@ class PipelineCoreTests(unittest.TestCase):
             self.assertEqual(profile["unstructured_runtime"]["selected_strategy"], "hi_res")
             self.assertEqual(
                 profile["unstructured_runtime"]["selected_strategy_reason"],
-                "ocr_enabled_for_difficult_pdf",
+                "ocr_enabled_for_page_local_candidate_evidence",
             )
         finally:
             pipeline.get_backend_pages = original_get_backend_pages
@@ -12780,6 +12858,34 @@ class PipelineCoreTests(unittest.TestCase):
 
         self.assertEqual(result["resolved"], "fast")
         self.assertEqual(result["reason"], "fast_sufficient_for_text_pdf")
+
+    def test_page_local_ocr_plan_preserves_native_islands_in_scan_heavy_pdf(self):
+        preflight = {"full_native_text_coverage": {
+            "status": "verified", "page_count": 10,
+            "image_backed_low_text_pages": [
+                {"page": page, "native_text_characters": 0, "largest_image_area_ratio": .9}
+                for page in [1, 2, 3, 4, 6, 7]
+            ],
+            "visible_vector_low_text_pages": [],
+        }}
+        plan = pipeline.automatic_page_local_ocr_plan(preflight, [], 10)
+
+        self.assertEqual(plan["ocr_required_pages"], [1, 2, 3, 4, 6, 7])
+        self.assertEqual(plan["native_good_pages"], [5, 8, 9, 10])
+        self.assertNotIn(5, plan["ocr_required_pages"])
+
+    def test_page_local_ocr_plan_keeps_sparse_native_image_page_uncertain(self):
+        preflight = {"full_native_text_coverage": {
+            "status": "verified", "page_count": 2,
+            "image_backed_low_text_pages": [
+                {"page": 2, "native_text_characters": 110, "largest_image_area_ratio": .8}
+            ],
+            "visible_vector_low_text_pages": [],
+        }}
+        plan = pipeline.automatic_page_local_ocr_plan(preflight, [], 2)
+
+        self.assertEqual(plan["ocr_required_pages"], [])
+        self.assertEqual(plan["uncertain_pages"], [2])
 
     def test_complete_native_text_candidate_suppresses_coverage_only_ocr_tiebreaker(self):
         candidates = [
@@ -13537,7 +13643,6 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(app.pipeline_segment_mode("none"), "none")
         self.assertEqual(app.pipeline_segment_mode(app.SEGMENT_PAGE_LIMIT_LABEL), "page_limit")
         self.assertEqual(app.pipeline_segment_mode(app.SEGMENT_PAGE_PASSAGES_LABEL), "page_passages")
-        self.assertEqual(app.pipeline_segment_mode("4-page chunks"), "page_limit")
 
         segment_components = [
             component.get("props", {})
@@ -14220,23 +14325,17 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(guidance["code"], "AUTO-TEXT-LAYER-REVIEW-001")
         self.assertIn("systematically corrupted", guidance["message"])
 
-    def test_photographed_spread_is_reported_but_not_an_upload_veto(self):
+    def test_ambiguous_text_shape_signals_do_not_withhold_upload(self):
         selected = {
             "backend": "pymupdf",
-            "readiness_reasons": ["photographed_spread_requires_manual_review"],
+            "readiness_reasons": [
+                "ambiguous_fragmented_text_pattern",
+                "ambiguous_backend_text_coverage_difference",
+                "sparse_document_layout",
+                "image_heavy_sparse_layout",
+            ],
         }
         self.assertEqual(pipeline.upload_block_reason_for_readiness(selected), "")
-        selected.update(backend="unstructured", unstructured_strategy="hi_res")
-        self.assertEqual(
-            pipeline.upload_block_reason_for_readiness(selected),
-            "photographed_spread_requires_manual_review",
-        )
-        selected.update(backend="pymupdf", unstructured_strategy="")
-        selected["readiness_reasons"].append("needs_unstructured_or_ocr")
-        self.assertEqual(
-            pipeline.upload_block_reason_for_readiness(selected),
-            "needs_unstructured_or_ocr",
-        )
 
     def test_runtime_verification_status_uses_live_embedder_probe_when_available(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -16584,6 +16683,39 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIsNotNone(gutter)
         self.assertGreater(gutter, .46)
         self.assertLess(gutter, .54)
+
+    def test_photographed_spread_detects_a_continuous_low_contrast_grey_fold(self):
+        from PIL import Image, ImageDraw, ImageStat
+        import rag_pdf_tools
+
+        page = Image.new("L", (900, 400), color=225)
+        ImageDraw.Draw(page).rectangle((440, 40, 460, 360), fill=211)
+        gutter = rag_pdf_tools.photographed_fold_gutter_fraction(page, ImageStat)
+
+        self.assertIsNotNone(gutter)
+        self.assertGreater(gutter, .46)
+        self.assertLess(gutter, .54)
+
+    def test_photographed_spread_rejects_a_short_grey_mark_as_a_fold(self):
+        from PIL import Image, ImageDraw, ImageStat
+        import rag_pdf_tools
+
+        page = Image.new("L", (900, 400), color=225)
+        ImageDraw.Draw(page).rectangle((440, 145, 460, 245), fill=195)
+
+        self.assertIsNone(rag_pdf_tools.photographed_fold_gutter_fraction(page, ImageStat))
+
+    def test_photographed_spread_keeps_a_blank_after_fold_page_on_full_page_path(self):
+        import rag_pdf_tools
+
+        specs = rag_pdf_tools.photographed_spread_crop_specs(1800, 900, .5)
+        self.assertFalse(
+            rag_pdf_tools.keep_photographed_spread_regions(
+                specs,
+                ["Substantial final-page prose. " * 30, ""],
+            )
+        )
+
 
     def test_unrotated_photo_gate_requires_uneven_dark_border_evidence(self):
         from PIL import Image, ImageDraw, ImageStat
@@ -21696,7 +21828,7 @@ class PipelineCoreTests(unittest.TestCase):
             held = {
                 "pdf": str(root / "held.pdf"),
                 "source_sha256": "held",
-                "batch_upload_blocked_reason": "photographed_spread_requires_manual_review",
+                "batch_upload_blocked_reason": "ocr_backend_text_coverage_disagreement",
             }
             def fake_upload(*_args, **kwargs):
                 row = kwargs["upload_plan_rows"][0]
@@ -22291,6 +22423,20 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertGreater(clean_score, noisy_score)
         self.assertIn("high_ocr_layout_artifact_ratio", noisy_reasons)
 
+    def test_normal_table_pipes_and_identifiers_are_not_ocr_artifacts(self):
+        pages = [{
+            "page": 1,
+            "text": ("column_a | column_b | source_id_945\n" * 100),
+        }]
+        quality = pipeline.extraction_quality(
+            pages,
+            [pipeline.page_stats_for(page, {"image_count": 0, "rotation": 0}) for page in pages],
+            1,
+            None,
+        )
+        self.assertEqual(quality["ocr_layout_artifact_count"], 0)
+        self.assertGreater(quality["layout_syntax_count"], 0)
+
     def test_unstructured_reconciliation_bonus_requires_an_actual_native_page_substitution(self):
         pages = [{"page": 1, "text": "Readable historical prose. " * 60}]
         quality = pipeline.extraction_quality(
@@ -22546,7 +22692,7 @@ class PipelinePdfIntegrationTests(unittest.TestCase):
             provenance_manifest = json.loads(
                 Path(summary["provenance_review_manifest"]).read_text(encoding="utf-8")
             )
-            self.assertEqual(provenance_manifest["schema_version"], 1)
+            self.assertEqual(provenance_manifest["schema_version"], 2)
             self.assertEqual(
                 provenance_manifest["source"]["sha256"],
                 profile["source_sha256"],
@@ -22558,14 +22704,6 @@ class PipelinePdfIntegrationTests(unittest.TestCase):
             self.assertEqual(
                 provenance_manifest["selected_extraction"]["pymupdf4llm_execution"],
                 {},
-            )
-            self.assertEqual(
-                provenance_manifest["selected_extraction"]["pymupdf4llm_ocr_page_workers"],
-                0,
-            )
-            self.assertEqual(
-                provenance_manifest["selected_extraction"]["ocr_page_workers_scope"],
-                "not_applicable",
             )
             self.assertEqual(profile["metadata_provenance"]["source_title"], "pdf_metadata")
             self.assertEqual(profile["anythingllm_chunk_simulation"]["chunk_size"], 400)

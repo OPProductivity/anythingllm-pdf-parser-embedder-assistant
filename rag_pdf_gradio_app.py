@@ -295,23 +295,13 @@ SEGMENT_PAGE_ONLY_LABEL = "Whole-page chunks"
 SEGMENT_PAGE_LIMIT_LABEL = "Page - preserve automatically"
 SEGMENT_PAGE_PASSAGES_LABEL = "Shorter page-local passages"
 SEGMENT_CUSTOM_PAGE_RANGE_LABEL = "Custom Range"
-LEGACY_SEGMENT_PAGE_LIMIT_LABEL = "Page-bounded subchunking"
 SEGMENT_NONE_LABEL = "All in one file"
 ADVANCED_BACKEND_AUTOMATIC_LABEL = "Automatic"
 
 
 def is_page_preserving_segment_mode(value):
-    """Return whether a UI label selects whole-page-first preservation.
-
-    Accept the earlier saved labels as well as the current wording so an old
-    browser session cannot silently change a run's segmentation policy.
-    """
-    normalized = str(value or "").casefold()
-    return (
-        normalized == SEGMENT_PAGE_LIMIT_LABEL.casefold()
-        or "page-preserving" in normalized
-        or "page-bounded" in normalized
-    )
+    """Return whether the current UI label selects page preservation."""
+    return str(value or "").casefold() == SEGMENT_PAGE_LIMIT_LABEL.casefold()
 
 
 def is_custom_page_range_segment_mode(value):
@@ -16478,14 +16468,13 @@ def _timing_event_history_schema_path(path):
     return Path(path).with_name(f"{Path(path).stem}-schema.json")
 
 
-def compact_timing_model_event_history(path=None, *, retain_archive=True):
+def compact_timing_model_event_history(path=None):
     """Migrate the old wide global event stream without losing learned timings.
 
     Per-run timelines retain the detailed counter evidence. The global file is
     rebuilt from completed-phase observations because those are the only event
-    rows read by ``timing_stage_prior_seconds``. A compressed one-time archive
-    preserves the pre-migration file for manual audit without putting it back
-    on the preview hot path.
+    rows read by ``timing_stage_prior_seconds``. Detailed evidence remains in
+    per-run timelines; the obsolete wide global duplicate is replaced.
     """
     history_path = Path(path or TIMING_MODEL_EVENTS_PATH)
     schema_path = _timing_event_history_schema_path(history_path)
@@ -16495,7 +16484,6 @@ def compact_timing_model_event_history(path=None, *, retain_archive=True):
         "learning_records": 0,
         "source_bytes": 0,
         "compacted_bytes": 0,
-        "archive": "",
     }
     with TIMING_MODEL_EVENT_COMPACTION_LOCK, PERSISTED_HISTORY_LOCK:
         try:
@@ -16515,7 +16503,6 @@ def compact_timing_model_event_history(path=None, *, retain_archive=True):
             }, indent=2))
             return dict(result, status="initialized")
         temporary_path = None
-        archive_path = None
         source_records = 0
         learning_records = 0
         source_bytes = history_path.stat().st_size
@@ -16544,11 +16531,6 @@ def compact_timing_model_event_history(path=None, *, retain_archive=True):
                         learning_records += 1
                 handle.flush()
                 os.fsync(handle.fileno())
-            if retain_archive and source_bytes:
-                stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
-                archive_path = history_path.with_name(f"{history_path.stem}-legacy-wide-{stamp}.zip")
-                with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
-                    archive.write(history_path, arcname=history_path.name)
             os.replace(temporary_path, history_path)
             temporary_path = None
             compacted_bytes = history_path.stat().st_size
@@ -16559,7 +16541,6 @@ def compact_timing_model_event_history(path=None, *, retain_archive=True):
                 "learning_records": learning_records,
                 "source_bytes": source_bytes,
                 "compacted_bytes": compacted_bytes,
-                "archive": str(archive_path or ""),
                 "global_policy": "completed_phase_learning_rows_only; detailed counters remain per run",
             }
             atomic_write_text(schema_path, json.dumps(marker, indent=2))
@@ -19952,10 +19933,6 @@ def observe_prequeue_cache_plan(context, report, *, initial_estimated_records=0)
     observed_windows = state.setdefault("observed_source_windows", set())
     state.update({
         "exact_snapshot_observed": True,
-        # Retained as a compatibility key for older diagnostic consumers. The
-        # live estimator no longer globally suppresses a whole batch merely
-        # because one group contains cache records.
-        "suppress_combined_queue_rate": False,
         "queue_records": queue_records,
         "cached_records": cached_records,
         "fresh_records": fresh_records,
@@ -21999,7 +21976,6 @@ def automatic_completion(summaries, prepare_and_upload):
         )
         suffix = "" if len(withheld) <= 3 else f" (+{len(withheld) - 3} more)"
         first_warning = str(ocr_withheld[0].get("api_upload_warning") or "").strip() if ocr_withheld else ""
-        photographed_spread_hold = "photographed spread" in first_warning.casefold()
         warning_detail = first_warning.removeprefix(
             "AnythingLLM upload was withheld because "
         ).removeprefix("AnythingLLM upload was withheld:").removeprefix(
@@ -22023,9 +21999,7 @@ def automatic_completion(summaries, prepare_and_upload):
             "state": "warning",
             "not_processed_pdf_count": len(withheld),
             "code": (
-                "AUTO-LAYOUT-REVIEW-001"
-                if photographed_spread_hold and not preparation_withheld
-                else "AUTO-OCR-REVIEW-001"
+                "AUTO-OCR-REVIEW-001"
                 if ocr_withheld and not preparation_withheld and not submitted_count
                 else "AUTO-OCR-REVIEW-PARTIAL-001"
                 if ocr_withheld and not preparation_withheld
@@ -22112,8 +22086,6 @@ def automatic_completion_phase(completion, prepare_and_upload):
         return "Eligible PDFs ready — remaining PDFs not processed"
     if code == "AUTO-OCR-REVIEW-001":
         return "PDF not processed — OCR extraction was inconclusive"
-    if code == "AUTO-LAYOUT-REVIEW-001":
-        return "PDF not processed — page layout was inconclusive"
     if state == "warning" and prepare_and_upload:
         # A warning is not proof of a document-list problem. Authentication,
         # OCR review, live retrieval, reconciliation, and drawer visibility
@@ -22168,7 +22140,6 @@ def automatic_batch_diagnostics_required(
         return True
     if completion.get("code") in {
         "AUTO-OCR-REVIEW-PARTIAL-001",
-        "AUTO-LAYOUT-REVIEW-PARTIAL-001",
     }:
         # These are source-local pre-upload holds. Submitted sources already
         # have exact vector evidence, while held sources never mutated the
@@ -24171,15 +24142,6 @@ def pipeline_segment_mode(segment_mode_value):
         return "page_passages"
     if is_custom_page_range_segment_mode(value):
         return "custom_page_ranges"
-    if "4-page" in value or "four-page" in value:
-        # A stale browser session can still submit the retired label. Preserve
-        # exact citations rather than silently changing it to global passages.
-        return "page_limit"
-    # Keep old saved UI state page-preserving. The old label promised a target
-    # it did not actually apply below the safety ceiling, so silently mapping
-    # it to the new shorter-passages mode would change existing runs.
-    if "page-bounded" in value:
-        return "page_limit"
     if is_page_preserving_segment_mode(value):
         return "page_limit"
     if "whole-page" in value:
@@ -27908,7 +27870,6 @@ def run_automatic(
         "batch_fresh_records": 0,
         "batch_source_total": 0,
         "exact_snapshot_observed": False,
-        "suppress_combined_queue_rate": False,
         "queue_records": 0,
         "cached_records": 0,
         "fresh_records": 0,
