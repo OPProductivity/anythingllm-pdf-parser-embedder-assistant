@@ -15222,6 +15222,27 @@ def _write_embedding_batch_ledger(ledger_path, workspace_slug, result):
             for location in ((recovery_batch.get("verification") or {}).get("confirmed_locations") or [])
             if str(location)
         }
+        # An accepted Desktop receipt can retain exact per-location vector
+        # proof outside the older verification sub-object.  Both fields carry
+        # exact identity evidence; omitting the current-upload field made a
+        # partially proven group incorrectly ask to observe every record again.
+        confirmed_locations.update(
+            str(location)
+            for location in (
+                (recovery_batch.get("verification") or {}).get(
+                    "current_upload_locations_with_vectors"
+                )
+                or []
+            )
+            if str(location)
+        )
+        confirmed_locations.update(
+            str(location)
+            for location in (
+                recovery_batch.get("current_upload_locations_with_vectors") or []
+            )
+            if str(location)
+        )
         if confirmed_locations:
             pending = [location for location in pending if str(location) not in confirmed_locations]
         source_by_location = {
@@ -17091,6 +17112,7 @@ def update_workspace_embeddings_desktop_queue(
         "source_atomic_finished_sources": set(),
         "source_atomic_staging_started": False,
         "source_atomic_staging_finished": False,
+        "source_atomic_runtime_patch_id": "",
         "source_atomic_precommit_rejection": {},
         "source_atomic_precommit_rejections": {},
         "source_atomic_commit_ambiguity": {},
@@ -17252,6 +17274,9 @@ def update_workspace_embeddings_desktop_queue(
                 "desktop_queue_active_fresh_segment_samples": fresh_samples,
                 "source_atomic_staging_started": bool(queue_state["source_atomic_staging_started"]),
                 "source_atomic_staging_finished": bool(queue_state["source_atomic_staging_finished"]),
+                "source_atomic_runtime_patch_id": str(
+                    queue_state["source_atomic_runtime_patch_id"] or ""
+                ),
                 "source_atomic_provider_batch_count": provider_batch_count,
                 "source_atomic_provider_chunk_count": provider_chunk_count,
                 "source_atomic_provider_elapsed_ms": provider_elapsed_ms,
@@ -17349,8 +17374,21 @@ def update_workspace_embeddings_desktop_queue(
                 queue_state["last_event_type"] = event_type
                 queue_state["events_observed"] += 1
                 queue_state["last_event_monotonic"] = event_now
+                runtime_patch_id = str(
+                    event.get("patchId") or event.get("patch_id") or ""
+                )
+                if not runtime_patch_id:
+                    attempt_prefix = str(event.get("attempt_id") or "").split(":", 1)[0]
+                    if attempt_prefix.startswith(
+                        "anythingllm_pdf_assistant_source_atomic_v"
+                    ):
+                        runtime_patch_id = attempt_prefix
+                if runtime_patch_id:
+                    queue_state["source_atomic_runtime_patch_id"] = runtime_patch_id
                 if event_type == "source_staging_started":
                     queue_state["source_atomic_staging_started"] = True
+                elif event_type == "source_atomic_gate_observed":
+                    pass
                 elif event_type == "source_staging_source_plan":
                     source_plan = {
                         "source_key": str(event.get("sourceKey") or ""),
@@ -17500,6 +17538,9 @@ def update_workspace_embeddings_desktop_queue(
                         # in the run timeline.  These are evidence fields, not
                         # queue-completion counters.
                         "source_atomic_source_key": str(event.get("sourceKey") or ""),
+                        "source_atomic_runtime_patch_id": str(
+                            snapshot.get("source_atomic_runtime_patch_id") or ""
+                        ),
                         "source_atomic_filename": str(event.get("filename") or ""),
                         "source_atomic_batch_index": event.get("batchIndex"),
                         "source_atomic_attempt": event.get("attempt"),
@@ -17848,6 +17889,20 @@ def update_workspace_embeddings_desktop_queue(
             receipt_observer=owned_desktop_queue_receipt,
         )
     finally:
+        # The HTTP response and the local SSE relay are independent loopback
+        # streams.  Desktop can finish the request a few scheduler ticks
+        # before the relay delivers the final ``source_staging_finished``
+        # event.  Drain only that already-expected terminal evidence; do not
+        # poll Desktop and do not delay runs whose planned sources are already
+        # complete.
+        drain_deadline = time.monotonic() + 0.75
+        while time.monotonic() < drain_deadline:
+            with queue_state_lock:
+                planned_count = len(queue_state["source_atomic_planned_sources"])
+                finished_count = len(queue_state["source_atomic_finished_sources"])
+            if planned_count <= 0 or finished_count >= planned_count:
+                break
+            time.sleep(0.025)
         progress_listener["stop_event"].set()
         progress_listener["thread"].join(timeout=1.0)
     result["runtime_events"].extend(progress_listener["events"])
@@ -19594,7 +19649,19 @@ def maybe_upload_segment_files_source_transactions(
                     stop_submission = True
                     break
                 continue
-            aggregate["stopped_after_source_transaction"] = first_source_index
+            held_indices = [
+                int(row.get("source_index") or 0)
+                for row in aggregate["source_transactions"]
+                if str(row.get("state") or "") == "ambiguous_external_mutation_held"
+            ]
+            # The stop boundary is the first genuinely unresolved source, not
+            # the first source in a queue group whose earlier members already
+            # have exact vector proof.
+            aggregate["stopped_after_source_transaction"] = (
+                min(index for index in held_indices if index > 0)
+                if any(index > 0 for index in held_indices)
+                else first_source_index
+            )
             aggregate["stop_reason"] = "ambiguous_external_mutation_held"
             stop_submission = True
             break

@@ -28,7 +28,7 @@ from auto_anythingllm_pipeline import (  # noqa: E402
     create_validation_workspace,
     default_anythingllm_storage_dir,
     delete_validation_workspace,
-    maybe_upload_segment_files,
+    maybe_upload_segment_files_source_transactions,
 )
 
 
@@ -117,8 +117,12 @@ def run_probe(
             result["error"] = "temporary API key creation failed"
             return result
         rows = []
+        # Exercise one genuinely large source. Multi-source continuation is a
+        # coordinator contract and has separate transaction tests; mixing
+        # seven synthetic sources here made a worker probe fail at the first
+        # source boundary while still calling the patch healthy.
+        source_path = f"source-atomic-runtime-probe-{token}.pdf"
         for source_index, record_count in enumerate(source_record_counts, start=1):
-            source_path = f"source-atomic-runtime-probe-{token}-{source_index}.pdf"
             for page_index in range(1, record_count + 1):
                 text_file = work_dir / f"probe-source-{source_index}-page-{page_index}.txt"
                 text_file.write_text(
@@ -146,7 +150,7 @@ def run_probe(
             if str(event.get("desktop_queue_event_type") or "").startswith("source_"):
                 result["source_atomic_events"].append(event)
 
-        upload = maybe_upload_segment_files(
+        upload = maybe_upload_segment_files_source_transactions(
             api_url,
             temporary_key["secret"],
             rows,
@@ -157,6 +161,7 @@ def run_probe(
             record_label="page-parent records",
         )
         result["upload_status"] = upload.get("status")
+        result["upload_errors"] = list(upload.get("errors") or [])
         embedding = dict(upload.get("embedding_update") or {})
         result["requested"] = int(embedding.get("requested") or 0)
         result["accepted"] = int(embedding.get("accepted") or 0)
@@ -206,15 +211,30 @@ def run_probe(
             max(0, int(event.get("chunkCount") or 0))
             for event in raw_provider_batches
         )
-        result["passed"] = any(
-            str(event.get("desktop_queue_event_type") or "").startswith("source_staging_")
-            for event in result["source_atomic_events"]
-        ) or any(
-            str(event.get("type") or "").startswith("source_staging_")
+        finished_source_keys = {
+            str(event.get("sourceKey") or "")
             for event in result["source_atomic_runtime_events"]
+            if str(event.get("type") or "") == "source_staging_finished"
+            and bool(event.get("success"))
+            and str(event.get("sourceKey") or "")
+        }
+        expected_provider_records = sum(source_record_counts)
+        result["finished_source_count"] = len(finished_source_keys)
+        result["expected_source_count"] = 1
+        result["expected_provider_records"] = expected_provider_records
+        result["passed"] = bool(
+            str(result["upload_status"] or "").casefold()
+            in {"complete", "reconciliation_pending"}
+            and not result["upload_errors"]
+            and result["accepted"] == result["requested"]
+            and result["finished_source_count"] == result["expected_source_count"]
+            and result["provider_batch_records"] == expected_provider_records
         )
         if not result["passed"]:
-            result["error"] = "Desktop accepted the probe but emitted no source-atomic staging event."
+            result["error"] = (
+                "The disposable upload did not complete every source with complete "
+                "canonical provider-batch evidence."
+            )
         # Persist only the completed upload/receipt evidence before the
         # intentionally slower asynchronous cleanup. This makes throughput
         # evidence available even when Desktop keeps deleting probe documents

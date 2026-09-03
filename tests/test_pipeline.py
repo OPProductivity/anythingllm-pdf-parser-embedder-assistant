@@ -2422,6 +2422,44 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn("Checking vector evidence", combined)
         self.assertIn("\n— ", combined)
 
+    def test_runtime_provider_batch_size_uses_canonical_terminal_telemetry(self):
+        import rag_pdf_gradio_app as app
+
+        report = {
+            "source_atomic_provider_batches": [
+                {"provider_batch_size": 36, "chunk_count": 36},
+            ],
+        }
+        self.assertEqual(
+            app.source_atomic_provider_batch_size_from_report(report, fallback=1),
+            36,
+        )
+        self.assertEqual(
+            app.source_atomic_provider_batch_size_from_report({}, fallback=1),
+            1,
+        )
+
+    def test_runtime_batch_size_corrects_historical_single_record_eta_plan(self):
+        import rag_pdf_gradio_app as app
+
+        corrected = app.confirmed_batch_execution_plan_eta_seconds(
+            3991,
+            113.084,
+            fresh_provider_requests=1718,
+            provider_request_seconds=2.25,
+            features={},
+            cached_attachment_records=0,
+            source_total=9,
+            cached_documents=0,
+            cache_attachment_prior={"record_seconds": .08, "source_seconds": 3.0},
+            fresh_provider_batch_size=36,
+        )
+
+        # The retained run completed in about 625 seconds. Runtime batch
+        # evidence turns its impossible 3991-second single-record projection
+        # into the same order of magnitude without using the final runtime.
+        self.assertEqual(corrected, 651)
+
     def test_grouped_upload_status_discards_prior_source_verification(self):
         import rag_pdf_gradio_app as app
 
@@ -11166,6 +11204,52 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(len(coverage["blank_pages"]), 0)
         self.assertEqual(len(coverage["visible_vector_low_text_pages"]), 1)
 
+    def test_native_image_geometry_uses_direct_bounding_boxes_without_xref_lookup(self):
+        import rag_pdf_gradio_app as app
+
+        page = SimpleNamespace(
+            rect=fitz.Rect(0, 0, 100, 200),
+            get_image_info=mock.Mock(return_value=[{"bbox": (0, 0, 100, 160), "xref": 7}]),
+            get_image_rects=mock.Mock(side_effect=AssertionError("legacy lookup should not run")),
+        )
+
+        ratios, fallback = app._page_image_area_ratios(page, [(7,)])
+
+        self.assertEqual(ratios, [0.8])
+        self.assertFalse(fallback)
+        page.get_image_info.assert_called_once_with(xrefs=False)
+        page.get_image_rects.assert_not_called()
+
+    def test_native_image_geometry_falls_back_when_direct_bounds_are_unusable(self):
+        import rag_pdf_gradio_app as app
+
+        page = SimpleNamespace(
+            rect=fitz.Rect(0, 0, 100, 200),
+            get_image_info=mock.Mock(return_value=[{"bbox": None, "xref": 7}]),
+            get_image_rects=mock.Mock(return_value=[fitz.Rect(0, 0, 100, 150)]),
+        )
+
+        ratios, fallback = app._page_image_area_ratios(page, [(7,)])
+
+        self.assertEqual(ratios, [0.75])
+        self.assertTrue(fallback)
+        page.get_image_rects.assert_called_once_with(7)
+
+    def test_native_image_geometry_preserves_legacy_result_near_ocr_boundary(self):
+        import rag_pdf_gradio_app as app
+
+        page = SimpleNamespace(
+            rect=fitz.Rect(0, 0, 100, 100),
+            get_image_info=mock.Mock(return_value=[{"bbox": (0, 0, 55, 55)}]),
+            get_image_rects=mock.Mock(return_value=[fitz.Rect(0, 0, 50, 50)]),
+        )
+
+        ratios, fallback = app._page_image_area_ratios(page, [(9,)])
+
+        self.assertEqual(ratios, [0.25])
+        self.assertTrue(fallback)
+        page.get_image_rects.assert_called_once_with(9)
+
     def test_native_coverage_reuses_the_historic_three_page_timing_sample(self):
         import rag_pdf_gradio_app as app
 
@@ -18578,6 +18662,41 @@ class PipelineCoreTests(unittest.TestCase):
             [row["source_key"] for row in ledger["recovery"]["remaining_sources"]],
             ["C:/sources/A.pdf", "C:/sources/B.pdf"],
         )
+
+    def test_observation_recovery_excludes_locations_with_exact_current_upload_vectors(self):
+        locations = ["custom/a.json", "custom/b.json", "custom/c.json"]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger_path = Path(temp_dir) / "batch-embedding-ledger.json"
+            pipeline._write_embedding_batch_ledger(
+                ledger_path,
+                "queue-workspace",
+                {
+                    "requested": 3,
+                    "accepted": 3,
+                    "planned_locations": locations,
+                    "batches": [{
+                        "batch": 1,
+                        "start_index": 0,
+                        "submission_state": "accepted",
+                        "receipt_state": "owned_queue_event_observed",
+                        "searchability_proven": False,
+                        "locations": locations,
+                        "verification": {
+                            "current_upload_locations_with_vectors": locations[:2],
+                        },
+                    }],
+                    "runtime_events": [],
+                    "location_sources": [
+                        {"location": location, "source_path": f"C:/sources/{index}.pdf"}
+                        for index, location in enumerate(locations, 1)
+                    ],
+                },
+            )
+            ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(ledger["recovery"]["state"], "observation_required")
+        self.assertTrue(ledger["recovery"]["resubmission_forbidden"])
+        self.assertEqual(ledger["recovery"]["remaining_locations"], [locations[-1]])
 
     def test_terminal_integrity_failure_overrides_nominal_success_without_retry(self):
         import rag_pdf_gradio_app as app

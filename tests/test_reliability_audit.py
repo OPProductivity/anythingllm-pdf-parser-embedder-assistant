@@ -180,6 +180,39 @@ def test_cancelled_held_source_is_recovery_required_not_a_count_contradiction(tm
     assert "AUDIT-CROSS-SOURCE-002" not in codes
 
 
+def test_held_accepted_source_can_require_observation_without_false_recovery_error(tmp_path):
+    locations = ["custom-documents/a.json", "custom-documents/b.json"]
+    _write(tmp_path / "run-progress.json", {
+        "state": "warning", "completed_units": 1, "total_units": 2,
+    })
+    _write(tmp_path / "batch-native-upload-report.json", {
+        "status": "reconciliation_pending", "uploaded": 2, "embedded": 1,
+        "locations": locations,
+    })
+    _write(tmp_path / "batch-embedding-ledger.json", {
+        "requested": 2, "accepted": 2,
+        "recovery": {
+            "state": "observation_required",
+            "remaining_locations": [locations[-1]],
+            "resubmission_forbidden": True,
+        },
+    })
+    _write(tmp_path / "source-transaction-ledger.json", {
+        "transaction_count": 2,
+        "transactions": [
+            {"source_index": 1, "planned_records": 1, "state": "exact_vectors_proven",
+             "uploaded": 1, "embedded": 1, "locations": locations[:1]},
+            {"source_index": 2, "planned_records": 1, "state": "ambiguous_external_mutation_held",
+             "uploaded": 1, "embedded": 0, "locations": locations[1:]},
+        ],
+        "stopped_after_source_transaction": 2,
+        "stop_reason": "ambiguous_external_mutation_held",
+    })
+
+    codes = {row["code"] for row in audit_run_directory(tmp_path)["findings"]}
+    assert "AUDIT-RECOVERY-001" not in codes
+
+
 def test_cancelled_held_queue_group_is_recovery_required_not_an_integrity_failure(tmp_path):
     """A bounded group may retain multiple held sources after one ambiguous receipt."""
     locations = [

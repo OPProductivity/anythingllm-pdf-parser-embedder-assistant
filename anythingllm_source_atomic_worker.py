@@ -17,12 +17,16 @@ from anythingllm_compatibility import (
 )
 
 
-SOURCE_ATOMIC_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_v6"
+SOURCE_ATOMIC_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_v10"
 SOURCE_ATOMIC_LEGACY_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_v1"
 SOURCE_ATOMIC_PREVIOUS_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_v2"
 SOURCE_ATOMIC_PREVIOUS_V3_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_v3"
 SOURCE_ATOMIC_PREVIOUS_V4_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_v4"
 SOURCE_ATOMIC_PREVIOUS_V5_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_v5"
+SOURCE_ATOMIC_PREVIOUS_V6_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_v6"
+SOURCE_ATOMIC_PREVIOUS_V7_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_v7"
+SOURCE_ATOMIC_PREVIOUS_V8_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_v8"
+SOURCE_ATOMIC_PREVIOUS_V9_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_v9"
 SOURCE_ATOMIC_DEFAULT_PROVIDER_BATCH_SIZE = 36
 SOURCE_ATOMIC_MAX_PROVIDER_BATCH_SIZE = 64
 # The direct OpenRouter-compatible request is deliberately bounded below the
@@ -31,7 +35,11 @@ SOURCE_ATOMIC_MAX_PROVIDER_BATCH_SIZE = 64
 # retry cannot duplicate a workspace record because cache and namespace writes
 # begin only after the response has been validated.
 SOURCE_ATOMIC_PROVIDER_FIRST_ATTEMPT_TIMEOUT_MS = 35_000
-SOURCE_ATOMIC_PROVIDER_RECOVERY_ATTEMPT_TIMEOUT_MS = 20_000
+# A recovery attempt follows an already-slow first request.  Giving it less
+# time than the first attempt made transiently slow but healthy provider calls
+# deterministically fail on attempt two.  Heartbeat evidence still makes this
+# a bounded, observable wait rather than an opaque SDK retry.
+SOURCE_ATOMIC_PROVIDER_RECOVERY_ATTEMPT_TIMEOUT_MS = 45_000
 SOURCE_ATOMIC_PROVIDER_RETRY_DELAY_CAP_MS = 5_000
 SOURCE_ATOMIC_PROVIDER_WAIT_HEARTBEAT_MS = 5_000
 V1161_EMBEDDING_WORKER_SHA256 = (
@@ -46,7 +54,7 @@ SOURCE_ATOMIC_OPENROUTER_GATE = (
 SOURCE_ATOMIC_LEGACY_OPENROUTER_GATE = 'process.env.EMBEDDING_ENGINE==="openrouter"'
 SOURCE_ATOMIC_GATE_PREAMBLE = r'''
 let __sourceAtomicConfiguredEngine=String(process.env.EMBEDDING_ENGINE||"").replace(/^['"]|['"]$/g,"").trim().toLowerCase();
-xr({type:"source_atomic_gate_observed",workspaceSlug:on,filename:Nr[0]||"",configuredEngine:__sourceAtomicConfiguredEngine,enabled:__sourceAtomicConfiguredEngine==="openrouter"});
+xr({type:"source_atomic_gate_observed",workspaceSlug:on,filename:Nr[0]||"",configuredEngine:__sourceAtomicConfiguredEngine,enabled:__sourceAtomicConfiguredEngine==="openrouter",patchId:"__SOURCE_ATOMIC_PATCH_ID__"});
 '''
 
 
@@ -62,7 +70,7 @@ let __sourceAtomicErrorStatus=(error)=>{let status=Number(error?.status||error?.
 let __sourceAtomicRetryable=(error)=>{if(error?.__sourceAtomicNoRetry)return false;let status=__sourceAtomicErrorStatus(error);if([408,409,429].includes(status)||status>=500)return true;if(status)return false;let name=String(error?.name||""),message=String(error?.message||"").toLowerCase();return name.includes("Connection")||name.includes("Timeout")||name==="AbortError"||name==="TypeError"||message.includes("timed out")||message.includes("timeout")||message.includes("connection reset")||message.includes("socket hang up")||message.includes("fetch failed")};
 let __sourceAtomicRetryDelayMs=(error)=>{let retryAfterMs=Number.parseFloat(__sourceAtomicHeaderValue(error,"retry-after-ms")),retryAfter=String(__sourceAtomicHeaderValue(error,"retry-after")||"").trim(),delay=0;if(Number.isFinite(retryAfterMs)&&retryAfterMs>=0)delay=retryAfterMs;else if(retryAfter){let seconds=Number.parseFloat(retryAfter);if(Number.isFinite(seconds)&&seconds>=0)delay=seconds*1000;else{let dateMs=Date.parse(retryAfter);if(Number.isFinite(dateMs))delay=Math.max(0,dateMs-Date.now())}}if(!Number.isFinite(delay)||delay<=0)delay=500;return Math.min(__sourceAtomicRetryDelayCapMs,Math.max(0,Math.round(delay)))};
 let __sourceAtomicErrorDetail=(error)=>({error_class:String(error?.name||error?.constructor?.name||"Error"),http_status:__sourceAtomicErrorStatus(error),message:String(error?.message||"provider request failed").slice(0,500)});
-let __sourceAtomicAttemptId=(context,attempt)=>`${String(context?.sourceKey||"source")}:${Number(context?.batchIndex||0)}:${attempt}`;
+let __sourceAtomicAttemptId=(context,attempt)=>`__SOURCE_ATOMIC_PATCH_ID__:${String(context?.sourceKey||"source")}:${Number(context?.batchIndex||0)}:${attempt}`;
 let __sourceAtomicEmbedBatch=async(texts,context)=>{if(!l?.openai?.embeddings||typeof l.openai.embeddings.create!=="function")throw new Error("source-atomic OpenRouter client is unavailable");let attempts=[],retryDelayMs=0;for(let attempt=1;attempt<=2;attempt++){let timeoutMs=attempt===1?__sourceAtomicFirstAttemptTimeoutMs:__sourceAtomicRecoveryAttemptTimeoutMs,started=Date.now(),pulse=null,attemptId=__sourceAtomicAttemptId(context,attempt);__sourceAtomicEmit({type:"source_staging_provider_batch_attempt",...context,attempt,attempt_id:attemptId,maximum_attempts:2,chunkCount:texts.length,request_timeout_ms:timeoutMs});try{pulse=setInterval(()=>__sourceAtomicEmit({type:"source_staging_provider_batch_waiting",...context,attempt,attempt_id:attemptId,maximum_attempts:2,chunkCount:texts.length,request_timeout_ms:timeoutMs,elapsed_ms:Date.now()-started}),__sourceAtomicWaitHeartbeatMs);let response=await l.openai.embeddings.create({model:l.model,input:texts},{maxRetries:0,timeout:timeoutMs}),vectors=Array.isArray(response?.data)?response.data.map(item=>item?.embedding):[];if(vectors.length!==texts.length||!vectors.every(vector=>Array.isArray(vector))){let mismatch=new Error("embedding response did not match source-atomic batch");mismatch.__sourceAtomicNoRetry=true;throw mismatch}let elapsedMs=Date.now()-started;attempts.push({attempt,attempt_id:attemptId,elapsed_ms:elapsedMs,request_timeout_ms:timeoutMs,outcome:"success"});__sourceAtomicEmit({type:"source_staging_provider_batch_attempt_completed",...context,attempt,attempt_id:attemptId,maximum_attempts:2,chunkCount:texts.length,elapsed_ms:elapsedMs,request_timeout_ms:timeoutMs});return{vectors,attemptCount:attempt,retryDelayMs,attempts}}catch(error){if(pulse!==null){clearInterval(pulse);pulse=null}let elapsedMs=Date.now()-started,detail=__sourceAtomicErrorDetail(error),retryable=attempt<2&&__sourceAtomicRetryable(error),attemptEvidence={attempt,attempt_id:attemptId,elapsed_ms:elapsedMs,request_timeout_ms:timeoutMs,outcome:"failed",retryable,...detail};attempts.push(attemptEvidence);__sourceAtomicEmit({type:"source_staging_provider_batch_attempt_failed",...context,maximum_attempts:2,chunkCount:texts.length,...attemptEvidence});if(!retryable){let terminal=new Error(`source-atomic provider attempt ${attempt}/2 failed${detail.http_status?` (HTTP ${detail.http_status})`:""}: ${detail.message}`);terminal.__sourceAtomicNoRetry=true;throw terminal}let delayMs=__sourceAtomicRetryDelayMs(error);retryDelayMs+=delayMs;__sourceAtomicEmit({type:"source_staging_provider_batch_retrying",...context,attempt,attempt_id:attemptId,next_attempt:attempt+1,maximum_attempts:2,chunkCount:texts.length,retry_delay_ms:delayMs,retry_delay_cap_ms:__sourceAtomicRetryDelayCapMs,...detail});await __sourceAtomicSleep(delayMs)}finally{if(pulse!==null)clearInterval(pulse)}}throw new Error("source-atomic provider retry state exhausted")};
 '''.replace(
     "__SOURCE_ATOMIC_PROVIDER_FIRST_ATTEMPT_TIMEOUT_MS__",
@@ -76,6 +84,9 @@ let __sourceAtomicEmbedBatch=async(texts,context)=>{if(!l?.openai?.embeddings||t
 ).replace(
     "__SOURCE_ATOMIC_PROVIDER_WAIT_HEARTBEAT_MS__",
     str(SOURCE_ATOMIC_PROVIDER_WAIT_HEARTBEAT_MS),
+).replace(
+    "__SOURCE_ATOMIC_PATCH_ID__",
+    SOURCE_ATOMIC_PATCH_ID,
 )
 
 
@@ -101,7 +112,7 @@ let __sourceAtomicEmit=xr;
 __SOURCE_ATOMIC_PROVIDER_POLICY_HELPER__
 for(let [f,y] of n){
   let __sourceAtomicStarted=Date.now(),__sourceAtomicBatchSize=Math.min(64,Math.max(1,Number.parseInt(process.env.SOURCE_ATOMIC_EMBED_BATCH_SIZE||"__SOURCE_ATOMIC_DEFAULT_PROVIDER_BATCH_SIZE__",10)||__SOURCE_ATOMIC_DEFAULT_PROVIDER_BATCH_SIZE__)),__sourceAtomicFilename=y[0]?.filename||"";
-  xr({type:"source_staging_started",workspaceSlug:on,sourceKey:f,filename:__sourceAtomicFilename,recordCount:y.length,provider_batch_size:__sourceAtomicBatchSize,concurrency:1});
+  xr({type:"source_staging_started",workspaceSlug:on,sourceKey:f,filename:__sourceAtomicFilename,recordCount:y.length,provider_batch_size:__sourceAtomicBatchSize,concurrency:1,patchId:"__SOURCE_ATOMIC_PATCH_ID__"});
   let _=new Array(y.length),v=null,__sourceAtomicProviderBatches=[];
   try{
     let A=[];
@@ -121,7 +132,7 @@ for(let [f,y] of n){
       xr({type:"source_staging_record",workspaceSlug:on,sourceKey:f,filename:T.entry.filename,recordIndex:T.recordIndex,chunkCount:T.texts.length,elapsed_ms:Date.now()-__sourceAtomicStarted})
     }
   }catch(A){v={error:A?.message||String(A)}}
-  xr({type:"source_staging_finished",workspaceSlug:on,sourceKey:f,filename:__sourceAtomicFilename,recordCount:y.length,elapsed_ms:Date.now()-__sourceAtomicStarted,success:v===null,provider_batch_size:__sourceAtomicBatchSize,providerBatches:__sourceAtomicProviderBatches});
+  xr({type:"source_staging_finished",workspaceSlug:on,sourceKey:f,filename:__sourceAtomicFilename,recordCount:y.length,elapsed_ms:Date.now()-__sourceAtomicStarted,success:v===null,provider_batch_size:__sourceAtomicBatchSize,providerBatches:__sourceAtomicProviderBatches,patchId:"__SOURCE_ATOMIC_PATCH_ID__"});
   if(v!==null){
     for(let A of y){xr({type:"doc_failed",workspaceSlug:on,userId:Ts,filename:A.filename,error:"Source rejected before namespace commit: "+v.error});r.push(A.raw?.title||A.filename)}
     xr({type:"source_rejected_before_commit",workspaceSlug:on,sourceKey:f,filename:__sourceAtomicFilename,error:v.error});continue;
@@ -154,6 +165,9 @@ xr({type:"all_complete",workspaceSlug:on,userId:Ts,totalDocs:e.length,embedded:t
 ).replace(
     "__SOURCE_ATOMIC_PROVIDER_POLICY_HELPER__",
     SOURCE_ATOMIC_PROVIDER_POLICY_HELPER,
+).replace(
+    "__SOURCE_ATOMIC_PATCH_ID__",
+    SOURCE_ATOMIC_PATCH_ID,
 )
 
 
@@ -205,6 +219,10 @@ def _render_v1161_embedding_worker_source(
             SOURCE_ATOMIC_PREVIOUS_V3_PATCH_ID,
             SOURCE_ATOMIC_PREVIOUS_V4_PATCH_ID,
             SOURCE_ATOMIC_PREVIOUS_V5_PATCH_ID,
+            SOURCE_ATOMIC_PREVIOUS_V6_PATCH_ID,
+            SOURCE_ATOMIC_PREVIOUS_V7_PATCH_ID,
+            SOURCE_ATOMIC_PREVIOUS_V8_PATCH_ID,
+            SOURCE_ATOMIC_PREVIOUS_V9_PATCH_ID,
         )
     ):
         raise ValueError("Embedding worker is already patched and cannot be rendered again.")
@@ -234,7 +252,9 @@ def patch_v1161_embedding_worker_source(source: str) -> str:
         source,
         patch_id=SOURCE_ATOMIC_PATCH_ID,
         openrouter_gate=SOURCE_ATOMIC_OPENROUTER_GATE,
-        gate_preamble=SOURCE_ATOMIC_GATE_PREAMBLE,
+        gate_preamble=SOURCE_ATOMIC_GATE_PREAMBLE.replace(
+            "__SOURCE_ATOMIC_PATCH_ID__", SOURCE_ATOMIC_PATCH_ID
+        ),
     )
 
 
@@ -412,6 +432,10 @@ def ensure_source_atomic_embedding_worker(
         or SOURCE_ATOMIC_PREVIOUS_V3_PATCH_ID in current_text
         or SOURCE_ATOMIC_PREVIOUS_V4_PATCH_ID in current_text
         or SOURCE_ATOMIC_PREVIOUS_V5_PATCH_ID in current_text
+        or SOURCE_ATOMIC_PREVIOUS_V6_PATCH_ID in current_text
+        or SOURCE_ATOMIC_PREVIOUS_V7_PATCH_ID in current_text
+        or SOURCE_ATOMIC_PREVIOUS_V8_PATCH_ID in current_text
+        or SOURCE_ATOMIC_PREVIOUS_V9_PATCH_ID in current_text
     ):
         if not backup.is_file():
             result["reason"] = "source_atomic_worker_backup_missing"
@@ -445,9 +469,9 @@ def ensure_source_atomic_embedding_worker(
         )
         if not upgraded_from_patch_id and any(
             patch_id in current_text
-            for patch_id in (SOURCE_ATOMIC_PREVIOUS_V3_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V4_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V5_PATCH_ID)
+            for patch_id in (SOURCE_ATOMIC_PREVIOUS_V3_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V4_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V5_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V6_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V7_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V8_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V9_PATCH_ID)
         ):
-            # v3-v5 were preceding, hash-gated revisions. Their
+            # v3-v6 were preceding, hash-gated revisions. Their
             # generated bodies are intentionally not reconstructed from
             # mutable live code; require the prior assistant manifest to bind
             # this exact file to the pristine v1.16.1 backup instead.
@@ -458,7 +482,7 @@ def ensure_source_atomic_embedding_worker(
             if (
                 isinstance(previous_manifest, dict)
                 and str(previous_manifest.get("patch_id") or "")
-                in {SOURCE_ATOMIC_PREVIOUS_V3_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V4_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V5_PATCH_ID}
+                in {SOURCE_ATOMIC_PREVIOUS_V3_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V4_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V5_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V6_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V7_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V8_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V9_PATCH_ID}
                 and str(previous_manifest.get("original_worker_sha256") or "")
                 == _sha256_bytes(original)
                 and str(previous_manifest.get("patched_worker_sha256") or "")

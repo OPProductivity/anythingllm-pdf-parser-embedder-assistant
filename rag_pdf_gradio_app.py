@@ -16948,6 +16948,56 @@ def automatic_ocr_preflight_risk(profile):
     return "native_text_likely"
 
 
+def _page_image_area_ratios(page, image_records):
+    """Read displayed image areas once, with the historic xref lookup as fallback."""
+    page_area = max(float(page.rect.width * page.rect.height), 1.0)
+    direct_ratios = []
+    direct_usable = False
+    try:
+        # Bounding boxes are sufficient here. Requesting xrefs additionally
+        # hashes image data and can cost more than the geometry it replaces.
+        for item in page.get_image_info(xrefs=False) or []:
+            if not isinstance(item, dict) or item.get("bbox") is None:
+                continue
+            try:
+                rectangle = fitz.Rect(item["bbox"])
+                area = float(rectangle.width * rectangle.height)
+            except (RuntimeError, ValueError, TypeError, AttributeError):
+                continue
+            if not math.isfinite(area) or area < 0:
+                continue
+            direct_usable = True
+            direct_ratios.append(round(area / page_area, 4))
+    except (RuntimeError, ValueError, TypeError, AttributeError):
+        pass
+
+    # The downstream OCR policy has material boundaries at .28 and .50. A
+    # direct bounding box well away from both cannot change that decision.
+    # Near either boundary, retain the historic xref result rather than let a
+    # PDF clipping-box difference move a page between OCR categories.
+    direct_largest = max(direct_ratios, default=0.0)
+    near_policy_boundary = direct_usable and (
+        abs(direct_largest - .28) <= .08 or abs(direct_largest - .50) <= .08
+    )
+    if (direct_usable and not near_policy_boundary) or not image_records:
+        return direct_ratios, False
+
+    fallback_ratios = []
+    for image_record in image_records:
+        try:
+            image_rectangles = page.get_image_rects(image_record[0])
+        except (RuntimeError, ValueError, TypeError, AttributeError):
+            continue
+        for rectangle in image_rectangles:
+            try:
+                area = float(rectangle.width * rectangle.height)
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if math.isfinite(area) and area >= 0:
+                fallback_ratios.append(round(area / page_area, 4))
+    return fallback_ratios, True
+
+
 def automatic_full_native_text_coverage(path):
     """Verify native text coverage on every physical page before OCR is deferred.
 
@@ -16967,7 +17017,12 @@ def automatic_full_native_text_coverage(path):
         "sparse_native_text_pages": [],
         "visible_vector_low_text_pages": [],
         "timing_profile": {},
+        "inspection_timing": {},
     }
+    inspection_started = time.perf_counter()
+    native_text_seconds = 0.0
+    image_geometry_seconds = 0.0
+    image_geometry_fallbacks = 0
     try:
         with fitz.open(pdf_path) as document:
             result["page_count"] = int(document.page_count or 0)
@@ -16982,7 +17037,9 @@ def automatic_full_native_text_coverage(path):
             timing_rows = []
             for index in range(result["page_count"]):
                 page = document.load_page(index)
+                native_text_started = time.perf_counter()
                 native_text = page.get_text("text") or ""
+                native_text_seconds += time.perf_counter() - native_text_started
                 text_characters = len(native_text.strip())
                 sampled_image_records = None
                 if index in sample_indexes:
@@ -17013,20 +17070,12 @@ def automatic_full_native_text_coverage(path):
                     # low-text page. Computing image rectangles on every
                     # image-rich, healthy text page made large folder previews
                     # needlessly slow without changing any OCR decision.
-                    page_area = max(float(page.rect.width * page.rect.height), 1.0)
-                    image_area_ratios = []
-                    for image_record in image_records:
-                        try:
-                            image_rectangles = page.get_image_rects(image_record[0])
-                        except (RuntimeError, ValueError, TypeError):
-                            continue
-                        for rectangle in image_rectangles:
-                            image_area_ratios.append(
-                                round(
-                                    max(0.0, float(rectangle.width * rectangle.height)) / page_area,
-                                    4,
-                                )
-                            )
+                    image_geometry_started = time.perf_counter()
+                    image_area_ratios, used_geometry_fallback = _page_image_area_ratios(
+                        page, image_records
+                    )
+                    image_geometry_seconds += time.perf_counter() - image_geometry_started
+                    image_geometry_fallbacks += int(used_geometry_fallback)
                     row = {
                         "page": index + 1,
                         "native_text_characters": text_characters,
@@ -17143,10 +17192,22 @@ def automatic_full_native_text_coverage(path):
                     low_label="light", middle_label="medium", high_label="heavy",
                 ),
             }
+            result["inspection_timing"] = {
+                "total_seconds": round(time.perf_counter() - inspection_started, 3),
+                "native_text_seconds": round(native_text_seconds, 3),
+                "image_geometry_seconds": round(image_geometry_seconds, 3),
+                "image_geometry_fallback_count": image_geometry_fallbacks,
+            }
     except Exception as exc:
         result.update({
             "status": "error",
             "error": f"{type(exc).__name__}: {exc}",
+            "inspection_timing": {
+                "total_seconds": round(time.perf_counter() - inspection_started, 3),
+                "native_text_seconds": round(native_text_seconds, 3),
+                "image_geometry_seconds": round(image_geometry_seconds, 3),
+                "image_geometry_fallback_count": image_geometry_fallbacks,
+            },
         })
     return result
 
@@ -26023,6 +26084,33 @@ def _report_nonnegative_count(report, canonical_key, *legacy_keys):
     return 0
 
 
+def source_atomic_provider_batch_size_from_report(report, fallback=1):
+    """Return a batch size proved by live source-atomic telemetry.
+
+    Startup compatibility describes what is installed.  Runtime events
+    describe what the already-running Desktop worker actually executed.  A
+    pending Desktop restart must therefore not leave ETA permanently pricing
+    one provider call per page-parent after a canonical event has proved a
+    bounded batch size.
+    """
+    report = report if isinstance(report, dict) else {}
+    candidates = [
+        report.get("source_atomic_provider_batch_size"),
+        report.get("provider_batch_size"),
+    ]
+    for batch in report.get("source_atomic_provider_batches") or []:
+        if isinstance(batch, dict):
+            candidates.append(batch.get("provider_batch_size"))
+    for value in reversed(candidates):
+        try:
+            parsed = int(value or 0)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            return parsed
+    return max(1, int(fallback or 1))
+
+
 def _report_has_explicit_count(report, key):
     return isinstance(report, dict) and key in report and report.get(key) is not None
 
@@ -26868,6 +26956,16 @@ def upload_prepared_automatic_batch(
                 and queue_event_age is not None
                 and queue_event_age >= ANYTHINGLLM_EMBEDDING_RECONCILIATION_STALL_SECONDS
             )
+            if quiet_queue_recovery:
+                # A rate inferred before a long quiet interval is no longer a
+                # forecast.  Retaining it produced claims such as "one second
+                # remaining" hundreds of seconds into recovery.
+                queue = {
+                    **queue,
+                    "desktop_queue_records_per_minute": None,
+                    "desktop_queue_estimated_remaining_seconds": None,
+                    "desktop_queue_rate_stale": True,
+                }
             should_read_storage = storage_observation_due_for_queue(
                 queue,
                 len(expected_batch),
@@ -26876,6 +26974,9 @@ def upload_prepared_automatic_batch(
                 elapsed_seconds=elapsed,
                 last_observation_elapsed_seconds=last_storage_observation_elapsed,
                 poll_interval_seconds=2.0,
+            )
+            quiet_queue_recovery_observation = bool(
+                quiet_queue_recovery and should_read_storage
             )
             if should_read_storage:
                 if quiet_queue_recovery:
@@ -27135,7 +27236,7 @@ def upload_prepared_automatic_batch(
                 time.sleep(2.0)
                 continue
             if not should_publish_vector_observation_status(
-                quiet_queue_recovery=quiet_queue_recovery,
+                quiet_queue_recovery=quiet_queue_recovery_observation,
                 current_submission_vectors=current_submission_vectors,
                 unique_identities=unique_identities,
                 previous_signature=last_published_vector_observation_signature,
@@ -27146,7 +27247,7 @@ def upload_prepared_automatic_batch(
                 # or terminal reconciliation result supplies the next fact.
                 time.sleep(2.0)
                 continue
-            elif quiet_queue_recovery:
+            elif quiet_queue_recovery_observation:
                 visible_vectors = current_submission_vectors or unique_identities
                 progress_detail = (
                     f"Desktop queue has been quiet for {queue_event_age:.0f}s at record "
@@ -27174,15 +27275,15 @@ def upload_prepared_automatic_batch(
                     "observation_status": last_report.get("status"),
                     "reconciliation_effective_deadline_seconds": round(effective_deadline_seconds, 3),
                     "reconciliation_deadline_extensions": deadline_extensions,
-                    "quiet_queue_recovery_observation": quiet_queue_recovery,
-                    "quiet_queue_recovery_record": queue_position if quiet_queue_recovery else None,
+                    "quiet_queue_recovery_observation": quiet_queue_recovery_observation,
+                    "quiet_queue_recovery_record": queue_position if quiet_queue_recovery_observation else None,
                     "quiet_queue_recovery_event_age_seconds": (
-                        round(queue_event_age, 3) if quiet_queue_recovery else None
+                        round(queue_event_age, 3) if quiet_queue_recovery_observation else None
                     ),
                     **queue,
                 },
             )
-            if not quiet_queue_recovery:
+            if not quiet_queue_recovery_observation:
                 last_published_vector_observation_signature = (
                     max(0, int(current_submission_vectors or 0)),
                     max(0, int(unique_identities or 0)),
@@ -28628,6 +28729,7 @@ def run_automatic(
     # run is using source-atomic provider batches; only then may the exact-plan
     # correction switch away from one-request-per-page-parent arithmetic.
     active_source_atomic_provider_batch_size = 1
+    execution_plan_priced_batch_size = 0
     initial_estimated_batches = max(
         0,
         int(
@@ -30354,8 +30456,10 @@ def run_automatic(
         def report_grouped_upload_status(stage, report=None):
             nonlocal expected_seconds, pending_ocr_eta_surcharge
             nonlocal active_source_atomic_provider_batch_size
+            nonlocal execution_plan_priced_batch_size
             report = report or {}
             stage_text = str(stage or "Submitting the selected PDF batch to AnythingLLM")
+            runtime_batch_reprice_context = None
             # The grouped Desktop route owns the live queue observer.  Feed
             # each of its evidence-bearing callbacks through the established
             # timing recorder before rendering the status, so the classic ETA
@@ -30375,6 +30479,68 @@ def run_automatic(
                         )
                     except (TypeError, ValueError):
                         active_source_atomic_provider_batch_size = 1
+            proved_batch_size = source_atomic_provider_batch_size_from_report(
+                report,
+                fallback=active_source_atomic_provider_batch_size,
+            )
+            if proved_batch_size > active_source_atomic_provider_batch_size:
+                active_source_atomic_provider_batch_size = proved_batch_size
+            # The exact cache/execution plan can precede the first live
+            # provider event.  Reprice it once more when runtime telemetry
+            # proves that the active Desktop worker batches provider calls.
+            # This is deliberately a correction of the same plan, not a new
+            # queue-rate model, and can only lower an estimate that was made
+            # with a smaller assumed batch size.
+            if (
+                cache_plan_context.get("batch_cache_plan_observed")
+                and active_source_atomic_provider_batch_size > 1
+                and execution_plan_priced_batch_size
+                < active_source_atomic_provider_batch_size
+            ):
+                elapsed = max(0.0, time.perf_counter() - started_at)
+                corrected_expected = confirmed_batch_execution_plan_eta_seconds(
+                    expected_seconds,
+                    elapsed,
+                    fresh_provider_requests=int(
+                        cache_plan_context.get("batch_fresh_records") or 0
+                    ),
+                    provider_request_seconds=timing_unit_prior,
+                    features=timing_features,
+                    cached_attachment_records=int(
+                        cache_plan_context.get("batch_cached_records") or 0
+                    ),
+                    source_total=int(
+                        cache_plan_context.get("batch_source_total") or 0
+                    ),
+                    cached_documents=int(
+                        cache_plan_context.get("batch_cached_documents") or 0
+                    ),
+                    cache_attachment_prior=cache_attachment_prior,
+                    fresh_provider_batch_size=active_source_atomic_provider_batch_size,
+                )
+                previous_priced_batch_size = execution_plan_priced_batch_size
+                execution_plan_priced_batch_size = (
+                    active_source_atomic_provider_batch_size
+                )
+                if corrected_expected + 5 < int(expected_seconds):
+                    previous_expected_seconds = int(expected_seconds)
+                    expected_seconds = corrected_expected
+                    run_timing_estimate["expected_seconds"] = expected_seconds
+                    runtime_batch_reprice_context = {
+                        "previous_provider_batch_size": previous_priced_batch_size,
+                        "confirmed_provider_batch_size": (
+                            active_source_atomic_provider_batch_size
+                        ),
+                        "fresh_provider_requests": int(
+                            cache_plan_context.get("batch_fresh_records") or 0
+                        ),
+                        "previous_expected_seconds": previous_expected_seconds,
+                        "expected_seconds": expected_seconds,
+                        "evidence": "canonical_source_atomic_runtime_telemetry",
+                    }
+                    run_timing_estimate.setdefault(
+                        "runtime_provider_batch_size_reprices", []
+                    ).append(dict(runtime_batch_reprice_context))
             if timing_event == "prepared_batch_complete":
                 cache_plan_context["prepared_records"] = max(
                     0,
@@ -30451,6 +30617,9 @@ def run_automatic(
             eta_basis_update = None
             cache_reuse_records = None
             queue_diagnostic_context = None
+            if runtime_batch_reprice_context is not None:
+                eta_reprice_reason = "runtime_provider_batch_size_confirmed"
+                eta_reprice_context = dict(runtime_batch_reprice_context)
             if bool(report.get("desktop_queue_slow_event_gap")):
                 queue_diagnostic_context = {
                     "kind": "desktop_queue_slow_event_gap",
@@ -30538,6 +30707,9 @@ def run_automatic(
                         fresh_provider_batch_size=(
                             active_source_atomic_provider_batch_size
                         ),
+                    )
+                    execution_plan_priced_batch_size = (
+                        active_source_atomic_provider_batch_size
                     )
                     eta_basis_update = (
                         "cache_plan_confirmed"
@@ -31530,6 +31702,18 @@ def run_automatic(
     else:
         progress(1.0, desc="Document(s) ready in AnythingLLM" if prepare_and_upload else "Preparation complete")
     prepared_paths = primary_prepared_download_paths(summaries)
+    terminal_source_transactions = [
+        row for row in (batch_upload_report.get("source_transactions") or [])
+        if isinstance(row, dict)
+    ]
+    terminal_vector_confirmed_files = sum(
+        1 for row in terminal_source_transactions
+        if str(row.get("state") or "") == "exact_vectors_proven"
+    )
+    terminal_accepted_files = sum(
+        1 for row in terminal_source_transactions
+        if int(row.get("newly_attached_records") or row.get("uploaded") or 0) > 0
+    )
     update_live_automatic_run_status(
         run_root,
         state=completion["state"],
@@ -31560,6 +31744,13 @@ def run_automatic(
         cancel_requested=True if completion["state"] == "cancelled" else None,
         output_paths=prepared_paths,
         activity_observed=False,
+        batch_accepted_files=terminal_accepted_files,
+        batch_prepared_files=len(summaries),
+        batch_vector_confirmed_files=terminal_vector_confirmed_files,
+        batch_completed_files=terminal_vector_confirmed_files,
+        batch_total_files=len(summaries),
+        batch_current_file_index=0,
+        authoritative_batch_completed_files=True,
     )
     if flat_no_logs_complete:
         # The temporary app-run directory contains worker/progress receipts.

@@ -200,11 +200,10 @@ def _audit_source_transactions(
          "At least one source transaction has no state.", artifact)
 
     if stop_index:
-        # A bounded AnythingLLM queue group can submit several sources before a
-        # single external mutation becomes ambiguous.  In that case the worker
-        # deliberately retains every source in that *same* group as held, so it
-        # can never release a later group by accident.  Older source-at-a-time
-        # ledgers still require the held source to be final.
+        # A bounded queue group may prove earlier sources before a later source
+        # becomes ambiguous.  The durable stop index therefore names the first
+        # held source; only that source and any retained successors must remain
+        # held.  Older all-held groups continue to satisfy the same rule.
         try:
             held_position = indices.index(stop_index)
         except ValueError:
@@ -620,8 +619,11 @@ def audit_run_directory(
              "AUDIT-CROSS-SOURCE-002",
              "Source transaction vector totals disagree with the batch report's current-run confirmed-vector total.",
              "source-transaction-ledger.json")
-        _add(findings, has_held_source and str(recovery.get("state") or "") != "resume_available",
-             "AUDIT-RECOVERY-001", "A held source has no resumable recovery state.",
+        recovery_state = str(recovery.get("state") or "")
+        _add(findings, has_held_source and recovery_state not in {
+            "resume_available", "observation_required"
+        },
+             "AUDIT-RECOVERY-001", "A held source has no safe recovery or observation state.",
              "batch-embedding-ledger.json")
         all_proven = (
             source_summary["retained_sources"] > 0

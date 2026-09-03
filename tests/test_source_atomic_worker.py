@@ -102,7 +102,7 @@ let __sourceAtomicEmit=(event)=>emitted.push(event);
 
     assert probe["calls"] == [
         {"maxRetries": 0, "timeout": 35_000},
-        {"maxRetries": 0, "timeout": 20_000},
+        {"maxRetries": 0, "timeout": 45_000},
     ]
     assert probe["attemptCount"] == 2
     assert probe["retryDelayMs"] == 5_000
@@ -134,7 +134,7 @@ let __sourceAtomicEmit=(event)=>emitted.push(event);
     assert probe["attemptCount"] == 2
     assert probe["calls"] == [
         {"maxRetries": 0, "timeout": 35_000},
-        {"maxRetries": 0, "timeout": 20_000},
+        {"maxRetries": 0, "timeout": 45_000},
     ]
     assert probe["events"].count("source_staging_provider_batch_retrying") == 1
 
@@ -262,6 +262,47 @@ def test_current_patch_migrates_manifest_bound_v3_worker(tmp_path, monkeypatch):
     assert source_atomic.SOURCE_ATOMIC_PATCH_ID in worker.read_text(encoding="utf-8")
     written_manifest = json.loads(manifest.read_text(encoding="utf-8"))
     assert written_manifest["provider_retry_policy"] == source_atomic.source_atomic_provider_retry_policy()
+
+
+def test_current_patch_migrates_manifest_bound_v7_worker(tmp_path, monkeypatch):
+    """The last deployed worker upgrades to runtime-self-identifying v8."""
+    worker = tmp_path / "embedding-worker.js"
+    original = _fixture_worker()
+    worker.write_text(original, encoding="utf-8")
+    executable = tmp_path / "AnythingLLM.exe"
+    executable.write_bytes(b"desktop")
+    report = _qualified_report(executable)
+    backup = worker.with_name(f"{worker.name}.pdf-assistant-v1161.backup")
+    backup.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(
+        source_atomic,
+        "V1161_EMBEDDING_WORKER_SHA256",
+        hashlib.sha256(backup.read_bytes()).hexdigest(),
+    )
+    previous = source_atomic.patch_v1161_embedding_worker_source(original).replace(
+        source_atomic.SOURCE_ATOMIC_PATCH_ID,
+        source_atomic.SOURCE_ATOMIC_PREVIOUS_V7_PATCH_ID,
+    )
+    worker.write_text(previous, encoding="utf-8")
+    manifest = worker.with_name(f"{worker.name}.pdf-assistant-source-atomic.json")
+    manifest.write_text(
+        json.dumps({
+            "patch_id": source_atomic.SOURCE_ATOMIC_PREVIOUS_V7_PATCH_ID,
+            "original_worker_sha256": hashlib.sha256(backup.read_bytes()).hexdigest(),
+            "patched_worker_sha256": hashlib.sha256(worker.read_bytes()).hexdigest(),
+        }),
+        encoding="utf-8",
+    )
+
+    migrated = source_atomic.ensure_source_atomic_embedding_worker(
+        report, worker_path=worker
+    )
+
+    assert migrated["status"] == "restart_required", migrated
+    assert migrated["upgraded_from_patch_id"] == source_atomic.SOURCE_ATOMIC_PREVIOUS_V7_PATCH_ID
+    patched = worker.read_text(encoding="utf-8")
+    assert source_atomic.SOURCE_ATOMIC_PATCH_ID in patched
+    assert f'patchId:"{source_atomic.SOURCE_ATOMIC_PATCH_ID}"' in patched
 
 
 def test_installer_is_a_noop_without_exact_v1161_authority(tmp_path):

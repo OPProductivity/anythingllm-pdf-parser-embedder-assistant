@@ -19,7 +19,7 @@ from anythingllm_source_atomic_worker import (
 )
 
 
-SOURCE_ATOMIC_SERVER_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_server_v4"
+SOURCE_ATOMIC_SERVER_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_server_v5"
 # Every revision changes guarded execution semantics (v3 added native cache
 # lookup; v4 hardens timeout classification). Older injected bodies are always
 # rebuilt from the verified pristine backup instead of being edited in place.
@@ -28,6 +28,7 @@ SOURCE_ATOMIC_PREVIOUS_SERVER_PATCH_IDS = frozenset(
         "anythingllm_pdf_assistant_source_atomic_server_v1",
         "anythingllm_pdf_assistant_source_atomic_server_v2",
         "anythingllm_pdf_assistant_source_atomic_server_v3",
+        "anythingllm_pdf_assistant_source_atomic_server_v4",
     }
 )
 # Kept as a compatibility alias for callers/tests that only need the oldest
@@ -61,7 +62,7 @@ let __sourceAtomicEmit=(event)=>o(s.slug,event);
 __SOURCE_ATOMIC_PROVIDER_POLICY_HELPER__
 for(let [N,R]of d){
   let A=Date.now(),H=R[0]?.filename||"";
-  o(s.slug,{type:"source_staging_started",workspaceSlug:s.slug,sourceKey:N,filename:H,recordCount:R.length,provider_batch_size:B,concurrency:1});
+  o(s.slug,{type:"source_staging_started",workspaceSlug:s.slug,sourceKey:N,filename:H,recordCount:R.length,provider_batch_size:B,concurrency:1,patchId:"__SOURCE_ATOMIC_SERVER_PATCH_ID__"});
   let V=[],E=null,Q=[],F={sourceRecordCount:R.length,cacheResolvedRecordCount:0,providerRequiredRecordCount:0,providerChunkCount:0};
   try{
     for(let G=0;G<R.length;G++){
@@ -90,7 +91,7 @@ for(let [N,R]of d){
       o(s.slug,{type:"source_staging_record",workspaceSlug:s.slug,sourceKey:N,filename:W.record.filename,chunkCount:W.texts.length,elapsed_ms:Date.now()-A,cacheResolution:"provider_staged"})
     }
   }catch(G){E=G?.message||String(G)}
-  o(s.slug,{type:"source_staging_finished",workspaceSlug:s.slug,sourceKey:N,filename:H,recordCount:R.length,elapsed_ms:Date.now()-A,success:E===null,provider_batch_size:B,sourcePlan:F,providerBatches:Q});
+  o(s.slug,{type:"source_staging_finished",workspaceSlug:s.slug,sourceKey:N,filename:H,recordCount:R.length,elapsed_ms:Date.now()-A,success:E===null,provider_batch_size:B,sourcePlan:F,providerBatches:Q,patchId:"__SOURCE_ATOMIC_SERVER_PATCH_ID__"});
   if(E!==null){for(let G of R){i.push(G.filename),c.add(E),o(s.slug,{type:"doc_failed",...G.progress,error:"Source rejected before namespace commit: "+E})}o(s.slug,{type:"source_rejected_before_commit",workspaceSlug:s.slug,sourceKey:N,filename:H,error:E});continue}
   for(let G of V){
     let W=G.record,X=o8(),{pageContent:Y,...J}=W.raw,K={docId:X,filename:W.filename.split(/[/\\]/).pop(),docpath:W.filename,workspaceId:s.id,metadata:JSON.stringify(J)};
@@ -108,6 +109,9 @@ return global.__embeddingProgress=null,o(s.slug,{type:"all_complete",workspaceSl
 ).replace(
     "__SOURCE_ATOMIC_PROVIDER_POLICY_HELPER__",
     SOURCE_ATOMIC_PROVIDER_POLICY_HELPER,
+).replace(
+    "__SOURCE_ATOMIC_SERVER_PATCH_ID__",
+    SOURCE_ATOMIC_SERVER_PATCH_ID,
 )
 
 
