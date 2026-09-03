@@ -12484,6 +12484,13 @@ QUEUE_ETA_REPRICE_INTERVAL_SECONDS = 180.0
 QUEUE_ETA_REPRICE_MIN_CHANGE_SECONDS = 20
 QUEUE_ETA_REPRICE_MIN_CHANGE_RATIO = 0.03
 QUEUE_ETA_MAX_CHANGE_RATIO = 0.25
+# Once an exact execution plan proves a run wholly fresh and the owned
+# observer has covered at least half of that work across multiple groups, the
+# ordinary 25% downward step can leave a known-stale estimate visible until
+# completion. Permit one slightly larger evidence-backed correction only in
+# that narrow case. Cache runs, opening estimates, upward repricing, and queue
+# execution never use this value.
+QUEUE_ETA_FRESH_ONLY_HIGH_COVERAGE_MAX_CHANGE_RATIO = 0.35
 # A slower live provider is real evidence, but an isolated slow source must not
 # be projected over every unopened PDF. Downward corrections may retain the
 # existing broad bound; upward corrections require cross-source consensus and
@@ -19126,6 +19133,22 @@ def batch_queue_forecast_has_broad_downward_coverage(forecast):
     )
 
 
+def batch_queue_forecast_is_high_confidence_fresh_only(forecast):
+    """Allow a larger downward step only from broad exact fresh evidence."""
+    evidence = forecast if isinstance(forecast, dict) else {}
+    prepared = max(0, int(evidence.get("prepared_records") or 0))
+    known_fresh = max(0, int(evidence.get("known_fresh_records") or 0))
+    completed = max(0, int(evidence.get("completed_records") or 0))
+    return bool(
+        evidence.get("batch_cache_plan_observed")
+        and prepared > 0
+        and known_fresh == prepared
+        and completed >= math.ceil(prepared * 0.5)
+        and int(evidence.get("observed_windows") or 0) >= 2
+        and batch_queue_forecast_has_broad_downward_coverage(evidence)
+    )
+
+
 def batch_queue_forecast_is_representative_whole_run(forecast):
     """Return whether one mature group covers the complete remaining run.
 
@@ -19277,7 +19300,12 @@ def observe_batch_prequeue_cache_plan(context, report):
     }
 
 
-def bounded_queue_eta_reprice(current_expected, queue_forecast):
+def bounded_queue_eta_reprice(
+    current_expected,
+    queue_forecast,
+    *,
+    max_downward_change_ratio=QUEUE_ETA_MAX_CHANGE_RATIO,
+):
     """Take one readable ETA step toward mature owned-queue evidence.
 
     The forecast can be much more accurate than the opening prior, but a
@@ -19289,7 +19317,11 @@ def bounded_queue_eta_reprice(current_expected, queue_forecast):
     forecast = max(0.0, float(queue_forecast or 0.0))
     if current <= 0.0:
         return int(math.ceil(forecast))
-    lower = current * (1.0 - QUEUE_ETA_MAX_CHANGE_RATIO)
+    downward_ratio = min(
+        1.0,
+        max(0.0, float(max_downward_change_ratio or 0.0)),
+    )
+    lower = current * (1.0 - downward_ratio)
     upward_step = min(
         float(QUEUE_ETA_MAX_UPWARD_CHANGE_SECONDS),
         current * QUEUE_ETA_MAX_UPWARD_CHANGE_RATIO,
@@ -19452,6 +19484,9 @@ def queue_eta_decision_context(forecast_samples, decision, queue_evidence):
         "single_large_fresh_group_exception": choice.get(
             "single_large_fresh_group_exception"
         ),
+        "high_confidence_fresh_only": choice.get(
+            "high_confidence_fresh_only"
+        ),
     }
     return {key: value for key, value in context.items() if value is not None}
 
@@ -19464,6 +19499,7 @@ def stable_queue_eta_reprice(
     current_elapsed=None,
     confirmed_fraction=None,
     allow_single_large_fresh_group_increase=False,
+    high_confidence_fresh_only=False,
     return_decision=False,
 ):
     """Return a material bounded reprice from spaced, corroborated samples.
@@ -19524,7 +19560,15 @@ def stable_queue_eta_reprice(
             QUEUE_ETA_REPRICE_MIN_CHANGE_SECONDS,
             int(round(current * QUEUE_ETA_REPRICE_MIN_CHANGE_RATIO)),
         )
-    candidate = bounded_queue_eta_reprice(current, raw_forecast)
+    candidate = bounded_queue_eta_reprice(
+        current,
+        raw_forecast,
+        max_downward_change_ratio=(
+            QUEUE_ETA_FRESH_ONLY_HIGH_COVERAGE_MAX_CHANGE_RATIO
+            if raw_forecast < current and high_confidence_fresh_only
+            else QUEUE_ETA_MAX_CHANGE_RATIO
+        ),
+    )
     phase_floor_seconds = None
     phase_floor_applied = False
     if raw_forecast < current and current_elapsed is not None:
@@ -19572,6 +19616,9 @@ def stable_queue_eta_reprice(
         "single_large_fresh_group_exception": bool(
             raw_forecast > current and allow_single_large_fresh_group_increase
         ),
+        "high_confidence_fresh_only": bool(
+            raw_forecast < current and high_confidence_fresh_only
+        ),
     }
 
 
@@ -19582,6 +19629,7 @@ def early_downward_queue_eta_reprice(
     observed_windows=1,
     current_elapsed=None,
     confirmed_fraction=None,
+    high_confidence_fresh_only=False,
 ):
     """Allow one earlier, still-corroborated downward Desktop ETA correction.
 
@@ -19624,7 +19672,15 @@ def early_downward_queue_eta_reprice(
         QUEUE_ETA_REPRICE_MIN_CHANGE_SECONDS,
         int(round(current * QUEUE_ETA_REPRICE_MIN_CHANGE_RATIO)),
     )
-    candidate = bounded_queue_eta_reprice(current, raw_forecast)
+    candidate = bounded_queue_eta_reprice(
+        current,
+        raw_forecast,
+        max_downward_change_ratio=(
+            QUEUE_ETA_FRESH_ONLY_HIGH_COVERAGE_MAX_CHANGE_RATIO
+            if high_confidence_fresh_only
+            else QUEUE_ETA_MAX_CHANGE_RATIO
+        ),
+    )
     phase_floor_seconds = None
     phase_floor_applied = False
     if current_elapsed is not None:
@@ -19656,6 +19712,7 @@ def early_downward_queue_eta_reprice(
         "sample_count": len(recent),
         "phase_floor_seconds": phase_floor_seconds,
         "phase_floor_applied": phase_floor_applied,
+        "high_confidence_fresh_only": bool(high_confidence_fresh_only),
     }
 
 
@@ -19966,6 +20023,17 @@ def prepared_source_cache_snapshot_report(
         filename_keys=[str(row.get("filename") or "").casefold() for row in valid_rows],
     )
     return report
+
+
+def prepared_cache_no_hit_log_milestone(observed_windows, total_windows):
+    """Return the quarter-coverage milestone represented by this snapshot."""
+    observed = max(0, int(observed_windows or 0))
+    total = max(1, int(total_windows or 1))
+    milestones = {
+        max(1, math.ceil(total * fraction))
+        for fraction in (.25, .50, .75, 1.0)
+    }
+    return observed if observed in milestones else 0
 
 
 def confirmed_batch_cache_remaining_factor(cached_records, fresh_records):
@@ -21612,6 +21680,45 @@ def refresh_automatic_run_estimate(
     )
 
 
+def automatic_author_outcome_summary(summaries):
+    """Summarize author outcomes without invoking unrelated completion logic."""
+    recognized = 0
+    abstained = 0
+    evaluated = 0
+    visible_text = 0
+    user_overrides = 0
+    source_counts = {}
+    for summary in (summaries or []):
+        if not isinstance(summary, dict):
+            continue
+        metadata = summary.get("batch_metadata_resolution") or {}
+        if not (metadata or "detected_author" in summary or "metadata_provenance" in summary):
+            continue
+        evaluated += 1
+        author = str(
+            metadata.get("detected_author") or summary.get("detected_author") or ""
+        ).strip()
+        provenance = metadata.get("metadata_provenance") or summary.get("metadata_provenance") or {}
+        source = str(provenance.get("source_author") or "not_available").strip()
+        source_counts[source] = source_counts.get(source, 0) + 1
+        if author:
+            recognized += 1
+            if source.startswith("text_"):
+                visible_text += 1
+            if source == "user_override":
+                user_overrides += 1
+        else:
+            abstained += 1
+    return {
+        "recognized": recognized,
+        "abstained": abstained,
+        "evaluated": evaluated,
+        "visible_pdf_text": visible_text,
+        "user_overrides": user_overrides,
+        "source_counts": source_counts,
+    }
+
+
 def automatic_completion_receipt(summaries):
     """Return a small, user-facing receipt without conflating global totals.
 
@@ -21663,6 +21770,13 @@ def automatic_completion_receipt(summaries):
         == "deferred_after_exact_vector_proof"
         for summary in rows
     )
+    canonical_cache_counts = [
+        positive_int(summary.get("canonical_cache_eligible_documents"))
+        for summary in rows
+        if "canonical_cache_eligible_documents" in summary
+    ]
+    fully_cache_backed_pdfs = canonical_cache_counts[0] if canonical_cache_counts else 0
+    author_outcomes = automatic_author_outcome_summary(rows)
     visual_review_rows = []
     visual_review_reason_counts = {
         "no_text_recovered": 0,
@@ -21717,6 +21831,13 @@ def automatic_completion_receipt(summaries):
         "partially_reconciled_pdfs": partially_reconciled_pdfs,
         "failed_pdfs": failures,
         "runtime_retrieval_deferred": runtime_deferred,
+        "fully_cache_backed_pdfs": fully_cache_backed_pdfs,
+        "author_recognized": author_outcomes["recognized"],
+        "author_abstained": author_outcomes["abstained"],
+        "author_evaluated": author_outcomes["evaluated"],
+        "author_visible_text": author_outcomes["visible_pdf_text"],
+        "author_user_overrides": author_outcomes["user_overrides"],
+        "author_source_counts": author_outcomes["source_counts"],
         "visual_review_pdfs": len(visual_review_rows),
         "visual_review_pages": sum(row["unresolved_pages"] for row in visual_review_rows),
         "visual_review": visual_review_rows,
@@ -21890,6 +22011,10 @@ def automatic_completion_success_message(summaries, *, include_runtime_note=True
         lead += (
             f" {receipt['selected_input_exact_duplicates']} byte-identical selected PDF(s) skipped."
         )
+    if receipt["fully_cache_backed_pdfs"]:
+        lead += (
+            f" {receipt['fully_cache_backed_pdfs']} PDF(s) were entirely cache-backed."
+        )
     if receipt["partially_reconciled_pdfs"]:
         lead += (
             f" {receipt['existing_records_reused']} existing record(s) across "
@@ -21911,9 +22036,19 @@ def automatic_completion_success_message(summaries, *, include_runtime_note=True
         reason_detail = f" ({'; '.join(reason_parts)})" if reason_parts else ""
         body += (
             f" Visual-text diagnostic: {receipt['visual_review_pages']} image-dominant page(s) "
-            f"in {receipt['visual_review_pdfs']} PDF(s) yielded no or low-confidence text"
-            f"{reason_detail}; indexing continued."
+            f"in {receipt['visual_review_pdfs']} PDF(s) yielded no reliable extracted text"
+            f"{reason_detail}; all other selected pages were indexed normally."
         )
+    if receipt["author_evaluated"]:
+        body += (
+            f" Author metadata: {receipt['author_recognized']} recognized; "
+            f"{receipt['author_abstained']} abstained"
+        )
+        if receipt["author_visible_text"]:
+            body += f"; {receipt['author_visible_text']} recognized from visible PDF text"
+        if receipt["author_user_overrides"]:
+            body += f"; {receipt['author_user_overrides']} user override(s)"
+        body += "."
     return lead + body
 
 
@@ -21955,6 +22090,9 @@ ERROR_DIMENSIONS_BY_CODE = {
     "AUTO-STORAGE-WRITE-ACTIVE-001": ("storage_audit", "external_write_active", "workspace", "storage_write_still_active"),
     "AUTO-METADATA-VISIBILITY-001": ("metadata_validation", "visibility_incomplete", "diagnostic", "metadata_visibility_incomplete"),
     "AUTO-DOCUMENT-LIST-OBSERVATION-001": ("document_list_validation", "visibility_incomplete", "diagnostic", "document_list_rows_unconfirmed"),
+    "RETRIEVAL-PROBE-NOT-RUN-001": ("optional_runtime_validation", "validation_deferred", "diagnostic", "retrieval_probe_deferred_after_vector_proof"),
+    # Read compatibility for retained pre-0.5.2 run evidence. New runs emit
+    # RETRIEVAL-PROBE-NOT-RUN-001 exclusively.
     "AUTO-RETRIEVAL-DEFERRED-001": ("optional_runtime_validation", "validation_deferred", "diagnostic", "retrieval_probe_deferred_after_vector_proof"),
     "AUTO-RETRIEVAL-RUNTIME-001": ("optional_runtime_validation", "validation_timed_out", "diagnostic", "retrieval_probe_transient_timeout"),
     "AUTO-RETRIEVAL-AUTH-001": ("optional_runtime_validation", "validation_blocked", "diagnostic", "retrieval_probe_authentication_blocked"),
@@ -22238,7 +22376,7 @@ def _automatic_completion_decision(summaries, prepare_and_upload):
                 "state": "successful",
                 # Retain the timeout classification in the durable run report
                 # without making an otherwise ready document look doubtful.
-                "diagnostic_code": "AUTO-RETRIEVAL-DEFERRED-001",
+                "diagnostic_code": "RETRIEVAL-PROBE-NOT-RUN-001",
                 "receipt": automatic_completion_receipt(summaries),
                 "message": automatic_completion_success_message(summaries),
             }
@@ -28563,6 +28701,7 @@ def run_automatic(
     prepared_cache_reports = {}
     prepared_cache_filename_owners = {}
     prepared_cache_invalid_sources = set()
+    prepared_cache_no_hit_logged_milestones = set()
     # Source-local cache snapshots can arrive one PDF at a time. Retain the
     # best exact presentation candidate across harmless sub-threshold updates;
     # otherwise several real cache wins can each be discarded before their
@@ -28741,6 +28880,11 @@ def run_automatic(
                                 batch_queue_forecast
                             )
                         ),
+                        high_confidence_fresh_only=(
+                            batch_queue_forecast_is_high_confidence_fresh_only(
+                                batch_queue_forecast
+                            )
+                        ),
                         return_decision=True,
                     )
                 else:
@@ -28750,6 +28894,11 @@ def run_automatic(
                         observed_windows=batch_queue_forecast.get("observed_windows", 0),
                         current_elapsed=elapsed,
                         confirmed_fraction=live.get("confirmed_fraction"),
+                        high_confidence_fresh_only=(
+                            batch_queue_forecast_is_high_confidence_fresh_only(
+                                batch_queue_forecast
+                            )
+                        ),
                     )
                 if stable_reprice.get("status") == "applied":
                     uncapped_expected = int(stable_reprice["expected_seconds"])
@@ -29066,6 +29215,7 @@ def run_automatic(
         """
         nonlocal expected_seconds, prepared_cache_storage_snapshot
         nonlocal prepared_cache_lowest_candidate
+        nonlocal prepared_cache_no_hit_logged_milestones
         if not desktop_serial_queue or automatic_run_cancellation_requested(run_root):
             return None
         if prepared_cache_storage_snapshot is None:
@@ -29219,6 +29369,22 @@ def run_automatic(
             report["eta_reprice_reason"] = "prepared_source_cache_snapshot"
             report["eta_reprice_context"] = context
         else:
+            # A fresh-only batch used to append the same no-hit suppression
+            # once per prepared PDF. Preserve useful coverage evidence at
+            # four deterministic milestones without producing dozens or
+            # hundreds of substantively identical JSONL rows.
+            no_hit_milestone = prepared_cache_no_hit_log_milestone(
+                observed_windows,
+                total_files,
+            )
+            should_log_suppression = bool(observed_cached)
+            if not observed_cached and no_hit_milestone:
+                should_log_suppression = (
+                    no_hit_milestone not in prepared_cache_no_hit_logged_milestones
+                )
+                prepared_cache_no_hit_logged_milestones.add(no_hit_milestone)
+            if not should_log_suppression:
+                return report
             append_eta_recalculation_event(
                 run_root,
                 status="suppressed",
@@ -30073,6 +30239,7 @@ def run_automatic(
     # names in this particular multi-PDF run.
     batch_metadata_manifest_path = Path(run_root) / "batch-metadata-resolution.json"
     try:
+        metadata_outcomes = automatic_author_outcome_summary(summaries)
         _write_automatic_run_json(
             batch_metadata_manifest_path,
             {
@@ -30086,6 +30253,7 @@ def run_automatic(
                     "author": (document_author or "").strip() if not batch_uses_per_pdf_metadata else "",
                     "short_label": (document_short_label or "").strip() if not batch_uses_per_pdf_metadata else "",
                 },
+                "author_outcome_summary": metadata_outcomes,
                 "documents": [
                     {
                         "pdf": str(summary.get("pdf") or ""),
@@ -30402,8 +30570,8 @@ def run_automatic(
                                 cached_records,
                                 fresh_records,
                             ),
-                            "observed_ocr_seconds_not_readded": deferred_ocr_seconds,
-                            "ocr_observations_deferred_until_exact_plan": deferred_ocr_files,
+                            "provisional_ocr_allowance_seconds_not_readded": deferred_ocr_seconds,
+                            "ocr_triggered_source_count": deferred_ocr_files,
                             "previous_expected_seconds": previous_expected_seconds,
                             "expected_seconds": expected_seconds,
                         }
@@ -30421,8 +30589,8 @@ def run_automatic(
                         run_timing_estimate.setdefault("ocr_runtime_reprices", []).append(
                             {
                                 "checkpoint": "exact_execution_plan",
-                                "observed_ocr_files": deferred_ocr_files,
-                                "observed_seconds_not_readded": deferred_ocr_seconds,
+                                "ocr_triggered_source_count": deferred_ocr_files,
+                                "provisional_allowance_seconds_not_readded": deferred_ocr_seconds,
                                 "expected_seconds": expected_seconds,
                                 "display_policy": "represented_by_elapsed_preparation",
                             }
@@ -30654,6 +30822,17 @@ def run_automatic(
                 cancel_callback=lambda root=run_root: automatic_run_cancellation_requested(root),
                 source_atomic_worker_authority=batch_compatibility_report,
             )
+            # Use the canonical exact cache-plan document count in completion
+            # messaging. Partial record reuse must not be presented as a
+            # fully cache-backed PDF.
+            if summaries:
+                summaries[0]["canonical_cache_eligible_documents"] = (
+                    _report_nonnegative_count(
+                        batch_upload_report,
+                        "cache_eligible_documents",
+                        "cached_documents",
+                    )
+                )
             _write_automatic_run_json(batch_upload_report_path, batch_upload_report, compact=True)
             downloadable.append(str(batch_upload_report_path))
             batch_ledger = run_root / "batch-embedding-ledger.json"

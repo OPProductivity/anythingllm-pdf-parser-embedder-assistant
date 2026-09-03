@@ -1953,7 +1953,7 @@ class PipelineCoreTests(unittest.TestCase):
         ], True)
 
         self.assertEqual(completion["state"], "successful")
-        self.assertEqual(completion["diagnostic_code"], "AUTO-RETRIEVAL-DEFERRED-001")
+        self.assertEqual(completion["diagnostic_code"], "RETRIEVAL-PROBE-NOT-RUN-001")
         self.assertEqual(completion["diagnostic_stage"], "optional_runtime_validation")
         self.assertEqual(completion["diagnostic_scope"], "diagnostic")
         self.assertNotIn("error_stage", completion)
@@ -4296,6 +4296,26 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertLess(exact_plan, all_sources)
         self.assertGreater(exact_plan, 191)
 
+    def test_fresh_cache_snapshot_logging_uses_only_quarter_milestones(self):
+        import rag_pdf_gradio_app as app
+
+        observed = [
+            value
+            for value in range(1, 35)
+            if app.prepared_cache_no_hit_log_milestone(value, 34)
+        ]
+        self.assertEqual(observed, [9, 17, 26, 34])
+
+        # Small batches retain distinct meaningful boundaries without
+        # emitting the same milestone twice.
+        self.assertEqual(
+            {
+                app.prepared_cache_no_hit_log_milestone(value, 2)
+                for value in range(1, 3)
+            },
+            {1, 2},
+        )
+
     def test_exact_batch_plan_drops_provisional_ocr_surcharge_from_remaining_eta(self):
         import rag_pdf_gradio_app as app
 
@@ -5452,7 +5472,68 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(receipt["visual_review_reason_counts"]["no_text_recovered"], 1)
         self.assertIn("Visual-text diagnostic", message)
         self.assertIn("1 no-text", message)
-        self.assertIn("indexing continued", message)
+        self.assertIn("image-dominant page(s)", message)
+        self.assertNotIn("decorative", message)
+        self.assertIn("all other selected pages were indexed normally", message)
+
+    def test_success_receipt_distinguishes_fully_cached_pdfs_and_author_outcomes(self):
+        import rag_pdf_gradio_app as app
+
+        summaries = [
+            {
+                "canonical_cache_eligible_documents": 1,
+                "api_uploaded": 3,
+                "api_embedded": 3,
+                "cached_attachment_reused_records": 3,
+                "batch_metadata_resolution": {
+                    "detected_author": "Visible Author",
+                    "metadata_provenance": {"source_author": "text_opening_title_block_byline"},
+                },
+            },
+            {
+                "api_uploaded": 2,
+                "api_embedded": 2,
+                "cached_attachment_reused_records": 1,
+                "batch_metadata_resolution": {
+                    "detected_author": "",
+                    "metadata_provenance": {"source_author": "not_available"},
+                },
+            },
+        ]
+
+        receipt = app.automatic_completion_receipt(summaries)
+        message = app.automatic_completion_success_message(summaries)
+
+        self.assertEqual(receipt["fully_cache_backed_pdfs"], 1)
+        self.assertEqual(receipt["author_recognized"], 1)
+        self.assertEqual(receipt["author_abstained"], 1)
+        self.assertEqual(receipt["author_visible_text"], 1)
+        self.assertIn("1 PDF(s) were entirely cache-backed", message)
+        self.assertIn("Author metadata: 1 recognized; 1 abstained", message)
+        self.assertIn("recognized from visible PDF text", message)
+
+    def test_success_receipt_does_not_infer_fully_cached_pdf_from_partial_record_counters(self):
+        import rag_pdf_gradio_app as app
+
+        summaries = [{
+            "api_uploaded": 3,
+            "api_embedded": 3,
+            "cached_attachment_reused_records": 3,
+        }]
+        receipt = app.automatic_completion_receipt(summaries)
+        self.assertEqual(receipt["fully_cache_backed_pdfs"], 0)
+
+    def test_author_outcomes_are_computed_without_completion_receipt(self):
+        import rag_pdf_gradio_app as app
+
+        outcome = app.automatic_author_outcome_summary([{
+            "batch_metadata_resolution": {
+                "detected_author": "Visible Author",
+                "metadata_provenance": {"source_author": "text_single_opening_person"},
+            },
+        }])
+        self.assertEqual(outcome["recognized"], 1)
+        self.assertEqual(outcome["visible_pdf_text"], 1)
 
     def test_workspace_batch_suggestion_bounds_identity_reads_and_marks_unread_tail(self):
         import rag_pdf_gradio_app as app
@@ -6504,6 +6585,48 @@ class PipelineCoreTests(unittest.TestCase):
             )["suppression_reason"],
             "not_a_downward_forecast",
         )
+
+    def test_high_coverage_fresh_only_plan_allows_larger_downward_step_only(self):
+        import rag_pdf_gradio_app as app
+
+        fresh = {
+            "batch_cache_plan_observed": True,
+            "prepared_records": 654,
+            "known_fresh_records": 654,
+            "completed_records": 332,
+            "observed_windows": 6,
+            "source_total": 10,
+            "fresh_segment_coverage": 1.0,
+            "cache_segmented_observation": True,
+        }
+        self.assertTrue(app.batch_queue_forecast_is_high_confidence_fresh_only(fresh))
+        self.assertFalse(app.batch_queue_forecast_is_high_confidence_fresh_only({
+            **fresh,
+            "known_fresh_records": 600,
+        }))
+        ordinary = app.stable_queue_eta_reprice(
+            1_092, [580, 585, 590, 595, 600], observed_windows=6
+        )
+        improved = app.stable_queue_eta_reprice(
+            1_092,
+            [580, 585, 590, 595, 600],
+            observed_windows=6,
+            high_confidence_fresh_only=True,
+        )
+        self.assertEqual(ordinary["expected_seconds"], 819)
+        self.assertEqual(improved["expected_seconds"], 710)
+        self.assertTrue(improved["high_confidence_fresh_only"])
+        # The motivating production run reached the earlier four-sample
+        # dispatcher branch, so the same narrow exception must work there.
+        early = app.early_downward_queue_eta_reprice(
+            1_092,
+            [580, 585, 590, 595],
+            observed_windows=6,
+            high_confidence_fresh_only=True,
+        )
+        self.assertEqual(early["status"], "applied")
+        self.assertEqual(early["expected_seconds"], 710)
+        self.assertTrue(early["high_confidence_fresh_only"])
 
     def test_early_downward_eta_reprice_uses_twenty_second_floor_or_three_percent(self):
         import rag_pdf_gradio_app as app
@@ -9157,7 +9280,7 @@ class PipelineCoreTests(unittest.TestCase):
         import rag_pdf_gradio_app as app
 
         self.assertRegex(app.APP_VERSION, r"^\d+\.\d+\.\d+$")
-        self.assertEqual(app.APP_VERSION, "0.5.1")
+        self.assertEqual(app.APP_VERSION, "0.5.2")
         self.assertEqual(app.APP_BASE_COMMIT, "portable-package")
         self.assertIn('window.matchMedia("(prefers-color-scheme: dark)")', app.APP_JS)
         self.assertIn('systemThemeQuery.addEventListener("change", applySystemTheme)', app.APP_JS)
@@ -23864,11 +23987,26 @@ class TimingAndInspectionSafetyTests(unittest.TestCase):
         self.assertEqual(record["error_stage"], "")
         self.assertEqual(record["error_category"], "")
         self.assertEqual(record["error_dimensions_schema"], "")
-        self.assertEqual(record["diagnostic_code"], "AUTO-RETRIEVAL-DEFERRED-001")
+        self.assertEqual(record["diagnostic_code"], "RETRIEVAL-PROBE-NOT-RUN-001")
         self.assertEqual(record["diagnostic_stage"], "optional_runtime_validation")
         self.assertEqual(
             record["diagnostic_dimensions_schema"],
             "anythingllm_pdf_diagnostic_dimensions_v1",
+        )
+
+    def test_historical_retrieval_deferred_code_keeps_diagnostic_dimensions(self):
+        import rag_pdf_gradio_app as app
+
+        result = app.with_error_dimensions({
+            "state": "successful",
+            "diagnostic_code": "AUTO-RETRIEVAL-DEFERRED-001",
+        })
+        self.assertEqual(result["diagnostic_stage"], "optional_runtime_validation")
+        self.assertEqual(result["diagnostic_outcome"], "validation_deferred")
+        self.assertEqual(result["diagnostic_scope"], "diagnostic")
+        self.assertEqual(
+            result["diagnostic_category"],
+            "retrieval_probe_deferred_after_vector_proof",
         )
 
     def test_confirmed_retrieval_boundary_is_not_hidden_by_visual_smoothing(self):
@@ -24256,7 +24394,7 @@ class TimingAndInspectionSafetyTests(unittest.TestCase):
 
         self.assertEqual(completion["state"], "successful")
         self.assertNotIn("code", completion)
-        self.assertEqual(completion["diagnostic_code"], "AUTO-RETRIEVAL-DEFERRED-001")
+        self.assertEqual(completion["diagnostic_code"], "RETRIEVAL-PROBE-NOT-RUN-001")
         self.assertEqual(
             completion["message"],
             "1 PDF(s) ready Vectors confirmed; live retrieval not run.",
