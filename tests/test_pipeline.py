@@ -1954,6 +1954,10 @@ class PipelineCoreTests(unittest.TestCase):
 
         self.assertEqual(completion["state"], "successful")
         self.assertEqual(completion["diagnostic_code"], "AUTO-RETRIEVAL-DEFERRED-001")
+        self.assertEqual(completion["diagnostic_stage"], "optional_runtime_validation")
+        self.assertEqual(completion["diagnostic_scope"], "diagnostic")
+        self.assertNotIn("error_stage", completion)
+        self.assertNotIn("error_category", completion)
         self.assertIn("Vectors confirmed; live retrieval not run", completion["message"])
         self.assertEqual(
             app.automatic_completion_phase(completion, True),
@@ -2042,19 +2046,24 @@ class PipelineCoreTests(unittest.TestCase):
                 "ocr_assisted_extraction_used": True,
                 "automatic_targeted_ocr_pages": [2, 6, 6],
                 "ocr_processing_seconds": 4.6,
+                "selected_output_ocr_processing_seconds": 4.6,
                 "ocr_cache_reused_pages": 2,
             },
             {
                 "selected_backend": "unstructured",
                 "ocr_assisted_extraction_used": True,
                 "ocr_processing_seconds": 61.2,
+                "selected_output_ocr_processing_seconds": 50.0,
+                "comparison_ocr_processing_seconds": 11.2,
             },
         ])
 
         self.assertEqual(
             rendered,
-            "Extraction: 2 native · 1 layout · 1 targeted OCR (2 pages checked) · 1 full OCR. "
-            "OCR processing: 01m06s. 2 cached OCR page(s) reused.",
+            "Extraction backends: 2 PyMuPDF · 1 layout · 2 Unstructured. "
+            "OCR contributed to the selected output for 2 PDF(s) (2 targeted page(s)). "
+            "OCR processing: 01m06s. Selected output: 00m55s; extractor comparison: 00m11s. "
+            "2 cached OCR page(s) reused.",
         )
 
     def test_stage_anomaly_detection_flags_only_material_historical_outlier(self):
@@ -4035,6 +4044,8 @@ class PipelineCoreTests(unittest.TestCase):
             root = Path(temp_dir)
             for name in app.AUTOMATIC_WORKER_TRANSPORT_ARTIFACTS:
                 (root / name).write_text("transport receipt", encoding="utf-8")
+            for name in ("run-checkpoint.json", "run-checkpoints.jsonl", "run-result.json"):
+                (root / name).write_text("run control", encoding="utf-8")
             retained = root / "run-summary.json"
             retained.write_text("{}", encoding="utf-8")
 
@@ -4043,7 +4054,15 @@ class PipelineCoreTests(unittest.TestCase):
                 {"lean_retention": {"applied": True}},
             )
 
-            self.assertEqual(removed, list(app.AUTOMATIC_WORKER_TRANSPORT_ARTIFACTS))
+            self.assertEqual(
+                removed,
+                [
+                    *app.AUTOMATIC_WORKER_TRANSPORT_ARTIFACTS,
+                    "run-checkpoint.json",
+                    "run-checkpoints.jsonl",
+                    "run-result.json",
+                ],
+            )
             self.assertTrue(retained.exists())
             self.assertTrue(all(not (root / name).exists() for name in removed))
 
@@ -4319,6 +4338,37 @@ class PipelineCoreTests(unittest.TestCase):
 
         self.assertEqual(exact_plan, 4_141)
         self.assertLess(exact_plan, 4_876)
+
+    def test_exact_all_fresh_plan_uses_proven_source_atomic_provider_batches(self):
+        import rag_pdf_gradio_app as app
+
+        established = app.confirmed_batch_execution_plan_eta_seconds(
+            4_876,
+            203,
+            fresh_provider_requests=1_718,
+            provider_request_seconds=2.285,
+            features={"document_count": 9},
+            cached_attachment_records=0,
+            source_total=9,
+            cached_documents=0,
+            cache_attachment_prior={},
+        )
+        source_atomic = app.confirmed_batch_execution_plan_eta_seconds(
+            4_876,
+            203,
+            fresh_provider_requests=1_718,
+            provider_request_seconds=2.285,
+            features={"document_count": 9},
+            cached_attachment_records=0,
+            source_total=9,
+            cached_documents=0,
+            cache_attachment_prior={},
+            fresh_provider_batch_size=36,
+        )
+
+        self.assertEqual(established, 4_141)
+        self.assertGreaterEqual(source_atomic, 700)
+        self.assertLess(source_atomic, 900)
 
     def test_exact_batch_plan_applies_cache_mix_only_to_future_work(self):
         import rag_pdf_gradio_app as app
@@ -4878,6 +4928,277 @@ class PipelineCoreTests(unittest.TestCase):
             ("Mohammad Reza Aslani, Forrest Cardamenis", "filename_leading_names"),
         )
 
+    def test_explicit_filename_author_survives_whole_stem_title_fallback(self):
+        path = Path("Francesco Casetti - The Persistence of Cinema.pdf")
+        inferred = pipeline.infer_author_from_samples_or_filename(
+            [], path, title_hint=path.stem,
+        )
+        self.assertEqual(
+            (inferred["author"], inferred["source"]),
+            ("Francesco Casetti", "filename_leading_name"),
+        )
+
+    def test_generic_artifact_suffix_does_not_turn_title_into_filename_author(self):
+        path = Path("Sound Media Ecology - complete book.pdf")
+        inferred = pipeline.infer_author_from_samples_or_filename(
+            [], path, title_hint=path.stem,
+        )
+        self.assertEqual(inferred["author"], "")
+
+    def test_explicit_filename_credit_rejects_catalog_titles_and_title_slugs(self):
+        for filename in (
+            "Intermedial Studies - An Introduction to Meaning.pdf",
+            "Hemispheric American Studies -- Caroline F Levander.pdf",
+            "Latin American Keywords Project - Introduction.pdf",
+            "Sinnreich- Some_Kid_in_His_Bedroom_The_Artist_Audience_Binary - chapter.pdf",
+        ):
+            with self.subTest(filename=filename):
+                path = Path(filename)
+                inferred = pipeline.infer_author_from_filename(path, title_hint=path.stem)
+                self.assertEqual(inferred["author"], "")
+
+    def test_visible_title_person_prefix_overrides_exporting_users_pdf_metadata(self):
+        title = "Teshome Gabriel | Third Cinema as Guardian of Popular Memory"
+        inference = pipeline.infer_author_from_samples_or_filename(
+            [{"page": 1, "text": f"13.07.25\n{title}\nPage 1 of 10"}],
+            Path("download.pdf"),
+            title_hint=title,
+        )
+        resolved = pipeline.resolve_author_from_metadata_and_inference(
+            "Sirin Erensoy",
+            inference,
+        )
+        self.assertEqual(
+            (inference["author"], inference["source"]),
+            ("Teshome Gabriel", "text_visible_title_person_prefix"),
+        )
+        self.assertEqual(
+            resolved,
+            {
+                "author": "Teshome Gabriel",
+                "source": "text_visible_title_person_prefix",
+            },
+        )
+
+    def test_title_person_prefix_requires_visible_title_and_rejects_publication_name(self):
+        absent = pipeline.infer_author_from_text_samples(
+            [{"page": 1, "text": "Unrelated opening page"}],
+            title_hint="Teshome Gabriel | Third Cinema as Guardian of Popular Memory",
+        )
+        publication = pipeline.infer_author_from_text_samples(
+            [{"page": 1, "text": "Cultural Studies | An article title"}],
+            title_hint="Cultural Studies | An article title",
+        )
+        self.assertNotEqual(absent.get("source"), "text_visible_title_person_prefix")
+        self.assertNotEqual(publication.get("source"), "text_visible_title_person_prefix")
+
+    def test_visible_opening_byline_overrides_export_metadata_without_embedded_title(self):
+        samples = [{
+            "page": 1,
+            "text": (
+                "THE PROBLEM WITH LATINX AS A RACIAL CONSTRUCT\n"
+                "Laura C. Chávez-Moreno\n"
+                "This chapter is a conceptual essay meant to introduce readers.\n"
+            ),
+        }]
+        inference = pipeline.infer_author_from_samples_or_filename(
+            samples, Path("download.pdf"), title_hint="",
+        )
+        resolved = pipeline.resolve_author_from_metadata_and_inference(
+            "Enrique G. Murillo Jr.", inference,
+        )
+        self.assertEqual(inference["author"], "Laura C. Chávez-Moreno")
+        self.assertEqual(inference["source"], "text_opening_title_block_byline")
+        self.assertEqual(resolved["author"], "Laura C. Chávez-Moreno")
+
+    def test_visible_pipe_credit_does_not_need_embedded_title_metadata(self):
+        inference = pipeline.infer_author_from_text_samples(
+            [{"page": 1, "text": "Teshome Gabriel | Third Cinema as Guardian of Popular Memory"}],
+            title_hint="",
+        )
+        self.assertEqual(
+            (inference["author"], inference["source"]),
+            ("Teshome Gabriel", "text_opening_title_block_byline"),
+        )
+
+    def test_one_opening_title_block_person_does_not_need_a_following_role_marker(self):
+        inference = pipeline.infer_author_from_text_samples(
+            [{
+                "page": 1,
+                "text": (
+                    "A CLEARLY VISIBLE ARTICLE TITLE\n"
+                    "Elena Markham\n"
+                    "Ordinary opening prose without an abstract heading or affiliation.\n"
+                ),
+            }],
+            title_hint="Markham - A Clearly Visible Article Title",
+        )
+
+        self.assertEqual(inference["author"], "Elena Markham")
+        self.assertIn(
+            inference["source"],
+            {"text_title_adjacent_byline", "text_opening_title_block_byline"},
+        )
+
+    def test_one_uncorroborated_person_shaped_opening_line_still_abstains(self):
+        inference = pipeline.infer_author_from_text_samples(
+            [{
+                "page": 1,
+                "text": "A CLEARLY VISIBLE ARTICLE TITLE\nNew Worlds\nOrdinary opening prose.\n",
+            }],
+            title_hint="unrelated-download-name",
+        )
+        resolved = pipeline.resolve_author_from_metadata_and_inference(
+            "Ignored Embedded User", inference,
+        )
+
+        self.assertEqual(resolved, {"author": "", "source": "not_available"})
+
+    def test_multiple_opening_people_still_need_structural_author_corroboration(self):
+        inference = pipeline.infer_author_from_text_samples(
+            [{
+                "page": 1,
+                "text": (
+                    "A CLEARLY VISIBLE ARTICLE TITLE\n"
+                    "Elena Markham and Jordan Lee\n"
+                    "Ordinary opening prose without an abstract heading or affiliation.\n"
+                ),
+            }],
+            title_hint="",
+        )
+
+        resolved = pipeline.resolve_author_from_metadata_and_inference(
+            "Ignored Embedded User", inference,
+        )
+        self.assertNotEqual(inference.get("source"), "text_opening_title_block_byline")
+        self.assertEqual(resolved, {"author": "", "source": "not_available"})
+
+    def test_strict_credit_block_collects_complete_wrapped_article_byline(self):
+        inference = pipeline.infer_author_from_samples_or_filename(
+            [{
+                "page": 1,
+                "text": (
+                    "LATINO OR HISPANIC\n"
+                    "Daniel E. Martínez1\n"
+                    "and Kelsey E. Gonzalez1\n"
+                    "Abstract\nResearch consistently finds different preferences.\n"
+                ),
+            }],
+            Path("article.pdf"),
+            title_hint="Latino or Hispanic",
+        )
+        self.assertEqual(inference["author"], "Daniel E. Martínez, Kelsey E. Gonzalez")
+        self.assertEqual(inference["source"], "text_strict_credit_block")
+
+    def test_strict_credit_block_handles_numbered_chapter_and_student_cover(self):
+        chapter = pipeline.infer_author_from_samples_or_filename(
+            [{
+                "page": 1,
+                "text": (
+                    "12 The intermediality of performance\n"
+                    "Per Bäckström, Heidrun Führer and Beate Schirrmacher\n"
+                    "In the street, you see a person standing on a box, motionless like a statue.\n"
+                ),
+            }],
+            Path("chapter.pdf"),
+            title_hint="",
+        )
+        student = pipeline.infer_author_from_samples_or_filename(
+            [{
+                "page": 1,
+                "text": "LATINA/O GV2\nNATHAN MINDERHOUD\nS5380944\nFINAL KEYWORD ESSAY\n",
+            }],
+            Path("essay.pdf"),
+            title_hint="",
+        )
+        self.assertEqual(
+            chapter["author"],
+            "Per Bäckström, Heidrun Führer, Beate Schirrmacher",
+        )
+        self.assertEqual(student["author"], "NATHAN MINDERHOUD")
+
+    def test_strict_explicit_editor_block_stops_before_publisher_furniture(self):
+        inference = pipeline.infer_author_from_strict_credit_blocks(
+            [{
+                "page": 1,
+                "text": (
+                    "Edited by\nJosé A. Cobas\nJorge Duany\nJoe R. Feagin\n"
+                    "Paradigm Publishers\nBoulder • London\n"
+                ),
+            }],
+            Path("book.pdf"),
+            title_hint="",
+        )
+        self.assertEqual(inference["author"], "José A. Cobas, Jorge Duany, Joe R. Feagin")
+        self.assertEqual(inference["source"], "text_strict_credit_block")
+
+    def test_strict_credit_block_rejects_heading_and_series_editor_furniture(self):
+        heading = pipeline.infer_author_from_samples_or_filename(
+            [{"page": 1, "text": "Different Views\nLATINO TERMINOLOGY\nAbstract\nText.\n"}],
+            Path("article.pdf"),
+            title_hint="Latino Terminology",
+        )
+        series = pipeline.infer_author_from_samples_or_filename(
+            [{
+                "page": 1,
+                "text": "NEGOTIATING LATINIDAD\nSeries Editors\nFrances R. Aparicio\nOmar Valerio-Jiménez\n",
+            }],
+            Path("book.pdf"),
+            title_hint="Negotiating Latinidad",
+        )
+        self.assertFalse(heading.get("author"))
+        self.assertNotIn(series.get("source"), pipeline.TRUSTED_AUTHOR_INFERENCE_SOURCES)
+
+    def test_series_editors_and_late_prose_do_not_override_document_author(self):
+        series = pipeline.infer_author_from_text_samples(
+            [{
+                "page": 1,
+                "text": (
+                    "INDIAN GIVEN\nSeries Editors\n"
+                    "Walter D. Mignolo, Duke University\n"
+                    "Irene Silverblatt, Duke University\n"
+                    "Sonia Saldívar-Hull, University of Texas\n"
+                ),
+            }],
+            title_hint="Indian Given",
+        )
+        prose = pipeline.infer_author_from_text_samples(
+            [{"page": 3, "text": "systems by racial assignment and categorization\nby Black Americans, I mean"}],
+            title_hint="The Problem with Latinx",
+        )
+        self.assertNotIn(series.get("source"), pipeline.TRUSTED_AUTHOR_INFERENCE_SOURCES)
+        self.assertNotIn(prose.get("source"), pipeline.TRUSTED_AUTHOR_INFERENCE_SOURCES)
+
+    def test_opening_affiliated_byline_collects_consecutive_authors(self):
+        inference = pipeline.infer_author_from_text_samples(
+            [{
+                "page": 1,
+                "text": (
+                    "Who Identifies as Latinx?\n"
+                    "G. Cristina Mora, University of California\n"
+                    "Reuben Perez, University of California\n"
+                    "Nicholas Vargas, University of Florida\n"
+                    "Abstract\nThis article examines ethnoracial labels.\n"
+                ),
+            }],
+            title_hint="Who Identifies as Latinx?",
+        )
+        self.assertEqual(
+            inference["author"],
+            "G. Cristina Mora, Reuben Perez, Nicholas Vargas",
+        )
+
+    def test_embedded_pdf_author_is_never_used_when_visible_and_filename_evidence_abstain(self):
+        inference = pipeline.infer_author_from_filename(
+            Path("MMT Keyword Essay GV2.pdf"),
+            title_hint="MMT Keyword Essay GV2",
+        )
+        resolved = pipeline.resolve_author_from_metadata_and_inference(
+            "Nathan Minderhoud", inference,
+        )
+        self.assertEqual(inference["author"], "")
+        self.assertEqual(resolved, {"author": "", "source": "not_available"})
+
     def test_weak_author_guesses_remain_review_evidence_not_durable_metadata(self):
         weak_text = pipeline.resolve_author_from_metadata_and_inference(
             "", {"author": "Siren Songs, Hearing Resilience", "source": "text_top_block_names"},
@@ -4893,7 +5214,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(weak_tail["source"], "not_available")
         self.assertEqual(corrected, {
             "author": "Elena Markham",
-            "source": "filename_leading_name_overrode_pdf_metadata",
+            "source": "filename_leading_name",
         })
 
     def test_grouped_source_progress_accumulates_across_pdf_local_queues(self):
@@ -5128,8 +5449,10 @@ class PipelineCoreTests(unittest.TestCase):
         receipt = app.automatic_completion_receipt([summary])
         message = app.automatic_completion_success_message([summary])
         self.assertEqual(receipt["visual_review_pages"], 1)
-        self.assertIn("need visual-text review", message)
-        self.assertIn("indexing was not blocked", message)
+        self.assertEqual(receipt["visual_review_reason_counts"]["no_text_recovered"], 1)
+        self.assertIn("Visual-text diagnostic", message)
+        self.assertIn("1 no-text", message)
+        self.assertIn("indexing continued", message)
 
     def test_workspace_batch_suggestion_bounds_identity_reads_and_marks_unread_tail(self):
         import rag_pdf_gradio_app as app
@@ -6399,6 +6722,17 @@ class PipelineCoreTests(unittest.TestCase):
             .55,
         )
         self.assertEqual(app.concurrent_ingestion_progress_fraction(.90, 20, 0), .9)
+        # Complete exact-vector proof is authoritative and may finish the
+        # ingestion lane even when a stale presentation ETA is still high.
+        self.assertEqual(
+            app.concurrent_ingestion_progress_fraction(
+                .95,
+                20,
+                4_000,
+                exact_evidence_complete=True,
+            ),
+            .95,
+        )
 
     def test_long_owned_preparation_can_use_elapsed_share_but_not_outrun_sources(self):
         import rag_pdf_gradio_app as app
@@ -10709,6 +11043,36 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(len(coverage["blank_pages"]), 0)
         self.assertEqual(len(coverage["visible_vector_low_text_pages"]), 1)
 
+    def test_native_coverage_reuses_the_historic_three_page_timing_sample(self):
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pdf = Path(tmpdir) / "profile.pdf"
+            document = fitz.open()
+            for index in range(7):
+                page = document.new_page()
+                page.insert_text((72, 72), (f"page {index} representative academic text " * (index + 1)))
+                if index in {0, 3, 6}:
+                    page.draw_rect(fitz.Rect(72, 100, 180, 150))
+            document.save(pdf)
+            document.close()
+
+            historic = app.automatic_timing_document_profile([pdf], page_sample_limit=3)
+            coverage = app.automatic_full_native_text_coverage(pdf)
+
+        reused = coverage["timing_profile"]
+        for key in (
+            "page_count", "sampled_pages", "sampled_text_chars", "sampled_images",
+            "sampled_drawings", "tableish_lines", "sampled_lines", "sampled_words",
+            "sparse_pages", "short_pages", "long_pages", "mean_chars_per_page",
+            "median_chars_per_page", "p90_chars_per_page", "page_text_variability",
+            "image_density", "drawing_density", "tableish_density", "sparse_fraction",
+            "short_fraction", "long_fraction", "text_density_bucket", "layout_bucket",
+            "ocr_risk_bucket", "line_density_bucket", "page_variability_bucket",
+            "file_size_bucket",
+        ):
+            self.assertEqual(reused[key], historic[key], key)
+
     def test_new_ordinary_picker_pdf_merges_into_existing_folder_batch(self):
         import rag_pdf_gradio_app as app
 
@@ -12938,6 +13302,40 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(plan["ocr_required_pages"], [])
         self.assertEqual(plan["uncertain_pages"], [2])
 
+    def test_verified_native_coverage_overrides_coarse_candidate_image_votes(self):
+        preflight = {"full_native_text_coverage": {
+            "status": "verified", "page_count": 2,
+            "image_backed_low_text_pages": [
+                {"page": 2, "native_text_characters": 156, "largest_image_area_ratio": .0113}
+            ],
+            "visible_vector_low_text_pages": [],
+        }}
+        candidates = [
+            {"page_stats": [{"pdf_page": 2, "words": 27, "image_count": 1}]},
+            {"page_stats": [{"pdf_page": 2, "words": 28, "image_count": 1}]},
+        ]
+
+        plan = pipeline.automatic_page_local_ocr_plan(preflight, candidates, 2)
+
+        self.assertEqual(plan["ocr_required_pages"], [])
+        self.assertEqual(plan["suppressed_candidate_vote_pages"], [2])
+        self.assertEqual(plan["candidate_vote_precedence"], "verified_all_page_native_coverage")
+
+    def test_candidate_image_votes_remain_fallback_without_verified_coverage(self):
+        candidates = [
+            {"page_stats": [{"pdf_page": 2, "words": 4, "image_count": 1}]},
+            {"page_stats": [{"pdf_page": 2, "words": 5, "image_count": 1}]},
+        ]
+
+        plan = pipeline.automatic_page_local_ocr_plan({}, candidates, 2)
+
+        self.assertEqual(plan["ocr_required_pages"], [2])
+        self.assertEqual(plan["suppressed_candidate_vote_pages"], [])
+        self.assertEqual(
+            plan["candidate_vote_precedence"],
+            "candidate_fallback_without_verified_coverage",
+        )
+
     def test_complete_native_text_candidate_suppresses_coverage_only_ocr_tiebreaker(self):
         candidates = [
             {
@@ -14744,6 +15142,24 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn("targeted_ocr_finished", activities)
         self.assertIn("native_layout_page_complete", activities)
 
+    def test_native_layout_progress_status_distinguishes_scan_apply_and_completion(self):
+        self.assertEqual(
+            pipeline.native_layout_progress_status(8, 20, "native_layout_scan"),
+            ("Scanning positioned page layout: 8/20 pages scanned", "native_layout_scan_progress"),
+        )
+        self.assertEqual(
+            pipeline.native_layout_progress_status(20, 20, "native_layout_scan"),
+            ("Positioned page-layout scan complete: 20/20 pages scanned", "native_layout_scan_complete"),
+        )
+        self.assertEqual(
+            pipeline.native_layout_progress_status(8, 20, "native_layout_page_complete"),
+            ("Applying native layout rules: 8/20 pages reviewed", "native_layout_rules_progress"),
+        )
+        self.assertEqual(
+            pipeline.native_layout_progress_status(20, 20, "native_layout_page_complete"),
+            ("Native layout rules applied: 20/20 pages complete", "native_layout_rules_complete"),
+        )
+
     def test_photographed_spread_reading_regions_keep_one_physical_page(self):
         rows = []
         for line_number in range(14):
@@ -16007,7 +16423,10 @@ class PipelineCoreTests(unittest.TestCase):
         )
         self.assertIn("Vladimir Karpukhin", report["author"])
         self.assertIn("Patrick Lewis", report["author"])
-        self.assertIn(report["source"], {"text_top_block_names", "text_title_adjacent_byline"})
+        self.assertIn(report["source"], {
+            "text_top_block_names", "text_title_adjacent_byline",
+            "text_opening_title_block_byline",
+        })
 
     def test_author_inference_finds_semicolon_and_middle_dot_names(self):
         report = pipeline.infer_author_from_text_samples(
@@ -16028,7 +16447,10 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn("Bob Jones", report["author"])
         self.assertIn("Carla Gomez", report["author"])
         self.assertIn("David Chen", report["author"])
-        self.assertIn(report["source"], {"text_top_block_names", "text_title_adjacent_byline"})
+        self.assertIn(report["source"], {
+            "text_top_block_names", "text_title_adjacent_byline",
+            "text_opening_title_block_byline",
+        })
 
     def test_author_inference_finds_adjacent_names_with_footnote_numbers(self):
         report = pipeline.infer_author_from_text_samples(
@@ -16066,7 +16488,10 @@ class PipelineCoreTests(unittest.TestCase):
         )
         self.assertIn("Jan van der Meer", report["author"])
         self.assertIn("Maria de la Cruz", report["author"])
-        self.assertIn(report["source"], {"text_top_block_names", "text_title_adjacent_byline"})
+        self.assertIn(report["source"], {
+            "text_top_block_names", "text_title_adjacent_byline",
+            "text_opening_title_block_byline",
+        })
 
     def test_author_inference_accepts_unicode_letter_names(self):
         self.assertTrue(
@@ -16192,7 +16617,10 @@ class PipelineCoreTests(unittest.TestCase):
             title_hint="Example Book: A Review of Public Ideas on Policy, Merit, and Community",
         )
         self.assertEqual(report["author"], "Sample Reviewer")
-        self.assertIn(report["source"], {"text_top_block_names", "text_role_followup", "text_title_adjacent_byline"})
+        self.assertIn(report["source"], {
+            "text_top_block_names", "text_role_followup", "text_title_adjacent_byline",
+            "text_opening_title_block_byline",
+        })
 
     def test_author_inference_reads_instructor_label(self):
         report = pipeline.infer_author_from_text_samples(
@@ -16228,6 +16656,28 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn("Alex Harper", report["author"])
         self.assertIn("Jordan Lee", report["author"])
         self.assertEqual(report["source"], "text_author_label")
+
+    def test_author_inference_reads_research_profile_author_count_followup(self):
+        report = pipeline.infer_author_from_text_samples(
+            [{
+                "page": 1,
+                "text": (
+                    "Cultural Homogenization, Ethnic Cleansing, and Genocide\n"
+                    "1 author:\n"
+                    "Daniele Conversi\n"
+                    "Ikerbasque Foundation Research Professor\n"
+                    "Euskal Herriko Unibertsitatea\n"
+                    "Introduction\n"
+                ),
+            }],
+            title_hint="Cultural Homogenization, Ethnic Cleansing, and Genocide",
+        )
+
+        self.assertEqual(report["author"], "Daniele Conversi")
+        self.assertIn(
+            report["source"],
+            {"text_role_followup", "text_opening_title_block_byline"},
+        )
 
     def test_author_inference_reads_catalog_author_and_does_not_reject_issn_surnames(self):
         report = pipeline.infer_author_from_text_samples(
@@ -16275,7 +16725,10 @@ class PipelineCoreTests(unittest.TestCase):
             title_hint="Example Book: An Example Title and Its Sample Subtitle",
         )
         self.assertEqual(report["author"], "Sample Author")
-        self.assertIn(report["source"], {"text_top_block_names", "text_title_adjacent_byline"})
+        self.assertIn(report["source"], {
+            "text_top_block_names", "text_title_adjacent_byline",
+            "text_opening_title_block_byline",
+        })
 
     def test_author_inference_recovers_all_caps_titlepage_name_above_plain_press_imprint(self):
         report = pipeline.infer_author_from_text_samples(
@@ -16346,6 +16799,139 @@ class PipelineCoreTests(unittest.TestCase):
             "Jacob Devlin, Ming-Wei Chang, Kenton Lee, Kristina Toutanova",
         )
         self.assertEqual(report["source"], "selected_extraction_text_adjacent_affiliated_byline")
+
+    def test_role_affiliation_sentence_does_not_promote_role_as_second_author(self):
+        report = pipeline.recover_author_from_selected_extraction(
+            [{
+                "page": 1,
+                "text": (
+                    "The Classical Hollywood Cinema\n"
+                    "Kristin Thompson is Honorary Fellow at the University of Wisconsin.\n"
+                ),
+            }],
+            title_hint="The Classical Hollywood Cinema",
+        )
+
+        self.assertEqual(report["author"], "Kristin Thompson")
+        self.assertNotIn("Fellow", report["author"])
+        self.assertEqual(report["source"], "selected_extraction_text_adjacent_affiliated_byline")
+
+    def test_explicit_title_page_byline_outranks_later_role_biography(self):
+        report = pipeline.recover_author_from_selected_extraction(
+            [{
+                "page": 1,
+                "text": (
+                    "THE CLASSICAL HOLLYWOOD CINEMA Film Style & Mode of Production to 1960 "
+                    "David Bordwell, Janet Staiger and Kristin Thompson London\n"
+                    "Kristin Thompson is Honorary Fellow at the University of Wisconsin.\n"
+                ),
+            }],
+            title_hint="The Classical Hollywood Cinema",
+        )
+
+        self.assertEqual(
+            report["author"],
+            "David Bordwell, Janet Staiger, Kristin Thompson",
+        )
+        self.assertEqual(
+            report["source"],
+            "selected_extraction_text_explicit_multi_author_byline",
+        )
+
+    def test_wrapped_title_uses_adjacent_filename_corroborated_author_not_late_bibliography(self):
+        report = pipeline.infer_author_from_text_samples(
+            [
+                {
+                    "page": 1,
+                    "text": (
+                        "Keywords: sexuality, race, gender, popular music, intersectionality, "
+                        "third-wave feminism, hip-hop, pop, rock, Riot Grrrl\n"
+                        "Subject: Musicology and Music History\n"
+                        "Series: Oxford Handbooks\n"
+                        "Collection: Oxford Handbooks Online\n"
+                        "Intersectionality in Third-Wave Popular Music: Sexuality,\n"
+                        "Race, and Class\n"
+                        "Elizabeth K. Keenan\n"
+                        "This essay traces popular music.\n"
+                    ),
+                },
+                {
+                    "page": 25,
+                    "text": (
+                        "Power Is Bad for Feminism, edited\n"
+                        "by Lisa Jervis and Andi Zeisler, New York: Farrar, Strauss, and Giroux.\n"
+                    ),
+                },
+            ],
+            title_hint="Keenan -Intersectionality in Third-Wave Popular Music - Sexuality, Race and Class",
+        )
+
+        self.assertEqual(report["author"], "Elizabeth K. Keenan")
+        self.assertEqual(report["source"], "text_title_window_adjacent_byline")
+
+    def test_late_bibliography_byline_is_not_durable_author_evidence(self):
+        report = pipeline.infer_author_from_text_samples(
+            [{
+                "page": 25,
+                "text": (
+                    "Power Is Bad for Feminism, edited\n"
+                    "by Lisa Jervis and Andi Zeisler, New York: Farrar, Strauss, and Giroux.\n"
+                ),
+            }],
+            title_hint="Intersectionality in Third-Wave Popular Music",
+        )
+
+        self.assertEqual(report["author"], "")
+
+    def test_journal_masthead_is_not_author_and_adjacent_caps_byline_overrides_stale_metadata(self):
+        report = pipeline.infer_author_from_text_samples(
+            [{
+                "page": 1,
+                "text": (
+                    "Film History, 28.3, pp. 114-138. Copyright 2016 Trustees of Indiana University.\n"
+                    "STEPHEN GROENING\n"
+                    "No One Likes to Be a Captive Audience:\n"
+                    "Headphones and In-Flight Cinema\n"
+                    "ABSTRACT: In-flight cinema emerged in the 1960s.\n"
+                ),
+            }],
+            title_hint="No One Likes to Be a Captive Audience",
+        )
+
+        self.assertEqual(report["author"], "STEPHEN GROENING")
+        self.assertEqual(report["source"], "text_title_window_adjacent_byline")
+        resolved = pipeline.resolve_author_from_metadata_and_inference(
+            "MacKey Composition",
+            report,
+        )
+        self.assertEqual(resolved["author"], "STEPHEN GROENING")
+        self.assertEqual(
+            resolved["source"],
+            "text_title_window_adjacent_byline",
+        )
+
+    def test_title_window_does_not_promote_nearby_subject_or_publication_phrases(self):
+        subject_report = pipeline.infer_author_from_text_samples(
+            [{
+                "page": 1,
+                "text": (
+                    "Keywords: sexuality, race, popular music, rock, Riot Grrrl\n"
+                    "Subject: Musicology and Music History\n"
+                    "Series: Oxford Handbooks\n"
+                    "Intersectionality in Third-Wave Popular Music: Sexuality, Race, and Class\n"
+                ),
+            }],
+            title_hint="Keenan -Intersectionality in Third-Wave Popular Music - Sexuality, Race and Class",
+        )
+        self.assertNotEqual(subject_report.get("author"), "Riot Grrrl rock")
+
+        self.assertEqual(
+            pipeline.infer_author_from_filename(
+                Path("Theory_Theatre - Ch.4 Reader Response and Reception Theory.pdf"),
+                title_hint="Theory_Theatre - Ch.4 Reader Response and Reception Theory",
+            )["author"],
+            "",
+        )
 
     def test_selected_ocr_author_recovery_rejects_weak_bare_title_block_name(self):
         report = pipeline.recover_author_from_selected_extraction(
@@ -17819,6 +18405,27 @@ class PipelineCoreTests(unittest.TestCase):
         )
         self.assertEqual(ledger["runtime_events"][0]["index"], 25)
 
+    def test_embedding_ledger_is_compact_without_changing_its_json_contract(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger_path = Path(temp_dir) / "embedding-batch-ledger.json"
+            pipeline._write_embedding_batch_ledger(
+                ledger_path,
+                "queue-workspace",
+                {
+                    "requested": 2,
+                    "accepted": 2,
+                    "batches": [{"batch": 1, "submission_state": "accepted"}],
+                    "runtime_events": [],
+                },
+            )
+            raw = ledger_path.read_text(encoding="utf-8")
+            ledger = json.loads(raw)
+
+        self.assertNotIn("\n", raw)
+        self.assertEqual(ledger["requested"], 2)
+        self.assertEqual(ledger["accepted"], 2)
+        self.assertEqual(ledger["recovery"]["state"], "not_needed")
+
     def test_embedding_recovery_keeps_each_remaining_source_key(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             ledger_path = Path(temp_dir) / "batch-embedding-ledger.json"
@@ -18598,6 +19205,7 @@ class PipelineCoreTests(unittest.TestCase):
         location = "custom-documents/source-atomic-staging-receipt.txt"
         post_started = threading.Event()
         status_messages = []
+        status_reports = []
 
         class FakeThread:
             def join(self, timeout=None):
@@ -18619,6 +19227,15 @@ class PipelineCoreTests(unittest.TestCase):
                         "filename": location,
                         "recordCount": 300,
                         "provider_batch_size": 36,
+                    })
+                    observer({
+                        "type": "source_staging_source_plan",
+                        "filename": location,
+                        "sourceKey": "probe.pdf",
+                        "recordCount": 72,
+                        "cacheResolvedRecordCount": 0,
+                        "providerRequiredRecordCount": 72,
+                        "providerChunkCount": 72,
                     })
                     observer({
                         "type": "source_staging_provider_batch",
@@ -18688,7 +19305,10 @@ class PipelineCoreTests(unittest.TestCase):
                 batch_verifier=lambda report: {
                     "status": "pass", "matching_vector_rows": len(report["locations"]),
                 },
-                status_callback=lambda message, _report: status_messages.append(str(message)),
+                status_callback=lambda message, report: (
+                    status_messages.append(str(message)),
+                    status_reports.append(dict(report or {})),
+                ),
             )
         finally:
             pipeline.start_json_post_response_tracker = original_tracker
@@ -18703,10 +19323,22 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(snapshot["source_atomic_provider_chunk_count"], 72)
         self.assertEqual(snapshot["source_atomic_provider_elapsed_ms"], 300)
         self.assertEqual(snapshot["source_atomic_provider_retry_count"], 1)
+        self.assertEqual(snapshot["source_atomic_planned_source_count"], 1)
+        self.assertEqual(snapshot["source_atomic_finished_source_count"], 1)
+        self.assertEqual(snapshot["source_atomic_planned_provider_chunk_count"], 72)
+        self.assertTrue(snapshot["source_atomic_provider_telemetry_complete"])
         self.assertEqual(snapshot["source_atomic_provider_last_retry"]["batch_index"], 0)
         self.assertEqual(snapshot["source_atomic_provider_last_retry"]["retry_delay_ms"], 250)
         self.assertFalse(any("unrecognized progress event" in message for message in status_messages))
         self.assertFalse(any("one page-parent record" in message for message in status_messages))
+        recovered = [
+            report for report in status_reports
+            if report.get("source_atomic_timing_recovered_from_terminal")
+        ]
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0]["source_atomic_batch_index"], 1)
+        self.assertEqual(recovered[0]["source_atomic_chunk_count"], 36)
+        self.assertEqual(recovered[0]["source_atomic_elapsed_ms"], 200)
         self.assertTrue(any(
             event.get("event") == "source_atomic_response_read_activity_lease"
             for event in result["runtime_events"]
@@ -23197,6 +23829,47 @@ class TimingAndInspectionSafetyTests(unittest.TestCase):
                     app.LIVE_AUTOMATIC_RUN_STATUS = original
 
         self.assertEqual(record["server_root_pid"], 4321)
+
+    def test_successful_diagnostic_uses_diagnostic_not_error_dimensions(self):
+        import rag_pdf_gradio_app as app
+
+        original = app.LIVE_AUTOMATIC_RUN_STATUS
+        completion = app.automatic_completion([{
+            "api_upload_status": "complete",
+            "post_upload_verification_status": "pass",
+            "anythingllm_runtime_validation_status": "deferred_after_exact_vector_proof",
+        }], True)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            try:
+                app.LIVE_AUTOMATIC_RUN_STATUS = {}
+                record = app.update_live_automatic_run_status(
+                    tmpdir,
+                    state="successful",
+                    phase="Document(s) ready in AnythingLLM",
+                    expected_seconds=60,
+                    confirmed_fraction=1.0,
+                    error_stage=completion.get("error_stage", ""),
+                    error_outcome=completion.get("error_outcome", ""),
+                    error_scope=completion.get("error_scope", ""),
+                    error_category=completion.get("error_category", ""),
+                    diagnostic_code=completion.get("diagnostic_code"),
+                    diagnostic_stage=completion.get("diagnostic_stage"),
+                    diagnostic_outcome=completion.get("diagnostic_outcome"),
+                    diagnostic_scope=completion.get("diagnostic_scope"),
+                    diagnostic_category=completion.get("diagnostic_category"),
+                )
+            finally:
+                app.LIVE_AUTOMATIC_RUN_STATUS = original
+
+        self.assertEqual(record["error_stage"], "")
+        self.assertEqual(record["error_category"], "")
+        self.assertEqual(record["error_dimensions_schema"], "")
+        self.assertEqual(record["diagnostic_code"], "AUTO-RETRIEVAL-DEFERRED-001")
+        self.assertEqual(record["diagnostic_stage"], "optional_runtime_validation")
+        self.assertEqual(
+            record["diagnostic_dimensions_schema"],
+            "anythingllm_pdf_diagnostic_dimensions_v1",
+        )
 
     def test_confirmed_retrieval_boundary_is_not_hidden_by_visual_smoothing(self):
         import rag_pdf_gradio_app as app

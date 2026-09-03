@@ -5260,7 +5260,6 @@ _WORKSPACE_AUTHOR_STOP_WORDS = {
 # pipeline may retain a weak opening-page name for review, but a title-shaped
 # line must never silently become a surname in a workspace suggestion.
 _WORKSPACE_PERSON_EVIDENCE_SOURCES = frozenset({
-    "pdf_metadata",
     "text_byline",
     "text_written_by",
     "text_edited_by",
@@ -5276,9 +5275,12 @@ _WORKSPACE_PERSON_EVIDENCE_SOURCES = frozenset({
     "text_bibliographic_byline",
     "text_compact_caps_byline",
     "text_title_adjacent_byline",
+    "text_title_window_adjacent_byline",
     "text_titlepage_publisher_byline",
     "text_first_lines_stacked_byline",
     "text_role_followup",
+    "text_visible_title_person_prefix",
+    "text_opening_title_block_byline",
     "filename_explicit_byline",
     "filename_leading_name",
     "filename_leading_names",
@@ -5290,21 +5292,6 @@ _WORKSPACE_PERSON_EVIDENCE_SOURCES = frozenset({
     "filename_name_before_section_label",
     "filename_surname_before_year",
     "filename_surname_before_section_number",
-    "filename_leading_name_overrode_pdf_metadata",
-    "filename_leading_names_overrode_pdf_metadata",
-    "filename_leading_surname_overrode_pdf_metadata",
-    "filename_leading_name_before_section_overrode_pdf_metadata",
-    "filename_corroborated_text_name_overrode_pdf_metadata",
-    "filename_leading_surnames_overrode_pdf_metadata",
-    "filename_compact_name_before_year_overrode_pdf_metadata",
-    "filename_name_before_section_label_overrode_pdf_metadata",
-    "filename_surname_before_year_overrode_pdf_metadata",
-    "filename_surname_before_section_number_overrode_pdf_metadata",
-    "text_byline_overrode_pdf_metadata",
-    "text_written_by_overrode_pdf_metadata",
-    "text_author_label_overrode_pdf_metadata",
-    "text_writer_label_overrode_pdf_metadata",
-    "text_bibliographic_author_label_overrode_pdf_metadata",
 })
 WORKSPACE_UNKNOWN_SOURCE_LABEL = "Unknown"
 _WORKSPACE_INSTITUTIONAL_SUFFIXES = (
@@ -5360,9 +5347,8 @@ def workspace_institutional_identity_from_text_samples(samples):
         organization = ""
     # Copyright establishes ownership, not authorship.  A membership body or
     # agency may genuinely issue its own report, but a publishing imprint is
-    # ordinarily only the rights holder for someone else's work. Keep Press/
-    # Publisher available for explicit embedded author metadata above, while
-    # refusing to turn a footer copyright into a workspace source identity.
+    # ordinarily only the rights holder for someone else's work. Refuse to
+    # turn a footer copyright into a workspace source identity.
     if re.search(r"\b(?:press|publishers?)$", organization, flags=re.I):
         organization = ""
     if organization:
@@ -5450,15 +5436,6 @@ def workspace_institutional_identity_from_pdf(pdf_file, *, native_metadata=None)
             if isinstance(native_metadata, dict)
             else pdf_metadata(path, include_author_samples=True)
         )
-        metadata_organization = workspace_institutional_name_from_value(metadata.get("author") or "")
-        if metadata_organization:
-            return {
-                "label": metadata_organization,
-                "kind": "institution",
-                "provenance": "embedded PDF organization metadata",
-                "evidence": metadata_organization,
-                "confidence": "high",
-            }
         return workspace_institutional_identity_from_text_samples(
             metadata.get("_author_text_samples") or []
         )
@@ -5505,19 +5482,6 @@ def workspace_person_identity_from_pdf(pdf_file, *, native_metadata=None):
             metadata = None
             author_report = infer_author_from_initial_pdf_pages(path, page_limit=3)
         author = str(author_report.get("author") or "").strip()
-        # A visible affiliated byline (for example, a foreword contributor)
-        # may correctly override PDF metadata during full document metadata
-        # extraction. A workspace batch mnemonic instead needs the document's
-        # catalog author. Restrict this tie-break to that explicit conflict;
-        # ordinary text/metadata recognition continues to use the shared
-        # pipeline result unchanged.
-        if str(author_report.get("source") or "") == "text_affiliated_byline_overrode_pdf_metadata":
-            metadata_author = normalize_metadata_author(
-                (metadata or pdf_metadata(path)).get("author") or ""
-            )
-            if metadata_author:
-                author = metadata_author
-                author_report = {**author_report, "source": "pdf_metadata"}
     except Exception:
         return {}
     source = str(author_report.get("source") or "")
@@ -5526,8 +5490,8 @@ def workspace_person_identity_from_pdf(pdf_file, *, native_metadata=None):
     # useful evidence for a human, but it is not adequate to name a workspace.
     # In particular, a two-word title fragment can look person-shaped once the
     # PDF's title metadata is missing or unrelated. Require an explicit credit,
-    # verified PDF author metadata, or a structurally constrained title-page
-    # form before deriving a compact surname. This is evidence-based rather
+    # or a structurally constrained title-page form before deriving a compact
+    # surname. This is evidence-based rather
     # than a blacklist of incidental words such as "Bold" or "Edition".
     if source not in _WORKSPACE_PERSON_EVIDENCE_SOURCES:
         return {}
@@ -5542,13 +5506,9 @@ def workspace_person_identity_from_pdf(pdf_file, *, native_metadata=None):
     # ``Edition``, or similar title/publisher remnant from becoming a label.
     single_catalog_surname = source in {
         "filename_leading_surname",
-        "filename_leading_surname_overrode_pdf_metadata",
         "filename_leading_surnames",
-        "filename_leading_surnames_overrode_pdf_metadata",
         "filename_surname_before_year",
-        "filename_surname_before_year_overrode_pdf_metadata",
         "filename_surname_before_section_number",
-        "filename_surname_before_section_number_overrode_pdf_metadata",
     }
     person_author = (
         normalize_text(first_author)
@@ -5565,9 +5525,7 @@ def workspace_person_identity_from_pdf(pdf_file, *, native_metadata=None):
     if result.isupper():
         result = result.capitalize()
     label = result[:1].upper() + result[1:]
-    if source == "pdf_metadata":
-        provenance = "embedded PDF author metadata"
-    elif source.startswith("filename_"):
+    if source.startswith("filename_"):
         provenance = "explicit leading filename author convention"
     elif source == "not_available":
         return {}
@@ -5578,7 +5536,7 @@ def workspace_person_identity_from_pdf(pdf_file, *, native_metadata=None):
         "kind": "person",
         "provenance": provenance,
         "evidence": first_author,
-        "confidence": "high" if source == "pdf_metadata" else "moderate",
+        "confidence": "moderate",
     }
 
 
@@ -10726,37 +10684,42 @@ def iter_pdf_picker_page_details(paths=None):
     """
     details = {}
     coverage_by_key = {}
+    page_total = 0
+    ocr_total = 0
     paths = clean_downloadable_paths(paths or [])
     total = len(paths)
     for completed, raw_path in enumerate(paths, start=1):
         path = Path(raw_path)
         try:
             inspection = pdf_picker_native_inspection(path)
-            details[str(path)] = dict(inspection["detail"])
+            detail = dict(inspection["detail"])
+            details[str(path)] = detail
             coverage_by_key[pdf_picker_native_inspection_key(path)] = inspection["coverage"]
+            try:
+                page_total += max(0, int(detail.get("pages") or 0))
+            except (TypeError, ValueError):
+                pass
+            try:
+                ocr_total += max(0, int(detail.get("ocr_pages") or 0))
+            except (TypeError, ValueError):
+                pass
         except Exception as exc:
             APP_LOGGER.info("PDF picker page inspection skipped for %s: %s", path, exc)
             details[str(path)] = {"pages": "?", "ocr_pages": "?"}
-        page_total = sum(
-            max(0, int(detail.get("pages") or 0))
-            for detail in details.values()
-            if str(detail.get("pages") or "").isdigit()
-        )
-        ocr_total = sum(
-            max(0, int(detail.get("ocr_pages") or 0))
-            for detail in details.values()
-            if str(detail.get("ocr_pages") or "").isdigit()
-        )
         yield {
             "completed": completed,
             "total": total,
             "pages": page_total,
             "likely_ocr_pages": ocr_total,
-            "details": dict(details),
+            # These mappings remain owned by this generator until its next
+            # iteration. Consumers only need to snapshot them at the final
+            # boundary; copying both growing dictionaries for every PDF made
+            # large folder previews quadratic in the number of sources.
+            "details": details,
             # This value stays server-side while the folder scan streams. The
             # final callback stores it in the short-lived version-keyed
             # snapshot; it is never rendered as browser-visible PDF content.
-            "coverage_by_key": dict(coverage_by_key),
+            "coverage_by_key": coverage_by_key,
         }
 
 
@@ -10772,8 +10735,8 @@ def pdf_picker_page_details(paths=None, *, retain_for_batch=False):
     details = {}
     coverage_by_key = {}
     for progress in iter_pdf_picker_page_details(paths):
-        details = dict(progress.get("details") or {})
-        coverage_by_key = dict(progress.get("coverage_by_key") or {})
+        details = progress.get("details") or {}
+        coverage_by_key = progress.get("coverage_by_key") or {}
     if retain_for_batch:
         retain_batch_native_inspection(coverage_by_key)
     return details
@@ -11094,8 +11057,11 @@ def stream_selected_pdf_directory(path_text="", scan_requested=False):
         if automatic_lifecycle_busy():
             yield tuple(gr.update() for _ in range(7))
             return
-        page_details = dict(preview_progress.get("details") or {})
-        coverage_by_key = dict(preview_progress.get("coverage_by_key") or {})
+        # The generator owns these dictionaries until the next iteration.
+        # Keep references during the scan and copy only once into the final
+        # manifest/snapshot below.
+        page_details = preview_progress.get("details") or {}
+        coverage_by_key = preview_progress.get("coverage_by_key") or {}
         completed_preview_files = int(preview_progress.get("completed") or 0)
         total_preview_files = int(preview_progress.get("total") or 0)
         if (
@@ -11112,7 +11078,7 @@ def stream_selected_pdf_directory(path_text="", scan_requested=False):
             gr.update(visible=False),
             gr.update(value="Inspecting PDF pages…", interactive=False),
         )
-    manifest["picker_page_details"] = page_details
+    manifest["picker_page_details"] = dict(page_details)
     retain_batch_native_inspection(coverage_by_key)
     manifest["schema_version"] = 1
     APP_LOGGER.info(
@@ -12782,6 +12748,7 @@ def concurrent_ingestion_progress_fraction(
     expected_seconds,
     *,
     presentation_expected_seconds=None,
+    exact_evidence_complete=False,
 ):
     """Combine owned queue/vector evidence with the current elapsed/ETA pair.
 
@@ -12792,6 +12759,13 @@ def concurrent_ingestion_progress_fraction(
     concurrent interval rather than two additive phases.
     """
     evidence = min(.95, max(0.0, float(evidence_fraction or 0.0)))
+    # Exact identity proof is stronger than the presentation clock.  Once the
+    # current queue group has proved every requested vector, allow it to reach
+    # the end of the ingestion lane; the real retrieval/reporting tail still
+    # owns the remaining progress range. Partial queue evidence remains paced
+    # by ETA exactly as before.
+    if exact_evidence_complete:
+        return evidence
     expected = max(0.0, float(expected_seconds or 0.0))
     if expected <= 0.0:
         return evidence
@@ -13025,6 +12999,11 @@ def update_live_automatic_run_status(
     error_outcome=None,
     error_scope=None,
     error_category=None,
+    diagnostic_code=None,
+    diagnostic_stage=None,
+    diagnostic_outcome=None,
+    diagnostic_scope=None,
+    diagnostic_category=None,
     queue_forecast_expected_seconds=None,
     cache_reuse_records=None,
     cache_reuse_documents=None,
@@ -13319,8 +13298,66 @@ def update_live_automatic_run_status(
         "error_category": str(error_category if error_category is not None else previous.get("error_category") or ""),
         "error_dimensions_schema": (
             "anythingllm_pdf_error_dimensions_v1"
-            if any(value is not None for value in (error_stage, error_outcome, error_scope, error_category))
+            if any(
+                str(value or "").strip()
+                for value in (error_stage, error_outcome, error_scope, error_category)
+            )
+            else ""
+            if any(
+                value is not None
+                for value in (error_stage, error_outcome, error_scope, error_category)
+            )
             else str(previous.get("error_dimensions_schema") or "")
+        ),
+        "diagnostic_code": str(
+            diagnostic_code
+            if diagnostic_code is not None
+            else previous.get("diagnostic_code") or ""
+        ),
+        "diagnostic_stage": str(
+            diagnostic_stage
+            if diagnostic_stage is not None
+            else previous.get("diagnostic_stage") or ""
+        ),
+        "diagnostic_outcome": str(
+            diagnostic_outcome
+            if diagnostic_outcome is not None
+            else previous.get("diagnostic_outcome") or ""
+        ),
+        "diagnostic_scope": str(
+            diagnostic_scope
+            if diagnostic_scope is not None
+            else previous.get("diagnostic_scope") or ""
+        ),
+        "diagnostic_category": str(
+            diagnostic_category
+            if diagnostic_category is not None
+            else previous.get("diagnostic_category") or ""
+        ),
+        "diagnostic_dimensions_schema": (
+            "anythingllm_pdf_diagnostic_dimensions_v1"
+            if any(
+                str(value or "").strip()
+                for value in (
+                    diagnostic_code,
+                    diagnostic_stage,
+                    diagnostic_outcome,
+                    diagnostic_scope,
+                    diagnostic_category,
+                )
+            )
+            else ""
+            if any(
+                value is not None
+                for value in (
+                    diagnostic_code,
+                    diagnostic_stage,
+                    diagnostic_outcome,
+                    diagnostic_scope,
+                    diagnostic_category,
+                )
+            )
+            else str(previous.get("diagnostic_dimensions_schema") or "")
         ),
         "not_processed_pdf_count": (
             max(0, int(not_processed_pdf_count))
@@ -13459,7 +13496,7 @@ def update_live_automatic_run_status(
         )
         if lifecycle_changed or terminal_snapshot or due_for_snapshot:
             try:
-                _write_automatic_run_json(status_path, record)
+                _write_automatic_run_json(status_path, record, compact=True)
                 if terminal_snapshot:
                     AUTOMATIC_RUN_PROGRESS_SNAPSHOT_STATE.pop(snapshot_key, None)
                 else:
@@ -14003,6 +14040,14 @@ def automatic_completion_from_durable_record(record):
         "error_scope": str(record.get("error_scope") or ""),
         "error_category": str(record.get("error_category") or ""),
         "error_dimensions_schema": str(record.get("error_dimensions_schema") or ""),
+        "diagnostic_code": str(record.get("diagnostic_code") or ""),
+        "diagnostic_stage": str(record.get("diagnostic_stage") or ""),
+        "diagnostic_outcome": str(record.get("diagnostic_outcome") or ""),
+        "diagnostic_scope": str(record.get("diagnostic_scope") or ""),
+        "diagnostic_category": str(record.get("diagnostic_category") or ""),
+        "diagnostic_dimensions_schema": str(
+            record.get("diagnostic_dimensions_schema") or ""
+        ),
     }
 
 
@@ -14689,7 +14734,7 @@ def automatic_run_cancellation_requested(run_root):
     )
 
 
-def _write_automatic_run_json(path, payload):
+def _write_automatic_run_json(path, payload, *, compact=False):
     """Atomically persist small control records used across concurrent callbacks."""
     target = Path(path)
     # Windows can reject simultaneous replacements of the same destination,
@@ -14702,7 +14747,11 @@ def _write_automatic_run_json(path, payload):
         # artifacts. Antivirus/indexing briefly holds Windows files open in
         # practice; failing one progress write must not make a running job
         # appear permanently stalled after a server refresh.
-        atomic_write_text(target, json.dumps(payload, ensure_ascii=False, indent=2))
+        if compact:
+            content = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        else:
+            content = json.dumps(payload, ensure_ascii=False, indent=2)
+        atomic_write_text(target, content)
 
 
 ETA_CHECKPOINT_NUMBER_FIELDS = (
@@ -14786,7 +14835,7 @@ def update_eta_checkpoint_record(
         if reason:
             record["recalculation_reasons"].append(reason)
         try:
-            _write_automatic_run_json(path, record)
+            _write_automatic_run_json(path, record, compact=True)
         except OSError as exc:
             APP_LOGGER.warning("could not persist compact ETA checkpoints: %s", exc)
         return record
@@ -15497,7 +15546,13 @@ def automatic_success_worker_artifact_cleanup_report(output_dir, summary):
     output = Path(output_dir)
     removed = []
     pending = []
-    for name in AUTOMATIC_WORKER_TRANSPORT_ARTIFACTS:
+    post_exit_artifacts = (
+        *AUTOMATIC_WORKER_TRANSPORT_ARTIFACTS,
+        "run-checkpoint.json",
+        "run-checkpoints.jsonl",
+        "run-result.json",
+    )
+    for name in post_exit_artifacts:
         candidate = output / name
         try:
             candidate.unlink(missing_ok=True)
@@ -16904,13 +16959,39 @@ def automatic_full_native_text_coverage(path):
         "blank_pages": [],
         "sparse_native_text_pages": [],
         "visible_vector_low_text_pages": [],
+        "timing_profile": {},
     }
     try:
         with fitz.open(pdf_path) as document:
             result["page_count"] = int(document.page_count or 0)
+            # Confirmation historically samples three representative pages.
+            # Capture those same observations during the all-page picker pass
+            # so reuse changes only compute, never OCR classification.
+            sample_count = min(3, result["page_count"])
+            sample_indexes = {
+                round(index * (result["page_count"] - 1) / max(1, sample_count - 1))
+                for index in range(sample_count)
+            }
+            timing_rows = []
             for index in range(result["page_count"]):
                 page = document.load_page(index)
-                text_characters = len((page.get_text("text") or "").strip())
+                native_text = page.get_text("text") or ""
+                text_characters = len(native_text.strip())
+                sampled_image_records = None
+                if index in sample_indexes:
+                    sampled_image_records = page.get_images(full=True)
+                    lines = [line for line in native_text.splitlines() if line.strip()]
+                    timing_rows.append({
+                        "text_characters": text_characters,
+                        "line_count": len(lines),
+                        "word_count": len(re.findall(r"\S+", native_text)),
+                        "image_count": len(sampled_image_records),
+                        "drawing_count": len(page.get_drawings()),
+                        "tableish_lines": sum(
+                            1 for line in native_text.splitlines()
+                            if "|" in line or re.search(r"\S\s{3,}\S", line)
+                        ),
+                    })
                 if text_characters < 160:
                     # A full image-resource walk is expensive on a long
                     # text-first PDF and does not influence its OCR decision:
@@ -16919,7 +17000,7 @@ def automatic_full_native_text_coverage(path):
                     # preserves every low-text/OCR decision while avoiding
                     # thousands of unused nested-resource traversals during a
                     # large-folder preview.
-                    image_records = page.get_images(full=True)
+                    image_records = sampled_image_records or page.get_images(full=True)
                     image_count = len(image_records)
                     # The precise image footprint is evidence only for a
                     # low-text page. Computing image rectangles on every
@@ -16986,6 +17067,75 @@ def automatic_full_native_text_coverage(path):
                         # have little native text without being scans. They
                         # are an observation, not a whole-document OCR trigger.
                         result["sparse_native_text_pages"].append(row)
+            sampled = max(1, len(timing_rows))
+            char_counts = [row["text_characters"] for row in timing_rows]
+            mean_chars = sum(char_counts) / sampled
+            mean_lines = sum(row["line_count"] for row in timing_rows) / sampled
+            mean_words = sum(row["word_count"] for row in timing_rows) / sampled
+            image_density = sum(row["image_count"] for row in timing_rows) / sampled
+            drawing_density = sum(row["drawing_count"] for row in timing_rows) / sampled
+            sparse_fraction = sum(row["text_characters"] < 180 for row in timing_rows) / sampled
+            result["timing_profile"] = {
+                "documents": 1,
+                "profiled_documents": 1,
+                "page_count": result["page_count"],
+                "document_page_counts": [result["page_count"]],
+                "file_bytes": pdf_path.stat().st_size,
+                "sampled_pages": len(timing_rows),
+                "sampled_text_chars": sum(char_counts),
+                "sampled_images": sum(row["image_count"] for row in timing_rows),
+                "sampled_drawings": sum(row["drawing_count"] for row in timing_rows),
+                "tableish_lines": sum(row["tableish_lines"] for row in timing_rows),
+                "sampled_lines": sum(row["line_count"] for row in timing_rows),
+                "sampled_words": sum(row["word_count"] for row in timing_rows),
+                "sparse_pages": sum(row["text_characters"] < 180 for row in timing_rows),
+                "short_pages": sum(row["text_characters"] < 600 for row in timing_rows),
+                "long_pages": sum(row["text_characters"] > 3000 for row in timing_rows),
+                "missing_inputs": 0,
+                "unreadable_inputs": 0,
+                "profile_sampling_ratio": 1.0,
+                "mean_chars_per_page": round(mean_chars, 1),
+                "mean_lines_per_page": round(mean_lines, 1),
+                "mean_words_per_page": round(mean_words, 1),
+                "median_chars_per_page": round(statistics.median(char_counts), 1) if char_counts else 0.0,
+                "p90_chars_per_page": round(_timing_percentile(char_counts, .90) or 0.0, 1),
+                "page_text_variability": round(
+                    statistics.pstdev(char_counts) / max(1.0, mean_chars), 3
+                ) if len(char_counts) > 1 else 0.0,
+                "bytes_per_page": round(pdf_path.stat().st_size / max(1, result["page_count"]), 1),
+                "image_density": round(image_density, 3),
+                "drawing_density": round(drawing_density, 3),
+                "tableish_density": round(
+                    sum(row["tableish_lines"] for row in timing_rows) / sampled, 3
+                ),
+                "sparse_fraction": round(sparse_fraction, 3),
+                "short_fraction": round(sum(row["text_characters"] < 600 for row in timing_rows) / sampled, 3),
+                "long_fraction": round(sum(row["text_characters"] > 3000 for row in timing_rows) / sampled, 3),
+                "text_density_bucket": _bucket(mean_chars, 650, 2400),
+                "layout_bucket": (
+                    "image_or_table_heavy"
+                    if image_density >= .5
+                    or sum(row["tableish_lines"] for row in timing_rows) / sampled >= 3.0
+                    or drawing_density >= 15
+                    else "text_first"
+                ),
+                "ocr_risk_bucket": (
+                    "high" if sparse_fraction >= .45 and image_density >= .25
+                    else "possible" if sparse_fraction >= .25
+                    else "low"
+                ),
+                "line_density_bucket": _bucket(mean_lines, 18, 52),
+                "page_variability_bucket": _bucket(
+                    statistics.pstdev(char_counts) / max(1.0, mean_chars) if len(char_counts) > 1 else 0.0,
+                    .35, .85,
+                    low_label="consistent", middle_label="mixed", high_label="variable",
+                ),
+                "file_size_bucket": _bucket(
+                    pdf_path.stat().st_size / max(1, result["page_count"]),
+                    80_000, 800_000,
+                    low_label="light", middle_label="medium", high_label="heavy",
+                ),
+            }
     except Exception as exc:
         result.update({
             "status": "error",
@@ -17042,15 +17192,7 @@ def automatic_ocr_preflight_manifest(
         except OSError:
             source_version = {}
         publish("identity_checked", source_index, path)
-        profile = automatic_timing_document_profile([path], page_sample_limit=3)
-        risk = automatic_ocr_preflight_risk(profile)
-        page_count = max(0, int(profile.get("page_count") or 0))
-        publish(
-            "profile_complete", source_index, path,
-            page_count=page_count,
-            sampled_pages=max(0, int(profile.get("sampled_pages") or 0)),
-        )
-        publish("coverage_started", source_index, path, page_count=page_count)
+        page_count = 0
         coverage_origin = "checked"
         try:
             # A large folder preview already read every physical page. Its
@@ -17065,6 +17207,18 @@ def automatic_ocr_preflight_manifest(
         except Exception:
             coverage = automatic_full_native_text_coverage(path)
             coverage_origin = "fallback_check"
+        profile = dict(coverage.get("timing_profile") or {})
+        if not profile:
+            profile = automatic_timing_document_profile([path], page_sample_limit=3)
+        risk = automatic_ocr_preflight_risk(profile)
+        page_count = max(0, int(profile.get("page_count") or coverage.get("page_count") or 0))
+        publish(
+            "profile_complete", source_index, path,
+            page_count=page_count,
+            sampled_pages=max(0, int(profile.get("sampled_pages") or 0)),
+            profile_origin="native_coverage_cache" if coverage.get("timing_profile") else "fallback_profile",
+        )
+        publish("coverage_started", source_index, path, page_count=page_count)
         publish(
             "coverage_complete", source_index, path,
             page_count=max(0, int(coverage.get("page_count") or page_count)),
@@ -19516,6 +19670,8 @@ def confirmed_prequeue_cache_eta_seconds(
     remaining_source_windows=0,
     cached_source_windows=None,
     cache_attachment_prior=None,
+    fresh_provider_batch_size=1,
+    fresh_source_windows=0,
 ):
     """Reprice only the unstarted Desktop queue after exact cache evidence.
 
@@ -19537,6 +19693,8 @@ def confirmed_prequeue_cache_eta_seconds(
     elapsed = max(0.0, float(elapsed_seconds or 0.0))
     fresh = max(0, int(fresh_provider_requests or 0))
     request_seconds = max(1.0, float(provider_request_seconds or 0.0))
+    provider_batch_size = max(1, int(fresh_provider_batch_size or 1))
+    fresh_windows = max(0, int(fresh_source_windows or 0))
     cached = max(0, int(cached_attachment_records or 0))
     source_windows = max(0, int(remaining_source_windows or 0))
     if cached_source_windows is not None:
@@ -19569,7 +19727,22 @@ def confirmed_prequeue_cache_eta_seconds(
         + cached * cached_record_seconds
         + source_windows * cached_source_seconds
     )
-    candidate = elapsed + fresh * request_seconds + remaining_tail
+    if provider_batch_size > 1 and fresh:
+        # The fingerprint-gated v1.16.1 worker embeds serial provider batches,
+        # not one request per page-parent. Preserve source atomicity by adding
+        # one possible partial batch for every later fresh source boundary.
+        # The modest per-record and per-source allowances cover Desktop commit
+        # and handoff work which is outside the provider HTTP duration.
+        provider_batches = math.ceil(fresh / provider_batch_size) + max(0, fresh_windows - 1)
+        provider_batch_seconds = max(5.0, request_seconds)
+        fresh_queue_seconds = (
+            provider_batches * provider_batch_seconds
+            + fresh * TIMING_MODEL_CACHE_TAIL_RECORD_SECONDS_FLOOR
+            + fresh_windows * 12.0
+        )
+    else:
+        fresh_queue_seconds = fresh * request_seconds
+    candidate = elapsed + fresh_queue_seconds + remaining_tail
     return int(math.ceil(min(current, max(elapsed + 8.0, candidate))))
 
 
@@ -19825,6 +19998,7 @@ def confirmed_batch_execution_plan_eta_seconds(
     source_total,
     cached_documents,
     cache_attachment_prior=None,
+    fresh_provider_batch_size=1,
 ):
     """Price the unstarted work only after the full batch plan is exact.
 
@@ -19844,6 +20018,8 @@ def confirmed_batch_execution_plan_eta_seconds(
         remaining_source_windows=source_total,
         cached_source_windows=cached_documents,
         cache_attachment_prior=cache_attachment_prior,
+        fresh_provider_batch_size=fresh_provider_batch_size,
+        fresh_source_windows=max(0, int(source_total or 0) - int(cached_documents or 0)),
     )
     cached = max(0, int(cached_attachment_records or 0))
     fresh = max(0, int(fresh_provider_requests or 0))
@@ -21488,6 +21664,11 @@ def automatic_completion_receipt(summaries):
         for summary in rows
     )
     visual_review_rows = []
+    visual_review_reason_counts = {
+        "no_text_recovered": 0,
+        "low_signal_ocr_fragments": 0,
+        "other": 0,
+    }
     for summary in rows:
         review = summary.get("visual_text_review")
         if not isinstance(review, dict):
@@ -21507,6 +21688,18 @@ def automatic_completion_receipt(summaries):
                 continue
             if number > 0 and number not in pages:
                 pages.append(number)
+                reason = (
+                    str(page.get("reason") or "").strip().casefold()
+                    if isinstance(page, dict) else ""
+                )
+                if reason in visual_review_reason_counts:
+                    visual_review_reason_counts[reason] += 1
+                else:
+                    visual_review_reason_counts["other"] += 1
+        # Older retained summaries may have only the unresolved count. Keep
+        # that evidence visible without pretending a missing reason was a
+        # substantive OCR failure.
+        visual_review_reason_counts["other"] += max(0, unresolved - len(pages))
         visual_review_rows.append({
             "pdf": Path(str(summary.get("pdf") or "document")).name,
             "unresolved_pages": unresolved,
@@ -21527,6 +21720,7 @@ def automatic_completion_receipt(summaries):
         "visual_review_pdfs": len(visual_review_rows),
         "visual_review_pages": sum(row["unresolved_pages"] for row in visual_review_rows),
         "visual_review": visual_review_rows,
+        "visual_review_reason_counts": visual_review_reason_counts,
     }
 
 
@@ -21538,12 +21732,15 @@ def automatic_extraction_method_summary(summaries):
     plus the exact page count where Automatic performed page-local OCR.
     """
     counts = {
-        "native": 0,
-        "layout": 0,
-        "targeted_ocr": 0,
+        "pymupdf_backend": 0,
+        "layout_backend": 0,
+        "unstructured_backend": 0,
+        "selected_output_ocr_pdfs": 0,
+        "comparison_only_ocr_pdfs": 0,
         "targeted_pages": 0,
-        "full_ocr": 0,
         "ocr_processing_seconds": 0.0,
+        "selected_output_ocr_processing_seconds": 0.0,
+        "comparison_ocr_processing_seconds": 0.0,
         "ocr_cache_reused_pages": 0,
     }
     for summary in (summaries or []):
@@ -21551,10 +21748,23 @@ def automatic_extraction_method_summary(summaries):
             continue
         backend = str(summary.get("selected_backend") or "").casefold()
         ocr_used = bool(summary.get("ocr_assisted_extraction_used"))
+        selected_ocr_seconds = 0.0
+        comparison_ocr_seconds = 0.0
         try:
             counts["ocr_processing_seconds"] += max(
                 0.0, float(summary.get("ocr_processing_seconds") or 0.0)
             )
+        except (TypeError, ValueError):
+            pass
+        try:
+            selected_ocr_seconds = max(
+                0.0, float(summary.get("selected_output_ocr_processing_seconds") or 0.0)
+            )
+            comparison_ocr_seconds = max(
+                0.0, float(summary.get("comparison_ocr_processing_seconds") or 0.0)
+            )
+            counts["selected_output_ocr_processing_seconds"] += selected_ocr_seconds
+            counts["comparison_ocr_processing_seconds"] += comparison_ocr_seconds
         except (TypeError, ValueError):
             pass
         try:
@@ -21568,41 +21778,56 @@ def automatic_extraction_method_summary(summaries):
             for page in (summary.get("automatic_targeted_ocr_pages") or [])
             if str(page).strip().isdigit() and int(page) > 0
         }
-        if ocr_used:
-            if target_pages:
-                counts["targeted_ocr"] += 1
-                counts["targeted_pages"] += len(target_pages)
-            else:
-                counts["full_ocr"] += 1
-        elif backend == "pymupdf":
-            counts["native"] += 1
+        if backend == "pymupdf":
+            counts["pymupdf_backend"] += 1
+        elif backend == "unstructured":
+            counts["unstructured_backend"] += 1
         elif backend:
-            counts["layout"] += 1
+            counts["layout_backend"] += 1
+        if ocr_used or selected_ocr_seconds > 0.0:
+            counts["selected_output_ocr_pdfs"] += 1
+            counts["targeted_pages"] += len(target_pages)
+        elif comparison_ocr_seconds > 0.0:
+            counts["comparison_only_ocr_pdfs"] += 1
 
     parts = []
-    if counts["native"]:
-        parts.append(f"{counts['native']} native")
-    if counts["layout"]:
-        parts.append(f"{counts['layout']} layout")
-    if counts["targeted_ocr"]:
-        parts.append(
-            f"{counts['targeted_ocr']} targeted OCR "
-            f"({counts['targeted_pages']} pages checked)"
-        )
-    if counts["full_ocr"]:
-        parts.append(f"{counts['full_ocr']} full OCR")
+    if counts["pymupdf_backend"]:
+        parts.append(f"{counts['pymupdf_backend']} PyMuPDF")
+    if counts["layout_backend"]:
+        parts.append(f"{counts['layout_backend']} layout")
+    if counts["unstructured_backend"]:
+        parts.append(f"{counts['unstructured_backend']} Unstructured")
     if not parts:
         return ""
-    result = "Extraction: " + " · ".join(parts) + "."
+    result = "Extraction backends: " + " · ".join(parts) + "."
+    if counts["selected_output_ocr_pdfs"]:
+        result += (
+            f" OCR contributed to the selected output for "
+            f"{counts['selected_output_ocr_pdfs']} PDF(s)"
+        )
+        if counts["targeted_pages"]:
+            result += f" ({counts['targeted_pages']} targeted page(s))"
+        result += "."
+    if counts["comparison_only_ocr_pdfs"]:
+        result += (
+            f" Comparison-only OCR ran for "
+            f"{counts['comparison_only_ocr_pdfs']} PDF(s)."
+        )
     if (
-        counts["targeted_ocr"]
-        or counts["full_ocr"]
+        counts["selected_output_ocr_pdfs"]
+        or counts["comparison_only_ocr_pdfs"]
         or counts["ocr_processing_seconds"] > 0.0
         or counts["ocr_cache_reused_pages"]
     ):
         result += (
             f" OCR processing: {format_estimate_clock(counts['ocr_processing_seconds'])}."
         )
+        if counts["comparison_ocr_processing_seconds"] >= 0.5:
+            result += (
+                " "
+                f"Selected output: {format_estimate_clock(counts['selected_output_ocr_processing_seconds'])}; "
+                f"extractor comparison: {format_estimate_clock(counts['comparison_ocr_processing_seconds'])}."
+            )
         if counts["ocr_cache_reused_pages"]:
             result += (
                 f" {counts['ocr_cache_reused_pages']} cached OCR page(s) reused."
@@ -21675,9 +21900,19 @@ def automatic_completion_success_message(summaries, *, include_runtime_note=True
     if include_runtime_note and receipt["runtime_retrieval_deferred"]:
         body += " Vectors confirmed; live retrieval not run."
     if receipt["visual_review_pages"]:
+        reasons = receipt["visual_review_reason_counts"]
+        reason_parts = []
+        if reasons["no_text_recovered"]:
+            reason_parts.append(f"{reasons['no_text_recovered']} no-text")
+        if reasons["low_signal_ocr_fragments"]:
+            reason_parts.append(f"{reasons['low_signal_ocr_fragments']} low-signal")
+        if reasons["other"]:
+            reason_parts.append(f"{reasons['other']} unclassified")
+        reason_detail = f" ({'; '.join(reason_parts)})" if reason_parts else ""
         body += (
-            f" {receipt['visual_review_pages']} image-heavy page(s) in "
-            f"{receipt['visual_review_pdfs']} PDF(s) need visual-text review; indexing was not blocked."
+            f" Visual-text diagnostic: {receipt['visual_review_pages']} image-dominant page(s) "
+            f"in {receipt['visual_review_pdfs']} PDF(s) yielded no or low-confidence text"
+            f"{reason_detail}; indexing continued."
         )
     return lead + body
 
@@ -21742,17 +21977,37 @@ def with_error_dimensions(result, *, stage=None, outcome=None, scope=None, categ
     """Attach orthogonal semantics without letting a legacy label drive logic."""
     enriched = dict(result or {})
     code = str(enriched.get("code") or enriched.get("diagnostic_code") or "")
+    diagnostic_only = bool(
+        str(enriched.get("state") or "") == "successful"
+        and enriched.get("diagnostic_code")
+        and not enriched.get("code")
+    )
     if not code and str(enriched.get("state") or "") == "successful":
         defaults = ("completion", "completed", "run", "none")
     else:
         defaults = ERROR_DIMENSIONS_BY_CODE.get(
             code, ("pipeline", "operation_failed", "run", "unclassified_pipeline_failure")
         )
-    enriched["error_stage"] = str(stage or enriched.get("error_stage") or defaults[0])
-    enriched["error_outcome"] = str(outcome or enriched.get("error_outcome") or defaults[1])
-    enriched["error_scope"] = str(scope or enriched.get("error_scope") or defaults[2])
-    enriched["error_category"] = str(category or enriched.get("error_category") or defaults[3])
-    enriched["error_dimensions_schema"] = "anythingllm_pdf_error_dimensions_v1"
+    if diagnostic_only:
+        enriched["diagnostic_stage"] = str(stage or enriched.get("diagnostic_stage") or defaults[0])
+        enriched["diagnostic_outcome"] = str(outcome or enriched.get("diagnostic_outcome") or defaults[1])
+        enriched["diagnostic_scope"] = str(scope or enriched.get("diagnostic_scope") or defaults[2])
+        enriched["diagnostic_category"] = str(category or enriched.get("diagnostic_category") or defaults[3])
+        enriched["diagnostic_dimensions_schema"] = "anythingllm_pdf_diagnostic_dimensions_v1"
+        for key in (
+            "error_stage",
+            "error_outcome",
+            "error_scope",
+            "error_category",
+            "error_dimensions_schema",
+        ):
+            enriched.pop(key, None)
+    else:
+        enriched["error_stage"] = str(stage or enriched.get("error_stage") or defaults[0])
+        enriched["error_outcome"] = str(outcome or enriched.get("error_outcome") or defaults[1])
+        enriched["error_scope"] = str(scope or enriched.get("error_scope") or defaults[2])
+        enriched["error_category"] = str(category or enriched.get("error_category") or defaults[3])
+        enriched["error_dimensions_schema"] = "anythingllm_pdf_error_dimensions_v1"
     return enriched
 
 
@@ -26850,6 +27105,7 @@ def upload_prepared_automatic_batch(
             "source_paths": [source_path for _summary, _rows, _sha, source_path in grouped_rows],
             "filename_disambiguations": filename_disambiguations,
         },
+        compact=True,
     )
 
     report = maybe_upload_to_anythingllm(
@@ -28229,10 +28485,11 @@ def run_automatic(
         str(timing_features.get("embedding_submission_strategy") or "").casefold()
         == "desktop_queue"
     )
-    # The Desktop receipt is one outer request, but the stock Desktop server
-    # invokes the provider once per page parent.  Keep all later exact-count
-    # adjustment arithmetic in those same units; otherwise the first segment
-    # plan would incorrectly erase most of the per-page ETA we just priced.
+    # The opening estimate must remain valid for the established Desktop path.
+    # A later fingerprint-gated worker callback may prove that this particular
+    # run is using source-atomic provider batches; only then may the exact-plan
+    # correction switch away from one-request-per-page-parent arithmetic.
+    active_source_atomic_provider_batch_size = 1
     initial_estimated_batches = max(
         0,
         int(
@@ -29837,6 +30094,7 @@ def run_automatic(
                     for summary in summaries
                 ],
             },
+            compact=True,
         )
         downloadable.append(str(batch_metadata_manifest_path))
     except OSError as exc:
@@ -29884,7 +30142,7 @@ def run_automatic(
                 }],
                 "document_results": {},
             }
-            _write_automatic_run_json(batch_upload_report_path, batch_upload_report)
+            _write_automatic_run_json(batch_upload_report_path, batch_upload_report, compact=True)
             downloadable.extend([
                 str(batch_upload_report_path),
                 str(run_root / "prepared-batch-recovery-verification.json"),
@@ -29916,7 +30174,7 @@ def run_automatic(
                     "errors": [{"error": message, "reason": prepared_checkpoint_error}],
                     "document_results": {},
                 }
-                _write_automatic_run_json(batch_upload_report_path, batch_upload_report)
+                _write_automatic_run_json(batch_upload_report_path, batch_upload_report, compact=True)
                 downloadable.append(str(batch_upload_report_path))
 
     if (
@@ -29927,6 +30185,7 @@ def run_automatic(
     ):
         def report_grouped_upload_status(stage, report=None):
             nonlocal expected_seconds, pending_ocr_eta_surcharge
+            nonlocal active_source_atomic_provider_batch_size
             report = report or {}
             stage_text = str(stage or "Submitting the selected PDF batch to AnythingLLM")
             # The grouped Desktop route owns the live queue observer.  Feed
@@ -29938,6 +30197,16 @@ def run_automatic(
             # healthy fast queue anchored to its conservative first-run prior.
             record_pipeline_timing(stage_text, report)
             timing_event = str(report.get("timing_event") or "")
+            if timing_event == "source_atomic_worker_active":
+                worker = report.get("source_atomic_worker")
+                if isinstance(worker, dict) and worker.get("enabled"):
+                    try:
+                        active_source_atomic_provider_batch_size = max(
+                            1,
+                            int(worker.get("provider_batch_size") or 1),
+                        )
+                    except (TypeError, ValueError):
+                        active_source_atomic_provider_batch_size = 1
             if timing_event == "prepared_batch_complete":
                 cache_plan_context["prepared_records"] = max(
                     0,
@@ -29977,6 +30246,11 @@ def run_automatic(
             grouped_confirmed_fraction = phase_start + (
                 phase_end - phase_start
             ) * evidence_fraction
+            exact_identity_evidence_complete = bool(
+                upload_progress_phase == "identity_set"
+                and grouped_progress["total_records"] > 0
+                and grouped_progress["completed_records"] >= grouped_progress["total_records"]
+            )
             if upload_progress_phase in {"desktop_queue", "identity_set"} and expected_seconds:
                 # The grouped Desktop callback used to bypass the same
                 # evidence-versus-visible-clock ceiling used by structured
@@ -30002,6 +30276,7 @@ def run_automatic(
                     presentation_expected_seconds=(
                         live_for_progress.get("presentation_expected_seconds")
                     ),
+                    exact_evidence_complete=exact_identity_evidence_complete,
                 )
             eta_reprice_reason = ""
             eta_reprice_context = None
@@ -30092,6 +30367,9 @@ def run_automatic(
                         source_total=source_total,
                         cached_documents=cached_documents,
                         cache_attachment_prior=cache_attachment_prior,
+                        fresh_provider_batch_size=(
+                            active_source_atomic_provider_batch_size
+                        ),
                     )
                     eta_basis_update = (
                         "cache_plan_confirmed"
@@ -30108,12 +30386,23 @@ def run_automatic(
                             "remaining_source_windows": source_total,
                             "cached_source_windows": cached_documents,
                             "provider_request_seconds_prior": round(timing_unit_prior, 3),
+                            "fresh_provider_batch_size": (
+                                active_source_atomic_provider_batch_size
+                            ),
+                            "fresh_provider_batch_count_upper_bound": (
+                                math.ceil(
+                                    fresh_records
+                                    / max(1, active_source_atomic_provider_batch_size)
+                                )
+                                + max(0, source_total - cached_documents - 1)
+                                if fresh_records else 0
+                            ),
                             "cached_attachment_tail_prior": dict(cache_attachment_prior),
                             "remaining_work_factor": confirmed_batch_cache_remaining_factor(
                                 cached_records,
                                 fresh_records,
                             ),
-                            "deferred_ocr_seconds": deferred_ocr_seconds,
+                            "observed_ocr_seconds_not_readded": deferred_ocr_seconds,
                             "ocr_observations_deferred_until_exact_plan": deferred_ocr_files,
                             "previous_expected_seconds": previous_expected_seconds,
                             "expected_seconds": expected_seconds,
@@ -30365,7 +30654,7 @@ def run_automatic(
                 cancel_callback=lambda root=run_root: automatic_run_cancellation_requested(root),
                 source_atomic_worker_authority=batch_compatibility_report,
             )
-            _write_automatic_run_json(batch_upload_report_path, batch_upload_report)
+            _write_automatic_run_json(batch_upload_report_path, batch_upload_report, compact=True)
             downloadable.append(str(batch_upload_report_path))
             batch_ledger = run_root / "batch-embedding-ledger.json"
             if automatic_run_cancellation_requested(run_root):
@@ -30385,7 +30674,7 @@ def run_automatic(
                 summary["post_upload_verification_status"] = "not_checked"
                 summary["anythingllm_runtime_validation_status"] = "not_checked"
             batch_upload_report = {"status": "error", "errors": [{"error": str(exc)}]}
-            _write_automatic_run_json(batch_upload_report_path, batch_upload_report)
+            _write_automatic_run_json(batch_upload_report_path, batch_upload_report, compact=True)
             downloadable.append(str(batch_upload_report_path))
             if (run_root / "batch-embedding-ledger.json").is_file():
                 schedule_automatic_recovery(run_root, reason="grouped_upload_exception")
@@ -30411,7 +30700,7 @@ def run_automatic(
     ):
         try:
             batch_retention_report = finalize_successful_automatic_batch_retention(summaries)
-            _write_automatic_run_json(batch_retention_report_path, batch_retention_report)
+            _write_automatic_run_json(batch_retention_report_path, batch_retention_report, compact=True)
             downloadable.append(str(batch_retention_report_path))
         except Exception as exc:
             # The workspace evidence is already complete. A local cleanup
@@ -30424,7 +30713,7 @@ def run_automatic(
                 "error": str(exc),
                 "documents": [],
             }
-            _write_automatic_run_json(batch_retention_report_path, batch_retention_report)
+            _write_automatic_run_json(batch_retention_report_path, batch_retention_report, compact=True)
             downloadable.append(str(batch_retention_report_path))
 
     if automatic_batch_diagnostics_required(
@@ -31072,10 +31361,15 @@ def run_automatic(
         ),
         completion_code=completion.get("code"),
         not_processed_pdf_count=completion.get("not_processed_pdf_count"),
-        error_stage=completion.get("error_stage"),
-        error_outcome=completion.get("error_outcome"),
-        error_scope=completion.get("error_scope"),
-        error_category=completion.get("error_category"),
+        error_stage=completion.get("error_stage", ""),
+        error_outcome=completion.get("error_outcome", ""),
+        error_scope=completion.get("error_scope", ""),
+        error_category=completion.get("error_category", ""),
+        diagnostic_code=completion.get("diagnostic_code"),
+        diagnostic_stage=completion.get("diagnostic_stage"),
+        diagnostic_outcome=completion.get("diagnostic_outcome"),
+        diagnostic_scope=completion.get("diagnostic_scope"),
+        diagnostic_category=completion.get("diagnostic_category"),
         # A partial terminal result owns an exact selected-record coverage
         # fraction. Preserve it instead of leaving the previous phase-budget
         # percentage on screen (for example, 80% beside a proven 289/322).

@@ -736,6 +736,15 @@ AUTHOR_NAME_PARTICLES = {
 }
 AUTHOR_AFFILIATION_HINTS = {
     "university",
+    "universidad",
+    "universidade",
+    "universita",
+    "università",
+    "universitat",
+    "universität",
+    "universite",
+    "université",
+    "unibertsitatea",
     "institute",
     "school",
     "department",
@@ -751,6 +760,7 @@ AUTHOR_AFFILIATION_HINTS = {
     "anthropic",
     "amazon",
     "meta",
+    "tech",
 }
 
 POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES = {
@@ -765,6 +775,11 @@ POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES = {
     "text_instructor_label",
     "text_affiliated_byline",
     "text_adjacent_affiliated_byline",
+    "text_explicit_multi_author_byline",
+    "text_title_window_adjacent_byline",
+    "text_visible_title_person_prefix",
+    "text_opening_title_block_byline",
+    "text_strict_credit_block",
     "text_stacked_affiliated_byline",
     "text_bibliographic_byline",
     "text_compact_caps_byline",
@@ -793,27 +808,7 @@ TRUSTED_AUTHOR_INFERENCE_SOURCES = POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES | {
     "filename_name_before_section_label",
     "filename_surname_before_year",
     "filename_surname_before_section_number",
-}
-
-AUTHOR_METADATA_OVERRIDE_SOURCES = {
-    "text_byline",
-    "text_written_by",
-    "text_author_label",
-    "text_writer_label",
-    "text_bibliographic_author_label",
-    "text_affiliated_byline",
-    "text_bibliographic_byline",
-    "filename_explicit_byline",
-    "filename_leading_name",
-    "filename_leading_names",
-    "filename_leading_surname",
-    "filename_leading_name_before_section",
-    "filename_corroborated_text_name",
-    "filename_leading_surnames",
-    "filename_compact_name_before_year",
-    "filename_name_before_section_label",
-    "filename_surname_before_year",
-    "filename_surname_before_section_number",
+    "filename_structured_corroborated_text_names",
 }
 
 AUTHOR_ORGANIZATION_TERMS = {
@@ -844,6 +839,15 @@ AUTHOR_ORGANIZATION_TERMS = {
     "society",
     "systems",
     "university",
+    "universidad",
+    "universidade",
+    "universita",
+    "università",
+    "universitat",
+    "universität",
+    "universite",
+    "université",
+    "unibertsitatea",
 }
 
 # These are legitimate visible credits, but they name a publication, desk, or
@@ -911,8 +915,12 @@ def pdf_date_to_epoch_ms(value):
     return int(parsed.timestamp() * 1000)
 
 
-def write_json(path: Path, data):
-    atomic_write_text(path, json.dumps(data, indent=2, ensure_ascii=False))
+def write_json(path: Path, data, *, compact=False):
+    if compact:
+        content = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    else:
+        content = json.dumps(data, indent=2, ensure_ascii=False)
+    atomic_write_text(path, content)
 
 
 def atomic_write_text(path: Path, content: str, *, encoding="utf-8", retries=3):
@@ -1301,6 +1309,24 @@ def extract_adjacent_affiliated_name_pairs(line, title_hint=""):
     raw = normalize_text(line or "")
     if not raw:
         return []
+    # A biographical role sentence is not a two-author byline.  Without this
+    # narrow branch, ``Kristin Thompson is Honorary Fellow at the University``
+    # was tokenized as the two plausible-looking pairs ``Kristin Thompson``
+    # and ``Honorary Fellow``.  Require both the role grammar and a real
+    # affiliation tail before accepting the single name; ordinary prose and
+    # genuine adjacent multi-author lines continue through the existing path.
+    role_match = re.match(
+        r"^(.{3,80}?)\s+is\s+(?:an?\s+)?"
+        r"(?:(?:honorary|senior|associate|assistant|visiting|research)\s+)?"
+        r"(?:fellow|professor|lecturer|researcher|scholar|faculty member)\s+"
+        r"(?:at|with)\s+(.+)$",
+        raw,
+        flags=re.I,
+    )
+    if role_match and has_author_affiliation_hint(role_match.group(2), max_chars=180):
+        candidate = normalize_author_candidate(role_match.group(1))
+        if looks_like_person_name(candidate, title_hint=title_hint, allow_all_caps=True):
+            return [candidate]
     email_or_affiliation = bool(re.search(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b", raw)) or has_author_affiliation_hint(raw)
     if not email_or_affiliation:
         return []
@@ -1321,6 +1347,135 @@ def extract_adjacent_affiliated_name_pairs(line, title_hint=""):
         if candidate not in candidates:
             candidates.append(candidate)
     return candidates if len(candidates) >= 2 else []
+
+
+def extract_explicit_multi_author_byline(line, title_hint=""):
+    """Return a compact comma-and title-page byline embedded in a longer line.
+
+    OCR and ebook title pages often flatten the title, subtitle, authors, and
+    place of publication onto one line.  Requiring the exact ``Name, Name and
+    Name`` grammar keeps this stronger than a later biographical role sentence
+    while avoiding arbitrary capitalized-name harvesting from prose.
+    """
+    raw = normalize_text(line or "")
+    if not raw:
+        return []
+    name = r"[A-Z][A-Za-z'.-]+\s+[A-Z][A-Za-z'.-]+"
+    match = re.search(
+        rf"(?<![A-Za-z'.-])({name})\s*,\s*({name})\s+(?:and|&)\s+({name})(?![A-Za-z'.-])",
+        raw,
+    )
+    if not match:
+        return []
+    candidates = [normalize_author_candidate(value) for value in match.groups()]
+    if not all(
+        looks_like_person_name(candidate, title_hint=title_hint, allow_all_caps=True)
+        for candidate in candidates
+    ):
+        return []
+    return candidates
+
+
+def extract_title_window_adjacent_byline(lines, title_hint=""):
+    """Recover a person immediately beside a filename-corroborated title.
+
+    Scholarly title pages frequently wrap the title over two or three lines,
+    so the older single-line title match missed an otherwise unambiguous
+    byline.  This helper deliberately requires a compact adjacent title window
+    to cover most of the meaningful selected-title tokens.  It does not scan
+    arbitrary names from the page and it accepts no distant candidate.
+    """
+    values = [normalize_text(line) for line in (lines or []) if normalize_text(line)]
+    if not values or not title_hint:
+        return []
+
+    ignored_title_words = {
+        "a", "an", "and", "article", "chapter", "ch", "for", "from", "in",
+        "of", "on", "paper", "part", "section", "the", "to", "with",
+    }
+
+    def content_tokens(value):
+        return [
+            token.casefold()
+            for token in re.findall(r"[^\W\d_]+", normalize_text(value), flags=re.UNICODE)
+            if token.casefold() not in ignored_title_words
+        ]
+
+    title_tokens = content_tokens(title_hint)
+    if len(title_tokens) < 4:
+        return []
+
+    def candidate_names(value):
+        names = split_author_line_candidates(
+            value,
+            title_hint=title_hint,
+            allow_all_caps=True,
+        )
+        if names:
+            return names
+        candidate = normalize_author_candidate(value)
+        if looks_like_person_name(candidate, title_hint=title_hint, allow_all_caps=True):
+            return [candidate]
+        return []
+
+    def title_window_matches(window, names):
+        if any(
+            re.match(
+                r"^(?:abstract|chapter|collection|downloaded from|keywords?|online isbn|"
+                r"print isbn|published|search in|series|subject)\b",
+                normalize_text(value),
+                flags=re.I,
+            )
+            for value in window
+        ):
+            return False
+        window_tokens = set(content_tokens(" ".join(window)))
+        if not window_tokens:
+            return False
+        # A catalog filename often begins with the author's surname. Remove
+        # only that independently corroborated leading token from the expected
+        # title; all actual title words still have to be present on the page.
+        expected = list(title_tokens)
+        surnames = {
+            re.findall(r"[^\W\d_]+", name, flags=re.UNICODE)[-1].casefold()
+            for name in names
+            if re.findall(r"[^\W\d_]+", name, flags=re.UNICODE)
+        }
+        leading_title_token_matches_surname = bool(expected and expected[0] in surnames)
+        all_caps_name_block = all(
+            name == name.upper()
+            and re.fullmatch(r"[A-ZÀ-ÖØ-Þ][A-ZÀ-ÖØ-Þ'.-]*(?:\s+[A-ZÀ-ÖØ-Þ][A-ZÀ-ÖØ-Þ'.-]*){1,3}", name)
+            and not re.search(r"\b(?:EDIT(?:ED)?|EDITORIAL|HISTORY|RESEARCH|STUDIES)\b", name, flags=re.I)
+            for name in names
+        )
+        # A title-case candidate is accepted only when its surname is the
+        # catalog prefix of the selected title/filename. Without that second
+        # signal, nearby subject headings such as ``Celebrity Studies`` can
+        # look person-shaped. An all-caps two-to-four-token name block may
+        # stand alone, but then the adjacent page title must match almost
+        # exactly.
+        if not leading_title_token_matches_surname and not all_caps_name_block:
+            return False
+        if leading_title_token_matches_surname:
+            expected = expected[1:]
+        if len(expected) < 4:
+            return False
+        matched = sum(token in window_tokens for token in expected)
+        required_fraction = 0.65 if leading_title_token_matches_surname else 0.85
+        return matched >= max(4, math.ceil(len(expected) * required_fraction))
+
+    for index, line in enumerate(values[:24]):
+        names = candidate_names(line)
+        if not names:
+            continue
+        for width in range(1, 5):
+            previous = values[max(0, index - width):index]
+            following = values[index + 1:index + 1 + width]
+            if previous and title_window_matches(previous, names):
+                return names
+            if following and title_window_matches(following, names):
+                return names
+    return []
 
 
 def extract_stacked_affiliated_names(lines, title_hint=""):
@@ -1507,6 +1662,136 @@ def extract_adjacent_person_names(line, title_hint="", *, allow_all_caps=True):
     return candidates if len(candidates) >= 2 else []
 
 
+def extract_opening_title_block_byline(lines, title_hint=""):
+    """Recover a visible author credit without relying on PDF properties.
+
+    The evidence is deliberately role-sensitive: candidates must be followed
+    by article/chapter body, citation, abstract, or affiliation evidence.
+    Series/editor furniture is excluded. A lone person adjacent to a matched
+    title is handled separately by the title-aware inference path.
+    """
+    values = [normalize_text(line) for line in (lines or []) if normalize_text(line)]
+
+    def split_inline_affiliation(value):
+        match = re.match(r"^(.{3,100}?),\s*(.+)$", value)
+        if not match:
+            return value, False
+        tail = match.group(2)
+        is_affiliation = (
+            has_author_affiliation_hint(tail, max_chars=180)
+            or bool(re.search(r"\b(?:college|institute|state|tech|university)\b", tail, flags=re.I))
+        )
+        return (match.group(1), True) if is_affiliation else (value, False)
+
+    for index, line in enumerate(values[:16]):
+        previous = values[max(0, index - 4):index]
+        if any(
+            re.search(r"\b(?:series|volume)\s+editors?\b|^editors?$", value, flags=re.I)
+            for value in previous
+        ):
+            continue
+        visible_pipe_credit = False
+        candidate_line = line
+        if "|" in line:
+            possible_credit, _separator, possible_title = line.partition("|")
+            possible_credit = normalize_author_candidate(possible_credit)
+            if (
+                len(possible_title.split()) >= 4
+                and not re.search(
+                    r"\b(?:journal|press|project|review|studies|university)\b",
+                    possible_credit,
+                    flags=re.I,
+                )
+                and looks_like_person_name(possible_credit, title_hint="", allow_all_caps=False)
+            ):
+                candidate_line = possible_credit
+                visible_pipe_credit = True
+        candidate_line, inline_affiliation = split_inline_affiliation(candidate_line)
+        if "," in line and not inline_affiliation:
+            continue
+        candidate_line = re.sub(
+            r"^(?:Dr|Mr|Mrs|Ms|Prof(?:essor)?)\.?\s+",
+            "",
+            candidate_line,
+            flags=re.I,
+        )
+        candidates = split_author_line_candidates(candidate_line, title_hint="", allow_all_caps=True)
+        if not candidates:
+            candidate = normalize_author_candidate(candidate_line)
+            if looks_like_person_name(candidate, title_hint="", allow_all_caps=True):
+                candidates = [candidate]
+        if not candidates:
+            continue
+        normalized_title = normalize_text(title_hint).casefold()
+        if normalized_title and any(
+            normalize_text(candidate).casefold() == normalized_title
+            for candidate in candidates
+        ):
+            continue
+        if any(
+            re.search(
+                r"\b(?:americans|article|audiences|cinema|communities|critique|editors?|immigrants|"
+                r"journal|keyword|latinos|open|press|profile|project|report|research|review|"
+                r"students|studies|quarterly|university|women|workers)\b",
+                candidate,
+                flags=re.I,
+            )
+            for candidate in candidates
+        ):
+            continue
+        if any(mark in line for mark in ("?", "“", "”", '"')):
+            continue
+        following_start = index + 1
+        if inline_affiliation:
+            # Multi-author journal title pages commonly put one
+            # ``Name, University`` credit on each consecutive line.
+            for extra_line in values[index + 1:min(len(values), index + 5)]:
+                extra_candidate_line, extra_is_affiliation = split_inline_affiliation(extra_line)
+                if not extra_is_affiliation:
+                    break
+                extra_candidate_line = re.sub(
+                    r"^(?:Dr|Mr|Mrs|Ms|Prof(?:essor)?)\.?\s+",
+                    "",
+                    extra_candidate_line,
+                    flags=re.I,
+                )
+                extra_candidate = normalize_author_candidate(extra_candidate_line)
+                if not looks_like_person_name(extra_candidate, title_hint="", allow_all_caps=True):
+                    break
+                if extra_candidate not in candidates:
+                    candidates.append(extra_candidate)
+                following_start += 1
+        following = values[following_start:following_start + 3]
+        if any(
+            re.search(r"\b(?:series|volume)\s+editors?\b|^editors?$", value, flags=re.I)
+            for value in following[:1]
+        ):
+            continue
+        if following:
+            immediate = normalize_author_candidate(following[0])
+            if (
+                looks_like_person_name(immediate, title_hint="", allow_all_caps=True)
+                or split_author_line_candidates(following[0], title_hint="", allow_all_caps=True)
+            ):
+                # A title fragment that happens to look like a person often
+                # sits immediately above the real byline.
+                continue
+        context = " ".join(following)
+        context_proves_role = bool(
+            visible_pipe_credit
+            or re.match(
+                r"^(?:abstract\b|introduction\b|keywords?\b|to cite this\b|"
+                r"this (?:article|chapter|essay|paper|book)\b)",
+                context,
+                flags=re.I,
+            )
+            or any(has_author_affiliation_hint(value, max_chars=180) for value in following)
+        )
+        if context_proves_role:
+            return candidates
+    return []
+
+
 def infer_author_from_text_samples(samples, title_hint=""):
     patterns = [
         (r"(?:^|\n)\s*by\s+([A-Z][A-Za-z.,'\- ]{3,70})", "text_byline"),
@@ -1531,6 +1816,38 @@ def infer_author_from_text_samples(samples, title_hint=""):
         if not text:
             continue
         lines = [normalize_text(line) for line in raw_text.splitlines() if normalize_text(line)]
+        # Browser print/export workflows can put the local computer user's
+        # name in PDF Author metadata while preserving the real web-page
+        # credit in both the PDF title and the visible page header.  Accept a
+        # leading ``Person | Article title`` credit only when the complete
+        # metadata title is independently visible on an opening page.  This
+        # is stronger than merely distrusting Safari/Quartz metadata and also
+        # works for equivalent exporters without maintaining a producer list.
+        if 1 <= page <= 3 and "|" in normalize_text(title_hint):
+            title_credit, _separator, title_body = normalize_text(title_hint).partition("|")
+            title_credit = normalize_author_candidate(title_credit)
+            visible_title = normalize_text(title_hint).casefold()
+            visible_lines = [line.casefold() for line in lines[:16]]
+            if (
+                title_body.strip()
+                and 2 <= len(title_credit.split()) <= 5
+                and not re.search(
+                    r"\b(?:journal|press|project|review|studies|university)\b",
+                    title_credit,
+                    flags=re.I,
+                )
+                and looks_like_person_name(title_credit, title_hint="", allow_all_caps=False)
+                and any(
+                    line == visible_title or line.startswith(visible_title)
+                    for line in visible_lines
+                )
+            ):
+                return {
+                    "author": title_credit,
+                    "source": "text_visible_title_person_prefix",
+                    "page": page,
+                    "evidence": normalize_text(title_hint),
+                }
         # Journal PDFs often carry stale workstation-owner metadata. Prefer a
         # visible byline only when its syntax is unusually strong: a personal
         # name followed by an affiliation, or a bare name immediately echoed
@@ -1543,11 +1860,50 @@ def infer_author_from_text_samples(samples, title_hint=""):
         # bylines. Explicit labelled credits below remain eligible on every
         # sampled page.
         title_page_lines = lines if 1 <= page <= 3 else []
-        for line in title_page_lines[:24]:
+        opening_declares_series_editors = any(
+            re.search(r"\b(?:series|volume)\s+editors?\b|^editors?$", line, flags=re.I)
+            for line in title_page_lines[:12]
+        )
+        opening_declares_explicit_credit = any(
+            re.fullmatch(r"(?:by|written\s+by|edited\s+by)\s*:?", line, flags=re.I)
+            for line in title_page_lines[:32]
+        )
+        adjacent_title_names = extract_title_window_adjacent_byline(
+            [] if opening_declares_series_editors else title_page_lines,
+            title_hint=title_hint,
+        )
+        if adjacent_title_names:
+            return {
+                "author": ", ".join(adjacent_title_names[:12]),
+                "source": "text_title_window_adjacent_byline",
+                "page": page,
+                "evidence": " / ".join(adjacent_title_names[:4]),
+            }
+        # A literal multi-author title-page byline outranks a later author
+        # biography.  This must run before the role-affiliation recovery below:
+        # otherwise ``Kristin Thompson is Honorary Fellow ...`` can be true
+        # evidence for one contributor yet still truncate a three-author book.
+        for line in ([] if opening_declares_series_editors else title_page_lines[:16]):
+            explicit_names = extract_explicit_multi_author_byline(
+                line,
+                title_hint=title_hint,
+            )
+            if explicit_names:
+                return {
+                    "author": ", ".join(explicit_names),
+                    "source": "text_explicit_multi_author_byline",
+                    "page": page,
+                    "evidence": " / ".join(explicit_names),
+                }
+        for line in ([] if opening_declares_series_editors else title_page_lines[:24]):
             candidate = ""
             comma_match = re.match(r"^(.{3,80}?),\s*(.+)$", line)
             if (
                 comma_match
+                # A numeric volume/issue immediately after the comma proves
+                # this is a journal masthead (``Film History, 28.3``), not a
+                # person followed by an academic affiliation.
+                and not re.match(r"^.{3,80}?,\s*\d+(?:\.\d+)?(?:\D|$)", line)
                 and has_author_affiliation_hint(comma_match.group(2), max_chars=180)
                 and len(comma_match.group(2).split()) <= 18
             ):
@@ -1556,6 +1912,12 @@ def infer_author_from_text_samples(samples, title_hint=""):
             if parenthetical_match and has_author_affiliation_hint(parenthetical_match.group(2), max_chars=120):
                 candidate = parenthetical_match.group(1)
             candidate = normalize_author_candidate(candidate)
+            candidate = re.sub(
+                r"^(?:Dr|Mr|Mrs|Ms|Prof(?:essor)?)\.?\s+",
+                "",
+                candidate,
+                flags=re.I,
+            )
             if candidate and looks_like_person_name(candidate, title_hint=title_hint):
                 if candidate not in affiliated_names:
                     affiliated_names.append(candidate)
@@ -1566,7 +1928,7 @@ def infer_author_from_text_samples(samples, title_hint=""):
                 "page": page,
                 "evidence": " / ".join(affiliated_names[:4]),
             }
-        for line in title_page_lines[:16]:
+        for line in ([] if opening_declares_series_editors else title_page_lines[:16]):
             adjacent_affiliated_names = extract_adjacent_affiliated_name_pairs(
                 line,
                 title_hint=title_hint,
@@ -1593,6 +1955,19 @@ def infer_author_from_text_samples(samples, title_hint=""):
         for pattern, source in patterns:
             match = re.search(pattern, raw_text, flags=re.I)
             if not match:
+                continue
+            if page > 2 and source in {
+                "text_byline",
+                "text_written_by",
+                "text_edited_by",
+                "text_review_byline",
+                "text_column_byline",
+            }:
+                # Closing pages are retained for explicit biographies, but a
+                # bibliography continuation can also start with ``by Name,
+                # New York: Publisher``. A plain late-page byline is therefore
+                # insufficient to mutate durable metadata. Labelled role and
+                # biography evidence below remains available.
                 continue
             candidate = normalize_author_candidate(match.group(1))
             if looks_like_person_name(candidate, title_hint=title_hint):
@@ -1625,7 +2000,7 @@ def infer_author_from_text_samples(samples, title_hint=""):
         # reliable than title-block geometry. Only then consider the compact
         # stacked-name layout used by scholarly title pages.
         stacked_affiliated_names = extract_stacked_affiliated_names(
-            title_page_lines[:40],
+            [] if opening_declares_series_editors else title_page_lines[:40],
             title_hint=title_hint,
         )
         if stacked_affiliated_names:
@@ -1642,7 +2017,11 @@ def infer_author_from_text_samples(samples, title_hint=""):
         # accept without mistaking preceding title fragments for a byline.
         # Restrict the search to the opening page and a short window so a
         # later citation/reference cannot leak into document metadata.
-        if page == 1:
+        if (
+            page == 1
+            and not opening_declares_series_editors
+            and not opening_declares_explicit_credit
+        ):
             for index, line in enumerate(top_lines[:12]):
                 candidate = normalize_author_candidate(line)
                 if not looks_like_person_name(candidate, title_hint=title_hint, allow_all_caps=False):
@@ -1747,7 +2126,12 @@ def infer_author_from_text_samples(samples, title_hint=""):
         # wrapped title lines), never an arbitrary title-shaped line.  A bare
         # one-word marker such as ``Bold`` or ``Edition`` still cannot satisfy
         # the person-name predicate.
-        if title_matched and 1 <= page <= 3:
+        if (
+            title_matched
+            and 1 <= page <= 3
+            and not opening_declares_series_editors
+            and not opening_declares_explicit_credit
+        ):
             for candidate_index in range(title_start_index + 1, min(len(top_lines), title_start_index + 5)):
                 line = top_lines[candidate_index]
                 if line.casefold() in AUTHOR_BLOCK_STOP_HINTS:
@@ -1771,9 +2155,43 @@ def infer_author_from_text_samples(samples, title_hint=""):
                     # remains allowed even when its sentence contains commas.
                     if "," in following and len(following.split()) <= 5:
                         continue
+                    following_candidate = normalize_author_candidate(following)
+                    if (
+                        len(candidates) == 1
+                        and not has_author_affiliation_hint(following, max_chars=180)
+                        and (
+                            looks_like_person_name(
+                                following_candidate,
+                                title_hint="",
+                                allow_all_caps=True,
+                            )
+                            or split_author_line_candidates(
+                                following,
+                                title_hint="",
+                                allow_all_caps=True,
+                            )
+                        )
+                    ):
+                        # The current line is the last title fragment; the
+                        # immediately following person is the actual byline.
+                        continue
+                    strong_visible_role = bool(
+                        len(candidates) >= 2
+                        or re.match(
+                            r"^(?:abstract\b|introduction\b|keywords?\b|to cite this\b|"
+                            r"this (?:article|chapter|essay|paper|book)\b)",
+                            following,
+                            flags=re.I,
+                        )
+                        or has_author_affiliation_hint(following, max_chars=180)
+                    )
                     return {
                         "author": ", ".join(candidates[:12]),
-                        "source": "text_title_adjacent_byline",
+                        "source": (
+                            "text_opening_title_block_byline"
+                            if strong_visible_role
+                            else "text_title_adjacent_byline"
+                        ),
                         "page": page,
                         "evidence": line,
                     }
@@ -1790,10 +2208,29 @@ def infer_author_from_text_samples(samples, title_hint=""):
                     len(line.split()) > 10 or re.search(r"[.!?]$", line)
                 ):
                     break
+        # If metadata/filename title matching was unavailable or deliberately
+        # abstained, independently inspect the visible opening title block.
+        # Keeping this after all established title-aware rules prevents it
+        # from displacing their stronger multi-author and publisher grammar.
+        if page == 1:
+            opening_byline = extract_opening_title_block_byline(
+                title_page_lines,
+                title_hint=title_hint,
+            )
+            if opening_byline:
+                return {
+                    "author": ", ".join(opening_byline[:12]),
+                    "source": "text_opening_title_block_byline",
+                    "page": page,
+                    "evidence": " / ".join(opening_byline[:4]),
+                }
         generic_fallback_last_index = min(len(top_lines) - 1, title_start_index + 8)
         for index, line in enumerate(top_lines):
             lowered = line.casefold().strip()
-            if lowered not in AUTHOR_ROLE_HINTS:
+            if (
+                lowered not in AUTHOR_ROLE_HINTS
+                and not re.fullmatch(r"\d+\s+authors?\s*:?", lowered)
+            ):
                 continue
             if index + 1 >= len(top_lines):
                 continue
@@ -1903,7 +2340,14 @@ def infer_author_from_filename(path: Path, title_hint=""):
     )
     if name_before_section:
         candidate = normalize_author_candidate(name_before_section.group(1))
-        if looks_like_person_name(candidate, allow_all_caps=False):
+        if (
+            not re.search(r"\b(?:keyword|keywords)\b", candidate, flags=re.I)
+            and not any(
+                len(token) >= 2 and token.isupper()
+                for token in candidate.split()
+            )
+            and looks_like_person_name(candidate, allow_all_caps=False)
+        ):
             return {"author": candidate, "source": "filename_name_before_section_label", "page": 0, "evidence": path.name}
     surname_before_year = re.match(
         r"^([A-ZÀ-ÖØ-Þ][A-ZÀ-ÖØ-Þ'’-]{2,})[-_](?:18|19|20)\d{2}(?=[_-]|$)",
@@ -1950,10 +2394,28 @@ def infer_author_from_filename(path: Path, title_hint=""):
     leading_credit = re.match(r"^(.{2,80}?)\s+[-–—]{1,2}\s+(.{4,})$", stem)
     if leading_credit:
         prefix = normalize_author_candidate(leading_credit.group(1))
+        trailing_title = normalize_text(leading_credit.group(2))
         prefix_words = re.findall(r"[^\W\d_][\w'.-]*", prefix, flags=re.UNICODE)
         prefix_is_complete_title = (
             normalize_text(prefix).casefold()
             == normalize_text(title_hint).casefold()
+        )
+        # ``Name - Title`` is an explicit catalog credit, but ``Book Title -
+        # complete book`` uses the same punctuation for an artifact label.
+        # Reject only a narrow set of generic right-hand labels; ordinary
+        # chapter/article titles remain eligible.
+        trailing_is_generic_artifact_label = bool(
+            re.fullmatch(
+                r"(?:complete|full)\s+(?:book|text|volume)|"
+                r"(?:book|document|file|pdf)\s+(?:complete|copy|extract|scan)|"
+                r"(?:complete|full|combined|merged|print|searchable|ocr)\s+(?:pdf|copy)",
+                trailing_title,
+                flags=re.I,
+            )
+        )
+        prefix_is_catalog_title_or_slug = (
+            "_" in prefix
+            or bool(re.search(r"\b(?:project|studies)\b", prefix, flags=re.I))
         )
         surname_pair = re.fullmatch(
             r"([A-ZÀ-ÖØ-Þ][^\W\d_][\w'.-]*)\s+(?:and|&)\s+"
@@ -1991,9 +2453,14 @@ def infer_author_from_filename(path: Path, title_hint=""):
             }
         if (
             not prefix_is_complete_title
+            and not trailing_is_generic_artifact_label
+            and not prefix_is_catalog_title_or_slug
             and looks_like_person_name(
                 prefix,
-                title_hint=title_hint,
+                # The delimiter establishes that this is the credit field.
+                # Passing the filename-derived title back here made every
+                # valid single-person credit look like a title fragment.
+                title_hint="",
                 allow_all_caps=False,
             )
         ):
@@ -2006,6 +2473,9 @@ def infer_author_from_filename(path: Path, title_hint=""):
         if (
             not prefix_is_complete_title
             and len(prefix_words) == 1
+            # An underscore inside the prefix marks a filename/title slug,
+            # not a single surname (``Theory_Theatre - Ch.4``).
+            and "_" not in prefix
             and 2 <= len(prefix_words[0]) <= 40
             and prefix_words[0][0].isupper()
         ):
@@ -2075,6 +2545,274 @@ def infer_author_from_filename(path: Path, title_hint=""):
     return {"author": "", "source": "not_found", "page": 0, "evidence": ""}
 
 
+def infer_author_from_strict_credit_blocks(samples, path: Path, title_hint=""):
+    """Recover complete visible credits only after ordinary inference abstains.
+
+    The detector is intentionally structural and opening-page-only.  It does
+    not scan arbitrary capitalized names: the complete name block must touch a
+    visible match for the independently resolved title, or the article's
+    abstract boundary.  This preserves abstention when the available excerpt
+    contains only series furniture, citations, or prose names.
+    """
+    ignored_title_words = {
+        "a", "an", "and", "article", "chapter", "for", "from", "in", "of",
+        "on", "part", "section", "the", "to", "with",
+    }
+    blocked_credit_terms = re.compile(
+        r"\b(?:corresponding\s+author|editors?\s+emeriti|series\s+editors?|"
+        r"volume\s+editors?|editorial\s+board|reviewed\s+by|instructor|"
+        r"journal|press|publishers?|series|volume|chapter|section|abstract|keywords?|academia)\b",
+        flags=re.I,
+    )
+
+    def title_tokens(value):
+        return [
+            token.casefold()
+            for token in re.findall(r"[^\W\d_]+", normalize_text(value), flags=re.UNICODE)
+            if token.casefold() not in ignored_title_words
+        ]
+
+    def clean_credit(value):
+        value = re.sub(r"(?<=\w)[*†‡§¶∗¹²³⁰-⁹]+\b", "", value or "")
+        value = re.sub(r"(?<=\w)\d{1,2}(?=\s*(?:,|and\b|&|$))", "", value, flags=re.I)
+        value = re.sub(
+            r"(?<=\w)\s+[a-d](?:\s*,\s*[a-d]){0,3}\s*[,⁎*]*(?=\s*(?:,|and\b|&|$))",
+            "",
+            value,
+        )
+        return normalize_text(value)
+
+    def names_from_block(block):
+        raw = " ".join(clean_credit(value) for value in block if clean_credit(value))
+        if (
+            not raw
+            or blocked_credit_terms.search(raw)
+            or "•" in raw
+            or has_author_affiliation_hint(raw, max_chars=240)
+        ):
+            return []
+        names = split_author_line_candidates(raw, title_hint=title_hint, allow_all_caps=True)
+        if not names:
+            candidate = normalize_author_candidate(raw)
+            if looks_like_person_name(candidate, title_hint=title_hint, allow_all_caps=True):
+                names = [candidate]
+        if not names:
+            return []
+        for name in names:
+            tokens = re.findall(r"[^\W\d_]+", name, flags=re.UNICODE)
+            if not 2 <= len(tokens) <= 6:
+                return []
+            # Initials must retain their punctuation; otherwise a wrapped
+            # title/location fragment with a one-letter token is not a name.
+            if any(
+                len(token) == 1 and not re.search(rf"\b{re.escape(token)}\.", raw)
+                for token in tokens
+            ):
+                return []
+        return names
+
+    def widest_complete_block(values, left, right, *, from_start=False):
+        candidates = []
+        maximum = min(3, max(0, right - left))
+        for width in range(1, maximum + 1):
+            block = values[left:left + width] if from_start else values[right - width:right]
+            if width > 1:
+                # Wrapped author lists advertise their continuation. Without
+                # this requirement, maximizing name count joins a title tail
+                # or an organisation line to an otherwise valid lone author.
+                joins = [
+                    bool(
+                        re.search(r"(?:,|\band\b|&)\s*$", block[index], flags=re.I)
+                        or re.match(r"^\s*(?:and\b|&)", block[index + 1], flags=re.I)
+                    )
+                    for index in range(len(block) - 1)
+                ]
+                if not all(joins):
+                    continue
+            names = names_from_block(block)
+            if names:
+                candidates.append((len(names), width, names, block))
+        return max(candidates, default=(0, 0, [], []))
+
+    expected = title_tokens(title_hint)
+    for sample in samples or []:
+        try:
+            page = int(sample.get("page") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not 1 <= page <= 3:
+            continue
+        raw_text = strip_known_extraction_structure_labels(
+            str(sample.get("text") or "").replace("\r\n", "\n").replace("\r", "\n")
+        )
+        values = [normalize_text(line) for line in raw_text.splitlines() if normalize_text(line)][:48]
+        if not values:
+            continue
+
+        # Explicit work-level role labels are sufficient on their own. Gather
+        # every consecutive name line before returning so ``Edited by`` never
+        # truncates a wrapped three-person editor block.
+        for index, line in enumerate(values[:40]):
+            inline = re.match(r"^(?:by|written\s+by|edited\s+by)\s+(.+)$", line, flags=re.I)
+            if inline:
+                names = names_from_block([inline.group(1)])
+                if names:
+                    return {
+                        "author": ", ".join(names[:12]),
+                        "source": "text_strict_credit_block",
+                        "page": page,
+                        "evidence": line,
+                    }
+            if not re.fullmatch(r"(?:by|written\s+by|edited\s+by)\s*:?", line, flags=re.I):
+                continue
+            collected = []
+            evidence_lines = []
+            for candidate_line in values[index + 1:index + 6]:
+                names = names_from_block([candidate_line])
+                if not names:
+                    break
+                collected.extend(name for name in names if name not in collected)
+                evidence_lines.append(candidate_line)
+            if collected:
+                return {
+                    "author": ", ".join(collected[:12]),
+                    "source": "text_strict_credit_block",
+                    "page": page,
+                    "evidence": f"{line} / {' / '.join(evidence_lines)}",
+                }
+
+        matched_window = None
+        if len(expected) >= 3:
+            for start in range(min(28, len(values))):
+                for width in range(1, min(7, len(values) - start + 1)):
+                    observed = set(title_tokens(" ".join(values[start:start + width])))
+                    matched = sum(token in observed for token in expected)
+                    candidate = (matched / len(expected), matched, -width, start, start + width)
+                    if matched_window is None or candidate > matched_window:
+                        matched_window = candidate
+        if matched_window and matched_window[0] >= 0.88 and matched_window[1] >= 3:
+            _fraction, _matched, _negative_width, start, end = matched_window
+            before = widest_complete_block(values, max(0, start - 3), start)
+            after = widest_complete_block(values, end, min(len(values), end + 3), from_start=True)
+            viable = [after] if after[2] else []
+            if before[2]:
+                filename_surnames = structured_filename_surname_evidence(Path(path))
+                before_surnames = {
+                    tokens[-1].casefold()
+                    for name in before[2]
+                    if (tokens := re.findall(r"[^\W\d_]+", name, flags=re.UNICODE))
+                }
+                if before_surnames and before_surnames.issubset(filename_surnames):
+                    viable.append(before)
+            if viable:
+                _count, _width, names, block = max(viable, key=lambda item: (item[0], item[1]))
+                return {
+                    "author": ", ".join(names[:12]),
+                    "source": "text_strict_credit_block",
+                    "page": page,
+                    "evidence": " / ".join(block),
+                }
+
+        # A complete name block immediately above Abstract is independently
+        # strong. Permit one intervening compact affiliation line, but never
+        # a publisher/series/editor label.
+        for index, line in enumerate(values[:32]):
+            if not re.fullmatch(
+                r"(?:abstract|a\s*b\s*s\s*t\s*r\s*a\s*c\s*t)\s*:?,?",
+                line,
+                flags=re.I,
+            ):
+                continue
+            cursor = index
+            if cursor and has_author_affiliation_hint(values[cursor - 1], max_chars=220):
+                cursor -= 1
+            _count, _width, names, block = widest_complete_block(
+                values,
+                max(0, cursor - 3),
+                cursor,
+            )
+            if names:
+                return {
+                    "author": ", ".join(names[:12]),
+                    "source": "text_strict_credit_block",
+                    "page": page,
+                    "evidence": " / ".join(block),
+                }
+        # Chapter/course-pack layouts may have no useful PDF title metadata.
+        # A complete byline is nevertheless strong when it sits between an
+        # explicit numbered chapter heading and the opening prose. This is a
+        # layout grammar, not a generic search for capitalized names.
+        for index in range(1, min(48, len(values) - 1)):
+            names = names_from_block([values[index]])
+            if not names:
+                continue
+            previous = values[max(0, index - 4):index]
+            following = values[index + 1:min(len(values), index + 3)]
+            previous_text = " ".join(previous)
+            next_line = following[0] if following else ""
+            numbered_heading = bool(
+                re.search(r"(?:^|\s)\d{1,3}\s+[A-ZÀ-ÖØ-Þ][^.!?]{5,}$", previous_text)
+                or (
+                    any(re.fullmatch(r"\d{1,3}", value) for value in previous)
+                    and any(len(value.split()) >= 3 for value in previous)
+                )
+                or any(re.fullmatch(r"i\s*n\s*t\s*r\s*o\s*d\s*u\s*c\s*t\s*i\s*o\s*n", value, flags=re.I) for value in previous)
+            )
+            opening_text = " ".join(following[:2])
+            opening_prose = len(opening_text.split()) >= 10 and bool(re.search(r"[.!?:;]", opening_text))
+            if numbered_heading and opening_prose:
+                return {
+                    "author": ", ".join(names[:12]),
+                    "source": "text_strict_credit_block",
+                    "page": page,
+                    "evidence": f"{previous[-1]} / {values[index]}",
+                }
+            # Student submissions identify their author with a directly
+            # adjacent student number. Instructors elsewhere on the cover are
+            # therefore not interchangeable with this credit.
+            if (
+                re.fullmatch(r"[A-Z]\d{6,10}", next_line, flags=re.I)
+                and any(re.search(r"\b(?:essay|assignment|thesis|paper)\b", value, flags=re.I) for value in following[1:3])
+            ):
+                return {
+                    "author": ", ".join(names[:12]),
+                    "source": "text_strict_credit_block",
+                    "page": page,
+                    "evidence": f"{values[index]} / {next_line}",
+                }
+            # Publisher web exports can put the byline directly below the
+            # article title and then state its containing volume explicitly.
+            if next_line.casefold().startswith("this article appears in"):
+                return {
+                    "author": ", ".join(names[:12]),
+                    "source": "text_strict_credit_block",
+                    "page": page,
+                    "evidence": f"{values[index]} / {next_line}",
+                }
+    return {"author": "", "source": "not_found", "page": 0, "evidence": ""}
+
+
+def structured_filename_surname_evidence(path: Path):
+    """Return surname tokens only from explicit, non-free-form filename fields."""
+    stem = normalize_text(path.stem)
+    evidence = []
+    match = re.match(r"^([A-Za-zÀ-ÖØ-öø-ÿ'’-]{3,})-(?:18|19|20)\d{2}-", stem)
+    if match:
+        evidence.append(match.group(1).casefold())
+    match = re.match(r"^([A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ'’-]{2,})-(?=[A-ZÀ-ÖØ-Þ])", stem)
+    if match:
+        evidence.append(match.group(1).casefold())
+    fields = [field.strip() for field in re.split(r"\s+--\s+", stem)]
+    if len(fields) >= 3:
+        author_field = fields[1]
+        for segment in re.split(r"\s*(?:;|,\s+(?=[A-ZÀ-ÖØ-Þ]))\s*", author_field):
+            segment = re.sub(r"\s*\((?:editor|ed\.?|author)\)\s*", "", segment, flags=re.I)
+            tokens = re.findall(r"[^\W\d_]+", segment, flags=re.UNICODE)
+            if len(tokens) >= 2:
+                evidence.append(tokens[-1].casefold())
+    return set(evidence)
+
+
 def infer_author_from_samples_or_filename(samples, path: Path, title_hint=""):
     """Apply the established sample rules, then the existing filename fallback."""
     report = infer_author_from_text_samples(samples, title_hint=title_hint)
@@ -2085,6 +2823,9 @@ def infer_author_from_samples_or_filename(samples, path: Path, title_hint=""):
         return report
     if filename_report.get("author") and filename_report.get("source") in TRUSTED_AUTHOR_INFERENCE_SOURCES:
         return filename_report
+    strict_credit = infer_author_from_strict_credit_blocks(samples, Path(path), title_hint=title_hint)
+    if strict_credit.get("author"):
+        return strict_credit
     # A bare title-page name is too weak on its own, but becomes materially
     # different evidence when the same complete name is independently encoded
     # at the start of the selected filename.  Compare normalized tokens so
@@ -2103,6 +2844,23 @@ def infer_author_from_samples_or_filename(samples, path: Path, title_hint=""):
             return {
                 **report,
                 "source": "filename_corroborated_text_name",
+                "evidence": f"{report.get('evidence') or ''} / {Path(path).name}".strip(" /"),
+            }
+        filename_surnames = structured_filename_surname_evidence(Path(path))
+        report_names = split_author_line_candidates(
+            report.get("author") or "",
+            title_hint="",
+            allow_all_caps=True,
+        ) or [normalize_author_candidate(report.get("author") or "")]
+        report_surnames = {
+            tokens[-1].casefold()
+            for name in report_names
+            if (tokens := re.findall(r"[^\W\d_]+", name, flags=re.UNICODE))
+        }
+        if report_surnames and report_surnames.issubset(filename_surnames):
+            return {
+                **report,
+                "source": "filename_structured_corroborated_text_names",
                 "evidence": f"{report.get('evidence') or ''} / {Path(path).name}".strip(" /"),
             }
     return report if report.get("author") else filename_report
@@ -2255,31 +3013,20 @@ def resolve_title_from_metadata_or_filename(
 
 
 def resolve_author_from_metadata_and_inference(metadata_author, inference, *, author_override=""):
-    """Resolve one document author with the pipeline's established precedence.
+    """Resolve one document author without trusting embedded PDF Author data.
 
-    This is deliberately shared by preparation and the lightweight workspace
-    suggestion probe.  A visible affiliation/bibliographic byline can correct
-    stale PDF metadata; other low-confidence text guesses cannot silently
-    replace it.
+    ``metadata_author`` remains in this compatibility signature because old
+    callers and audit tools still pass it. It is deliberately diagnostic-only:
+    durable author identity comes from a user override or trusted visible-text
+    and explicit filename evidence.
     """
     override = normalize_text(author_override or "")
     if override:
         return {"author": override, "source": "user_override"}
-    metadata_value = normalize_metadata_author(metadata_author)
+    _ = metadata_author
     report = dict(inference or {})
     inferred_value = normalize_text(report.get("author") or "")
     inferred_source = str(report.get("source") or "")
-    if metadata_value:
-        if (
-            inferred_value
-            and inferred_value.casefold() != metadata_value.casefold()
-            and inferred_source in AUTHOR_METADATA_OVERRIDE_SOURCES
-        ):
-            return {
-                "author": inferred_value,
-                "source": f"{inferred_source}_overrode_pdf_metadata",
-            }
-        return {"author": metadata_value, "source": "pdf_metadata"}
     if inferred_value and inferred_source in TRUSTED_AUTHOR_INFERENCE_SOURCES:
         return {"author": inferred_value, "source": inferred_source or "text_inference"}
     return {"author": "", "source": "not_available"}
@@ -3061,6 +3808,12 @@ def retain_successful_run_leanly(
             "selected_backend": summary.get("selected_backend"),
             "total_pipeline_seconds": summary.get("total_pipeline_seconds"),
             "ocr_processing_seconds": summary.get("ocr_processing_seconds", 0.0),
+            "selected_output_ocr_processing_seconds": summary.get(
+                "selected_output_ocr_processing_seconds", 0.0
+            ),
+            "comparison_ocr_processing_seconds": summary.get(
+                "comparison_ocr_processing_seconds", 0.0
+            ),
             "ocr_cache_reused_pages": summary.get("ocr_cache_reused_pages", 0),
             "api_upload_status": summary.get("api_upload_status"),
             "post_upload_verification_status": summary.get("post_upload_verification_status"),
@@ -4411,6 +5164,43 @@ def apply_region_aware_native_layout(pdf_path, pages, progress_callback=None):
         "targeted_ocr_seconds": round(targeted_ocr_seconds, 3),
         "pages": review_pages,
     }
+
+
+def native_layout_progress_status(completed, total, activity):
+    """Describe the two native-layout passes without making progress look reset."""
+    completed = min(max(0, int(completed or 0)), max(1, int(total or 0)))
+    total = max(1, int(total or 0))
+    if activity == "targeted_ocr_started":
+        return (
+            f"Targeted OCR recovery on PDF page {completed}; "
+            f"{max(0, completed - 1)}/{total} layout pages applied",
+            "targeted_ocr_active",
+        )
+    if activity == "targeted_ocr_finished":
+        return (
+            f"Targeted OCR recovery finished on PDF page {completed}; "
+            f"{completed}/{total} layout pages applied",
+            "targeted_ocr_finished",
+        )
+    if activity == "native_layout_scan":
+        if completed >= total:
+            return (
+                f"Positioned page-layout scan complete: {completed}/{total} pages scanned",
+                "native_layout_scan_complete",
+            )
+        return (
+            f"Scanning positioned page layout: {completed}/{total} pages scanned",
+            "native_layout_scan_progress",
+        )
+    if completed >= total:
+        return (
+            f"Native layout rules applied: {completed}/{total} pages complete",
+            "native_layout_rules_complete",
+        )
+    return (
+        f"Applying native layout rules: {completed}/{total} pages reviewed",
+        "native_layout_rules_progress",
+    )
 
 
 def _lane_heading_matches(stat, labels):
@@ -6209,8 +6999,9 @@ def automatic_page_local_ocr_plan(ocr_preflight_hint, candidates=None, pdf_page_
     required = set()
     uncertain = set()
     evidence = {}
+    verified_coverage = str(coverage.get("status") or "").casefold() == "verified"
 
-    if str(coverage.get("status") or "").casefold() == "verified":
+    if verified_coverage:
         for row in coverage.get("image_backed_low_text_pages") or []:
             try:
                 page = int(row.get("page") or 0)
@@ -6255,8 +7046,19 @@ def automatic_page_local_ocr_plan(ocr_preflight_hint, candidates=None, pdf_page_
             if page >= 1 and images > 0 and words < 40:
                 page_votes[page] += 1
     needed_votes = 2 if candidate_count >= 2 else 1
+    suppressed_candidate_vote_pages = []
     for page, votes in page_votes.items():
         if votes >= needed_votes:
+            # The all-page native inspection is more direct evidence than a
+            # backend's coarse ``images > 0 and words < 40`` vote. Publisher
+            # logos and other tiny incidental images must not turn an
+            # otherwise readable native page into an OCR candidate merely
+            # because two extractors agree that it is short. A material
+            # raster/empty-text gap was already classified above. Candidate
+            # votes remain the fallback for callers without verified coverage.
+            if verified_coverage and page not in required:
+                suppressed_candidate_vote_pages.append(page)
+                continue
             required.add(page)
             uncertain.discard(page)
             evidence[page] = "native_candidates_agree_image_page_has_inadequate_text"
@@ -6291,6 +7093,12 @@ def automatic_page_local_ocr_plan(ocr_preflight_hint, candidates=None, pdf_page_
         "native_good_pages": [page for page, value in classes.items() if value == "native_good"],
         "page_classification": classes,
         "evidence": {str(page): evidence[page] for page in sorted(evidence)},
+        "suppressed_candidate_vote_pages": sorted(suppressed_candidate_vote_pages),
+        "candidate_vote_precedence": (
+            "verified_all_page_native_coverage"
+            if verified_coverage
+            else "candidate_fallback_without_verified_coverage"
+        ),
     }
 
 
@@ -14462,12 +15270,16 @@ def _write_embedding_batch_ledger(ledger_path, workspace_slug, result):
         }
     else:
         payload["recovery"] = {"state": "not_needed", "remaining_locations": []}
-    write_json(ledger_path, payload)
+    # This complete ledger is rewritten at every durable submission boundary.
+    # Compact JSON preserves the exact schema and values while avoiding the
+    # substantial whitespace I/O cost of repeatedly pretty-printing large
+    # location and batch collections.
+    write_json(ledger_path, payload, compact=True)
     resume_path = ledger_path.with_name("resume-embedding-manifest.json")
     if recovery_batch or resume_path.exists():
         # Overwrite a stale interim recovery file with ``not_needed`` once a
         # formerly ambiguous batch has been reconciled successfully.
-        write_json(resume_path, payload)
+        write_json(resume_path, payload, compact=True)
 
 
 def _update_workspace_embeddings_batched_serial(
@@ -16271,6 +17083,12 @@ def update_workspace_embeddings_desktop_queue(
         "source_atomic_provider_elapsed_ms": 0,
         "source_atomic_provider_retry_count": 0,
         "source_atomic_provider_last_retry": {},
+        # Source-plan and terminal-event coverage are diagnostic dimensions.
+        # They never decide queue/vector success: the exact vector ledger does.
+        # Keeping the identities as sets lets a coalesced SSE event be reported
+        # honestly without double-counting a repeated notification.
+        "source_atomic_planned_sources": {},
+        "source_atomic_finished_sources": set(),
         "source_atomic_staging_started": False,
         "source_atomic_staging_finished": False,
         "source_atomic_precommit_rejection": {},
@@ -16312,12 +17130,16 @@ def update_workspace_embeddings_desktop_queue(
                 "provider_batch_size": provider_batch_size,
             })
         if not normalized:
-            return
+            return []
         by_identity = {
             (str(item.get("source_key") or ""), int(item.get("batch_index") or 0)): dict(item)
             for item in queue_state["source_atomic_provider_batches"] or []
             if isinstance(item, dict)
         }
+        new_items = [
+            item for item in normalized
+            if (item["source_key"], item["batch_index"]) not in by_identity
+        ]
         for item in normalized:
             by_identity[(item["source_key"], item["batch_index"])] = item
         ordered = sorted(
@@ -16334,6 +17156,7 @@ def update_workspace_embeddings_desktop_queue(
         queue_state["source_atomic_provider_elapsed_ms"] = sum(
             int(item.get("elapsed_ms") or 0) for item in ordered
         )
+        return new_items
 
     def queue_snapshot():
         with queue_state_lock:
@@ -16369,6 +17192,13 @@ def update_workspace_embeddings_desktop_queue(
             provider_elapsed_ms = max(0, int(queue_state["source_atomic_provider_elapsed_ms"] or 0))
             provider_retry_count = max(0, int(queue_state["source_atomic_provider_retry_count"] or 0))
             provider_last_retry = dict(queue_state["source_atomic_provider_last_retry"] or {})
+            planned_sources = dict(queue_state["source_atomic_planned_sources"] or {})
+            finished_sources = set(queue_state["source_atomic_finished_sources"] or set())
+            planned_provider_chunks = sum(
+                max(0, int(item.get("provider_chunks") or 0))
+                for item in planned_sources.values()
+                if isinstance(item, dict)
+            )
             records_per_second = 0.0
             if last_progress_at > first_progress_at and last_progress_position > first_progress_position:
                 records_per_second = (last_progress_position - first_progress_position) / (
@@ -16428,6 +17258,13 @@ def update_workspace_embeddings_desktop_queue(
                 "source_atomic_provider_batches": provider_batches,
                 "source_atomic_provider_retry_count": provider_retry_count,
                 "source_atomic_provider_last_retry": provider_last_retry,
+                "source_atomic_planned_source_count": len(planned_sources),
+                "source_atomic_finished_source_count": len(finished_sources),
+                "source_atomic_planned_provider_chunk_count": planned_provider_chunks,
+                "source_atomic_provider_telemetry_complete": bool(
+                    len(finished_sources) == len(planned_sources)
+                    and provider_chunk_count == planned_provider_chunks
+                ) if planned_sources else None,
                 "source_atomic_precommit_rejection": dict(queue_state["source_atomic_precommit_rejection"] or {}),
                 "source_atomic_precommit_rejections": [
                     dict(rejection)
@@ -16501,6 +17338,7 @@ def update_workspace_embeddings_desktop_queue(
             "source_commit_ambiguous",
             "source_committed",
         }
+        replayed_provider_batches = []
         if source_atomic_event:
             with queue_state_lock:
                 event_now = time.monotonic()
@@ -16514,20 +17352,26 @@ def update_workspace_embeddings_desktop_queue(
                 if event_type == "source_staging_started":
                     queue_state["source_atomic_staging_started"] = True
                 elif event_type == "source_staging_source_plan":
-                    queue_state["source_atomic_source_plan"] = {
+                    source_plan = {
                         "source_key": str(event.get("sourceKey") or ""),
                         "records": event.get("recordCount"),
                         "cache_resolved_records": event.get("cacheResolvedRecordCount"),
                         "provider_required_records": event.get("providerRequiredRecordCount"),
                         "provider_chunks": event.get("providerChunkCount"),
                     }
+                    queue_state["source_atomic_source_plan"] = source_plan
+                    if source_plan["source_key"]:
+                        queue_state["source_atomic_planned_sources"][source_plan["source_key"]] = source_plan
                 elif event_type == "source_staging_finished":
                     queue_state["source_atomic_staging_finished"] = True
+                    finished_source_key = str(event.get("sourceKey") or "")
+                    if finished_source_key:
+                        queue_state["source_atomic_finished_sources"].add(finished_source_key)
                     # The terminal event is a compact server-side replay of
                     # this source's provider batches. It restores any SSE
                     # notification that was coalesced while retaining exact
                     # source-local identity.
-                    merge_source_atomic_provider_batches(
+                    replayed_provider_batches = merge_source_atomic_provider_batches(
                         event.get("providerBatches") or event.get("provider_batches") or [],
                         source_key=str(event.get("sourceKey") or ""),
                     )
@@ -16568,6 +17412,28 @@ def update_workspace_embeddings_desktop_queue(
                         "error": str(event.get("error") or ""),
                     }
             snapshot = queue_snapshot()
+            # A busy SSE relay may omit an individual provider-batch event.
+            # The source terminal event carries the complete bounded list and
+            # already repairs the aggregate snapshot above. Mirror only the
+            # genuinely missing entries into the existing timing callback so
+            # the detailed timeline agrees with that authoritative terminal
+            # evidence without duplicating live events.
+            if callable(status_callback) and replayed_provider_batches:
+                for recovered in replayed_provider_batches:
+                    status_callback(
+                        "AnythingLLM provider-batch timing recovered from the completed source receipt",
+                        {
+                            "timing_event": "source_atomic_provider_batch_completed",
+                            "desktop_queue_event_type": "source_staging_finished_replay",
+                            "source_atomic_timing_recovered_from_terminal": True,
+                            "source_atomic_source_key": str(recovered.get("source_key") or ""),
+                            "source_atomic_filename": str(event.get("filename") or ""),
+                            "source_atomic_batch_index": recovered.get("batch_index"),
+                            "source_atomic_chunk_count": recovered.get("chunk_count"),
+                            "source_atomic_elapsed_ms": recovered.get("elapsed_ms"),
+                            **snapshot,
+                        },
+                    )
             # A source emits one ``source_staging_record`` event per prepared
             # page-parent record. It is useful durable activity evidence, but
             # echoing every one into the live description would replace the
@@ -18783,6 +19649,57 @@ def maybe_upload_segment_files_source_transactions(
         "queue_completed_records": "records with completed Desktop queue evidence",
         "vector_confirmed_records": "records with exact searchable-vector proof",
     }
+    telemetry_groups = []
+    for batch in aggregate.get("embedding_update", {}).get("batches") or []:
+        snapshot = (
+            (batch.get("progress_observation") or {}).get("final_queue_snapshot") or {}
+        )
+        planned_chunks = max(
+            0, int(snapshot.get("source_atomic_planned_provider_chunk_count") or 0)
+        )
+        observed_chunks = max(
+            0, int(snapshot.get("source_atomic_provider_chunk_count") or 0)
+        )
+        planned_sources = max(
+            0, int(snapshot.get("source_atomic_planned_source_count") or 0)
+        )
+        finished_sources = max(
+            0, int(snapshot.get("source_atomic_finished_source_count") or 0)
+        )
+        if planned_sources or planned_chunks:
+            telemetry_groups.append({
+                "queue_group": max(0, int(batch.get("source_queue_group_index") or 0)),
+                "planned_sources": planned_sources,
+                "observed_finished_sources": finished_sources,
+                "planned_provider_chunks": planned_chunks,
+                "observed_provider_chunks": observed_chunks,
+                "complete": bool(
+                    planned_sources == finished_sources
+                    and planned_chunks == observed_chunks
+                ),
+            })
+    if telemetry_groups:
+        planned_chunks = sum(item["planned_provider_chunks"] for item in telemetry_groups)
+        observed_chunks = sum(item["observed_provider_chunks"] for item in telemetry_groups)
+        planned_sources = sum(item["planned_sources"] for item in telemetry_groups)
+        finished_sources = sum(item["observed_finished_sources"] for item in telemetry_groups)
+        aggregate["embedding_update"]["source_atomic_telemetry_coverage"] = {
+            "status": (
+                "complete"
+                if all(item["complete"] for item in telemetry_groups)
+                else "partial_observer_telemetry"
+            ),
+            "meaning": (
+                "Observer telemetry coverage only; exact-vector reconciliation remains authoritative."
+            ),
+            "planned_sources": planned_sources,
+            "observed_finished_sources": finished_sources,
+            "planned_provider_chunks": planned_chunks,
+            "observed_provider_chunks": observed_chunks,
+            "missing_terminal_source_events": max(0, planned_sources - finished_sources),
+            "missing_provider_chunk_events": max(0, planned_chunks - observed_chunks),
+            "groups": telemetry_groups,
+        }
     persist_transactions(finalize_snapshot=True, include_aggregate_embedding=True)
     return aggregate
 
@@ -22077,21 +22994,9 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                         layout_aggregate_total,
                         (backend_index + 1) * total,
                     )
-                    if activity == "targeted_ocr_started":
-                        detail = (
-                            f"Targeted OCR recovery on PDF page {completed}; "
-                            f"{completed - 1}/{total} layout pages reviewed"
-                        )
-                        evidence = "targeted_ocr_active"
-                    elif activity == "targeted_ocr_finished":
-                        detail = (
-                            f"Targeted OCR recovery finished on PDF page {completed}; "
-                            f"{completed}/{total} layout pages reviewed"
-                        )
-                        evidence = "targeted_ocr_finished"
-                    else:
-                        detail = f"Inspecting native layout: {completed}/{total} pages reviewed"
-                        evidence = "native_layout_progress"
+                    detail, evidence = native_layout_progress_status(
+                        completed, total, activity
+                    )
                     # PyMuPDF extraction has already supplied all page-count
                     # evidence. This truthful substage label keeps the same
                     # completed-unit boundary rather than inflating progress.
@@ -22724,6 +23629,12 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     if not viable:
         raise RuntimeError("No extraction backend produced usable segments.")
     selected = sorted(viable, key=lambda c: c["score"], reverse=True)[0]
+    selected_output_ocr_processing_seconds = max(
+        0.0, float(selected.get("ocr_processing_seconds") or 0.0)
+    )
+    comparison_ocr_processing_seconds = max(
+        0.0, ocr_processing_seconds - selected_output_ocr_processing_seconds
+    )
     automatic_targeted_ocr_selection = {
         "applied": False,
         "recovered_page_numbers": [],
@@ -25408,6 +26319,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         "attempted": bool(unstructured_candidates),
         "completed": any(not candidate.get("error") for candidate in unstructured_candidates),
         "errors": unstructured_errors,
+        "processing_seconds": round(comparison_ocr_processing_seconds, 3),
     }
     summary = {
         "output_root": str(out_root),
@@ -25421,6 +26333,12 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         "metadata_provenance": dict(profile.get("metadata_provenance") or {}),
         "total_pipeline_seconds": round(time.perf_counter() - total_started, 2),
         "ocr_processing_seconds": round(ocr_processing_seconds, 3),
+        "selected_output_ocr_processing_seconds": round(
+            selected_output_ocr_processing_seconds, 3
+        ),
+        "comparison_ocr_processing_seconds": round(
+            comparison_ocr_processing_seconds, 3
+        ),
         "ocr_cache_reused_pages": max(0, int(ocr_cache_reused_pages)),
         "readiness_status": selected["readiness_status"],
         "readiness_reasons": selected["readiness_reasons"],
