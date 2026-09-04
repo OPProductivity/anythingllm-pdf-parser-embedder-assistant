@@ -66,7 +66,7 @@ AUTOMATIC_WORKER_ARGUMENT_FIELDS = frozenset({
     "temporary_validation_cleanup_policy",
     "test_workspace_slug",
     "unstructured_circuit_breaker",
-    "unstructured_ocr_cache_dir",
+    "unstructured_ocr_checkpoint_dir",
     "unstructured_runtime_probe",
     "unstructured_strategy",
     "upload_indices",

@@ -216,6 +216,20 @@ def test_env_snapshot_redacts_secret_and_restore_skips_unrecoverable_secret(tmp_
     assert payload["env"]["EMBEDDING_ENGINE"]["value"] == "openrouter"
 
 
+def test_identical_settings_state_reuses_one_snapshot(tmp_path, monkeypatch):
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    create_storage(storage)
+    (storage / ".env").write_text("EMBEDDING_ENGINE='openrouter'\n", encoding="utf-8")
+    adapter = guarded_mutation_adapter(storage, "deduplicated", tmp_path / "snapshots", monkeypatch)
+
+    first = adapter.snapshot(env_keys=["EMBEDDING_ENGINE"])
+    second = adapter.snapshot(env_keys=["EMBEDDING_ENGINE"])
+
+    assert second == first
+    assert len(list((tmp_path / "snapshots").glob("anythingllm-settings-snapshot-*.json"))) == 1
+
+
 def test_guarded_env_write_rejects_multiline_or_malformed_assignments(tmp_path, monkeypatch):
     storage = tmp_path / "storage"
     storage.mkdir()

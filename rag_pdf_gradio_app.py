@@ -194,7 +194,6 @@ AUTO_OUTPUT_DIR = PORTABLE_APPLICATION_PATHS["automatic_outputs"]
 ADVANCED_DIAGNOSTICS_OUTPUT_DIR = BASE_OUTPUT_DIR / "advanced-diagnostics"
 PRIVATE_RUN_HISTORY_DIR = PORTABLE_APPLICATION_PATHS["private_history"]
 INGESTION_HISTORY_PATH = PRIVATE_RUN_HISTORY_DIR / "ingestion-history.jsonl"
-AUTOMATIC_RECOVERY_HISTORY_PATH = PRIVATE_RUN_HISTORY_DIR / "automatic-recovery-history.jsonl"
 TIMING_MODEL_DIR = PRIVATE_RUN_HISTORY_DIR / "timing-model"
 TIMING_MODEL_RUNS_PATH = TIMING_MODEL_DIR / "timing-runs.jsonl"
 TIMING_MODEL_EVENTS_PATH = TIMING_MODEL_DIR / "timing-events.jsonl"
@@ -225,6 +224,8 @@ TIMING_MODEL_BACKFILL_CUTOVER_PATH = TIMING_MODEL_DIR / "timing-history-cutover.
 PERSISTED_HISTORY_LOCK = threading.RLock()
 TIMING_MODEL_EVENT_COMPACTION_LOCK = threading.RLock()
 TIMING_MODEL_EVENT_COMPACTION_DONE = set()
+TIMING_MODEL_RUN_COMPACTION_LOCK = threading.RLock()
+TIMING_MODEL_RUN_COMPACTION_DONE = set()
 # Retention is intentionally outside the timing-event hot path. Desktop can
 # emit an observation every couple of seconds during a large queue; parsing a
 # growing year of JSONL before every append would turn harmless audit history
@@ -237,11 +238,11 @@ BACKGROUND_HISTORY_PRUNE_INTERVAL_SECONDS = 24 * 60 * 60
 # own reservation lock so two initial UI callbacks cannot learn the same run
 # twice before either append becomes visible in the shared history.
 TIMING_MODEL_BACKFILL_LOCK = threading.RLock()
-# Version 4 retains the single Desktop-style workspace queue contract while
-# allowing a bounded historical refinement of its existing per-page provider
-# allowance. Earlier rows remain append-only audit evidence and are admitted
-# only through the compatibility rules below.
-TIMING_MODEL_VERSION = 4
+# Version 5 keeps the v4 timing semantics but stores run features as a nested
+# object instead of duplicating them both at the top level and inside the
+# opening-estimate feature record. Readers expand both schemas in memory, so
+# existing calibrated observations remain usable.
+TIMING_MODEL_VERSION = 5
 BACKGROUND_LOG_RETENTION_DAYS = 365
 # Bump this only when the meaning of the repeat-run processing identity
 # changes. Historical settings receipts remain harmless, but are no longer
@@ -7477,7 +7478,10 @@ def builtin_automatic_run_setting_values(pdf_files=None, folder_pdf_files=None, 
         "advanced_end_section_names": "\n".join(DEFAULT_END_SECTION_HEADINGS),
         "automatic_validation_phrases": "",
         "unstructured_strategy": "auto",
-        "generate_inline_fallback": True,
+        # Native metadata is the normal qualified path. The marked fallback is
+        # an explicit manual-export option, not a second copy every run should
+        # generate by default.
+        "generate_inline_fallback": False,
         "inherit_anythingllm_settings": True,
         "anythingllm_chunk_size": current_anythingllm_chunk_size_value(resolved_anythingllm_state),
         "anythingllm_chunk_overlap": current_anythingllm_chunk_overlap_value(resolved_anythingllm_state),
@@ -14428,18 +14432,6 @@ def _read_automatic_run_json(path):
     return value if isinstance(value, dict) else {}
 
 
-def _append_automatic_recovery_history(record):
-    try:
-        with PERSISTED_HISTORY_LOCK:
-            AUTOMATIC_RECOVERY_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-            with AUTOMATIC_RECOVERY_HISTORY_PATH.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-    except OSError as exc:
-        APP_LOGGER.warning("could not record automatic recovery history: %s", exc)
-
-
 def _recovery_ledger_groups(run_root):
     """Yield each ledger with its nearest worker configuration, never a sibling's."""
     root = Path(run_root)
@@ -14664,7 +14656,6 @@ def recover_automatic_run(
         _write_automatic_run_json(root / AUTOMATIC_RUN_RECOVERY_STATE, result)
     except OSError:
         pass
-    _append_automatic_recovery_history(result)
     return result
 
 
@@ -15635,6 +15626,43 @@ def finalize_successful_automatic_batch_retention(summaries):
         ),
         "documents": results,
     }
+
+
+SUCCESSFUL_BATCH_TRANSIENT_ARTIFACTS = (
+    ".automatic-batch-upload-config.json",
+    ".automatic-worker-heartbeat.json",
+    ".active-preparation-worker.json",
+    "batch-retention-report.json",
+    "batch-submission-receipts.jsonl",
+    "output-capacity-preflight.json",
+    "output-capacity-latest-check.json",
+    "prepared-batch-recovery-manifest.json",
+    "prepared-batch-recovery-verification.json",
+    "runtime-events.jsonl",
+    "workspace-duplicate-fast-preflight.json",
+)
+
+
+def compact_successful_automatic_batch_root(run_root):
+    """Remove active/replay-only batch evidence after proven terminal success.
+
+    The exact upload report, embedding ledger, source ledger, integrity audit,
+    OCR/metadata evidence, progress trace, and timing evidence remain. Failed,
+    cancelled, warning, or cleanup-pending runs never cross this boundary.
+    """
+    root = Path(run_root)
+    removed = []
+    pending = []
+    for name in SUCCESSFUL_BATCH_TRANSIENT_ARTIFACTS:
+        path = root / name
+        if not path.exists():
+            continue
+        try:
+            path.unlink()
+            removed.append(name)
+        except OSError as exc:
+            pending.append({"artifact": name, "error": type(exc).__name__})
+    return {"removed": removed, "pending": pending}
 
 
 def new_automatic_runtime_guard():
@@ -16764,6 +16792,12 @@ def _read_timing_jsonl(path, limit=240):
             is_global_event_history = str(history_path.absolute()).casefold() == str(Path(TIMING_MODEL_EVENTS_PATH).absolute()).casefold()
         if is_global_event_history:
             ensure_compact_timing_model_event_history(history_path)
+        try:
+            is_timing_run_history = history_path.resolve() == Path(TIMING_MODEL_RUNS_PATH).resolve()
+        except OSError:
+            is_timing_run_history = str(history_path.absolute()).casefold() == str(Path(TIMING_MODEL_RUNS_PATH).absolute()).casefold()
+        if is_timing_run_history:
+            ensure_compact_timing_run_history(history_path)
         with PERSISTED_HISTORY_LOCK:
             lines = _tail_jsonl_lines(history_path, limit)
         rows = []
@@ -16777,7 +16811,7 @@ def _read_timing_jsonl(path, limit=240):
                 malformed += 1
                 continue
             if isinstance(row, dict):
-                rows.append(row)
+                rows.append(expand_timing_run_history_row(row))
             else:
                 malformed += 1
         if malformed:
@@ -16786,6 +16820,211 @@ def _read_timing_jsonl(path, limit=240):
     except OSError as exc:
         APP_LOGGER.warning("could not read timing-model history: %s", exc)
         return []
+
+
+TIMING_RUN_OBSERVED_FEATURE_FIELDS = frozenset({
+    "selected_backend",
+    "ocr_used",
+    "embedding_timing_lane",
+    "timing_formula_lane",
+    "embedding_batch_size",
+    "embedding_verification_mode",
+    "embedding_verification_interval",
+    "anythingllm_config_batch_size",
+})
+
+
+def compact_timing_document_row(document):
+    """Keep only document fields consumed by ETA calibration and diagnostics."""
+    value = dict(document or {})
+    phase_timing = dict(value.get("phase_timing") or {})
+    phase_seconds = {
+        str(name): round(max(0.0, float(seconds or 0.0)), 3)
+        for name, seconds in dict(phase_timing.get("phase_seconds") or {}).items()
+        if float(seconds or 0.0) > 0.0
+    }
+    return {
+        "filename": str(value.get("filename") or ""),
+        "pages": max(0, int(value.get("pages") or 0)),
+        "records": max(0, int(value.get("records") or 0)),
+        "extraction_seconds": round(
+            max(0.0, float(phase_timing.get("extraction_seconds") or 0.0)), 3
+        ),
+        "phase_seconds": phase_seconds,
+        "ocr_processing_seconds": round(
+            max(0.0, float(value.get("ocr_processing_seconds") or 0.0)), 3
+        ),
+        "ocr_processing_pages": max(0, int(value.get("ocr_processing_pages") or 0)),
+        "total_pipeline_seconds": round(
+            max(0.0, float(value.get("total_pipeline_seconds") or 0.0)), 3
+        ),
+    }
+
+
+def expand_timing_document_row(document):
+    """Present compact document timing through the historical public shape."""
+    value = dict(document or {})
+    if "phase_seconds" not in value and isinstance(value.get("phase_timing"), dict):
+        return value
+    phase_seconds = dict(value.pop("phase_seconds", None) or {})
+    extraction_seconds = max(0.0, float(value.pop("extraction_seconds", 0.0) or 0.0))
+    value["phase_timing"] = {
+        "schema_version": 1,
+        "capture": "compact_timing_history_v5",
+        "extraction_seconds": extraction_seconds,
+        "phase_seconds": phase_seconds,
+    }
+    return value
+
+
+def compact_timing_run_history_row(record):
+    """Return the v5 on-disk shape without changing ETA feature semantics."""
+    row = dict(record or {})
+    stored_initial = dict(
+        row.pop("initial_features", None)
+        or row.pop("initial_estimate_features", None)
+        or {}
+    )
+    features = dict(row.pop("features", None) or {})
+    stored_initial_overrides = dict(row.pop("initial_feature_overrides", None) or {})
+    stored_initial_keys = set(row.pop("initial_feature_keys", None) or ())
+    stored_initial_exclusions = set(row.pop("initial_feature_exclusions", None) or ())
+    if not stored_initial_keys:
+        stored_initial_keys = (
+            set(stored_initial)
+            if stored_initial
+            else set(features) - stored_initial_exclusions
+        )
+    initial = {
+        **{name: value for name, value in features.items() if name in stored_initial_keys},
+        **stored_initial,
+        **stored_initial_overrides,
+    }
+    feature_names = set(initial) | set(TIMING_RUN_OBSERVED_FEATURE_FIELDS)
+    for name in feature_names:
+        if name in row:
+            features[name] = row.pop(name)
+    initial_overrides = {
+        name: value
+        for name, value in initial.items()
+        if name not in features or features.get(name) != value
+    }
+    if isinstance(row.get("document_timing"), list):
+        row["document_timing"] = [
+            compact_timing_document_row(document)
+            for document in row["document_timing"]
+            if isinstance(document, dict)
+        ]
+    row["schema_version"] = TIMING_MODEL_VERSION
+    row["initial_feature_exclusions"] = sorted(set(features) - set(initial))
+    row["initial_feature_overrides"] = initial_overrides
+    row["features"] = features
+    return row
+
+
+def expand_timing_run_history_row(record):
+    """Expose compact and historical rows through the established API."""
+    stored = dict(record or {})
+    features = dict(stored.get("features") or {})
+    stored_initial = dict(
+        stored.get("initial_features")
+        or stored.get("initial_estimate_features")
+        or {}
+    )
+    initial_keys = set(stored.get("initial_feature_keys") or ())
+    if not initial_keys:
+        initial_keys = (
+            set(stored_initial)
+            if stored_initial
+            else set(features) - set(stored.get("initial_feature_exclusions") or ())
+        )
+    initial = {
+        **{name: value for name, value in features.items() if name in initial_keys},
+        **stored_initial,
+        **dict(stored.get("initial_feature_overrides") or {}),
+    }
+    expanded = {**features, **stored}
+    if isinstance(expanded.get("document_timing"), list):
+        expanded["document_timing"] = [
+            expand_timing_document_row(document)
+            for document in expanded["document_timing"]
+            if isinstance(document, dict)
+        ]
+    expanded["initial_estimate_features"] = initial
+    return expanded
+
+
+def compact_timing_run_history(path=None):
+    """Migrate wide ETA rows atomically while preserving every observation."""
+    history_path = Path(path or TIMING_MODEL_RUNS_PATH)
+    schema_path = history_path.with_name(f"{history_path.stem}-schema.json")
+    if not history_path.is_file():
+        return {"status": "not_needed", "records": 0}
+    temporary = None
+    with TIMING_MODEL_RUN_COMPACTION_LOCK, PERSISTED_HISTORY_LOCK:
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=history_path.parent,
+                prefix=f".{history_path.name}.", suffix=".compact.tmp", delete=False,
+            ) as handle:
+                temporary = Path(handle.name)
+                records = 0
+                for line in history_path.read_text(encoding="utf-8").splitlines():
+                    if not line.strip():
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        # Preserve malformed evidence rather than hiding it.
+                        handle.write(line + "\n")
+                        continue
+                    if not isinstance(row, dict):
+                        handle.write(line + "\n")
+                        continue
+                    handle.write(json.dumps(compact_timing_run_history_row(row), ensure_ascii=False, sort_keys=True) + "\n")
+                    records += 1
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, history_path)
+            temporary = None
+            atomic_write_text(
+                schema_path,
+                json.dumps(
+                    {
+                        "schema_version": TIMING_MODEL_VERSION,
+                        "migrated_at": datetime.now().isoformat(timespec="seconds"),
+                        "records": records,
+                        "policy": "nested current features plus opening-feature overrides",
+                    },
+                    indent=2,
+                ),
+            )
+            return {"status": "compacted", "records": records}
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+
+def ensure_compact_timing_run_history(path=None):
+    history_path = Path(path or TIMING_MODEL_RUNS_PATH)
+    schema_path = history_path.with_name(f"{history_path.stem}-schema.json")
+    try:
+        key = str(history_path.resolve()).casefold()
+    except OSError:
+        key = str(history_path.absolute()).casefold()
+    with TIMING_MODEL_RUN_COMPACTION_LOCK:
+        if key in TIMING_MODEL_RUN_COMPACTION_DONE:
+            return {"status": "already_checked"}
+        try:
+            marker = json.loads(schema_path.read_text(encoding="utf-8"))
+            if int(marker.get("schema_version") or 0) >= TIMING_MODEL_VERSION:
+                TIMING_MODEL_RUN_COMPACTION_DONE.add(key)
+                return {"status": "already_compact"}
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+        result = compact_timing_run_history(history_path)
+        TIMING_MODEL_RUN_COMPACTION_DONE.add(key)
+        return result
 
 
 def _bucket(value, low, high, *, low_label="low", high_label="high", middle_label="medium"):
@@ -20615,7 +20854,10 @@ def _ensure_timing_model_backfill():
                     if float(batch.get("batch_elapsed_seconds") or 0) > 0
                 ],
             }
-            _append_timing_jsonl(TIMING_MODEL_RUNS_PATH, row)
+            _append_timing_jsonl(
+                TIMING_MODEL_RUNS_PATH,
+                compact_timing_run_history_row(row),
+            )
             existing.add(run_key)
             seeded += 1
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
@@ -21492,7 +21734,10 @@ def record_timing_model_run(
             row,
             hydrated_timing_model_history(),
         )
-        _append_timing_jsonl(TIMING_MODEL_RUNS_PATH, row)
+        _append_timing_jsonl(
+            TIMING_MODEL_RUNS_PATH,
+            compact_timing_run_history_row(row),
+        )
         summary = {
             "schema_version": TIMING_MODEL_VERSION,
             "updated_at": row["recorded_at"],
@@ -21960,6 +22205,17 @@ def automatic_extraction_method_summary(summaries):
             for page in (summary.get("automatic_targeted_ocr_pages") or [])
             if str(page).strip().isdigit() and int(page) > 0
         }
+        ocr_page_evidence = summary.get("ocr_page_evidence") or {}
+        try:
+            observed_ocr_pages = max(
+                0, int(ocr_page_evidence.get("ocr_observed_page_count") or 0)
+            )
+            selected_ocr_pages = max(
+                0, int(ocr_page_evidence.get("selected_ocr_page_count") or 0)
+            )
+        except (AttributeError, TypeError, ValueError):
+            observed_ocr_pages = 0
+            selected_ocr_pages = 0
         if backend == "pymupdf":
             counts["pymupdf_backend"] += 1
         elif backend == "unstructured":
@@ -21968,7 +22224,13 @@ def automatic_extraction_method_summary(summaries):
             counts["layout_backend"] += 1
         if ocr_used or selected_ocr_seconds > 0.0:
             counts["selected_output_ocr_pdfs"] += 1
-            counts["targeted_pages"] += len(target_pages)
+            # The historical list was a preflight plan, so it undercounted
+            # page-local OCR that was added after native candidate inspection.
+            # Prefer the retained page ledger; keep the plan only for older
+            # summaries that predate that evidence.
+            counts["targeted_pages"] += (
+                selected_ocr_pages or observed_ocr_pages or len(target_pages)
+            )
         elif comparison_ocr_seconds > 0.0:
             counts["comparison_only_ocr_pdfs"] += 1
 
@@ -23543,7 +23805,11 @@ def run_automatic_from_confirmation(*values, progress=gr.Progress(track_tqdm=Fal
                 try:
                     _write_automatic_run_json(
                         Path(reserved_run_root) / "anythingllm-mutation-compatibility.json",
-                        compatibility_report,
+                        (
+                            compact_native_mutation_authority(compatibility_report)
+                            if compatibility_report.get("status") == "pass"
+                            else compatibility_report
+                        ),
                     )
                 except OSError as exc:
                     APP_LOGGER.warning(
@@ -25588,6 +25854,28 @@ def automatic_ocr_outcome_line(summary):
     if block_reason:
         guidance = ocr_upload_hold_guidance(block_reason, reasons)
         return f"OCR outcome: {guidance['code']} — {guidance['message']}"
+
+    content_status = str(summary.get("ocr_content_status") or "")
+    quality_summary = dict(summary.get("ocr_page_quality_summary") or {})
+    observed_pages = sorted({
+        int(page)
+        for field in (
+            "sparse_relative_pages",
+            "front_matter_sparse_pages",
+            "low_signal_visual_pages",
+            "dense_corruption_suspected_pages",
+        )
+        for page in (quality_summary.get(field) or [])
+        if str(page).isdigit() and int(page) > 0
+    })
+    if content_status == "ready_with_ocr_quality_observations" and observed_pages:
+        page_label = ", ".join(str(page) for page in observed_pages[:8])
+        suffix = "" if len(observed_pages) <= 8 else ", …"
+        return (
+            "OCR outcome: OCR-assisted extraction was used. Page-quality observations were recorded "
+            f"for {len(observed_pages)} page(s) (PDF page(s): {page_label}{suffix}); "
+            "the observed source text was preserved and the observations did not block upload."
+        )
 
     if summary.get("ocr_assisted_extraction_used"):
         evidence = str(summary.get("ocr_assisted_extraction_evidence") or "OCR-capable backend").replace("_", " ")
@@ -28222,7 +28510,14 @@ def run_automatic(
             )
         compatibility_path = run_root / "anythingllm-mutation-compatibility.json"
         try:
-            _write_automatic_run_json(compatibility_path, compatibility_report)
+            _write_automatic_run_json(
+                compatibility_path,
+                (
+                    compact_native_mutation_authority(compatibility_report)
+                    if compatibility_report.get("status") == "pass"
+                    else compatibility_report
+                ),
+            )
         except OSError as exc:
             APP_LOGGER.warning("could not persist AnythingLLM mutation compatibility evidence: %s", exc)
         if compatibility_report.get("status") != "pass":
@@ -29760,6 +30055,11 @@ def run_automatic(
         if source_sha:
             selected_input_canonicals_by_sha[source_sha] = str(pdf_path)
         progress(start_fraction, desc=format_progress_desc(f"Preparing {pdf_path.name}", file_index, total_files))
+        out_dir = batch_output_directories[str(pdf_path)]
+        # Checkpoint expensive OCR pages only inside this source's current run
+        # directory. A safe worker restart for this run can resume completed
+        # pages, while a newly created run can never consume older OCR text.
+        ocr_checkpoint_dir = out_dir / ".ocr-page-checkpoints"
         args = SimpleNamespace(
             # Never allow a title inferred for (or left over from) one PDF to
             # become the page-parent base for every member of a batch. A
@@ -29846,11 +30146,7 @@ def run_automatic(
                 else None
             ),
             unstructured_circuit_breaker=unstructured_circuit_breaker,
-            # OCR output is expensive but deterministic only within its exact
-            # source/runtime identity.  The extractor validates that identity
-            # before reuse; this durable cache never changes an existing
-            # AnythingLLM payload or a completed run's artifacts.
-            unstructured_ocr_cache_dir=str(AUTO_OUTPUT_DIR / "_unstructured-ocr-cache"),
+            unstructured_ocr_checkpoint_dir=str(ocr_checkpoint_dir),
             # Hashing happens just before this worker starts, so a later
             # selected byte-identical path can be skipped before extraction.
             # The pipeline verifies the stat fingerprint and streams a new hash
@@ -29862,7 +30158,6 @@ def run_automatic(
             temporary_validation_cleanup_policy="cleanup_always",
             cancel_callback=lambda root=run_root: automatic_run_cancellation_requested(root),
         )
-        out_dir = batch_output_directories[str(pdf_path)]
         try:
             worker_result = execute_automatic_preparation_in_worker(
                 pdf_path,
@@ -30126,6 +30421,19 @@ def run_automatic(
                     summary["runtime_recovery"] = runtime_recovery
                     summary["runtime_retry_after_desktop_start"] = True
                     worker_result = retry_result
+            try:
+                shutil.rmtree(ocr_checkpoint_dir)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                # Checkpoint cleanup is local housekeeping after an otherwise
+                # successful source. It must not turn proven output into a
+                # failed run, but the app log retains the cleanup problem.
+                APP_LOGGER.warning(
+                    "could not remove completed run-local OCR checkpoints %s: %s",
+                    ocr_checkpoint_dir,
+                    exc,
+                )
             worker_context = worker_result.get("batch_inspection_context")
             if isinstance(worker_context, dict):
                 batch_inspection_context.update(worker_context)
@@ -30316,7 +30624,7 @@ def run_automatic(
                 downloadable.append(summary[key])
         if summary.get("upload_file"):
             base_dir = Path(summary["upload_file"]).parent
-            for derived in ["metadata-ratio.csv", "outline-validation.csv", "native-header-chunk-audit.csv"]:
+            for derived in ["outline-validation.csv", "native-header-chunk-audit.csv"]:
                 candidate = base_dir / derived
                 if candidate.exists():
                     downloadable.append(str(candidate))
@@ -31677,15 +31985,37 @@ def run_automatic(
     if slow_stage_note:
         completion["message"] = f"{completion['message']} {slow_stage_note}"
     if not flat_no_logs_complete:
+        terminal_processing_settings = {
+            **dict(processing_settings or {}),
+            "successful_output_retention": {
+                "status": str(batch_retention_report.get("status") or "not_required"),
+                "documents": len(batch_retention_report.get("documents") or []),
+            },
+            "output_capacity_preflight": {
+                "status": str((batch_capacity or {}).get("status") or "not_recorded"),
+                "projected_bytes": int((batch_capacity or {}).get("projected_bytes") or 0),
+                "available_bytes": int((batch_capacity or {}).get("available_bytes") or 0),
+            },
+        }
         append_ingestion_history(
             run_root,
             summaries,
             completion,
             prepare_and_upload,
             workspace_slug,
-            processing_settings=processing_settings,
+            processing_settings=terminal_processing_settings,
             mode=mode,
         )
+        if (
+            completion["state"] == "successful"
+            and batch_retention_report.get("status") == "complete"
+        ):
+            root_cleanup = compact_successful_automatic_batch_root(run_root)
+            if root_cleanup["pending"]:
+                APP_LOGGER.warning(
+                    "successful batch root cleanup left %s active/recovery artifact(s)",
+                    len(root_cleanup["pending"]),
+                )
     if flat_no_logs_output_dir:
         lines[0] = f"Output folder: {flat_no_logs_output_dir}"
     display_status = "completed" if completion["state"] == "successful" else completion["state"]
@@ -32620,7 +32950,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     interactive=True,
                 )
                 generate_inline_fallback = gr.Checkbox(
-                    value=True,
+                    value=builtin_automatic_run_setting_values()["generate_inline_fallback"],
                     label="Generate inline metadata fallback files",
                 )
                 retain_detailed_evidence = gr.Checkbox(

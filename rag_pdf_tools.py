@@ -63,14 +63,10 @@ UNSTRUCTURED_OCR_PAGE_TIMEOUT_SECONDS_MIN = 30
 UNSTRUCTURED_OCR_PAGE_TIMEOUT_SECONDS_MAX = 1800
 UNSTRUCTURED_OCR_PAGE_GROUP_SIZE_DEFAULT = 12
 UNSTRUCTURED_OCR_PAGE_GROUP_SIZE_MAX = 32
-# The cache contains prepared element text, including the conservative
-# category cleanup below. Increment this whenever prepared text changes so an
-# older noisy OCR cache is never silently reused as current output.
-# Schema 20 changes photographed-spread OCR from one full-page reading stream
-# to fold-gated left/right reading regions.  Reusing a schema-19 result here
-# can silently restore the old interleaved reading order, so this is a content
-# compatibility boundary rather than a cosmetic cache bump.
-UNSTRUCTURED_OCR_CACHE_SCHEMA_VERSION = 20
+# OCR page checkpoints are deliberately scoped to one run directory. Their
+# schema protects a restarted worker inside that run from incompatible page
+# data; unlike the retired shared OCR cache, a new run never consults them.
+UNSTRUCTURED_OCR_CHECKPOINT_SCHEMA_VERSION = 1
 # A photographed page benefits from a small, deterministic outer-margin crop
 # before OCR.  It removes scanner borders and handwritten marginalia without
 # changing the source-page identity or trying to reconstruct a new PDF.
@@ -639,12 +635,12 @@ def _normalized_ocr_page_numbers(page_numbers, source_page_count=None):
     return sorted(normalized)
 
 
-def _unstructured_ocr_cache_identity(pdf_path: Path, strategy: str, runtime: dict, page_numbers=None) -> dict:
-    """Return only stable, non-sensitive cache identity fields.
+def _unstructured_ocr_checkpoint_identity(pdf_path: Path, strategy: str, runtime: dict, page_numbers=None) -> dict:
+    """Return stable, non-sensitive identity fields for a run-local checkpoint.
 
-    A cache hit must never cross a source change, strategy change, package
-    upgrade, or Tesseract executable change.  The actual extracted text is
-    intentionally stored only in the local cache payload, never in logs.
+    A checkpoint hit must never cross a source change, strategy change,
+    package upgrade, or Tesseract executable change. The caller supplies a
+    directory inside the current run, preventing reuse by independent runs.
     """
     source = Path(pdf_path)
     tesseract_path = Path(str((runtime or {}).get("tesseract_executable") or ""))
@@ -658,7 +654,7 @@ def _unstructured_ocr_cache_identity(pdf_path: Path, strategy: str, runtime: dic
     except OSError:
         tesseract_identity = {"path": str(tesseract_path), "missing": True}
     return {
-        "schema_version": UNSTRUCTURED_OCR_CACHE_SCHEMA_VERSION,
+        "schema_version": UNSTRUCTURED_OCR_CHECKPOINT_SCHEMA_VERSION,
         "source_sha256": _versioned_file_sha256(source),
         "strategy": str(strategy or "").casefold(),
         "unstructured_version": _unstructured_package_version(),
@@ -670,31 +666,31 @@ def _unstructured_ocr_cache_identity(pdf_path: Path, strategy: str, runtime: dic
     }
 
 
-def _unstructured_ocr_cache_path(cache_dir, identity: dict) -> Path | None:
-    if not cache_dir:
+def _unstructured_ocr_checkpoint_path(checkpoint_dir, identity: dict) -> Path | None:
+    if not checkpoint_dir:
         return None
     try:
         encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
         key = hashlib.sha256(encoded).hexdigest()
-        root = Path(cache_dir)
-        return root / f"unstructured-ocr-{key}.json"
+        root = Path(checkpoint_dir)
+        return root / f"unstructured-page-checkpoint-{key}.json"
     except (OSError, TypeError, ValueError):
         return None
 
 
-def load_unstructured_ocr_cache(pdf_path: Path, strategy: str, runtime: dict, cache_dir=None, page_numbers=None):
-    """Load a validated local OCR cache entry, or return ``None``.
+def load_unstructured_ocr_checkpoint(pdf_path: Path, strategy: str, runtime: dict, checkpoint_dir=None, page_numbers=None):
+    """Load a validated OCR page checkpoint belonging to the current run.
 
-    Corrupt/incomplete cache files are ignored rather than turning an ordinary
+    Corrupt/incomplete checkpoint files are ignored rather than turning an ordinary
     extraction into a failure.  The caller can simply re-run OCR and replace
     the entry atomically.
     """
-    if not cache_dir:
+    if not checkpoint_dir:
         return None
     try:
         requested_pages = _normalized_ocr_page_numbers(page_numbers)
-        identity = _unstructured_ocr_cache_identity(pdf_path, strategy, runtime, requested_pages)
-        path = _unstructured_ocr_cache_path(cache_dir, identity)
+        identity = _unstructured_ocr_checkpoint_identity(pdf_path, strategy, runtime, requested_pages)
+        path = _unstructured_ocr_checkpoint_path(checkpoint_dir, identity)
         if not path or not path.is_file():
             return None
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -711,7 +707,7 @@ def load_unstructured_ocr_cache(pdf_path: Path, strategy: str, runtime: dict, ca
             return None
         for page in pages:
             page["unstructured_execution"] = {
-                "mode": "persistent_ocr_cache_hit",
+                "mode": "run_local_ocr_checkpoint_hit",
                 "requested_workers": 0,
                 "actual_workers": 0,
                 "strategy": str(strategy or "").casefold(),
@@ -724,18 +720,18 @@ def load_unstructured_ocr_cache(pdf_path: Path, strategy: str, runtime: dict, ca
         return None
 
 
-def save_unstructured_ocr_cache(
+def save_unstructured_ocr_checkpoint(
     pdf_path: Path,
     strategy: str,
     runtime: dict,
-    cache_dir,
+    checkpoint_dir,
     pages,
     page_count,
     element_rows,
     page_numbers=None,
 ):
-    """Persist a complete OCR result atomically and return its local path."""
-    if not cache_dir or not pages or int(page_count or 0) <= 0:
+    """Persist a complete run-local OCR page checkpoint atomically."""
+    if not checkpoint_dir or not pages or int(page_count or 0) <= 0:
         return ""
     try:
         requested_pages = _normalized_ocr_page_numbers(page_numbers, page_count)
@@ -743,8 +739,8 @@ def save_unstructured_ocr_cache(
         expected_pages = requested_pages or list(range(1, int(page_count) + 1))
         if observed_pages != expected_pages:
             return ""
-        identity = _unstructured_ocr_cache_identity(pdf_path, strategy, runtime, requested_pages)
-        path = _unstructured_ocr_cache_path(cache_dir, identity)
+        identity = _unstructured_ocr_checkpoint_identity(pdf_path, strategy, runtime, requested_pages)
+        path = _unstructured_ocr_checkpoint_path(checkpoint_dir, identity)
         if not path:
             return ""
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1418,7 +1414,7 @@ def _unstructured_elements_to_pages(elements, *, page_offset=0, expected_page=No
     return pages, element_rows
 
 
-def photographed_page_ocr_regions(page, runtime):
+def photographed_page_ocr_regions(page, runtime, *, page_number=None):
     """Return OCR-ready reading regions for a visually identified photo page.
 
     The PDF page number remains the only citation page.  A future true-spread
@@ -1452,7 +1448,43 @@ def photographed_page_ocr_regions(page, runtime):
     # A continuous dark fold is required before we even consider two regions.
     gutter_fraction = photographed_fold_gutter_fraction(image, ImageStat)
     spread_specs = photographed_spread_crop_specs(width, height, gutter_fraction)
+    route_recovery = None
+    portrait_sliver = photographed_portrait_neighbour_sliver(image, ImageOps) if not spread_specs else None
+    if portrait_sliver:
+        full_text = _ocr_photographed_crop(image, PHOTOGRAPHED_PAGE_CROP, tesseract, ImageOps)
+        narrow_text = _ocr_photographed_crop(image, portrait_sliver["narrow_crop_fraction"], tesseract, ImageOps)
+        dominant_text = _ocr_photographed_crop(image, portrait_sliver["dominant_crop_fraction"], tesseract, ImageOps)
+        narrow_quality = photographed_ocr_text_quality(narrow_text)
+        dominant_quality = photographed_ocr_text_quality(dominant_text)
+        if len(full_text) >= 80 and narrow_quality["word_count"] >= 8 and dominant_quality["word_count"] >= 80:
+            left, top, right, bottom = PHOTOGRAPHED_PAGE_CROP
+            return [{
+                "text": full_text,
+                "reading_region": "full_page_inner_crop",
+                "reading_region_index": 1,
+                "reading_region_count": 1,
+                "source_column_index": 1,
+                "ocr_method": "tesseract_photographed_page_crop",
+                "annotations_excluded": "outer_margin_crop",
+                "crop_fraction": [left, top, right, bottom],
+                "ocr_route_recovery": {
+                    "attempted": True,
+                    "initial_route": "portrait_page_with_edge_fold",
+                    "selected_route": "pending_neighbour_sliver_resolution",
+                    "reason": "narrow_edge_text_separated_by_continuous_fold",
+                    "region_word_counts": [narrow_quality["word_count"], dominant_quality["word_count"]],
+                },
+                "_neighbour_page_runover_candidate": {
+                    "side": portrait_sliver["side"],
+                    "narrow_text": narrow_text,
+                    "dominant_text": dominant_text,
+                    "dominant_crop_fraction": list(portrait_sliver["dominant_crop_fraction"]),
+                    "geometry_confidence": "high",
+                    "geometry_evidence": dict(portrait_sliver),
+                },
+            }]
     if spread_specs:
+        precomputed_region_texts = {}
         crop_widths = [fraction[2] - fraction[0] for _name, _index, fraction in spread_specs]
         if min(crop_widths) / max(crop_widths) < .58:
             # Keep the complete page for now.  The narrow strip is only
@@ -1463,6 +1495,8 @@ def photographed_page_ocr_regions(page, runtime):
             full_text = _ocr_photographed_crop(image, PHOTOGRAPHED_PAGE_CROP, tesseract, ImageOps)
             narrow_text = _ocr_photographed_crop(image, spread_specs[narrow_index][2], tesseract, ImageOps)
             dominant_text = _ocr_photographed_crop(image, spread_specs[dominant_index][2], tesseract, ImageOps)
+            precomputed_region_texts[narrow_index] = narrow_text
+            precomputed_region_texts[dominant_index] = dominant_text
             if len(full_text) >= 80 and len(narrow_text) >= 24 and len(dominant_text) >= 160:
                 left, top, right, bottom = PHOTOGRAPHED_PAGE_CROP
                 return [{
@@ -1474,6 +1508,16 @@ def photographed_page_ocr_regions(page, runtime):
                     "ocr_method": "tesseract_photographed_page_crop",
                     "annotations_excluded": "outer_margin_crop",
                     "crop_fraction": [left, top, right, bottom],
+                    "ocr_route_recovery": {
+                        "attempted": True,
+                        "initial_route": "confirmed_fold_spread_split",
+                        "selected_route": "asymmetric_fold_full_page_preservation",
+                        "reason": "narrow_fold_side_contains_plausible_text",
+                        "region_word_counts": [
+                            photographed_ocr_text_quality(narrow_text)["word_count"],
+                            photographed_ocr_text_quality(dominant_text)["word_count"],
+                        ],
+                    },
                     "_neighbour_page_runover_candidate": {
                         "side": spread_specs[narrow_index][0],
                         "narrow_text": narrow_text,
@@ -1482,10 +1526,20 @@ def photographed_page_ocr_regions(page, runtime):
                     },
                 }]
         region_texts = []
+        resolved_spread_specs = []
+        crop_adjustments = []
         for name, index, fraction in spread_specs:
-            text = _ocr_photographed_crop(image, fraction, tesseract, ImageOps)
+            resolved_fraction, crop_adjustment = adaptive_ocr_crop_fraction(
+                image, fraction, ImageOps, max_expand=.018
+            )
+            resolved_spread_specs.append((name, index, resolved_fraction))
+            crop_adjustments.append(crop_adjustment)
+        for region_position, (name, index, fraction) in enumerate(resolved_spread_specs):
+            text = precomputed_region_texts.get(region_position)
+            if text is None:
+                text = _ocr_photographed_crop(image, fraction, tesseract, ImageOps)
             region_texts.append(text)
-        if keep_photographed_spread_regions(spread_specs, region_texts):
+        if keep_photographed_spread_regions(resolved_spread_specs, region_texts):
             return [
                 {
                     "text": text,
@@ -1496,9 +1550,22 @@ def photographed_page_ocr_regions(page, runtime):
                     "ocr_method": "tesseract_photographed_spread_crop",
                     "annotations_excluded": "outer_margin_crop",
                     "crop_fraction": list(fraction),
+                    "crop_adjustment": crop_adjustment,
                 }
-                for (name, index, fraction), text in zip(spread_specs, region_texts)
+                for (name, index, fraction), text, crop_adjustment in zip(
+                    resolved_spread_specs, region_texts, crop_adjustments
+                )
             ]
+        route_recovery = {
+            "attempted": True,
+            "initial_route": "confirmed_fold_spread_split",
+            "selected_route": "pending_embedded_or_full_page_recovery",
+            "reason": "one_or_more_fold_regions_below_prose_threshold",
+            "region_word_counts": [
+                photographed_ocr_text_quality(text)["word_count"]
+                for text in region_texts
+            ],
+        }
 
     # A photographed two-page spread is commonly stored as one substantial
     # embedded image.  It must pass through the fold-gated split above before
@@ -1507,8 +1574,92 @@ def photographed_page_ocr_regions(page, runtime):
     # landscape pages without a strong fold retain the established path.
     embedded_fraction = embedded_scanned_image_fraction(page)
     if embedded_fraction:
+        column_evidence = photographed_three_column_signal(image, ImageOps)
+        if column_evidence["detected"]:
+            text = _ocr_photographed_crop(
+                image, embedded_fraction, tesseract, ImageOps, psm=3
+            )
+            drop_cap_reference = _ocr_photographed_crop(
+                image, embedded_fraction, tesseract, ImageOps, psm=4
+            ) if int(page_number or 0) == 1 else ""
+            text, drop_cap_evidence = recover_opening_three_column_drop_cap(
+                text,
+                drop_cap_reference,
+                image,
+                tesseract,
+                ImageOps,
+                page_number=page_number,
+            )
+            text, byline_evidence = relocate_unique_opening_ocr_byline(
+                text, page_number=page_number
+            )
+            if len(text) >= 80:
+                if route_recovery:
+                    route_recovery["selected_route"] = "embedded_three_column_document"
+                return [{
+                    "text": text,
+                    "reading_region": "embedded_scanned_three_column_document",
+                    "reading_region_index": 1,
+                    "reading_region_count": 1,
+                    "source_column_index": 1,
+                    "ocr_method": "tesseract_embedded_three_column_document_crop",
+                    "annotations_excluded": "embedded_image_bounds_and_outer_margin_crop",
+                    "crop_fraction": list(embedded_fraction),
+                    "column_preprocessing": {
+                        **column_evidence,
+                        "psm": 3,
+                        "reading_order": "automatic_column_first",
+                        "byline": byline_evidence,
+                        "drop_cap": drop_cap_evidence,
+                    },
+                    **({"ocr_route_recovery": route_recovery} if route_recovery else {}),
+                }]
+        embedded_fraction, crop_adjustment = adaptive_ocr_crop_fraction(image, embedded_fraction, ImageOps)
         text = _ocr_photographed_crop(image, embedded_fraction, tesseract, ImageOps)
-        if len(text) >= 80:
+        if len(text) < 80 and int(page_number or 0) <= 2:
+            display_text = _ocr_photographed_crop(image, embedded_fraction, tesseract, ImageOps, psm=3)
+            if credible_short_ocr_display_text(display_text):
+                text = display_text
+        embedded_quality = photographed_ocr_text_quality(text)
+        crop_boundary = ocr_crop_boundary_evidence(image, embedded_fraction, ImageOps)
+        retry_evidence = {
+            "attempted": False,
+            "reason": "embedded_crop_recovery_sufficient",
+            "embedded_crop": embedded_quality,
+            "crop_boundary": crop_boundary,
+        }
+        # PDF image rectangles can be misleading on rotated or transformed
+        # wrapper pages. A weak result is therefore checked once against the
+        # rendered page's conservative inner crop. Strong ordinary scan pages
+        # do not incur this second OCR call.
+        weak_embedded_recovery = embedded_scan_crop_needs_full_page_retry(
+            embedded_fraction, embedded_quality, crop_boundary
+        )
+        if weak_embedded_recovery:
+            full_text = _ocr_photographed_crop(
+                image, PHOTOGRAPHED_PAGE_CROP, tesseract, ImageOps
+            )
+            full_quality = photographed_ocr_text_quality(full_text)
+            materially_better_full_page = full_page_ocr_retry_materially_better(
+                embedded_quality, full_quality
+            )
+            retry_evidence = {
+                "attempted": True,
+                "reason": (
+                    "full_page_retry_selected"
+                    if materially_better_full_page
+                    else "embedded_crop_retained"
+                ),
+                "embedded_crop": embedded_quality,
+                "full_page_inner_crop": full_quality,
+                "crop_boundary": crop_boundary,
+            }
+            if materially_better_full_page:
+                text = full_text
+                embedded_fraction = PHOTOGRAPHED_PAGE_CROP
+        if len(text) >= 80 or credible_short_ocr_display_text(text):
+            if route_recovery:
+                route_recovery["selected_route"] = "embedded_scan_bounds"
             return [{
                 "text": text,
                 "reading_region": "embedded_scanned_document",
@@ -1518,6 +1669,9 @@ def photographed_page_ocr_regions(page, runtime):
                 "ocr_method": "tesseract_embedded_scanned_document_crop",
                 "annotations_excluded": "embedded_image_bounds_and_outer_margin_crop",
                 "crop_fraction": list(embedded_fraction),
+                "crop_adjustment": crop_adjustment,
+                "ocr_crop_retry": retry_evidence,
+                **({"ocr_route_recovery": route_recovery} if route_recovery else {}),
             }]
     if not photographed_page_visual_signal(page, image, ImageStat):
         return []
@@ -1525,8 +1679,14 @@ def photographed_page_ocr_regions(page, runtime):
 
     left, top, right, bottom = PHOTOGRAPHED_PAGE_CROP
     text = _ocr_photographed_crop(image, PHOTOGRAPHED_PAGE_CROP, tesseract, ImageOps)
+    if len(text) < 80 and int(page_number or 0) <= 2:
+        display_text = _ocr_photographed_crop(image, PHOTOGRAPHED_PAGE_CROP, tesseract, ImageOps, psm=3)
+        if credible_short_ocr_display_text(display_text):
+            text = display_text
     if len(text) < 80:
         return []
+    if route_recovery:
+        route_recovery["selected_route"] = "photographed_page_inner_crop"
     return [
         {
             "text": text,
@@ -1537,6 +1697,7 @@ def photographed_page_ocr_regions(page, runtime):
             "ocr_method": "tesseract_photographed_page_crop",
             "annotations_excluded": "outer_margin_crop",
             "crop_fraction": [left, top, right, bottom],
+            **({"ocr_route_recovery": route_recovery} if route_recovery else {}),
         }
     ]
 
@@ -1556,9 +1717,26 @@ def embedded_scanned_image_fraction(page):
         except Exception:
             continue
         for rect in rects:
-            coverage = max(0.0, float(rect.width * rect.height)) / page_area
+            # ``get_image_rects`` reports PDF coordinates before the page's
+            # display rotation, while ``page.rect`` and the rendered image used
+            # by the caller are rotation-aware.  Comparing those two spaces
+            # directly can turn a full-page scan into an apparently clipped
+            # 70-80% crop and remove the end of every OCR line.  Transform the
+            # provenance rectangle into displayed-page coordinates first.
+            try:
+                displayed_rect = fitz.Rect(rect)
+                if int(getattr(page, "rotation", 0) or 0) % 360:
+                    displayed_rect = displayed_rect * page.rotation_matrix
+                displayed_rect = displayed_rect & page.rect
+            except Exception:
+                continue
+            if displayed_rect.is_empty or displayed_rect.is_infinite:
+                continue
+            coverage = max(
+                0.0, float(displayed_rect.width * displayed_rect.height)
+            ) / page_area
             if coverage >= .28:
-                candidates.append((coverage, rect))
+                candidates.append((coverage, displayed_rect))
     if not candidates:
         return None
     _coverage, rect = max(candidates, key=lambda item: item[0])
@@ -1618,10 +1796,25 @@ def photographed_fold_gutter_fraction(image, image_stat):
         return float(image_stat.Stat(gray.crop((left, top, right, bottom))).mean[0])
 
     candidates = [(fraction, stripe_mean(fraction)) for fraction in [0.34 + step * .01 for step in range(33)]]
-    fraction, darkness = min(candidates, key=lambda item: item[1])
     side_values = [stripe_mean(.16), stripe_mean(.24), stripe_mean(.76), stripe_mean(.84)]
     side_baseline = sorted(side_values)[1:3]
     baseline = sum(side_baseline) / max(len(side_baseline), 1)
+    # Prefer a clean paper gutter when one exists. On bright book scans, the
+    # darkest stripe is commonly a body-text column rather than the binding;
+    # choosing it first creates an asymmetric split and can repeat OCR work.
+    # The established two-sided contrast requirement prevents a blank title
+    # leaf or an empty half-page from being mistaken for a spread.
+    light_fraction, lightness = max(candidates, key=lambda item: item[1])
+    left_content = min(stripe_mean(.24), stripe_mean(.38))
+    right_content = min(stripe_mean(.70), stripe_mean(.82))
+    if (
+        lightness >= 248.0
+        and lightness >= left_content + 18.0
+        and lightness >= right_content + 18.0
+    ):
+        return round(light_fraction, 3)
+
+    fraction, darkness = min(candidates, key=lambda item: item[1])
     # A true photographed fold is a vertically continuous shadow. Requiring
     # this contrast avoids splitting ordinary landscape pages or columns.
     if darkness <= baseline - max(18.0, baseline * .10):
@@ -1648,15 +1841,6 @@ def photographed_fold_gutter_fraction(image, image_stat):
     continuous_grey_shadow = sum(delta >= 7.0 for delta in band_deltas) >= 7
     if continuous_grey_shadow and statistics.median(band_deltas) >= 10.0:
         return round(fraction, 3)
-    light_fraction, lightness = max(candidates, key=lambda item: item[1])
-    left_content = min(stripe_mean(.24), stripe_mean(.38))
-    right_content = min(stripe_mean(.70), stripe_mean(.82))
-    if (
-        lightness >= 248.0
-        and lightness >= left_content + 18.0
-        and lightness >= right_content + 18.0
-    ):
-        return round(light_fraction, 3)
     return None
 
 
@@ -1671,6 +1855,126 @@ def photographed_spread_crop_specs(width, height, gutter_fraction=None):
     ]
 
 
+def _grayscale_pixels(image, image_ops, *, width=360, height=480):
+    gray = image_ops.grayscale(image).resize((width, height))
+    flattened = getattr(gray, "get_flattened_data", None)
+    raw_pixels: Any = flattened() if callable(flattened) else gray.getdata()
+    return list(raw_pixels), width, height
+
+
+def photographed_portrait_neighbour_sliver(image, image_ops):
+    """Nominate, but do not yet delete, a narrow facing-page strip."""
+    width, height = image.size
+    if width <= 0 or height <= 0 or width / height >= .90:
+        return None
+    pixels, sample_width, sample_height = _grayscale_pixels(image, image_ops, width=360, height=500)
+    top = int(sample_height * .08)
+    bottom = int(sample_height * .94)
+    body_height = max(1, bottom - top)
+    occupancy = [
+        sum(pixels[y * sample_width + x] < 165 for y in range(top, bottom)) / body_height
+        for x in range(sample_width)
+    ]
+    candidates = []
+    for side, low, high in (("left", .045, .19), ("right", .81, .955)):
+        start = int(sample_width * low)
+        end = max(start + 1, int(sample_width * high))
+        seam = max(range(start, end), key=occupancy.__getitem__)
+        seam_strength = occupancy[seam]
+        # Repeated prose lines can share the same left edge and make one
+        # ordinary text column look vertically dark. A fold must be a local
+        # peak, not merely the darkest x-coordinate in the outer band.
+        comparison_radius = max(5, int(sample_width * .019))
+        neighbours = (
+            occupancy[max(start, seam - comparison_radius):seam]
+            + occupancy[seam + 1:min(end, seam + comparison_radius + 1)]
+        )
+        local_baseline = statistics.median(neighbours) if neighbours else seam_strength
+        seam_contrast = seam_strength - local_baseline
+        fraction = seam / sample_width
+        narrow_width = fraction if side == "left" else 1.0 - fraction
+        if seam_strength >= .30 and seam_contrast >= .10 and .045 <= narrow_width <= .19:
+            candidates.append((seam_strength, seam_contrast, side, fraction))
+    if not candidates:
+        return None
+    seam_strength, seam_contrast, side, fraction = max(candidates)
+    gap = .012
+    if side == "left":
+        narrow = (.025, .045, max(.035, fraction - gap), .96)
+        dominant = (min(.965, fraction + gap), .045, .975, .96)
+    else:
+        narrow = (min(.965, fraction + gap), .045, .975, .96)
+        dominant = (.025, .045, max(.035, fraction - gap), .96)
+    return {
+        "side": side,
+        "seam_fraction": round(fraction, 4),
+        "seam_dark_occupancy": round(seam_strength, 4),
+        "seam_local_contrast": round(seam_contrast, 4),
+        "narrow_crop_fraction": narrow,
+        "dominant_crop_fraction": dominant,
+        "method": "portrait_edge_continuous_fold_v1",
+    }
+
+
+def ocr_crop_boundary_evidence(image, fraction, image_ops):
+    """Measure whether source ink touches a proposed OCR crop boundary."""
+    pixels, sample_width, sample_height = _grayscale_pixels(image, image_ops, width=360, height=480)
+    left, top, right, bottom = [float(value) for value in fraction]
+    x1 = max(0, min(sample_width - 1, int(left * sample_width)))
+    x2 = max(x1 + 1, min(sample_width, int(right * sample_width)))
+    y1 = max(0, min(sample_height - 1, int(top * sample_height)))
+    y2 = max(y1 + 1, min(sample_height, int(bottom * sample_height)))
+    band_x = max(2, int(sample_width * .006))
+    band_y = max(2, int(sample_height * .006))
+
+    def density(ax, ay, bx, by):
+        total = max(1, (bx - ax) * (by - ay))
+        return sum(
+            pixels[y * sample_width + x] < 190
+            for y in range(ay, by) for x in range(ax, bx)
+        ) / total
+
+    edges = {
+        "left": density(x1, y1, min(x2, x1 + band_x), y2),
+        "right": density(max(x1, x2 - band_x), y1, x2, y2),
+        "top": density(x1, y1, x2, min(y2, y1 + band_y)),
+        "bottom": density(x1, max(y1, y2 - band_y), x2, y2),
+    }
+    return {
+        "edge_ink_density": {key: round(value, 4) for key, value in edges.items()},
+        "ink_touches_boundary": any(value >= .035 for value in edges.values()),
+    }
+
+
+def adaptive_ocr_crop_fraction(image, fraction, image_ops, *, max_expand=.014):
+    """Expand only crop edges that visibly intersect source ink."""
+    original = tuple(float(value) for value in fraction)
+    evidence = ocr_crop_boundary_evidence(image, original, image_ops)
+    densities = evidence["edge_ink_density"]
+    left, top, right, bottom = original
+    expanded_edges = []
+    if densities["left"] >= .035 and left > .002:
+        left = max(.0, left - max_expand)
+        expanded_edges.append("left")
+    if densities["right"] >= .035 and right < .998:
+        right = min(1.0, right + max_expand)
+        expanded_edges.append("right")
+    if densities["top"] >= .035 and top > .002:
+        top = max(.0, top - max_expand)
+        expanded_edges.append("top")
+    if densities["bottom"] >= .035 and bottom < .998:
+        bottom = min(1.0, bottom + max_expand)
+        expanded_edges.append("bottom")
+    adjusted = (left, top, right, bottom)
+    return adjusted, {
+        "method": "edge_ink_bounded_expansion_v1",
+        "original_crop_fraction": list(original),
+        "adjusted_crop_fraction": list(adjusted),
+        "expanded_edges": expanded_edges,
+        **evidence,
+    }
+
+
 def keep_photographed_spread_regions(specs, region_texts):
     """Keep both regions only when doing so cannot discard plausible content."""
     if len(specs or []) != 2 or len(region_texts or []) != 2:
@@ -1682,6 +1986,274 @@ def keep_photographed_spread_regions(specs, region_texts):
         # evidence; use full-page OCR instead.
         return False
     return all(len(str(text or "")) >= 240 for text in region_texts)
+
+
+def photographed_three_column_signal(image, image_ops):
+    """Detect only a strong upper-page three-column gutter pattern.
+
+    The detector is intentionally cheap and conservative. It downsamples the
+    upper body of a photographed page and requires two nearly empty vertical
+    gutters in broad one-third/two-third search bands. Looking only at the
+    upper body lets a lower-page illustration coexist with three text columns,
+    while requiring both gutters rejects ordinary one/two-column pages, book
+    folds, and isolated internal whitespace.
+    """
+    gray = image_ops.grayscale(image)
+    width, height = gray.size
+    if width < 300 or height < 400:
+        return {"detected": False, "reason": "image_too_small", "gutters": []}
+    upper = gray.crop((
+        int(width * .04), int(height * .12),
+        int(width * .96), int(height * .42),
+    ))
+    sample_width = min(600, max(240, upper.width))
+    sample_height = min(240, max(120, upper.height))
+    sample = upper.resize((sample_width, sample_height))
+    flattened = getattr(sample, "get_flattened_data", None)
+    raw_pixels: Any = flattened() if callable(flattened) else sample.getdata()
+    pixels = list(raw_pixels)
+    row_ink = []
+    for y in range(sample_height):
+        offset = y * sample_width
+        ink = sum(pixels[offset + x] < 205 for x in range(sample_width))
+        row_ink.append(ink / sample_width)
+    text_rows = [index for index, ratio in enumerate(row_ink) if ratio > .008]
+    if len(text_rows) < max(18, int(sample_height * .16)):
+        return {"detected": False, "reason": "insufficient_text_rows", "gutters": []}
+    occupancy = []
+    for x in range(sample_width):
+        occupancy.append(
+            sum(pixels[y * sample_width + x] < 205 for y in text_rows)
+            / len(text_rows)
+        )
+    window = max(3, int(sample_width * .012))
+    smoothed = [
+        sum(occupancy[start:start + window]) / window
+        for start in range(sample_width - window + 1)
+    ]
+    gutters = []
+    for low, high in ((.23, .43), (.55, .77)):
+        start = min(len(smoothed) - 1, int(low * sample_width))
+        end = max(start + 1, min(len(smoothed), int(high * sample_width)))
+        position = min(range(start, end), key=smoothed.__getitem__)
+        gutters.append({
+            "x_fraction": round(position / sample_width, 3),
+            "ink_occupancy": round(float(smoothed[position]), 4),
+        })
+    column_ink = []
+    for low, high in ((.02, .29), (.36, .62), (.70, .98)):
+        start = min(len(occupancy) - 1, int(low * sample_width))
+        end = max(start + 1, min(len(occupancy), int(high * sample_width)))
+        column_ink.append(round(sum(occupancy[start:end]) / (end - start), 4))
+    gutter_evidence = all(gutter["ink_occupancy"] <= .01 for gutter in gutters)
+    # Blank half-pages and title leaves can contain two large empty bands but
+    # are not three-column documents. Require actual ink in all three column
+    # bodies as well as the two gutters.
+    column_evidence = all(value >= .018 for value in column_ink)
+    column_balance = max(column_ink) / max(min(column_ink), .0001) if column_ink else float("inf")
+    balanced_columns = column_balance <= 5.0
+    detected = gutter_evidence and column_evidence and balanced_columns
+    return {
+        "detected": detected,
+        "reason": (
+            "two_upper_page_gutters_and_three_inked_columns"
+            if detected
+            else "column_ink_imbalanced"
+            if gutter_evidence and column_evidence
+            else "column_ink_insufficient"
+            if gutter_evidence
+            else "gutter_evidence_insufficient"
+        ),
+        "gutters": gutters,
+        "column_ink_occupancy": column_ink,
+        "column_ink_balance_ratio": round(column_balance, 3),
+    }
+
+
+def relocate_unique_opening_ocr_byline(text, *, page_number=None):
+    """Move one exact first-page ``By Person`` line directly below the title.
+
+    PSM 3 correctly follows columns but may place a centered byline after the
+    first column. This function changes ordering only: it never edits or
+    invents name text, and it abstains unless exactly one constrained byline is
+    present on PDF page 1.
+    """
+    evidence = {"relocated": False, "reason": "not_first_pdf_page"}
+    if int(page_number or 0) != 1:
+        return str(text or ""), evidence
+    content = str(text or "")
+    lines = content.splitlines()
+    pattern = re.compile(
+        r"(?i:by|written by|story by)\s+"
+        r"[A-Z][A-Za-z.'’-]+(?:\s+[A-Z][A-Za-z.'’-]+){1,4}"
+    )
+    candidates = [
+        (index, line.strip())
+        for index, line in enumerate(lines)
+        if pattern.fullmatch(line.strip())
+    ]
+    if len(candidates) != 1:
+        return content, {
+            "relocated": False,
+            "reason": "exact_unique_byline_not_found",
+            "candidate_count": len(candidates),
+        }
+    index, byline = candidates[0]
+    nonempty = [position for position, line in enumerate(lines) if line.strip()]
+    if not nonempty:
+        return content, {"relocated": False, "reason": "empty_ocr_text"}
+    # A periodical masthead can precede the article title. Anchor after the
+    # final short heading immediately before the opening prose, rather than
+    # blindly treating the first OCR line as the title. If no early prose line
+    # makes that boundary clear, preserve the original order.
+    early_nonempty = nonempty[:12]
+    prose_index = next((
+        position
+        for position in early_nonempty
+        if (
+            len(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", lines[position])) >= 7
+            or re.search(r"[.!?][\"'’)]?\s*$", lines[position].strip())
+        )
+    ), None)
+    heading_indexes = [
+        position
+        for position in early_nonempty
+        if prose_index is not None and position < prose_index and position != index
+    ]
+    if not heading_indexes:
+        return content, {
+            "relocated": False,
+            "reason": "opening_title_boundary_unclear",
+            "candidate_count": 1,
+        }
+    title_index = heading_indexes[-1]
+    if index <= title_index + 2:
+        return content, {
+            "relocated": False,
+            "reason": "already_adjacent_to_title",
+            "candidate_count": 1,
+        }
+    del lines[index]
+    while (
+        index < len(lines)
+        and index > 0
+        and not lines[index].strip()
+        and not lines[index - 1].strip()
+    ):
+        del lines[index]
+    lines[title_index + 1:title_index + 1] = ["", byline, ""]
+    return "\n".join(lines).strip() + "\n", {
+        "relocated": True,
+        "reason": "single_exact_opening_byline",
+        "candidate_count": 1,
+        "byline": byline,
+    }
+
+
+def recover_opening_three_column_drop_cap(
+    text, reference_text, image, tesseract, image_ops, *, page_number=None
+):
+    """Recover one oversized opening glyph from its image component.
+
+    The glyph is read from a tightly bounded connected component.  A second
+    layout mode supplies only the following uppercase token.  No dictionary,
+    fuzzy word substitution, or invented punctuation is involved.
+    """
+    evidence = {"recovered": False, "reason": "not_first_pdf_page"}
+    if int(page_number or 0) != 1:
+        return str(text or ""), evidence
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return str(text or ""), {"recovered": False, "reason": "component_runtime_unavailable"}
+    gray = np.array(image_ops.grayscale(image))
+    mask = (gray < 140).astype("uint8")
+    _count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, 8)
+    height, width = gray.shape[:2]
+    candidates = []
+    for x, y, component_width, component_height, area in stats[1:]:
+        if (
+            x < width * .22
+            and height * .04 < y < height * .38
+            and height * .025 < component_height < height * .12
+            and width * .01 < component_width < width * .12
+        ):
+            candidates.append((int(area), int(x), int(y), int(component_width), int(component_height)))
+    if not candidates:
+        return str(text or ""), {"recovered": False, "reason": "oversized_opening_component_not_found"}
+    _area, x, y, component_width, component_height = max(candidates)
+    pad = .01
+    fraction = (
+        max(0.0, x / width - pad),
+        max(0.0, y / height - pad),
+        min(1.0, (x + component_width) / width + pad),
+        min(1.0, (y + component_height) / height + pad),
+    )
+    glyph_text = normalize_text(
+        _ocr_photographed_crop(image, fraction, tesseract, image_ops, psm=13)
+    )
+    glyph_match = re.fullmatch(r"([A-Za-z])[.:]?", glyph_text)
+    if not glyph_match:
+        return str(text or ""), {
+            "recovered": False,
+            "reason": "component_did_not_resolve_to_one_glyph",
+            "component_crop_fraction": list(fraction),
+        }
+    glyph = glyph_match.group(1).upper()
+
+    def first_prose_token(content):
+        for line in str(content or "").splitlines():
+            words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", line)
+            if (
+                len(words) >= 5
+                and 2 <= len(words[0]) <= 5
+                and words[0].isupper()
+                and not words[1].isupper()
+            ):
+                return words[0]
+        return ""
+
+    reference_token = first_prose_token(reference_text)
+    if not reference_token or reference_token.startswith(glyph):
+        return str(text or ""), {
+            "recovered": False,
+            "reason": "independent_following_token_not_available",
+            "glyph": glyph,
+            "component_crop_fraction": list(fraction),
+        }
+    completed_token = glyph + reference_token
+    lines = str(text or "").splitlines()
+    for index, line in enumerate(lines):
+        words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", line)
+        if len(words) < 5 or not words[0].isupper():
+            continue
+        observed_token = words[0]
+        if observed_token != reference_token and not observed_token.endswith(reference_token):
+            continue
+        match = re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", line)
+        if not match:
+            continue
+        prefix = line[:match.start()]
+        if not re.search(r"[A-Za-z0-9]", prefix):
+            prefix = ""
+        lines[index] = prefix + completed_token + line[match.end():]
+        return "\n".join(lines), {
+            "recovered": True,
+            "reason": "geometry_glyph_plus_independent_following_token",
+            "glyph": glyph,
+            "reference_token": reference_token,
+            "observed_token": observed_token,
+            "completed_token": completed_token,
+            "component_crop_fraction": list(fraction),
+        }
+    return str(text or ""), {
+        "recovered": False,
+        "reason": "reading_order_token_not_aligned",
+        "glyph": glyph,
+        "reference_token": reference_token,
+        "component_crop_fraction": list(fraction),
+    }
 
 
 def neighbour_fragment_match(candidate_text, adjacent_text):
@@ -1737,7 +2309,11 @@ def resolve_confirmed_neighbour_runovers(pages):
             "side": candidate.get("side") or "",
             **match,
         }
-        if not match["confirmed"]:
+        geometry_confirmed = str(candidate.get("geometry_confidence") or "") == "high"
+        preprocessing["neighbour_page_runover"]["geometry_confidence"] = (
+            "high" if geometry_confirmed else "not_established"
+        )
+        if not match["confirmed"] and not geometry_confirmed:
             preprocessing["neighbour_page_runover"]["decision"] = "ambiguous_retained"
             continue
         regions = row.get("reading_regions") or []
@@ -1748,11 +2324,17 @@ def resolve_confirmed_neighbour_runovers(pages):
         region["crop_fraction"] = list(candidate.get("dominant_crop_fraction") or region.get("crop_fraction") or [])
         region["annotations_excluded"] = "outer_margin_crop_and_confirmed_neighbour_page_runover"
         row["text"] = region["text"]
-        preprocessing["neighbour_page_runover"]["decision"] = "confirmed_excluded"
+        preprocessing["neighbour_page_runover"]["decision"] = (
+            "geometry_confirmed_excluded"
+            if geometry_confirmed and not match["confirmed"]
+            else "confirmed_excluded"
+        )
+        if candidate.get("geometry_evidence"):
+            preprocessing["neighbour_page_runover"]["geometry_evidence"] = dict(candidate["geometry_evidence"])
     return pages
 
 
-def _ocr_photographed_crop(image, fraction, tesseract, image_ops):
+def _ocr_photographed_crop(image, fraction, tesseract, image_ops, *, psm=4):
     """OCR one visual region, retaining only text suitable for preparation."""
     width, height = image.size
     left, top, right, bottom = fraction
@@ -1765,7 +2347,7 @@ def _ocr_photographed_crop(image, fraction, tesseract, image_ops):
         cropped.save(image_path)
         try:
             completed = subprocess.run(
-                [tesseract, str(image_path), "stdout", "--psm", "4", "-l", "eng"],
+                [tesseract, str(image_path), "stdout", "--psm", str(int(psm)), "-l", "eng"],
                 capture_output=True,
                 text=True,
                 timeout=90,
@@ -1776,6 +2358,69 @@ def _ocr_photographed_crop(image, fraction, tesseract, image_ops):
     if completed.returncode != 0:
         return ""
     return clean_photographed_ocr_text(completed.stdout)
+
+
+def photographed_ocr_text_quality(text):
+    """Return narrow lexical evidence for choosing between OCR crops.
+
+    This is not a language-quality score and never rewrites words. It exists
+    only to notice a crop that returned a small collection of line fragments
+    while a bounded full-page retry recovered substantially more coherent
+    material from the same source page.
+    """
+    content = str(text or "")
+    words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+(?:['’-][A-Za-zÀ-ÖØ-öø-ÿ]+)?", content)
+    short_words = sum(1 for word in words if len(word) <= 2)
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    fragment_lines = sum(
+        1
+        for line in lines
+        if len(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", line)) <= 3
+    )
+    return {
+        "word_count": len(words),
+        "line_count": len(lines),
+        "short_word_ratio": round(short_words / max(len(words), 1), 4),
+        "fragment_line_ratio": round(fragment_lines / max(len(lines), 1), 4),
+    }
+
+
+def embedded_scan_crop_needs_full_page_retry(crop_fraction, quality, crop_boundary=None):
+    """Retry only weak OCR from a suspiciously clipped embedded image box."""
+    left, top, right, bottom = crop_fraction
+    clipped_wrapper = (right - left) < .82 or (bottom - top) < .82
+    weak_recovery = (
+        quality["word_count"] < 180
+        or quality["fragment_line_ratio"] >= .35
+    )
+    boundary_clipping = bool((crop_boundary or {}).get("ink_touches_boundary"))
+    return bool(clipped_wrapper and (weak_recovery or boundary_clipping))
+
+
+def credible_short_ocr_display_text(text):
+    """Accept a short title/part leaf only when its OCR shape is unambiguous."""
+    content = normalize_text(text)
+    words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", content)
+    letters = "".join(words)
+    if not (2 <= len(words) <= 12 and 7 <= len(letters) <= 100):
+        return False
+    if len(content.splitlines()) > 5:
+        return False
+    uppercase = letters == letters.upper()
+    title_case = sum(word[:1].isupper() for word in words) >= max(2, len(words) - 1)
+    return bool(uppercase or title_case)
+
+
+def full_page_ocr_retry_materially_better(embedded_quality, full_quality):
+    """Select a retry only when it clearly recovers omitted page content."""
+    return bool(
+        full_quality["word_count"] >= max(
+            embedded_quality["word_count"] + 60,
+            math.ceil(embedded_quality["word_count"] * 1.45),
+        )
+        and full_quality["fragment_line_ratio"]
+        <= embedded_quality["fragment_line_ratio"] + .10
+    )
 
 
 def clean_photographed_ocr_text(text):
@@ -1806,22 +2451,37 @@ def clean_photographed_ocr_text(text):
 def _photographed_page_result(source, page_index, runtime):
     """Build a page result when local crop OCR safely handles a photograph."""
     page = source.load_page(page_index)
-    regions = photographed_page_ocr_regions(page, runtime)
+    regions = photographed_page_ocr_regions(
+        page, runtime, page_number=page_index + 1
+    )
     if not regions:
         return None
     page_number = page_index + 1
     runover_candidate = regions[0].pop("_neighbour_page_runover_candidate", None)
+    region_methods = [str(region.get("ocr_method") or "") for region in regions]
+    if region_methods and all(
+        method == "tesseract_photographed_spread_crop" for method in region_methods
+    ):
+        selected_route = "confirmed_fold_spread_split"
+    elif "tesseract_embedded_three_column_document_crop" in region_methods:
+        selected_route = "embedded_three_column_document"
+    elif "tesseract_embedded_scanned_document_crop" in region_methods:
+        selected_route = "embedded_scan_bounds"
+    else:
+        selected_route = "photographed_page_inner_crop"
+    combined_text = "\n\n".join(region["text"] for region in regions)
     page_row = {
         "page": page_number,
-        "text": "\n\n".join(region["text"] for region in regions),
+        "text": combined_text,
         "kind": "photographed_page_crop_ocr",
         "reading_regions": regions,
         "spread_preprocessing": {
             "status": "applied",
-            "path": "photographed_page_inner_crop",
+            "path": selected_route,
             "source_pdf_page": page_number,
             "logical_page_preserved": True,
             "annotations_excluded": "outer_margin_crop",
+            "selection_policy": "deterministic_page_evidence_with_bounded_recovery",
         },
     }
     if runover_candidate:
@@ -1834,8 +2494,8 @@ def _photographed_page_result(source, page_index, runtime):
                 "element_index": 1,
                 "pdf_page": page_number,
                 "category": "PhotographedPageCropOCR",
-                "chars": len(regions[0]["text"]),
-                "preview": normalize_text(regions[0]["text"])[:250],
+                "chars": len(combined_text),
+                "preview": normalize_text(combined_text)[:250],
             }
         ],
     }
@@ -2044,7 +2704,7 @@ def get_pages_with_unstructured(
     pdf_path: Path,
     strategy: str,
     runtime_probe=None,
-    cache_dir=None,
+    checkpoint_dir=None,
     progress_callback=None,
     page_numbers=None,
 ):
@@ -2059,11 +2719,11 @@ def get_pages_with_unstructured(
     # strategies receive the bounded per-page process lane. The parent still
     # owns candidate scoring, artifacts, AnythingLLM mutation, and progress.
     if resolved_strategy in {"hi_res", "ocr_only"} and pdf_path.exists():
-        cached = load_unstructured_ocr_cache(
+        cached = load_unstructured_ocr_checkpoint(
             pdf_path,
             resolved_strategy,
             runtime,
-            cache_dir,
+            checkpoint_dir,
             page_numbers=page_numbers,
         )
         if cached is not None:
@@ -2082,10 +2742,10 @@ def get_pages_with_unstructured(
                 else None
             )
         cached_page_results = {}
-        if target_page_numbers and cache_dir:
+        if target_page_numbers and checkpoint_dir:
             for page_number in target_page_numbers:
-                page_cached = load_unstructured_ocr_cache(
-                    pdf_path, resolved_strategy, runtime, cache_dir,
+                page_cached = load_unstructured_ocr_checkpoint(
+                    pdf_path, resolved_strategy, runtime, checkpoint_dir,
                     page_numbers=[page_number],
                 )
                 if page_cached is not None:
@@ -2112,11 +2772,11 @@ def get_pages_with_unstructured(
                 "actual_workers": 1,
                 "strategy": resolved_strategy,
             }
-            cache_path = save_unstructured_ocr_cache(
+            cache_path = save_unstructured_ocr_checkpoint(
                 pdf_path,
                 resolved_strategy,
                 runtime,
-                cache_dir,
+                checkpoint_dir,
                 pages,
                 page_count,
                 element_rows,
@@ -2132,8 +2792,8 @@ def get_pages_with_unstructured(
             cached_page_count = len(cached_page_results)
 
             def checkpoint_completed_page(page_row, page_elements, physical_page_count):
-                save_unstructured_ocr_cache(
-                    pdf_path, resolved_strategy, runtime, cache_dir,
+                save_unstructured_ocr_checkpoint(
+                    pdf_path, resolved_strategy, runtime, checkpoint_dir,
                     [page_row], physical_page_count, page_elements,
                     page_numbers=[int(page_row.get("page") or 0)],
                 )
@@ -2162,11 +2822,11 @@ def get_pages_with_unstructured(
                 *fresh_element_rows,
             ]
             element_rows.sort(key=lambda row: (int(row.get("pdf_page") or 0), int(row.get("element_index") or 0)))
-            cache_path = save_unstructured_ocr_cache(
+            cache_path = save_unstructured_ocr_checkpoint(
                 pdf_path,
                 resolved_strategy,
                 runtime,
-                cache_dir,
+                checkpoint_dir,
                 pages,
                 page_count,
                 element_rows,
@@ -2200,8 +2860,8 @@ def get_pages_with_unstructured(
         # the isolated page lane above and reports every finished page.
         progress_callback(page_count, page_count)
     if resolved_strategy in {"hi_res", "ocr_only"}:
-        cache_path = save_unstructured_ocr_cache(
-            pdf_path, resolved_strategy, runtime, cache_dir, pages, page_count, element_rows
+        cache_path = save_unstructured_ocr_checkpoint(
+            pdf_path, resolved_strategy, runtime, checkpoint_dir, pages, page_count, element_rows
         )
         if cache_path:
             for page in pages:
@@ -2214,7 +2874,7 @@ def get_backend_pages(
     backend: str,
     unstructured_strategy: str,
     unstructured_runtime_probe=None,
-    unstructured_cache_dir=None,
+    unstructured_checkpoint_dir=None,
     progress_callback=None,
     unstructured_page_numbers=None,
 ):
@@ -2230,7 +2890,7 @@ def get_backend_pages(
             pdf_path,
             unstructured_strategy,
             runtime_probe=unstructured_runtime_probe,
-            cache_dir=unstructured_cache_dir,
+            checkpoint_dir=unstructured_checkpoint_dir,
             progress_callback=progress_callback,
             page_numbers=unstructured_page_numbers,
         )

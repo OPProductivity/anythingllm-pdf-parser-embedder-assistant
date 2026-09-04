@@ -29,6 +29,7 @@ warnings.filterwarnings("ignore", category=ResourceWarning, message=r"unclosed e
 
 import auto_anythingllm_pipeline as pipeline  # noqa: E402
 import anythingllm_persistence  # noqa: E402
+import rag_pdf_tools  # noqa: E402
 
 
 pytestmark = pytest.mark.offline_deterministic
@@ -121,6 +122,20 @@ def fake_json_post_tracker_from_post(post):
 
 
 class PipelineCoreTests(unittest.TestCase):
+    def setUp(self):
+        """Keep synthetic terminal receipts out of the user's Run History."""
+        import rag_pdf_gradio_app as app
+
+        self._history_temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._history_temp_dir.cleanup)
+        self._history_path_patch = mock.patch.object(
+            app,
+            "INGESTION_HISTORY_PATH",
+            Path(self._history_temp_dir.name) / "ingestion-history.jsonl",
+        )
+        self._history_path_patch.start()
+        self.addCleanup(self._history_path_patch.stop)
+
     @staticmethod
     def _qualified_settings_profile():
         """Grant fixture-only mutation authority for pipeline write tests."""
@@ -458,7 +473,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertLessEqual(FakeExecutor.max_pending, 2)
         self.assertEqual(progress[-1], (5, 5))
 
-    def test_unstructured_ocr_cache_requires_the_exact_source_identity(self):
+    def test_unstructured_ocr_checkpoint_requires_the_exact_source_identity(self):
         import rag_pdf_tools
 
         with tempfile.TemporaryDirectory() as root:
@@ -474,18 +489,25 @@ class PipelineCoreTests(unittest.TestCase):
             }
             pages = [{"page": 1, "text": "Recovered OCR text", "kind": "unstructured_elements"}]
             elements = [{"element_index": 1, "pdf_page": 1, "category": "NarrativeText", "chars": 18, "preview": "Recovered OCR text"}]
-            cache_dir = root_path / "cache"
-            stored = rag_pdf_tools.save_unstructured_ocr_cache(
-                pdf_path, "hi_res", runtime, cache_dir, pages, 1, elements
+            checkpoint_dir = root_path / "run" / ".ocr-page-checkpoints"
+            stored = rag_pdf_tools.save_unstructured_ocr_checkpoint(
+                pdf_path, "hi_res", runtime, checkpoint_dir, pages, 1, elements
             )
-            cached = rag_pdf_tools.load_unstructured_ocr_cache(
-                pdf_path, "hi_res", runtime, cache_dir
+            cached = rag_pdf_tools.load_unstructured_ocr_checkpoint(
+                pdf_path, "hi_res", runtime, checkpoint_dir
+            )
+            independent_run = rag_pdf_tools.load_unstructured_ocr_checkpoint(
+                pdf_path,
+                "hi_res",
+                runtime,
+                root_path / "another-run" / ".ocr-page-checkpoints",
             )
 
-        self.assertTrue(Path(stored).name.startswith("unstructured-ocr-"))
+        self.assertTrue(Path(stored).name.startswith("unstructured-page-checkpoint-"))
         self.assertIsNotNone(cached)
+        self.assertIsNone(independent_run)
         self.assertEqual(cached[0][0]["text"], "Recovered OCR text")
-        self.assertEqual(cached[0][0]["unstructured_execution"]["mode"], "persistent_ocr_cache_hit")
+        self.assertEqual(cached[0][0]["unstructured_execution"]["mode"], "run_local_ocr_checkpoint_hit")
 
     def test_unstructured_targeted_ocr_reuses_page_checkpoints(self):
         import rag_pdf_tools
@@ -499,9 +521,9 @@ class PipelineCoreTests(unittest.TestCase):
             document.save(pdf_path)
             document.close()
             runtime = {"backend_module_origin": "fixture", "tesseract_executable": ""}
-            cache_dir = root_path / "cache"
-            rag_pdf_tools.save_unstructured_ocr_cache(
-                pdf_path, "hi_res", runtime, cache_dir,
+            checkpoint_dir = root_path / "run" / ".ocr-page-checkpoints"
+            rag_pdf_tools.save_unstructured_ocr_checkpoint(
+                pdf_path, "hi_res", runtime, checkpoint_dir,
                 [{"page": 1, "text": "cached one"}], 3,
                 [{"element_index": 1, "pdf_page": 1}], page_numbers=[1],
             )
@@ -519,7 +541,7 @@ class PipelineCoreTests(unittest.TestCase):
                 rag_pdf_tools._parallel_unstructured_ocr_pages = fake_parallel
                 pages, count, _rows = rag_pdf_tools.get_pages_with_unstructured(
                     pdf_path, "hi_res", runtime_probe=runtime,
-                    cache_dir=cache_dir, page_numbers=[1, 2, 3],
+                    checkpoint_dir=checkpoint_dir, page_numbers=[1, 2, 3],
                 )
             finally:
                 rag_pdf_tools._parallel_unstructured_ocr_pages = original_parallel
@@ -1287,6 +1309,19 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn("AUTO-OCR-UNAVAILABLE-001", line)
         self.assertIn("No upload was sent", line)
 
+    def test_automatic_ocr_outcome_line_explains_preserved_quality_observations(self):
+        import rag_pdf_gradio_app as app
+
+        line = app.automatic_ocr_outcome_line({
+            "ocr_assisted_extraction_used": True,
+            "ocr_content_status": "ready_with_ocr_quality_observations",
+            "ocr_page_quality_summary": {"low_signal_visual_pages": [2, 6]},
+        })
+        self.assertIn("observations were recorded", line)
+        self.assertIn("PDF page(s): 2, 6", line)
+        self.assertIn("source text was preserved", line)
+        self.assertIn("did not block upload", line)
+
     def test_automatic_ocr_outcome_line_explains_a_failed_comparison_without_claiming_ocr_was_used(self):
         import rag_pdf_gradio_app as app
 
@@ -1435,7 +1470,7 @@ class PipelineCoreTests(unittest.TestCase):
                 "native_heading_recovery",
             },
         )
-        self.assertEqual(report["method"], "page_local_evidence_reconciliation_v3")
+        self.assertEqual(report["method"], "page_local_evidence_reconciliation_v4")
 
     def test_native_ocr_reconciliation_restores_only_an_isolated_opening_heading(self):
         pages, _report = pipeline.reconcile_native_ocr_pages(
@@ -1453,6 +1488,212 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(
             pages[0]["native_ocr_reconciliation"]["native_heading_recovery"]["action"],
             "prefixed_missing_heading",
+        )
+
+    def test_native_ocr_reconciliation_treats_sparse_front_matter_as_diagnostic(self):
+        native_pages = [{"page": page, "text": ""} for page in range(1, 5)]
+        ocr_pages = [
+            {"page": 1, "text": "fragmented recovery " * 55},
+            {"page": 2, "text": "complete scholarly passage " * 320},
+            {"page": 3, "text": "complete historical discussion " * 310},
+            {"page": 4, "text": "complete critical account " * 300},
+        ]
+
+        pages, report = pipeline.reconcile_native_ocr_pages(native_pages, ocr_pages)
+
+        self.assertEqual(report["front_matter_sparse_pages"], [1])
+        self.assertEqual(report["sparse_relative_pages"], [])
+        self.assertEqual(
+            pages[0]["ocr_page_quality"]["state"],
+            "front_matter_sparse_text",
+        )
+        self.assertTrue(pages[0]["ocr_page_quality"]["diagnostic_only"])
+        self.assertTrue(pages[0]["ocr_page_quality"]["text_preserved"])
+        self.assertIn("fragmented recovery", pages[0]["text"])
+
+    def test_native_ocr_reconciliation_labels_a_short_final_page_without_failure_language(self):
+        native_pages = [{"page": page, "text": ""} for page in range(1, 5)]
+        ocr_pages = [
+            {"page": 1, "text": "complete opening discussion " * 300},
+            {"page": 2, "text": "complete scholarly passage " * 320},
+            {"page": 3, "text": "complete historical discussion " * 310},
+            {"page": 4, "text": "short concluding passage " * 55},
+        ]
+
+        pages, report = pipeline.reconcile_native_ocr_pages(native_pages, ocr_pages)
+
+        self.assertEqual(report["terminal_page_sparse_pages"], [4])
+        self.assertEqual(report["sparse_relative_pages"], [])
+        self.assertEqual(
+            pages[-1]["ocr_page_quality"]["state"], "terminal_page_sparse_text"
+        )
+        self.assertEqual(pages[-1]["ocr_page_quality"]["observed_preview"], "")
+
+    def test_native_ocr_reconciliation_preserves_low_signal_illustration_labels(self):
+        noisy_labels = (
+            "[Image] av yen avxwvavs\n\n"
+            "[UncategorizedText] avn rey\n\n"
+            "[UncategorizedText] aw ant"
+        )
+
+        pages, report = pipeline.reconcile_native_ocr_pages(
+            [{"page": 2, "text": ""}],
+            [{"page": 2, "text": noisy_labels}],
+        )
+
+        self.assertEqual(report["front_matter_sparse_pages"], [2])
+        self.assertEqual(report["low_signal_visual_pages"], [])
+        self.assertEqual(pages[0]["text"], noisy_labels)
+        self.assertEqual(
+            pages[0]["ocr_page_quality"]["observed_preview"],
+            "[Image] av yen avxwvavs [UncategorizedText] avn rey [UncategorizedText] aw ant",
+        )
+
+    def test_native_ocr_reconciliation_keeps_short_coherent_notice(self):
+        notice = (
+            "Copyright of Cultural Studies is the property of Routledge and its "
+            "content may not be copied without the copyright holder's permission."
+        )
+
+        pages, report = pipeline.reconcile_native_ocr_pages(
+            [{"page": 32, "text": ""}],
+            [{"page": 32, "text": notice}],
+        )
+
+        self.assertEqual(report["low_signal_visual_pages"], [])
+        self.assertEqual(report["sparse_relative_pages"], [])
+        self.assertEqual(pages[0]["text"], notice)
+
+    def test_native_ocr_reconciliation_preserves_later_low_signal_visual_text(self):
+        labels = "[Image] LESS IS ENOUGH\n\n[Title] PIER VITTORIO AURELI"
+        pages, report = pipeline.reconcile_native_ocr_pages(
+            [{"page": 3, "text": ""}],
+            [{"page": 3, "text": labels}],
+        )
+        self.assertEqual(report["low_signal_visual_pages"], [3])
+        self.assertEqual(pages[0]["text"], labels)
+        self.assertTrue(pages[0]["ocr_page_quality"]["text_preserved"])
+
+    def test_photographed_ocr_route_evidence_reports_persisted_decisions_only(self):
+        pages = [{
+            "page": 3,
+            "spread_preprocessing": {
+                "neighbour_page_runover": {"decision": "ambiguous_retained"}
+            },
+            "reading_regions": [{
+                "ocr_method": "tesseract_embedded_three_column_document_crop",
+                "reading_region_count": 1,
+                "column_preprocessing": {
+                    "detected": True,
+                    "byline": {"relocated": True},
+                },
+                "ocr_crop_retry": {
+                    "attempted": True,
+                    "reason": "full_page_retry_selected",
+                },
+            }],
+        }, {
+            "page": 4,
+            "reading_regions": [{
+                "ocr_method": "tesseract_photographed_spread_crop",
+                "reading_region_count": 2,
+            }, {
+                "ocr_method": "tesseract_photographed_spread_crop",
+                "reading_region_count": 2,
+            }],
+        }]
+
+        evidence = pipeline.photographed_ocr_route_evidence(pages)
+
+        self.assertFalse(evidence["adds_ocr_work"])
+        self.assertEqual(evidence["photographed_spread_pages"], [4])
+        self.assertEqual(evidence["three_column_pages"], [3])
+        self.assertEqual(evidence["crop_retry_attempted_pages"], [3])
+        self.assertEqual(evidence["crop_retry_selected_pages"], [3])
+        self.assertEqual(evidence["byline_relocated_pages"], [3])
+        self.assertEqual(
+            evidence["ocr_method_counts"]["tesseract_photographed_spread_crop"], 2
+        )
+        self.assertEqual(
+            evidence["neighbour_runover_decisions"], {"ambiguous_retained": 1}
+        )
+
+    def test_empty_native_document_promotes_targeted_ocr_to_full_document(self):
+        candidates = [{
+            "backend": "pymupdf",
+            "pages": [{"page": page, "text": ""} for page in range(1, 19)],
+            "quality": {"included_words": 0},
+        }]
+        self.assertTrue(pipeline.native_document_requires_full_ocr(candidates, 18))
+
+    def test_ocr_timing_uses_final_targeted_ocr_candidate(self):
+        native = {"backend": "pymupdf", "ocr_processing_seconds": 0.0}
+        recovered = {"backend": "unstructured", "ocr_processing_seconds": 54.5}
+
+        total, selected, comparison = pipeline.partition_ocr_processing_seconds(
+            [native, recovered], recovered
+        )
+
+        self.assertEqual(total, 54.5)
+        self.assertEqual(selected, 54.5)
+        self.assertEqual(comparison, 0.0)
+
+    def test_mixed_native_document_retains_page_local_ocr(self):
+        candidates = [{
+            "backend": "pymupdf",
+            "pages": [{"page": page, "text": "native prose"} for page in range(1, 19)],
+            "quality": {"included_words": 2200},
+        }]
+        self.assertFalse(pipeline.native_document_requires_full_ocr(candidates, 18))
+
+    def test_full_page_ocr_retry_requires_material_recovery(self):
+        clipped = {"word_count": 129, "fragment_line_ratio": .12}
+        complete = {"word_count": 341, "fragment_line_ratio": .08}
+        marginal = {"word_count": 170, "fragment_line_ratio": .08}
+        noisy = {"word_count": 341, "fragment_line_ratio": .30}
+
+        self.assertTrue(
+            rag_pdf_tools.full_page_ocr_retry_materially_better(clipped, complete)
+        )
+        self.assertFalse(
+            rag_pdf_tools.full_page_ocr_retry_materially_better(clipped, marginal)
+        )
+        self.assertFalse(
+            rag_pdf_tools.full_page_ocr_retry_materially_better(clipped, noisy)
+        )
+
+    def test_embedded_scan_retry_is_limited_to_clipped_weak_recovery(self):
+        weak = {"word_count": 129, "fragment_line_ratio": .12}
+        strong = {"word_count": 341, "fragment_line_ratio": .08}
+
+        self.assertTrue(
+            rag_pdf_tools.embedded_scan_crop_needs_full_page_retry(
+                (.0085, .0134, .6982, 1.0), weak
+            )
+        )
+        self.assertFalse(
+            rag_pdf_tools.embedded_scan_crop_needs_full_page_retry(
+                (.03, .03, .97, .97), weak
+            )
+        )
+        self.assertFalse(
+            rag_pdf_tools.embedded_scan_crop_needs_full_page_retry(
+                (.0085, .0134, .6982, 1.0), strong
+            )
+        )
+        self.assertTrue(
+            rag_pdf_tools.embedded_scan_crop_needs_full_page_retry(
+                (.0085, .0134, .6982, 1.0),
+                strong,
+                {"ink_touches_boundary": True},
+            )
+        )
+        self.assertFalse(
+            rag_pdf_tools.embedded_scan_crop_needs_full_page_retry(
+                (.03, .03, .97, .97),
+                weak,
+                {"ink_touches_boundary": True},
+            )
         )
 
     def test_visual_text_coverage_review_warns_without_inventing_image_caption_text(self):
@@ -3549,6 +3790,11 @@ class PipelineCoreTests(unittest.TestCase):
                     "pages": [{"pdf_page": 2}, {"pdf_page": 7}],
                     "assessment_warnings": [],
                 },
+                "photographed_ocr_routes": {
+                    "method": "persisted_reading_region_summary_v1",
+                    "adds_ocr_work": False,
+                    "three_column_pages": [1, 2],
+                },
             }
             result = pipeline.retain_successful_run_leanly(
                 root,
@@ -3587,6 +3833,14 @@ class PipelineCoreTests(unittest.TestCase):
                 "pages": [2, 7],
                 "assessment_warnings": [],
             })
+            self.assertEqual(
+                compact["preparation"]["photographed_ocr_routes"],
+                {
+                    "method": "persisted_reading_region_summary_v1",
+                    "adds_ocr_work": False,
+                    "three_column_pages": [1, 2],
+                },
+            )
             self.assertEqual(summary["upload_file"], str(root / "Example-pdf-parsed.txt"))
             self.assertEqual(summary["manifest"], "")
             self.assertEqual(summary["variant_outputs"], {})
@@ -3681,7 +3935,8 @@ class PipelineCoreTests(unittest.TestCase):
             self.assertFalse(selected.exists())
             self.assertFalse((root / "metadata-api").exists())
             self.assertTrue((root / "Example-pdf-parsed.txt").is_file())
-            self.assertTrue((root / "Example-p001-s01.txt").is_file())
+            self.assertFalse((root / "Example-p001-s01.txt").exists())
+            self.assertEqual(result["retained_segment_files"], 0)
             self.assertEqual(compact["verification_receipt"]["shared_batch"]["expected_records"], 2)
             self.assertEqual(compact["verification_receipt"]["shared_batch"]["confirmed_vectors"], 2)
 
@@ -3714,6 +3969,30 @@ class PipelineCoreTests(unittest.TestCase):
 
             self.assertTrue(result["applied"])
             self.assertFalse(selected.exists())
+
+    def test_successful_batch_root_cleanup_removes_only_active_and_replay_artifacts(self):
+        import rag_pdf_gradio_app as app
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for name in app.SUCCESSFUL_BATCH_TRANSIENT_ARTIFACTS:
+                (root / name).write_text("temporary", encoding="utf-8")
+            for name in (
+                "ingestion-terminal-record.json",
+                "batch-native-upload-report.json",
+                "batch-embedding-ledger.json",
+                "source-transaction-ledger.json",
+                "integrity-audit.json",
+                "progress-trace.jsonl",
+            ):
+                (root / name).write_text("retained", encoding="utf-8")
+
+            result = app.compact_successful_automatic_batch_root(root)
+
+            self.assertFalse(result["pending"])
+            self.assertEqual(set(result["removed"]), set(app.SUCCESSFUL_BATCH_TRANSIENT_ARTIFACTS))
+            self.assertTrue((root / "batch-native-upload-report.json").is_file())
+            self.assertTrue((root / "progress-trace.jsonl").is_file())
 
     def test_layout_artifact_disagreement_accepts_clean_complete_sparse_text(self):
         selected = {
@@ -9163,6 +9442,64 @@ class PipelineCoreTests(unittest.TestCase):
             rows = app._read_timing_jsonl(path, limit=3)
 
         self.assertEqual([row["run_key"] for row in rows], ["run-77", "run-78", "run-79"])
+
+    def test_timing_run_history_nests_features_without_changing_eta_inputs(self):
+        import rag_pdf_gradio_app as app
+
+        original = {
+            "schema_version": 4,
+            "run_key": "run-a",
+            "source": "automatic-run",
+            "state": "successful",
+            "actual_seconds": 120.0,
+            "initial_estimate_features": {
+                "mode": app.MODE_NATIVE_UPLOAD_LABEL,
+                "document_count": 3,
+                "estimated_records": 90,
+            },
+            "mode": app.MODE_NATIVE_UPLOAD_LABEL,
+            "document_count": 3,
+            "estimated_records": 120,
+            "selected_backend": "pymupdf",
+            "document_timing": [{
+                "filename": "Example.pdf",
+                "pages": 4,
+                "records": 5,
+                "phase_timing": {
+                    "capture": "pipeline_timing_event_relay",
+                    "event_count": 12,
+                    "interpretation": "repeated explanatory text",
+                    "extraction_seconds": 3.5,
+                    "phase_seconds": {
+                        "source_metadata_and_author_inference": 0.4,
+                        "payload_packaging_and_diagnostics": 0.2,
+                    },
+                },
+                "ocr_processing_seconds": 1.25,
+                "ocr_processing_pages": 1,
+                "total_pipeline_seconds": 4.2,
+            }],
+        }
+
+        compact = app.compact_timing_run_history_row(original)
+        expanded = app.expand_timing_run_history_row(compact)
+
+        self.assertNotIn("mode", compact)
+        self.assertNotIn("document_count", compact)
+        self.assertEqual(compact["features"]["estimated_records"], 120)
+        self.assertEqual(compact["initial_feature_overrides"]["estimated_records"], 90)
+        self.assertEqual(expanded["mode"], original["mode"])
+        self.assertEqual(expanded["document_count"], 3)
+        self.assertEqual(expanded["initial_estimate_features"], original["initial_estimate_features"])
+        self.assertNotIn("phase_timing", compact["document_timing"][0])
+        self.assertEqual(
+            expanded["document_timing"][0]["phase_timing"]["extraction_seconds"],
+            3.5,
+        )
+        self.assertEqual(
+            app._timing_row_stage_measurements(expanded)["extraction"]["seconds"],
+            3.5,
+        )
 
     def test_global_timing_event_migration_preserves_only_model_learning_rows(self):
         import rag_pdf_gradio_app as app
@@ -14981,6 +15318,13 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(guidance["code"], "AUTO-TEXT-LAYER-REVIEW-001")
         self.assertIn("systematically corrupted", guidance["message"])
 
+    def test_legacy_sparse_ocr_observation_does_not_block_upload(self):
+        selected = {
+            "backend": "unstructured",
+            "readiness_reasons": ["ocr_prose_page_recovery_incomplete"],
+        }
+        self.assertEqual(pipeline.upload_block_reason_for_readiness(selected), "")
+
     def test_ambiguous_text_shape_signals_do_not_withhold_upload(self):
         selected = {
             "backend": "pymupdf",
@@ -15760,6 +16104,16 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn("[SUPPLEMENTARY REGION | pages 29–30 | sustained_references_region", rendered)
         self.assertIn("Primary upload: automatically excluded by the sustained reference/index-region rule.", rendered)
         self.assertIn("REVIEW-ONLY SUPPLEMENTARY CANDIDATE | page 31 | possible_image_credit", rendered)
+
+    def test_empty_supplementary_lane_does_not_create_placeholder_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate_text = Path(tmp) / "supplementary-content-candidates.txt"
+            result = pipeline.write_supplementary_lane_candidate_text(
+                candidate_text,
+                {"items": []},
+            )
+            self.assertIsNone(result)
+            self.assertFalse(candidate_text.exists())
 
     def test_reference_lane_includes_tightly_evidenced_final_continuation_page(self):
         stats = []
@@ -17461,6 +17815,36 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(cleaned[3]["text"], "history and science; stories of philosophy.")
         self.assertEqual(cleaned[3]["reading_regions"][0]["raw_text"].splitlines()[0], "CULTURE AS HISTORY")
 
+    def test_three_column_ocr_removes_a_repeated_header_misordered_after_columns(self):
+        method = "tesseract_embedded_three_column_document_crop"
+        pages = [{
+            "page": 1,
+            "text": "The Crisis\n\nThe Whipping\n\nOpening prose.",
+            "reading_regions": [{
+                "text": "The Crisis\n\nThe Whipping\n\nOpening prose.",
+                "ocr_method": method,
+            }],
+        }, {
+            "page": 2,
+            "text": "174\n\nContinued first column.\n\nThe Crisis\n\nContinued third column.",
+            "reading_regions": [{
+                "text": "174\n\nContinued first column.\n\nThe Crisis\n\nContinued third column.",
+                "ocr_method": method,
+            }],
+        }]
+
+        cleaned, evidence = pipeline.remove_verified_photographed_ocr_running_headers(pages)
+
+        self.assertIn("The Crisis", evidence["verified_headers"])
+        self.assertTrue(cleaned[0]["text"].startswith("The Crisis"))
+        self.assertNotIn("The Crisis", cleaned[1]["text"])
+        self.assertIn("Continued first column", cleaned[1]["text"])
+        self.assertIn("Continued third column", cleaned[1]["text"])
+        self.assertEqual(
+            cleaned[1]["reading_regions"][0]["removed_marginalia"][0]["reason"],
+            "verified_repeated_three_column_running_header",
+        )
+
     def test_photographed_ocr_cleanup_removes_only_isolated_margin_marks(self):
         import rag_pdf_tools
 
@@ -17540,6 +17924,27 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertGreater(gutter, .46)
         self.assertLess(gutter, .54)
 
+    def test_photographed_spread_prefers_a_bright_gutter_over_body_text(self):
+        from PIL import Image, ImageDraw, ImageStat
+        import rag_pdf_tools
+
+        page = Image.new("L", (1200, 700), color=242)
+        draw = ImageDraw.Draw(page)
+        # Two text-bearing page bodies with a clean central paper gutter.
+        for y in range(100, 620, 28):
+            draw.rectangle((90, y, 535, y + 12), fill=45)
+            draw.rectangle((665, y, 1110, y + 12), fill=45)
+        # A vertically continuous dark body-text stripe must not outrank the
+        # actual white gutter merely because it is the darkest candidate.
+        draw.rectangle((735, 100, 755, 620), fill=30)
+        draw.rectangle((585, 0, 615, 700), fill=255)
+
+        gutter = rag_pdf_tools.photographed_fold_gutter_fraction(page, ImageStat)
+
+        self.assertIsNotNone(gutter)
+        self.assertGreater(gutter, .46)
+        self.assertLess(gutter, .54)
+
     def test_photographed_spread_rejects_a_short_grey_mark_as_a_fold(self):
         from PIL import Image, ImageDraw, ImageStat
         import rag_pdf_tools
@@ -17559,6 +17964,53 @@ class PipelineCoreTests(unittest.TestCase):
                 ["Substantial final-page prose. " * 30, ""],
             )
         )
+
+    def test_asymmetric_spread_abstention_reuses_already_ocrd_region_text(self):
+        import sys
+        from unittest import mock
+        import rag_pdf_tools
+
+        width, height = 1800, 900
+        pixmap = SimpleNamespace(
+            width=width,
+            height=height,
+            samples=b"\xff" * (width * height * 3),
+        )
+        page = SimpleNamespace(
+            get_text=lambda _kind: "",
+            get_pixmap=lambda **_kwargs: pixmap,
+        )
+        specs = rag_pdf_tools.photographed_spread_crop_specs(width, height, .31)
+        narrow_fraction = specs[0][2]
+        dominant_fraction = specs[1][2]
+
+        def fake_ocr(_image, fraction, *_args, **_kwargs):
+            if fraction == narrow_fraction:
+                return "short"
+            if fraction == dominant_fraction:
+                return "dominant text " * 20
+            return "full page text " * 20
+
+        with (
+            mock.patch.object(
+                rag_pdf_tools, "photographed_fold_gutter_fraction", return_value=.31
+            ),
+            mock.patch.object(
+                rag_pdf_tools, "_ocr_photographed_crop", side_effect=fake_ocr
+            ) as ocr,
+            mock.patch.object(
+                rag_pdf_tools, "embedded_scanned_image_fraction", return_value=None
+            ),
+            mock.patch.object(
+                rag_pdf_tools, "photographed_page_visual_signal", return_value=False
+            ),
+        ):
+            regions = rag_pdf_tools.photographed_page_ocr_regions(
+                page, {"tesseract_executable": sys.executable}
+            )
+
+        self.assertEqual(regions, [])
+        self.assertEqual(ocr.call_count, 3)
 
 
     def test_unrotated_photo_gate_requires_uneven_dark_border_evidence(self):
@@ -17594,6 +18046,178 @@ class PipelineCoreTests(unittest.TestCase):
             get_image_rects=lambda _xref: [fitz.Rect(220, 300, 380, 460)],
         )
         self.assertIsNone(rag_pdf_tools.embedded_scanned_image_fraction(incidental))
+
+    def test_embedded_scan_region_uses_display_coordinates_on_rotated_page(self):
+        import rag_pdf_tools
+
+        # Cohen-style wrapper geometry: the image fills the displayed page,
+        # but its PDF-space rectangle is portrait and extends beyond the crop
+        # box. Without the page rotation transform this was normalized to a
+        # false right edge near .78 and clipped every OCR line.
+        page = SimpleNamespace(
+            rotation=270,
+            rotation_matrix=fitz.Matrix(0.0, -1.0, 1.0, 0.0, 0.0, 557.0644),
+            rect=fitz.Rect(0.0, 0.0, 738.6335, 557.0644),
+            get_images=lambda full=True: [(41,)],
+            get_image_rects=lambda _xref: [
+                fitz.Rect(-12.5766, -48.9055, 582.4235, 793.0945)
+            ],
+        )
+
+        fraction = rag_pdf_tools.embedded_scanned_image_fraction(page)
+
+        self.assertIsNotNone(fraction)
+        self.assertLess(fraction[0], .02)
+        self.assertLess(fraction[1], .02)
+        self.assertGreater(fraction[2], .98)
+        self.assertGreater(fraction[3], .98)
+
+    def test_rotated_embedded_scan_uses_corrected_region_in_production_route_once(self):
+        import sys
+        from unittest import mock
+        import rag_pdf_tools
+
+        width, height = 1478, 1114
+        pixmap = SimpleNamespace(
+            width=width,
+            height=height,
+            samples=b"\xff" * (width * height * 3),
+        )
+        page = SimpleNamespace(
+            rotation=270,
+            rotation_matrix=fitz.Matrix(0.0, -1.0, 1.0, 0.0, 0.0, 557.0644),
+            rect=fitz.Rect(0.0, 0.0, 738.6335, 557.0644),
+            get_text=lambda _kind: "",
+            get_pixmap=lambda **_kwargs: pixmap,
+            get_images=lambda full=True: [(41,)],
+            get_image_rects=lambda _xref: [
+                fitz.Rect(-12.5766, -48.9055, 582.4235, 793.0945)
+            ],
+        )
+        observed_fractions = []
+
+        def fake_ocr(_image, fraction, *_args, **_kwargs):
+            observed_fractions.append(fraction)
+            return "complete source prose " * 100
+
+        with (
+            mock.patch.object(
+                rag_pdf_tools, "photographed_fold_gutter_fraction", return_value=None
+            ),
+            mock.patch.object(
+                rag_pdf_tools,
+                "photographed_three_column_signal",
+                return_value={"detected": False, "reason": "fixture", "gutters": []},
+            ),
+            mock.patch.object(
+                rag_pdf_tools, "_ocr_photographed_crop", side_effect=fake_ocr
+            ),
+        ):
+            regions = rag_pdf_tools.photographed_page_ocr_regions(
+                page,
+                {"tesseract_executable": sys.executable},
+                page_number=6,
+            )
+
+        self.assertEqual(len(observed_fractions), 1)
+        self.assertEqual(len(regions), 1)
+        self.assertEqual(
+            regions[0]["ocr_method"], "tesseract_embedded_scanned_document_crop"
+        )
+        self.assertLess(observed_fractions[0][0], .02)
+        self.assertGreater(observed_fractions[0][2], .98)
+
+    def test_photographed_page_result_records_finished_route_and_all_region_text(self):
+        import rag_pdf_tools
+        from unittest import mock
+
+        regions = [
+            {
+                "text": "left source page",
+                "ocr_method": "tesseract_photographed_spread_crop",
+            },
+            {
+                "text": "right source page",
+                "ocr_method": "tesseract_photographed_spread_crop",
+            },
+        ]
+        source = SimpleNamespace(load_page=lambda _index: object())
+        with mock.patch.object(
+            rag_pdf_tools, "photographed_page_ocr_regions", return_value=regions
+        ):
+            result = rag_pdf_tools._photographed_page_result(source, 4, {})
+
+        self.assertEqual(
+            result["page_row"]["spread_preprocessing"]["path"],
+            "confirmed_fold_spread_split",
+        )
+        self.assertEqual(
+            result["page_row"]["spread_preprocessing"]["selection_policy"],
+            "deterministic_page_evidence_with_bounded_recovery",
+        )
+        self.assertEqual(
+            result["element_rows"][0]["chars"],
+            len("left source page\n\nright source page"),
+        )
+
+    def test_failed_fold_split_records_one_bounded_production_recovery(self):
+        import sys
+        from unittest import mock
+        import rag_pdf_tools
+
+        width, height = 1800, 900
+        pixmap = SimpleNamespace(
+            width=width,
+            height=height,
+            samples=b"\xff" * (width * height * 3),
+        )
+        page = SimpleNamespace(
+            get_text=lambda _kind: "",
+            get_pixmap=lambda **_kwargs: pixmap,
+        )
+        specs = rag_pdf_tools.photographed_spread_crop_specs(width, height, .45)
+        embedded = (.01, .01, .99, .99)
+
+        def fake_ocr(_image, fraction, *_args, **_kwargs):
+            if fraction == specs[0][2]:
+                return "photograph caption"
+            if fraction == specs[1][2]:
+                return "complete right page prose " * 100
+            if fraction == embedded:
+                return "complete full source page prose " * 110
+            return ""
+
+        with (
+            mock.patch.object(
+                rag_pdf_tools, "photographed_fold_gutter_fraction", return_value=.45
+            ),
+            mock.patch.object(
+                rag_pdf_tools, "embedded_scanned_image_fraction", return_value=embedded
+            ),
+            mock.patch.object(
+                rag_pdf_tools,
+                "photographed_three_column_signal",
+                return_value={"detected": False, "reason": "fixture", "gutters": []},
+            ),
+            mock.patch.object(
+                rag_pdf_tools, "_ocr_photographed_crop", side_effect=fake_ocr
+            ) as ocr,
+        ):
+            regions = rag_pdf_tools.photographed_page_ocr_regions(
+                page,
+                {"tesseract_executable": sys.executable},
+                page_number=6,
+            )
+
+        self.assertEqual(ocr.call_count, 3)
+        self.assertEqual(len(regions), 1)
+        recovery = regions[0]["ocr_route_recovery"]
+        self.assertTrue(recovery["attempted"])
+        self.assertEqual(recovery["initial_route"], "confirmed_fold_spread_split")
+        self.assertEqual(recovery["selected_route"], "embedded_scan_bounds")
+        self.assertEqual(
+            recovery["reason"], "one_or_more_fold_regions_below_prose_threshold"
+        )
 
     def test_neighbour_runover_requires_adjacent_text_evidence_before_exclusion(self):
         import rag_pdf_tools
@@ -17652,6 +18276,183 @@ class PipelineCoreTests(unittest.TestCase):
         match = rag_pdf_tools.neighbour_fragment_match(narrow, adjacent)
         self.assertFalse(match["confirmed"])
         self.assertEqual(match["fragments"], 0)
+
+    def test_photographed_three_column_signal_requires_two_upper_page_gutters(self):
+        from PIL import Image, ImageDraw, ImageOps
+
+        three_columns = Image.new("RGB", (1200, 1600), "white")
+        draw = ImageDraw.Draw(three_columns)
+        for y in range(210, 650, 24):
+            draw.rectangle((70, y, 380, y + 10), fill="black")
+            draw.rectangle((440, y, 750, y + 10), fill="black")
+            draw.rectangle((810, y, 1130, y + 10), fill="black")
+        signal = rag_pdf_tools.photographed_three_column_signal(
+            three_columns, ImageOps
+        )
+        self.assertTrue(signal["detected"])
+        self.assertEqual(
+            signal["reason"],
+            "two_upper_page_gutters_and_three_inked_columns",
+        )
+        self.assertEqual(len(signal["gutters"]), 2)
+        self.assertEqual(len(signal["column_ink_occupancy"]), 3)
+
+        two_columns = Image.new("RGB", (1200, 1600), "white")
+        draw = ImageDraw.Draw(two_columns)
+        for y in range(210, 650, 24):
+            draw.rectangle((70, y, 545, y + 10), fill="black")
+            draw.rectangle((655, y, 1130, y + 10), fill="black")
+        rejected = rag_pdf_tools.photographed_three_column_signal(
+            two_columns, ImageOps
+        )
+        self.assertFalse(rejected["detected"])
+
+        blank_left = Image.new("RGB", (1200, 1600), "white")
+        draw = ImageDraw.Draw(blank_left)
+        for y in range(210, 650, 24):
+            draw.rectangle((810, y, 1130, y + 10), fill="black")
+        blank_left_signal = rag_pdf_tools.photographed_three_column_signal(
+            blank_left, ImageOps
+        )
+        self.assertFalse(blank_left_signal["detected"])
+        self.assertEqual(blank_left_signal["reason"], "column_ink_insufficient")
+
+    def test_three_column_signal_rejects_cover_like_imbalanced_bands(self):
+        from PIL import Image, ImageDraw, ImageOps
+
+        cover = Image.new("RGB", (1200, 1600), "white")
+        draw = ImageDraw.Draw(cover)
+        for y in range(210, 650, 24):
+            draw.rectangle((70, y, 100, y + 10), fill="black")
+            draw.rectangle((440, y, 750, y + 10), fill="black")
+            draw.rectangle((810, y, 840, y + 10), fill="black")
+        signal = rag_pdf_tools.photographed_three_column_signal(cover, ImageOps)
+        self.assertFalse(signal["detected"])
+        self.assertEqual(signal["reason"], "column_ink_imbalanced")
+
+    def test_portrait_neighbour_sliver_requires_strong_outer_fold(self):
+        from PIL import Image, ImageDraw, ImageOps
+
+        page = Image.new("RGB", (800, 1200), "white")
+        draw = ImageDraw.Draw(page)
+        for y in range(140, 1050, 24):
+            draw.rectangle((35, y, 80, y + 8), fill="gray")
+        draw.rectangle((105, 80, 118, 1120), fill="black")
+        for y in range(140, 1050, 24):
+            draw.rectangle((145, y, 700, y + 8), fill="black")
+        signal = rag_pdf_tools.photographed_portrait_neighbour_sliver(page, ImageOps)
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal["side"], "left")
+        self.assertEqual(signal["method"], "portrait_edge_continuous_fold_v1")
+
+        ordinary = Image.new("RGB", (800, 1200), "white")
+        ordinary_draw = ImageDraw.Draw(ordinary)
+        for y in range(140, 1050, 24):
+            ordinary_draw.rectangle((70, y, 700, y + 8), fill="black")
+        self.assertIsNone(
+            rag_pdf_tools.photographed_portrait_neighbour_sliver(ordinary, ImageOps)
+        )
+
+    def test_short_ocr_display_text_accepts_titles_not_fragment_noise(self):
+        self.assertTrue(rag_pdf_tools.credible_short_ocr_display_text("PART TWO"))
+        self.assertTrue(rag_pdf_tools.credible_short_ocr_display_text("The Central of Europe"))
+        self.assertFalse(rag_pdf_tools.credible_short_ocr_display_text("i rn oe qe fi"))
+
+    def test_short_native_heading_leaf_survives_segment_threshold(self):
+        self.assertTrue(pipeline.credible_short_page_leaf("Chapter Four\nParis Is Devine"))
+        self.assertTrue(pipeline.credible_short_page_leaf("To\nJohn Emerson"))
+        self.assertFalse(pipeline.credible_short_page_leaf("58"))
+        self.assertFalse(pipeline.credible_short_page_leaf("isolated incidental words"))
+
+    def test_ocr_page_ledger_keeps_route_without_source_text(self):
+        ledger = pipeline.ocr_page_evidence_ledger(
+            [{
+                "page": 2,
+                "text": "Recovered source words here",
+                "spread_preprocessing": {
+                    "path": "embedded_scan_bounds",
+                    "neighbour_page_runover": {"decision": "geometry_confirmed_excluded"},
+                },
+                "reading_regions": [{
+                    "ocr_method": "tesseract_embedded_scanned_document_crop",
+                    "crop_fraction": [.1, .05, .95, .95],
+                    "ocr_crop_retry": {"attempted": True, "reason": "embedded_crop_retained"},
+                }],
+            }],
+            {"pages": [{"page": 2, "decision": "ocr_used_native_page_missing"}]},
+            [2, 3],
+        )
+        self.assertEqual(ledger["targeted_page_count"], 2)
+        self.assertEqual(ledger["ocr_observed_page_count"], 1)
+        self.assertEqual(ledger["selected_ocr_page_count"], 1)
+        self.assertNotIn("text", ledger["pages"][0])
+        self.assertEqual(
+            ledger["pages"][0]["neighbour_runover"]["decision"],
+            "geometry_confirmed_excluded",
+        )
+
+    def test_ocr_page_ledger_ignores_malformed_optional_page_values(self):
+        ledger = pipeline.ocr_page_evidence_ledger(
+            [{"page": "bad", "text": "ignored"}, {"page": 4, "text": "usable"}],
+            {"pages": [{"page": None}, {"page": "bad"}]},
+            ["bad", None, 4],
+        )
+        self.assertEqual(ledger["page_count"], 1)
+        self.assertEqual(ledger["targeted_page_count"], 1)
+        self.assertEqual(ledger["pages"][0]["page"], 4)
+
+    def test_three_column_drop_cap_recovery_uses_geometry_not_fuzzy_words(self):
+        from PIL import Image, ImageDraw, ImageOps
+        from unittest import mock
+
+        image = Image.new("RGB", (800, 1200), "white")
+        ImageDraw.Draw(image).rectangle((65, 170, 105, 225), fill="black")
+        with mock.patch.object(
+            rag_pdf_tools, "_ocr_photographed_crop", return_value="T:"
+        ):
+            corrected, evidence = rag_pdf_tools.recover_opening_three_column_drop_cap(
+                "The Whipping\n\nHE matron picked up her heavy winter coat.",
+                "The Whipping\n\nHE matron picked up her heavy winter coat.",
+                image,
+                "tesseract",
+                ImageOps,
+                page_number=1,
+            )
+        self.assertTrue(evidence["recovered"])
+        self.assertIn("THE matron picked up", corrected)
+        self.assertEqual(evidence["completed_token"], "THE")
+
+    def test_three_column_byline_relocation_changes_order_not_text(self):
+        original = (
+            "The Crisis\n\n"
+            "The Whipping\n\n"
+            "The matron picked up her heavy winter coat.\n\n"
+            "First-column paragraph two continued here.\n\n"
+            "By Marita Bonner\n\n"
+            "Second-column paragraph.\n"
+        )
+        corrected, evidence = rag_pdf_tools.relocate_unique_opening_ocr_byline(
+            original, page_number=1
+        )
+        self.assertTrue(evidence["relocated"])
+        self.assertLess(corrected.index("The Whipping"), corrected.index("By Marita Bonner"))
+        self.assertLess(corrected.index("By Marita Bonner"), corrected.index("The matron"))
+        self.assertEqual(corrected.count("By Marita Bonner"), 1)
+        self.assertEqual(sorted(corrected.split()), sorted(original.split()))
+
+    def test_three_column_byline_relocation_abstains_off_first_page_or_when_ambiguous(self):
+        text = "Title\n\nBy First Author\n\nBody\n\nBy Second Author"
+        unchanged, evidence = rag_pdf_tools.relocate_unique_opening_ocr_byline(
+            text, page_number=1
+        )
+        self.assertEqual(unchanged, text)
+        self.assertEqual(evidence["reason"], "exact_unique_byline_not_found")
+
+        later, later_evidence = rag_pdf_tools.relocate_unique_opening_ocr_byline(
+            "Title\n\nBody\n\nBy Marita Bonner", page_number=2
+        )
+        self.assertEqual(later, "Title\n\nBody\n\nBy Marita Bonner")
+        self.assertEqual(later_evidence["reason"], "not_first_pdf_page")
 
     def test_build_page_line_map_tracks_original_page_lines(self):
         raw = "Header Line\n\nFirst body line\nSecond body line\n\nThird body line"

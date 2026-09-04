@@ -3251,21 +3251,67 @@ def remove_verified_photographed_ocr_running_headers(pages):
     inspection.
     """
     candidates = {}
+    three_column_opening_lines = set()
+    three_column_occurrences = {}
     for page_info in pages:
         page_number = int(page_info.get("page") or 0)
         for region_index, region in enumerate(page_info.get("reading_regions") or []):
-            if not str(region.get("ocr_method") or "").startswith("tesseract_photographed_"):
+            ocr_method = str(region.get("ocr_method") or "")
+            photographed = ocr_method.startswith("tesseract_photographed_")
+            three_column = ocr_method == "tesseract_embedded_three_column_document_crop"
+            if not (photographed or three_column):
                 continue
             lines = [line.strip() for line in str(region.get("text") or "").splitlines() if normalize_text(line)]
             if not lines:
                 continue
             first = normalize_text(lines[0])
             letters = re.sub(r"[^A-Za-z]", "", first)
-            if not (5 <= len(first) <= 90 and len(letters) >= 5 and first == first.upper() and not re.search(r"[.!?]$", first)):
+            if (
+                photographed
+                and 5 <= len(first) <= 90
+                and len(letters) >= 5
+                and first == first.upper()
+                and not re.search(r"[.!?]$", first)
+            ):
+                candidates.setdefault(first.casefold(), {"text": first, "locations": []})["locations"].append(
+                    (page_number, region_index)
+                )
+            if three_column and 5 <= len(first) <= 60 and len(letters) >= 5 and not re.search(r"[.!?]$", first):
+                three_column_opening_lines.add(first.casefold())
+
+    for page_info in pages:
+        page_number = int(page_info.get("page") or 0)
+        for region_index, region in enumerate(page_info.get("reading_regions") or []):
+            if str(region.get("ocr_method") or "") != "tesseract_embedded_three_column_document_crop":
                 continue
-            candidates.setdefault(first.casefold(), {"text": first, "locations": []})["locations"].append(
-                (page_number, region_index)
-            )
+            lines = [
+                line.strip()
+                for line in str(region.get("text") or "").splitlines()
+                if normalize_text(line)
+            ]
+            for line_index, line in enumerate(lines):
+                normalized = normalize_text(line)
+                key = normalized.casefold()
+                if key not in three_column_opening_lines:
+                    continue
+                three_column_occurrences.setdefault(key, {
+                    "text": normalized,
+                    "locations": [],
+                })["locations"].append((page_number, region_index, line_index))
+
+    # PSM 3 can put a visually top-of-page header after one or two complete
+    # columns. Restrict this recovery to the exact first line of another
+    # three-column page, repeated on at least two physical pages. Keep its
+    # earliest occurrence so an opening masthead/title is never erased.
+    three_column_verified = {
+        key: {
+            **entry,
+            "preserved_page": min(page for page, _region, _line in entry["locations"]),
+        }
+        for key, entry in three_column_occurrences.items()
+        if key in three_column_opening_lines
+        and len({page for page, _region, _line in entry["locations"]}) >= 2
+    }
 
     verified = {
         key: entry for key, entry in candidates.items()
@@ -3274,6 +3320,7 @@ def remove_verified_photographed_ocr_running_headers(pages):
     removed = []
     transformed = []
     for page_info in pages:
+        page_number = int(page_info.get("page") or 0)
         copied = dict(page_info)
         regions = []
         for region in page_info.get("reading_regions") or []:
@@ -3282,13 +3329,33 @@ def remove_verified_photographed_ocr_running_headers(pages):
             first_index = next((index for index, line in enumerate(lines) if normalize_text(line)), None)
             first = normalize_text(lines[first_index]) if first_index is not None else ""
             entry = verified.get(first.casefold())
+            remove_indexes = set()
             if entry and str(copied_region.get("ocr_method") or "").startswith("tesseract_photographed_"):
-                copied_region["raw_text"] = copied_region.get("text", "")
-                copied_region["text"] = "\n".join(line for index, line in enumerate(lines) if index != first_index).strip()
-                copied_region["removed_marginalia"] = [{
+                remove_indexes.add(first_index)
+                copied_region.setdefault("removed_marginalia", []).append({
                     "text": entry["text"], "reason": "verified_repeated_photographed_ocr_running_header"
-                }]
+                })
                 removed.append({"pdf_page": int(page_info.get("page") or 0), "text": entry["text"]})
+            if str(copied_region.get("ocr_method") or "") == "tesseract_embedded_three_column_document_crop":
+                for line_index, line in enumerate(lines):
+                    repeated = three_column_verified.get(normalize_text(line).casefold())
+                    if not repeated or page_number == repeated["preserved_page"]:
+                        continue
+                    remove_indexes.add(line_index)
+                    copied_region.setdefault("removed_marginalia", []).append({
+                        "text": repeated["text"],
+                        "reason": "verified_repeated_three_column_running_header",
+                    })
+                    removed.append({
+                        "pdf_page": page_number,
+                        "text": repeated["text"],
+                        "reason": "verified_repeated_three_column_running_header",
+                    })
+            if remove_indexes:
+                copied_region["raw_text"] = copied_region.get("text", "")
+                copied_region["text"] = "\n".join(
+                    line for index, line in enumerate(lines) if index not in remove_indexes
+                ).strip()
             regions.append(copied_region)
         if regions:
             copied["raw_text"] = page_info.get("text", "")
@@ -3297,9 +3364,130 @@ def remove_verified_photographed_ocr_running_headers(pages):
         transformed.append(copied)
     return transformed, {
         "status": "applied" if removed else "no_verified_photographed_ocr_running_headers",
-        "method": "repeated_all_caps_first_line_photographed_ocr_v1",
-        "verified_headers": [entry["text"] for entry in verified.values()],
+        "method": "verified_repeated_photographed_ocr_running_headers_v2",
+        "verified_headers": [entry["text"] for entry in verified.values()] + [
+            entry["text"] for entry in three_column_verified.values()
+        ],
+        "removed_marginalia_count": len(removed),
         "removed": removed,
+    }
+
+
+def photographed_ocr_route_evidence(pages):
+    """Summarize already-recorded OCR route decisions without new OCR work."""
+    method_counts = Counter()
+    spread_pages = set()
+    three_column_pages = set()
+    crop_retry_pages = set()
+    crop_retry_selected_pages = set()
+    route_recovery_pages = set()
+    byline_relocated_pages = set()
+    neighbour_runover_decisions = Counter()
+    selected_route_counts = Counter()
+    for page_info in pages or []:
+        if not isinstance(page_info, dict):
+            continue
+        page_number = int(page_info.get("page") or 0)
+        preprocessing = page_info.get("spread_preprocessing") or {}
+        selected_route = str(preprocessing.get("path") or "").strip()
+        if selected_route:
+            selected_route_counts[selected_route] += 1
+        runover = preprocessing.get("neighbour_page_runover") or {}
+        decision = str(runover.get("decision") or "").strip()
+        if decision:
+            neighbour_runover_decisions[decision] += 1
+        for region in page_info.get("reading_regions") or []:
+            if not isinstance(region, dict):
+                continue
+            method = str(region.get("ocr_method") or "").strip()
+            if method:
+                method_counts[method] += 1
+            if int(region.get("reading_region_count") or 1) == 2:
+                spread_pages.add(page_number)
+            column = region.get("column_preprocessing") or {}
+            if bool(column.get("detected")):
+                three_column_pages.add(page_number)
+            byline = column.get("byline") or {}
+            if bool(byline.get("relocated")):
+                byline_relocated_pages.add(page_number)
+            retry = region.get("ocr_crop_retry") or {}
+            if bool(retry.get("attempted")):
+                crop_retry_pages.add(page_number)
+                if retry.get("reason") == "full_page_retry_selected":
+                    crop_retry_selected_pages.add(page_number)
+            route_recovery = region.get("ocr_route_recovery") or {}
+            if bool(route_recovery.get("attempted")):
+                route_recovery_pages.add(page_number)
+    return {
+        "method": "persisted_reading_region_summary_v1",
+        "adds_ocr_work": False,
+        "ocr_method_counts": dict(sorted(method_counts.items())),
+        "selected_route_counts": dict(sorted(selected_route_counts.items())),
+        "photographed_spread_pages": sorted(spread_pages),
+        "three_column_pages": sorted(three_column_pages),
+        "crop_retry_attempted_pages": sorted(crop_retry_pages),
+        "crop_retry_selected_pages": sorted(crop_retry_selected_pages),
+        "route_recovery_pages": sorted(route_recovery_pages),
+        "byline_relocated_pages": sorted(byline_relocated_pages),
+        "neighbour_runover_decisions": dict(sorted(neighbour_runover_decisions.items())),
+    }
+
+
+def ocr_page_evidence_ledger(ocr_pages, reconciliation=None, targeted_pages=None):
+    """Return one compact, text-free OCR decision row per observed/targeted page."""
+    reconciliation = reconciliation or {}
+
+    def positive_page(value):
+        try:
+            page_number = int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+        return page_number if page_number > 0 else 0
+
+    decisions = {
+        positive_page(row.get("page")): row
+        for row in reconciliation.get("pages") or []
+        if isinstance(row, dict) and positive_page(row.get("page"))
+    }
+    ocr_by_page = {
+        positive_page(row.get("page")): row
+        for row in ocr_pages or []
+        if isinstance(row, dict) and positive_page(row.get("page"))
+    }
+    targeted = {
+        positive_page(page) for page in (targeted_pages or [])
+        if positive_page(page)
+    }
+    rows = []
+    for page_number in sorted(set(ocr_by_page).union(targeted)):
+        page = ocr_by_page.get(page_number) or {}
+        regions = [row for row in (page.get("reading_regions") or []) if isinstance(row, dict)]
+        preprocessing = page.get("spread_preprocessing") or {}
+        retry = next((row.get("ocr_crop_retry") for row in regions if row.get("ocr_crop_retry")), {}) or {}
+        decision = decisions.get(page_number) or {}
+        rows.append({
+            "page": page_number,
+            "targeted": page_number in targeted,
+            "ocr_observed": bool(page),
+            "ocr_word_count": len(_reconciliation_text_tokens(page.get("text") or "")),
+            "selected_route": str(preprocessing.get("path") or "not_recorded"),
+            "ocr_methods": sorted({str(row.get("ocr_method") or "") for row in regions if row.get("ocr_method")}),
+            "crop_fractions": [list(row.get("crop_fraction") or []) for row in regions],
+            "crop_adjustments": [row.get("crop_adjustment") for row in regions if row.get("crop_adjustment")],
+            "crop_retry_attempted": bool(retry.get("attempted")),
+            "crop_retry_result": str(retry.get("reason") or "not_attempted"),
+            "neighbour_runover": dict(preprocessing.get("neighbour_page_runover") or {}),
+            "reconciliation_decision": str(decision.get("decision") or "not_reconciled"),
+            "quality_state": str((decision.get("ocr_page_quality") or {}).get("state") or "not_assessed"),
+        })
+    return {
+        "schema_version": 1,
+        "content_retained": False,
+        "page_count": len(rows),
+        "targeted_page_count": sum(1 for row in rows if row["targeted"]),
+        "ocr_observed_page_count": sum(1 for row in rows if row["ocr_observed"]),
+        "selected_ocr_page_count": sum(1 for row in rows if row["reconciliation_decision"].startswith("ocr_")),
+        "pages": rows,
     }
 
 
@@ -3587,6 +3775,8 @@ def retain_successful_run_leanly(
     allow_exact_vector_runtime_deferred=False,
     shared_batch_receipt=None,
     preserve_generated_children=(),
+    retain_segment_files=True,
+    preserve_preexisting_children=True,
 ):
     """Replace a successful run's forensic tree with usable text + compact facts.
 
@@ -3648,9 +3838,15 @@ def retain_successful_run_leanly(
     # that directory. Record its original children before staging any compact
     # output so the later cleanup cannot mistake a pre-existing export for a
     # disposable worker artefact.
-    try:
-        preexisting_root_children = {child.name for child in out_root.iterdir()}
-    except OSError:
+    if preserve_preexisting_children:
+        try:
+            preexisting_root_children = {child.name for child in out_root.iterdir()}
+        except OSError:
+            preexisting_root_children = set()
+    else:
+        # Automatic source directories are created and owned by this run. At
+        # the proven-success boundary their existing children are generated
+        # artifacts, not user files that need the standalone-output guard.
         preexisting_root_children = set()
     retained_text_path = out_root / prepared_text_path.name
     if prepared_text_path != retained_text_path:
@@ -3664,10 +3860,10 @@ def retain_successful_run_leanly(
     stage_parent = selected_dir if selected_dir.is_dir() else out_root
     stage_dir = Path(tempfile.mkdtemp(prefix=".retained-segments-", dir=stage_parent))
     try:
-        staged_segments = materialize_retained_segments(
-            prepared_text_path,
-            stage_dir,
-            segments,
+        staged_segments = (
+            materialize_retained_segments(prepared_text_path, stage_dir, segments)
+            if retain_segment_files
+            else []
         )
         planned_direct_segments = [out_root / segment_path.name for segment_path in staged_segments]
         planned_targets = [retained_text_path, *planned_direct_segments]
@@ -3884,6 +4080,10 @@ def retain_successful_run_leanly(
             "segments": summary.get("segments"),
             "chunk_size": summary.get("chunk_size"),
             "chunk_overlap": summary.get("chunk_overlap"),
+            "photographed_ocr_routes": dict(
+                summary.get("photographed_ocr_routes") or {}
+            ),
+            "ocr_page_evidence": dict(summary.get("ocr_page_evidence") or {}),
             # The detailed review artifact is intentionally pruned for a
             # lean success, so retain just the non-content integrity facts.
             # This keeps a warning durable without retaining OCR previews or
@@ -4040,6 +4240,12 @@ def finalize_deferred_batch_lean_retention(out_root: Path, summary):
         segments=segments,
         allow_exact_vector_runtime_deferred=True,
         shared_batch_receipt=receipt,
+        # Exact-vector-proven automatic uploads retain the complete parsed
+        # transcript and compact source receipt. Individual segment files are
+        # a manual/local-export convenience and need not become thousands of
+        # permanent filesystem objects after an automatic upload succeeds.
+        retain_segment_files=False,
+        preserve_preexisting_children=False,
     )
     if retained.get("applied"):
         retained["policy"] = "lean_success_after_shared_batch_v1"
@@ -5533,7 +5739,13 @@ def write_supplementary_lane_candidate_text(path, lane_review):
             f"evidence: {item.get('evidence', 'unspecified')}.\n"
             f"{item.get('text', '').strip()}"
         )
-    path.write_text("\n\n".join(block for block in blocks if block.strip()) + ("\n" if blocks else ""), encoding="utf-8")
+    content = "\n\n".join(block for block in blocks if block.strip())
+    path = Path(path)
+    if not content:
+        path.unlink(missing_ok=True)
+        return None
+    path.write_text(content + "\n", encoding="utf-8")
+    return path
 
 
 def split_page_with_offsets(clean, target_chars=650, min_boundary=250):
@@ -5925,7 +6137,8 @@ def make_segments(
             )
             page_line_map = build_page_line_map(raw)
             clean = page_line_map.get("clean_text") or normalize_page_layout_text(raw)
-            if len(clean) < 40:
+            credible_short_leaf = credible_short_page_leaf(clean)
+            if len(clean) < 40 and not credible_short_leaf:
                 continue
             # A photographed spread may have several independently OCRed
             # regions.  They are still the same source PDF page for citations.
@@ -5946,6 +6159,8 @@ def make_segments(
                     page_segment.get("char_end_page"),
                 )
                 flags = []
+                if credible_short_leaf:
+                    flags.append("short_display_leaf_preserved")
                 if len(page_segment["text"]) < 120:
                     flags.append("short_segment")
                 if not current_chapter:
@@ -6005,6 +6220,23 @@ def make_segments(
             page_numbers=custom_group_page_numbers,
         )
     return segments
+
+
+def credible_short_page_leaf(text):
+    """Keep a concise visible heading/dedication without admitting page-number noise."""
+    clean = normalize_text(text)
+    words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", clean)
+    return bool(
+        len(clean) < 40
+        and 2 <= len(words) <= 10
+        and (
+            re.search(
+                r"(?i)\b(?:chapter|part|book|prologue|epilogue|introduction|preface|dedicated|to)\b",
+                clean,
+            )
+            or all(word[:1].isupper() for word in words)
+        )
+    )
 
 
 def parse_custom_page_group_sizes(value):
@@ -6358,6 +6590,114 @@ def _reconciliation_text_tokens(text):
     )
 
 
+def assess_reconciled_ocr_page_quality(pages, decisions):
+    """Record conservative OCR-page diagnostics without rewriting source text.
+
+    Page density is useful evidence, but it cannot distinguish a clipped prose
+    page from a legitimate cover, title leaf, notice, poem, or illustration.
+    These states are therefore observational. Direct extractor failure and
+    competing-crop evidence remain the mechanisms that can withhold a source.
+    """
+    decision_by_page = {
+        int(row.get("page") or 0): row
+        for row in decisions or []
+        if isinstance(row, dict) and int(row.get("page") or 0) > 0
+    }
+    selected_ocr_rows = []
+    for page in pages or []:
+        page_number = int(page.get("page") or 0)
+        decision = decision_by_page.get(page_number) or {}
+        if not str(decision.get("decision") or "").startswith("ocr_"):
+            continue
+        tokens = _reconciliation_text_tokens(page.get("text") or "")
+        if len(tokens) >= 80:
+            selected_ocr_rows.append((page_number, len(tokens)))
+    substantial_counts = [count for _page, count in selected_ocr_rows]
+    peer_median = statistics.median(substantial_counts) if len(substantial_counts) >= 3 else 0.0
+
+    page_states = []
+    last_page_number = max(
+        (int(page.get("page") or 0) for page in pages or [] if isinstance(page, dict)),
+        default=0,
+    )
+    for page in pages or []:
+        page_number = int(page.get("page") or 0)
+        decision = decision_by_page.get(page_number) or {}
+        if not str(decision.get("decision") or "").startswith("ocr_"):
+            continue
+        text = str(page.get("text") or "")
+        tokens = _reconciliation_text_tokens(text)
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        fragment_lines = sum(
+            1 for line in lines
+            if len(_reconciliation_text_tokens(line)) <= 3
+        )
+        fragment_line_ratio = fragment_lines / max(len(lines), 1)
+        image_label_present = bool(re.search(r"(?m)^\[Image\]", text))
+        low_signal_visual_labels = (
+            len(tokens) <= 18
+            and image_label_present
+            and fragment_line_ratio >= .50
+        )
+        incomplete_against_peers = (
+            peer_median >= 240
+            and 18 < len(tokens) < max(140, int(peer_median * .35))
+        )
+        integrity = text_integrity_metrics(text)
+        dense_corruption_suspected = (
+            len(tokens) >= 160
+            and int(integrity.get("fragmented_cluster_token_count") or 0) >= 20
+            and float(integrity.get("fragmented_cluster_token_ratio") or 0.0) >= .12
+        )
+        front_matter_sparse = page_number <= 2 and (
+            low_signal_visual_labels or incomplete_against_peers
+        )
+        terminal_page_sparse = (
+            incomplete_against_peers
+            and page_number == last_page_number
+            and last_page_number > 2
+        )
+        if front_matter_sparse:
+            state = "front_matter_sparse_text"
+            observed_preview = normalize_text(text)[:180]
+        elif terminal_page_sparse:
+            state = "terminal_page_sparse_text"
+            observed_preview = ""
+        elif dense_corruption_suspected:
+            state = "dense_ocr_corruption_suspected"
+            observed_preview = normalize_text(text)[:180]
+        elif low_signal_visual_labels:
+            state = "low_signal_visual_text"
+            observed_preview = normalize_text(text)[:180]
+        elif incomplete_against_peers:
+            state = "sparse_relative_to_peer_pages"
+            observed_preview = normalize_text(text)[:180]
+        else:
+            state = "recovered"
+            observed_preview = ""
+        quality = {
+            "state": state,
+            "word_count": len(tokens),
+            "line_count": len(lines),
+            "fragment_line_ratio": round(fragment_line_ratio, 4),
+            "peer_median_word_count": round(peer_median, 1),
+            "image_label_present": image_label_present,
+            "observed_preview": observed_preview,
+            "text_preserved": True,
+            "diagnostic_only": state != "recovered",
+            "fragmented_cluster_token_count": int(
+                integrity.get("fragmented_cluster_token_count") or 0
+            ),
+            "fragmented_cluster_token_ratio": round(
+                float(integrity.get("fragmented_cluster_token_ratio") or 0.0), 4
+            ),
+        }
+        page["ocr_page_quality"] = quality
+        decision["ocr_page_quality"] = quality
+        page_states.append({"page": page_number, **quality})
+    return page_states
+
+
 def _native_raw_reconciliation_text(native_page, fallback_text=""):
     """Use the original positioned native text when it is available.
 
@@ -6524,9 +6864,10 @@ def reconcile_native_ocr_pages(native_pages, ocr_pages):
         }
         reconciled.append(page_row)
         decisions.append({"page": page_number, **page_row["native_ocr_reconciliation"]})
+    page_quality = assess_reconciled_ocr_page_quality(reconciled, decisions)
     return reconciled, {
         "status": "applied" if decisions else "not_available",
-        "method": "page_local_evidence_reconciliation_v3",
+        "method": "page_local_evidence_reconciliation_v4",
         "selection_policy": (
             "page-local evidence; preserve OCR structure only as the "
             "conservative tie-breaker"
@@ -6535,6 +6876,27 @@ def reconcile_native_ocr_pages(native_pages, ocr_pages):
         "native_selected_pages": [
             row["page"] for row in decisions
             if row["decision"].startswith("native_used")
+        ],
+        "page_quality": page_quality,
+        "sparse_relative_pages": [
+            row["page"] for row in page_quality
+            if row["state"] == "sparse_relative_to_peer_pages"
+        ],
+        "front_matter_sparse_pages": [
+            row["page"] for row in page_quality
+            if row["state"] == "front_matter_sparse_text"
+        ],
+        "terminal_page_sparse_pages": [
+            row["page"] for row in page_quality
+            if row["state"] == "terminal_page_sparse_text"
+        ],
+        "low_signal_visual_pages": [
+            row["page"] for row in page_quality
+            if row["state"] == "low_signal_visual_text"
+        ],
+        "dense_corruption_suspected_pages": [
+            row["page"] for row in page_quality
+            if row["state"] == "dense_ocr_corruption_suspected"
         ],
     }
 
@@ -7102,6 +7464,30 @@ def automatic_page_local_ocr_plan(ocr_preflight_hint, candidates=None, pdf_page_
     }
 
 
+def native_document_requires_full_ocr(candidates, pdf_page_count=0):
+    """Return true only when the direct native text layer is document-wide empty.
+
+    A layout extractor may invoke OCR internally and recover some text from a
+    scan. That does not make it a native authority for pages omitted from a
+    targeted Unstructured pass. Mixed PDFs retain page-local OCR; only a
+    materially empty direct PyMuPDF candidate is promoted to whole-document
+    OCR so later pages cannot disappear during reconciliation.
+    """
+    native = next(
+        (
+            candidate for candidate in candidates or []
+            if str(candidate.get("backend") or "").casefold() == "pymupdf"
+            and not candidate.get("error")
+        ),
+        None,
+    )
+    if not native:
+        return False
+    words = int((native.get("quality") or {}).get("included_words") or 0)
+    page_count = max(1, int(pdf_page_count or 0))
+    return words < max(100, page_count * 10)
+
+
 def has_document_wide_ocr_evidence(candidates, ocr_preflight_hint=None, pdf_page_count=0):
     """Whether candidate evidence warrants OCRing an entire PDF.
 
@@ -7205,6 +7591,18 @@ def is_unstructured_runtime_failure(error):
         "no module named 'unstructured", "no module named 'onnxruntime",
         "no module named 'detectron2",
     ))
+
+
+def partition_ocr_processing_seconds(candidates, selected):
+    """Attribute OCR time after the final output candidate has been chosen."""
+    total_seconds = sum(
+        max(0.0, float((candidate or {}).get("ocr_processing_seconds") or 0.0))
+        for candidate in (candidates or [])
+    )
+    selected_seconds = max(
+        0.0, float((selected or {}).get("ocr_processing_seconds") or 0.0)
+    )
+    return total_seconds, selected_seconds, max(0.0, total_seconds - selected_seconds)
 
 
 def ocr_assistance_evidence(selected, candidates, profile):
@@ -7542,8 +7940,11 @@ def write_provenance_review_manifest(
             "page_transition_manifest": "page-transition-manifest.jsonl",
             "layout_region_review": "layout-region-review.json",
             "retrieval_lane_review": "retrieval-lane-review.json",
-            "supplementary_lane_candidates": "supplementary-content-candidates.txt",
-            "readiness_report": "readiness-report.html",
+            "supplementary_lane_candidates": (
+                "supplementary-content-candidates.txt"
+                if (selected_dir / "supplementary-content-candidates.txt").is_file()
+                else ""
+            ),
         },
         "provenance_checks": {
             "page_transition_boundaries_checked": len(transition_rows),
@@ -7734,14 +8135,15 @@ def evaluate_edge_cases(
         check_status((selected_dir / "anythingllm-upload.txt").exists()),
         str(selected_dir / "anythingllm-upload.txt"),
     )
-    add(
-        "fallback_inline_artifact",
-        check_status(
-            (selected_dir / "anythingllm-upload-inline-metadata-fallback.txt").exists(),
-            warn=True,
-        ),
-        str(selected_dir / "anythingllm-upload-inline-metadata-fallback.txt"),
-    )
+    if selected.get("chunk_eval", {}).get("status") != "disabled":
+        add(
+            "fallback_inline_artifact",
+            check_status(
+                (selected_dir / "anythingllm-upload-inline-metadata-fallback.txt").exists(),
+                warn=True,
+            ),
+            str(selected_dir / "anythingllm-upload-inline-metadata-fallback.txt"),
+        )
     add("frontmatter_variant", check_status((selected_dir / "anythingllm-upload-frontmatter-and-body.txt").exists(), warn=True), "optional variant")
     add("endmatter_variant", check_status((selected_dir / "anythingllm-upload-body-with-endmatter.txt").exists(), warn=True), "optional variant")
     layout = selected.get("layout_evidence") or {}
@@ -14310,6 +14712,18 @@ def ocr_upload_hold_guidance(block_reason: str, readiness_reasons=()):
             "next_steps": [
                 "Open the readiness report and compare the candidate extraction reports.",
                 "Use an explicit OCR strategy only after confirming which output preserves the source correctly.",
+            ],
+        }
+    if reason == "ocr_prose_page_recovery_incomplete":
+        return {
+            "code": "AUTO-OCR-INCOMPLETE-001",
+            "message": (
+                "AnythingLLM upload was withheld: at least one scanned prose page recovered "
+                "substantially less text than comparable pages in the same PDF. No upload was sent."
+            ),
+            "next_steps": [
+                "Open the page-quality evidence and compare the named PDF page with the original.",
+                "Use a verified OCRed copy or a reviewed extraction override before retrying that PDF.",
             ],
         }
     if "ocr_attempt_failed" in reasons:
@@ -23014,22 +23428,34 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                     evidence_kind="page_completed",
                 )
 
+            unstructured_page_numbers = (
+                automatic_targeted_ocr_pages
+                if backend == "unstructured" and automatic_targeted_ocr_pages
+                else None
+            )
+            if unstructured_page_numbers:
+                if native_document_requires_full_ocr(
+                    candidates, profile.get("pdf_page_count")
+                ):
+                    unstructured_page_numbers = None
+                    page_total = max(1, int(profile.get("pdf_page_count") or 0))
+                    automatic_targeted_ocr_pages = list(range(1, page_total + 1))
+                    auto_unstructured_reasons.append(
+                        "whole_document_ocr_required_because_native_document_is_empty"
+                    )
+
             pages, page_count, element_rows = get_backend_pages(
                 pdf_path,
                 backend,
                 unstructured_effective_strategy if backend == "unstructured" else requested_unstructured_strategy,
                 unstructured_runtime_probe=active_unstructured["runtime"] if backend == "unstructured" else None,
-                unstructured_cache_dir=(
-                    getattr(args, "unstructured_ocr_cache_dir", "")
+                unstructured_checkpoint_dir=(
+                    getattr(args, "unstructured_ocr_checkpoint_dir", "")
                     if backend == "unstructured"
                     else None
                 ),
                 progress_callback=report_backend_page_progress,
-                unstructured_page_numbers=(
-                    automatic_targeted_ocr_pages
-                    if backend == "unstructured" and automatic_targeted_ocr_pages
-                    else None
-                ),
+                unstructured_page_numbers=unstructured_page_numbers,
             )
             report_upload_phase(
                 "candidate_evaluation",
@@ -23084,15 +23510,12 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                     progress_callback=report_native_layout_progress,
                 )
             elif backend == "unstructured":
+                raw_ocr_pages = list(pages)
                 pages, layout_evidence = remove_verified_photographed_ocr_running_headers(pages)
-                layout_evidence["photographed_spread_page_count"] = sum(
-                    1
-                    for page in pages
-                    if any(
-                        int(region.get("reading_region_count") or 1) == 2
-                        for region in (page.get("reading_regions") or [])
-                        if isinstance(region, dict)
-                    )
+                route_evidence = photographed_ocr_route_evidence(pages)
+                layout_evidence["photographed_ocr_routes"] = route_evidence
+                layout_evidence["photographed_spread_page_count"] = len(
+                    route_evidence["photographed_spread_pages"]
                 )
                 native_peer = next(
                     (
@@ -23112,6 +23535,11 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                         "status": "not_available",
                         "reason": "No prepared PyMuPDF candidate was available for page-local reconciliation.",
                     }
+                native_ocr_reconciliation["ocr_page_evidence"] = ocr_page_evidence_ledger(
+                    raw_ocr_pages,
+                    native_ocr_reconciliation,
+                    automatic_targeted_ocr_pages,
+                )
             write_json(candidate_dir / "layout-region-review.json", layout_evidence)
             if backend == "unstructured":
                 write_json(candidate_dir / "native-ocr-reconciliation.json", native_ocr_reconciliation)
@@ -23333,8 +23761,8 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 )
             append_jsonl(candidate_dir / "segment-manifest.jsonl", segments)
             write_csv(candidate_dir / "extraction-report.csv", [asdict(s) for s in stats])
-            write_csv(candidate_dir / "outline-validation.csv", outline_validation["rows"])
-            write_csv(candidate_dir / "metadata-ratio.csv", [marker_stats])
+            if outline_validation["rows"]:
+                write_csv(candidate_dir / "outline-validation.csv", outline_validation["rows"])
             append_jsonl(candidate_dir / "probes.jsonl", probes)
             write_csv(candidate_dir / "literal-results.csv", literal_results)
             write_csv(
@@ -23400,26 +23828,14 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 variant_path = candidate_dir / f"anythingllm-upload-{name}.txt"
                 variant_fallback_path = candidate_dir / f"anythingllm-upload-{name}-inline-metadata-fallback.txt"
                 variant_manifest = candidate_dir / f"segment-manifest-{name}.jsonl"
-                variant_ratio = candidate_dir / f"metadata-ratio-{name}.csv"
                 variant_path.write_text(variant_text, encoding="utf-8")
                 if generate_inline_fallback:
                     variant_fallback_path.write_text(variant_fallback_text, encoding="utf-8")
                 append_jsonl(variant_manifest, variant_segments)
-                write_csv(
-                    variant_ratio,
-                    [
-                        marker_ratio_stats(
-                            variant_segments,
-                            marker_style=args.marker_style,
-                            include_markers=generate_inline_fallback,
-                        )
-                    ],
-                )
                 variant_outputs[name] = {
                     "upload_file": str(variant_path),
                     "fallback_upload_file": str(variant_fallback_path) if generate_inline_fallback else "",
                     "manifest": str(variant_manifest),
-                    "metadata_ratio": str(variant_ratio),
                     "start_page": variant_start,
                     "end_page": variant_end,
                     "segments": len(variant_segments),
@@ -23457,6 +23873,9 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 "page_stats": [asdict(s) for s in stats],
                 "layout_evidence": layout_evidence,
                 "native_ocr_reconciliation": native_ocr_reconciliation,
+                "ocr_page_evidence": dict(
+                    native_ocr_reconciliation.get("ocr_page_evidence") or {}
+                ),
                 "visual_text_review": visual_text_review,
                 "lane_review": lane_review,
                 "start_page": start_page,
@@ -23580,7 +23999,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             in {"hi_res", "ocr_only"}
         ):
             execution = candidate.get("unstructured_execution") or {}
-            if str(execution.get("mode") or "") == "persistent_ocr_cache_hit":
+            if str(execution.get("mode") or "") == "run_local_ocr_checkpoint_hit":
                 candidate_ocr_cache_pages = len(
                     execution.get("targeted_page_numbers") or candidate.get("pages") or []
                 )
@@ -23696,12 +24115,6 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     if not viable:
         raise RuntimeError("No extraction backend produced usable segments.")
     selected = sorted(viable, key=lambda c: c["score"], reverse=True)[0]
-    selected_output_ocr_processing_seconds = max(
-        0.0, float(selected.get("ocr_processing_seconds") or 0.0)
-    )
-    comparison_ocr_processing_seconds = max(
-        0.0, ocr_processing_seconds - selected_output_ocr_processing_seconds
-    )
     automatic_targeted_ocr_selection = {
         "applied": False,
         "recovered_page_numbers": [],
@@ -23738,6 +24151,9 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                     "ocr_used_native_page_missing",
                     "ocr_used_native_page_inadequate",
                 }
+                and bool(
+                    (row.get("ocr_page_quality") or {}).get("text_preserved", True)
+                )
                 and page_text_by_number.get(candidate_page_number(row), "")
             )
             if recovered_page_numbers:
@@ -23757,6 +24173,11 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             automatic_targeted_ocr_selection["reason"] = (
                 "targeted_ocr_did_not_recover_nonempty_text"
             )
+    (
+        ocr_processing_seconds,
+        selected_output_ocr_processing_seconds,
+        comparison_ocr_processing_seconds,
+    ) = partition_ocr_processing_seconds(candidates, selected)
     # This evidence is only available after the candidate has actually run.
     # Emit it before the upload phase so an outer progress UI can adjust the
     # remaining estimate without charging OCR to text-only PDFs in advance.
@@ -23830,6 +24251,38 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         if row.get("kind") in {"exact_phrase", "user_exact_phrase"}
     )
     quality = selected.get("quality", {})
+    selected_ocr_reconciliation = selected.get("native_ocr_reconciliation") or {}
+    def positive_ocr_pages(field):
+        return sorted({
+            int(page)
+            for page in (selected_ocr_reconciliation.get(field) or [])
+            if str(page).isdigit() and int(page) > 0
+        })
+
+    sparse_relative_ocr_pages = positive_ocr_pages("sparse_relative_pages")
+    front_matter_sparse_ocr_pages = positive_ocr_pages("front_matter_sparse_pages")
+    terminal_page_sparse_ocr_pages = positive_ocr_pages("terminal_page_sparse_pages")
+    low_signal_visual_ocr_pages = positive_ocr_pages("low_signal_visual_pages")
+    dense_corruption_ocr_pages = positive_ocr_pages("dense_corruption_suspected_pages")
+    selected["ocr_page_quality_summary"] = {
+        "sparse_relative_pages": sparse_relative_ocr_pages,
+        "front_matter_sparse_pages": front_matter_sparse_ocr_pages,
+        "terminal_page_sparse_pages": terminal_page_sparse_ocr_pages,
+        "low_signal_visual_pages": low_signal_visual_ocr_pages,
+        "dense_corruption_suspected_pages": dense_corruption_ocr_pages,
+        "diagnostic_only": True,
+        "source_text_preserved": True,
+    }
+    selected["ocr_content_status"] = (
+        "ready_with_ocr_quality_observations"
+        if any((
+            sparse_relative_ocr_pages,
+            front_matter_sparse_ocr_pages,
+            low_signal_visual_ocr_pages,
+            dense_corruption_ocr_pages,
+        ))
+        else "ready"
+    )
     if exact_vector_fail:
         readiness_reasons.append("exact_vector_retrieval_failed")
     if vector_status.startswith("error_"):
@@ -24029,8 +24482,9 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         if source_path.exists():
             shutil.copy2(source_path, selected_dir / filename)
     shutil.copy2(src_candidate_dir / "extraction-report.csv", selected_dir / "extraction-report.csv")
-    shutil.copy2(src_candidate_dir / "outline-validation.csv", selected_dir / "outline-validation.csv")
-    shutil.copy2(src_candidate_dir / "metadata-ratio.csv", selected_dir / "metadata-ratio.csv")
+    candidate_outline = src_candidate_dir / "outline-validation.csv"
+    if candidate_outline.is_file() and candidate_outline.stat().st_size > 3:
+        shutil.copy2(candidate_outline, selected_dir / "outline-validation.csv")
     shutil.copy2(
         src_candidate_dir / "native-header-chunk-audit.csv",
         selected_dir / "native-header-chunk-audit.csv",
@@ -24055,7 +24509,6 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         chunk_overlap,
         profile["anythingllm_embedding_config"],
     )
-    write_csv(selected_dir / "representation-comparison.csv", comparison_rows)
     write_json(selected_dir / "representation-comparison.json", comparison_rows)
     harmonization_report_rows = harmonization_rows(
         selected["segments"],
@@ -24064,10 +24517,8 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         chunk_overlap,
         profile["anythingllm_embedding_config"],
     )
-    write_csv(selected_dir / "harmonization-report.csv", harmonization_report_rows)
     write_json(selected_dir / "harmonization-report.json", harmonization_report_rows)
     recommendation_rows = representation_recommendation_rows(harmonization_report_rows)
-    write_csv(selected_dir / "representation-recommendation.csv", recommendation_rows)
     write_json(selected_dir / "representation-recommendation.json", recommendation_rows)
     selected_variants = {}
     for variant_name, variant in (selected.get("variant_outputs") or {}).items():
@@ -24075,7 +24526,6 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         for key, filename in (
             ("upload_file", f"anythingllm-upload-{variant_name}.txt"),
             ("manifest", f"segment-manifest-{variant_name}.jsonl"),
-            ("metadata_ratio", f"metadata-ratio-{variant_name}.csv"),
         ):
             source_path = Path(variant[key])
             target_path = selected_dir / filename
@@ -26309,18 +26759,13 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         selected_dir / "retrieval-lane-review.json",
         selected_dir / "supplementary-content-candidates.txt",
         provenance_review_manifest,
-        selected_dir / "representation-comparison.csv",
         selected_dir / "representation-comparison.json",
-        selected_dir / "harmonization-report.csv",
         selected_dir / "harmonization-report.json",
-        selected_dir / "representation-recommendation.csv",
         selected_dir / "representation-recommendation.json",
         selected_dir / "extraction-report.csv",
         selected_dir / "outline-validation.csv",
-        selected_dir / "metadata-ratio.csv",
         selected_dir / "native-header-chunk-audit.csv",
         selected_dir / "output-variant-summary.csv",
-        selected_dir / "readiness-report.html",
         metadata_dir / "raw-text-payloads-native-header.jsonl",
         metadata_dir / "raw-text-payloads-page-parents-native-header.jsonl",
         metadata_dir / "upload-plan.csv",
@@ -26353,8 +26798,6 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         if variant.get("fallback_upload_file"):
             output_paths.append(Path(variant["fallback_upload_file"]))
     output_paths = [path for path in output_paths if path.exists()]
-    report_html = build_html_report(profile, candidates, selected, output_paths, storage_report, upload_report)
-    (selected_dir / "readiness-report.html").write_text(report_html, encoding="utf-8")
     harmonization_by_name = {row["representation"]: row for row in harmonization_report_rows}
     segment_harmonization = harmonization_by_name.get("passage_segments", {})
     parent_harmonization = harmonization_by_name.get("page_parents", {})
@@ -26449,6 +26892,9 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             profile.get("unstructured_auto_trigger", {}).get("targeted_page_numbers") or []
         ),
         "ocr_comparison": ocr_comparison,
+        "ocr_content_status": selected.get("ocr_content_status", "ready"),
+        "ocr_page_quality_summary": dict(selected.get("ocr_page_quality_summary") or {}),
+        "ocr_page_evidence": dict(selected.get("ocr_page_evidence") or {}),
         "native_ocr_reconciliation": dict(selected.get("native_ocr_reconciliation") or {}),
         "visual_text_review": dict(selected.get("visual_text_review") or {}),
         "pdf_page_count": profile["pdf_page_count"],
@@ -26475,6 +26921,9 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         "outline_reliability": selected.get("outline_validation", {}).get("reliability"),
         "layout_region_status": (selected.get("layout_evidence") or {}).get("status", "not_applied"),
         "layout_removed_marginalia_count": (selected.get("layout_evidence") or {}).get("removed_marginalia_count", 0),
+        "photographed_ocr_routes": dict(
+            (selected.get("layout_evidence") or {}).get("photographed_ocr_routes") or {}
+        ),
         "layout_note_candidates_retained_count": (selected.get("layout_evidence") or {}).get("note_candidates_retained_count", 0),
         "layout_excluded_footnote_count": (selected.get("layout_evidence") or {}).get("excluded_footnote_count", 0),
         "layout_two_column_page_count": (selected.get("layout_evidence") or {}).get("two_column_page_count", 0),
@@ -26528,12 +26977,16 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         "layout_region_review": str(selected_dir / "layout-region-review.json"),
         "visual_text_review_artifact": str(selected_dir / "visual-text-review.json"),
         "retrieval_lane_review": str(selected_dir / "retrieval-lane-review.json"),
-        "supplementary_lane_candidates": str(selected_dir / "supplementary-content-candidates.txt"),
+        "supplementary_lane_candidates": (
+            str(selected_dir / "supplementary-content-candidates.txt")
+            if (selected_dir / "supplementary-content-candidates.txt").is_file()
+            else ""
+        ),
         "provenance_review_manifest": str(provenance_review_manifest),
-        "representation_comparison": str(selected_dir / "representation-comparison.csv"),
-        "harmonization_report": str(selected_dir / "harmonization-report.csv"),
-        "representation_recommendation": str(selected_dir / "representation-recommendation.csv"),
-        "report": str(selected_dir / "readiness-report.html"),
+        "representation_comparison": str(selected_dir / "representation-comparison.json"),
+        "harmonization_report": str(selected_dir / "harmonization-report.json"),
+        "representation_recommendation": str(selected_dir / "representation-recommendation.json"),
+        "report": "",
         "variant_summary": str(selected_dir / "output-variant-summary.csv"),
         "metadata_payloads": str(metadata_dir / "raw-text-payloads-native-header.jsonl"),
         "page_parent_metadata_payloads": str(metadata_dir / "raw-text-payloads-page-parents-native-header.jsonl"),

@@ -23,6 +23,7 @@ ENVIRONMENT_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # same time.  Keep the whole read/replace/verify sequence serial, rather than
 # merely making the final replacement atomic.
 PERSISTENCE_WRITE_LOCK = threading.RLock()
+SETTINGS_SNAPSHOT_RETENTION_LIMIT = 64
 
 
 def _now():
@@ -98,6 +99,57 @@ def _atomic_write_text(path: Path, content: str) -> None:
                 pass
 
 
+def _snapshot_state_key(payload):
+    """Identify the restorable state, excluding per-attempt bookkeeping."""
+    value = dict(payload or {})
+    return json.dumps(
+        {
+            "matched_profile": value.get("matched_profile"),
+            "env": value.get("env") or {},
+            "sqlite": value.get("sqlite") or {},
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def compact_settings_snapshots(snapshot_dir, *, limit=SETTINGS_SNAPSHOT_RETENTION_LIMIT):
+    """Keep one newest restoration point per state and bound old uniques."""
+    root = Path(snapshot_dir)
+    if not root.is_dir():
+        return {"kept": [], "removed": []}
+    candidates = sorted(
+        root.glob("anythingllm-settings-snapshot-*.json"),
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    )
+    kept = []
+    removed = []
+    seen_states = set()
+    for path in candidates:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            state_key = _snapshot_state_key(payload)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            # A malformed restoration point is evidence of its own failure;
+            # never silently remove it during ordinary deduplication.
+            kept.append(path)
+            continue
+        duplicate = state_key in seen_states
+        over_limit = len(seen_states) >= max(1, int(limit or 1))
+        if duplicate or over_limit:
+            try:
+                path.unlink()
+                removed.append(path)
+            except OSError:
+                kept.append(path)
+            continue
+        seen_states.add(state_key)
+        kept.append(path)
+    return {"kept": kept, "removed": removed}
+
+
 class AnythingLLMPersistenceAdapter:
     """Perform narrowly allowed Desktop-setting writes with a redacted snapshot.
 
@@ -146,11 +198,22 @@ class AnythingLLMPersistenceAdapter:
             "sqlite": sqlite_values,
         }
         self.snapshot_dir.mkdir(parents=True, exist_ok=True)
+        compacted = compact_settings_snapshots(self.snapshot_dir)
+        state_key = _snapshot_state_key(payload)
+        for existing in compacted["kept"]:
+            try:
+                if _snapshot_state_key(json.loads(existing.read_text(encoding="utf-8"))) == state_key:
+                    return existing
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                continue
         # Each mutation needs an immutable restoration point. A fixed filename
         # used to overwrite the snapshot from an earlier setting change in the
         # same run, making a full rollback impossible.
         path = self.snapshot_dir / f"anythingllm-settings-snapshot-{uuid.uuid4().hex}.json"
         _atomic_write_text(path, json.dumps(payload, indent=2, ensure_ascii=False))
+        # Compact once more so adding a new unique state cannot leave the
+        # directory one entry above its configured bound until a later write.
+        compact_settings_snapshots(self.snapshot_dir)
         return path
 
     def write_env_setting(self, key, value, reason="operator_requested_change"):
