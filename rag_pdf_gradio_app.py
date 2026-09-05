@@ -76,6 +76,7 @@ from embedder_capabilities import (
 )
 
 from auto_anythingllm_pipeline import (
+    summarize_ocr_run_evidence,
     AUTOMATIC_UPLOAD_PHASE_RANGES,
     ANYTHINGLLM_EMBEDDING_RECONCILIATION_STALL_SECONDS,
     ANYTHINGLLM_EMBEDDING_RECONCILIATION_TIMEOUT_SECONDS,
@@ -1294,8 +1295,35 @@ def gradio_server_app_with_connection_watchdog():
     return app
 
 
+PDF_FOLDER_PICKER_TIMING_JS = """
+(...args) => {
+  try {
+    const now = Date.now();
+    const click = window.ragPdfFolderClick;
+    args[5] = {
+      click_epoch_ms: click && now - click.epoch >= 0 && now - click.epoch < 60000 ? click.epoch : now,
+      dispatch_epoch_ms: now,
+      document_age_ms: performance.now(),
+      captured_click: !!(click && now - click.epoch >= 0 && now - click.epoch < 60000)
+    };
+    window.ragPdfFolderClick = null;
+  } catch (_) { args[5] = null; }
+  return args;
+}
+"""
+
+
 APP_JS = """
 () => {
+  // Observation only: do not delay, cancel, replace or submit a picker event.
+  if (!window.ragPdfFolderTimingInstalled) {
+    window.ragPdfFolderTimingInstalled = true;
+    document.addEventListener("click", (event) => {
+      if (event.target instanceof Element && event.target.closest("#choose-pdf-folder-button")) {
+        window.ragPdfFolderClick = {epoch: Date.now()};
+      }
+    }, true);
+  }
   // This JavaScript is a narrow rendering adapter for unstable Gradio DOM
   // details. It must not become a second business-logic layer: durable run
   // state, validation, upload, and cancellation decisions stay in Python.
@@ -7851,7 +7879,15 @@ def append_ingestion_history(
         # A terminal audit record must not turn a completed cancellation into a
         # UI failure if a future setting gains a Path-like value. Preserve it
         # as its literal local path instead.
-        atomic_write_text(Path(run_root) / "ingestion-terminal-record.json", json.dumps(record, indent=2, default=str))
+        # Keep the OCR rollup in this run, not duplicated in growing Run History.
+        # Observational failure must never reclassify a completed/cancelled run.
+        terminal_record = dict(record)
+        try:
+            terminal_record["ocr_diagnostics"] = summarize_ocr_run_evidence(summaries)
+        except Exception as exc:
+            terminal_record["ocr_diagnostics"] = {"status": "unavailable", "error_type": type(exc).__name__}
+            APP_LOGGER.warning("could not summarize OCR run evidence: %s", type(exc).__name__)
+        atomic_write_text(Path(run_root) / "ingestion-terminal-record.json", json.dumps(terminal_record, indent=2, default=str))
         AUTO_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         with PERSISTED_HISTORY_LOCK:
             prune_background_jsonl(INGESTION_HISTORY_PATH)
@@ -10161,23 +10197,67 @@ def choose_output_directory(current_value=""):
     return selected
 
 
-def choose_pdf_input_directory(current_value="", *, preserve_on_cancel=True):
+def _pdf_picker_timing_start(browser=None):
+    trace = {"id": uuid.uuid4().hex[:16], "callback_epoch_ms": time.time() * 1000,
+             "callback_monotonic": time.perf_counter()}
+    browser = browser if isinstance(browser, dict) else {}
+    for key in ("click_epoch_ms", "dispatch_epoch_ms", "document_age_ms"):
+        value = browser.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 1e14 and math.isfinite(value):
+            trace[key] = value
+    trace["captured_click"] = browser.get("captured_click") is True
+    return trace
+
+
+def _pdf_picker_timing_log(trace):
+    # One existing-log write AFTER the dialog returns, never on its opening
+    # path. A failed diagnostic must not change selection/cancellation.
+    try:
+        record = {key: value for key, value in trace.items() if key != "callback_monotonic"}
+        if "dispatch_epoch_ms" in record:
+            record["browser_to_callback_ms"] = round(record["callback_epoch_ms"] - record["dispatch_epoch_ms"], 3)
+        if "click_epoch_ms" in record and "dispatch_epoch_ms" in record:
+            record["click_to_dispatch_ms"] = round(record["dispatch_epoch_ms"] - record["click_epoch_ms"], 3)
+        record["clock_note"] = "browser-to-server uses wall clocks; negative values indicate clock mismatch"
+        record["dialog_return_note"] = "includes dialog opening AND time spent choosing; not opening latency"
+        APP_LOGGER.info("PDF picker timing %s", json.dumps(record, sort_keys=True),
+                        extra={"event": "pdf_folder_picker_timing"})
+    except Exception:
+        pass
+
+
+def choose_pdf_input_directory(current_value="", *, preserve_on_cancel=True, picker_timing=None):
+    trace = dict(picker_timing) if isinstance(picker_timing, dict) else _pdf_picker_timing_start()
+    started = time.perf_counter()
+    trace["chain_to_picker_ms"] = round((started - trace.get("callback_monotonic", started)) * 1000, 3)
     try:
         import tkinter as tk
         from tkinter import filedialog
 
+        trace["tk_import_ms"] = round((time.perf_counter() - started) * 1000, 3)
+        root_started = time.perf_counter()
         root = tk.Tk()
         root.withdraw()
         root.attributes("-topmost", True)
+        trace["tk_initialize_ms"] = round((time.perf_counter() - root_started) * 1000, 3)
+        trace["dialog_invoked_epoch_ms"] = time.time() * 1000
+        dialog_started = time.perf_counter()
         selected = filedialog.askdirectory(
             initialdir=(current_value or str(USER_DOWNLOADS_DIR)),
             title="Choose a folder to scan for PDF files",
             mustexist=True,
         )
+        trace["dialog_call_ms"] = round((time.perf_counter() - dialog_started) * 1000, 3)
+        trace["outcome"] = "selected" if selected else "cancelled"
         root.destroy()
     except Exception as exc:
+        trace["outcome"] = "exception"
+        trace["exception_type"] = type(exc).__name__
         APP_LOGGER.warning("native PDF-folder picker failed: %s", exc)
         return (current_value or "") if preserve_on_cancel else None
+    finally:
+        trace["picker_total_ms"] = round((time.perf_counter() - started) * 1000, 3)
+        _pdf_picker_timing_log(trace)
     if not selected:
         return (current_value or "") if preserve_on_cancel else None
     return selected
@@ -10327,6 +10407,14 @@ def automatic_batch_output_capacity_preflight(
             )
         ),
     }
+
+
+def terminal_output_capacity_evidence(capacity):
+    """Compact the canonical preflight result without inventing zero space."""
+    value = capacity or {}
+    return {"status": str(value.get("status") or "not_recorded"),
+            "projected_bytes": value.get("projected_artifact_bytes"),
+            "available_bytes": value.get("available_free_bytes")}
 
 
 def directory_scan_entries(path_text=""):
@@ -10953,9 +11041,12 @@ def apply_batch_folder_file_selection(manifest=None, selected_paths=None):
 
 
 @automatic_next_run_callback(9)
-def choose_pdf_input_directory_for_scan(current_value=""):
+def choose_pdf_input_directory_for_scan(current_value="", selection_state=None):
     """Select a root and clear any preceding scan before discovery begins."""
-    selected = choose_pdf_input_directory(current_value, preserve_on_cancel=False)
+    timing = (selection_state or {}).get("picker_timing") if isinstance(selection_state, dict) else None
+    selected = choose_pdf_input_directory(current_value, preserve_on_cancel=False, **(
+        {"picker_timing": timing} if isinstance(timing, dict) else {}
+    ))
     if selected is None:
         return (
             "",
@@ -12327,9 +12418,11 @@ def automatic_folder_selection_begin_state(
     pdf_files=None,
     folder_pdf_files=None,
     folder_manifest=None,
+    picker_browser_timing=None,
 ):
     """Start a folder-batch update without blanking the ordinary PDF picker."""
-    return _automatic_selection_begin_state(
+    timing = _pdf_picker_timing_start(picker_browser_timing) if picker_browser_timing is not None else None
+    result = _automatic_selection_begin_state(
         previous_state,
         _viewed_run_root,
         pdf_files,
@@ -12338,6 +12431,9 @@ def automatic_folder_selection_begin_state(
         preserve_ordinary_picker=True,
         selection_not_yet_chosen=True,
     )
+    if timing is not None:
+        result[0]["picker_timing"] = timing
+    return result
 
 
 def automatic_selection_finish_state(selection_state, pdf_files=None, folder_pdf_files=None, folder_manifest=None):
@@ -12836,6 +12932,22 @@ def concurrent_preparation_progress_fraction(
     return max(evidence, min(elapsed_share, source_ceiling))
 
 
+def ingestion_progress_after_preparation(evidence_fraction, preparation_fraction):
+    """Preserve the existing ingestion lane after a long local preparation.
+
+    A run-local, frozen display origin only; never changes ETA, record counts,
+    phase ownership, or the final reporting reservation. Fast preparation is
+    byte-for-byte the old numeric mapping.
+    """
+    origin = AUTOMATIC_UPLOAD_PHASE_RANGES["payloads"][1]
+    end = AUTOMATIC_UPLOAD_PHASE_RANGES["identity_set"][1]
+    evidence = max(0.0, min(end, float(evidence_fraction)))
+    start = max(origin, min(.50, float(preparation_fraction or 0.0)))
+    if start == origin or evidence >= end:
+        return evidence
+    return start + max(0.0, evidence - origin) / (end - origin) * (end - start)
+
+
 def raw_paced_progress_fraction(record, now=None):
     """Return the evidence-plus-time target before display smoothing."""
     now = time.time() if now is None else float(now)
@@ -12854,7 +12966,8 @@ def raw_paced_progress_fraction(record, now=None):
     allowance = max(0.0, float(0.025 if allowance_value is None else allowance_value))
     phase_start = min(confirmed, max(0.0, float(record.get("phase_start_fraction") or confirmed)))
     paced = phase_start + allowance * min(1.0, max(0.0, now - phase_started) / budget)
-    return min(0.995, max(confirmed, paced))
+    presentation = max(0.0, float(record.get("presentation_progress_fraction") or 0.0))
+    return min(0.995, max(confirmed, paced, presentation))
 
 
 def paced_progress_fraction(record, now=None):
@@ -12907,6 +13020,7 @@ def reprice_presentation_expected_seconds(
     is_material_reprice,
     preserve_existing_remaining_discount=False,
     elapsed_seconds=0.0,
+    minimum_remaining_ratio=0.0,
 ):
     """Keep a model reprice from needlessly jolting the visible timer.
 
@@ -12938,6 +13052,10 @@ def reprice_presentation_expected_seconds(
             if previous_remaining
             else 1.0,
         )
+        # An evidence-based fresh-queue correction should not inherit an
+        # ever larger discount merely because the opening clock has elapsed.
+        # This bounds the display adjustment only, not the underlying model.
+        presentation_ratio = max(presentation_ratio, min(1.0, max(0.0, minimum_remaining_ratio)))
         repriced_presentation = max(
             0,
             int(math.ceil(
@@ -12989,6 +13107,7 @@ def update_live_automatic_run_status(
     expected_seconds=0,
     details="",
     confirmed_fraction=None,
+    presentation_progress_fraction=None,
     cancel_available=None,
     cancel_requested=None,
     activity_observed=True,
@@ -13113,6 +13232,11 @@ def update_live_automatic_run_status(
                 and not bool(cache_plan_partial is False and cache_reuse_records)
             ),
             elapsed_seconds=presentation_elapsed_seconds,
+            minimum_remaining_ratio=(
+                0.70 if eta_reprice_reason == "owned_queue_rate"
+                and not (cache_reuse_records or previous.get("cache_reuse_records"))
+                else 0.0
+            ),
         )
     else:
         try:
@@ -13407,6 +13531,13 @@ def update_live_automatic_run_status(
         "cache_plan_partial": cache_plan_partial,
         "comparable_runs": comparable_value,
         "confirmed_fraction": confirmed,
+        # Display-only lift, separate from the canonical fraction used by ETA
+        # phase floors and audit evidence. It advances only on owned events.
+        "presentation_progress_fraction": (
+            max(0.0, min(.95, float(presentation_progress_fraction)))
+            if presentation_progress_fraction is not None
+            else (0.0 if reset_progress else float(previous.get("presentation_progress_fraction") or 0.0))
+        ),
         "phase_started_epoch": now if phase_changed else float(previous.get("phase_started_epoch") or now),
         "phase_start_fraction": confirmed if phase_changed else float(previous.get("phase_start_fraction") or confirmed),
         "phase_allowance": phase_allowance if phase_changed else float(previous.get("phase_allowance") or phase_allowance),
@@ -13608,6 +13739,7 @@ def update_live_automatic_run_status(
                 "diagnostic_context": record.get("diagnostic_context", {}),
                 "details": record["details"],
                 "confirmed_percent": round(float(record["confirmed_fraction"]) * 100.0, 3),
+                "presentation_progress_percent": round(float(record.get("presentation_progress_fraction") or 0.0) * 100.0, 3),
                 "visible_progress_percent": paced_progress_percent(record, now),
                 "elapsed_seconds": round(elapsed, 3),
                 "active_window_seconds": round(
@@ -18856,6 +18988,53 @@ def timing_model_desktop_provider_request_prior_seconds(features, history):
     )
 
 
+def completed_queue_opening_prior(features, history):
+    """Price only the opening queue term from whole, proven queue durations.
+
+    Unlike instantaneous observer throughput this includes provider staging
+    and receipt waits. Small runs and unsupported lanes retain their prior.
+    No provider-call count or live reprice input is modified.
+    """
+    if not timing_model_large_batch_queue_eligible(features):
+        return {}
+    target = max(1, int(features.get("estimated_records") or 0))
+    rates = []
+    support = 0
+    seen = set()
+    for row in reversed(list(history or [])):
+        key = str(row.get("run_key") or "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        if (not timing_model_observation_usable(row)
+                or timing_model_cached_attachment_reuse_count(row) != 0
+                or not timing_model_large_batch_queue_eligible(row)
+                or any(row.get(k) != features.get(k) for k in (
+                    "mode", "native_upload_scope", "native_upload_transport",
+                    "native_upload_representation", "segment_mode", "embedding_timing_lane"))):
+            continue
+        count = int(row.get("actual_records") or 0)
+        if not max(100, target * .5) <= count <= target * 2:
+            continue
+        batches = timing_model_unique_batch_measurements(row)
+        if (not batches or sum(int(b.get("records") or 0) for b in batches) != count
+                or any(not b.get("searchability_proven") or float(b.get("elapsed_seconds") or 0) <= 0
+                       for b in batches)):
+            continue
+        duration = sum(float(b["elapsed_seconds"]) for b in batches)
+        if not math.isfinite(duration):
+            continue
+        rates.append(duration / count)
+        support += count
+        if len(rates) == 6:
+            break
+    if len(rates) < 2 or support < 1000:
+        return {}
+    return {"seconds_per_record": max(.35, float(_timing_percentile(rates, .75)) * 1.25),
+            "matching_runs": len(rates), "fresh_records": support,
+            "basis": "complete_proven_queue_durations_including_staging"}
+
+
 def timing_model_base_seconds(features, *, batch_seconds_prior=6.0):
     """Transparent phase-based ETA formula, using a measured batch-rate when known."""
     pages = max(0, int(features.get("page_count") or 0))
@@ -18949,7 +19128,13 @@ def timing_model_base_seconds(features, *, batch_seconds_prior=6.0):
                 or DESKTOP_SERIAL_PROVIDER_REQUEST_PRIOR_SECONDS
             ),
         )
-        embedding_batches = provider_requests * request_prior
+        opening_queue_prior = features.get("opening_complete_queue_prior") or {}
+        if (opening_queue_prior.get("basis") == "complete_proven_queue_durations_including_staging"
+                and int(opening_queue_prior.get("matching_runs") or 0) >= 2
+                and int(opening_queue_prior.get("fresh_records") or 0) >= 1000):
+            embedding_batches = records * max(.35, float(opening_queue_prior["seconds_per_record"]))
+        else:
+            embedding_batches = provider_requests * request_prior
     else:
         embedding_batches = batches * max(1.5, float(batch_seconds_prior or 6.0))
     if probe_scope:
@@ -19796,6 +19981,21 @@ def queue_eta_decision_context(forecast_samples, decision, queue_evidence):
         ),
     }
     return {key: value for key, value in context.items() if value is not None}
+
+
+class QueueEtaEvidenceGate:
+    """Consume a spaced observation once, even across overlapping callbacks."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._last_applied_sample = -float("inf")
+
+    def claim(self, sample_elapsed):
+        with self._lock:
+            if not math.isfinite(sample_elapsed) or sample_elapsed <= self._last_applied_sample:
+                return False
+            self._last_applied_sample = sample_elapsed
+            return True
 
 
 def stable_queue_eta_reprice(
@@ -21135,6 +21335,9 @@ def estimate_automatic_run(
         features["probe_observation_seconds"] = round(probe_observation_prior, 3)
     features["probe_observation_prior_samples"] = probe_observation_samples
     features["probe_observation_prior_source"] = probe_observation_source
+    opening_queue_prior = completed_queue_opening_prior(features, history)
+    if opening_queue_prior:
+        features["opening_complete_queue_prior"] = opening_queue_prior
     base = timing_model_base_seconds(features, batch_seconds_prior=batch_prior)
     comparable = sorted(
         (
@@ -21238,6 +21441,11 @@ def estimate_automatic_run(
         and str(features.get("embedding_submission_strategy") or "").casefold() == "desktop_queue"
         else f"{features['estimated_batches']} batches × {batch_prior:.1f}s ({batch_source})"
     )
+    if opening_queue_prior:
+        native_embedding_term = (
+            f"{features['estimated_records']} records × {opening_queue_prior['seconds_per_record']:.3f}s "
+            f"complete queue prior including staging ({opening_queue_prior['matching_runs']} fresh runs)"
+        )
     formula = (
         f"{base:.0f}s base = {document_term} + extraction/profile + "
           + (f"batch inspection ({inspection_source}) + raw upload + {native_embedding_term} + final verification ({probe_observation_source})" if mode == MODE_NATIVE_UPLOAD_LABEL else f"local packaging + selected embedder ({local_embedding_source})")
@@ -22375,9 +22583,10 @@ def automatic_completion_success_message(summaries, *, include_runtime_note=True
             reason_parts.append(f"{reasons['other']} unclassified")
         reason_detail = f" ({'; '.join(reason_parts)})" if reason_parts else ""
         body += (
-            f" Visual-text diagnostic: {receipt['visual_review_pages']} image-dominant page(s) "
-            f"in {receipt['visual_review_pdfs']} PDF(s) yielded no reliable extracted text"
-            f"{reason_detail}; all other selected pages were indexed normally."
+            f" Image-page note: {receipt['visual_review_pages']} page(s) "
+            f"in {receipt['visual_review_pdfs']} PDF(s) have no reliable indexed text"
+            f"{reason_detail}. These may be publisher logos, illustrations, or unread text; "
+            "this check does not distinguish them. All other selected pages were indexed normally."
         )
     if receipt["author_evaluated"]:
         body += (
@@ -28920,7 +29129,9 @@ def run_automatic(
         # it cannot take x/y evidence more than five points above that share.
         # This happens only on a real owned callback, never as an unattended
         # timer fill during a stalled queue.
-        if phase_name in {"metadata", "extraction", "candidate_evaluation", "payloads"} and expected_seconds:
+        presentation_progress_fraction = None
+        if (phase_name in {"metadata", "extraction", "candidate_evaluation", "payloads"}
+                or (phase_name == "worker_lifecycle" and not grouped_upload_progress_active)) and expected_seconds:
             live = dict(LIVE_AUTOMATIC_RUN_STATUS or {})
             started_epoch = float(live.get("started_epoch") or 0.0)
             if started_epoch > 0.0 and total_files:
@@ -28928,18 +29139,25 @@ def run_automatic(
                     .001,
                     AUTOMATIC_UPLOAD_PHASE_RANGES["payloads"][1],
                 )
-                current_source_share = min(1.0, source_fraction / local_lane_end)
+                current_source_share = (
+                    source_fraction if phase_name == "worker_lifecycle"
+                    else min(1.0, source_fraction / local_lane_end)
+                )
                 completed_source_share = min(
                     1.0,
                     (max(0, file_index - 1) + current_source_share) / total_files,
                 )
-                confirmed_fraction = concurrent_preparation_progress_fraction(
+                prepared_display = concurrent_preparation_progress_fraction(
                     confirmed_fraction,
                     max(0.0, time.time() - started_epoch),
                     expected_seconds,
                     completed_source_share,
                     presentation_expected_seconds=live.get("presentation_expected_seconds"),
                 )
+                if phase_name == "worker_lifecycle":
+                    presentation_progress_fraction = prepared_display
+                else:
+                    confirmed_fraction = prepared_display
         if phase_name in {"desktop_queue", "identity_set"} and expected_seconds:
             live = dict(LIVE_AUTOMATIC_RUN_STATUS or {})
             started_epoch = float(live.get("started_epoch") or 0.0)
@@ -28960,6 +29178,7 @@ def run_automatic(
             expected_seconds=expected_seconds,
             details=(f"PDF {file_index}/{total}" if total else ""),
             confirmed_fraction=confirmed_fraction,
+            presentation_progress_fraction=presentation_progress_fraction,
             cancel_available=(
                 automatic_run_cancel_is_safe(stage_text) and not cancellation_active
             ),
@@ -28987,6 +29206,7 @@ def run_automatic(
     last_early_downward_reprice_elapsed = -float("inf")
     last_queue_eta_sample_elapsed = -float("inf")
     queue_eta_forecast_samples = []
+    queue_eta_evidence_gate = QueueEtaEvidenceGate()
     latest_batch_queue_forecast_seconds = 0
     grouped_queue_progress_state = {
         "prepared_records": 0,
@@ -29267,6 +29487,9 @@ def run_automatic(
             if batch_queue_rate_is_mature and (
                 representative_reprice_due or normal_reprice_due or early_downward_reprice_due
             ):
+                # Capture before decision/logging I/O: another callback must not
+                # take another bounded step from the same spaced observation.
+                decision_sample_elapsed = last_queue_eta_sample_elapsed
                 if representative_reprice_due:
                     stable_reprice = representative_whole_run_queue_eta_reprice(
                         expected_seconds,
@@ -29335,7 +29558,16 @@ def run_automatic(
                             "raw_forecast_seconds": stable_reprice.get("raw_forecast_seconds"),
                             "candidate_expected_seconds": capped_expected,
                         }
+                if stable_reprice.get("status") == "applied" and not queue_eta_evidence_gate.claim(
+                    decision_sample_elapsed
+                ):
+                    stable_reprice = {
+                        **stable_reprice,
+                        "status": "suppressed",
+                        "suppression_reason": "forecast_sample_already_applied",
+                    }
                 if stable_reprice.get("status") == "applied":
+                    last_queue_eta_recalibration_elapsed = elapsed
                     expected_seconds = stable_reprice["expected_seconds"]
                     run_timing_estimate["expected_seconds"] = expected_seconds
                     run_timing_estimate.setdefault("queue_rate_recalibrations", []).append({
@@ -30778,6 +31010,11 @@ def run_automatic(
         and not cancellation_requested
         and not batch_upload_report
     ):
+        # Freeze once, before the grouped observer begins. Recomputing this
+        # from each callback would ratchet the bar upward without new work.
+        preparation_display_fraction = float(
+            (LIVE_AUTOMATIC_RUN_STATUS or {}).get("presentation_progress_fraction") or 0.0
+        )
         def report_grouped_upload_status(stage, report=None):
             nonlocal expected_seconds, pending_ocr_eta_surcharge
             nonlocal active_source_atomic_provider_batch_size
@@ -30905,6 +31142,9 @@ def run_automatic(
             grouped_confirmed_fraction = phase_start + (
                 phase_end - phase_start
             ) * evidence_fraction
+            grouped_display_fraction = ingestion_progress_after_preparation(
+                grouped_confirmed_fraction, preparation_display_fraction
+            )
             exact_identity_evidence_complete = bool(
                 upload_progress_phase == "identity_set"
                 and grouped_progress["total_records"] > 0
@@ -30935,6 +31175,11 @@ def run_automatic(
                     presentation_expected_seconds=(
                         live_for_progress.get("presentation_expected_seconds")
                     ),
+                    exact_evidence_complete=exact_identity_evidence_complete,
+                )
+                grouped_display_fraction = concurrent_ingestion_progress_fraction(
+                    grouped_display_fraction, queue_elapsed_seconds, expected_seconds,
+                    presentation_expected_seconds=live_for_progress.get("presentation_expected_seconds"),
                     exact_evidence_complete=exact_identity_evidence_complete,
                 )
             eta_reprice_reason = ""
@@ -31257,6 +31502,7 @@ def run_automatic(
                 expected_seconds=expected_seconds,
                 details=display_stage_text,
                 confirmed_fraction=grouped_confirmed_fraction,
+                presentation_progress_fraction=grouped_display_fraction,
                 cancel_available=not automatic_run_cancellation_requested(run_root),
                 cancel_requested=automatic_run_cancellation_requested(run_root),
                 activity_observed=True,
@@ -32008,11 +32254,7 @@ def run_automatic(
                 "status": str(batch_retention_report.get("status") or "not_required"),
                 "documents": len(batch_retention_report.get("documents") or []),
             },
-            "output_capacity_preflight": {
-                "status": str((batch_capacity or {}).get("status") or "not_recorded"),
-                "projected_bytes": int((batch_capacity or {}).get("projected_bytes") or 0),
-                "available_bytes": int((batch_capacity or {}).get("available_bytes") or 0),
-            },
+            "output_capacity_preflight": terminal_output_capacity_evidence(batch_capacity),
         }
         append_ingestion_history(
             run_root,
@@ -32279,6 +32521,9 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 auto_folder_pdfs = gr.State([])
                 auto_folder_manifest = gr.State({})
                 auto_folder_scan_requested = gr.State(False)
+                # Real JSON input, not State: the pre-dispatch JS supplies
+                # browser timing without adding a separate network request.
+                auto_folder_picker_timing = gr.JSON(value=None, visible=False)
                 with gr.Column(elem_classes=["batch-folder-inner"]):
                     # Hide the wrapper rather than only the Button.  Gradio can
                     # render component updates on an outer block; this makes the
@@ -33859,7 +34104,8 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
             )
             choose_pdf_folder_button.click(
                 fn=automatic_folder_selection_begin_state,
-                inputs=[automatic_selection_state, automatic_viewed_run_root, auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
+                inputs=[automatic_selection_state, automatic_viewed_run_root, auto_pdfs, auto_folder_pdfs, auto_folder_manifest, auto_folder_picker_timing],
+                js=PDF_FOLDER_PICKER_TIMING_JS,
                 outputs=[
                     automatic_selection_state,
                     automatic_viewed_run_root,
@@ -33873,7 +34119,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=choose_pdf_input_directory_for_scan,
-                inputs=[auto_folder_path],
+                inputs=[auto_folder_path, automatic_selection_state],
                 outputs=[
                     auto_folder_path,
                     auto_folder_scan_requested,

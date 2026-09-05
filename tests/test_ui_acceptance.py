@@ -369,9 +369,13 @@ def test_six_pdf_local_batch_prepares_every_selected_source(page, local_app_url,
 
     # The terminal status is outside the collapsed downloads section and is
     # therefore the durable user-visible completion signal for every source.
-    expect(page.get_by_text(re.compile(r"PDF preparation finished: 6/6"))).to_be_visible(
+    expect(page.get_by_text(re.compile(r"PDF source decisions recorded: 6/6"))).to_be_visible(
         timeout=120000
     )
+    # Source decisions alone can also include failures/skips. Require the
+    # successful terminal handoff, not just a completed local decision count.
+    expect(live_confirm).to_have_text("Processing successful ✓")
+    expect(page.get_by_text("Overall progress: 100%", exact=True)).to_be_visible()
 
 
 def test_selected_pdf_reuse_action_has_an_icon_not_an_empty_square(page, local_app_url, one_page_pdf):

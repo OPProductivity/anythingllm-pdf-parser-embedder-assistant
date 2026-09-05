@@ -1704,7 +1704,8 @@ class PipelineCoreTests(unittest.TestCase):
         )
         self.assertEqual(review["status"], "review_needed")
         self.assertEqual([row["pdf_page"] for row in review["pages"]], [1, 2])
-        self.assertIn("No label was guessed", review["message"])
+        self.assertIn("No text was guessed", review["message"])
+        self.assertIn("does not distinguish", review["message"])
 
     def test_visual_text_coverage_review_honors_selected_scope_and_handles_bad_metadata(self):
         scoped = pipeline.visual_text_coverage_review(
@@ -5806,11 +5807,12 @@ class PipelineCoreTests(unittest.TestCase):
         message = app.automatic_completion_success_message([summary])
         self.assertEqual(receipt["visual_review_pages"], 1)
         self.assertEqual(receipt["visual_review_reason_counts"]["no_text_recovered"], 1)
-        self.assertIn("Visual-text diagnostic", message)
+        self.assertIn("Image-page note", message)
+        self.assertIn("publisher logos", message)
         self.assertIn("1 no-text", message)
-        self.assertIn("image-dominant page(s)", message)
+        self.assertIn("this check does not distinguish them", message)
         self.assertNotIn("decorative", message)
-        self.assertIn("all other selected pages were indexed normally", message)
+        self.assertIn("all other selected pages were indexed normally", message.lower())
 
     def test_success_receipt_distinguishes_fully_cached_pdfs_and_author_outcomes(self):
         import rag_pdf_gradio_app as app

@@ -1087,7 +1087,8 @@ def pdf_metadata(path: Path, include_page_geometry=False, include_author_samples
 
 
 def normalize_author_candidate(value):
-    candidate = normalize_text(value or "")
+    # Directional formatting from PDF exports is not part of a person's name.
+    candidate = normalize_text(re.sub(r"[\u202a-\u202e\u2066-\u2069]", "", value or ""))
     candidate = re.sub(r"[*†‡§¶∗]+", " ", candidate)
     candidate = re.sub(
         r"^(?:by|written by|edited by|review(?:ed)? by|text by|article by|essay by|column by|commentary by|analysis by|opinion by|author(?:\(s\))?|authors?|writer(?:s)?|instructor|lecturer|professor)\s*[:\-]?\s*",
@@ -1217,6 +1218,8 @@ def looks_like_person_name(value, title_hint="", *, allow_all_caps=True):
     if author_phrase_is_title_fragment(candidate, title_hint):
         return False
     if ":" in candidate:
+        return False
+    if re.search(r"\b(?:(?:trans|pp|vol)\.|translated\s+by\b|reproduced\s+(?:by|from)\b)", lowered):
         return False
     # Slash-separated strings such as ``Geneva/Addis Ababa`` are publication
     # datelines, not person names.  Keeping this syntactic rule narrow avoids
@@ -1604,6 +1607,10 @@ def is_high_confidence_all_caps_titlepage_author(candidate, following_line, titl
 
 
 def split_author_line_candidates(line, title_hint="", *, allow_all_caps=True):
+    # Reject citation furniture before removing numbers or splitting names.
+    # Otherwise an anthology title and its editor can become two 'authors'.
+    if re.search(r"\b(?:(?:trans|pp|vol)\.|translated\s+by\b|reproduced\s+(?:by|from)\b|edited\s+by\b)|\b(?:18|19|20)\d{2}\b", line or "", re.I):
+        return []
     raw = re.sub(r"[*†‡§¶∗0-9]+", " ", line or "")
     raw = re.sub(r"\s+", " ", raw).strip(" ,;:-")
     if not raw or "@" in raw:
@@ -1799,6 +1806,55 @@ def extract_opening_title_block_byline(lines, title_hint=""):
 
 
 def infer_author_from_text_samples(samples, title_hint=""):
+    """Resolve visible credits without confusing endorsements or translators."""
+    samples = list(samples or [])
+    opening = [s for s in samples if 1 <= int(s.get("page") or 0) <= 4]
+    # A title-page editor credit is a document role, unlike a quoted review.
+    # Require the actual title on the same page; never promote series editors.
+    title_key = " ".join(re.findall(r"\w+", str(title_hint).casefold()))
+    for sample in opening:
+        text = str(sample.get("text") or "")
+        lines = [normalize_text(x) for x in text.splitlines() if normalize_text(x)]
+        page_key = " ".join(re.findall(r"\w+", text.casefold()))
+        if len(title_key.split()) >= 3 and len(title_key) >= 16 and title_key in page_key:
+            for i, line in enumerate(lines[:12]):
+                if line.casefold() != "editors" or i == 0:
+                    continue
+                names = split_author_line_candidates(lines[i-1].replace("•", " and "), allow_all_caps=True)
+                if names:
+                    return {"author": ", ".join(names), "source": "text_edited_by",
+                            "page": sample["page"], "evidence": lines[i-1] + " / Editors"}
+    filtered = []
+    for sample in samples:
+        text = str(sample.get("text") or "")
+        # Multiple dash-attributed endorsements are not an author title block.
+        # Leave ordinary name/affiliation pages and a single quoted passage alone.
+        endorsements = re.findall(r"(?m)^\s*[—–]\s*[^\n,]{3,80},", text)
+        if len(endorsements) >= 2 and any(c in text for c in '“”"'):
+            continue
+        filtered.append(sample)
+    report = _infer_author_from_text_samples(filtered, title_hint=title_hint)
+    return exclude_explicit_translators(report, opening)
+
+
+def exclude_explicit_translators(report, samples):
+    translators = []
+    for sample in samples:
+        if not 1 <= int(sample.get("page") or 0) <= 4:
+            continue
+        for name in re.findall(r"(?im)^\s*translated\s+by\s+([^\n]{3,80})", str(sample.get("text") or "")):
+            translators.extend(normalize_author_candidate(n) for n in re.split(r"\s+and\s+|[;,]", name, flags=re.I))
+    if report.get("author") and translators:
+        excluded = {normalize_author_candidate(n).casefold() for n in translators}
+        names = split_author_line_candidates(report["author"], allow_all_caps=True)
+        retained = [n for n in names if normalize_author_candidate(n).casefold() not in excluded]
+        if names and retained != names:
+            report = {**report, "author": ", ".join(retained),
+                      "excluded_translator_names": translators}
+    return report
+
+
+def _infer_author_from_text_samples(samples, title_hint=""):
     patterns = [
         (r"(?:^|\n)\s*by\s+([A-Z][A-Za-z.,'\- ]{3,70})", "text_byline"),
         (r"(?:^|\n)\s*written by\s+([A-Z][A-Za-z.,'\- ]{3,70})", "text_written_by"),
@@ -2839,6 +2895,43 @@ def structured_filename_surname_evidence(path: Path):
     return set(evidence)
 
 
+def opening_filename_corroborated_credit(samples, path: Path, title_hint=""):
+    """A first-page work credit may outrank a later citation's By/Edited by.
+
+    No free search for names: require a complete standalone name in the first
+    twelve lines (or an explicit first-page bibliographic/worker credit), plus
+    an independently matching surname at the beginning of the filename.
+    """
+    tokens = re.findall(r"[^\W\d_]+", Path(path).stem.casefold())
+    if not tokens:
+        return {}
+    candidates = {}
+    for sample in samples:
+        if sample.get("page") != 1:
+            continue
+        lines = [normalize_text(re.sub(r"[\u202a-\u202e\u2066-\u2069]", "", s))
+                 for s in str(sample.get("text") or "").splitlines() if s.strip()]
+        for index, line in enumerate(lines[:18]):
+            candidate = line if index < 12 else ""
+            bibliography = re.match(r'^([^,]{5,70}),\s*[“"‘]', line)
+            reported = re.match(r"^Reported\s+by\s+(.+?)\s*\(\s*Staff\s+Writer\s*\)", line, re.I)
+            if bibliography and index == 0:
+                candidate = bibliography.group(1)
+            elif reported:
+                candidate = reported.group(1)
+            if not looks_like_person_name(candidate, title_hint=title_hint, allow_all_caps=False):
+                continue
+            name = normalize_author_candidate(candidate)
+            names = re.findall(r"[^\W\d_]+", name.casefold())
+            if names and (names[-1] == tokens[0] or tokens[:len(names)] == names):
+                candidates[name] = line
+    if len(candidates) != 1:
+        return {}
+    name, evidence = next(iter(candidates.items()))
+    return {"author": name, "source": "filename_corroborated_text_name", "page": 1,
+            "evidence": evidence + " / opening filename credit"}
+
+
 def infer_author_from_samples_or_filename(samples, path: Path, title_hint=""):
     """Apply the established sample rules, then the existing filename fallback."""
     decoded_stem = urllib.parse.unquote(re.sub(r"_([0-9A-Fa-f]{2})", r"%\1", Path(path).stem))
@@ -2859,6 +2952,10 @@ def infer_author_from_samples_or_filename(samples, path: Path, title_hint=""):
     report = infer_author_from_text_samples(samples, title_hint=title_hint)
     if report.get("source") == "text_non_person_byline":
         return report
+    opening_credit = opening_filename_corroborated_credit(samples, path, title_hint)
+    if opening_credit and (not report.get("author") or int(report.get("page") or 0) > 1
+                           or report.get("source") not in TRUSTED_AUTHOR_INFERENCE_SOURCES):
+        return opening_credit
     filename_report = infer_author_from_filename(path, title_hint=title_hint)
     if report.get("author") and report.get("source") in TRUSTED_AUTHOR_INFERENCE_SOURCES:
         return report
@@ -2904,7 +3001,7 @@ def infer_author_from_samples_or_filename(samples, path: Path, title_hint=""):
                 "source": "filename_structured_corroborated_text_names",
                 "evidence": f"{report.get('evidence') or ''} / {Path(path).name}".strip(" /"),
             }
-    return report if report.get("author") else filename_report
+    return exclude_explicit_translators(report if report.get("author") else filename_report, samples)
 
 
 def selected_extraction_author_samples(pages, *, page_limit=4):
@@ -2953,6 +3050,27 @@ def recover_author_from_selected_extraction(pages, *, title_hint="", page_limit=
             "sample_pages": [],
         }
     report = dict(infer_author_from_text_samples(samples, title_hint=title_hint))
+    if not report.get("author") and samples:
+        # OCR-only recovery: a standalone opening byline below an uppercase
+        # title must be independently repeated as a running head on another
+        # physical page. Do not use isolated person-shaped OCR guesses.
+        first = samples[0]
+        lines = [normalize_text(x) for x in first["text"].splitlines() if normalize_text(x)]
+        for i, line in enumerate(lines[:28]):
+            if not re.fullmatch(r"[A-ZÀ-ÖØ-Þ][A-ZÀ-ÖØ-Þ '’-]{4,70}", line):
+                continue
+            name = normalize_author_candidate(line)
+            heading = " ".join(lines[max(0, i-3):i])
+            if (not looks_like_person_name(name, allow_all_caps=True)
+                    or not 2 <= len(name.split()) <= 4
+                    or len(heading.split()) < 5 or not heading.isupper()):
+                continue
+            repeated = any(re.search(rf"(?im)^\s*\d*\s*{re.escape(line)}\s*$", s["text"])
+                           for s in samples[1:] if s["page"] != first["page"])
+            if repeated:
+                report = {"author": name, "source": "text_compact_caps_byline",
+                          "page": first["page"], "evidence": "opening title byline corroborated by running head"}
+                break
     report["sample_pages"] = [row["page"] for row in samples]
     base_source = str(report.get("source") or "not_found")
     if report.get("author") and base_source not in POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES:
@@ -3522,7 +3640,9 @@ def ocr_page_evidence_ledger(ocr_pages, reconciliation=None, targeted_pages=None
         page = ocr_by_page.get(page_number) or {}
         regions = [row for row in (page.get("reading_regions") or []) if isinstance(row, dict)]
         preprocessing = page.get("spread_preprocessing") or {}
-        retry = next((row.get("ocr_crop_retry") for row in regions if row.get("ocr_crop_retry")), {}) or {}
+        retries = [row["ocr_crop_retry"] for row in regions
+                   if isinstance(row.get("ocr_crop_retry"), dict) and row["ocr_crop_retry"]]
+        retry_results = Counter(str(row.get("reason") or "not_recorded") for row in retries)
         drop_cap_rows = []
         reading_order_rows = []
         for region in regions:
@@ -3554,9 +3674,24 @@ def ocr_page_evidence_ledger(ocr_pages, reconciliation=None, targeted_pages=None
             "ocr_methods": sorted({str(row.get("ocr_method") or "") for row in regions if row.get("ocr_method")}),
             "crop_fractions": [list(row.get("crop_fraction") or []) for row in regions],
             "crop_adjustments": [row.get("crop_adjustment") for row in regions if row.get("crop_adjustment")],
-            "crop_retry_attempted": bool(retry.get("attempted")),
-            "crop_retry_result": str(retry.get("reason") or "not_attempted"),
+            "render_dpi": sorted({int(row["render_dpi"]) for row in regions if row.get("render_dpi")}),
+            "recognition_layout": [dict(row["recognition_layout"]) for row in regions if row.get("recognition_layout")],
+            "crop_retry_attempted": any(bool(row.get("attempted")) for row in retries),
+            "crop_retry_result": (next(iter(retry_results)) if len(retry_results) == 1
+                                  else "multiple_region_results" if retry_results else "not_recorded"),
+            "crop_retry_region_counts": {
+                "assessed": len(retries),
+                "not_recorded": len(regions) - len(retries),
+                "attempted": sum(bool(row.get("attempted")) for row in retries),
+                "selected": sum(row.get("reason") == "full_page_retry_selected" for row in retries),
+                "results": dict(sorted(retry_results.items())),
+            },
             "reading_order_applied": any(bool(row.get("applied")) for row in reading_order_rows),
+            "reading_order_assessed": bool(reading_order_rows),
+            "drop_cap_assessed": bool(drop_cap_rows),
+            "drop_cap_assessment_reasons": dict(Counter(
+                str(row.get("reason") or "not_recorded") for row in drop_cap_rows
+            )),
             "drop_cap_recovered_count": sum(
                 int(row.get("recovered_count") or 0) for row in drop_cap_rows
             ),
@@ -3582,6 +3717,111 @@ def ocr_page_evidence_ledger(ocr_pages, reconciliation=None, targeted_pages=None
         "ocr_observed_page_count": sum(1 for row in rows if row["ocr_observed"]),
         "selected_ocr_page_count": sum(1 for row in rows if row["selected_ocr_output"]),
         "pages": rows,
+    }
+
+
+def summarize_ocr_run_evidence(summaries):
+    """Bounded, text-free terminal rollup; never a routing/ETA/quality input.
+
+    Only use evidence already in memory. Missing measurements are not zero
+    OCR work. Retained-region call times omit discarded/other-backend calls
+    and sum worker durations, not parallel run wall time.
+    """
+    coverage, recovery, profiles, outcomes, quality, reconciliation, neighbours, drop_cap_reasons = (
+        Counter() for _ in range(8)
+    )
+    setup_seconds = subprocess_seconds = 0.0
+    measurement_pages = Counter()
+    assessment_pages = {key: Counter() for key in ("reading_order", "drop_cap", "crop_retry")}
+    for summary in summaries or []:
+        coverage["source_summaries"] += 1
+        ledger = summary.get("ocr_page_evidence") or {}
+        if ledger.get("schema_version") != 2:
+            coverage["source_summaries_without_page_evidence"] += 1
+            continue
+        for row in ledger.get("pages") or []:
+            coverage["evidence_pages"] += 1
+            for key in ("targeted", "ocr_observed", "selected_ocr_output", "in_selected_range"):
+                coverage[key] += bool(row.get(key))
+            coverage["targeted_without_observed_text"] += bool(
+                row.get("targeted") and not row.get("ocr_word_count")
+            )
+            coverage["observed_with_text"] += bool(row.get("ocr_observed") and row.get("ocr_word_count"))
+            quality[str(row.get("quality_state") or "not_assessed")] += 1
+            reconciliation[str(row.get("reconciliation_decision") or "not_recorded")] += 1
+            neighbours[str((row.get("neighbour_runover") or {}).get("decision") or "not_assessed")] += 1
+            retries = row.get("crop_retry_region_counts")
+            if isinstance(retries, dict):
+                for key in ("assessed", "not_recorded", "attempted", "selected"):
+                    recovery[f"crop_retry_regions_{key}"] += int(retries.get(key) or 0)
+            else:
+                recovery["pages_without_region_retry_counts"] += 1
+            for key in ("reading_order_assessed", "reading_order_applied", "drop_cap_assessed"):
+                recovery[key + "_pages"] += bool(row.get(key))
+                if key.endswith("assessed") and key not in row:
+                    recovery[key + "_unknown_pages"] += 1
+            recovery["drop_caps_recovered"] += int(row.get("drop_cap_recovered_count") or 0)
+            drop_cap_reasons.update(row.get("drop_cap_assessment_reasons") or {})
+            recovery["pages_with_unresolved_drop_caps"] += bool(row.get("drop_cap_unresolved_reasons"))
+            recovery["display_regions_recovered"] += int(row.get("missing_display_regions_recovered") or 0)
+            adjustments = row.get("crop_adjustments") or []
+            recovery["crop_regions_assessed"] += len(adjustments)
+            recovery["crop_regions_expanded"] += sum(bool(a.get("expanded_edges")) for a in adjustments)
+            # This is the observed boundary signal, not proof that final text is clipped.
+            recovery["crop_regions_with_boundary_ink_signal"] += sum(bool(a.get("ink_touches_boundary")) for a in adjustments)
+            recognition = row.get("recognition_layout") or []
+            timed_calls = sum(
+                isinstance(call.get("subprocess_seconds"), (int, float))
+                and not isinstance(call.get("subprocess_seconds"), bool)
+                and math.isfinite(call["subprocess_seconds"])
+                and call["subprocess_seconds"] >= 0
+                for call in recognition
+            )
+            coverage["pages_without_retained_call_measurements"] += not timed_calls
+            measurement_state = (
+                "all_retained_profiles_timed" if recognition and timed_calls == len(recognition)
+                else "some_retained_profiles_timed" if timed_calls
+                else "profiles_without_valid_timing" if recognition
+                else "regions_without_recognition_profiles" if row.get("crop_fractions")
+                else "no_retained_region_evidence"
+            )
+            measurement_pages[measurement_state] += 1
+            for key in ("reading_order", "drop_cap"):
+                assessment_pages[key]["recorded" if row.get(key + "_assessed") else "not_recorded"] += 1
+            retry_counts = retries if isinstance(retries, dict) else {}
+            assessed = int(retry_counts.get("assessed") or 0)
+            missing = int(retry_counts.get("not_recorded") or 0)
+            assessment_pages["crop_retry"][
+                "partially_recorded" if assessed and missing
+                else "recorded" if assessed else "not_recorded"
+            ] += 1
+            for call in recognition:
+                profile = "/".join(str(call.get(k) or "not_recorded") for k in ("model", "psm", "route_reason"))
+                profiles[profile] += 1
+                outcomes[str(call.get("subprocess_outcome") or "not_measured")] += 1
+                for key in ("setup_seconds", "subprocess_seconds"):
+                    value = call.get(key)
+                    if isinstance(value, (int, float)) and math.isfinite(value) and value >= 0:
+                        if key == "setup_seconds":
+                            setup_seconds += value
+                        else:
+                            subprocess_seconds += value
+    return {
+        "schema_version": 1,
+        "scope": "available_source_summaries_not_accuracy_or_complete_cancelled_run_coverage",
+        "coverage": dict(coverage), "recovery": dict(recovery),
+        "measurement_page_states": dict(measurement_pages),
+        "assessment_page_states": {key: dict(value) for key, value in assessment_pages.items()},
+        "coverage_interpretation": "not_recorded_is_unknown_not_ineligible;timings_cover_retained_profiles_only",
+        "drop_cap_assessment_reasons": dict(drop_cap_reasons),
+        "recognition_profiles": dict(profiles), "retained_call_outcomes": dict(outcomes),
+        "quality_states": dict(quality), "reconciliation_decisions": dict(reconciliation),
+        "neighbour_decisions": dict(neighbours),
+        "measured_seconds": {"scope": "retained_region_calls_cumulative_not_run_wall_time",
+                             "setup": round(setup_seconds, 4),
+                             "tesseract_subprocess": round(subprocess_seconds, 4)},
+        "not_measured_here": ["rendering", "full_geometry_analysis", "reconciliation_time",
+                              "discarded_calls_and_other_ocr_backends"],
     }
 
 
@@ -4993,7 +5233,7 @@ def _layout_marginal_annotation_plan(rows, width, height):
             annotation_like = (
                 alpha == 0
                 or (symbol_count >= 2 and alpha / max(len(text), 1) < .55)
-            )
+            ) and not _layout_is_printed_abbreviation(text)
             # An OCR font identifies the text layer, not handwriting. Printed
             # marginal references can use that same font and punctuation.
             if outside and alpha >= 10 and len(text.split()) >= 2:
@@ -5033,7 +5273,8 @@ def _layout_marginal_annotation_plan(rows, width, height):
             )
             alpha = _layout_alpha_count(text)
             symbol_count = len(re.findall(r"[^A-Za-zÀ-ÖØ-öø-ÿ0-9\s-]", text))
-            noisy = symbol_count >= 2 and alpha / max(len(text), 1) < .78
+            noisy = (symbol_count >= 2 and alpha / max(len(text), 1) < .78
+                     and not _layout_is_printed_abbreviation(text))
             if near_outer_edge and noisy:
                 candidates.add((row_index, span_index))
     return {
@@ -5046,8 +5287,12 @@ def _layout_marginal_annotation_plan(rows, width, height):
     }
 
 
-def _layout_text_noise_score(text):
-    """Return a deliberately simple OCR-noise signal for same-page comparison."""
+def _layout_is_printed_abbreviation(text):
+    # Punctuation density does not make U.S., U.K. or N.Y. marginal debris.
+    return bool(re.fullmatch(r"(?:[A-Za-z]\.){2,6}", str(text or "").strip()))
+
+
+def _layout_embedded_symbol_noise_score(text):
     value = str(text or "")
     return (
         len(re.findall(r"[^A-Za-zÀ-ÖØ-öø-ÿ0-9\s.,;:!?()'’\"-]{2,}", value))
@@ -5055,7 +5300,45 @@ def _layout_text_noise_score(text):
     )
 
 
-def _reocr_confirmed_native_body_region(pdf_path, page_number, body_bounds, page_width):
+def _layout_text_noise_score(text):
+    """Return a deliberately simple OCR-noise signal for same-page comparison."""
+    value = str(text or "")
+    return (
+        _layout_embedded_symbol_noise_score(value)
+        # Embedded scan layers often put isolated pen marks on separate lines.
+        # The old adjacent-symbol-only score called these damaged pages clean.
+        + sum(
+            1 for line in value.splitlines()
+            if (token := line.strip()) and len(token) <= 10
+            and _layout_alpha_count(token) <= 2
+            and not _layout_is_printed_abbreviation(token)
+            and re.search(r"[=<>#@_^~|\[\]{}*/\\\"'’?:;]", token)
+        )
+    )
+
+
+def _native_body_reocr_decision(raw_text, candidate_text):
+    """Account for every gate, for accepted and rejected scan-body recovery."""
+    raw_noise = _layout_text_noise_score(raw_text)
+    candidate_noise = _layout_text_noise_score(candidate_text)
+    coverage = _layout_alpha_count(candidate_text) / max(_layout_alpha_count(raw_text), 1)
+    if len(candidate_text) < 800:
+        reason = "candidate_too_short_or_unavailable"
+    elif raw_noise <= 0:
+        reason = "no_native_noise_evidence"
+    elif coverage < .70:
+        reason = "insufficient_native_content_coverage"
+    elif candidate_noise > raw_noise * .65:
+        reason = "insufficient_noise_reduction"
+    else:
+        reason = "scan_body_noise_reduced_with_content_coverage"
+    return {"attempted": True, "selected": reason == "scan_body_noise_reduced_with_content_coverage",
+            "reason": reason, "word_count": len(candidate_text.split()),
+            "raw_noise_score": raw_noise, "reocr_noise_score": candidate_noise,
+            "alpha_coverage": round(coverage, 4)}
+
+
+def _reocr_confirmed_native_body_region(pdf_path, page_number, body_bounds, page_width, *, segmentation_mode=4):
     """OCR only a confirmed printed body rectangle on an annotated scan.
 
     This path is intentionally unavailable to ordinary native pages. It is a
@@ -5096,7 +5379,7 @@ def _reocr_confirmed_native_body_region(pdf_path, page_number, body_bounds, page
             image_path = Path(temp_dir) / "body.png"
             ImageOps.autocontrast(image.crop(crop).convert("L")).save(image_path)
             completed = subprocess.run(
-                [tesseract, str(image_path), "stdout", "--psm", "4", "-l", "eng"],
+                [tesseract, str(image_path), "stdout", "--psm", str(segmentation_mode), "-l", "eng"],
                 capture_output=True,
                 text=True,
                 timeout=90,
@@ -5324,28 +5607,38 @@ def apply_region_aware_native_layout(pdf_path, pages, progress_callback=None):
         annotation_candidates = annotation_plan.pop("candidate_spans", set())
         body_reocr_text = ""
         candidate_text = ""
+        body_reocr_decision = {"attempted": False, "selected": False, "reason": "margin_recovery_not_required", "word_count": 0}
         if annotation_plan.get("applied"):
             if progress_callback:
                 progress_callback(page_number, page_total, "targeted_ocr_started")
             targeted_ocr_started = time.perf_counter()
+            raw_text = str(page_info.get("text") or "")
+            # The newly recoverable cohort has isolated margin debris but
+            # no embedded symbol corruption. Preserve its stable single-body
+            # reading order; retain the established flexible mode for mixed
+            # damaged layouts, notes, and all previously recoverable pages.
+            body_segmentation_mode = (
+                6 if _layout_embedded_symbol_noise_score(raw_text) == 0
+                and _layout_text_noise_score(raw_text) > 0 else 4
+            )
             candidate_text = _reocr_confirmed_native_body_region(
                 pdf_path,
                 page_number,
                 annotation_plan.get("body_bounds"),
                 layout["width"],
+                segmentation_mode=body_segmentation_mode,
             )
             targeted_ocr_seconds += time.perf_counter() - targeted_ocr_started
-            raw_text = str(page_info.get("text") or "")
             # Select the fresh OCR only when it contains a substantial share
             # of the original prose and demonstrably reduces corruption. This
-            # comparison makes a poorer fallback impossible to choose merely
-            # because a margin was detected.
-            if (
-                len(candidate_text) >= 800
-                and _layout_text_noise_score(raw_text) > 0
-                and _layout_alpha_count(candidate_text) >= _layout_alpha_count(raw_text) * .70
-                and _layout_text_noise_score(candidate_text) <= _layout_text_noise_score(raw_text) * .65
-            ):
+            # comparison guards against obvious coverage loss; it is not a
+            # proof of correct spelling or reading order.
+            body_reocr_decision = _native_body_reocr_decision(raw_text, candidate_text)
+            body_reocr_decision["segmentation"] = (
+                "isolated_margin_noise_single_body_psm6" if body_segmentation_mode == 6
+                else "mixed_layout_psm4"
+            )
+            if body_reocr_decision["selected"]:
                 body_reocr_text = candidate_text
             if progress_callback:
                 progress_callback(page_number, page_total, "targeted_ocr_finished")
@@ -5468,18 +5761,11 @@ def apply_region_aware_native_layout(pdf_path, pages, progress_callback=None):
             semantic_text = body_reocr_text
             reading_order = "reocr_confirmed_annotated_body"
             annotation_plan["body_reocr"] = {
-                "attempted": True,
-                "word_count": len(candidate_text.split()),
-                "selected": True,
+                **body_reocr_decision,
                 "method": "tesseract_confirmed_native_body_crop",
-                "raw_noise_score": _layout_text_noise_score(page_info.get("text", "")),
-                "reocr_noise_score": _layout_text_noise_score(body_reocr_text),
             }
         else:
-            annotation_plan["body_reocr"] = {
-                "selected": False, "attempted": bool(annotation_plan.get("applied")),
-                "word_count": len(candidate_text.split()),
-            }
+            annotation_plan["body_reocr"] = body_reocr_decision
         transformed.append({
             **page_info,
             "raw_text": page_info.get("text", ""),
@@ -6801,6 +7087,7 @@ def assess_reconciled_ocr_page_quality(pages, decisions):
         )
         front_matter_sparse = page_number <= 2 and (
             low_signal_visual_labels or incomplete_against_peers
+            or (len(tokens) <= 18 and peer_median >= 240)
         )
         terminal_page_sparse = (
             incomplete_against_peers
@@ -7196,7 +7483,7 @@ def visual_text_coverage_review(pages, page_count, page_geometry, *, start_page=
         "method": "image_page_low_signal_text_guard_v2",
         "unresolved_page_count": len(unresolved),
         "message": (
-            "Image-dominant page(s) yielded no reliable text. No label was guessed or added to the retrieval payload."
+            "Image-containing page(s) have no reliable indexed text. They may be publisher logos, illustrations, or unread text; this check does not distinguish them. No text was guessed."
             if unresolved else (
                 "Visual-text coverage was only partially assessed because page/extractor metadata was incomplete."
                 if assessment_warnings else "No image-dominant low-signal text pages were detected."
@@ -7353,19 +7640,19 @@ def has_complete_native_text_candidate(candidates, pdf_page_count, ocr_preflight
     """Return true when a default extractor already recovered trustworthy text.
 
     Automatic mode may skip a later OCR-capable candidate when an earlier
-    native candidate covers the whole file with clean text and valid
+    native candidate covers the selected range with clean text and valid
     provenance. This deliberately does not relax the gate for an actual
     extractor failure, image-heavy pages, or an untrusted outline.
     """
     page_count = max(1, int(pdf_page_count or 0))
     coverage = dict((ocr_preflight_hint or {}).get("full_native_text_coverage") or {})
-    sparse_image_review_only = (
-        coverage.get("status") == "verified"
-        and len(coverage.get("image_backed_low_text_pages") or []) > 0
-        and len(coverage.get("image_backed_low_text_pages") or []) / page_count
-        <= SPARSE_IMAGE_REVIEW_PAGE_RATIO
-    )
-    minimum_words = max(500, page_count * 150)
+    try:
+        image_pages = {
+            int(row["page"]) for row in coverage.get("image_backed_low_text_pages") or []
+        }
+        image_pages_valid = all(1 <= page <= page_count for page in image_pages)
+    except (KeyError, TypeError, ValueError, OverflowError):
+        image_pages, image_pages_valid = set(), False
     for candidate in candidates or []:
         quality = candidate.get("quality") or {}
         native_chunk_eval = candidate.get("native_chunk_eval") or {}
@@ -7375,7 +7662,22 @@ def has_complete_native_text_candidate(candidates, pdf_page_count, ocr_preflight
         # actual gaps while avoiding a redundant full-document OCR/layout pass
         # for otherwise complete documents.
         empty_pages = max(0, int(quality.get("empty_pages") or 0))
-        material_pages = max(1, page_count - empty_pages)
+        selected_start = max(1, int(candidate.get("start_page") or 1))
+        selected_stop = min(page_count + 1, int(candidate.get("end_page") or page_count + 1))
+        if selected_start >= selected_stop:
+            continue
+        selected_pages = selected_stop - selected_start
+        # Both density and sparse-image evidence must describe the same range.
+        # Otherwise a short excerpt owes a whole book's word count, or scan-heavy
+        # excerpts can appear sparse merely because the enclosing book is long.
+        minimum_words = max(500, selected_pages * 150)
+        selected_image_pages = sum(selected_start <= page < selected_stop for page in image_pages)
+        sparse_image_review_only = (
+            coverage.get("status") == "verified"
+            and image_pages_valid
+            and 0 < selected_image_pages / selected_pages <= SPARSE_IMAGE_REVIEW_PAGE_RATIO
+        )
+        material_pages = max(1, selected_stop - selected_start - empty_pages)
         if (
             not candidate.get("error")
             and len(candidate.get("segments") or []) > 0
@@ -8562,7 +8864,7 @@ def build_run_diagnostics(
             "warning",
             "extraction",
             (
-                f"{visual_text.get('unresolved_page_count')} image-dominant page(s) produced only low-signal or no text"
+                f"{visual_text.get('unresolved_page_count')} image-containing page(s) have low-signal or no indexed text; publisher logos and illustrations are not distinguished from unread text"
                 + (f" (PDF page(s): {pages})." if pages else ".")
             ),
             "No text was guessed or added. Review visual-text-review.json and the original PDF page if an image caption or label matters for retrieval.",

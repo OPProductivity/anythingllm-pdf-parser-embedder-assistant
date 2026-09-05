@@ -99,6 +99,7 @@ benchmarks = ["*.json"]
 [tool.setuptools.data-files]
 "share/anythingllm-pdf-assistant" = ["Install-AnythingLLMDesktopRefreshBridge.ps1", "Install-AnythingLLMPdfAssistant.ps1", "VERSION"]
 "share/anythingllm-pdf-assistant/assets" = ["assets/pdf-icon.svg", "assets/upload-selected-files.svg", "assets/anythingllm-pdf-assistant-start.ico", "assets/anythingllm-pdf-assistant-stop.ico"]
+"share/anythingllm-pdf-assistant/assets/tessdata-annotated" = ["assets/tessdata-annotated/eng.traineddata", "assets/tessdata-annotated/LICENSE", "assets/tessdata-annotated/README.md"]
 
 [tool.ruff]
 target-version = "py314"

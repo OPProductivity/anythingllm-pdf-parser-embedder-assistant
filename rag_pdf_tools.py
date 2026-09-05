@@ -1447,7 +1447,16 @@ def photographed_page_ocr_regions(page, runtime, *, page_number=None):
     # as many tiny word fragments, while still not being a second source page.
     # A continuous dark fold is required before we even consider two regions.
     gutter_fraction = photographed_fold_gutter_fraction(image, ImageStat)
+    if gutter_fraction is None:
+        gutter_fraction = photographed_sparse_spread_gutter(image, ImageStat)
     spread_specs = photographed_spread_crop_specs(width, height, gutter_fraction)
+    spread_dpi = photographed_spread_render_dpi(image, spread_specs, ImageOps)
+    if spread_dpi > PHOTOGRAPHED_PAGE_OCR_DPI:
+        # Two pages share the raster: 144 DPI can silently omit small body
+        # lines even with correct crops. Render once at 180 for this route,
+        # rather than OCRing several candidates or changing ordinary scans.
+        pix = page.get_pixmap(matrix=fitz.Matrix(spread_dpi / 72, spread_dpi / 72), alpha=False)
+        image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
     route_recovery = None
     portrait_sliver = photographed_portrait_neighbour_sliver(image, ImageOps) if not spread_specs else None
     if portrait_sliver:
@@ -1485,6 +1494,7 @@ def photographed_page_ocr_regions(page, runtime, *, page_number=None):
             }]
     if spread_specs:
         precomputed_region_texts = {}
+        precomputed_region_decisions = {}
         crop_widths = [fraction[2] - fraction[0] for _name, _index, fraction in spread_specs]
         if min(crop_widths) / max(crop_widths) < .58:
             # Keep the complete page for now.  The narrow strip is only
@@ -1493,8 +1503,12 @@ def photographed_page_ocr_regions(page, runtime, *, page_number=None):
             narrow_index = crop_widths.index(min(crop_widths))
             dominant_index = 1 - narrow_index
             full_text = _ocr_photographed_crop(image, PHOTOGRAPHED_PAGE_CROP, tesseract, ImageOps)
-            narrow_text = _ocr_photographed_crop(image, spread_specs[narrow_index][2], tesseract, ImageOps)
-            dominant_text = _ocr_photographed_crop(image, spread_specs[dominant_index][2], tesseract, ImageOps)
+            precomputed_region_decisions[narrow_index] = {}
+            precomputed_region_decisions[dominant_index] = {}
+            narrow_text = _ocr_photographed_crop(image, spread_specs[narrow_index][2], tesseract, ImageOps,
+                                               recognition_evidence=precomputed_region_decisions[narrow_index])
+            dominant_text = _ocr_photographed_crop(image, spread_specs[dominant_index][2], tesseract, ImageOps,
+                                                 recognition_evidence=precomputed_region_decisions[dominant_index])
             precomputed_region_texts[narrow_index] = narrow_text
             precomputed_region_texts[dominant_index] = dominant_text
             if len(full_text) >= 80 and len(narrow_text) >= 24 and len(dominant_text) >= 160:
@@ -1526,6 +1540,7 @@ def photographed_page_ocr_regions(page, runtime, *, page_number=None):
                     },
                 }]
         region_texts = []
+        region_decisions = []
         resolved_spread_specs = []
         crop_adjustments = []
         for name, index, fraction in spread_specs:
@@ -1536,9 +1551,12 @@ def photographed_page_ocr_regions(page, runtime, *, page_number=None):
             crop_adjustments.append(crop_adjustment)
         for region_position, (name, index, fraction) in enumerate(resolved_spread_specs):
             text = precomputed_region_texts.get(region_position)
+            decision = precomputed_region_decisions.get(region_position, {})
             if text is None:
-                text = _ocr_photographed_crop(image, fraction, tesseract, ImageOps)
+                text = _ocr_photographed_crop(image, fraction, tesseract, ImageOps,
+                                             recognition_evidence=decision)
             region_texts.append(text)
+            region_decisions.append(decision)
         if keep_photographed_spread_regions(resolved_spread_specs, region_texts):
             return [
                 {
@@ -1551,9 +1569,11 @@ def photographed_page_ocr_regions(page, runtime, *, page_number=None):
                     "annotations_excluded": "outer_margin_crop",
                     "crop_fraction": list(fraction),
                     "crop_adjustment": crop_adjustment,
+                    "render_dpi": spread_dpi,
+                    "recognition_layout": dict(decision),
                 }
-                for (name, index, fraction), text, crop_adjustment in zip(
-                    resolved_spread_specs, region_texts, crop_adjustments
+                for (name, index, fraction), text, crop_adjustment, decision in zip(
+                    resolved_spread_specs, region_texts, crop_adjustments, region_decisions
                 )
             ]
         route_recovery = {
@@ -1648,12 +1668,15 @@ def photographed_page_ocr_regions(page, runtime, *, page_number=None):
                     **({"ocr_route_recovery": route_recovery} if route_recovery else {}),
                 }]
         embedded_fraction, crop_adjustment = adaptive_ocr_crop_fraction(image, embedded_fraction, ImageOps)
+        recognition_layout = {}
         text, layout_rows = _ocr_photographed_crop_with_layout(
-            image, embedded_fraction, tesseract, ImageOps
+            image, embedded_fraction, tesseract, ImageOps,
+            recognition_evidence=recognition_layout,
         )
         if not text:
             text = _ocr_photographed_crop(
-                image, embedded_fraction, tesseract, ImageOps
+                image, embedded_fraction, tesseract, ImageOps,
+                recognition_evidence=recognition_layout,
             )
             layout_rows = []
         text, drop_cap_evidence = recover_geometry_aligned_drop_caps(
@@ -1669,14 +1692,19 @@ def photographed_page_ocr_regions(page, runtime, *, page_number=None):
             page_number=page_number,
         )
         if len(text) < 80 and int(page_number or 0) <= 2:
-            display_text = _ocr_photographed_crop(image, embedded_fraction, tesseract, ImageOps, psm=3)
+            display_decision = {}
+            display_text = _ocr_photographed_crop(image, embedded_fraction, tesseract, ImageOps, psm=3,
+                                                 recognition_evidence=display_decision)
             if credible_short_ocr_display_text(display_text):
                 text = display_text
+                recognition_layout = display_decision
         embedded_quality = photographed_ocr_text_quality(text)
         crop_boundary = ocr_crop_boundary_evidence(image, embedded_fraction, ImageOps)
         retry_evidence = {
             "attempted": False,
-            "reason": "embedded_crop_recovery_sufficient",
+            "reason": ("sparse_opening_text_retained_coverage_unverified"
+                       if len(text.split()) <= 18 and int(page_number or 0) <= 2
+                       else "embedded_crop_recovery_sufficient"),
             "embedded_crop": embedded_quality,
             "crop_boundary": crop_boundary,
         }
@@ -1688,8 +1716,10 @@ def photographed_page_ocr_regions(page, runtime, *, page_number=None):
             embedded_fraction, embedded_quality, crop_boundary
         )
         if weak_embedded_recovery:
+            full_page_decision = {}
             full_text = _ocr_photographed_crop(
-                image, PHOTOGRAPHED_PAGE_CROP, tesseract, ImageOps
+                image, PHOTOGRAPHED_PAGE_CROP, tesseract, ImageOps,
+                recognition_evidence=full_page_decision,
             )
             full_quality = photographed_ocr_text_quality(full_text)
             materially_better_full_page = full_page_ocr_retry_materially_better(
@@ -1709,6 +1739,7 @@ def photographed_page_ocr_regions(page, runtime, *, page_number=None):
             if materially_better_full_page:
                 text = full_text
                 embedded_fraction = PHOTOGRAPHED_PAGE_CROP
+                recognition_layout = full_page_decision
         if len(text) >= 80 or credible_short_ocr_display_text(text):
             if route_recovery:
                 route_recovery["selected_route"] = "embedded_scan_bounds"
@@ -1723,6 +1754,7 @@ def photographed_page_ocr_regions(page, runtime, *, page_number=None):
                 "crop_fraction": list(embedded_fraction),
                 "crop_adjustment": crop_adjustment,
                 "drop_cap_recovery": drop_cap_evidence,
+                "recognition_layout": dict(recognition_layout),
                 "missing_display_regions": missing_display_evidence,
                 "ocr_crop_retry": retry_evidence,
                 **({"ocr_route_recovery": route_recovery} if route_recovery else {}),
@@ -1901,6 +1933,71 @@ def photographed_fold_gutter_fraction(image, image_stat, *, _stripe_fraction=.01
     if _stripe_fraction == .012:
         return photographed_fold_gutter_fraction(image, image_stat, _stripe_fraction=.008)
     return None
+
+
+def photographed_spread_render_dpi(image, specs, image_ops):
+    """Raise resolution only for small printed lines in confirmed regions.
+
+    Measure short horizontal ink bands in a narrow body strip to avoid skew
+    merging adjacent lines. Ignore specks and illustrations; no OCR trial is
+    needed. Larger type keeps the established raster and output unchanged.
+    """
+    if not specs:
+        return PHOTOGRAPHED_PAGE_OCR_DPI
+    width, height = image.size
+    gray = image_ops.grayscale(image)
+    small_type = False
+    for _name, _index, fraction in specs:
+        left, _top, right, _bottom = fraction
+        span = right - left
+        strip = gray.crop((int(width*(left+span*.32)), int(height*.20),
+                           int(width*(left+span*.70)), int(height*.80)))
+        binary = strip.point(lambda value: 255 if value < 140 else 0)
+        bands = []
+        current = 0
+        for y in range(binary.height + 1):
+            ink = y < binary.height and binary.crop((0,y,binary.width,y+1)).getbbox() is not None
+            if ink:
+                current += 1
+            else:
+                if current > 80:
+                    # A large illustration is not small-type evidence.
+                    # Keep its established raster: resampling can lose
+                    # lettering embedded in the picture.
+                    return PHOTOGRAPHED_PAGE_OCR_DPI
+                if 5 <= current <= 40:
+                    bands.append(current)
+                current = 0
+        small_type |= len(bands) >= 8 and statistics.median(bands) <= 16
+    return 180 if small_type else PHOTOGRAPHED_PAGE_OCR_DPI
+
+
+def photographed_sparse_spread_gutter(image, image_stat):
+    """Allow short facing-page notes, but reject text spanning the gutter.
+
+    The established contrast test must agree in two upper-body windows. A
+    near-white gutter must then continue through the lower body. This does
+    not relax the ordinary full-height fold detector or infer from width.
+    """
+    width, height = image.size
+    if width / max(1, height) < 1.22:
+        return None
+    candidates = [photographed_fold_gutter_fraction(
+        image.crop((0, 0, width, int(height * end))), image_stat
+    ) for end in (.4, .5)]
+    first, second = candidates
+    if first is None or second is None or abs(first - second) > .015:
+        return None
+    gutter = (first + second) / 2
+    if not .43 <= gutter <= .57:
+        return None
+    gray = image.convert("L")
+    for band in range(8):
+        stripe = gray.crop((int(width*(gutter-.008)), int(height*(.15+band*.09)),
+                            int(width*(gutter+.008)), int(height*(.24+band*.09))))
+        if image_stat.Stat(stripe).mean[0] < 248:
+            return None
+    return round(gutter, 3)
 
 
 def photographed_spread_crop_specs(width, height, gutter_fraction=None):
@@ -2429,10 +2526,145 @@ def _parse_tesseract_tsv(tsv_text):
     return rows
 
 
+@lru_cache(maxsize=4)
+def _verified_annotated_model(path, size, mtime):
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest() == "8280aed0782fe27257a68ea10fe7ef324ca0f8d85bd2fd145d1c2b560bcb66ba"  # pragma: allowlist secret -- public tessdata model checksum
+    except OSError:
+        return False
+
+
+def annotated_model_arguments(requested_psm, resolved_psm):
+    if requested_psm != 4 or resolved_psm != 6:
+        return []
+    model = Path(__file__).resolve().parent / "assets" / "tessdata-annotated" / "eng.traineddata"
+    if not model.is_file():
+        model = Path(sys.prefix) / "share" / "anythingllm-pdf-assistant" / "assets" / "tessdata-annotated" / "eng.traineddata"
+    try:
+        stat = model.stat()
+        if stat.st_size == 15400601 and _verified_annotated_model(str(model),stat.st_size,stat.st_mtime_ns):
+            return ["--tessdata-dir",str(model.parent),"--oem","1"]
+    except OSError:
+        pass
+    return []
+
+
+def annotated_text_block_psm(cropped, requested=4, *, decision=None):
+    """Keep underlined prose together without deleting any source pixels.
+
+    Only an already isolated reading region is eligible. Several long, thin
+    horizontal strokes are needed; ruled tables with vertical lines retain
+    the established layout mode. Other explicitly requested modes are intact.
+    Optional image-analysis failure falls back to the existing OCR route.
+    """
+    def choose(mode, reason):
+        if decision is not None:
+            decision.update(candidate_psm=mode, geometry_reason=reason,
+                            underlined_prose_detected=mode == 6 and requested == 4)
+        return mode
+
+    if requested != 4:
+        return choose(requested, "explicit_layout_preserved")
+    try:
+        import cv2
+        import numpy as np
+        from PIL import ImageOps
+        rgb = np.asarray(cropped.convert("RGB"), dtype=np.int16)
+        coloured_marks = (rgb.max(axis=2) - rgb.min(axis=2) > 40) & (rgb.max(axis=2) > 120)
+        if np.count_nonzero(coloured_marks) / coloured_marks.size > .005:
+            return choose(requested, "coloured_marks_preserve_layout")
+        ink = (np.asarray(ImageOps.autocontrast(cropped.convert('L'))) < 170).astype(np.uint8) * 255
+        height, width = ink.shape
+        if width < 200 or height < 200:
+            return choose(requested, "region_too_small")
+        # A dirty crop boundary may contain a neighbouring page or scan frame.
+        # Do not force its contents into one text block; preserve layout OCR.
+        edge_y, edge_x = max(2, height // 100), max(2, width // 100)
+        if any(np.count_nonzero(edge) / edge.size > .03 for edge in (
+            ink[:edge_y], ink[-edge_y:], ink[:, :edge_x], ink[:, -edge_x:]
+        )):
+            return choose(requested, "crop_border_ink")
+        vertical = cv2.morphologyEx(ink, cv2.MORPH_OPEN,
+                                    np.ones((max(40,height//8),1),np.uint8))
+        # Even one substantial spine/frame line makes a single-block layout
+        # unsafe: it can pull neighbouring-page fragments into the prose.
+        if cv2.countNonZero(vertical) > height * .5:
+            return choose(requested, "vertical_spine_or_rule")
+        horizontal = cv2.morphologyEx(ink, cv2.MORPH_OPEN,
+                                      np.ones((1,max(40,width//25)),np.uint8))
+        count, _, stats, _ = cv2.connectedComponentsWithStats(horizontal)
+        rules = [s for s in stats[1:count] if s[2] >= max(40,width*.04)
+                 and s[3] <= max(5,height*.006) and s[2]/max(1,s[3]) >= 30]
+        if len(rules) < 3 or sum(s[2] for s in rules) < width*.15:
+            return choose(requested, "insufficient_annotation_rules")
+        # Five closely spaced parallel rules are more consistent with music
+        # staves than underlined prose. Keep the existing layout for these.
+        ordered_rules = sorted(rules, key=lambda s: s[1])
+        for i in range(len(ordered_rules) - 4):
+            group = ordered_rules[i:i + 5]
+            gaps = np.diff([s[1] for s in group])
+            if (min(gaps) >= 3 and max(gaps) <= height * .012
+                    and max(gaps) - min(gaps) <= 2
+                    and max(s[0] for s in group) - min(s[0] for s in group) <= width * .02):
+                return choose(requested, "staff_like_parallel_rules")
+        # Sparse title leaves can contain decorative rules too. Require a
+        # substantial text block before changing its segmentation/model.
+        _, _, components, _ = cv2.connectedComponentsWithStats(ink)
+        text_components = sum(
+            2 <= s[2] <= width * .035
+            and 3 <= s[3] <= height * .035 and s[4] >= 5
+            for s in components[1:]
+        )
+        return choose(6, "substantial_underlined_prose") if text_components >= 500 else choose(requested, "sparse_text_block")
+    except Exception as exc:
+        # This optional, non-mutating geometry probe must never block OCR.
+        if decision is not None:
+            decision["probe_error_type"] = type(exc).__name__
+        return choose(requested, "geometry_probe_unavailable")
+
+
+def _resolve_ocr_recognition(cropped, requested):
+    """Resolve the tested model/layout pair once, before invoking Tesseract."""
+    decision = {"requested_psm": requested, "annotation_pixels_removed": False}
+    candidate = annotated_text_block_psm(cropped, requested, decision=decision)
+    model_args = annotated_model_arguments(requested, candidate)
+    psm = candidate
+    if requested == 4 and candidate == 6 and not model_args:
+        # The tested route requires both changes. A missing/invalid model must
+        # not leave the changed layout paired with unqualified language data.
+        psm = requested
+        decision["route_reason"] = "annotated_model_unavailable_original_route"
+    else:
+        decision["route_reason"] = decision["geometry_reason"]
+    decision.update(psm=psm, model="tessdata_best_eng" if model_args else "installed_eng")
+    return psm, model_args, decision
+
+
+def _run_measured_tesseract(command, recognition_evidence):
+    """Observe the existing call only; preserve its result and exception policy."""
+    started = time.perf_counter()
+    outcome = "exception"
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=90, check=False)
+        outcome = "exit_ok" if completed.returncode == 0 else "nonzero_exit"
+        return completed
+    except subprocess.TimeoutExpired:
+        outcome = "timeout"
+        raise
+    except OSError:
+        outcome = "launch_error"
+        raise
+    finally:
+        if isinstance(recognition_evidence, dict):
+            recognition_evidence["subprocess_seconds"] = round(time.perf_counter() - started, 4)
+            recognition_evidence["subprocess_outcome"] = outcome
+
+
 def _ocr_photographed_crop_with_layout(
-    image, fraction, tesseract, image_ops, *, psm=4
+    image, fraction, tesseract, image_ops, *, psm=4, recognition_evidence=None
 ):
     """OCR once and return both readable text and word/block geometry."""
+    setup_started = time.perf_counter()
     width, height = image.size
     left, top, right, bottom = fraction
     crop_box = (
@@ -2440,20 +2672,23 @@ def _ocr_photographed_crop_with_layout(
         int(width * right), int(height * bottom),
     )
     cropped = image_ops.autocontrast(image.crop(crop_box).convert("L"))
+    psm, model_args, decision = _resolve_ocr_recognition(image.crop(crop_box), psm)
+    if recognition_evidence is not None:
+        recognition_evidence.clear()
+        recognition_evidence.update(decision, crop_fraction=list(fraction))
+        recognition_evidence["setup_seconds"] = round(time.perf_counter() - setup_started, 4)
     with tempfile.TemporaryDirectory(prefix="rag-photographed-layout-") as temp_dir:
         image_path = Path(temp_dir) / "page.png"
         output_base = Path(temp_dir) / "result"
         cropped.save(image_path)
         try:
-            completed = subprocess.run(
+            completed = _run_measured_tesseract(
                 [
                     tesseract, str(image_path), str(output_base),
+                    *model_args,
                     "--psm", str(int(psm)), "-l", "eng", "txt", "tsv",
                 ],
-                capture_output=True,
-                text=True,
-                timeout=90,
-                check=False,
+                recognition_evidence,
             )
         except (OSError, subprocess.TimeoutExpired):
             return "", []
@@ -2474,6 +2709,8 @@ def _ocr_photographed_crop_with_layout(
     for row in rows:
         row["crop_width"] = cropped.width
         row["crop_height"] = cropped.height
+        row["ocr_psm"] = psm
+        row["ocr_model"] = "tessdata_best_eng" if model_args else "installed_eng"
     return clean_photographed_ocr_text(text), rows
 
 
@@ -3002,24 +3239,27 @@ def recover_missing_display_regions(text, image, fraction, rows, tesseract, imag
     return content, evidence
 
 
-def _ocr_photographed_crop(image, fraction, tesseract, image_ops, *, psm=4):
+def _ocr_photographed_crop(image, fraction, tesseract, image_ops, *, psm=4, recognition_evidence=None):
     """OCR one visual region, retaining only text suitable for preparation."""
+    setup_started = time.perf_counter()
     width, height = image.size
     left, top, right, bottom = fraction
     crop_box = (int(width * left), int(height * top), int(width * right), int(height * bottom))
     # Auto-contrast restores black glyphs laid over yellow highlighter while
     # keeping the source crop and page identity unchanged.
     cropped = image_ops.autocontrast(image.crop(crop_box).convert("L"))
+    psm, model_args, decision = _resolve_ocr_recognition(image.crop(crop_box), psm)
+    if recognition_evidence is not None:
+        recognition_evidence.clear()
+        recognition_evidence.update(decision, crop_fraction=list(fraction))
+        recognition_evidence["setup_seconds"] = round(time.perf_counter() - setup_started, 4)
     with tempfile.TemporaryDirectory(prefix="rag-photographed-page-") as temp_dir:
         image_path = Path(temp_dir) / "page.png"
         cropped.save(image_path)
         try:
-            completed = subprocess.run(
-                [tesseract, str(image_path), "stdout", "--psm", str(int(psm)), "-l", "eng"],
-                capture_output=True,
-                text=True,
-                timeout=90,
-                check=False,
+            completed = _run_measured_tesseract(
+                [tesseract, str(image_path), "stdout", *model_args, "--psm", str(int(psm)), "-l", "eng"],
+                recognition_evidence,
             )
         except (OSError, subprocess.TimeoutExpired):
             return ""
