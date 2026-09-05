@@ -3382,6 +3382,10 @@ def photographed_ocr_route_evidence(pages):
     crop_retry_selected_pages = set()
     route_recovery_pages = set()
     byline_relocated_pages = set()
+    reading_order_applied_pages = set()
+    drop_cap_recovered_pages = set()
+    drop_cap_unresolved_pages = set()
+    drop_cap_recovered_count = 0
     neighbour_runover_decisions = Counter()
     selected_route_counts = Counter()
     for page_info in pages or []:
@@ -3407,9 +3411,19 @@ def photographed_ocr_route_evidence(pages):
             column = region.get("column_preprocessing") or {}
             if bool(column.get("detected")):
                 three_column_pages.add(page_number)
+            reading_order = column.get("reading_order") or {}
+            if isinstance(reading_order, dict) and bool(reading_order.get("applied")):
+                reading_order_applied_pages.add(page_number)
             byline = column.get("byline") or {}
             if bool(byline.get("relocated")):
                 byline_relocated_pages.add(page_number)
+            drop_cap = column.get("drop_cap") or region.get("drop_cap_recovery") or {}
+            recovered_count = int(drop_cap.get("recovered_count") or 0)
+            if recovered_count:
+                drop_cap_recovered_pages.add(page_number)
+                drop_cap_recovered_count += recovered_count
+            if drop_cap.get("unresolved"):
+                drop_cap_unresolved_pages.add(page_number)
             retry = region.get("ocr_crop_retry") or {}
             if bool(retry.get("attempted")):
                 crop_retry_pages.add(page_number)
@@ -3429,11 +3443,15 @@ def photographed_ocr_route_evidence(pages):
         "crop_retry_selected_pages": sorted(crop_retry_selected_pages),
         "route_recovery_pages": sorted(route_recovery_pages),
         "byline_relocated_pages": sorted(byline_relocated_pages),
+        "reading_order_applied_pages": sorted(reading_order_applied_pages),
+        "drop_cap_recovered_pages": sorted(drop_cap_recovered_pages),
+        "drop_cap_recovered_count": drop_cap_recovered_count,
+        "drop_cap_unresolved_pages": sorted(drop_cap_unresolved_pages),
         "neighbour_runover_decisions": dict(sorted(neighbour_runover_decisions.items())),
     }
 
 
-def ocr_page_evidence_ledger(ocr_pages, reconciliation=None, targeted_pages=None):
+def ocr_page_evidence_ledger(ocr_pages, reconciliation=None, targeted_pages=None, *, start_page=1, end_page=None):
     """Return one compact, text-free OCR decision row per observed/targeted page."""
     reconciliation = reconciliation or {}
 
@@ -3464,29 +3482,63 @@ def ocr_page_evidence_ledger(ocr_pages, reconciliation=None, targeted_pages=None
         regions = [row for row in (page.get("reading_regions") or []) if isinstance(row, dict)]
         preprocessing = page.get("spread_preprocessing") or {}
         retry = next((row.get("ocr_crop_retry") for row in regions if row.get("ocr_crop_retry")), {}) or {}
+        drop_cap_rows = []
+        reading_order_rows = []
+        for region in regions:
+            column = region.get("column_preprocessing") or {}
+            drop_cap = column.get("drop_cap") or region.get("drop_cap_recovery") or {}
+            if drop_cap:
+                drop_cap_rows.append(drop_cap)
+            reading_order = column.get("reading_order") or {}
+            if reading_order:
+                reading_order_rows.append(reading_order)
         decision = decisions.get(page_number) or {}
+        in_selected_range = page_number >= start_page and (end_page is None or page_number < end_page)
+        word_count = len(_reconciliation_text_tokens(page.get("text") or ""))
         rows.append({
             "page": page_number,
             "targeted": page_number in targeted,
             "ocr_observed": bool(page),
-            "ocr_word_count": len(_reconciliation_text_tokens(page.get("text") or "")),
+            "ocr_word_count": word_count,
+            "in_selected_range": in_selected_range,
+            "selected_ocr_output": bool(
+                in_selected_range and word_count and (
+                    str(decision.get("decision") or "").startswith("ocr_")
+                    or reconciliation.get("status") == "not_available"
+                )
+            ),
+            "output_disposition": "excluded_page_range" if not in_selected_range else ("no_ocr_text" if not word_count else "within_selected_range"),
             "selected_route": str(preprocessing.get("path") or "not_recorded"),
             "ocr_methods": sorted({str(row.get("ocr_method") or "") for row in regions if row.get("ocr_method")}),
             "crop_fractions": [list(row.get("crop_fraction") or []) for row in regions],
             "crop_adjustments": [row.get("crop_adjustment") for row in regions if row.get("crop_adjustment")],
             "crop_retry_attempted": bool(retry.get("attempted")),
             "crop_retry_result": str(retry.get("reason") or "not_attempted"),
+            "reading_order_applied": any(bool(row.get("applied")) for row in reading_order_rows),
+            "drop_cap_recovered_count": sum(
+                int(row.get("recovered_count") or 0) for row in drop_cap_rows
+            ),
+            "missing_display_regions_recovered": sum(
+                int((row.get("missing_display_regions") or {}).get("recovered_count") or 0)
+                for row in regions
+            ),
+            "drop_cap_unresolved_reasons": sorted({
+                str(item.get("reason") or "unclassified")
+                for row in drop_cap_rows
+                for item in (row.get("unresolved") or [])
+                if isinstance(item, dict)
+            }),
             "neighbour_runover": dict(preprocessing.get("neighbour_page_runover") or {}),
             "reconciliation_decision": str(decision.get("decision") or "not_reconciled"),
             "quality_state": str((decision.get("ocr_page_quality") or {}).get("state") or "not_assessed"),
         })
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "content_retained": False,
         "page_count": len(rows),
         "targeted_page_count": sum(1 for row in rows if row["targeted"]),
         "ocr_observed_page_count": sum(1 for row in rows if row["ocr_observed"]),
-        "selected_ocr_page_count": sum(1 for row in rows if row["reconciliation_decision"].startswith("ocr_")),
+        "selected_ocr_page_count": sum(1 for row in rows if row["selected_ocr_output"]),
         "pages": rows,
     }
 
@@ -6657,6 +6709,22 @@ def assess_reconciled_ocr_page_quality(pages, decisions):
             and page_number == last_page_number
             and last_page_number > 2
         )
+        unresolved_drop_cap_reasons = sorted({
+            str(item.get("reason") or "unclassified")
+            for region in (page.get("reading_regions") or [])
+            if isinstance(region, dict)
+            for drop_cap in [
+                (region.get("column_preprocessing") or {}).get("drop_cap")
+                or region.get("drop_cap_recovery")
+                or {}
+            ]
+            for item in (drop_cap.get("unresolved") or [])
+            if isinstance(item, dict)
+            and str(item.get("reason") or "") in {
+                "lowercase_suffix_spacing_ambiguous",
+                "short_completion_lacks_same_page_lexical_evidence",
+            }
+        })
         if front_matter_sparse:
             state = "front_matter_sparse_text"
             observed_preview = normalize_text(text)[:180]
@@ -6672,6 +6740,9 @@ def assess_reconciled_ocr_page_quality(pages, decisions):
         elif incomplete_against_peers:
             state = "sparse_relative_to_peer_pages"
             observed_preview = normalize_text(text)[:180]
+        elif unresolved_drop_cap_reasons:
+            state = "recovered_with_local_ocr_uncertainty"
+            observed_preview = normalize_text(text)[:180]
         else:
             state = "recovered"
             observed_preview = ""
@@ -6685,6 +6756,7 @@ def assess_reconciled_ocr_page_quality(pages, decisions):
             "observed_preview": observed_preview,
             "text_preserved": True,
             "diagnostic_only": state != "recovered",
+            "unresolved_drop_cap_reasons": unresolved_drop_cap_reasons,
             "fragmented_cluster_token_count": int(
                 integrity.get("fragmented_cluster_token_count") or 0
             ),
@@ -6897,6 +6969,10 @@ def reconcile_native_ocr_pages(native_pages, ocr_pages):
         "dense_corruption_suspected_pages": [
             row["page"] for row in page_quality
             if row["state"] == "dense_ocr_corruption_suspected"
+        ],
+        "local_ocr_uncertainty_pages": [
+            row["page"] for row in page_quality
+            if row["state"] == "recovered_with_local_ocr_uncertainty"
         ],
     }
 
@@ -23535,14 +23611,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                         "status": "not_available",
                         "reason": "No prepared PyMuPDF candidate was available for page-local reconciliation.",
                     }
-                native_ocr_reconciliation["ocr_page_evidence"] = ocr_page_evidence_ledger(
-                    raw_ocr_pages,
-                    native_ocr_reconciliation,
-                    automatic_targeted_ocr_pages,
-                )
             write_json(candidate_dir / "layout-region-review.json", layout_evidence)
-            if backend == "unstructured":
-                write_json(candidate_dir / "native-ocr-reconciliation.json", native_ocr_reconciliation)
             pymupdf4llm_execution = (
                 pymupdf4llm_execution_evidence(pages)
                 if backend == "pymupdf4llm"
@@ -23633,6 +23702,12 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                     "end_page": end_page,
                     "reliable": reference_is_reliable,
                 }
+            if backend == "unstructured":
+                native_ocr_reconciliation["ocr_page_evidence"] = ocr_page_evidence_ledger(
+                    raw_ocr_pages, native_ocr_reconciliation, automatic_targeted_ocr_pages,
+                    start_page=start_page, end_page=end_page,
+                )
+                write_json(candidate_dir / "native-ocr-reconciliation.json", native_ocr_reconciliation)
             boundary_reconciled = bool(
                 boundary_reference_backend != backend
                 and (
@@ -24264,12 +24339,14 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     terminal_page_sparse_ocr_pages = positive_ocr_pages("terminal_page_sparse_pages")
     low_signal_visual_ocr_pages = positive_ocr_pages("low_signal_visual_pages")
     dense_corruption_ocr_pages = positive_ocr_pages("dense_corruption_suspected_pages")
+    local_ocr_uncertainty_pages = positive_ocr_pages("local_ocr_uncertainty_pages")
     selected["ocr_page_quality_summary"] = {
         "sparse_relative_pages": sparse_relative_ocr_pages,
         "front_matter_sparse_pages": front_matter_sparse_ocr_pages,
         "terminal_page_sparse_pages": terminal_page_sparse_ocr_pages,
         "low_signal_visual_pages": low_signal_visual_ocr_pages,
         "dense_corruption_suspected_pages": dense_corruption_ocr_pages,
+        "local_ocr_uncertainty_pages": local_ocr_uncertainty_pages,
         "diagnostic_only": True,
         "source_text_preserved": True,
     }

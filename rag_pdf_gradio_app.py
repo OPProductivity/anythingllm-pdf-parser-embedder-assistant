@@ -22163,6 +22163,7 @@ def automatic_extraction_method_summary(summaries):
         "layout_backend": 0,
         "unstructured_backend": 0,
         "selected_output_ocr_pdfs": 0,
+        "ocr_without_selected_text_pdfs": 0,
         "comparison_only_ocr_pdfs": 0,
         "targeted_pages": 0,
         "ocr_processing_seconds": 0.0,
@@ -22223,13 +22224,17 @@ def automatic_extraction_method_summary(summaries):
         elif backend:
             counts["layout_backend"] += 1
         if ocr_used or selected_ocr_seconds > 0.0:
+            if ocr_page_evidence.get("schema_version") == 2 and selected_ocr_pages == 0:
+                counts["ocr_without_selected_text_pdfs"] += 1
+                continue
             counts["selected_output_ocr_pdfs"] += 1
             # The historical list was a preflight plan, so it undercounted
             # page-local OCR that was added after native candidate inspection.
             # Prefer the retained page ledger; keep the plan only for older
             # summaries that predate that evidence.
             counts["targeted_pages"] += (
-                selected_ocr_pages or observed_ocr_pages or len(target_pages)
+                selected_ocr_pages if ocr_page_evidence.get("schema_version") == 2
+                else (selected_ocr_pages or observed_ocr_pages or len(target_pages))
             )
         elif comparison_ocr_seconds > 0.0:
             counts["comparison_only_ocr_pdfs"] += 1
@@ -22256,6 +22261,11 @@ def automatic_extraction_method_summary(summaries):
         result += (
             f" Comparison-only OCR ran for "
             f"{counts['comparison_only_ocr_pdfs']} PDF(s)."
+        )
+    if counts["ocr_without_selected_text_pdfs"]:
+        result += (
+            f" OCR ran without contributing selected text for "
+            f"{counts['ocr_without_selected_text_pdfs']} PDF(s)."
         )
     if (
         counts["selected_output_ocr_pdfs"]

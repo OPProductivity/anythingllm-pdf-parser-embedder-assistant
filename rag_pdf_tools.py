@@ -1576,20 +1576,53 @@ def photographed_page_ocr_regions(page, runtime, *, page_number=None):
     if embedded_fraction:
         column_evidence = photographed_three_column_signal(image, ImageOps)
         if column_evidence["detected"]:
-            text = _ocr_photographed_crop(
+            text, layout_rows = _ocr_photographed_crop_with_layout(
                 image, embedded_fraction, tesseract, ImageOps, psm=3
             )
-            drop_cap_reference = _ocr_photographed_crop(
-                image, embedded_fraction, tesseract, ImageOps, psm=4
-            ) if int(page_number or 0) == 1 else ""
-            text, drop_cap_evidence = recover_opening_three_column_drop_cap(
+            if not text:
+                text = _ocr_photographed_crop(
+                    image, embedded_fraction, tesseract, ImageOps, psm=3
+                )
+                layout_rows = []
+            text, reading_order_evidence = reorder_three_column_ocr_blocks(
                 text,
-                drop_cap_reference,
+                layout_rows,
+                column_evidence,
+                embedded_fraction,
+            )
+            text, drop_cap_evidence = recover_geometry_aligned_drop_caps(
+                text,
                 image,
+                embedded_fraction,
+                layout_rows,
                 tesseract,
                 ImageOps,
-                page_number=page_number,
             )
+            # Some decorative opening Ws are segmented into several strokes
+            # rather than one connected glyph. Retain the older, tightly
+            # bounded first-page fallback only when the geometry route could
+            # not recover an opening initial itself.
+            if (
+                int(page_number or 0) == 1
+                and not drop_cap_evidence.get("opening_recovered")
+            ):
+                drop_cap_reference = _ocr_photographed_crop(
+                    image, embedded_fraction, tesseract, ImageOps, psm=4
+                )
+                text, opening_evidence = recover_opening_three_column_drop_cap(
+                    text,
+                    drop_cap_reference,
+                    image,
+                    tesseract,
+                    ImageOps,
+                    page_number=page_number,
+                )
+                drop_cap_evidence["opening_fallback"] = opening_evidence
+                if opening_evidence.get("recovered"):
+                    drop_cap_evidence["recovered_count"] = int(
+                        drop_cap_evidence.get("recovered_count") or 0
+                    ) + 1
+                    drop_cap_evidence["opening_recovered"] = True
             text, byline_evidence = relocate_unique_opening_ocr_byline(
                 text, page_number=page_number
             )
@@ -1608,14 +1641,33 @@ def photographed_page_ocr_regions(page, runtime, *, page_number=None):
                     "column_preprocessing": {
                         **column_evidence,
                         "psm": 3,
-                        "reading_order": "automatic_column_first",
+                        "reading_order": reading_order_evidence,
                         "byline": byline_evidence,
                         "drop_cap": drop_cap_evidence,
                     },
                     **({"ocr_route_recovery": route_recovery} if route_recovery else {}),
                 }]
         embedded_fraction, crop_adjustment = adaptive_ocr_crop_fraction(image, embedded_fraction, ImageOps)
-        text = _ocr_photographed_crop(image, embedded_fraction, tesseract, ImageOps)
+        text, layout_rows = _ocr_photographed_crop_with_layout(
+            image, embedded_fraction, tesseract, ImageOps
+        )
+        if not text:
+            text = _ocr_photographed_crop(
+                image, embedded_fraction, tesseract, ImageOps
+            )
+            layout_rows = []
+        text, drop_cap_evidence = recover_geometry_aligned_drop_caps(
+            text,
+            image,
+            embedded_fraction,
+            layout_rows,
+            tesseract,
+            ImageOps,
+        )
+        text, missing_display_evidence = recover_missing_display_regions(
+            text, image, embedded_fraction, layout_rows, tesseract, ImageOps,
+            page_number=page_number,
+        )
         if len(text) < 80 and int(page_number or 0) <= 2:
             display_text = _ocr_photographed_crop(image, embedded_fraction, tesseract, ImageOps, psm=3)
             if credible_short_ocr_display_text(display_text):
@@ -1670,6 +1722,8 @@ def photographed_page_ocr_regions(page, runtime, *, page_number=None):
                 "annotations_excluded": "embedded_image_bounds_and_outer_margin_crop",
                 "crop_fraction": list(embedded_fraction),
                 "crop_adjustment": crop_adjustment,
+                "drop_cap_recovery": drop_cap_evidence,
+                "missing_display_regions": missing_display_evidence,
                 "ocr_crop_retry": retry_evidence,
                 **({"ocr_route_recovery": route_recovery} if route_recovery else {}),
             }]
@@ -2334,6 +2388,593 @@ def resolve_confirmed_neighbour_runovers(pages):
     return pages
 
 
+def _parse_tesseract_tsv(tsv_text):
+    """Parse word geometry without treating ordinary quote marks as CSV syntax."""
+    rows = []
+    for raw_line in str(tsv_text or "").splitlines()[1:]:
+        fields = raw_line.split("\t", 11)
+        if len(fields) != 12:
+            continue
+        try:
+            level, page, block, paragraph, line, word = (
+                int(fields[index]) for index in range(6)
+            )
+            left, top, width, height = (
+                int(fields[index]) for index in range(6, 10)
+            )
+            confidence = float(fields[10])
+        except (TypeError, ValueError):
+            continue
+        text = fields[11].strip()
+        if level != 5 or not text:
+            continue
+        rows.append({
+            "page": page,
+            "block": block,
+            "paragraph": paragraph,
+            "line": line,
+            "word": word,
+            "left": left,
+            "top": top,
+            "width": width,
+            "height": height,
+            "confidence": round(confidence, 3),
+            "text": text,
+        })
+    return rows
+
+
+def _ocr_photographed_crop_with_layout(
+    image, fraction, tesseract, image_ops, *, psm=4
+):
+    """OCR once and return both readable text and word/block geometry."""
+    width, height = image.size
+    left, top, right, bottom = fraction
+    crop_box = (
+        int(width * left), int(height * top),
+        int(width * right), int(height * bottom),
+    )
+    cropped = image_ops.autocontrast(image.crop(crop_box).convert("L"))
+    with tempfile.TemporaryDirectory(prefix="rag-photographed-layout-") as temp_dir:
+        image_path = Path(temp_dir) / "page.png"
+        output_base = Path(temp_dir) / "result"
+        cropped.save(image_path)
+        try:
+            completed = subprocess.run(
+                [
+                    tesseract, str(image_path), str(output_base),
+                    "--psm", str(int(psm)), "-l", "eng", "txt", "tsv",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=90,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return "", []
+        text_path = output_base.with_suffix(".txt")
+        tsv_path = output_base.with_suffix(".tsv")
+        if completed.returncode != 0 or not text_path.is_file():
+            return "", []
+        try:
+            text = text_path.read_text(encoding="utf-8", errors="replace")
+            tsv_text = (
+                tsv_path.read_text(encoding="utf-8", errors="replace")
+                if tsv_path.is_file()
+                else ""
+            )
+        except OSError:
+            return "", []
+    rows = _parse_tesseract_tsv(tsv_text)
+    for row in rows:
+        row["crop_width"] = cropped.width
+        row["crop_height"] = cropped.height
+    return clean_photographed_ocr_text(text), rows
+
+
+def _tsv_block_text(rows):
+    paragraphs = []
+    for paragraph_number in sorted({row["paragraph"] for row in rows}):
+        paragraph_rows = [
+            row for row in rows if row["paragraph"] == paragraph_number
+        ]
+        lines = []
+        for line_number in sorted({row["line"] for row in paragraph_rows}):
+            line_rows = sorted(
+                (row for row in paragraph_rows if row["line"] == line_number),
+                key=lambda row: row["word"],
+            )
+            lines.append(" ".join(row["text"] for row in line_rows))
+        paragraphs.append("\n".join(lines))
+    return "\n\n".join(paragraphs).strip()
+
+
+def _tsv_column_line_text(rows):
+    """Rebuild one column from physical line bands, including split blocks."""
+    logical_lines = []
+    for block, paragraph, line in sorted({
+        (row["block"], row["paragraph"], row["line"]) for row in rows
+    }):
+        line_rows = [
+            row for row in rows
+            if (row["block"], row["paragraph"], row["line"])
+            == (block, paragraph, line)
+        ]
+        logical_lines.append({
+            "top": min(row["top"] for row in line_rows),
+            "bottom": max(row["top"] + row["height"] for row in line_rows),
+            "rows": list(line_rows),
+        })
+    logical_lines.sort(key=lambda item: (item["top"], min(row["left"] for row in item["rows"])))
+    bands = []
+    for logical_line in logical_lines:
+        center = (logical_line["top"] + logical_line["bottom"]) / 2
+        matching = next((
+            band for band in reversed(bands[-3:])
+            if abs(center - band["center"]) <= max(
+                4,
+                min(
+                    logical_line["bottom"] - logical_line["top"],
+                    band["bottom"] - band["top"],
+                ) * .55,
+            )
+        ), None)
+        if matching is None:
+            bands.append({
+                "top": logical_line["top"],
+                "bottom": logical_line["bottom"],
+                "center": center,
+                "rows": list(logical_line["rows"]),
+            })
+        else:
+            matching["top"] = min(matching["top"], logical_line["top"])
+            matching["bottom"] = max(matching["bottom"], logical_line["bottom"])
+            matching["center"] = (matching["top"] + matching["bottom"]) / 2
+            matching["rows"].extend(logical_line["rows"])
+    rendered = []
+    for band in sorted(bands, key=lambda item: (item["top"], min(row["left"] for row in item["rows"]))):
+        rendered.append(" ".join(
+            row["text"] for row in sorted(band["rows"], key=lambda row: (row["left"], row["word"]))
+        ))
+    return "\n".join(rendered).strip()
+
+
+def reorder_three_column_ocr_blocks(text, layout_rows, column_evidence, crop_fraction):
+    """Put Tesseract blocks into page-column reading order when geometry is strong.
+
+    Tesseract PSM 3 identifies the right blocks but can emit a tall first
+    column, then the middle column, then return to small bottom fragments of
+    the first column.  Reordering the *same recognized tokens* fixes that
+    structural defect without selecting a second OCR candidate or rewriting
+    any word.
+    """
+    rows = [row for row in (layout_rows or []) if isinstance(row, dict)]
+    evidence = {
+        "method": "tesseract_block_geometry_column_order_v1",
+        "applied": False,
+        "reason": "layout_words_unavailable",
+        "block_count": 0,
+    }
+    if not rows or not (column_evidence or {}).get("detected"):
+        return str(text or ""), evidence
+    gutters = list((column_evidence or {}).get("gutters") or [])
+    if len(gutters) != 2:
+        evidence["reason"] = "two_gutters_unavailable"
+        return str(text or ""), evidence
+    crop_left, _crop_top, crop_right, _crop_bottom = crop_fraction
+    crop_width_fraction = max(float(crop_right) - float(crop_left), .001)
+    # The detector's x values are relative to its 4%-96% page sample.
+    gutter_positions = [
+        ((.04 + .92 * float(row["x_fraction"])) - float(crop_left))
+        / crop_width_fraction
+        for row in gutters
+    ]
+    crop_width = max(row.get("crop_width", 0) for row in rows) or max(
+        row["left"] + row["width"] for row in rows
+    )
+    crop_height = max(row.get("crop_height", 0) for row in rows) or max(
+        row["top"] + row["height"] for row in rows
+    )
+    evidence["coordinate_basis"] = (
+        "actual_crop" if all(row.get("crop_width") and row.get("crop_height") for row in rows)
+        else "legacy_text_extent"
+    )
+    blocks = []
+    for block_number in sorted({row["block"] for row in rows}):
+        block_rows = [row for row in rows if row["block"] == block_number]
+        left = min(row["left"] for row in block_rows)
+        top = min(row["top"] for row in block_rows)
+        right = max(row["left"] + row["width"] for row in block_rows)
+        bottom = max(row["top"] + row["height"] for row in block_rows)
+        center_fraction = ((left + right) / 2) / max(crop_width, 1)
+        if center_fraction < gutter_positions[0]:
+            column = 0
+        elif center_fraction < gutter_positions[1]:
+            column = 1
+        else:
+            column = 2
+        blocks.append({
+            "block": block_number,
+            "left": left,
+            "top": top,
+            "right": right,
+            "bottom": bottom,
+            "column": column,
+            "top_fraction": top / max(crop_height, 1),
+            "text": _tsv_block_text(block_rows),
+        })
+    evidence["block_count"] = len(blocks)
+    nonempty = [block for block in blocks if block["text"]]
+    if len(nonempty) < 3:
+        evidence["reason"] = "insufficient_text_blocks"
+        return str(text or ""), evidence
+    substantial_blocks = [block for block in nonempty if len(block["text"].split()) >= 20]
+    body_candidates = substantial_blocks or [
+        block for block in nonempty if any(character.islower() for character in block["text"])
+    ] or nonempty
+    body_top = min(block["top"] for block in body_candidates)
+    headers = [
+        block for block in nonempty
+        if block["top_fraction"] < .22
+        and (
+            block["bottom"] <= body_top
+            or (block["top_fraction"] < .075
+                and not any(character.islower() for character in block["text"]))
+        )
+        and (block["bottom"] - block["top"]) / max(crop_height, 1) < .08
+    ]
+    tails = [
+        block for block in nonempty
+        if block not in headers
+        and block["top_fraction"] > .93
+        and block["column"] != 0
+    ]
+    body = [block for block in nonempty if block not in headers and block not in tails]
+    ordered = (
+        sorted(headers, key=lambda block: (block["top"], block["left"]))
+        + sorted(body, key=lambda block: (block["column"], block["top"], block["left"]))
+        + sorted(tails, key=lambda block: (block["top"], block["left"]))
+    )
+    header_text = [block["text"] for block in ordered if block in headers]
+    body_text = []
+    for column in range(3):
+        column_blocks = [block for block in body if block["column"] == column]
+        column_block_numbers = {block["block"] for block in column_blocks}
+        column_rows = [row for row in rows if row["block"] in column_block_numbers]
+        rendered_column = _tsv_column_line_text(column_rows)
+        if rendered_column:
+            body_text.append(rendered_column)
+    tail_text = [block["text"] for block in ordered if block in tails]
+    rebuilt = clean_photographed_ocr_text("\n\n".join(header_text + body_text + tail_text))
+    original_words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", str(text or ""))
+    rebuilt_words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", rebuilt)
+    # Geometry is allowed to change order, never lexical content.  Requiring
+    # the complete case-insensitive multiset is stronger than a word-count
+    # tolerance: a coincidental loss and gain cannot cancel each other out.
+    # Include numbers and punctuation too: alphabetic-only comparison could
+    # silently discard a year, amount, or punctuation-only line.
+    lexical_content_preserved = (
+        sorted(re.findall(r"\w+|[^\w\s]", str(text or "").casefold()))
+        == sorted(re.findall(r"\w+|[^\w\s]", rebuilt.casefold()))
+    )
+    if not rebuilt or not lexical_content_preserved:
+        evidence["reason"] = "rebuilt_lexical_content_changed"
+        evidence["original_word_count"] = len(original_words)
+        evidence["rebuilt_word_count"] = len(rebuilt_words)
+        return str(text or ""), evidence
+    evidence.update({
+        "applied": True,
+        "reason": "strong_three_column_geometry",
+        "original_word_count": len(original_words),
+        "rebuilt_word_count": len(rebuilt_words),
+        "block_order": [block["block"] for block in ordered],
+    })
+    return rebuilt, evidence
+
+
+def _ocr_connected_glyph(image, fraction, tesseract, image_ops):
+    raw = normalize_text(
+        _ocr_photographed_crop(image, fraction, tesseract, image_ops, psm=10)
+    )
+    letters = re.findall(r"[A-Za-z]", raw)
+    nonletters = re.sub(r"[A-Za-z\s]", "", raw)
+    if len(letters) == 1 and len(nonletters) <= 2:
+        return letters[0].upper(), raw
+    return "", raw
+
+
+def _geometry_drop_cap_completion(content, glyph, token):
+    """Choose a joined or standalone initial using only same-page evidence."""
+    joined = glyph + token
+    joined_elsewhere = bool(re.search(
+        rf"(?i)(?<![A-Za-z]){re.escape(joined)}(?![A-Za-z])",
+        content,
+    ))
+    if len(token) > 4 or joined_elsewhere:
+        return joined, "joined_initial", ""
+    token_occurrences = len(re.findall(
+        rf"(?i)(?<![A-Za-z]){re.escape(token)}(?![A-Za-z])",
+        content,
+    ))
+    if glyph in {"A", "I"} and token_occurrences >= 2:
+        return f"{glyph} {token}", "standalone_initial", ""
+    return "", "", "short_completion_lacks_same_page_lexical_evidence"
+
+
+def recover_geometry_aligned_drop_caps(
+    text, image, crop_fraction, layout_rows, tesseract, image_ops
+):
+    """Recover only a physically adjacent oversized initial glyph."""
+    evidence = {
+        "method": "connected_glyph_plus_tesseract_word_geometry_v1",
+        "recovered_count": 0,
+        "opening_recovered": False,
+        "repairs": [],
+        "unresolved": [],
+    }
+    rows = [row for row in (layout_rows or []) if isinstance(row, dict)]
+    if not rows:
+        evidence["reason"] = "layout_words_unavailable"
+        return str(text or ""), evidence
+    word_heights = sorted(row["height"] for row in rows if row["height"] > 0)
+    median_height = word_heights[len(word_heights) // 2] if word_heights else 0
+    # Only these line starts can reach the existing component matcher. Avoid
+    # allocating a page-sized component map when there is nothing to match.
+    rows = [row for row in rows if (
+        row["word"] == 1
+        and 2 <= len(re.sub(r"[^A-Za-z]", "", row["text"])) <= 14
+        and (re.sub(r"[^A-Za-z]", "", row["text"]).isupper()
+             or len(re.sub(r"[^A-Za-z]", "", row["text"])) <= 3)
+        and row["height"] <= max(median_height * 1.55, median_height + 8)
+    )]
+    if not rows:
+        evidence["reason"] = "no_eligible_line_starts"
+        evidence["candidate_count"] = 0
+        return str(text or ""), evidence
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        evidence["reason"] = "component_runtime_unavailable"
+        return str(text or ""), evidence
+    page_width, page_height = image.size
+    crop_left, crop_top, crop_right, crop_bottom = crop_fraction
+    crop_box = (
+        int(page_width * crop_left), int(page_height * crop_top),
+        int(page_width * crop_right), int(page_height * crop_bottom),
+    )
+    cropped = image_ops.autocontrast(image.crop(crop_box).convert("L"))
+    gray = np.array(cropped)
+    mask = (gray < 140).astype("uint8")
+    _count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, 8)
+    components = stats[1:]
+    component_x, component_y, component_w, component_h, component_area = components.T
+    content = str(text or "")
+    # Associate each oversized connected component with only its best-aligned
+    # line start.  Without this ownership step one decorative initial could be
+    # compared with several nearby rows, producing noisy unresolved warnings
+    # even after the correct row had already been repaired.
+    component_matches = {}
+    for row in rows:
+        token = re.sub(r"[^A-Za-z]", "", row["text"])
+        if (
+            row["word"] != 1
+            or not (2 <= len(token) <= 14)
+            or (not token.isupper() and len(token) > 3)
+            or row["height"] > max(median_height * 1.55, median_height + 8)
+        ):
+            continue
+        token_top = row["top"]
+        token_bottom = token_top + row["height"]
+        # Apply the same geometric bounds in NumPy before entering Python.
+        # Scans contain thousands of ordinary glyphs; only the few components
+        # beside this line start can qualify as a missing oversized initial.
+        required_height_ratio = 1.8 if token.isupper() else 3.0
+        allowed_gap = (max(45, row["height"] * 3) if token.isupper()
+                       else max(12, row["height"] * .75))
+        gaps = row["left"] - (component_x + component_w)
+        overlaps = np.minimum(token_bottom, component_y + component_h) - np.maximum(token_top, component_y)
+        eligible = np.flatnonzero(
+            (gaps >= 0) & (gaps <= allowed_gap)
+            & (overlaps >= np.minimum(row["height"], component_h) * .35)
+            & (component_h >= row["height"] * required_height_ratio)
+            & (component_w >= row["height"] * .5)
+            & (component_area >= max(80, row["height"] * row["height"] * .7))
+        )
+        for index in eligible:
+            component_index = int(index) + 1
+            x, y, component_width, component_height, area = components[index]
+            component_bottom = y + component_height
+            vertical_overlap = min(token_bottom, component_bottom) - max(token_top, y)
+            gap = row["left"] - (x + component_width)
+            required_height_ratio = 1.8 if token.isupper() else 3.0
+            allowed_gap = (
+                max(45, row["height"] * 3)
+                if token.isupper()
+                else max(12, row["height"] * .75)
+            )
+            if (
+                0 <= gap <= allowed_gap
+                and vertical_overlap >= min(row["height"], component_height) * .35
+                and component_height >= row["height"] * required_height_ratio
+                and component_width >= row["height"] * .5
+                and area >= max(80, row["height"] * row["height"] * .7)
+            ):
+                top_alignment = abs(token_top - y)
+                baseline_alignment = abs(token_bottom - component_bottom)
+                alignment_score = min(top_alignment, baseline_alignment)
+                candidate = (
+                    float(alignment_score), float(gap), -int(area), row,
+                    int(x), int(y), int(component_width), int(component_height),
+                )
+                previous = component_matches.get(component_index)
+                if previous is None or candidate[:3] < previous[:3]:
+                    component_matches[component_index] = candidate
+    candidates_checked = len(component_matches)
+    for (
+        _alignment_score, _gap, _negative_area, row,
+        x, y, component_width, component_height,
+    ) in component_matches.values():
+        token = re.sub(r"[^A-Za-z]", "", row["text"])
+        # The conservative policy never rewrites mixed/lowercase suffixes:
+        # their spacing is ambiguous. Retain that decision before spending
+        # another OCR request on a glyph that cannot change the outcome.
+        if not token.isupper():
+            evidence["unresolved"].append({
+                "token": token,
+                "reason": "lowercase_suffix_spacing_ambiguous",
+                "glyph_ocr_skipped": True,
+            })
+            continue
+        pad_x = max(3, int(component_height * .16))
+        pad_y = max(3, int(component_height * .12))
+        glyph_fraction = (
+            max(0.0, (crop_box[0] + x - pad_x) / page_width),
+            max(0.0, (crop_box[1] + y - pad_y) / page_height),
+            min(1.0, (crop_box[0] + x + component_width + pad_x) / page_width),
+            min(1.0, (crop_box[1] + y + component_height + pad_y) / page_height),
+        )
+        glyph, raw_glyph = _ocr_connected_glyph(
+            image, glyph_fraction, tesseract, image_ops
+        )
+        if not glyph:
+            evidence["unresolved"].append({
+                "token": token,
+                "reason": "component_not_one_glyph",
+                "raw_glyph": raw_glyph,
+            })
+            continue
+        # Tesseract can preserve the oversized glyph as its own token while
+        # also reporting the following word geometry.  In that case there is
+        # no missing initial to recover (for example ``I GOT`` must not be
+        # treated as a failed attempt to form ``IGOT``).
+        if re.search(
+            rf"(?i)(?<![A-Za-z]){re.escape(glyph)}\s+{re.escape(token)}(?![A-Za-z])",
+            content,
+        ):
+            continue
+        completed_token, repair_mode, unresolved_reason = (
+            _geometry_drop_cap_completion(content, glyph, token)
+        )
+        if unresolved_reason:
+            evidence["unresolved"].append({
+                "token": token,
+                "glyph": glyph,
+                "completed_token": glyph + token,
+                "reason": unresolved_reason,
+            })
+            continue
+        pattern = re.compile(rf"(?<![A-Za-z]){re.escape(token)}(?![A-Za-z])")
+        matches = list(pattern.finditer(content))
+        if len(matches) != 1:
+            evidence["unresolved"].append({
+                "token": token,
+                "glyph": glyph,
+                "reason": "text_token_not_unique",
+                "occurrences": len(matches),
+            })
+            continue
+        content = pattern.sub(completed_token, content, count=1)
+        repair = {
+            "glyph": glyph,
+            "observed_token": token,
+            "completed_token": completed_token,
+            "repair_mode": repair_mode,
+            "block": row["block"],
+            "top_fraction": round(row["top"] / max(cropped.height, 1), 4),
+        }
+        evidence["repairs"].append(repair)
+        evidence["recovered_count"] += 1
+        if repair["top_fraction"] <= .18:
+            evidence["opening_recovered"] = True
+    evidence["candidate_count"] = candidates_checked
+    evidence["reason"] = (
+        "one_or_more_geometry_aligned_initials_recovered"
+        if evidence["recovered_count"]
+        else "no_unambiguous_geometry_aligned_initial"
+    )
+    return content, evidence
+
+
+def recover_missing_display_regions(text, image, fraction, rows, tesseract, image_ops, *, page_number=None):
+    """Recover at most three omitted title lines, never re-OCR ordinary prose.
+
+    Only sparse uppercase opening leaves qualify. Pixel bands must contain
+    substantial word-shaped ink and have no recognized word overlapping
+    them. Existing text is untouched; a unique following TSV line anchors each
+    insertion. This is bounded missing-region recovery, not candidate voting.
+    """
+    evidence = {"method": "missing_display_bands_v1", "recovered_count": 0, "regions": []}
+    content = str(text or "")
+    letters = [c for c in content if c.isalpha()]
+    if (not rows or not page_number or page_number > 2 or not 5 <= len(content.split()) <= 45
+            or not letters or sum(c.isupper() for c in letters) / len(letters) < .9):
+        evidence["reason"] = "not_sparse_uppercase_opening"
+        return content, evidence
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        evidence["reason"] = "component_runtime_unavailable"
+        return content, evidence
+    width, height = image.size
+    crop = image.crop(tuple(
+        int(value * dimension)
+        for value, dimension in zip(fraction, (width, height, width, height))
+    )).convert("L")
+    mask = (np.asarray(crop) < 160).astype("uint8")
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    valid = np.zeros(count, dtype=bool)
+    for index, (x, y, component_width, component_height, area) in enumerate(stats):
+        if (index and area >= 20 and component_width >= 3 and component_height >= 8
+                and x > crop.width * .025 and x + component_width < crop.width * .975):
+            valid[index] = True
+    ink = valid[labels]
+    active = np.count_nonzero(ink, axis=1) >= 8
+    starts = np.flatnonzero(active & ~np.r_[False, active[:-1]])
+    ends = np.flatnonzero(active & ~np.r_[active[1:], False]) + 1
+    bands = []
+    for y1, y2 in zip(starts, ends):
+        if y2 - y1 < 15 or y2 > crop.height * .45:
+            continue
+        if any(min(y2,r["top"]+r["height"])-max(y1,r["top"]) > min(y2-y1,r["height"])*.25 for r in rows):
+            continue
+        components = [index for index in np.flatnonzero(valid)
+                      if stats[index, 1] >= y1 and stats[index, 1] + stats[index, 3] <= y2]
+        xs = np.flatnonzero(np.any(ink[y1:y2], axis=0))
+        # Touching display letters can be one component (e.g. tightly set AS).
+        # Keep only a word-shaped band, not a narrow isolated initial/stroke.
+        if len(components) < 2 and (not components or xs[-1] - xs[0] + 1 < (y2 - y1) * 1.15):
+            continue
+        bands.append((int(y1),int(y2),int(xs[0]),int(xs[-1])+1))
+    if not 1 <= len(bands) <= 3:
+        evidence["reason"] = "no_bounded_missing_bands"
+        return content, evidence
+    insertions = {}
+    for y1, y2, x1, x2 in bands:
+        following = [row for row in rows if row["top"] >= y2]
+        if not following:
+            continue
+        anchor=min(following,key=lambda r:(r["top"],r["left"]))
+        line=sorted([r for r in rows if (r["block"],r["paragraph"],r["line"]) == (anchor["block"],anchor["paragraph"],anchor["line"])],key=lambda r:r["word"])
+        pattern=r"\s+".join(re.escape(r["text"]) for r in line)
+        matches = list(re.finditer(pattern, content))
+        if len(matches) != 1:
+            continue
+        region=(max(0,(x1-8)/crop.width),max(0,(y1-8)/crop.height),min(1,(x2+8)/crop.width),min(1,(y2+8)/crop.height))
+        recovered = _ocr_photographed_crop(crop, region, tesseract, image_ops, psm=7).strip()
+        # Reject noise and uncertain prose, retaining the old output verbatim.
+        if not re.fullmatch(r"[A-Z][A-Z '’\-]{1,79}", recovered):
+            continue
+        insertions.setdefault(matches[0].start(),[]).append(recovered)
+        evidence["regions"].append({"crop_relative_fraction":list(region),"word_count":len(recovered.split()),"psm":7})
+    for position, additions in sorted(insertions.items(), reverse=True):
+        content = content[:position] + "\n\n".join(additions) + "\n\n" + content[position:]
+    evidence["recovered_count"] = len(evidence["regions"])
+    evidence["reason"] = "missing_regions_recovered" if insertions else "missing_regions_unresolved"
+    return content, evidence
+
+
 def _ocr_photographed_crop(image, fraction, tesseract, image_ops, *, psm=4):
     """OCR one visual region, retaining only text suitable for preparation."""
     width, height = image.size
@@ -2661,6 +3302,14 @@ def _parallel_unstructured_ocr_pages(
                         f"Unstructured OCR timed out after {timeout_seconds}s for PDF page(s) {pages_text}. "
                         "The isolated OCR workers were stopped; rerun after reviewing the OCR runtime or use a smaller PDF."
                     )
+        except BaseException:
+            # Callback/checkpoint/submission failures must not enter a waiting
+            # shutdown while sibling native OCR workers may be hung. Preserve
+            # the original exception and use the existing owned-pool cleanup.
+            if not terminated:
+                _terminate_unstructured_executor(executor)
+                terminated = True
+            raise
         finally:
             if not terminated:
                 executor.shutdown(wait=True, cancel_futures=True)

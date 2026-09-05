@@ -2307,6 +2307,25 @@ class PipelineCoreTests(unittest.TestCase):
             "2 cached OCR page(s) reused.",
         )
 
+    def test_extraction_summary_respects_explicit_zero_selected_ocr_pages(self):
+        import rag_pdf_gradio_app as app
+
+        rendered = app.automatic_extraction_method_summary([{
+            "selected_backend": "unstructured",
+            "ocr_assisted_extraction_used": True,
+            "ocr_processing_seconds": 13.4,
+            "selected_output_ocr_processing_seconds": 13.4,
+            "automatic_targeted_ocr_pages": [1],
+            "ocr_page_evidence": {
+                "schema_version": 2, "selected_ocr_page_count": 0,
+                "ocr_observed_page_count": 1,
+            },
+        }])
+        self.assertNotIn("OCR contributed", rendered)
+        self.assertNotIn("targeted page", rendered)
+        self.assertIn("without contributing selected text for 1 PDF(s)", rendered)
+        self.assertIn("OCR processing: 00m13s", rendered)
+
     def test_stage_anomaly_detection_flags_only_material_historical_outlier(self):
         import rag_pdf_gradio_app as app
 
@@ -18401,6 +18420,56 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(ledger["targeted_page_count"], 1)
         self.assertEqual(ledger["pages"][0]["page"], 4)
 
+    def test_ocr_page_ledger_excludes_cover_and_empty_ocr_from_selected_count(self):
+        ledger = pipeline.ocr_page_evidence_ledger(
+            [{"page": 1, "text": "Cover title"},
+             {"page": 2, "text": ""},
+             {"page": 3, "text": "Body text"},
+             {"page": 4, "text": "Back matter"}],
+            {"pages": [{"page": p, "decision": "ocr_structure_preserved_tie_break"}
+                       for p in range(1, 5)]},
+            [1, 2, 3, 4], start_page=2, end_page=4,
+        )
+        self.assertEqual(ledger["ocr_observed_page_count"], 4)
+        self.assertEqual(ledger["selected_ocr_page_count"], 1)
+        self.assertEqual([p["page"] for p in ledger["pages"] if p["selected_ocr_output"]], [3])
+        self.assertEqual(ledger["pages"][0]["output_disposition"], "excluded_page_range")
+        self.assertEqual(ledger["pages"][1]["output_disposition"], "no_ocr_text")
+        self.assertEqual(ledger["pages"][3]["output_disposition"], "excluded_page_range")
+
+    def test_drop_cap_without_eligible_line_start_does_not_inspect_image(self):
+        image = mock.Mock()
+        text, evidence = rag_pdf_tools.recover_geometry_aligned_drop_caps(
+            "Ordinary continuous prose", image, (0, 0, 1, 1),
+            [{"word": 1, "text": "Ordinary", "height": 12}], "unused", mock.Mock(),
+        )
+        self.assertEqual(text, "Ordinary continuous prose")
+        self.assertEqual(evidence["candidate_count"], 0)
+        image.crop.assert_not_called()
+
+    def test_ocr_page_ledger_preserves_contribution_without_native_peer(self):
+        ledger = pipeline.ocr_page_evidence_ledger(
+            [{"page": 1, "text": "Recovered text"}],
+            {"status": "not_available"}, [1],
+        )
+        self.assertEqual(ledger["selected_ocr_page_count"], 1)
+
+    def test_ambiguous_lowercase_suffix_does_not_request_glyph_ocr(self):
+        from PIL import Image, ImageDraw, ImageOps
+
+        image = Image.new("RGB", (800, 1200), "white")
+        ImageDraw.Draw(image).rectangle((65, 170, 105, 250), fill="black")
+        with mock.patch.object(rag_pdf_tools, "_ocr_connected_glyph") as glyph:
+            text, evidence = rag_pdf_tools.recover_geometry_aligned_drop_caps(
+                "The unchanged words", image, (0, 0, 1, 1),
+                [{"word": 1, "text": "The", "height": 20, "top": 170, "left": 110}],
+                "unused", ImageOps,
+            )
+        self.assertEqual(text, "The unchanged words")
+        self.assertEqual(evidence["candidate_count"], 1)
+        self.assertTrue(evidence["unresolved"][0]["glyph_ocr_skipped"])
+        glyph.assert_not_called()
+
     def test_three_column_drop_cap_recovery_uses_geometry_not_fuzzy_words(self):
         from PIL import Image, ImageDraw, ImageOps
         from unittest import mock
@@ -18421,6 +18490,128 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertTrue(evidence["recovered"])
         self.assertIn("THE matron picked up", corrected)
         self.assertEqual(evidence["completed_token"], "THE")
+
+    def test_tesseract_tsv_parser_does_not_treat_quote_as_multiline_csv(self):
+        tsv = (
+            "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n"
+            "5\t1\t3\t1\t1\t1\t10\t20\t40\t12\t95.0\t\"cause\n"
+            "5\t1\t3\t1\t1\t2\t55\t20\t30\t12\t94.0\tthey\n"
+        )
+        rows = rag_pdf_tools._parse_tesseract_tsv(tsv)
+        self.assertEqual([row["text"] for row in rows], ['"cause', "they"])
+
+    def test_three_column_block_geometry_repairs_return_to_earlier_column(self):
+        def row(block, line, word, left, top, text):
+            return {
+                "page": 1,
+                "block": block,
+                "paragraph": 1,
+                "line": line,
+                "word": word,
+                "left": left,
+                "top": top,
+                "width": max(12, len(text) * 8),
+                "height": 14,
+                "confidence": 95.0,
+                "text": text,
+            }
+
+        rows = [
+            row(1, 1, 1, 20, 10, "TITLE"),
+            row(3, 1, 1, 20, 100, "What"),
+            row(3, 2, 1, 20, 122, "cops?"),
+            row(4, 1, 1, 75, 100, "about"),
+            row(4, 1, 2, 125, 100, "the"),
+            row(7, 1, 1, 350, 100, "Middle"),
+            row(7, 1, 2, 420, 100, "column"),
+            row(10, 1, 1, 700, 100, "Right"),
+            row(10, 1, 2, 755, 100, "column"),
+        ]
+        text, evidence = rag_pdf_tools.reorder_three_column_ocr_blocks(
+            "TITLE\n\nWhat cops?\n\nMiddle column\n\nabout the\n\nRight column",
+            rows,
+            {
+                "detected": True,
+                "gutters": [
+                    {"x_fraction": .33, "ink_occupancy": 0.0},
+                    {"x_fraction": .66, "ink_occupancy": 0.0},
+                ],
+            },
+            (0.0, 0.0, 1.0, 1.0),
+        )
+        self.assertTrue(evidence["applied"])
+        self.assertIn("What about the\ncops?", text)
+        self.assertLess(text.index("cops?"), text.index("Middle column"))
+        self.assertLess(text.index("Middle column"), text.index("Right column"))
+        self.assertEqual(
+            sorted(re.findall(r"[A-Za-z]+", text.casefold())),
+            sorted(re.findall(
+                r"[A-Za-z]+",
+                "TITLE What cops Middle column about the Right column".casefold(),
+            )),
+        )
+
+    def test_ocr_route_evidence_records_repairs_without_source_text(self):
+        evidence = pipeline.photographed_ocr_route_evidence([{
+            "page": 4,
+            "spread_preprocessing": {"path": "embedded_three_column_document"},
+            "reading_regions": [{
+                "ocr_method": "tesseract_embedded_three_column_document_crop",
+                "column_preprocessing": {
+                    "detected": True,
+                    "reading_order": {"applied": True},
+                    "drop_cap": {
+                        "recovered_count": 2,
+                        "unresolved": [{"reason": "lowercase_suffix_spacing_ambiguous"}],
+                    },
+                },
+            }],
+        }])
+        self.assertEqual(evidence["reading_order_applied_pages"], [4])
+        self.assertEqual(evidence["drop_cap_recovered_pages"], [4])
+        self.assertEqual(evidence["drop_cap_recovered_count"], 2)
+        self.assertEqual(evidence["drop_cap_unresolved_pages"], [4])
+
+    def test_drop_cap_completion_distinguishes_joined_and_standalone_initials(self):
+        self.assertEqual(
+            rag_pdf_tools._geometry_drop_cap_completion(
+                "THE other example HE matron", "T", "HE"
+            ),
+            ("THE", "joined_initial", ""),
+        )
+        self.assertEqual(
+            rag_pdf_tools._geometry_drop_cap_completion(
+                "GOT back and got home", "I", "GOT"
+            ),
+            ("I GOT", "standalone_initial", ""),
+        )
+        self.assertEqual(
+            rag_pdf_tools._geometry_drop_cap_completion(
+                "GOT back", "I", "GOT"
+            )[2],
+            "short_completion_lacks_same_page_lexical_evidence",
+        )
+
+    def test_ocr_page_quality_records_unresolved_drop_cap_without_rewriting(self):
+        original = "na prefatory note to a collection of essays"
+        pages = [{
+            "page": 2,
+            "text": original,
+            "reading_regions": [{
+                "drop_cap_recovery": {
+                    "unresolved": [{
+                        "token": "na",
+                        "glyph": "I",
+                        "reason": "lowercase_suffix_spacing_ambiguous",
+                    }],
+                },
+            }],
+        }]
+        decisions = [{"page": 2, "decision": "ocr_selected"}]
+        quality = pipeline.assess_reconciled_ocr_page_quality(pages, decisions)
+        self.assertEqual(quality[0]["state"], "recovered_with_local_ocr_uncertainty")
+        self.assertEqual(pages[0]["text"], original)
+        self.assertTrue(quality[0]["text_preserved"])
 
     def test_three_column_byline_relocation_changes_order_not_text(self):
         original = (
