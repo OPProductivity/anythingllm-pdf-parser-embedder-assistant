@@ -353,19 +353,20 @@ def run_transport_fault_acceptance(output_root: str | Path) -> dict[str, Any]:
         endpoint = f"http://127.0.0.1:{port}"
         server = None
         if not expected.get("no_server"):
-            server = subprocess.Popen(
-                [
-                    sys.executable, "-m", "reliability_fault_injection",
-                    "--server-worker", "--port", str(port),
-                    "--scenario", scenario, "--journal", str(journal),
-                ],
-                cwd=Path(__file__).resolve().parent,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            _wait_for_server(endpoint)
+            with (scenario_root / "server-stderr.log").open("wb") as stderr_log:
+                server = subprocess.Popen(
+                    [
+                        sys.executable, "-m", "reliability_fault_injection",
+                        "--server-worker", "--port", str(port),
+                        "--scenario", scenario, "--journal", str(journal),
+                    ],
+                    cwd=Path(__file__).resolve().parent,
+                    stdout=subprocess.DEVNULL,
+                    stderr=stderr_log,
+                )
         try:
+            if server is not None:
+                _wait_for_server(endpoint)
             client = subprocess.run(
                 [
                     sys.executable, "-m", "reliability_fault_injection",

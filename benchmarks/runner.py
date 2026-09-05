@@ -427,8 +427,8 @@ def benchmark_status_state(missing_or_stale: list[tuple[str, int]], calibration_
 
 def private_environment_baseline() -> dict[str, Any]:
     try:
-        revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=False).stdout.strip()
-    except OSError:
+        revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=False, timeout=20).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
         revision = "unavailable"
     health = app.anythingllm_observer_api_health(app.DEFAULT_ANYTHINGLLM_API_URL)
     raw = {

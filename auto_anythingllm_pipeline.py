@@ -2061,6 +2061,7 @@ def infer_author_from_text_samples(samples, title_hint=""):
             # Some scanned articles split a compact all-caps byline over the
             # first two visual lines. Only consider that exact position: a
             # wider scan would turn a stacked book title into a person's name.
+            stacked_author = None
             if len(top_lines) >= 2:
                 stacked = normalize_author_candidate(f"{top_lines[0]} {top_lines[1]}")
                 if (
@@ -2072,7 +2073,7 @@ def infer_author_from_text_samples(samples, title_hint=""):
                     # machine-generated filename.
                     and looks_like_person_name(stacked, title_hint="", allow_all_caps=True)
                 ):
-                    return {
+                    stacked_author = {
                         "author": stacked,
                         "source": "text_first_lines_stacked_byline",
                         "page": page,
@@ -2103,6 +2104,11 @@ def infer_author_from_text_samples(samples, title_hint=""):
                         "page": page,
                         "evidence": f"{line} / publication-metadata-nearby",
                     }
+            # An unlabelled stacked name is weaker than the explicit
+            # initial-plus-imprint evidence above. Do not let a recovered
+            # title line short-circuit that stronger author evidence.
+            if stacked_author is not None:
+                return stacked_author
         title_start_index = 0
         title_matched = False
         normalized_title = (

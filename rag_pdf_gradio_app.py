@@ -651,6 +651,10 @@ def acquire_automatic_anythingllm_mutation_lease(owner):
             return {"acquired": True, "owner": requested_owner, "scope": "process-fallback"}
         try:
             kernel32 = ctypes.windll.kernel32
+            kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+            kernel32.CreateMutexW.restype = ctypes.c_void_p
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            kernel32.CloseHandle.restype = ctypes.c_int
             # Keep a handle open rather than taking mutex ownership. A
             # streaming Gradio callback can resume on a different worker
             # thread after yielding; Windows mutex ownership is thread-bound,
@@ -688,7 +692,10 @@ def release_automatic_anythingllm_mutation_lease(expected_owner=None):
             # The lightweight non-Windows fallback is unreachable here, so
             # this is the real Windows kernel handle returned by CreateMutex.
             try:
-                ctypes.windll.kernel32.CloseHandle(handle)
+                close_handle = ctypes.windll.kernel32.CloseHandle
+                close_handle.argtypes = [ctypes.c_void_p]
+                close_handle.restype = ctypes.c_int
+                close_handle(handle)
             except Exception:
                 pass
         return True

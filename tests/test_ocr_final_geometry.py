@@ -81,3 +81,25 @@ def test_display_recovery_never_reocrs_ordinary_prose_or_later_pages():
             result,evidence=tools.recover_missing_display_regions(text,None,None,[{}],'ocr',None,page_number=page)
             assert result==text
         ocr.assert_not_called()
+
+
+def test_lower_spanning_caption_and_its_continuation_follow_column_prose():
+    rows=words()
+    for block,left,top,width,text in [(5,500,1100,300,'CAPTION'),
+                                      (6,540,1150,210,'Poem'),
+                                      (7,620,1200,100,'Signature')]:
+        rows.append(dict(block=block,paragraph=1,line=1,word=1,left=left,
+                         top=top,width=width,height=15,text=text,
+                         crop_width=1000,crop_height=1400))
+    text,evidence=reorder('Left Middle Right End CAPTION Poem Signature',rows)
+    assert evidence['applied']
+    assert evidence['spanning_tail_blocks']
+    assert text.index('Right')<text.index('CAPTION')<text.index('Poem')<text.index('Signature')
+
+
+def test_strong_publisher_author_is_not_shadowed_by_stacked_title():
+    import auto_anythingllm_pipeline as pipeline
+    text='CULTURE\nAS\nHISTORY\nTHE TRANSFORMATION\nOF AMERICAN SOCIETY\nIN THE\nTWENTIETH CENTURY\nWARREN I.SUSMAN\nSMITHSONIAN INSTITUTION PRESS'
+    result=pipeline.recover_author_from_selected_extraction([{'page':1,'text':text}],title_hint='Susman-Twenties')
+    assert result['author']=='WARREN I. SUSMAN'
+    assert result['source']=='selected_extraction_text_compact_caps_byline'

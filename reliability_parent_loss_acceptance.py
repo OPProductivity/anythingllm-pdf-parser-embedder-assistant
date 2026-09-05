@@ -84,14 +84,17 @@ def run_parent_loss_acceptance(
         "--run-root",
         str(run_root),
     ]
-    parent = subprocess.Popen(
-        command,
-        cwd=Path(__file__).resolve().parent,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    # The intentionally surviving worker may inherit stderr. An undrained
+    # pipe can both stall the parent and keep read() waiting after parent death.
+    stderr_path = root / "parent-stderr.log"
+    with stderr_path.open("wb") as stderr_log:
+        parent = subprocess.Popen(
+            command,
+            cwd=Path(__file__).resolve().parent,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr_log,
+        )
     marker = _wait_for_first(
         run_root,
         ".active-preparation-worker.json",
@@ -103,7 +106,9 @@ def run_parent_loss_acceptance(
         except subprocess.TimeoutExpired:
             parent.terminate()
             parent.wait(timeout=10)
-        stderr = parent.stderr.read()[-12000:] if parent.stderr else ""
+        with stderr_path.open("rb") as stderr_log:
+            stderr_log.seek(max(0, stderr_path.stat().st_size - 12000))
+            stderr = stderr_log.read(12000).decode("utf-8", errors="replace")
         report = {
             "schema": SCHEMA,
             "generated_at": datetime.now(UTC).isoformat(),

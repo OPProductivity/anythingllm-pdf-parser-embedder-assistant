@@ -2623,12 +2623,34 @@ def reorder_three_column_ocr_blocks(text, layout_rows, column_evidence, crop_fra
         )
         and (block["bottom"] - block["top"]) / max(crop_height, 1) < .08
     ]
+    # A short lower-page block crossing a gutter is a spanning region, not
+    # part of whichever column happens to contain its centre. Keep its
+    # contained continuation/byline together after the column prose.
+    spanning_tails = [
+        block for block in nonempty if block not in headers
+        and block["top_fraction"] > .70
+        and (block["bottom"] - block["top"]) / max(crop_height, 1) < .20
+        and any(
+            block["left"] < gutter * crop_width - .035 * crop_width
+            and block["right"] > gutter * crop_width + .035 * crop_width
+            for gutter in gutter_positions
+        )
+    ]
     tails = [
         block for block in nonempty
         if block not in headers
-        and block["top_fraction"] > .93
-        and block["column"] != 0
+        and (
+            (block["top_fraction"] > .93 and block["column"] != 0)
+            or block in spanning_tails
+            or any(
+                block["top"] >= caption["bottom"]
+                and block["left"] >= caption["left"]
+                and block["right"] <= caption["right"]
+                for caption in spanning_tails
+            )
+        )
     ]
+    evidence["spanning_tail_blocks"] = [block["block"] for block in spanning_tails]
     body = [block for block in nonempty if block not in headers and block not in tails]
     ordered = (
         sorted(headers, key=lambda block: (block["top"], block["left"]))
