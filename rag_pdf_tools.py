@@ -1828,7 +1828,7 @@ def photographed_page_visual_signal(page, image, image_stat):
     return min(means) < 240 and max(means) - min(means) >= 16
 
 
-def photographed_fold_gutter_fraction(image, image_stat):
+def photographed_fold_gutter_fraction(image, image_stat, *, _stripe_fraction=.012):
     """Locate a strong central fold shadow or clean facing-page gutter.
 
     Some book scans have a dark binding shadow; others have a bright strip of
@@ -1841,7 +1841,7 @@ def photographed_fold_gutter_fraction(image, image_stat):
     if width / max(height, 1) < 1.22:
         return None
     top, bottom = int(height * .12), int(height * .90)
-    stripe_half_width = max(2, int(width * .012))
+    stripe_half_width = max(2, int(width * _stripe_fraction))
 
     def stripe_mean(fraction):
         center = int(width * fraction)
@@ -1895,6 +1895,11 @@ def photographed_fold_gutter_fraction(image, image_stat):
     continuous_grey_shadow = sum(delta >= 7.0 for delta in band_deltas) >= 7
     if continuous_grey_shadow and statistics.median(band_deltas) >= 10.0:
         return round(fraction, 3)
+    # Preserve every established fold decision. Only an unresolved landscape
+    # gets a narrower measurement, with the same contrast/continuity tests.
+    # A thin opening-page binding can be washed out by the wider stripe.
+    if _stripe_fraction == .012:
+        return photographed_fold_gutter_fraction(image, image_stat, _stripe_fraction=.008)
     return None
 
 

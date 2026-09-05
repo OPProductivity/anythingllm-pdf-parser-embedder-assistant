@@ -1225,6 +1225,8 @@ def looks_like_person_name(value, title_hint="", *, allow_all_caps=True):
         return False
     if looks_like_non_person_byline(candidate):
         return False
+    if re.search(r"\b(?:film|feminist|critical)\s+theory\b", lowered):
+        return False
     # These are lexical markers, not arbitrary substrings: ``Fleissner``
     # contains the character sequence ``issn`` and is a perfectly valid
     # surname.  Require a standalone protocol/identifier marker instead.
@@ -1308,6 +1310,10 @@ def extract_adjacent_affiliated_name_pairs(line, title_hint=""):
     """
     raw = normalize_text(line or "")
     if not raw:
+        return []
+    # Citation furniture must be rejected before tokenization removes its
+    # digits and turns "Vol. 50 No. 3" into a person-shaped "Vol. No.".
+    if re.search(r"\b(?:vol\.?\s*\d|pp\.?\s*\d|doi\s*:)", raw, flags=re.I):
         return []
     # A biographical role sentence is not a two-author byline.  Without this
     # narrow branch, ``Kristin Thompson is Honorary Fellow at the University``
@@ -1956,6 +1962,9 @@ def infer_author_from_text_samples(samples, title_hint=""):
             match = re.search(pattern, raw_text, flags=re.I)
             if not match:
                 continue
+            if source == "text_byline" and re.match(r"\s*(?:18|19|20)\d{2}\b", raw_text[match.end():]):
+                # A wrapped "by Name, 2002" is a cited work, not this byline.
+                continue
             if page > 2 and source in {
                 "text_byline",
                 "text_written_by",
@@ -2140,6 +2149,11 @@ def infer_author_from_text_samples(samples, title_hint=""):
         ):
             for candidate_index in range(title_start_index + 1, min(len(top_lines), title_start_index + 5)):
                 line = top_lines[candidate_index]
+                # Some downloaded filenames encode spaces as _20. Decode
+                # only for this wrapped-title exclusion, not as author proof.
+                decoded_title = urllib.parse.unquote(re.sub(r"_([0-9A-Fa-f]{2})", r"%\1", title_hint))
+                if author_phrase_is_title_fragment(line, decoded_title):
+                    continue
                 if line.casefold() in AUTHOR_BLOCK_STOP_HINTS:
                     break
                 candidates = split_author_line_candidates(
@@ -2265,6 +2279,9 @@ def infer_author_from_text_samples(samples, title_hint=""):
         reviewed_work_context = False
         for index, line in enumerate(top_lines):
             if index < title_start_index:
+                continue
+            decoded_title = urllib.parse.unquote(re.sub(r"_([0-9A-Fa-f]{2})", r"%\1", title_hint))
+            if author_phrase_is_title_fragment(line, decoded_title):
                 continue
             lowered = line.casefold().strip()
             if not lowered:
@@ -2651,7 +2668,7 @@ def infer_author_from_strict_credit_blocks(samples, path: Path, title_hint=""):
         raw_text = strip_known_extraction_structure_labels(
             str(sample.get("text") or "").replace("\r\n", "\n").replace("\r", "\n")
         )
-        values = [normalize_text(line) for line in raw_text.splitlines() if normalize_text(line)][:48]
+        values = [normalize_text(line) for line in raw_text.splitlines() if normalize_text(line)][:64]
         if not values:
             continue
 
@@ -2689,7 +2706,10 @@ def infer_author_from_strict_credit_blocks(samples, path: Path, title_hint=""):
 
         matched_window = None
         if len(expected) >= 3:
-            for start in range(min(28, len(values))):
+            # PDF object order can place a visually opening title/byline
+            # after a body column. Keep the same 88% title-match requirement,
+            # but cover that bounded first-page object-order displacement.
+            for start in range(min(56, len(values))):
                 for width in range(1, min(7, len(values) - start + 1)):
                     observed = set(title_tokens(" ".join(values[start:start + width])))
                     matched = sum(token in observed for token in expected)
@@ -2821,6 +2841,21 @@ def structured_filename_surname_evidence(path: Path):
 
 def infer_author_from_samples_or_filename(samples, path: Path, title_hint=""):
     """Apply the established sample rules, then the existing filename fallback."""
+    decoded_stem = urllib.parse.unquote(re.sub(r"_([0-9A-Fa-f]{2})", r"%\1", Path(path).stem))
+    catalog_parts = decoded_stem.split("--")
+    if len(catalog_parts) >= 3:
+        def name_key(value):
+            return " ".join(re.findall(r"[^\W\d_]+", "".join(
+                c for c in unicodedata.normalize("NFKD", value).casefold()
+                if not unicodedata.combining(c)
+            )))
+        for sample in samples:
+            lines = str(sample.get("text") or "").strip().splitlines()
+            first = normalize_author_candidate(lines[0]) if lines else ""
+            if sample.get("page") == 1 and looks_like_person_name(first, allow_all_caps=False):
+                if any(name_key(first) == name_key(part) for part in catalog_parts[1:]):
+                    return {"author": first, "source": "filename_corroborated_text_name", "page": 1,
+                            "evidence": first + " / delimited filename credit"}
     report = infer_author_from_text_samples(samples, title_hint=title_hint)
     if report.get("source") == "text_non_person_byline":
         return report
@@ -3500,7 +3535,8 @@ def ocr_page_evidence_ledger(ocr_pages, reconciliation=None, targeted_pages=None
                 reading_order_rows.append(reading_order)
         decision = decisions.get(page_number) or {}
         in_selected_range = page_number >= start_page and (end_page is None or page_number < end_page)
-        word_count = len(_reconciliation_text_tokens(page.get("text") or ""))
+        word_count = (max(0, int(page["observed_word_count"])) if "observed_word_count" in page
+                      else len(_reconciliation_text_tokens(page.get("text") or "")))
         rows.append({
             "page": page_number,
             "targeted": page_number in targeted,
@@ -4142,6 +4178,8 @@ def retain_successful_run_leanly(
                 summary.get("photographed_ocr_routes") or {}
             ),
             "ocr_page_evidence": dict(summary.get("ocr_page_evidence") or {}),
+            "native_layout_decisions": list(summary.get("native_layout_decisions") or []),
+            "extraction_decision": dict(summary.get("extraction_decision") or {}),
             # The detailed review artifact is intentionally pruned for a
             # lean success, so retain just the non-content integrity facts.
             # This keeps a warning durable without retaining OCR previews or
@@ -4939,6 +4977,7 @@ def _layout_marginal_annotation_plan(rows, width, height):
     left_bound = max(0.0, left - width * .018)
     right_bound = min(width, right + width * .018)
     outside_candidates = []
+    outside_prose = 0
     candidates = set()
     bands = set()
     for row_index, row in enumerate(rows):
@@ -4953,13 +4992,20 @@ def _layout_marginal_annotation_plan(rows, width, height):
             symbol_count = len(re.findall(r"[^A-Za-zÀ-ÖØ-öø-ÿ0-9\s-]", text))
             annotation_like = (
                 alpha == 0
-                or symbol_count >= 2
-                or "hiddenhorzocr" in str(span.get("font") or "").casefold()
+                or (symbol_count >= 2 and alpha / max(len(text), 1) < .55)
             )
+            # An OCR font identifies the text layer, not handwriting. Printed
+            # marginal references can use that same font and punctuation.
+            if outside and alpha >= 10 and len(text.split()) >= 2:
+                outside_prose += 1
             if outside and annotation_like:
                 outside_candidates.append((row_index, span_index))
                 candidates.add((row_index, span_index))
                 bands.add(min(7, max(0, int(span["y0"] / max(height, 1) * 8))))
+    if outside_prose >= 4:
+        return {"applied": False, "reason": "readable_margin_content_preserved",
+                "body_bounds": [round(left_bound, 2), round(right_bound, 2)],
+                "outside_prose_span_count": outside_prose}
     # Multiple bands prevent a real page number, a single sidebar, or a header
     # from triggering content deletion. The outside pieces are only removed
     # after this document/page-local confirmation succeeds.
@@ -5175,6 +5221,35 @@ def _layout_reading_order(rows, width, height):
     return sorted(rows, key=lambda row: (row["y0"], row["x0"])), "visual_line_order", None
 
 
+def _layout_has_scan_background(pdf_path, page_number):
+    """Margin handwriting recovery requires an actual page-sized raster."""
+    with fitz.open(pdf_path) as document:
+        page = document.load_page(page_number - 1)
+        area = max(page.rect.get_area(), 1)
+        return any(
+            (fitz.Rect(info["bbox"]) & page.rect).get_area() >= area * .65
+            for info in page.get_image_info()
+        )
+
+
+def native_layout_ocr_page_evidence(layout_evidence, *, start_page=1, end_page=None):
+    observed, decisions = [], []
+    for row in (layout_evidence or {}).get("pages", []):
+        evidence = (row.get("outer_margin_annotation") or {}).get("body_reocr") or {}
+        if not evidence.get("attempted"):
+            continue
+        number = row["pdf_page"]
+        observed.append({"page": number, "observed_word_count": evidence.get("word_count", 0)})
+        decisions.append({"page": number, "decision": "ocr_selected_native_body" if evidence.get("selected") else "native_retained"})
+    ledger = ocr_page_evidence_ledger(observed, {"pages": decisions},
+                                    [row["page"] for row in observed],
+                                    start_page=start_page, end_page=end_page)
+    for row in ledger["pages"]:
+        row["ocr_methods"] = ["tesseract_confirmed_native_body_crop"]
+        row["selected_route"] = "native_body_margin_recovery"
+    return ledger
+
+
 def apply_region_aware_native_layout(pdf_path, pages, progress_callback=None):
     """Create conservative semantic text from positioned native PDF lines.
 
@@ -5244,8 +5319,11 @@ def apply_region_aware_native_layout(pdf_path, pages, progress_callback=None):
         annotation_plan = _layout_marginal_annotation_plan(
             layout["rows"], layout["width"], layout_height
         )
+        if (annotation_plan.get("applied") or annotation_plan.get("reason") == "readable_margin_content_preserved") and not _layout_has_scan_background(pdf_path, page_number):
+            annotation_plan = {"applied": False, "reason": "no_page_sized_scan_background"}
         annotation_candidates = annotation_plan.pop("candidate_spans", set())
         body_reocr_text = ""
+        candidate_text = ""
         if annotation_plan.get("applied"):
             if progress_callback:
                 progress_callback(page_number, page_total, "targeted_ocr_started")
@@ -5264,6 +5342,7 @@ def apply_region_aware_native_layout(pdf_path, pages, progress_callback=None):
             # because a margin was detected.
             if (
                 len(candidate_text) >= 800
+                and _layout_text_noise_score(raw_text) > 0
                 and _layout_alpha_count(candidate_text) >= _layout_alpha_count(raw_text) * .70
                 and _layout_text_noise_score(candidate_text) <= _layout_text_noise_score(raw_text) * .65
             ):
@@ -5340,7 +5419,8 @@ def apply_region_aware_native_layout(pdf_path, pages, progress_callback=None):
 
         def small_lower_rows(row):
             return (
-                row["y0"] >= layout_height * 0.78
+                annotation_plan.get("reason") != "readable_margin_content_preserved"
+                and row["y0"] >= layout_height * 0.78
                 and body_text_size
                 and row["font_sizes"]
                 and max(row["font_sizes"]) <= body_text_size - 1.5
@@ -5376,18 +5456,30 @@ def apply_region_aware_native_layout(pdf_path, pages, progress_callback=None):
         ordered, reading_order, reading_regions = _layout_reading_order(
             retained, layout["width"], layout["height"]
         )
+        if annotation_plan.get("reason") == "readable_margin_content_preserved":
+            left_bound, right_bound = annotation_plan["body_bounds"]
+            margin = [row for row in retained if row["x1"] < left_bound or row["x0"] > right_bound]
+            body = [row for row in retained if row not in margin]
+            ordered = sorted(body, key=lambda row: (row["y0"], row["x0"]))
+            ordered += sorted(margin, key=lambda row: (row["x0"] >= right_bound, row["y0"]))
+            reading_order, reading_regions = "body_then_preserved_margin_notes", None
         semantic_text = "\n".join(row["text"].rstrip() for row in ordered).strip()
         if body_reocr_text:
             semantic_text = body_reocr_text
             reading_order = "reocr_confirmed_annotated_body"
             annotation_plan["body_reocr"] = {
+                "attempted": True,
+                "word_count": len(candidate_text.split()),
                 "selected": True,
                 "method": "tesseract_confirmed_native_body_crop",
                 "raw_noise_score": _layout_text_noise_score(page_info.get("text", "")),
                 "reocr_noise_score": _layout_text_noise_score(body_reocr_text),
             }
         else:
-            annotation_plan["body_reocr"] = {"selected": False}
+            annotation_plan["body_reocr"] = {
+                "selected": False, "attempted": bool(annotation_plan.get("applied")),
+                "word_count": len(candidate_text.split()),
+            }
         transformed.append({
             **page_info,
             "raw_text": page_info.get("text", ""),
@@ -7306,6 +7398,31 @@ def has_complete_native_text_candidate(candidates, pdf_page_count, ocr_preflight
         ):
             return True
     return False
+
+
+def extraction_candidate_decision_metrics(candidate):
+    """Compact observations only; never used to choose or skip an extractor."""
+    quality = candidate.get("quality") or {}
+    return {
+        "backend": candidate.get("backend"),
+        "failed": bool(candidate.get("error")),
+        "has_segments": bool(candidate.get("segments")),
+        "score": candidate.get("score"),
+        "score_reasons": list(candidate.get("score_reasons") or []),
+        "elapsed_seconds": candidate.get("comparison_elapsed_seconds"),
+        "selected_start_page": candidate.get("start_page"),
+        "selected_end_page_exclusive": candidate.get("end_page"),
+        "outline_validation": dict(candidate.get("outline_validation") or {}),
+        "native_chunk_status": (candidate.get("native_chunk_eval") or {}).get("status"),
+        "quality": {key: quality.get(key) for key in (
+            "included_pages", "empty_pages", "included_words", "average_words_per_page",
+            "scanned_likelihood", "text_integrity_status", "replacement_chars",
+            "ocr_layout_artifact_ratio", "duplicate_pages",
+            "image_heavy_low_text_pages", "fragmented_page_count",
+            "fragmented_single_letter_token_ratio", "fragmented_cluster_token_ratio",
+            "text_integrity_interpretation",
+        )},
+    }
 
 
 def is_reliable_structure_reference(quality, pdf_page_count):
@@ -23364,6 +23481,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     auto_unstructured_reasons = []
     auto_unstructured_suppressed_reasons = []
     automatic_candidate_shortcuts = []
+    extraction_attempt_decisions = []
     automatic_targeted_ocr_pages = []
     shared_boundary_reference = None
     ocr_processing_seconds = 0.0
@@ -23385,6 +23503,11 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             and not bool(args.deep_extraction)
             and (complete_native_candidate or targeted_visual_text_recovery)
         ):
+            extraction_attempt_decisions.append({
+                "backend": backend, "action": "skipped",
+                "complete_native_candidate": complete_native_candidate,
+                "targeted_visual_text_recovery": targeted_visual_text_recovery,
+            })
             # PyMuPDF4LLM's layout path can re-run Tesseract on every image
             # page even when the preceding native candidate already has
             # complete text and page-level provenance. Keep the explicit and
@@ -23449,6 +23572,23 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 else ""
             )
         )
+        extraction_attempt_decisions.append({
+            "backend": backend, "action": "run", "backend_mode": backend_mode,
+            "deep_extraction": bool(args.deep_extraction),
+            "complete_native_candidate": complete_native_candidate,
+            "targeted_visual_text_recovery": targeted_visual_text_recovery,
+            "unstructured_reasons": list(auto_unstructured_reasons) if backend == "unstructured" else [],
+            "strategy": active_unstructured["resolved"] if backend == "unstructured" else None,
+            "prior_candidates": [extraction_candidate_decision_metrics(c) for c in candidates],
+        })
+        if candidates and backend_mode == "automatic":
+            reason = ("; ".join(auto_unstructured_reasons[:2]).replace("_", " ")
+                      if backend == "unstructured" and auto_unstructured_reasons
+                      else "deep extraction requested" if args.deep_extraction
+                      else "whole-PDF native completeness not established")
+            earlier_state = ("earlier candidate retained" if any(c.get("segments") for c in candidates)
+                             else "earlier extraction produced no usable candidate")
+            extraction_label += f" — quality comparison ({reason}); {earlier_state}"
         known_pages = max(1, int(pdf_meta.get("pdf_page_count") or 0))
         extraction_total = max(1, known_pages * max(1, len(backend_names)))
         report_upload_phase(
@@ -23463,6 +23603,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         candidate_dir.mkdir(parents=True, exist_ok=True)
         unstructured_circuit = getattr(args, "unstructured_circuit_breaker", None)
         if backend == "unstructured" and isinstance(unstructured_circuit, dict) and unstructured_circuit.get("blocked"):
+            extraction_attempt_decisions[-1]["action"] = "blocked_by_existing_circuit"
             candidates.append(
                 {
                     "backend": backend,
@@ -23714,6 +23855,10 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                     start_page=start_page, end_page=end_page,
                 )
                 write_json(candidate_dir / "native-ocr-reconciliation.json", native_ocr_reconciliation)
+            elif backend == "pymupdf":
+                native_ocr_reconciliation["ocr_page_evidence"] = native_layout_ocr_page_evidence(
+                    layout_evidence, start_page=start_page, end_page=end_page,
+                )
             boundary_reconciled = bool(
                 boundary_reference_backend != backend
                 and (
@@ -24067,6 +24212,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             )
         backend_elapsed_seconds = time.perf_counter() - backend_started
         candidate = candidates[-1]
+        candidate["comparison_elapsed_seconds"] = round(backend_elapsed_seconds, 3)
         candidate_ocr_seconds = 0.0
         candidate_ocr_cache_pages = 0
         if backend == "pymupdf":
@@ -24310,6 +24456,8 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     selected["post_extraction_author_recovery"] = dict(post_extraction_author_recovery)
     profile["post_extraction_author_recovery"] = dict(post_extraction_author_recovery)
     selection_stage = f"Selected {selected['backend']} and writing output variants"
+    if len(viable) > 1:
+        selection_stage += f" — compared {len(viable)} extractors; selected by quality policy"
     if ocr_evidence["used"]:
         selection_stage += " — OCR-assisted extraction observed"
     report_upload_phase(
@@ -27003,7 +27151,24 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         "avg_content_chars": selected.get("marker_stats", {}).get("avg_content_chars"),
         "outline_reliability": selected.get("outline_validation", {}).get("reliability"),
         "layout_region_status": (selected.get("layout_evidence") or {}).get("status", "not_applied"),
+        "extraction_decision": {
+            "schema_version": 1,
+            "purpose": "observational_only_no_selection_policy_change",
+            "pdf_page_count": profile.get("pdf_page_count"),
+            "attempts": extraction_attempt_decisions,
+            "candidates": [extraction_candidate_decision_metrics(c) for c in candidates],
+            "selected_backend": selected["backend"],
+            "selection_basis": "targeted_ocr_recovery_override" if automatic_targeted_ocr_selection["applied"] else "highest_score_stable_backend_order",
+            "targeted_ocr_selection": automatic_targeted_ocr_selection,
+            "unstructured_suppressed_reasons": auto_unstructured_suppressed_reasons,
+        },
         "layout_removed_marginalia_count": (selected.get("layout_evidence") or {}).get("removed_marginalia_count", 0),
+        "native_layout_decisions": [
+            {"page": row.get("pdf_page"), "margin_decision": row.get("outer_margin_annotation")}
+            for row in (selected.get("layout_evidence") or {}).get("pages", [])
+            if (row.get("outer_margin_annotation") or {}).get("applied")
+            or (row.get("outer_margin_annotation") or {}).get("reason") == "readable_margin_content_preserved"
+        ],
         "photographed_ocr_routes": dict(
             (selected.get("layout_evidence") or {}).get("photographed_ocr_routes") or {}
         ),

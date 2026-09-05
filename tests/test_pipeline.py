@@ -15694,7 +15694,7 @@ class PipelineCoreTests(unittest.TestCase):
                     "body_bounds": [50.0, 560.0],
                     "candidate_spans": set(),
                 },
-            ), mock.patch.object(
+            ), mock.patch.object(pipeline, "_layout_has_scan_background", return_value=True), mock.patch.object(
                 pipeline,
                 "_reocr_confirmed_native_body_region",
                 return_value="",
@@ -15829,6 +15829,11 @@ class PipelineCoreTests(unittest.TestCase):
             document = pipeline.fitz.open()
             for page_number in range(1, 3):
                 page = document.new_page(width=612, height=792)
+                # Model a scan with a searchable text layer, not born-digital
+                # prose: the annotation-recovery path requires this evidence.
+                scan = pipeline.fitz.Pixmap(pipeline.fitz.csRGB, pipeline.fitz.IRect(0, 0, 612, 792), False)
+                scan.clear_with(255)
+                page.insert_image(page.rect, pixmap=scan)
                 for line_number in range(12):
                     y = 100 + line_number * 32
                     page.insert_text(
