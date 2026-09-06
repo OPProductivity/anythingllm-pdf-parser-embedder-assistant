@@ -77,6 +77,7 @@ from embedder_capabilities import (
 )
 
 from auto_anythingllm_pipeline import (
+    _api_urlopen,
     summarize_ocr_run_evidence,
     AUTOMATIC_UPLOAD_PHASE_RANGES,
     ANYTHINGLLM_EMBEDDING_RECONCILIATION_STALL_SECONDS,
@@ -5009,7 +5010,7 @@ def api_headers(api_key):
 
 def api_get_json(api_url, path, api_key, timeout=20):
     req = urllib.request.Request(api_url.rstrip("/") + path, headers=api_headers(api_key))
-    with urllib.request.urlopen(req, timeout=timeout) as response:
+    with _api_urlopen(req, timeout=timeout) as response:
         return response.status, json.loads(response.read().decode("utf-8", errors="replace"))
 
 
@@ -9444,7 +9445,7 @@ def request_desktop_workspace_refresh(timeout_seconds=6.0):
         data=b"",
     )
     try:
-        with urllib.request.urlopen(request, timeout=max(0.1, float(timeout_seconds))) as response:
+        with _api_urlopen(request, timeout=max(0.1, float(timeout_seconds))) as response:
             payload = json.loads(response.read().decode("utf-8") or "{}")
         if int(getattr(response, "status", 0) or 0) == 202 and payload.get("ok"):
             report = dict(descriptor, status="refreshed", refresh_response=payload)

@@ -49,6 +49,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from portable_paths import application_paths
+from authenticated_http import AuthenticatedRedirectError, RejectAuthenticatedRedirects
 from anythingllm_persistence import AnythingLLMPersistenceAdapter
 from typing import Any, cast
 
@@ -10592,7 +10593,7 @@ def get_openrouter_embedding_response(texts, adapter):
         headers=headers,
     )
     started = time.time()
-    with urllib.request.urlopen(req, timeout=int(normalized.get("timeout_seconds") or DEFAULT_OPENROUTER_TIMEOUT_SECONDS)) as response:
+    with _api_urlopen(req, timeout=int(normalized.get("timeout_seconds") or DEFAULT_OPENROUTER_TIMEOUT_SECONDS)) as response:
         data = json.loads(response.read().decode("utf-8", errors="replace"))
     elapsed_ms = int((time.time() - started) * 1000)
     vectors = data.get("embeddings")
@@ -11904,13 +11905,21 @@ def default_short_label(title, author):
     return title_words[0] if title_words else "PDF"
 
 
+def _api_urlopen(request, timeout):
+    # Keep this policy local, leaving unauthenticated HTTP and the owned queue
+    # socket transport unchanged. Authenticated endpoints must not redirect.
+    if request.has_header("Authorization") or request.has_header("X-anythingllm-pdf-prep-bridge"):
+        return urllib.request.build_opener(RejectAuthenticatedRedirects()).open(request, timeout=timeout)
+    return urllib.request.urlopen(request, timeout=timeout)
+
+
 def post_json(url, body, api_key=None, timeout: float = ANYTHINGLLM_HTTP_RESPONSE_TIMEOUT_SECONDS):
     data = json.dumps(body).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(url, data=data, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as response:
+    with _api_urlopen(req, timeout=timeout) as response:
         return response.status, response.read().decode("utf-8", errors="replace")
 
 
@@ -12995,7 +13004,7 @@ def listen_for_anythingllm_embed_progress(
         request = urllib.request.Request(endpoint_candidates[endpoint_index], headers=headers)
         payload_lines = []
         try:
-            with urllib.request.urlopen(request, timeout=5) as response:
+            with _api_urlopen(request, timeout=5) as response:
                 failures = 0
                 connected_once = True
                 if callable(state_callback):
@@ -13049,6 +13058,12 @@ def listen_for_anythingllm_embed_progress(
                 if not connected_once:
                     failures += 1
                 stop_event.wait(0.75 if connected_once else min(5.0, 0.25 * (2 ** min(failures, 4))))
+        except AuthenticatedRedirectError as exc:
+            if callable(state_callback):
+                state_callback("unavailable", {"at_monotonic": time.monotonic(), "reason": str(exc.reason), "failures": 1})
+            if callable(error_callback):
+                error_callback(str(exc.reason), 1)
+            return
         except urllib.error.HTTPError as exc:
             if exc.code == 404 and endpoint_index + 1 < len(endpoint_candidates):
                 endpoint_index += 1
@@ -13329,7 +13344,7 @@ def post_multipart_form(
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(url, data=bytes(body), headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as response:
+    with _api_urlopen(req, timeout=timeout) as response:
         return response.status, response.read().decode("utf-8", errors="replace")
 
 
@@ -13338,7 +13353,7 @@ def get_json(url, api_key=None, timeout: float = 30.0):
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as response:
+    with _api_urlopen(req, timeout=timeout) as response:
         return response.status, response.read().decode("utf-8", errors="replace")
 
 
@@ -13360,7 +13375,7 @@ def get_json_with_retry(url, api_key=None, timeout: float = 5.0, max_attempts=3,
         except urllib.error.HTTPError as exc:
             status = int(exc.code)
             try:
-                body = exc.read().decode("utf-8", errors="replace")
+                body = str(exc.reason) if isinstance(exc, AuthenticatedRedirectError) else exc.read().decode("utf-8", errors="replace")
             finally:
                 exc.close()
             retry_after = exc.headers.get("Retry-After") if exc.headers else None
@@ -13388,7 +13403,7 @@ def delete_json(url, api_key=None, timeout=30, body=None):
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(url, data=data, headers=headers, method="DELETE")
-    with urllib.request.urlopen(req, timeout=timeout) as response:
+    with _api_urlopen(req, timeout=timeout) as response:
         return response.status, response.read().decode("utf-8", errors="replace")
 
 
@@ -20844,6 +20859,11 @@ def post_json_captured(url, body, api_key=None, timeout_label="request", timeout
             "http_status": status,
             "data": data,
             "error": "",
+            "elapsed_seconds": round(time.perf_counter() - started, 3),
+        }
+    except AuthenticatedRedirectError as exc:
+        return {
+            "http_status": exc.code, "data": {}, "error": str(exc.reason),
             "elapsed_seconds": round(time.perf_counter() - started, 3),
         }
     except urllib.error.HTTPError as exc:

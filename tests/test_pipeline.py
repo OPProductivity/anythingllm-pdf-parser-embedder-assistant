@@ -1926,7 +1926,7 @@ class PipelineCoreTests(unittest.TestCase):
                 return b'{"ok": true, "action": "refresh-workspaces"}'
 
         original_descriptor_path = app.desktop_refresh_bridge_descriptor_path
-        original_urlopen = app.urllib.request.urlopen
+        original_urlopen = app._api_urlopen
         observed = {}
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
@@ -1947,7 +1947,7 @@ class PipelineCoreTests(unittest.TestCase):
                     observed["timeout"] = timeout
                     return FakeResponse()
 
-                app.urllib.request.urlopen = fake_urlopen
+                app._api_urlopen = fake_urlopen
                 result = app.request_desktop_workspace_refresh(timeout_seconds=0.25)
 
             self.assertEqual(result["status"], "refreshed")
@@ -1959,13 +1959,13 @@ class PipelineCoreTests(unittest.TestCase):
             self.assertIn("active AnythingLLM Desktop workspace sidebar", app.desktop_workspace_refresh_note(result))
         finally:
             app.desktop_refresh_bridge_descriptor_path = original_descriptor_path
-            app.urllib.request.urlopen = original_urlopen
+            app._api_urlopen = original_urlopen
 
     def test_outdated_desktop_draft_guard_is_fail_closed_before_http_request(self):
         import rag_pdf_gradio_app as app
 
         original_descriptor_path = app.desktop_refresh_bridge_descriptor_path
-        original_urlopen = app.urllib.request.urlopen
+        original_urlopen = app._api_urlopen
         called = []
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
@@ -1977,20 +1977,20 @@ class PipelineCoreTests(unittest.TestCase):
                     "token": "x" * 43,
                 }), encoding="utf-8")
                 app.desktop_refresh_bridge_descriptor_path = lambda: descriptor
-                app.urllib.request.urlopen = lambda *args, **kwargs: called.append(True)
+                app._api_urlopen = lambda *args, **kwargs: called.append(True)
                 result = app.request_desktop_workspace_refresh()
             self.assertEqual(result["status"], "draft_guard_outdated")
             self.assertEqual(called, [])
             self.assertIn("outdated", app.desktop_workspace_refresh_note(result))
         finally:
             app.desktop_refresh_bridge_descriptor_path = original_descriptor_path
-            app.urllib.request.urlopen = original_urlopen
+            app._api_urlopen = original_urlopen
 
     def test_desktop_refresh_descriptor_rejects_non_capability_tokens_before_http_request(self):
         import rag_pdf_gradio_app as app
 
         original_descriptor_path = app.desktop_refresh_bridge_descriptor_path
-        original_urlopen = app.urllib.request.urlopen
+        original_urlopen = app._api_urlopen
         called = []
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
@@ -2004,21 +2004,21 @@ class PipelineCoreTests(unittest.TestCase):
                     "token": "!" * 43,
                 }), encoding="utf-8")
                 app.desktop_refresh_bridge_descriptor_path = lambda: descriptor
-                app.urllib.request.urlopen = lambda *args, **kwargs: called.append(True)
+                app._api_urlopen = lambda *args, **kwargs: called.append(True)
                 result = app.request_desktop_workspace_refresh()
 
             self.assertEqual(result["status"], "invalid_descriptor")
             self.assertEqual(called, [])
         finally:
             app.desktop_refresh_bridge_descriptor_path = original_descriptor_path
-            app.urllib.request.urlopen = original_urlopen
+            app._api_urlopen = original_urlopen
 
     def test_stale_desktop_bridge_descriptor_never_opens_a_loopback_connection(self):
         import rag_pdf_gradio_app as app
 
         original_descriptor_path = app.desktop_refresh_bridge_descriptor_path
         original_process_live = app.desktop_bridge_process_is_live
-        original_urlopen = app.urllib.request.urlopen
+        original_urlopen = app._api_urlopen
         called = []
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
@@ -2033,7 +2033,7 @@ class PipelineCoreTests(unittest.TestCase):
                 }), encoding="utf-8")
                 app.desktop_refresh_bridge_descriptor_path = lambda: descriptor
                 app.desktop_bridge_process_is_live = lambda _pid: False
-                app.urllib.request.urlopen = lambda *args, **kwargs: called.append(True)
+                app._api_urlopen = lambda *args, **kwargs: called.append(True)
                 result = app.request_desktop_workspace_refresh()
 
             self.assertEqual(result["status"], "not_installed_or_not_running")
@@ -2042,13 +2042,13 @@ class PipelineCoreTests(unittest.TestCase):
         finally:
             app.desktop_refresh_bridge_descriptor_path = original_descriptor_path
             app.desktop_bridge_process_is_live = original_process_live
-            app.urllib.request.urlopen = original_urlopen
+            app._api_urlopen = original_urlopen
 
     def test_desktop_bridge_draft_rejection_is_reported_without_retrying(self):
         import rag_pdf_gradio_app as app
 
         original_descriptor_path = app.desktop_refresh_bridge_descriptor_path
-        original_urlopen = app.urllib.request.urlopen
+        original_urlopen = app._api_urlopen
         calls = []
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
@@ -2072,7 +2072,7 @@ class PipelineCoreTests(unittest.TestCase):
                         io.BytesIO(b'{"ok": false, "error": "unsent_draft_detected"}'),
                     )
 
-                app.urllib.request.urlopen = deferred
+                app._api_urlopen = deferred
                 result = app.request_desktop_workspace_refresh()
 
             self.assertEqual(result["status"], "draft_protected")
@@ -2080,7 +2080,7 @@ class PipelineCoreTests(unittest.TestCase):
             self.assertIn("unsent draft text", app.desktop_workspace_refresh_note(result))
         finally:
             app.desktop_refresh_bridge_descriptor_path = original_descriptor_path
-            app.urllib.request.urlopen = original_urlopen
+            app._api_urlopen = original_urlopen
 
     def test_bridge_installer_uses_broad_fail_closed_draft_detection_before_refresh_event(self):
         source = (PROJECT_ROOT / "Install-AnythingLLMDesktopRefreshBridge.ps1").read_text(encoding="utf-8")
@@ -16787,7 +16787,7 @@ class PipelineCoreTests(unittest.TestCase):
                         {"data": [{"embedding": [0.1, 0.2]}, {"embedding": [0.3, 0.4]}]}
                     ).encode("utf-8")
 
-            original_urlopen = pipeline.urllib.request.urlopen
+            original_urlopen = pipeline._api_urlopen
             try:
                 def fake_urlopen(req, timeout=0):
                     captured["url"] = req.full_url
@@ -16796,10 +16796,10 @@ class PipelineCoreTests(unittest.TestCase):
                     captured["body"] = json.loads(req.data.decode("utf-8"))
                     return FakeResponse()
 
-                pipeline.urllib.request.urlopen = fake_urlopen
+                pipeline._api_urlopen = fake_urlopen
                 vectors = pipeline.get_openrouter_embeddings(["alpha", "beta"], adapter)
             finally:
-                pipeline.urllib.request.urlopen = original_urlopen
+                pipeline._api_urlopen = original_urlopen
             self.assertEqual(vectors, [[0.1, 0.2], [0.3, 0.4]])
             self.assertEqual(captured["url"], pipeline.DEFAULT_OPENROUTER_EMBEDDINGS_URL)
             self.assertEqual(captured["headers"]["Content-type"], "application/json")

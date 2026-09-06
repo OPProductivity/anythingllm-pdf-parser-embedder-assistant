@@ -22,6 +22,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from portable_paths import application_paths, ensure_application_directories, package_resource_path
+from authenticated_http import RejectAuthenticatedRedirects
 
 
 def _notify_browser_stop(record, event):
@@ -34,7 +35,7 @@ def _notify_browser_stop(record, event):
         data=b"", method="POST", headers={"X-Assistant-Stop-Token": token},
     )
     try:
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), RejectAuthenticatedRedirects())
         with opener.open(request, timeout=0.8):
             pass
     except (OSError, urllib.error.URLError):

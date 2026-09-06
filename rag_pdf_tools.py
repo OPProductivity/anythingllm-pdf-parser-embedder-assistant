@@ -823,7 +823,8 @@ def _pymupdf4llm_retry_without_invalid_page_annotations(
         page_path = Path(temp_dir) / "sanitized-source.pdf"
         removed = []
         with fitz.open(pdf_path_text) as source:
-            for source_page_index, copied_page in enumerate(source):
+            for source_page_index in range(source.page_count):
+                copied_page = source[source_page_index]
                 for annotation in list(copied_page.annots() or []):
                     rect = annotation.rect
                     values = (rect.x0, rect.y0, rect.x1, rect.y1)
@@ -2326,7 +2327,7 @@ def recover_opening_three_column_drop_cap(
         return str(text or ""), {"recovered": False, "reason": "component_runtime_unavailable"}
     gray = np.array(image_ops.grayscale(image))
     mask = (gray < 140).astype("uint8")
-    _count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, 8)
+    _count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
     height, width = gray.shape[:2]
     candidates = []
     for x, y, component_width, component_height, area in stats[1:]:
@@ -3011,7 +3012,7 @@ def recover_geometry_aligned_drop_caps(
     cropped = image_ops.autocontrast(image.crop(crop_box).convert("L"))
     gray = np.array(cropped)
     mask = (gray < 140).astype("uint8")
-    _count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, 8)
+    _count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
     components = stats[1:]
     component_x, component_y, component_w, component_h, component_area = components.T
     content = str(text or "")
@@ -3188,13 +3189,13 @@ def recover_missing_display_regions(text, image, fraction, rows, tesseract, imag
         for value, dimension in zip(fraction, (width, height, width, height))
     )).convert("L")
     mask = (np.asarray(crop) < 160).astype("uint8")
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     valid = np.zeros(count, dtype=bool)
     for index, (x, y, component_width, component_height, area) in enumerate(stats):
         if (index and area >= 20 and component_width >= 3 and component_height >= 8
                 and x > crop.width * .025 and x + component_width < crop.width * .975):
             valid[index] = True
-    ink = valid[labels]
+    ink = valid[np.asarray(labels, dtype=np.int32)]
     active = np.count_nonzero(ink, axis=1) >= 8
     starts = np.flatnonzero(active & ~np.r_[False, active[:-1]])
     ends = np.flatnonzero(active & ~np.r_[active[1:], False]) + 1
