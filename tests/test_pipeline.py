@@ -3821,6 +3821,7 @@ class PipelineCoreTests(unittest.TestCase):
                 summary,
                 {"source_file": "C:/Example.pdf", "filename": "Example.pdf", "pdf_page_count": 2},
                 parsed,
+                preexisting_children=(),  # All artifacts in this fixture belong to this run.
                 segments=(
                     {"pdf_page": 1, "text": "First page, first chunk."},
                     {"pdf_page": 1, "text": "First page, second chunk."},
@@ -4110,6 +4111,7 @@ class PipelineCoreTests(unittest.TestCase):
                     "source_sha256": "a" * 64,
                 },
                 parsed,
+                preexisting_children=(),  # No user-owned files in this export fixture.
                 segments=(
                     {"pdf_page": 1, "text": "First segment."},
                     {"pdf_page": 1, "text": "Second segment."},
@@ -9676,7 +9678,7 @@ class PipelineCoreTests(unittest.TestCase):
         import rag_pdf_gradio_app as app
 
         self.assertRegex(app.APP_VERSION, r"^\d+\.\d+\.\d+$")
-        self.assertEqual(app.APP_VERSION, "0.5.2")
+        self.assertEqual(app.APP_VERSION, (Path(app.__file__).parent / "VERSION").read_text().strip())
         self.assertEqual(app.APP_BASE_COMMIT, "portable-package")
         self.assertIn('window.matchMedia("(prefers-color-scheme: dark)")', app.APP_JS)
         self.assertIn('systemThemeQuery.addEventListener("change", applySystemTheme)', app.APP_JS)

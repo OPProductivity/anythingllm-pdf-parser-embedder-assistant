@@ -35,9 +35,10 @@ def _read_env_lines(path):
 
 
 def _env_value(text, key):
-    match = re.search(rf"^\s*{re.escape(key)}\s*=\s*(.*)$", text, re.MULTILINE)
-    if not match:
+    matches = list(re.finditer(rf"^\s*{re.escape(key)}\s*=\s*(.*)$", text, re.MULTILINE))
+    if not matches:
         return None
+    match = matches[-1]
     value = match.group(1).strip()
     if len(value) >= 2 and value[0] == "'" and value[-1] == "'":
         return value[1:-1]
@@ -248,7 +249,7 @@ class AnythingLLMPersistenceAdapter:
                 replacement = _environment_assignment_line(key, value)
                 pattern = re.compile(rf"^\s*{re.escape(key)}\s*=.*$", re.MULTILINE)
                 updated = (
-                    pattern.sub(lambda _match: replacement, updated, count=1)
+                    pattern.sub(lambda _match: replacement, updated)
                     if pattern.search(updated)
                     else updated.rstrip() + "\n" + replacement + "\n"
                 )

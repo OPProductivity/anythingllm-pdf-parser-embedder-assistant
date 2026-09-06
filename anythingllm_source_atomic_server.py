@@ -60,6 +60,7 @@ let{SystemSettings:S}=x(),l=P().getEmbeddingEngineSelection(),T=Xt().TextSplitte
   C=await S.getValueOrFallback({label:"text_splitter_chunk_overlap"},20),B=Math.min(64,Math.max(1,Number.parseInt(process.env.SOURCE_ATOMIC_EMBED_BATCH_SIZE||"__SOURCE_ATOMIC_DEFAULT_PROVIDER_BATCH_SIZE__",10)||__SOURCE_ATOMIC_DEFAULT_PROVIDER_BATCH_SIZE__));
 let __sourceAtomicEmit=(event)=>o(s.slug,event);
 __SOURCE_ATOMIC_PROVIDER_POLICY_HELPER__
+let sourceCommitAborted=false;
 for(let [N,R]of d){
   let A=Date.now(),H=R[0]?.filename||"";
   o(s.slug,{type:"source_staging_started",workspaceSlug:s.slug,sourceKey:N,filename:H,recordCount:R.length,provider_batch_size:B,concurrency:1,patchId:"__SOURCE_ATOMIC_SERVER_PATCH_ID__"});
@@ -96,9 +97,16 @@ for(let [N,R]of d){
   for(let G of V){
     let W=G.record,X=o8(),{pageContent:Y,...J}=W.raw,K={docId:X,filename:W.filename.split(/[/\\]/).pop(),docpath:W.filename,workspaceId:s.id,metadata:JSON.stringify(J)};
     o(s.slug,{type:"doc_starting",...W.progress}),global.__embeddingProgress={workspaceSlug:s.slug,filename:W.filename,userId:t};
-    let{vectorized:L,error:M}=await r.addDocumentToNamespace(s.slug,{...W.raw,docId:X},W.filename);
-    if(!L){i.push(J?.title||K.filename),c.add(M),o(s.slug,{type:"doc_failed",...W.progress,error:M||"Unknown error"});continue}
-    try{await ir.workspace_documents.create({data:K}),a.push(W.filename),o(s.slug,{type:"doc_complete",...W.progress,cacheResolution:G.cacheResolved?"native_cache_hit":"provider_staged"})}catch(O){i.push(J?.title||K.filename),c.add(O.message),o(s.slug,{type:"doc_failed",...W.progress,error:"Failed to save document record"}),o(s.slug,{type:"source_commit_ambiguous",workspaceSlug:s.slug,sourceKey:N,filename:W.filename,error:O.message});global.__embeddingProgress=null;break}
+    try{
+      let{vectorized:L,error:M}=await r.addDocumentToNamespace(s.slug,{...W.raw,docId:X},W.filename);
+      if(!L)throw new Error(M||"Namespace commit was not confirmed");
+      await ir.workspace_documents.create({data:K});a.push(W.filename);
+      o(s.slug,{type:"doc_complete",...W.progress,cacheResolution:G.cacheResolved?"native_cache_hit":"provider_staged"});
+    }catch(O){let message=O?.message||String(O);i.push(W.filename);c.add(message);sourceCommitAborted=true;o(s.slug,{type:"doc_failed",...W.progress,error:message});o(s.slug,{type:"source_commit_ambiguous",workspaceSlug:s.slug,sourceKey:N,filename:W.filename,error:message});global.__embeddingProgress=null;break}
+  }
+  if(sourceCommitAborted){
+    for(let pending of e)if(!a.includes(pending)&&!i.includes(pending)){i.push(pending);o(s.slug,{type:"doc_failed",workspaceSlug:s.slug,userId:t,filename:pending,error:"Not attempted after source commit ambiguity"})}
+    break;
   }
   o(s.slug,{type:"source_committed",workspaceSlug:s.slug,sourceKey:N,filename:H,recordCount:R.length});
 }

@@ -237,6 +237,7 @@ def test_successful_retention_reports_a_locked_artifact_without_failing_the_docu
         },
         {"source_file": "C:/approved.pdf", "filename": "approved.pdf"},
         prepared,
+        preexisting_children=(),  # These are owned artifacts, including the locked one.
     )
 
     assert result["applied"] is True

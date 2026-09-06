@@ -1269,6 +1269,12 @@ def _unstructured_is_symbol_noise(text):
     raw = str(text or "").strip()
     if not raw:
         return True
+    # Numbers are content too (table cells, percentages, dates). Keep simple
+    # numeric expressions, but not arbitrary OCR debris such as ``{7``.
+    if any(char.isdigit() for char in raw) and re.fullmatch(r"[\d\s.,%‰$€£¥+−–—\-/():]+", raw):
+        return False
+    if any(char.isalpha() and not re.match(r"[A-Za-zÀ-ÖØ-öø-ÿ]", char) for char in raw):
+        return False
     letters = re.findall(r"[A-Za-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u00ff]", raw)
     wordlike = re.findall(r"[A-Za-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u00ff]{3,}", raw)
     nonspace = re.sub(r"\s+", "", raw)
@@ -3482,6 +3488,7 @@ def _parallel_unstructured_ocr_pages(
     page_timeout_seconds=None,
     progress_callback=None,
     completed_page_callback=None,
+    resolve_neighbours=True,
 ):
     """Extract OCR pages in isolated processes and reassemble source order.
 
@@ -3607,7 +3614,8 @@ def _parallel_unstructured_ocr_pages(
         raise RuntimeError(
             f"Parallel Unstructured OCR page coverage mismatch: expected {expected_pages}, observed {observed_pages}"
         )
-    resolve_confirmed_neighbour_runovers(pages)
+    if resolve_neighbours:
+        resolve_confirmed_neighbour_runovers(pages)
     for page in pages:
         page["unstructured_execution"] = {
             "mode": "isolated_parallel_pages",
@@ -3691,6 +3699,7 @@ def get_pages_with_unstructured(
             ]
             if not missing_target_pages:
                 pages = [cached_page_results[page][0][0] for page in target_page_numbers]
+                resolve_confirmed_neighbour_runovers(pages)
                 element_rows = [
                     row for page in target_page_numbers for row in cached_page_results[page][2]
                 ]
@@ -3747,12 +3756,14 @@ def get_pages_with_unstructured(
                 page_numbers=missing_target_pages,
                 progress_callback=report_fresh_progress,
                 completed_page_callback=checkpoint_completed_page,
+                resolve_neighbours=False,
             )
             pages = [
                 *(cached_page_results[page][0][0] for page in sorted(cached_page_results)),
                 *fresh_pages,
             ]
             pages.sort(key=lambda row: int(row.get("page") or 0))
+            resolve_confirmed_neighbour_runovers(pages)
             element_rows = [
                 *(row for page in sorted(cached_page_results) for row in cached_page_results[page][2]),
                 *fresh_element_rows,

@@ -1,10 +1,12 @@
 import hashlib
 import json
 import sys
+import pytest
 from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+pytestmark = pytest.mark.offline_deterministic
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import anythingllm_source_atomic_server as source_atomic_server  # noqa: E402
@@ -26,7 +28,7 @@ def _report(executable):
 def _server_fixture():
     return (
         '"use strict";var UM={addDocuments:async function(s,e=[],t=null){'
-        'let legacy=true;return legacy},removeDocuments:async function(){}};'
+        'let legacy=true;return {legacy:legacy}},removeDocuments:async function(){}};'
     )
 
 

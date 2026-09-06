@@ -4112,6 +4112,7 @@ def retain_successful_run_leanly(
     preserve_generated_children=(),
     retain_segment_files=True,
     preserve_preexisting_children=True,
+    preexisting_children=None,
 ):
     """Replace a successful run's forensic tree with usable text + compact facts.
 
@@ -4175,7 +4176,10 @@ def retain_successful_run_leanly(
     # disposable worker artefact.
     if preserve_preexisting_children:
         try:
-            preexisting_root_children = {child.name for child in out_root.iterdir()}
+            preexisting_root_children = (
+                set(preexisting_children) if preexisting_children is not None
+                else {child.name for child in out_root.iterdir()}
+            )
         except OSError:
             preexisting_root_children = set()
     else:
@@ -4265,16 +4269,21 @@ def retain_successful_run_leanly(
             "prepared_text": str(retained_text_path),
         }
     cleanup_warnings = []
-    if selected_dir.exists() and selected_dir != out_root:
+    if (selected_dir.exists() and selected_dir != out_root
+            and selected_dir.name not in preexisting_root_children):
         for child in list(selected_dir.iterdir()):
             _best_effort_remove_success_artifact(child, deleted, cleanup_warnings, out_root)
         if selected_dir.exists():
             _best_effort_remove_success_artifact(selected_dir, deleted, cleanup_warnings, out_root)
     for name in LEAN_SUCCESS_ARTIFACT_DIRECTORIES:
+        if name in preexisting_root_children:
+            continue
         candidate = out_root / name
         if candidate.exists():
             _best_effort_remove_success_artifact(candidate, deleted, cleanup_warnings, out_root)
     for name in LEAN_SUCCESS_ARTIFACT_FILES:
+        if name in preexisting_root_children:
+            continue
         candidate = out_root / name
         if candidate.exists():
             _best_effort_remove_success_artifact(candidate, deleted, cleanup_warnings, out_root)
@@ -4471,6 +4480,7 @@ def retain_successful_run_leanly(
         "segments_directory": "",
         "retained_segment_files": len(retained_segments),
         "deleted": sorted(deleted),
+        "retained_segment_paths": [str(path) for path in retained_segments],
         "cleanup_pending": bool(cleanup_warnings),
         "cleanup_warnings": cleanup_warnings,
     }
@@ -4598,6 +4608,7 @@ def retain_successful_run_without_logs(
     *,
     segments=(),
     preserve_generated_children=(),
+    preexisting_children=None,
 ):
     """Keep a successful local run as a flat, text-only export.
 
@@ -4613,6 +4624,7 @@ def retain_successful_run_without_logs(
         prepared_text_path,
         segments=segments,
         preserve_generated_children=preserve_generated_children,
+        preexisting_children=preexisting_children,
     )
     if not retained.get("applied"):
         return retained
@@ -4632,7 +4644,7 @@ def retain_successful_run_without_logs(
         return {"applied": False, "reason": "prepared_text_missing_after_lean_cleanup"}
     segment_root = Path(str(retained.get("segments_directory") or root))
     planned_segments = []
-    for segment_path in sorted(segment_root.glob("*.txt")) if segment_root.is_dir() else []:
+    for segment_path in sorted(Path(path) for path in retained.get("retained_segment_paths", [])):
         match = re.search(r"-p(\d+)-s(\d+)\.txt$", segment_path.name, re.IGNORECASE)
         if not match:
             continue
@@ -5435,6 +5447,13 @@ def _layout_photographed_spread_columns(rows, width, height):
     # keeps the rule narrower than generic two-column detection.
     if fold_overlap < width * .02 or not (width * .30 <= fold_centre <= width * .70):
         return None
+    # Prose establishes the fold, not which retained lines deserve output.
+    assigned = {id(row) for row in left + right}
+    for row in rows:
+        if id(row) not in assigned:
+            destination = left if (row["x0"] + row["x1"]) / 2 <= fold_centre else right
+            destination.append(row)
+            assigned.add(id(row))
     return {
         "left": sorted(left, key=lambda row: (row["y0"], row["x0"])),
         "right": sorted(right, key=lambda row: (row["y0"], row["x0"])),
@@ -23466,6 +23485,9 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     external-integration data flow is migrated into typed phase results.
     """
     total_started = time.perf_counter()
+    retention_preexisting_children = (
+        {child.name for child in Path(out_root).iterdir()} if Path(out_root).is_dir() else set()
+    )
     progress_callback = getattr(args, "progress_callback", None)
 
     def report_progress(
@@ -27790,6 +27812,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             prepared_text_path,
             segments=selected.get("segments") or (),
             preserve_generated_children=active_retention_exclusions,
+            preexisting_children=retention_preexisting_children,
         )
     elif bool(getattr(args, "lean_retention", False)):
         summary["lean_retention"] = retain_successful_run_leanly(
@@ -27799,6 +27822,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             prepared_text_path,
             segments=selected.get("segments") or (),
             preserve_generated_children=active_retention_exclusions,
+            preexisting_children=retention_preexisting_children,
         )
     if not partial_vector_coverage:
         report_upload_phase(
