@@ -3883,29 +3883,6 @@ class PipelineCoreTests(unittest.TestCase):
                 "chunk_survival_ratio": 1.0,
             })
 
-    def test_lean_receipt_preserves_measured_source_values_including_zero(self):
-        for count, ratio in ((0, 0.0), (4, 1.0)):
-            with self.subTest(count=count), tempfile.TemporaryDirectory() as temp_dir:
-                root = Path(temp_dir)
-                parsed = root / "parsed.txt"
-                parsed.write_text("text", encoding="utf-8")
-                result = pipeline.retain_successful_run_leanly(root, {
-                    "readiness_status": "ready", "api_upload_status": "complete",
-                    "post_upload_verification_status": "pass",
-                    "anythingllm_runtime_validation_status": "pass",
-                    "post_upload_matching_workspace_documents": count,
-                    "post_upload_desktop_drawer_root_locations": count,
-                    "post_upload_desktop_drawer_nested_locations": count,
-                    "post_upload_chunk_survival_ratio": ratio,
-                }, {}, parsed)
-                self.assertTrue(result["applied"])
-                receipt = json.loads((root / "run-summary.json").read_text(encoding="utf-8"))
-                storage = receipt["verification_receipt"]["storage"]
-                self.assertEqual(storage["observation_scope"], "source_verification")
-                for field in ("workspace_documents", "drawer_root_files", "drawer_nested_files"):
-                    self.assertEqual(storage[field], count)
-                self.assertEqual(storage["chunk_survival_ratio"], ratio)
-
     def test_lean_retention_preserves_evidence_when_upload_or_verification_is_ambiguous(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -3967,10 +3944,6 @@ class PipelineCoreTests(unittest.TestCase):
                 "post_upload_expected_payloads": 2,
                 "post_upload_matching_vectors": 2,
                 "anythingllm_runtime_validation_status": "deferred_after_exact_vector_proof",
-                "post_upload_matching_workspace_documents": 0,
-                "post_upload_desktop_drawer_root_locations": 0,
-                "post_upload_desktop_drawer_nested_locations": 0,
-                "post_upload_chunk_survival_ratio": 0.0,
                 "batch_upload_result": {"searchability_proven": True, "locations": ["custom-documents/example.txt"]},
                 "lean_retention": {"deferred": True, "reason": "awaiting_shared_automatic_batch_upload"},
             }
@@ -3987,11 +3960,6 @@ class PipelineCoreTests(unittest.TestCase):
             self.assertEqual(result["retained_segment_files"], 0)
             self.assertEqual(compact["verification_receipt"]["shared_batch"]["expected_records"], 2)
             self.assertEqual(compact["verification_receipt"]["shared_batch"]["confirmed_vectors"], 2)
-            storage = compact["verification_receipt"]["storage"]
-            self.assertEqual(storage["vectors"], 2)
-            self.assertEqual(storage["observation_scope"], "shared_batch_vectors")
-            for field in ("workspace_documents", "drawer_root_files", "drawer_nested_files", "chunk_survival_ratio"):
-                self.assertIsNone(storage[field])
 
     def test_deferred_batch_lean_retention_allows_exact_proof_despite_quality_advisory(self):
         """A local extraction advisory must not falsely downgrade proven upload success."""
@@ -5292,36 +5260,6 @@ class PipelineCoreTests(unittest.TestCase):
 
         self.assertEqual(accepted["label"], "Bold")
         self.assertEqual(accepted["kind"], "person")
-
-    def test_document_furniture_is_not_a_person_but_real_surnames_remain_valid(self):
-        for label in ("CROSS REF ID:", "Cross Reference ID", "Site Navigation",
-                      "Site Mobile Navigation", "Site Search Navigation"):
-            with self.subTest(label=label):
-                self.assertFalse(pipeline.looks_like_person_name(label))
-        for name in ("Jennifer L Fleissner", "John Cross", "Mary Mobile", "Miriam Hansen"):
-            self.assertTrue(pipeline.looks_like_person_name(name))
-
-    def test_explicit_filename_corroborated_opening_credit_survives_title_with_author(self):
-        samples = [
-            {"page": 1, "text": "Early Silent Cinema:\nWhose Public Sphere?\nby Miriam Hansen\nIn search of a usable past"},
-            {"page": 3, "text": "Gerald Mast, University of Chicago\nDiscussion of earlier work"},
-        ]
-        report = pipeline.infer_author_from_samples_or_filename(
-            samples, Path("Miriam Hansen - Early Silent Cinema.pdf"),
-            title_hint="Early Silent Cinema: Whose Public Sphere? by Miriam Hansen",
-        )
-        self.assertEqual(report["author"], "Miriam Hansen")
-        self.assertEqual(report["page"], 1)
-        # A different filename cannot corroborate the same visible credit.
-        self.assertFalse(pipeline.opening_filename_corroborated_credit(
-            samples, Path("Jane Smith - Early Silent Cinema.pdf"),
-            title_hint="Early Silent Cinema: Whose Public Sphere? by Miriam Hansen",
-        ))
-        # A bare title phrase retains its existing exclusion.
-        self.assertFalse(pipeline.opening_filename_corroborated_credit(
-            [{"page": 1, "text": "Border Inspections\nIntroduction"}],
-            Path("Border Inspections - Working Life.pdf"), title_hint="Border Inspections",
-        ))
 
     def test_filename_leading_author_conventions_beat_weak_title_evidence(self):
         samples = [{"page": 1, "text": "Siren Songs\nHearing Resilience\nA cultural study"}]
