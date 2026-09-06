@@ -10,7 +10,6 @@ ruff==0.15.21
 pip-audit==2.10.1
 pyright==1.1.411
 pre-commit==4.6.0
-psutil==7.2.2
 bandit==1.9.4
 uv==0.11.28
 pytest-playwright==0.8.0

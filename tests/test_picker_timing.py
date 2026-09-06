@@ -25,6 +25,7 @@ def test_picker_timings_measure_boundaries_without_logging_before_dialog(selecte
     def choose(**kwargs):
         logger.info.assert_not_called()
         assert kwargs['initialdir']=='C:/previous'
+        assert kwargs['parent'] is root
         clock[0]+=10  # Includes the person's interaction, not only opening.
         return selected
     tk=SimpleNamespace(Tk=create,filedialog=SimpleNamespace(askdirectory=choose))
@@ -60,6 +61,59 @@ def test_tk_failure_retains_existing_cancel_contract_and_logs_stage():
     data=json.loads(logger.info.call_args.args[1])
     assert data['outcome']=='exception' and data['exception_type']=='RuntimeError'
     assert 'dialog_invoked_epoch_ms' not in data
+
+
+@pytest.mark.parametrize('stage', ['withdraw', 'attributes', 'dialog'])
+def test_picker_cleans_up_root_on_every_post_creation_failure(stage):
+    root = Mock()
+    choose = Mock(return_value='chosen')
+    (choose if stage == 'dialog' else getattr(root, stage)).side_effect = RuntimeError(stage)
+    tk = SimpleNamespace(Tk=Mock(return_value=root), filedialog=SimpleNamespace(askdirectory=choose))
+    with patch.dict(sys.modules, {'tkinter': tk}):
+        assert app.choose_pdf_input_directory('previous', preserve_on_cancel=False) is None
+    root.destroy.assert_called_once()
+
+
+def test_cleanup_failure_does_not_discard_valid_selection():
+    root = Mock()
+    root.destroy.side_effect = RuntimeError('cleanup')
+    tk = SimpleNamespace(Tk=lambda: root, filedialog=SimpleNamespace(askdirectory=lambda **_: 'chosen'))
+    with patch.dict(sys.modules, {'tkinter': tk}):
+        assert app.choose_pdf_input_directory() == 'chosen'
+
+
+@pytest.mark.parametrize('count', [0, 40, 376, 1000])
+def test_opening_folder_does_not_resolve_previous_selection(count):
+    paths = [f'C:/previous/{i}.pdf' for i in range(count)]
+    with (patch.object(app, 'LIVE_AUTOMATIC_RUN_STATUS', {}),
+          patch.object(app, 'local_path_identity_key', side_effect=AssertionError('unneeded filesystem access'))):
+        result = app.automatic_folder_selection_begin_state({}, '', [], paths, {'pdf_candidates': paths})
+    assert result[0]['state'] == 'pending'
+    assert result[0]['selection_signature'] == ''
+    assert result[0]['accept_next_signature'] is True
+
+
+def test_actual_selection_still_computes_identity():
+    with (patch.object(app, 'LIVE_AUTOMATIC_RUN_STATUS', {}),
+          patch.object(app, 'automatic_selection_signature', return_value='verified') as signature):
+        result = app.automatic_selection_begin_state({}, '', ['C:/a.pdf'])
+    signature.assert_called_once()
+    assert result[0]['selection_signature'] == 'verified'
+
+
+def test_initial_settings_snapshot_does_not_become_runtime_cache():
+    assert not hasattr(app, '_INITIAL_UI_SETTINGS')
+    snapshot = {'chunking': {'chunk_size': 777, 'chunk_overlap': 33},
+                'embedder': {'max_chunk_length': 888, 'policy': {'recommended_limit': 999}}}
+    with patch.object(app, 'anythingllm_resolved_state', return_value=snapshot) as resolve:
+        assert app.current_anythingllm_chunk_size_value(snapshot) == '777'
+        assert app.current_anythingllm_chunk_overlap_value(snapshot) == '33'
+        assert app.current_anythingllm_embedder_max_chunk_value(snapshot) == 888
+        assert app.current_anythingllm_recommended_embedder_limit_value(snapshot) == 999
+        resolve.assert_not_called()
+        assert app.current_anythingllm_chunk_size_value() == '777'
+        assert app.current_anythingllm_embedder_max_chunk_value() == 888
+        assert resolve.call_count == 2
 
 
 def test_browser_data_is_diagnostic_only_and_bounded():

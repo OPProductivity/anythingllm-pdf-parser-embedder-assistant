@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import json
+import math
 import os
 import shutil
 import socket
@@ -35,6 +36,98 @@ BROWSER_READY_TIMEOUT_SECONDS = 45
 BROWSER_READY_POLL_SECONDS = 0.15
 _SERVER_MARKER_WRITE_LOCK = threading.Lock()
 _SERVER_START_LOCK = threading.Lock()
+_NATIVE_READ_SLOT = threading.Lock()
+
+
+class ServerOwnershipProbeError(RuntimeError):
+    """Ownership is unknown, not evidence that a process is foreign."""
+
+
+def _bounded_native_read(action, timeout_seconds=2.0):
+    """Bound the caller's wait, not the OS call; at most one read can linger.
+
+    Only read-only actions belong here. A timed-out result is never reused.
+    A stuck read refuses subsequent probes until it returns or this process
+    exits, rather than creating an unbounded collection of probe threads.
+    """
+    if not _NATIVE_READ_SLOT.acquire(blocking=False):
+        raise ServerOwnershipProbeError("A Windows identity read is still pending; retry shortly.")
+    done = threading.Event()
+    result = []
+    errors = []
+    def read():
+        try:
+            result.append(action())
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            _NATIVE_READ_SLOT.release()
+            done.set()
+    try:
+        threading.Thread(target=read, name="windows-identity-read", daemon=True).start()
+    except BaseException:
+        _NATIVE_READ_SLOT.release()
+        raise
+    if not done.wait(timeout_seconds):
+        raise ServerOwnershipProbeError("Windows identity verification timed out; no stop was authorized.")
+    if errors:
+        raise errors[0]
+    return result[0]
+
+
+def _required_process_identity(process):
+    # psutil may suppress AccessDenied during construction and retain
+    # (pid, None). Never use Process equality as sufficient identity proof.
+    created = process.create_time()
+    if not isinstance(created, (float, int)) or not math.isfinite(created) or created <= 0:
+        raise ServerOwnershipProbeError("Windows did not supply a process creation identity.")
+    return process.pid, created
+
+
+@contextmanager
+def _pinned_server_process(pid, expected_ticks=None):
+    """Keep the verified root PID unrecyclable through the existing tree stop."""
+    from ctypes import wintypes as w
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [w.DWORD, w.BOOL, w.DWORD]
+    kernel.OpenProcess.restype = w.HANDLE
+    kernel.CloseHandle.argtypes = [w.HANDLE]
+    kernel.CloseHandle.restype = w.BOOL
+    kernel.GetProcessTimes.argtypes = [w.HANDLE] + [ctypes.POINTER(w.FILETIME)] * 4
+    kernel.GetProcessTimes.restype = w.BOOL
+    handle = kernel.OpenProcess(0x1000, False, int(pid))  # QUERY_LIMITED_INFORMATION
+    if not handle:
+        raise ServerOwnershipProbeError("Cannot retain the recorded Windows process identity; no stop authorized.")
+    try:
+        creation, exit_time, kernel_time, user_time = (w.FILETIME() for _ in range(4))
+        if not kernel.GetProcessTimes(handle, ctypes.byref(creation), ctypes.byref(exit_time),
+                                      ctypes.byref(kernel_time), ctypes.byref(user_time)):
+            raise ServerOwnershipProbeError("Cannot read the retained Windows process identity.")
+        ticks = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+        if expected_ticks is not None and str(ticks) != str(expected_ticks):
+            raise ServerOwnershipProbeError("The recorded PID belongs to a different process incarnation; refusing Stop.")
+        yield ticks
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def _notify_launcher_message(message: str) -> None:
+    print(message, file=sys.stderr)
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.user32.MessageBoxW(None, message, "PDF assistant startup", 0x40)
+        except (OSError, AttributeError):
+            pass
+
+
+def _notify_browser_readiness_timeout(port: int) -> None:
+    message = (
+        f"The PDF assistant has not responded within {BROWSER_READY_TIMEOUT_SECONDS} seconds. "
+        "It may still be starting; it has not been stopped.\n\n"
+        f"Try {_local_app_url(port)} shortly, or use Start again. "
+        "If it remains unavailable, inspect the assistant logs."
+    )
+    _notify_launcher_message(message)
 
 
 @contextmanager
@@ -86,6 +179,7 @@ def _server_start_ownership_lock(port: int):
 
 def _port_is_available(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(1.0)
         probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         return probe.connect_ex(("127.0.0.1", port)) != 0
 
@@ -111,13 +205,11 @@ def _open_local_app_browser(port: int) -> None:
             os.startfile(url)  # type: ignore[attr-defined]  # Windows ShellExecute
         else:
             webbrowser.open_new_tab(url)
-    except OSError:
-        # The server remains usable when the OS has no default browser. The
-        # caller still prints the localhost URL for a manual open.
-        return
+    except OSError as exc:
+        _notify_launcher_message(f"The assistant is ready, but Windows could not open the browser ({type(exc).__name__}). Open {url} manually.")
 
 
-def _open_browser_when_local_app_is_ready(port: int) -> threading.Thread:
+def _open_browser_when_local_app_is_ready(port: int, *, cancelled=None, loaded=None) -> threading.Thread:
     """Open one browser tab after the app accepts HTTP, without blocking startup.
 
     This deliberately lives in the CLI rather than delegating to Gradio's
@@ -129,10 +221,17 @@ def _open_browser_when_local_app_is_ready(port: int) -> threading.Thread:
     def wait_and_open() -> None:
         deadline = time.monotonic() + BROWSER_READY_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
-            if _local_app_is_responding(port):
+            if cancelled is not None and cancelled.is_set():
+                return
+            if (loaded is None or loaded.is_set()) and _local_app_is_responding(port):
                 _open_local_app_browser(port)
                 return
             time.sleep(BROWSER_READY_POLL_SECONDS)
+        if cancelled is None or not cancelled.is_set():
+            _notify_browser_readiness_timeout(port)
+            # Startup may have finished while the notice was being read.
+            if (cancelled is None or not cancelled.is_set()) and (loaded is None or loaded.is_set()) and _local_app_is_responding(port):
+                _open_local_app_browser(port)
 
     watcher = threading.Thread(
         target=wait_and_open,
@@ -159,6 +258,21 @@ def _marker_root_pid(record: dict) -> int:
 
 def _owned_server_process_command(pid: int) -> str | None:
     """Return a PID's command line; ``None`` means the ownership probe failed."""
+    api = _native_process_api()
+    if sys.platform == "win32" and api is not None and int(pid) > 0:
+        try:
+            def read_command():
+                process = api.Process(int(pid))
+                identity = _required_process_identity(process)
+                command = subprocess.list2cmdline(process.cmdline())
+                if identity != _required_process_identity(api.Process(int(pid))):
+                    raise ServerOwnershipProbeError("Process identity changed during verification.")
+                return command if process.is_running() else ""
+            return _bounded_native_read(read_command)
+        except api.NoSuchProcess:
+            return ""
+        except (api.Error, OSError, ServerOwnershipProbeError):
+            return None
     powershell = _powershell()
     if sys.platform != "win32" or not powershell or int(pid) <= 0:
         return ""
@@ -171,7 +285,7 @@ def _owned_server_process_command(pid: int) -> str | None:
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                "(Get-CimInstance Win32_Process -Filter ('ProcessId = ' + $env:ANYTHINGLLM_SERVER_PID)).CommandLine",
+                "$ErrorActionPreference = 'Stop'; (Get-CimInstance Win32_Process -Filter ('ProcessId = ' + $env:ANYTHINGLLM_SERVER_PID)).CommandLine",
             ],
             env=environment,
             capture_output=True,
@@ -181,7 +295,54 @@ def _owned_server_process_command(pid: int) -> str | None:
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
-    return observed.stdout or ""
+    return (observed.stdout or "") if observed.returncode == 0 else None
+
+
+def _native_process_api():
+    # Lazy import keeps unrelated CLI commands light. Legacy installations can
+    # still use the bounded PowerShell path; denied reads never fall back to a
+    # weaker ownership decision.
+    try:
+        import psutil
+        return psutil
+    except ImportError:
+        return None
+
+
+def _native_listener_belongs_to_root(api, port: int, root_pid: int) -> bool | None:
+    return _bounded_native_read(lambda: _native_listener_identity_read(api, port, root_pid))
+
+
+def _native_listener_identity_read(api, port: int, root_pid: int) -> bool | None:
+    try:
+        # Windows' IPv4 table also includes dual-stack listeners. Querying
+        # both families would falsely reject an unrelated IPv6-only listener
+        # on the same numeric port, which cannot serve our IPv4 URL.
+        listeners = [connection for connection in api.net_connections(kind="tcp4")
+                     if connection.status == api.CONN_LISTEN and connection.laddr
+                     and connection.laddr.port == int(port)
+                     and connection.laddr.ip in {"127.0.0.1", "0.0.0.0"}]
+        if not listeners:
+            return None
+        root = api.Process(int(root_pid))
+        root_identity = _required_process_identity(root)
+        for listener in listeners:
+            if not listener.pid:
+                raise ServerOwnershipProbeError("Windows did not identify the local port owner; retry.")
+            candidate = api.Process(listener.pid)
+            seen = set()
+            while candidate is not None and candidate.pid not in seen:
+                if _required_process_identity(candidate) == root_identity:
+                    break
+                seen.add(candidate.pid)
+                candidate = candidate.parent()
+            else:
+                return False
+        if not root.is_running() or _required_process_identity(api.Process(int(root_pid))) != root_identity:
+            raise ServerOwnershipProbeError("The server changed during ownership verification; retry.")
+        return True
+    except (api.Error, OSError) as exc:
+        raise ServerOwnershipProbeError("Windows could not read a stable process/port identity; retry.") from exc
 
 
 def _listener_belongs_to_server_root(port: int, root_pid: int) -> bool | None:
@@ -191,26 +352,37 @@ def _listener_belongs_to_server_root(port: int, root_pid: int) -> bool | None:
     read-only check: marker ownership must never authorize a broad kill based
     on a port alone.
     """
+    api = _native_process_api()
+    if sys.platform == "win32" and api is not None and int(root_pid) > 0:
+        return _native_listener_belongs_to_root(api, port, root_pid)
     powershell = _powershell()
     if sys.platform != "win32" or not powershell or int(root_pid) <= 0:
         return False
     environment = os.environ.copy()
     environment.update({"ANYTHINGLLM_SERVER_PORT": str(int(port)), "ANYTHINGLLM_SERVER_ROOT_PID": str(int(root_pid))})
     script = """
-$listener = Get-NetTCPConnection -LocalPort ([int]$env:ANYTHINGLLM_SERVER_PORT) -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
-if ($null -eq $listener) { exit 2 }
-$listenerPid = [int]$listener.OwningProcess
-$candidate = $listenerPid
-$seen = @{}
-while ($candidate -gt 0 -and -not $seen.ContainsKey($candidate)) {
-  if ($candidate -eq [int]$env:ANYTHINGLLM_SERVER_ROOT_PID) { Write-Output 'owned'; exit 0 }
-  $seen[$candidate] = $true
-  $process = Get-CimInstance Win32_Process -Filter ('ProcessId = ' + $candidate) -ErrorAction SilentlyContinue
-  if ($null -eq $process) { break }
-  $candidate = [int]$process.ParentProcessId
+try {
+  $listeners = @(Get-NetTCPConnection -ErrorAction Stop | Where-Object { $_.LocalPort -eq [int]$env:ANYTHINGLLM_SERVER_PORT -and $_.State -eq 'Listen' -and $_.LocalAddress -in @('127.0.0.1', '0.0.0.0', '::', '::ffff:127.0.0.1') })
+} catch { exit 3 }
+$ipv4Listeners = @($listeners | Where-Object { $_.LocalAddress -in @('127.0.0.1', '0.0.0.0') })
+if ($ipv4Listeners.Count -gt 0) { $listeners = $ipv4Listeners }
+if ($listeners.Count -eq 0) { exit 2 }
+foreach ($listener in $listeners) {
+  $candidate = [int]$listener.OwningProcess
+  if ($candidate -le 0) { exit 3 }
+  $seen = @{}
+  $owned = $false
+  while ($candidate -gt 0 -and -not $seen.ContainsKey($candidate)) {
+    if ($candidate -eq [int]$env:ANYTHINGLLM_SERVER_ROOT_PID) { $owned = $true; break }
+    $seen[$candidate] = $true
+    try { $process = Get-CimInstance Win32_Process -Filter ('ProcessId = ' + $candidate) -ErrorAction Stop } catch { exit 3 }
+    if ($null -eq $process) { exit 3 }
+    $candidate = [int]$process.ParentProcessId
+  }
+  if (-not $owned) { Write-Output 'foreign'; exit 1 }
 }
-Write-Output 'foreign'
-exit 1
+Write-Output 'owned'
+exit 0
 """
     try:
         result = subprocess.run(
@@ -221,11 +393,17 @@ exit 1
             timeout=POWERSHELL_COMMAND_TIMEOUT_SECONDS,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ServerOwnershipProbeError(
+            "Windows could not complete the port-ownership check; no process was stopped."
+        ) from exc
     if result.returncode == 2:
         return None
-    return result.returncode == 0 and "owned" in (result.stdout or "").casefold()
+    if result.returncode == 0 and (result.stdout or "").strip().casefold() == "owned":
+        return True
+    if result.returncode == 1 and (result.stdout or "").strip().casefold() == "foreign":
+        return False
+    raise ServerOwnershipProbeError("Windows returned an inconclusive port-ownership result; no process was stopped.")
 
 
 def _recorded_server_is_alive_on_port(port: int) -> bool:
@@ -244,10 +422,13 @@ def _recorded_server_is_alive_on_port(port: int) -> bool:
             return False
         command = _owned_server_process_command(pid)
         if command is None:
-            return False
+            raise ServerOwnershipProbeError("Windows could not verify the recorded server process; retry Start.")
         command_line = command.casefold()
         if not any(token in command_line for token in ("anythingllm_pdf_assistant_cli", "anythingllm-pdf-assistant")):
             return False
+        if record.get("process_creation_ticks") is not None:
+            with _pinned_server_process(pid, record["process_creation_ticks"]):
+                return _listener_belongs_to_server_root(port, pid) is not False
         listener_owned = _listener_belongs_to_server_root(port, pid)
         return listener_owned is not False
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
@@ -428,6 +609,9 @@ def _write_server_marker(port: int) -> Path:
         "command": "anythingllm-pdf-assistant start",
         "started_at": time.time(),
     }
+    if sys.platform == "win32":
+        with _pinned_server_process(root_pid) as ticks:
+            payload["process_creation_ticks"] = str(ticks)
     # A fixed ``.tmp`` name allowed two shortcut launches to clobber each
     # other's marker staging file. The marker is the ownership boundary for
     # Stop, so publish it only after one complete, durable write.
@@ -503,12 +687,12 @@ def _shortcut_arguments(action: str) -> str:
     working_directory = Path(__file__).resolve().parent
     escaped_working_directory = str(working_directory).replace("'", "''")
     command = "start --browser" if action == "start" else "stop"
-    # A Stop shortcut otherwise appears to do nothing: it closes its tiny
-    # PowerShell host at exactly the moment the user needs confirmation. Keep
-    # that host minimized, but alive briefly so it is visible on the taskbar
-    # and can be restored to read the success/failure line if desired.
+    # Stop is an explicitly visible interactive shortcut: leave failures on
+    # screen rather than hiding the very explanation the user needs.
     if action == "stop":
-        command = "stop; $assistantExitCode = $LASTEXITCODE; Start-Sleep -Seconds 4; exit $assistantExitCode"
+        command = ("stop; $assistantExitCode = $LASTEXITCODE; "
+                   "if ($assistantExitCode -eq 0) { Start-Sleep -Seconds 2 } "
+                   "else { Read-Host 'Press Enter to close' }; exit $assistantExitCode")
         command_text = f"& '{escaped_executable}' -m anythingllm_pdf_assistant_cli {command}"
     else:
         # Launch the long-running Python server in its own hidden process.
@@ -525,7 +709,7 @@ def _shortcut_arguments(action: str) -> str:
     # leading invocation operator becomes the complete argument and a Python
     # path containing spaces is split at ``C:\\Program`` by PowerShell.
     return (
-        "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "
+        f"-NoProfile -ExecutionPolicy Bypass -WindowStyle {'Normal' if action == 'stop' else 'Hidden'} -Command "
         f'"{command_text}"'
     )
 
@@ -547,6 +731,7 @@ def _write_windows_shortcut(path: Path, arguments: str, icon_path: Path, descrip
             "ANYTHINGLLM_SHORTCUT_WORKING_DIRECTORY": str(Path(__file__).resolve().parent),
             "ANYTHINGLLM_SHORTCUT_DESCRIPTION": description,
             "ANYTHINGLLM_SHORTCUT_ICON": str(icon_path),
+            "ANYTHINGLLM_SHORTCUT_WINDOW_STYLE": "1" if path.name == STOP_SHORTCUT_NAME else "7",
         }
     )
     script = "\n".join(
@@ -558,7 +743,7 @@ def _write_windows_shortcut(path: Path, arguments: str, icon_path: Path, descrip
             "$shortcut.WorkingDirectory = $env:ANYTHINGLLM_SHORTCUT_WORKING_DIRECTORY",
             "$shortcut.Description = $env:ANYTHINGLLM_SHORTCUT_DESCRIPTION",
             "$shortcut.IconLocation = $env:ANYTHINGLLM_SHORTCUT_ICON",
-            "$shortcut.WindowStyle = 7",
+            "$shortcut.WindowStyle = [int]$env:ANYTHINGLLM_SHORTCUT_WINDOW_STYLE",
             "$shortcut.Save()",
         ]
     )
@@ -608,6 +793,19 @@ def install_desktop_shortcuts(overwrite: bool = False) -> tuple[Path, ...]:
 
 
 def _stop() -> int:
+    # Start must not publish a replacement marker between termination and
+    # cleanup. Use the same ownership mutex, not a separate competing lock.
+    try:
+        record = json.loads(_server_marker_path().read_text(encoding="utf-8"))
+        port = int(record.get("port") or 0)
+        with _server_start_ownership_lock(port):
+            return _stop_under_start_lock()
+    except (OSError, ValueError, TypeError, RuntimeError) as exc:
+        print(f"Could not resolve local server Stop: {exc}", file=sys.stderr)
+        return 1
+
+
+def _stop_under_start_lock() -> int:
     if sys.platform != "win32":
         print("Stopping the local server is supported only on Windows.", file=sys.stderr)
         return 1
@@ -639,7 +837,31 @@ def _stop() -> int:
             return 0
         print("The recorded process is no longer the owned PDF assistant server; refusing to stop it.", file=sys.stderr)
         return 1
-    listener_owned = _listener_belongs_to_server_root(port, pid)
+    try:
+        with _pinned_server_process(pid, record.get("process_creation_ticks")):
+            # Re-read under the retained handle: the initial read above is
+            # useful for stale-marker cleanup but does not authorize a kill.
+            if _owned_server_process_command(pid) != command:
+                raise ServerOwnershipProbeError("The server command changed during verification.")
+            return _stop_pinned_server(marker, record, pid, port)
+    except (ServerOwnershipProbeError, OSError) as exc:
+        print(f"Could not retain server ownership: {exc}", file=sys.stderr)
+        return 1
+
+
+def _stop_pinned_server(marker, record, pid, port):
+    # The caller must retain the root process handle until this returns.
+    # Preserve all existing tree-stop and cancellation-recovery semantics.
+    try:
+        if json.loads(marker.read_text(encoding="utf-8")) != record:
+            raise ServerOwnershipProbeError("The server marker changed; retry Stop.")
+    except (OSError, ValueError) as exc:
+        raise ServerOwnershipProbeError("Cannot recheck the server marker; retry Stop.") from exc
+    try:
+        listener_owned = _listener_belongs_to_server_root(port, pid)
+    except ServerOwnershipProbeError as exc:
+        print(f"Could not verify server ownership: {exc} Please retry Stop.", file=sys.stderr)
+        return 1
     if listener_owned is False:
         print("Port ownership does not match the recorded local PDF assistant; refusing to stop it.", file=sys.stderr)
         return 1
@@ -694,26 +916,27 @@ def _start(port: int, browser: bool) -> int:
     # hidden process where the person receives no feedback.
     try:
         with _server_start_ownership_lock(port):
-            if _recorded_server_is_alive_on_port(port):
-                if browser:
-                    # This short-lived command is itself launched by a desktop
-                    # shortcut. Wait for its browser helper here: a daemon watcher
-                    # would otherwise be discarded the moment this process returns.
-                    watcher = _open_browser_when_local_app_is_ready(port)
-                    watcher.join(BROWSER_READY_TIMEOUT_SECONDS + BROWSER_READY_POLL_SECONDS)
-                print(f"The owned local PDF assistant is already starting or serving at {_local_app_url(port)}")
-                return 0
-
-            if _doctor(port, allow_owned_running_server=False) != 0:
-                return 1
-            # Claim ownership before importing the large Gradio application.
-            # The cross-process lock covers the observation and publication as
-            # one transaction; after publication later starters can attach.
-            os.environ.setdefault(SERVER_ROOT_PID_ENV, str(os.getpid()))
-            marker = _write_server_marker(port)
+            already_running = _recorded_server_is_alive_on_port(port)
+            if not already_running:
+                if _doctor(port, allow_owned_running_server=False) != 0:
+                    raise RuntimeError("The local port or data directories are unavailable. No existing server was stopped. Run the assistant doctor command for details.")
+                os.environ.setdefault(SERVER_ROOT_PID_ENV, str(os.getpid()))
+                marker = _write_server_marker(port)
     except RuntimeError as exc:
-        print(f"Could not claim local server startup ownership: {exc}", file=sys.stderr)
+        message = f"Could not claim local server startup ownership: {exc}"
+        if browser:
+            _notify_launcher_message(message)
+        else:
+            print(message, file=sys.stderr)
         return 1
+    if already_running:
+        if browser:
+            # Do not hold the startup mutex while waiting for readiness or
+            # acknowledgement of a timeout notice. Keep this short-lived
+            # process alive until its notification has actually been delivered.
+            _open_browser_when_local_app_is_ready(port).join()
+        print(f"The owned local PDF assistant is already starting or serving at {_local_app_url(port)}")
+        return 0
     # Shortcut creation belongs to install/repair, not to every launch. The
     # old per-start Desktop/PowerShell lookup added avoidable startup work and
     # could contend with Explorer while the shortcut was itself being opened.
@@ -721,6 +944,10 @@ def _start(port: int, browser: bool) -> int:
     # Desktop click can otherwise arrive during that import while neither a
     # listener nor a marker exists, causing two full servers to race for the
     # same port.
+    cancelled = threading.Event()
+    loaded = threading.Event()
+    if browser:
+        _open_browser_when_local_app_is_ready(port, cancelled=cancelled, loaded=loaded)
     try:
         os.environ["GRADIO_SERVER_PORT"] = str(port)
         # This is a local document assistant.  Opening the browser is only a
@@ -728,14 +955,21 @@ def _start(port: int, browser: bool) -> int:
         # enabled.
         os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
         from rag_pdf_gradio_app import launch_application
-
-        if browser:
-            _open_browser_when_local_app_is_ready(port)
+        loaded.set()
         # Browser opening is owned by the readiness watcher above. In
         # particular, do not rely on Gradio to open a tab from a hidden
         # shortcut process after the relatively heavy app build completes.
         launch_application(port=port, inbrowser=False)
+    except Exception as exc:
+        cancelled.set()
+        message = f"PDF assistant startup/server failed ({type(exc).__name__}): {exc}"
+        if browser:
+            _notify_launcher_message(message)
+        else:
+            print(message, file=sys.stderr)
+        return 1
     finally:
+        cancelled.set()
         _remove_own_server_marker(marker)
     return 0
 
@@ -930,7 +1164,11 @@ def main(argv: list[str] | None = None) -> int:
     if command == "paths":
         return _print_paths()
     if command == "doctor":
-        return _doctor(args.port)
+        try:
+            return _doctor(args.port)
+        except ServerOwnershipProbeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
     if command == "start":
         return _start(args.port, args.browser)
     if command == "stop":

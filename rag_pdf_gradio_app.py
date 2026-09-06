@@ -1717,6 +1717,8 @@ APP_JS = """
       const chooseHost = document.getElementById("choose-pdf-folder-button");
       const chooseButton = chooseHost?.querySelector("button") || chooseHost;
       if (!chooseButton || target.closest("#choose-pdf-folder-button")) return;
+      // Record the panel click before forwarding it to Gradio's hidden button.
+      window.ragPdfFolderClick = {epoch: Date.now()};
       chooseButton.click();
     });
   };
@@ -6622,8 +6624,8 @@ def anythingllm_settings_snapshot_html():
     )
 
 
-def current_anythingllm_embedder_max_chunk_value():
-    state = anythingllm_resolved_state(default_anythingllm_storage_dir(), runtime_verify=False)
+def current_anythingllm_embedder_max_chunk_value(resolved_state=None):
+    state = resolved_state if resolved_state is not None else anythingllm_resolved_state(default_anythingllm_storage_dir(), runtime_verify=False)
     embed = state["embedder"]
     try:
         return int(embed.get("max_chunk_length") or 0) or int((embed.get("policy") or {}).get("recommended_limit") or 0) or 4096
@@ -6631,8 +6633,8 @@ def current_anythingllm_embedder_max_chunk_value():
         return 4096
 
 
-def current_anythingllm_recommended_embedder_limit_value():
-    state = anythingllm_resolved_state(default_anythingllm_storage_dir(), runtime_verify=False)
+def current_anythingllm_recommended_embedder_limit_value(resolved_state=None):
+    state = resolved_state if resolved_state is not None else anythingllm_resolved_state(default_anythingllm_storage_dir(), runtime_verify=False)
     try:
         return int((state["embedder"].get("policy") or {}).get("recommended_limit") or 0) or 4096
     except (TypeError, ValueError):
@@ -9288,16 +9290,41 @@ def desktop_bridge_process_is_live(pid):
     if not pid:
         return True
     if os.name == "nt":
+        from anythingllm_pdf_assistant_cli import _native_process_api, _bounded_native_read, _required_process_identity, ServerOwnershipProbeError
+        api = _native_process_api()
+        if api is not None:
+            try:
+                # Liveness only: the bridge request still needs its separate
+                # capability token. A live PID alone never proves ownership.
+                def read_live():
+                    process = api.Process(int(pid))
+                    _required_process_identity(process)
+                    return process.is_running()
+                return int(pid) > 0 and _bounded_native_read(read_live)
+            except api.NoSuchProcess:
+                return False
+            except (api.Error, OSError, ServerOwnershipProbeError):
+                return None
+            except (TypeError, ValueError):
+                return False
         try:
+            import csv
             probe = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {int(pid)}", "/NH"],
+                ["tasklist", "/FI", f"PID eq {int(pid)}", "/NH", "/FO", "CSV"],
                 capture_output=True,
                 text=True,
                 timeout=2,
                 check=False,
             )
-            return str(int(pid)) in (probe.stdout or "")
-        except (OSError, ValueError, subprocess.SubprocessError):
+            if probe.returncode != 0:
+                return None
+            return any(
+                len(row) > 1 and row[1] == str(int(pid))
+                for row in csv.reader((probe.stdout or "").splitlines())
+            )
+        except (OSError, csv.Error, subprocess.SubprocessError):
+            return None
+        except (TypeError, ValueError):
             return False
     try:
         os.kill(int(pid), 0)
@@ -9344,8 +9371,12 @@ def read_desktop_refresh_bridge_descriptor(include_capability_token=False):
         return dict(base_report, status="invalid_descriptor")
     # A forced process stop cannot run Electron's graceful quit cleanup. Do not
     # treat its leftover capability descriptor as a live bridge.
-    if bridge_pid and not desktop_bridge_process_is_live(bridge_pid):
-        return dict(base_report, status="not_installed_or_not_running", stale_descriptor=True)
+    if bridge_pid:
+        live = desktop_bridge_process_is_live(bridge_pid)
+        if live is None:
+            return dict(base_report, status="process_verification_unavailable")
+        if not live:
+            return dict(base_report, status="not_installed_or_not_running", stale_descriptor=True)
     report = dict(
         base_report,
         available=True,
@@ -9437,6 +9468,8 @@ def request_desktop_workspace_refresh(timeout_seconds=6.0):
 
 def desktop_workspace_refresh_note(report):
     status = (report or {}).get("status") or "not_checked"
+    if status == "process_verification_unavailable":
+        return "Windows could not verify the Desktop bridge process; sidebar refresh was skipped. This does not mean Desktop has stopped."
     if status == "refreshed":
         return "Asked the active AnythingLLM Desktop workspace sidebar to refresh."
     if status == "not_installed_or_not_running":
@@ -9514,7 +9547,8 @@ def background_reconciliation_html(workspace_slug, snapshot):
         ("Workspace documents", (snapshot or {}).get("workspace_documents") if (snapshot or {}).get("workspace_documents") is not None else "not observed"),
         ("Embedded vectors", (snapshot or {}).get("embedded_vectors") if (snapshot or {}).get("embedded_vectors") is not None else "not observed"),
         ("Database", (snapshot or {}).get("database_status") or "not checked"),
-        ("Desktop sidebar bridge", "ready" if desktop_bridge.get("available") else "not active"),
+        ("Desktop sidebar bridge", "ready" if desktop_bridge.get("available") else
+         "process verification unavailable" if desktop_bridge.get("status") == "process_verification_unavailable" else "not active"),
     ]
     table = "".join(
         f'<div class="metadata-key">{html.escape(str(key))}</div><div class="metadata-value">{html.escape(str(value))}</div>'
@@ -10230,6 +10264,7 @@ def choose_pdf_input_directory(current_value="", *, preserve_on_cancel=True, pic
     trace = dict(picker_timing) if isinstance(picker_timing, dict) else _pdf_picker_timing_start()
     started = time.perf_counter()
     trace["chain_to_picker_ms"] = round((started - trace.get("callback_monotonic", started)) * 1000, 3)
+    root = None
     try:
         import tkinter as tk
         from tkinter import filedialog
@@ -10237,25 +10272,33 @@ def choose_pdf_input_directory(current_value="", *, preserve_on_cancel=True, pic
         trace["tk_import_ms"] = round((time.perf_counter() - started) * 1000, 3)
         root_started = time.perf_counter()
         root = tk.Tk()
+        trace["tk_create_ms"] = round((time.perf_counter() - root_started) * 1000, 3)
         root.withdraw()
         root.attributes("-topmost", True)
         trace["tk_initialize_ms"] = round((time.perf_counter() - root_started) * 1000, 3)
         trace["dialog_invoked_epoch_ms"] = time.time() * 1000
         dialog_started = time.perf_counter()
         selected = filedialog.askdirectory(
+            parent=root,
             initialdir=(current_value or str(USER_DOWNLOADS_DIR)),
             title="Choose a folder to scan for PDF files",
             mustexist=True,
         )
         trace["dialog_call_ms"] = round((time.perf_counter() - dialog_started) * 1000, 3)
         trace["outcome"] = "selected" if selected else "cancelled"
-        root.destroy()
     except Exception as exc:
         trace["outcome"] = "exception"
         trace["exception_type"] = type(exc).__name__
         APP_LOGGER.warning("native PDF-folder picker failed: %s", exc)
         return (current_value or "") if preserve_on_cancel else None
     finally:
+        # Never leave a default root behind after a failed dialog. Explicit
+        # parenting above avoids borrowing another callback thread's Tk root.
+        if root is not None:
+            try:
+                root.destroy()
+            except Exception as exc:
+                trace["cleanup_exception_type"] = type(exc).__name__
         trace["picker_total_ms"] = round((time.perf_counter() - started) * 1000, 3)
         _pdf_picker_timing_log(trace)
     if not selected:
@@ -12286,11 +12329,11 @@ def automatic_selection_pending_action_states(pdf_files=None, folder_pdf_files=N
 
 def automatic_selection_preparing_status_html(pdf_files=None, folder_pdf_files=None, *, detail=""):
     """Render browser-owned picker work without creating a run lifecycle."""
-    selected_count = len(unique_local_path_strings(
-        normalize_file_list(pdf_files) + normalize_file_list(folder_pdf_files)
-    ))
     current_detail = str(detail or "").strip()
     if not current_detail:
+        selected_count = len(unique_local_path_strings(
+            normalize_file_list(pdf_files) + normalize_file_list(folder_pdf_files)
+        ))
         current_detail = (
             f"{selected_count} PDF(s) accepted — synchronizing selection settings, metadata, and estimate"
             if selected_count
@@ -12347,7 +12390,11 @@ def _automatic_selection_begin_state(
         revision = max(0, int(state.get("revision") or 0)) + 1
     except (TypeError, ValueError):
         revision = 1
-    signature = automatic_selection_signature(pdf_files, folder_pdf_files, folder_manifest)
+    # No new folder has been chosen: the old signature is discarded below.
+    # Keep physical-path validation for actual selections, not dialog opening.
+    signature = "" if selection_not_yet_chosen else automatic_selection_signature(
+        pdf_files, folder_pdf_files, folder_manifest
+    )
     if (
         not selection_not_yet_chosen
         and signature
@@ -12432,6 +12479,9 @@ def automatic_folder_selection_begin_state(
         selection_not_yet_chosen=True,
     )
     if timing is not None:
+        timing["selection_callback_ms"] = round(
+            (time.perf_counter() - timing["callback_monotonic"]) * 1000, 3
+        )
         result[0]["picker_timing"] = timing
     return result
 
@@ -22494,8 +22544,8 @@ def automatic_extraction_method_summary(summaries):
         if counts["comparison_ocr_processing_seconds"] >= 0.5:
             result += (
                 " "
-                f"Selected output: {format_estimate_clock(counts['selected_output_ocr_processing_seconds'])}; "
-                f"extractor comparison: {format_estimate_clock(counts['comparison_ocr_processing_seconds'])}."
+                f"Selected extractor OCR: {format_estimate_clock(counts['selected_output_ocr_processing_seconds'])}; "
+                f"comparison OCR: {format_estimate_clock(counts['comparison_ocr_processing_seconds'])}."
             )
         if counts["ocr_cache_reused_pages"]:
             result += (
@@ -32452,6 +32502,9 @@ def run_edge_case_tests(
 initialize_timing_model_for_application_startup()
 INITIAL_WORKSPACE_CHOICES, INITIAL_WORKSPACE_VALUE, INITIAL_WORKSPACE_STATUS = initial_workspace_controls()
 INITIAL_ANYTHINGLLM_STARTUP_STATUS = anythingllm_startup_status_html()
+# Only initial component values share this observation. Runtime callbacks and
+# run preflight still resolve current state; this is not a cross-run cache.
+_INITIAL_UI_SETTINGS = anythingllm_resolved_state(default_anythingllm_storage_dir(), runtime_verify=False)
 
 
 with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
@@ -33107,7 +33160,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 with gr.Row(elem_classes=["aligned-settings-row", "anythingllm-upload-only-auto-control"]) as anythingllm_chunk_controls:
                     anythingllm_chunk_size = gr.Dropdown(
                         choices=CHUNK_SIZE_PRESET_CHOICES,
-                        value=current_anythingllm_chunk_size_value(),
+                        value=current_anythingllm_chunk_size_value(_INITIAL_UI_SETTINGS),
                         label="AnythingLLM chunk size",
                         info="Used when inheritance is off. Click for tested presets or type a whole number.",
                         allow_custom_value=True,
@@ -33115,7 +33168,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     )
                     anythingllm_chunk_overlap = gr.Dropdown(
                         choices=CHUNK_OVERLAP_PRESET_CHOICES,
-                        value=current_anythingllm_chunk_overlap_value(),
+                        value=current_anythingllm_chunk_overlap_value(_INITIAL_UI_SETTINGS),
                         label="AnythingLLM chunk overlap",
                         info="Used when inheritance is off. Click for tested presets or type a whole number.",
                         allow_custom_value=True,
@@ -33123,14 +33176,14 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     )
                 with gr.Row(elem_classes=["aligned-settings-row", "anythingllm-upload-only-auto-control"]) as anythingllm_embedder_limit_controls:
                     anythingllm_embedder_max_chunk = gr.Number(
-                        value=current_anythingllm_embedder_max_chunk_value(),
+                        value=current_anythingllm_embedder_max_chunk_value(_INITIAL_UI_SETTINGS),
                         precision=0,
                         minimum=1,
                         label="AnythingLLM embedder max chunk limit",
                         info="Writes EMBEDDING_MODEL_MAX_CHUNK_LENGTH in AnythingLLM storage .env.",
                     )
                     anythingllm_embedder_recommended_limit = gr.Number(
-                        value=current_anythingllm_recommended_embedder_limit_value(),
+                        value=current_anythingllm_recommended_embedder_limit_value(_INITIAL_UI_SETTINGS),
                         precision=0,
                         minimum=1,
                         label="Recommended embedder max chunk limit",
@@ -33212,7 +33265,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     interactive=True,
                 )
                 generate_inline_fallback = gr.Checkbox(
-                    value=builtin_automatic_run_setting_values()["generate_inline_fallback"],
+                    value=builtin_automatic_run_setting_values(resolved_anythingllm_state=_INITIAL_UI_SETTINGS)["generate_inline_fallback"],
                     label="Generate inline metadata fallback files",
                 )
                 retain_detailed_evidence = gr.Checkbox(
@@ -35210,7 +35263,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     "These values apply only to a later PDF selection or a fresh setup. They never alter the selected or running Automatic job. "
                     "Source files, document metadata, API keys, per-document names, upload page ranges, and recovery state are intentionally not stored."
                 )
-                editor_builtin_defaults = builtin_automatic_run_setting_values()
+                editor_builtin_defaults = builtin_automatic_run_setting_values(resolved_anythingllm_state=_INITIAL_UI_SETTINGS)
                 future_defaults_use_file_title_fallback = gr.Checkbox(
                     value=editor_builtin_defaults["use_file_title_fallback"],
                     label="Use the PDF file title as a fallback",
@@ -35593,6 +35646,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                         target_passage_sizing_plan(
                             SEGMENT_PAGE_LIMIT_LABEL,
                             TARGET_PASSAGE_INHERIT_LABEL,
+                            resolved_state=_INITIAL_UI_SETTINGS,
                         )
                     ),
                 )
@@ -35756,6 +35810,9 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 outputs=[diagnostics_summary],
                 show_progress="hidden",
             )
+
+
+del _INITIAL_UI_SETTINGS
 
 
 def launch_application(*, port: int | None = None, inbrowser: bool = False):

@@ -2304,7 +2304,7 @@ class PipelineCoreTests(unittest.TestCase):
             rendered,
             "Extraction backends: 2 PyMuPDF · 1 layout · 2 Unstructured. "
             "OCR contributed to the selected output for 2 PDF(s) (2 targeted page(s)). "
-            "OCR processing: 01m06s. Selected output: 00m55s; extractor comparison: 00m11s. "
+            "OCR processing: 01m06s. Selected extractor OCR: 00m55s; comparison OCR: 00m11s. "
             "2 cached OCR page(s) reused.",
         )
 
