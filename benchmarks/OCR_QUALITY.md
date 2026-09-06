@@ -18,6 +18,35 @@ embedding, or the UI. It does not write timing history or reuse OCR results.
 Tests under `tests/test_ocr_quality_pack.py` exercise the checker with deliberate
 mutations; they do not replace this real-PDF qualification command.
 
+## Ruled-text hybrid qualification (September 6)
+
+Horizontal rules alone no longer imply handwritten underlining. The production
+recognition selector distinguishes aligned short printed rules (block layout,
+installed model), paired printed heading rules (qualified model, original
+raster), and supported prose underlines (existing qualified model/raster path).
+Staff detection also checks long overlapping lines when notes fragment a line;
+these newly detected cases keep the qualified model with layout mode 4, avoiding
+the unnecessary loss of its prose improvements alongside the score.
+No source-specific names, post-OCR word substitutions, extra competing OCR
+passes, crop-bound changes or changes to ingestion/ETA are involved.
+
+Private matched replays cover every physical page of Gorbman (11), Alba/Nee
+(50) and Rossellini (11), using the same runtime and source bytes. Inspect both
+changed and unchanged pages; a globally better recognizer is not established.
+Alba retains improvements to citation completeness while recovering several
+spellings, but not every spelling. Rossellini retains block-recognition gains
+without the enlargement artifact. Gorbman's opening-page treatment remains
+unchanged: tested alternatives lost a known-correct passage. Its remaining
+margin noise is not claimed solved. The staff-page fallback removes musical
+symbol debris but retains older lexical limitations. Existing seven-page
+reference assertions are not weakened to hide those tradeoffs.
+
+Run-local OCR checkpoint schema 2 prevents a resumed run from using page data
+prepared under the prior recognition policy. This is not cross-run caching.
+The extra geometry counts and route reasons stay in existing page evidence.
+Private experiments/results are under the September 6 audit's `hybrid-*`
+directories, not in the production OCR execution path.
+
 Required passages and ordered anchors were checked against rendered pages.
 Hashes detect any other normalized-text change, including unexpected bleed;
 they do NOT certify every word as correct. Known existing mistakes are stated

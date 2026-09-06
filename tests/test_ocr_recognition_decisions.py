@@ -18,8 +18,8 @@ def annotated_region():
     for y in range(50, 400, 15):
         for x in range(50, 750, 15):
             draw.rectangle((x, y, x + 4, y + 7), fill=0)
-    for x in (100, 220, 350):
-        draw.line((x, 450, x + 60, 450), fill=0)
+    for y in (105, 210, 315):
+        draw.line((100, y, 300, y), fill=0)
     return image
 
 

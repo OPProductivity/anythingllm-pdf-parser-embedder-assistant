@@ -66,7 +66,7 @@ UNSTRUCTURED_OCR_PAGE_GROUP_SIZE_MAX = 32
 # OCR page checkpoints are deliberately scoped to one run directory. Their
 # schema protects a restarted worker inside that run from incompatible page
 # data; unlike the retired shared OCR cache, a new run never consults them.
-UNSTRUCTURED_OCR_CHECKPOINT_SCHEMA_VERSION = 1
+UNSTRUCTURED_OCR_CHECKPOINT_SCHEMA_VERSION = 2
 # A photographed page benefits from a small, deterministic outer-margin crop
 # before OCR.  It removes scanner borders and handwritten marginalia without
 # changing the source-page identity or trying to reconstruct a new PDF.
@@ -2558,17 +2558,19 @@ def annotated_model_arguments(requested_psm, resolved_psm):
 
 
 def annotated_text_block_psm(cropped, requested=4, *, decision=None):
-    """Keep underlined prose together without deleting any source pixels.
+    """Classify ruled text before choosing layout, without deleting pixels.
 
     Only an already isolated reading region is eligible. Several long, thin
-    horizontal strokes are needed; ruled tables with vertical lines retain
-    the established layout mode. Other explicitly requested modes are intact.
+    horizontal strokes are needed. Printed repeat-author/heading rules have
+    separate model/raster policies; ruled tables and staves retain the
+    established layout mode. Other explicitly requested modes are intact.
     Optional image-analysis failure falls back to the existing OCR route.
     """
     def choose(mode, reason):
         if decision is not None:
             decision.update(candidate_psm=mode, geometry_reason=reason,
-                            underlined_prose_detected=mode == 6 and requested == 4)
+                            underlined_prose_detected=(mode == 6 and requested == 4
+                                                      and reason == "substantial_underlined_prose"))
         return mode
 
     if requested != 4:
@@ -2607,23 +2609,81 @@ def annotated_text_block_psm(cropped, requested=4, *, decision=None):
             return choose(requested, "insufficient_annotation_rules")
         # Five closely spaced parallel rules are more consistent with music
         # staves than underlined prose. Keep the existing layout for these.
-        ordered_rules = sorted(rules, key=lambda s: s[1])
-        for i in range(len(ordered_rules) - 4):
-            group = ordered_rules[i:i + 5]
-            gaps = np.diff([s[1] for s in group])
-            if (min(gaps) >= 3 and max(gaps) <= height * .012
-                    and max(gaps) - min(gaps) <= 2
-                    and max(s[0] for s in group) - min(s[0] for s in group) <= width * .02):
-                return choose(requested, "staff_like_parallel_rules")
+        # Short fragments can fall between real staff lines. Examine the long
+        # rules separately so those fragments cannot defeat the staff guard.
+        for long_only, rule_set in ((False, rules), (True, [s for s in rules if s[2] >= width * .25])):
+            ordered_rules = sorted(rule_set, key=lambda s: s[1])
+            for i in range(len(ordered_rules) - 4):
+                group = ordered_rules[i:i + 5]
+                gaps = np.diff([s[1] for s in group])
+                aligned = max(s[0] for s in group) - min(s[0] for s in group) <= width * .02
+                if long_only:
+                    # Notes may interrupt the left end of one staff line.
+                    # Require a substantial COMMON horizontal span instead.
+                    overlap = min(s[0] + s[2] for s in group) - max(s[0] for s in group)
+                    aligned = aligned or overlap >= min(s[2] for s in group) * .7
+                if (min(gaps) >= 3 and max(gaps) <= height * .012
+                        and max(gaps) - min(gaps) <= 2
+                        and aligned):
+                    if long_only and decision is not None:
+                        decision["staff_fragment_recovery"] = True
+                    return choose(requested, "staff_like_parallel_rules")
         # Sparse title leaves can contain decorative rules too. Require a
         # substantial text block before changing its segmentation/model.
         _, _, components, _ = cv2.connectedComponentsWithStats(ink)
-        text_components = sum(
+        text_components = [s for s in components[1:] if
             2 <= s[2] <= width * .035
             and 3 <= s[3] <= height * .035 and s[4] >= 5
-            for s in components[1:]
-        )
-        return choose(6, "substantial_underlined_prose") if text_components >= 500 else choose(requested, "sparse_text_block")
+        ]
+        if len(text_components) < 500:
+            return choose(requested, "sparse_text_block")
+        # Printed repeat-author rules and heading separators are not evidence
+        # of underlined prose. Require nearby ink ABOVE each qualifying rule,
+        # scaled to the observed character height, without changing any pixels.
+        letter_height = max(3, int(np.median([s[3] for s in text_components])))
+        supported_rules = []
+        for rule in rules:
+            x, y, rule_width = (int(rule[i]) for i in range(3))
+            above = ink[max(0, y - int(letter_height * 1.5)):max(0, y - 2),
+                        x:x + rule_width]
+            if above.size and np.count_nonzero(above) / above.size >= .08:
+                supported_rules.append(rule)
+        # Retain distinct-baseline evidence, but do not require three baselines:
+        # that experiment lost correctly recovered text on short annotations.
+        baselines = []
+        for rule in sorted(supported_rules, key=lambda s: s[1]):
+            if not baselines or int(rule[1]) - baselines[-1] > letter_height:
+                baselines.append(int(rule[1]))
+        if decision is not None:
+            decision.update(annotation_rule_count=len(rules),
+                            text_supported_rule_count=len(supported_rules),
+                            underlined_baseline_count=len(baselines))
+        # Aligned short author-repeat rules benefit from block segmentation,
+        # not from the annotation-specific model. This is geometry evidence,
+        # not a claim to have recognized a bibliography's semantic contents.
+        if (not supported_rules
+                and max(s[0] for s in rules) <= width * .25
+                and max(s[0] for s in rules) - min(s[0] for s in rules) <= width * .02
+                and max(s[2] for s in rules) <= width * .15
+                and max(s[2] for s in rules) <= min(s[2] for s in rules) * 1.25):
+            return choose(6, "aligned_short_printed_rules")
+        # Two boxed-off headings: retain the tested block/model pair, but do
+        # not enlarge their raster as though they were handwritten underlines.
+        ordered_rules = sorted(rules, key=lambda s: s[1])
+        if len(rules) >= 4 and len(rules) % 2 == 0 and len(supported_rules) * 2 == len(rules):
+            supported_y = {int(s[1]) for s in supported_rules}
+            if all(
+                int(top[1]) not in supported_y and int(bottom[1]) in supported_y
+                and abs(int(top[0]) - int(bottom[0])) <= width * .02
+                and abs(int(top[2]) - int(bottom[2])) <= width * .02
+                and top[2] >= width * .2
+                and letter_height * 1.5 <= bottom[1] - top[1] <= letter_height * 8
+                for top, bottom in zip(ordered_rules[::2], ordered_rules[1::2])
+            ):
+                return choose(6, "paired_printed_heading_rules")
+        if len(supported_rules) < 3 or sum(s[2] for s in supported_rules) < width * .15:
+            return choose(requested, "insufficient_text_supported_underlines")
+        return choose(6, "substantial_underlined_prose")
     except Exception as exc:
         # This optional, non-mutating geometry probe must never block OCR.
         if decision is not None:
@@ -2635,9 +2695,13 @@ def _resolve_ocr_recognition(cropped, requested):
     """Resolve the tested model/layout pair once, before invoking Tesseract."""
     decision = {"requested_psm": requested, "annotation_pixels_removed": False}
     candidate = annotated_text_block_psm(cropped, requested, decision=decision)
-    model_args = annotated_model_arguments(requested, candidate)
+    printed_repeats = decision["geometry_reason"] == "aligned_short_printed_rules"
+    # Newly recognized fragmented staves need layout mode 4, but retaining the
+    # qualified model avoids restoring older prose spelling errors beside them.
+    model_candidate = 6 if decision.get("staff_fragment_recovery") else candidate
+    model_args = [] if printed_repeats else annotated_model_arguments(requested, model_candidate)
     psm = candidate
-    if requested == 4 and candidate == 6 and not model_args:
+    if requested == 4 and candidate == 6 and not model_args and not printed_repeats:
         # The tested route requires both changes. A missing/invalid model must
         # not leave the changed layout paired with unqualified language data.
         psm = requested
@@ -3258,7 +3322,9 @@ def _ocr_photographed_crop(image, fraction, tesseract, image_ops, *, psm=4, reco
     cropped = image_ops.autocontrast(image.crop(crop_box).convert("L"))
     psm, model_args, decision = _resolve_ocr_recognition(image.crop(crop_box), psm)
     decision["recognition_raster_scale"] = 1.0
-    if enhance_annotated_prose and decision.get("requested_psm") == 4 and psm == 6 and model_args:
+    if (enhance_annotated_prose and decision.get("requested_psm") == 4
+            and psm == 6 and model_args
+            and decision.get("geometry_reason") != "paired_printed_heading_rules"):
         # Only confirmed-spread prose opts in. Auxiliary/reference OCR and
         # TSV geometry keep their established raster. Resolve layout once;
         # preserve the full fractional bounds, without another OCR pass.

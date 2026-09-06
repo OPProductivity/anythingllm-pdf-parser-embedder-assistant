@@ -17,6 +17,9 @@ def test_underlined_region_changes_layout_not_pixels():
     for y in range(50, 400, 15):
         for x in range(50, 750, 15):
             draw.rectangle((x, y, x + 4, y + 7), fill=0)
+    assert t.annotated_text_block_psm(im) == 4  # detached rules still aren't underlines
+    for y in (105, 210, 315):
+        draw.line((100, y, 300, y), fill=0, width=1)
     before = im.tobytes()
     assert t.annotated_text_block_psm(im) == 6
     assert im.tobytes() == before
