@@ -57,3 +57,20 @@ region evidence. Assessment page states separately count recorded, partially
 recorded, and unrecorded evidence. Unrecorded does not establish that an
 assessment was ineligible or that another backend performed it. These are
 bounded counters in the same terminal record, not new per-file logs.
+
+## September 6 targeted recognition-raster qualification
+
+Confirmed spread regions with the existing annotated-prose recognition profile
+can enlarge the recognition raster 1.5x without changing crop fractions, model,
+PSM or the single-call policy. Auxiliary and TSV-coordinate routes are excluded.
+An input-pixel budget and allocation fallback retain the original route.
+Existing page evidence records recognition_raster_scale and any fallback.
+
+A matched 37-source ab7cb74/current local replay completed with equal 1,741-page
+coverage and 1,810 segments. Only two pages changed; metadata and recorded
+routing/reconciliation decisions did not. This is a modest, mixed lexical gain,
+not universally improved OCR: Cohen gains several words but loses two others.
+Dense-endnote experiments were rejected rather than introducing citation errors.
+The default suite, targeted raster checks, UI suite, seven-page quality pack and
+offline recovery scenarios passed. No fresh live provider comparison was made.
+Detailed private evidence: version-balance-20260905/HYBRID-RESULTS.md.

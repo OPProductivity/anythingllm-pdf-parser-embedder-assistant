@@ -1554,7 +1554,8 @@ def photographed_page_ocr_regions(page, runtime, *, page_number=None):
             decision = precomputed_region_decisions.get(region_position, {})
             if text is None:
                 text = _ocr_photographed_crop(image, fraction, tesseract, ImageOps,
-                                             recognition_evidence=decision)
+                                             recognition_evidence=decision,
+                                             enhance_annotated_prose=True)
             region_texts.append(text)
             region_decisions.append(decision)
         if keep_photographed_spread_regions(resolved_spread_specs, region_texts):
@@ -3239,7 +3240,7 @@ def recover_missing_display_regions(text, image, fraction, rows, tesseract, imag
     return content, evidence
 
 
-def _ocr_photographed_crop(image, fraction, tesseract, image_ops, *, psm=4, recognition_evidence=None):
+def _ocr_photographed_crop(image, fraction, tesseract, image_ops, *, psm=4, recognition_evidence=None, enhance_annotated_prose=False):
     """OCR one visual region, retaining only text suitable for preparation."""
     setup_started = time.perf_counter()
     width, height = image.size
@@ -3249,6 +3250,24 @@ def _ocr_photographed_crop(image, fraction, tesseract, image_ops, *, psm=4, reco
     # keeping the source crop and page identity unchanged.
     cropped = image_ops.autocontrast(image.crop(crop_box).convert("L"))
     psm, model_args, decision = _resolve_ocr_recognition(image.crop(crop_box), psm)
+    decision["recognition_raster_scale"] = 1.0
+    if enhance_annotated_prose and decision.get("requested_psm") == 4 and psm == 6 and model_args:
+        # Only confirmed-spread prose opts in. Auxiliary/reference OCR and
+        # TSV geometry keep their established raster. Resolve layout once;
+        # preserve the full fractional bounds, without another OCR pass.
+        if width * height <= 8_000_000:
+            try:
+                from PIL import Image
+                enlarged = image.resize((round(width * 1.5), round(height * 1.5)), Image.Resampling.LANCZOS)
+                enlarged_box = tuple(int(value * size) for value, size in zip(
+                    fraction, (enlarged.width, enlarged.height, enlarged.width, enlarged.height)
+                ))
+                cropped = image_ops.autocontrast(enlarged.crop(enlarged_box).convert("L"))
+                decision["recognition_raster_scale"] = 1.5
+            except (MemoryError, OSError, ValueError) as exc:
+                decision["raster_enhancement_fallback"] = type(exc).__name__
+        else:
+            decision["raster_enhancement_fallback"] = "raster_budget_preserve_original"
     if recognition_evidence is not None:
         recognition_evidence.clear()
         recognition_evidence.update(decision, crop_fraction=list(fraction))
