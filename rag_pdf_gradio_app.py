@@ -50,6 +50,7 @@ from automatic_worker_protocol import (
 import fitz
 import gradio as gr
 from gradio.routes import App as GradioFastAPIApp
+from server_lifecycle import LIFECYCLE_HEAD, install_lifecycle_routes
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 from structured_logging import configure_structured_logger
@@ -1206,6 +1207,7 @@ APP_THEME_FOUNDATION_HEAD = """
 """
 APP_BROWSER_THEME_HEAD = (
     APP_THEME_FOUNDATION_HEAD
+    + LIFECYCLE_HEAD
     + APP_CONNECTION_WATCHDOG_HEAD[
         APP_CONNECTION_WATCHDOG_HEAD.index('<script id="rag-local-theme-controls">'):
     ]
@@ -1290,6 +1292,7 @@ def gradio_server_app_with_connection_watchdog():
     """Create the app shell early enough for the HTML watchdog middleware."""
 
     app = GradioFastAPIApp()
+    install_lifecycle_routes(app)
     app.add_api_route("/healthz", local_pdf_app_healthz, methods=["GET"], include_in_schema=False)
     app.add_middleware(LocalServerConnectionWatchdogMiddleware)
     return app

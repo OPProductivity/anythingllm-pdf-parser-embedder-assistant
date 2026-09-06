@@ -6,6 +6,7 @@ import argparse
 import ctypes
 import json
 import math
+import secrets
 import os
 import shutil
 import socket
@@ -21,6 +22,23 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from portable_paths import application_paths, ensure_application_directories, package_resource_path
+
+
+def _notify_browser_stop(record, event):
+    """Best effort, bounded notification; never an authorization to terminate."""
+    token = record.get("stop_notification_token")
+    if not token:
+        return
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{int(record['port'])}/assistant-lifecycle/{event}",
+        data=b"", method="POST", headers={"X-Assistant-Stop-Token": token},
+    )
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(request, timeout=0.8):
+            pass
+    except (OSError, urllib.error.URLError):
+        pass
 
 
 SERVER_MARKER_NAME = "localhost-server.json"
@@ -608,7 +626,9 @@ def _write_server_marker(port: int) -> Path:
         "executable": str(Path(sys.executable).resolve()),
         "command": "anythingllm-pdf-assistant start",
         "started_at": time.time(),
+        "stop_notification_token": secrets.token_urlsafe(32),
     }
+    os.environ["ANYTHINGLLM_PDF_ASSISTANT_STOP_TOKEN"] = payload["stop_notification_token"]
     if sys.platform == "win32":
         with _pinned_server_process(root_pid) as ticks:
             payload["process_creation_ticks"] = str(ticks)
@@ -792,6 +812,39 @@ def install_desktop_shortcuts(overwrite: bool = False) -> tuple[Path, ...]:
     return tuple(created)
 
 
+def install_browser_launcher():
+    """Register one per-user, fixed start action, not a general shell bridge."""
+    if sys.platform != "win32":
+        raise RuntimeError("Browser launching is supported only on Windows.")
+    import winreg
+
+    launcher = Path(__file__).resolve().with_name("assistant_browser_launcher.py")
+    executable = Path(sys.executable).resolve().with_name("pythonw.exe")
+    if not launcher.is_file() or not executable.is_file():
+        raise RuntimeError("The packaged browser launcher or pythonw.exe is missing.")
+    root = r"Software\Classes\anythingllm-pdf-assistant"
+    owner = "anythingllm-pdf-assistant-fixed-start-v1"
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, root) as key:
+            try:
+                existing_owner = winreg.QueryValueEx(key, "AssistantOwner")[0]
+            except FileNotFoundError:
+                existing_owner = None
+            if existing_owner != owner:
+                raise RuntimeError("The launch protocol belongs to another registration; it was not replaced.")
+    except FileNotFoundError:
+        pass
+    # No %1 substitution: even adversarial URI text cannot enter the command.
+    command = f'"{executable}" "{launcher}"'
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, root) as key:
+        winreg.SetValueEx(key, "", 0, winreg.REG_SZ, "URL:AnythingLLM PDF Assistant")
+        winreg.SetValueEx(key, "URL Protocol", 0, winreg.REG_SZ, "")
+        winreg.SetValueEx(key, "AssistantOwner", 0, winreg.REG_SZ, owner)
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, root + r"\shell\open\command") as key:
+        winreg.SetValueEx(key, "", 0, winreg.REG_SZ, command)
+    return "anythingllm-pdf-assistant://start"
+
+
 def _stop() -> int:
     # Start must not publish a replacement marker between termination and
     # cleanup. Use the same ownership mutex, not a separate competing lock.
@@ -874,6 +927,7 @@ def _stop_pinned_server(marker, record, pid, port):
             file=sys.stderr,
         )
         return 1
+    _notify_browser_stop(record, "stop_requested")
     try:
         stopped = subprocess.run(
             ["taskkill", "/PID", str(pid), "/T", "/F"],
@@ -883,9 +937,11 @@ def _stop_pinned_server(marker, record, pid, port):
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
+        _notify_browser_stop(record, "stop_cancelled")
         print(f"Could not stop the owned local PDF assistant server: {exc}", file=sys.stderr)
         return 1
     if stopped.returncode != 0:
+        _notify_browser_stop(record, "stop_cancelled")
         print((stopped.stderr or stopped.stdout or "Could not stop the local server.").strip(), file=sys.stderr)
         return 1
     try:
@@ -1113,6 +1169,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     shortcuts = subcommands.add_parser("shortcuts", help="create or repair Windows desktop shortcuts")
     shortcuts.add_argument("action", choices=("install", "repair"), nargs="?", default="install")
+    subcommands.add_parser("browser-launcher", help="register the Windows Launch again link for this installation")
 
     subcommands.add_parser("stop", help="stop the owned local PDF assistant server")
 
@@ -1173,10 +1230,18 @@ def main(argv: list[str] | None = None) -> int:
         return _start(args.port, args.browser)
     if command == "stop":
         return _stop()
+    if command == "browser-launcher":
+        try:
+            print(f"Browser launcher ready: {install_browser_launcher()}")
+            return 0
+        except (OSError, RuntimeError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
     if command == "shortcuts":
         try:
             paths = install_desktop_shortcuts(overwrite=args.action == "repair")
-        except RuntimeError as exc:
+            install_browser_launcher()
+        except (OSError, RuntimeError) as exc:
             print(str(exc), file=sys.stderr)
             return 1
         for path in paths:

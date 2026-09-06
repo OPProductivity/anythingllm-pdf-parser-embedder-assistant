@@ -149,7 +149,21 @@ anythingllm-pdf-assistant start --browser
 anythingllm-pdf-assistant doctor
 anythingllm-pdf-assistant paths
 anythingllm-pdf-assistant shortcuts repair
+anythingllm-pdf-assistant browser-launcher
 ```
+
+On Windows, installation/shortcut repair also registers a per-user
+`anythingllm-pdf-assistant://start` launcher. The stopped page's **Launch again**
+link invokes the same `start --browser` command as the Desktop shortcut, even
+when the server is off. A browser permission prompt may appear. The launcher
+accepts no commands or paths from the URI and does not run a background service.
+The offline stopped page itself remains a browser-local document; it makes no
+reconnection requests. Unexpected disconnects still reconnect automatically.
+
+Production dependencies are declared in `pyproject.toml` and mirrored in
+`requirements.lock`, including `psutil` (Windows process ownership), FastAPI and
+Starlette (HTTP lifecycle routes), and OpenCV (OCR image geometry). Development
+tools such as pytest and Playwright remain in `requirements-dev.lock`.
 
 For manual `pipx` installation and bridge commands, see the detailed guide.
 
