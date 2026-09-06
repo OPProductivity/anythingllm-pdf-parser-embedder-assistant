@@ -1182,6 +1182,11 @@ def author_candidate_is_document_role(value):
             candidate,
             flags=re.I,
         )
+        or re.fullmatch(
+            r"(?:cross\s+ref(?:erence)?\s+id|site\s+(?:(?:mobile|search)\s+)?navigation)",
+            candidate,
+            flags=re.I,
+        )
     )
 
 
@@ -2914,13 +2919,17 @@ def opening_filename_corroborated_credit(samples, path: Path, title_hint=""):
                  for s in str(sample.get("text") or "").splitlines() if s.strip()]
         for index, line in enumerate(lines[:18]):
             candidate = line if index < 12 else ""
+            explicit_byline = index < 12 and bool(re.match(r"^(?:by|written\s+by)\s+", line, re.I))
             bibliography = re.match(r'^([^,]{5,70}),\s*[“"‘]', line)
             reported = re.match(r"^Reported\s+by\s+(.+?)\s*\(\s*Staff\s+Writer\s*\)", line, re.I)
             if bibliography and index == 0:
                 candidate = bibliography.group(1)
             elif reported:
                 candidate = reported.group(1)
-            if not looks_like_person_name(candidate, title_hint=title_hint, allow_all_caps=False):
+            # A visible By credit corroborated by the filename is not a title
+            # fragment merely because the PDF title also includes that name.
+            # Bare names retain the existing title-fragment exclusion.
+            if not looks_like_person_name(candidate, title_hint="" if explicit_byline else title_hint, allow_all_caps=False):
                 continue
             name = normalize_author_candidate(candidate)
             names = re.findall(r"[^\W\d_]+", name.casefold())
@@ -4365,12 +4374,24 @@ def retain_successful_run_leanly(
             # they deliberately contain neither API credentials nor source text.
             "storage": {
                 "expected_payloads": summary.get("post_upload_expected_payloads", 0),
-                "workspace_documents": summary.get("post_upload_matching_workspace_documents", 0),
+                "workspace_documents": (
+                    None if shared_batch_receipt else summary.get("post_upload_matching_workspace_documents")
+                ),
                 "vectors": summary.get("post_upload_matching_vectors", 0),
                 "drawer_layout": summary.get("post_upload_desktop_drawer_layout", "not_checked"),
-                "drawer_root_files": summary.get("post_upload_desktop_drawer_root_locations", 0),
-                "drawer_nested_files": summary.get("post_upload_desktop_drawer_nested_locations", 0),
-                "chunk_survival_ratio": summary.get("post_upload_chunk_survival_ratio", 0.0),
+                # Shared-batch proof establishes vectors, not these separate
+                # per-source measurements. Never present placeholder zeros
+                # from the preparation summary as observed failures.
+                "drawer_root_files": (
+                    None if shared_batch_receipt else summary.get("post_upload_desktop_drawer_root_locations")
+                ),
+                "drawer_nested_files": (
+                    None if shared_batch_receipt else summary.get("post_upload_desktop_drawer_nested_locations")
+                ),
+                "chunk_survival_ratio": (
+                    None if shared_batch_receipt else summary.get("post_upload_chunk_survival_ratio")
+                ),
+                "observation_scope": "shared_batch_vectors" if shared_batch_receipt else "source_verification",
             },
             "runtime": {
                 "embedder_status": summary.get("anythingllm_runtime_embedder_probe_status", "not_checked"),
