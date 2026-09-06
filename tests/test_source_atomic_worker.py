@@ -264,7 +264,8 @@ def test_current_patch_migrates_manifest_bound_v3_worker(tmp_path, monkeypatch):
     assert written_manifest["provider_retry_policy"] == source_atomic.source_atomic_provider_retry_policy()
 
 
-def test_current_patch_migrates_manifest_bound_v7_worker(tmp_path, monkeypatch):
+@pytest.mark.parametrize("previous_id", [source_atomic.SOURCE_ATOMIC_PREVIOUS_V7_PATCH_ID, source_atomic.SOURCE_ATOMIC_PREVIOUS_V10_PATCH_ID])
+def test_current_patch_migrates_manifest_bound_recent_worker(tmp_path, monkeypatch, previous_id):
     """The last deployed worker upgrades to runtime-self-identifying v8."""
     worker = tmp_path / "embedding-worker.js"
     original = _fixture_worker()
@@ -281,13 +282,13 @@ def test_current_patch_migrates_manifest_bound_v7_worker(tmp_path, monkeypatch):
     )
     previous = source_atomic.patch_v1161_embedding_worker_source(original).replace(
         source_atomic.SOURCE_ATOMIC_PATCH_ID,
-        source_atomic.SOURCE_ATOMIC_PREVIOUS_V7_PATCH_ID,
+        previous_id,
     )
     worker.write_text(previous, encoding="utf-8")
     manifest = worker.with_name(f"{worker.name}.pdf-assistant-source-atomic.json")
     manifest.write_text(
         json.dumps({
-            "patch_id": source_atomic.SOURCE_ATOMIC_PREVIOUS_V7_PATCH_ID,
+            "patch_id": previous_id,
             "original_worker_sha256": hashlib.sha256(backup.read_bytes()).hexdigest(),
             "patched_worker_sha256": hashlib.sha256(worker.read_bytes()).hexdigest(),
         }),
@@ -299,7 +300,7 @@ def test_current_patch_migrates_manifest_bound_v7_worker(tmp_path, monkeypatch):
     )
 
     assert migrated["status"] == "restart_required", migrated
-    assert migrated["upgraded_from_patch_id"] == source_atomic.SOURCE_ATOMIC_PREVIOUS_V7_PATCH_ID
+    assert migrated["upgraded_from_patch_id"] == previous_id
     patched = worker.read_text(encoding="utf-8")
     assert source_atomic.SOURCE_ATOMIC_PATCH_ID in patched
     assert f'patchId:"{source_atomic.SOURCE_ATOMIC_PATCH_ID}"' in patched

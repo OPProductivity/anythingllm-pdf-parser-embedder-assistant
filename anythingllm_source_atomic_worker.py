@@ -17,7 +17,7 @@ from anythingllm_compatibility import (
 )
 
 
-SOURCE_ATOMIC_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_v10"
+SOURCE_ATOMIC_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_v11"
 SOURCE_ATOMIC_LEGACY_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_v1"
 SOURCE_ATOMIC_PREVIOUS_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_v2"
 SOURCE_ATOMIC_PREVIOUS_V3_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_v3"
@@ -27,6 +27,7 @@ SOURCE_ATOMIC_PREVIOUS_V6_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_v6
 SOURCE_ATOMIC_PREVIOUS_V7_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_v7"
 SOURCE_ATOMIC_PREVIOUS_V8_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_v8"
 SOURCE_ATOMIC_PREVIOUS_V9_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_v9"
+SOURCE_ATOMIC_PREVIOUS_V10_PATCH_ID = "anythingllm_pdf_assistant_source_atomic_v10"
 SOURCE_ATOMIC_DEFAULT_PROVIDER_BATCH_SIZE = 36
 SOURCE_ATOMIC_MAX_PROVIDER_BATCH_SIZE = 64
 # The direct OpenRouter-compatible request is deliberately bounded below the
@@ -223,6 +224,7 @@ def _render_v1161_embedding_worker_source(
             SOURCE_ATOMIC_PREVIOUS_V7_PATCH_ID,
             SOURCE_ATOMIC_PREVIOUS_V8_PATCH_ID,
             SOURCE_ATOMIC_PREVIOUS_V9_PATCH_ID,
+            SOURCE_ATOMIC_PREVIOUS_V10_PATCH_ID,
         )
     ):
         raise ValueError("Embedding worker is already patched and cannot be rendered again.")
@@ -436,6 +438,7 @@ def ensure_source_atomic_embedding_worker(
         or SOURCE_ATOMIC_PREVIOUS_V7_PATCH_ID in current_text
         or SOURCE_ATOMIC_PREVIOUS_V8_PATCH_ID in current_text
         or SOURCE_ATOMIC_PREVIOUS_V9_PATCH_ID in current_text
+        or SOURCE_ATOMIC_PREVIOUS_V10_PATCH_ID in current_text
     ):
         if not backup.is_file():
             result["reason"] = "source_atomic_worker_backup_missing"
@@ -469,7 +472,7 @@ def ensure_source_atomic_embedding_worker(
         )
         if not upgraded_from_patch_id and any(
             patch_id in current_text
-            for patch_id in (SOURCE_ATOMIC_PREVIOUS_V3_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V4_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V5_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V6_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V7_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V8_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V9_PATCH_ID)
+            for patch_id in (SOURCE_ATOMIC_PREVIOUS_V3_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V4_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V5_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V6_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V7_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V8_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V9_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V10_PATCH_ID)
         ):
             # v3-v6 were preceding, hash-gated revisions. Their
             # generated bodies are intentionally not reconstructed from
@@ -482,7 +485,7 @@ def ensure_source_atomic_embedding_worker(
             if (
                 isinstance(previous_manifest, dict)
                 and str(previous_manifest.get("patch_id") or "")
-                in {SOURCE_ATOMIC_PREVIOUS_V3_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V4_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V5_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V6_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V7_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V8_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V9_PATCH_ID}
+                in {SOURCE_ATOMIC_PREVIOUS_V3_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V4_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V5_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V6_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V7_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V8_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V9_PATCH_ID, SOURCE_ATOMIC_PREVIOUS_V10_PATCH_ID}
                 and str(previous_manifest.get("original_worker_sha256") or "")
                 == _sha256_bytes(original)
                 and str(previous_manifest.get("patched_worker_sha256") or "")
