@@ -1,3 +1,5 @@
+import ast
+import inspect
 import json
 from unittest import mock
 
@@ -5,6 +7,95 @@ import pytest
 
 
 pytestmark = pytest.mark.offline_deterministic
+
+
+def test_grouped_cache_callback_does_not_override_presentation_repricing():
+    """Guard the actual callback wiring, not just the already-correct helper."""
+    import rag_pdf_gradio_app as app
+
+    tree = ast.parse(inspect.getsource(app))
+    callbacks = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "update_live_automatic_run_status"
+        and any(k.arg == "cache_plan_partial" for k in node.keywords)
+        and any(k.arg == "diagnostic_context" for k in node.keywords)
+    ]
+    assert callbacks, "Grouped upload status callback was not found"
+    assert all(
+        not any(k.arg == "presentation_expected_seconds" for k in node.keywords)
+        for node in callbacks
+    )
+
+
+@pytest.mark.parametrize(
+    "old_model,old_display,new_model,elapsed,cached,reason",
+    [
+        (497, 362, 469, 202.157, 1796, "confirmed_batch_cache_plan"),
+        (257, 184, 112, 43.583, 49, "confirmed_batch_cache_plan"),
+        (1000, 700, 1000, 70, 500, ""),
+        (1000, 1000, 800, 100, 100, "confirmed_batch_cache_plan"),
+        (12000, 8400, 11000, 300, 3000, "confirmed_batch_cache_plan"),
+        (100, 70, 60, 20, 0, "confirmed_batch_execution_plan"),
+    ],
+)
+def test_cache_confirmation_preserves_display_continuity_and_raw_evidence(
+    tmp_path, monkeypatch, old_model, old_display, new_model, elapsed, cached, reason,
+):
+    import rag_pdf_gradio_app as app
+
+    monkeypatch.setattr(app, "LIVE_AUTOMATIC_RUN_STATUS", {})
+    with mock.patch.object(app.time, "time", return_value=1000.0):
+        app.update_live_automatic_run_status(
+            tmp_path, state="running", phase="Preparing",
+            expected_seconds=old_model, presentation_expected_seconds=old_display,
+            cache_plan_partial=True, confirmed_fraction=.1,
+        )
+    with mock.patch.object(app.time, "time", return_value=1000.0 + elapsed):
+        status = app.update_live_automatic_run_status(
+            tmp_path, state="running", phase="Submitting",
+            expected_seconds=new_model, cache_reuse_records=cached,
+            cache_plan_partial=False, eta_reprice_reason=reason,
+            eta_basis="cache_plan_confirmed" if cached else "execution_plan_confirmed",
+            confirmed_fraction=.2,
+        )
+        repaint = app.update_live_automatic_run_status(
+            tmp_path, state="running", phase="Desktop queue",
+            expected_seconds=new_model, cache_reuse_records=cached,
+        )
+    assert status["expected_seconds"] == new_model
+    assert status["cache_reuse_records"] == cached
+    assert status["presentation_expected_seconds"] <= old_display
+    assert repaint["presentation_expected_seconds"] == status["presentation_expected_seconds"]
+    persisted = json.loads((tmp_path / "run-progress.json").read_text(encoding="utf-8"))
+    assert persisted["expected_seconds"] == new_model
+    assert persisted["presentation_expected_seconds"] == status["presentation_expected_seconds"]
+    if reason:
+        events = [json.loads(line) for line in
+                  (tmp_path / "eta-recalculation-events.jsonl").read_text(encoding="utf-8").splitlines()]
+        assert events[-1]["new_expected_seconds"] == new_model
+        assert events[-1]["presentation_expected_seconds"] == status["presentation_expected_seconds"]
+    if old_model == 497:
+        assert status["presentation_expected_seconds"] == 347
+
+
+def test_real_upward_cache_queue_reprice_is_not_frozen(tmp_path, monkeypatch):
+    import rag_pdf_gradio_app as app
+
+    monkeypatch.setattr(app, "LIVE_AUTOMATIC_RUN_STATUS", {})
+    app.update_live_automatic_run_status(
+        tmp_path, state="running", phase="Queue", expected_seconds=500,
+        presentation_expected_seconds=350, cache_reuse_records=100,
+        cache_plan_partial=False,
+    )
+    status = app.update_live_automatic_run_status(
+        tmp_path, state="running", phase="Queue", expected_seconds=650,
+        cache_reuse_records=100, cache_plan_partial=False,
+        eta_reprice_reason="owned_queue_rate",
+    )
+    assert status["expected_seconds"] == 650
+    assert status["presentation_expected_seconds"] == 650
 
 
 def test_eta_checkpoint_retains_exactly_ten_numbers_and_material_reasons(tmp_path):

@@ -13274,8 +13274,9 @@ def update_live_automatic_run_status(
         # Ordinary status repaints retain their existing display clock. For an
         # all-fresh plan, retain the deliberately optimistic opening discount
         # against remaining work through subsequent evidence-based reprices.
-        # A complete cache plan is exact workload evidence and therefore
-        # replaces that opening presentation model.
+        # Exact cache workload evidence updates the canonical model, but must
+        # not expose the opening display discount as an upward clock jump
+        # when that model decreases. Genuine upward reprices remain allowed.
         presentation_expected = reprice_presentation_expected_seconds(
             previous_expected_seconds=previous.get("expected_seconds"),
             previous_presentation_expected_seconds=prior_presentation_expected,
@@ -31598,9 +31599,8 @@ def run_automatic(
                 cache_plan_partial=(
                     False if timing_event == "batch_cache_lookup_completed" else None
                 ),
-                presentation_expected_seconds=(
-                    expected_seconds if (cache_reuse_records or 0) > 0 else None
-                ),
+                # Use ordinary display repricing: a downward exact-cache
+                # correction must not reset the discounted clock upward.
                 diagnostic_context=queue_diagnostic_context,
             )
 
