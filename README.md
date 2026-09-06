@@ -142,7 +142,12 @@ raw run reports, API keys, or provider credentials.
 
 ### Command-line and shortcut support
 
-The desktop installer creates Start and Stop shortcuts. You can also run:
+The desktop installer creates Start and Stop shortcuts.
+
+The Stop shortcut runs without a terminal window. Successful stops are silent;
+ownership refusals or other failures display a small error dialog instead.
+
+You can also run:
 
 ```powershell
 anythingllm-pdf-assistant start --browser

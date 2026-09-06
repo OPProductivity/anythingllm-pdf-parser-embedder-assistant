@@ -65,6 +65,7 @@ py-modules = [
   "anythingllm_compatibility",
   "anythingllm_pdf_assistant_cli",
   "assistant_browser_launcher",
+  "assistant_stop_launcher",
   "anythingllm_source_atomic_server",
   "anythingllm_source_atomic_worker",
   "anythingllm_persistence",

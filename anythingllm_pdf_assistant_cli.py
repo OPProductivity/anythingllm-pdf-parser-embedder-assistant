@@ -702,34 +702,25 @@ def _desktop_directory() -> Path:
 
 
 def _shortcut_arguments(action: str) -> str:
+    if action == "stop":
+        # Executed by pythonw.exe, not a visible PowerShell/Terminal host.
+        return f'"{Path(__file__).resolve().with_name("assistant_stop_launcher.py")}"'
     executable = Path(sys.executable).resolve()
     escaped_executable = str(executable).replace("'", "''")
     working_directory = Path(__file__).resolve().parent
     escaped_working_directory = str(working_directory).replace("'", "''")
-    command = "start --browser" if action == "start" else "stop"
-    # Stop is an explicitly visible interactive shortcut: leave failures on
-    # screen rather than hiding the very explanation the user needs.
-    if action == "stop":
-        command = ("stop; $assistantExitCode = $LASTEXITCODE; "
-                   "if ($assistantExitCode -eq 0) { Start-Sleep -Seconds 2 } "
-                   "else { Read-Host 'Press Enter to close' }; exit $assistantExitCode")
-        command_text = f"& '{escaped_executable}' -m anythingllm_pdf_assistant_cli {command}"
-    else:
-        # Launch the long-running Python server in its own hidden process.
-        # Hiding only the short PowerShell host leaves the child python.exe
-        # console visible, which makes a desktop shortcut look stuck even
-        # though the browser app is already serving.
-        command_text = (
-            f"Start-Process -FilePath '{escaped_executable}' "
-            "-ArgumentList @('-m', 'anythingllm_pdf_assistant_cli', 'start', '--browser') "
-            f"-WorkingDirectory '{escaped_working_directory}' "
-            "-WindowStyle Hidden"
-        )
+    # Keep the existing Start path unchanged.
+    command_text = (
+        f"Start-Process -FilePath '{escaped_executable}' "
+        "-ArgumentList @('-m', 'anythingllm_pdf_assistant_cli', 'start', '--browser') "
+        f"-WorkingDirectory '{escaped_working_directory}' "
+        "-WindowStyle Hidden"
+    )
     # ``-Command`` accepts one command string. Without these quotes, the
     # leading invocation operator becomes the complete argument and a Python
     # path containing spaces is split at ``C:\\Program`` by PowerShell.
     return (
-        f"-NoProfile -ExecutionPolicy Bypass -WindowStyle {'Normal' if action == 'stop' else 'Hidden'} -Command "
+        "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "
         f'"{command_text}"'
     )
 
@@ -738,11 +729,17 @@ def _write_windows_shortcut(path: Path, arguments: str, icon_path: Path, descrip
     powershell = _powershell()
     if not powershell:
         raise RuntimeError("PowerShell is required to create Windows shortcuts.")
+    target = powershell
+    if path.name == STOP_SHORTCUT_NAME:
+        pythonw = Path(sys.executable).resolve().with_name("pythonw.exe")
+        if not pythonw.is_file() or not Path(__file__).resolve().with_name("assistant_stop_launcher.py").is_file():
+            raise RuntimeError("The windowless Stop launcher is missing; existing shortcut was not changed.")
+        target = str(pythonw)
     environment = os.environ.copy()
     environment.update(
         {
             "ANYTHINGLLM_SHORTCUT_PATH": str(path),
-            "ANYTHINGLLM_SHORTCUT_TARGET": powershell,
+            "ANYTHINGLLM_SHORTCUT_TARGET": target,
             "ANYTHINGLLM_SHORTCUT_ARGUMENTS": arguments,
             # ``python -m anythingllm_pdf_assistant_cli`` must resolve the
             # local source/package. The application data directory contains
@@ -751,7 +748,7 @@ def _write_windows_shortcut(path: Path, arguments: str, icon_path: Path, descrip
             "ANYTHINGLLM_SHORTCUT_WORKING_DIRECTORY": str(Path(__file__).resolve().parent),
             "ANYTHINGLLM_SHORTCUT_DESCRIPTION": description,
             "ANYTHINGLLM_SHORTCUT_ICON": str(icon_path),
-            "ANYTHINGLLM_SHORTCUT_WINDOW_STYLE": "1" if path.name == STOP_SHORTCUT_NAME else "7",
+            "ANYTHINGLLM_SHORTCUT_WINDOW_STYLE": "7",
         }
     )
     script = "\n".join(
@@ -931,6 +928,7 @@ def _stop_pinned_server(marker, record, pid, port):
     try:
         stopped = subprocess.run(
             ["taskkill", "/PID", str(pid), "/T", "/F"],
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
             capture_output=True,
             text=True,
             timeout=POWERSHELL_COMMAND_TIMEOUT_SECONDS,

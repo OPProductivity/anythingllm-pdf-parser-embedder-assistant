@@ -33,10 +33,8 @@ def test_shortcut_arguments_start_the_packaged_module():
     assert "-ArgumentList @('-m', 'anythingllm_pdf_assistant_cli', 'start', '--browser')" in start_arguments
     assert "-WorkingDirectory" in start_arguments
     stop_arguments = cli._shortcut_arguments("stop")
-    assert "anythingllm_pdf_assistant_cli stop" in stop_arguments
-    assert "Start-Sleep -Seconds 2" in stop_arguments
-    assert "-WindowStyle Normal" in stop_arguments
-    assert "Read-Host" in stop_arguments
+    assert stop_arguments == f'"{Path(cli.__file__).resolve().with_name("assistant_stop_launcher.py")}"'
+    assert "Read-Host" not in stop_arguments
     assert "-WindowStyle Hidden" in start_arguments
 
 
