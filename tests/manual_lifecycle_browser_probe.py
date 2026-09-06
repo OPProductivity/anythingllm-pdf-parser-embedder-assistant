@@ -40,7 +40,8 @@ def main():
             assert len(requests) > before
         else:
             assert 'Assistant stopped through user intervention. Connection broken.' in page.locator('body').inner_text()
-            assert page.get_by_role('link', name='Launch again').get_attribute('href') == 'anythingllm-pdf-assistant://start'
+            assert page.locator('body').inner_text().strip() == 'Assistant stopped through user intervention. Connection broken.'
+            assert page.get_by_role('link').count() == 0
             assert len(requests) == before
         browser.close()
 

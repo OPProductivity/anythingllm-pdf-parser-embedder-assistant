@@ -107,12 +107,7 @@ document.addEventListener('DOMContentLoaded', () => {
         doc.head.append(style);
         const message = doc.createElement('p');
         message.textContent = 'Assistant stopped through user intervention. Connection broken.';
-        const link = doc.createElement('a');
-        link.href = 'anythingllm-pdf-assistant://start';
-        link.textContent = 'Launch again';
-        const hint = doc.createElement('p');
-        hint.textContent = 'Starts the assistant using its Windows launcher. Your browser may ask permission to open it.';
-        doc.body.append(message, link, hint);
+        doc.body.append(message);
         location.replace(URL.createObjectURL(new Blob(['<!doctype html>' + doc.documentElement.outerHTML], {type:'text/html'})));
       }
     };

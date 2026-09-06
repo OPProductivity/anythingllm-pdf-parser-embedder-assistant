@@ -154,10 +154,10 @@ anythingllm-pdf-assistant browser-launcher
 
 On Windows, installation/shortcut repair also registers a per-user
 `anythingllm-pdf-assistant://start` launcher. The stopped page's **Launch again**
-link invokes the same `start --browser` command as the Desktop shortcut, even
-when the server is off. A browser permission prompt may appear. The launcher
+link has been removed because browser activation was unreliable. Use the
+Desktop Start shortcut to launch the assistant again. The registered launcher
 accepts no commands or paths from the URI and does not run a background service.
-The offline stopped page itself remains a browser-local document; it makes no
+The offline stopped page shows only the stopped confirmation; it makes no
 reconnection requests. Unexpected disconnects still reconnect automatically.
 
 Production dependencies are declared in `pyproject.toml` and mirrored in
