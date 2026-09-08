@@ -5484,6 +5484,49 @@ def _layout_photographed_spread_columns(rows, width, height):
     }
 
 
+def _layout_short_or_offset_columns(rows, width, height):
+    """Recover clear prose gutters missed by the fixed-centre/full-height rule.
+
+    Only used after the established detector abstains. Require substantial
+    prose on both sides, simultaneous vertical coverage and an empty gutter.
+    Do not reinterpret tables, overlapping text or mixed full-width body text.
+    All retained rows are emitted exactly once, without modifying their text.
+    """
+    if width <= 0 or height <= 0:
+        return None
+    prose = [row for row in rows
+             if _layout_alpha_count(row.get("text")) >= 25
+             and len(str(row.get("text") or "").split()) >= 5
+             and row["x1"] - row["x0"] >= width * .28]
+    for split in sorted({row["x0"] for row in prose
+                         if width * .35 <= row["x0"] <= width * .65}):
+        left_prose = [row for row in prose if row["x1"] <= split - width * .006]
+        right_prose = [row for row in prose if row["x0"] >= split]
+        if len(left_prose) < 6 or len(right_prose) < 6:
+            continue
+        inner_left = max(row["x1"] for row in left_prose)
+        if split - inner_left > width * .10:
+            continue
+        overlap = (min(max(r["y1"] for r in left_prose), max(r["y1"] for r in right_prose))
+                   - max(min(r["y0"] for r in left_prose), min(r["y0"] for r in right_prose)))
+        if overlap < height * .10:
+            continue
+        # Small baseline differences do not turn the first column line into
+        # a full-width preamble. A genuine title must sit above both bodies.
+        body_start = min(row["y0"] for row in left_prose + right_prose) - 3
+        preamble = [row for row in rows if row["y1"] < body_start
+                    and row["x0"] < split - 1 and row["x1"] > inner_left]
+        body = [row for row in rows if row not in preamble]
+        left = [row for row in body if row["x1"] <= split - width * .003]
+        right = [row for row in body if row["x0"] >= split - 1]
+        if len(left) + len(right) != len(body):
+            continue
+        def key(row):
+            return row["y0"], row["x0"]
+        return sorted(preamble, key=key) + sorted(left, key=key) + sorted(right, key=key)
+    return None
+
+
 def _layout_reading_order(rows, width, height):
     """Use column-first reading order only with strong two-column evidence."""
     if not rows:
@@ -5542,6 +5585,9 @@ def _layout_reading_order(rows, width, height):
         ordered += sorted(body_left, key=lambda row: (row["y0"], row["x0"]))
         ordered += sorted(body_right, key=lambda row: (row["y0"], row["x0"]))
         return ordered, "two_column_column_first", None
+    recovered_columns = _layout_short_or_offset_columns(rows, width, height)
+    if recovered_columns is not None:
+        return recovered_columns, "two_column_column_first", None
     return sorted(rows, key=lambda row: (row["y0"], row["x0"])), "visual_line_order", None
 
 
