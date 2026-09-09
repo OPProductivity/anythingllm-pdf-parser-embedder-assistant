@@ -260,6 +260,47 @@ def _decode_font_text(text, method):
     )
 
 
+def _decode_selected_font_line(line, method, counts):
+    """Protect individual normal accented words, not their whole context.
+
+    Called only after selecting and validating a decoding hypothesis. A plain
+    accented name must not license preservation of neighboring encoded prose.
+    This cannot identify every mixed-font transition from text alone.
+    """
+    spans = []
+    for match in re.finditer(r"[^\W\d_]+(?:[-'’][^\W\d_]+)*", line):
+        word = match[0]
+        if (len(word) >= 2 and (word.islower() or word.istitle())
+                and all(_latin_letter(c) or c in "-'’" for c in word)
+                # A leading accented-looking value can be an unknown font
+                # glyph (e.g. an unrecovered ligature followed by letters).
+                # Require an interior accent after an ordinary ASCII letter.
+                and any(i > 0 and word[i-1].isascii() and word[i-1].isalpha()
+                        and ord(c) > 127 and _latin_letter(c) for i, c in enumerate(word))
+                and (not match.start() or line[match.start() - 1] in ' \t([{"')
+                and (match.end() == len(line) or line[match.end()] in ' \t.,;:!?)]}"')):
+            spans.append((match.start(), match.end()))
+
+    def decode_piece(raw):
+        decoded = _decode_font_text(raw, method)
+        if method != "standard_glyph_order":
+            # Unknown values in the encoded spans are not trustworthy accents.
+            # Do not apply this removal to the explicitly preserved words.
+            counts["unmapped_font_glyphs_removed"] += sum(ord(c) > 127 for c in decoded)
+            decoded = "".join(c for c in decoded if ord(c) < 128)
+        return decoded
+
+    parts = []
+    start = 0
+    for left, right in spans:
+        parts.extend((decode_piece(line[start:left]), line[left:right]))
+        start = right
+    parts.append(decode_piece(line[start:]))
+    if spans:
+        counts["readable_accented_words_preserved"] += len(spans)
+    return "".join(parts)
+
+
 def repair_font_encoded_text(text):
     """Bounded, text-only decoding hypothesis; never spellcheck ordinary prose.
 
@@ -305,11 +346,7 @@ def repair_font_encoded_text(text):
                         repaired.append(line)
                         counts["mixed_font_lines_left_unchanged"] += 1
                         continue
-                    if best[3] != "standard_glyph_order":
-                        # These remaining values belong to an unidentified
-                        # font encoding, not trustworthy Unicode accents.
-                        counts["unmapped_font_glyphs_removed"] += sum(ord(c) > 127 for c in decoded)
-                        decoded = "".join(c for c in decoded if ord(c) < 128)
+                    decoded = _decode_selected_font_line(line, best[3], counts)
                     repaired.append(decoded)
                 decoded = "".join(repaired)
                 # Some encodings retain a frequent control-valued word gap.
@@ -366,7 +403,7 @@ def prepare_readable_pages(pdf_path, pages, *, progress_callback=None):
             page["text"] = "\n\n".join(str(r.get("text") or "") for r in regions)
         output.append(page)
     return output, {
-        "schema_version": 2, "policy": "text_only_readable_v4",
+        "schema_version": 2, "policy": "text_only_readable_v5",
         "counts": dict(counts), "seconds": round(time.monotonic() - started, 3),
         "source_word_ocr_seconds": 0.0,
     }
