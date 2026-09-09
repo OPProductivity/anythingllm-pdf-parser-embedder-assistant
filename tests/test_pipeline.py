@@ -2912,7 +2912,10 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn('A browser-only preference must never open a', app.APP_BROWSER_THEME_HEAD)
         self.assertIn('document.addEventListener("pointerdown"', app.APP_BROWSER_THEME_HEAD)
         self.assertNotIn('rag-local-server-connection-watchdog', app.APP_BROWSER_THEME_HEAD)
-        self.assertNotIn('fetch("/healthz"', app.APP_BROWSER_THEME_HEAD)
+        # No recurring connection polling: the initial-mount recovery alone
+        # may make one bounded health request before its tab-local retry.
+        self.assertEqual(app.APP_BROWSER_THEME_HEAD.count('fetch("/healthz"'), 1)
+        self.assertNotIn('setInterval(', app.APP_BROWSER_THEME_HEAD)
         # Gradio's launch(js=...) contract requires a callback. Turning this
         # into an IIFE makes Gradio invoke it as an event preprocessor and can
         # erase every input for confirmation-click handlers.

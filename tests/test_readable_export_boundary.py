@@ -90,7 +90,7 @@ def test_damaged_text_never_opens_pdf_or_launches_ocr(tmp_path):
         output,evidence=hygiene.prepare_readable_pages(tmp_path/'absent.pdf',[{'page':1,'text':'con\x7frmation'}])
     assert output[0]['text']=='conrmation'
     assert evidence['source_word_ocr_seconds']==0
-    assert evidence['policy']=='text_only_readable_v5'
+    assert evidence['policy']=='text_only_readable_v7'
 
 
 def test_segment_offsets_use_cleaned_content():

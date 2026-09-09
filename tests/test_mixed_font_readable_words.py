@@ -24,7 +24,7 @@ def test_exact_body_and_name_preserved_together(method, name, position):
     out, evidence = h.prepare_readable_pages('not-opened.pdf', original)
     assert out[0]['text'] == expected
     assert original[0]['text'] == raw
-    assert evidence['policy'] == 'text_only_readable_v5'
+    assert evidence['policy'] == 'text_only_readable_v7'
     assert evidence['counts']['readable_accented_words_preserved'] >= 1
     assert h.prepare_readable_pages('not-opened.pdf', out)[0] == out
 

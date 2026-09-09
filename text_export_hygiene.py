@@ -277,8 +277,23 @@ def _decode_selected_font_line(line, method, counts):
                 # Require an interior accent after an ordinary ASCII letter.
                 and any(i > 0 and word[i-1].isascii() and word[i-1].isalpha()
                         and ord(c) > 127 and _latin_letter(c) for i, c in enumerate(word))
-                and (not match.start() or line[match.start() - 1] in ' \t([{"')
-                and (match.end() == len(line) or line[match.end()] in ' \t.,;:!?)]}"')):
+                and (not match.start() or line[match.start() - 1] in '\x03 \t([{"')
+                and (match.end() == len(line) or line[match.end()] in '\x03 \t.,;:!?)]}"')):
+            encoded_boundary = (
+                (match.start() > 0 and line[match.start() - 1] == '\x03')
+                or (match.end() < len(line) and line[match.end()] == '\x03')
+            )
+            # Glyph 3 is a space only in the selected standard table. Extend
+            # this boundary protection only to actual accented spellings:
+            # Latin click letters, for example, must not masquerade as accents.
+            # NFD is used for recognition only; the original word is retained.
+            if encoded_boundary and (
+                method != 'standard_glyph_order'
+                or not any(unicodedata.category(mark) == 'Mn'
+                           for char in word
+                           for mark in unicodedata.normalize('NFD', char))
+            ):
+                continue
             spans.append((match.start(), match.end()))
 
     def decode_piece(raw):
@@ -299,6 +314,114 @@ def _decode_selected_font_line(line, method, counts):
     if spans:
         counts["readable_accented_words_preserved"] += len(spans)
     return "".join(parts)
+
+
+_FRENCH_FUNCTION_WORDS = frozenset(
+    "le la les de des du un une et est sont qui que au aux dans sur par pour "
+    "avec pas ce cet cette ces se son sa ses en il ils elle elles ont comme "
+    "plus mais ou".split()
+)
+
+
+def _french_font_evidence(text):
+    words = re.findall(r"[^\W\d_]+", text.lower())
+    hits = [word for word in words if word in _FRENCH_FUNCTION_WORDS]
+    return len(hits), len(set(hits)), len(hits) / max(1, len(words))
+
+
+def _encoded_space_signature(text):
+    """Positive repeated glyph-gap evidence, not simply uppercase prose."""
+    tokens = re.findall(r"\x03([A-Za-z][^\x00-\x1f ]+)", text)
+    gaps = re.findall(r"[^\s\x00-\x1f]\x03(?=[^\s\x00-\x1f])", text)
+    return ((len(gaps) >= 6 and len(set(gaps)) >= 3)
+            or (len(tokens) >= 6 and len(set(tokens)) >= 4))
+
+
+def _keep_unresolved_font_boundaries(text, counts):
+    # Called only within a font-like span with a repeated encoded-space
+    # signature. Unknown letters are still left to the normal final cleanup.
+    # Do not invent (c), ^2, etc. from undecoded symbolic glyph values here.
+    counts["unresolved_font_gaps_preserved"] += text.count("\x03")
+    parts = []
+    for char in text:
+        category = unicodedata.category(char)
+        if char == "\x03":
+            parts.append(" ")
+        elif ord(char) > 127 and (category.startswith("S") or category == "No"):
+            counts["unresolved_font_symbols_removed"] += 1
+        else:
+            parts.append(char)
+    return "".join(parts)
+
+
+def _rescue_standard_glyph_window(text, counts):
+    """Narrow abstention fallback; never relax the ordinary decoder globally.
+
+    Standard glyph-valued word gaps plus independent lexical/field structure
+    may justify a short header, name-heavy references or French prose. The
+    decision stays inside this bounded window; no PDF access or OCR is used.
+    Return None without a structural signature. The final cleanup always runs.
+    """
+    if not _encoded_space_signature(text):
+        return None
+    candidate = _decode_font_text(text, "standard_glyph_order")
+    english = _language_evidence(candidate)
+    french = _french_font_evidence(candidate)
+    original = _language_evidence(text)
+    bibliography = (
+        len(re.findall(r"\b(?:18|19|20)\d{2}\b", candidate)) >= 2
+        and len(re.findall(r"(?m)^[A-Z][a-z]+, [A-Z][a-z]+", candidate)) >= 2
+    )
+    english_ok = (
+        english[0] >= 4 and english[1] >= 3 and english[2] >= .12
+        and english[0] >= original[0] + 3 and english[2] >= original[2] + .10
+    )
+    bibliography_ok = (
+        bibliography and english[0] >= 3 and english[1] >= 2
+        and english[2] >= .10 and english[0] >= original[0] + 3
+    )
+    french_ok = (
+        french[0] >= 8 and french[1] >= 5 and french[2] >= .18
+        and french[0] >= _french_font_evidence(text)[0] + 7
+    )
+    first_line = next((line.strip().casefold() for line in candidate.split("\n") if line.strip()), "")
+    field_ok = first_line in {"keywords", "key words"} and candidate.count(",") >= 3
+    if not (english_ok or bibliography_ok or french_ok or field_ok):
+        counts["encoded_gap_only_windows"] += 1
+        return _keep_unresolved_font_boundaries(text, counts)
+
+    output = []
+    for line in re.split(r"(\r\n|\n|\r)", text):
+        decoded = _decode_font_text(line, "standard_glyph_order")
+        before = _language_evidence(line)[0]
+        after = _language_evidence(decoded)[0]
+        if french_ok:
+            before = max(before, _french_font_evidence(line)[0])
+            after = max(after, _french_font_evidence(decoded)[0])
+        numerical = bool(
+            re.fullmatch(r"[\d\s.,:/()\-]+", decoded)
+            and len(re.findall(r"\d", decoded)) >= 2
+        )
+        heading = decoded.strip().casefold() in {"bibliography", "key words", "keywords", "résumé", "abstract"}
+        punctuation = bool(re.search(r"[\x0b\x0c\x0f-\x1d]", line)) and bool(re.search(r"[A-Za-z]", decoded))
+        supported = after > 0 or numerical or heading or line.count("\x03") >= 3 or punctuation
+        keyword_list = field_ok and decoded.count(",") >= 3 and line.count("\x03") >= 4
+        if line.strip() and (not supported or (before > 0 and after < before and not keyword_list)):
+            # Keep correctly decoded mixed-font prose. A rejected encoded
+            # continuation can retain its word gaps without borrowing a map.
+            output.append(line.replace("\x03", " "))
+            counts["signature_lines_left_unchanged"] += 1
+            continue
+        # Glyph 9 is '&' only when bracketed by encoded spaces. Ordinary tabs
+        # stay tabs, including in mixed-layout lines and outside this fallback.
+        pieces = re.split(r"(\x03\t\x03)", line)
+        output.append("".join(
+            " & " if piece == "\x03\t\x03"
+            else _decode_selected_font_line(piece, "standard_glyph_order", counts)
+            for piece in pieces
+        ))
+    counts["signature_rescued_windows"] += 1
+    return "".join(output)
 
 
 def repair_font_encoded_text(text):
@@ -366,8 +489,11 @@ def repair_font_encoded_text(text):
                 counts["font_decoded_input_characters"] += len(window)
                 counts["standard_glyph_windows" if best[3] == "standard_glyph_order" else "uniform_shift_windows"] += 1
             else:
-                output.append(window)
-                counts["font_like_unresolved_windows"] += 1
+                rescued_before = counts["signature_rescued_windows"]
+                rescued = _rescue_standard_glyph_window(window, counts)
+                output.append(window if rescued is None else rescued)
+                if counts["signature_rescued_windows"] == rescued_before:
+                    counts["font_like_unresolved_windows"] += 1
     return "".join(output), dict(counts)
 
 
@@ -403,7 +529,7 @@ def prepare_readable_pages(pdf_path, pages, *, progress_callback=None):
             page["text"] = "\n\n".join(str(r.get("text") or "") for r in regions)
         output.append(page)
     return output, {
-        "schema_version": 2, "policy": "text_only_readable_v5",
+        "schema_version": 2, "policy": "text_only_readable_v7",
         "counts": dict(counts), "seconds": round(time.monotonic() - started, 3),
         "source_word_ocr_seconds": 0.0,
     }

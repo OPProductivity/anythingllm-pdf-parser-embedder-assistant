@@ -1109,8 +1109,8 @@ APP_CONNECTION_WATCHDOG_HEAD = """
     // not when that tab's initial components have finished mounting.  Keep a
     // compact, theme-aware cover over that short interval so the user never
     // watches the File picker, batch picker, and output-mode block push one
-    // another down the page.  This guard is initial-page-only: it disconnects
-    // permanently before any PDF interaction can occur.
+    // another down the page. This guard is initial-page-only: recovery never
+    // reloads a page after usable controls appear or user interaction occurs.
     const installInitialShellGuard = () => {
       const mount = () => {
         if (!document.body || document.getElementById("rag-initial-ui-overlay")) return;
@@ -1129,13 +1129,38 @@ APP_CONNECTION_WATCHDOG_HEAD = """
           && document.querySelector("#output-mode-radio")
         );
         let settleTimer = 0;
+        let recoveryTimer = 0;
         let finished = false;
-        const finish = (force = false) => {
-          if (finished || (!force && !shellReady())) return;
+        let interacted = false;
+        const retryKey = "rag-initial-ui-retry";
+        const onInteraction = (event) => {
+          if (event.isTrusted) interacted = true;
+        };
+        for (const name of ["pointerdown", "keydown", "input", "change", "drop"]) {
+          document.addEventListener(name, onInteraction, true);
+        }
+        const dispose = () => {
           finished = true;
           window.clearTimeout(settleTimer);
+          window.clearTimeout(recoveryTimer);
           observer.disconnect();
-          document.documentElement.dataset.ragInitialUi = "ready";
+          for (const name of ["pointerdown", "keydown", "input", "change", "drop"]) {
+            document.removeEventListener(name, onInteraction, true);
+          }
+        };
+        const hasUsableControls = () => Boolean(document.querySelector(
+          "#automatic-pdf-upload, #choose-pdf-folder-button, #confirm-automatic-run-button, input, textarea, select"
+        ));
+        const finish = (force = false) => {
+          if (finished || (!force && !shellReady())) return;
+          if (shellReady()) {
+            dispose();
+            document.documentElement.dataset.ragInitialUi = "ready";
+            try { sessionStorage.removeItem(retryKey); } catch (_) {}
+          } else {
+            // The cosmetic cover's deadline is not evidence of a mounted app.
+            document.documentElement.dataset.ragInitialUi = "waiting";
+          }
           // Do not fade a partially updated Gradio tree through the cover.
           // The quiet-window gate below makes this removal occur only after
           // the completed shell is already visually stable.
@@ -1154,11 +1179,82 @@ APP_CONNECTION_WATCHDOG_HEAD = """
         };
         const observer = new MutationObserver(scheduleFinish);
         observer.observe(document.body, { childList: true, subtree: true });
+        const recoverInitialLoad = async () => {
+          if (finished) return;
+          if (shellReady()) { finish(true); return; }
+          // Never reload a partially usable page, selected files or a run.
+          // A health response proves reachability, not frontend readiness.
+          if (interacted || hasUsableControls()) { dispose(); return; }
+          let reachable = false;
+          const controller = new AbortController();
+          const deadline = window.setTimeout(() => controller.abort(), 4000);
+          try {
+            const response = await fetch("/healthz", { cache: "no-store", signal: controller.signal });
+            reachable = response.ok;
+          } catch (_) {
+            reachable = false;
+          } finally {
+            window.clearTimeout(deadline);
+          }
+          // Hydration or user interaction may have happened during the fetch.
+          if (finished) return;
+          if (shellReady()) { finish(true); return; }
+          if (interacted || hasUsableControls()) { dispose(); return; }
+          let retryAllowed = false;
+          if (reachable) {
+            try {
+              retryAllowed = sessionStorage.getItem(retryKey) !== "attempted";
+              if (retryAllowed) sessionStorage.setItem(retryKey, "attempted");
+            } catch (_) {
+              // Without durable tab-local storage, automatic retries could loop.
+              retryAllowed = false;
+            }
+          }
+          dispose();
+          overlay.remove();
+          if (retryAllowed) {
+            document.documentElement.dataset.ragInitialUi = "retrying";
+            window.location.reload();
+            return;
+          }
+          document.documentElement.dataset.ragInitialUi = "failed";
+          const notice = document.createElement("div");
+          notice.id = "rag-initial-ui-recovery";
+          notice.setAttribute("role", "alert");
+          const message = document.createElement("p");
+          message.textContent = reachable
+            ? "The assistant interface did not finish loading. Reload this page to try again."
+            : "The assistant server is not responding. Start it with the desktop shortcut, then reload this page.";
+          const retry = document.createElement("button");
+          retry.type = "button";
+          retry.textContent = "Reload page";
+          retry.addEventListener("click", () => window.location.reload());
+          notice.append(message, retry);
+          document.body.appendChild(notice);
+          // A very late successful mount must also remove this retry control,
+          // so it cannot remain beside a later file selection or active run.
+          const noticeObserver = new MutationObserver(() => {
+            if (!hasUsableControls()) return;
+            notice.remove();
+            noticeObserver.disconnect();
+          });
+          noticeObserver.observe(document.body, { childList: true, subtree: true });
+        };
         scheduleFinish();
         window.setTimeout(() => finish(true), 8000);
+        recoveryTimer = window.setTimeout(recoverInitialLoad, 20000);
       };
       if (document.body) mount();
-      else document.addEventListener("DOMContentLoaded", mount, { once: true });
+      else {
+        // A stalled deferred/module download can prevent DOMContentLoaded.
+        // Start the bounded guard as soon as the parser creates the body.
+        const mountObserver = new MutationObserver(() => {
+          if (!document.body) return;
+          mountObserver.disconnect();
+          mount();
+        });
+        mountObserver.observe(document.documentElement, { childList: true });
+      }
     };
     installInitialShellGuard();
   };
@@ -1204,6 +1300,13 @@ APP_THEME_FOUNDATION_HEAD = """
   #rag-initial-ui-overlay span { color: #2563eb; font-size: 28px; line-height: 1; text-align: center; }
   #rag-initial-ui-overlay strong { font-weight: 600; }
   html.dark #rag-initial-ui-overlay { background: #0f172a; color: #e5eefc; }
+  #rag-initial-ui-recovery {
+    position: fixed; bottom: 24px; left: 24px; right: 24px; z-index: 2147483001;
+    padding: 16px; border: 1px solid #64748b; border-radius: 8px;
+    background: #eef2f7; color: #1e293b; font: 16px/1.4 "Segoe UI", sans-serif;
+  }
+  html.dark #rag-initial-ui-recovery { background: #0f172a; color: #e5eefc; }
+  #rag-initial-ui-recovery button { padding: 8px 16px; cursor: pointer; }
 </style>
 """
 APP_BROWSER_THEME_HEAD = (
@@ -1237,6 +1340,13 @@ class LocalServerConnectionWatchdogMiddleware(BaseHTTPMiddleware):
             return response
 
         body = b"".join([chunk async for chunk in response.body_iterator])
+        # Root HTML contains live component configuration and parser-time code.
+        # Do not retain an obsolete shell across server restarts. Hashed static
+        # assets and all non-root responses keep their existing cache policy.
+        response.headers["Cache-Control"] = "no-store"
+        for header in ("ETag", "Last-Modified"):
+            if header in response.headers:
+                del response.headers[header]
         document = body.decode("utf-8", errors="replace")
         marker = 'id="rag-local-theme-controls"'
         if marker in document or "</head>" not in document.lower():
