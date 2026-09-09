@@ -14,6 +14,7 @@ does not prove a later one.
 """
 
 import argparse
+from text_export_hygiene import prepare_readable_pages, readable_export_text
 import csv
 import concurrent.futures
 from difflib import SequenceMatcher
@@ -4176,6 +4177,13 @@ def retain_successful_run_leanly(
     if not prepared_text_path.is_file():
         return {"applied": False, "reason": "prepared_text_missing"}
 
+    # Whole-file mode already retains the complete parsed transcript. Its one
+    # segment is an internal upload representation, not a second user export.
+    # Do this only at proven-success retention, leaving recovery evidence and
+    # all passage/page/custom-range exports unchanged.
+    if str(summary.get("segment_mode") or "").casefold() == "none":
+        retain_segment_files = False
+
     deleted = []
     selected_dir = prepared_text_path.parent
     # A caller can select an existing output directory. Lean retention owns
@@ -4450,6 +4458,7 @@ def retain_successful_run_leanly(
             ),
             "ocr_page_evidence": dict(summary.get("ocr_page_evidence") or {}),
             "native_layout_decisions": list(summary.get("native_layout_decisions") or []),
+            "text_export_hygiene": dict(summary.get("text_export_hygiene") or {}),
             "extraction_decision": dict(summary.get("extraction_decision") or {}),
             # The detailed review artifact is intentionally pruned for a
             # lean success, so retain just the non-content integrity facts.
@@ -6616,6 +6625,7 @@ def make_segments(
             source_meta.get("repeated_headers"),
             source_meta.get("repeated_footers"),
         )
+        page_raw, _ = readable_export_text(page_raw)
         outline_context = outline_context_for_page(outline, page_num, start_page, end_page)
         outline_chapter = outline_context.get("chapter") or ""
         if outline_context.get("part"):
@@ -6658,6 +6668,10 @@ def make_segments(
                 source_meta.get("repeated_headers"),
                 source_meta.get("repeated_footers"),
             )
+            # Final readable-text boundary precedes line maps, offsets and
+            # every segment/upload representation. Quality evidence above
+            # remains based on the untouched extraction, not cleaned damage.
+            raw, _ = readable_export_text(raw)
             page_line_map = build_page_line_map(raw)
             clean = page_line_map.get("clean_text") or normalize_page_layout_text(raw)
             credible_short_leaf = credible_short_page_leaf(clean)
@@ -7712,7 +7726,9 @@ def split_text_for_inline_markers(text, target_chars=320, hard_max_chars=480):
 
 
 def inline_marker_text(row, marker_style="short", target_chars=320, hard_max_chars=480):
-    marker = compact_marker(row, marker_style=marker_style)
+    # Rendered labels can contain Unicode author/title metadata even though
+    # segment content was already cleaned before offsets were assigned.
+    marker, _ = readable_export_text(compact_marker(row, marker_style=marker_style))
     blocks = split_text_for_inline_markers(
         row.get("text", ""),
         target_chars=target_chars,
@@ -24306,10 +24322,23 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                     if s.duplicate_of_page is not None
                 },
             }
+            def report_export_preparation(page_number):
+                report_upload_phase(
+                    "extraction",
+                    f"Preparing plain-text export formatting on PDF page {page_number}",
+                    completed_units=backend_index + 1,
+                    total_units=max(1, len(backend_names)),
+                    fallback_fraction=(backend_index + 1) / max(1, len(backend_names)),
+                    evidence_kind="text_export_sanitation",
+                )
+
+            segment_pages, text_export_hygiene = prepare_readable_pages(
+                pdf_path, pages, progress_callback=report_export_preparation,
+            )
             segments = make_segments(
                 pdf_path,
                 backend,
-                pages,
+                segment_pages,
                 start_page,
                 end_page,
                 candidate_source_meta,
@@ -24427,7 +24456,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 variant_segments = make_segments(
                     pdf_path,
                     backend,
-                    pages,
+                    segment_pages,
                     variant_start,
                     variant_end,
                     candidate_source_meta,
@@ -24507,6 +24536,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 # OCR candidate can reconcile the same physical pages. It is
                 # deliberately excluded from persisted candidate summaries.
                 "pages": pages,
+                "text_export_hygiene": text_export_hygiene,
                 "page_stats": [asdict(s) for s in stats],
                 "layout_evidence": layout_evidence,
                 "native_ocr_reconciliation": native_ocr_reconciliation,
@@ -27525,6 +27555,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             "backend_word_disagreement_resolution"
         ],
         "selected_backend": selected["backend"],
+        "text_export_hygiene": dict(selected.get("text_export_hygiene") or {}),
         "unstructured_selected_strategy": profile["unstructured_runtime"].get("selected_strategy"),
         "ocr_assisted_extraction_used": bool(ocr_evidence["used"]),
         "ocr_assisted_extraction_evidence": ocr_evidence["evidence"],
