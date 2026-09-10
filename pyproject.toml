@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "anythingllm-pdf-assistant"
-version = "0.5.4"
+version = "0.5.7"
 description = "Local PDF-to-text, OCR, page-aware chunking, and AnythingLLM Desktop upload assistant"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
@@ -79,6 +79,7 @@ py-modules = [
   "orchestration",
   "portable_paths",
   "server_lifecycle",
+  "server_exit_log",
   "post_upload_polling",
   "process_lock",
   "prepared_recovery",

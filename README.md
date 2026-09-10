@@ -147,6 +147,19 @@ The desktop installer creates Start and Stop shortcuts.
 The Stop shortcut runs without a terminal window. Successful stops are silent;
 ownership refusals or other failures display a small error dialog instead.
 
+For unattended use and agent-operated restarts on Windows, use the Desktop
+Start shortcut's detached `Start-Process -WindowStyle Hidden` method. Do not
+leave the production server attached to an interactive/tool command session.
+The assistant has no configured idle shutdown timer.
+
+Rare lifecycle events are retained in `logs/server-lifecycle.jsonl` (128 KB
+plus one rotated backup): startup, normal return, caught failures, interrupts,
+intentional Stop outcomes, and discovery of a previous ownership marker.
+Exception type and code locations are recorded without exception messages,
+credentials or document text. Logging failure does not block Start or Stop.
+A hard kill/power loss cannot log its own cause; a marker discovered at the
+next start records an unknown previous exit, not a fabricated exit time/code.
+
 You can also run:
 
 ```powershell

@@ -7868,31 +7868,8 @@ def create_fresh_automatic_run_root(output_root_base, *, prefix="r"):
     raise OSError("Could not reserve a fresh automatic run folder after 999 attempts.")
 
 
-def flat_no_logs_batch_output_folder_name(pdf_paths, parent=None):
-    """Name a user-visible compact export from its first and last PDF."""
-    paths = [Path(path) for path in pdf_paths or []]
-    if not paths:
-        return "parsed-pdfs"
-    first = safe_stem(paths[0].stem) or "document"
-    last = safe_stem(paths[-1].stem) or "document"
-    preferred = first if len(paths) == 1 else f"{first}--{last}"
-    if parent is None:
-        return preferred[:120].rstrip("-._ ") or "parsed-pdfs"
-    available = 250 - len(str(Path(parent))) - 1
-    if available < 16:
-        raise OSError("Output root is too long for a Windows-compatible local export folder.")
-    if len(preferred) <= available:
-        return preferred
-    if len(paths) == 1:
-        return first[:available].rstrip("-._ ") or "document"
-    separator = "--"
-    first_limit = max(1, (available - len(separator)) // 2)
-    last_limit = max(1, available - len(separator) - first_limit)
-    return f"{first[:first_limit].rstrip('-._ ')}{separator}{last[:last_limit].rstrip('-._ ')}"
-
-
 def promote_flat_no_logs_batch_output(output_root, temporary_run_dir, pdf_paths, summaries):
-    """Promote successful no-log document exports into one named batch folder.
+    """Promote successful no-log document exports into one timestamped folder.
 
     The worker still stages output in a uniquely owned ``r-*`` directory while
     it is running. Once every document is ready, only its plain-text export is
@@ -7902,15 +7879,6 @@ def promote_flat_no_logs_batch_output(output_root, temporary_run_dir, pdf_paths,
     """
     base = Path(output_root)
     run_root = Path(temporary_run_dir)
-    name = flat_no_logs_batch_output_folder_name(pdf_paths, parent=base)
-    target = base / name
-    for suffix in range(2, 1000):
-        if not target.exists():
-            break
-        target = base / f"{name}-{suffix}"
-    else:
-        raise OSError("Could not reserve a unique local export folder after 998 retries.")
-
     document_dirs = []
     for summary in summaries or []:
         upload_file = Path(str((summary or {}).get("upload_file") or ""))
@@ -7941,7 +7909,9 @@ def promote_flat_no_logs_batch_output(output_root, temporary_run_dir, pdf_paths,
     if len(names) != len(set(names)):
         raise FileExistsError("No-log batch export would create duplicate filenames.")
 
-    target.mkdir(parents=True, exist_ok=False)
+    # Use the same short, atomically reserved names as ordinary app runs.
+    # Do not reuse the staging directory: its receipts are cleaned afterwards.
+    target = create_fresh_automatic_run_root(base)
     for _source_dir, child in planned:
         shutil.move(str(child), str(target / child.name))
     for summary in summaries or []:
@@ -32846,7 +32816,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                         scale=1,
                     )
                     include_front_matter = gr.Checkbox(value=True, label="Include foreword/preface", min_width=0, scale=1)
-                    include_back_matter = gr.Checkbox(value=True, label="Include notes/bibliography/index", min_width=0, scale=1)
+                    include_back_matter = gr.Checkbox(value=True, label="Include bibliography/index/end notes", min_width=0, scale=1)
                 segment_mode = gr.Dropdown(
                     choices=[
                         SEGMENT_NONE_LABEL,
@@ -35443,7 +35413,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 with gr.Row():
                     future_defaults_deep_extraction = gr.Checkbox(value=editor_builtin_defaults["deep_extraction"], label="Force Unstructured")
                     future_defaults_front_matter = gr.Checkbox(value=editor_builtin_defaults["include_front_matter"], label="Include foreword/preface")
-                    future_defaults_back_matter = gr.Checkbox(value=editor_builtin_defaults["include_back_matter"], label="Include notes/bibliography/index")
+                    future_defaults_back_matter = gr.Checkbox(value=editor_builtin_defaults["include_back_matter"], label="Include bibliography/index/end notes")
                     future_defaults_inline_fallback = gr.Checkbox(value=editor_builtin_defaults["generate_inline_fallback"], label="Generate inline metadata fallback files")
                 with gr.Row():
                     future_defaults_backend = gr.Dropdown(
@@ -35698,7 +35668,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                         scale=1,
                     )
                     advanced_include_front_matter = gr.Checkbox(value=True, label="Include foreword/preface", min_width=0, scale=1)
-                    advanced_include_back_matter = gr.Checkbox(value=True, label="Include notes/bibliography/index", min_width=0, scale=1)
+                    advanced_include_back_matter = gr.Checkbox(value=True, label="Include bibliography/index/end notes", min_width=0, scale=1)
                 advanced_unstructured_strategy = gr.Dropdown(
                     choices=["auto", "fast", "hi_res", "ocr_only"],
                     value="auto",

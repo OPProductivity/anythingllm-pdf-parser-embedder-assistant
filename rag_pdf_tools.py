@@ -37,6 +37,8 @@ from multiprocessing import get_context
 from pathlib import Path
 from typing import Any
 
+from portable_paths import package_resource_path
+
 try:
     import fitz
 except ImportError:
@@ -639,7 +641,7 @@ def _unstructured_ocr_checkpoint_identity(pdf_path: Path, strategy: str, runtime
     """Return stable, non-sensitive identity fields for a run-local checkpoint.
 
     A checkpoint hit must never cross a source change, strategy change,
-    package upgrade, or Tesseract executable change. The caller supplies a
+    assistant/package upgrade, or Tesseract executable change. The caller supplies a
     directory inside the current run, preventing reuse by independent runs.
     """
     source = Path(pdf_path)
@@ -655,6 +657,7 @@ def _unstructured_ocr_checkpoint_identity(pdf_path: Path, strategy: str, runtime
         tesseract_identity = {"path": str(tesseract_path), "missing": True}
     return {
         "schema_version": UNSTRUCTURED_OCR_CHECKPOINT_SCHEMA_VERSION,
+        "assistant_version": package_resource_path("VERSION").read_text(encoding="utf-8").strip(),
         "source_sha256": _versioned_file_sha256(source),
         "strategy": str(strategy or "").casefold(),
         "unstructured_version": _unstructured_package_version(),

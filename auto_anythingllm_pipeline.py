@@ -43,7 +43,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import ssl
-from collections import Counter
+from collections import Counter, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
@@ -5146,10 +5146,56 @@ def _layout_text_key(text):
     return re.sub(r"\s+", " ", value).strip(" -–—|#")
 
 
+def _layout_ligature_space_repair(chars, font_size):
+    """Remove only spaces geometrically inside a ligature, never guess a word."""
+    result, removed = [], 0
+    for index, char in enumerate(chars):
+        if char.get("c") == " " and 0 < index < len(chars) - 1:
+            before, after = chars[index - 1], chars[index + 1]
+            if before.get("c") in {"ﬀ", "ﬁ", "ﬂ", "ﬃ", "ﬄ", "ﬅ", "ﬆ"} and str(after.get("c", "")).isalpha():
+                b, space = before["bbox"], char["bbox"]
+                tolerance = max(.1, float(font_size) * .08)
+                # A genuine word space starts AFTER the ligature. In damaged
+                # typesetting its advance can instead lie inside that glyph.
+                if (space[0] >= b[0] and space[2] <= b[2] + .05
+                        and abs(after["origin"][0] - b[2]) <= tolerance
+                        and abs(before["origin"][1] - after["origin"][1]) <= .1):
+                    removed += 1
+                    continue
+        result.append(char["c"])
+    return "".join(result), removed
+
+
+def _layout_repair_ligature_spans(page, blocks):
+    """Inspect character geometry only on pages with a ligature-space signal."""
+    suspect = [span for block in blocks if block.get("type") == 0
+               for line in block.get("lines", []) for span in line.get("spans", [])
+               if re.search(r"[ﬀﬁﬂﬃﬄﬅﬆ] [^\W\d_]", span.get("text", ""))]
+    if not suspect:
+        return
+    raw = page.get_text("rawdict", flags=fitz.TEXTFLAGS_RAWDICT & ~fitz.TEXT_PRESERVE_IMAGES)
+    indexed = {}
+    for block in raw.get("blocks", []):
+        for line in block.get("lines", []):
+            if tuple(line.get("dir", (1, 0))) != (1, 0):
+                continue
+            for span in line.get("spans", []):
+                indexed[(tuple(span.get("bbox", ())), span.get("font"))] = span
+    for span in suspect:
+        source = indexed.get((tuple(span.get("bbox", ())), span.get("font")))
+        if source and "".join(c["c"] for c in source["chars"]) == span["text"]:
+            text, count = _layout_ligature_space_repair(source["chars"], source["size"])
+            if count:
+                span["text"] = text
+                span["native_ligature_space_repairs"] = count
+
+
 def _layout_line_rows(page):
-    """Return positioned native text lines; no OCR or content mutation occurs here."""
+    """Return native lines, repairing only source-proven overlapping spaces."""
     rows = []
-    for block in page.get_text("dict", sort=False).get("blocks", []):
+    blocks = page.get_text("dict", sort=False).get("blocks", [])
+    _layout_repair_ligature_spans(page, blocks)
+    for block in blocks:
         if block.get("type") != 0:
             continue
         for line in block.get("lines", []):
@@ -5166,6 +5212,7 @@ def _layout_line_rows(page):
                     "x1": float(bbox[2]), "y1": float(bbox[3]),
                     "font_sizes": [float(span.get("size") or 0) for span in spans],
                     "fonts": [str(span.get("font") or "") for span in spans],
+                    "native_ligature_space_repairs": sum(span.get("native_ligature_space_repairs", 0) for span in spans),
                     # Preserve the positioned pieces as well as the flattened
                     # line.  On a poor historical scan, a handwritten margin
                     # note may be appended to an otherwise good body line.
@@ -5600,6 +5647,75 @@ def _layout_reading_order(rows, width, height):
     return sorted(rows, key=lambda row: (row["y0"], row["x0"])), "visual_line_order", None
 
 
+def _layout_refine_reading_order(rows, ordered, order, width, height):
+    """Refine explicit native layout cases without deleting or rewriting rows.
+
+    This is not a general column detector. Photograph/spread regions bypass
+    it; existing ordering is retained unless one of the narrow guards matches.
+    """
+    reasons = []
+
+    def visual(values):
+        return sorted(values, key=lambda row: (row["y0"], row["x0"]))
+
+    narrow = [row for row in rows if row["x1"] - row["x0"] < width * .30]
+    full = [row for row in rows if row["x1"] - row["x0"] > width * .60]
+    if (order == "two_column_column_first" and len(narrow) >= 20 and len(full) >= 3
+            and sum(len(row["normalized"].split()) <= 3 for row in narrow) >= .85 * len(narrow)):
+        # Justified text can expose each word as a separate line. Those word
+        # fragments do not establish two columns alongside full-width prose.
+        ordered, order = visual(rows), "visual_line_order"
+        reasons.append("fragmented_single_column")
+
+    boundary = next((row for row in rows if re.fullmatch(r"about the authors?", row["normalized"], re.I)), None)
+    if order == "visual_line_order" and boundary:
+        top = [row for row in rows if row["y1"] < boundary["y0"]]
+        left = [row for row in top if row["x1"] < width * .50]
+        right = [row for row in top if row["x0"] >= width * .50]
+        citations = sum(bool(re.search(r"\([12]\d{3}\)\.", row["text"])) for row in top)
+        if (len(left) >= 3 and len(right) >= 3 and len(left) + len(right) == len(top)
+                and citations >= 2 and any("doi.org/" in row["text"] for row in top)):
+            ordered = visual(left) + visual(right) + visual([row for row in rows if row not in top])
+            reasons.append("short_reference_zone")
+
+    abstract = next((row for row in rows if re.sub(r"\s+", "", row["normalized"]).casefold() == "abstract"), None)
+    keywords = next((row for row in rows if row["normalized"].casefold() == "keywords:"), None)
+    if (abstract and keywords and keywords["x1"] < abstract["x0"]
+            and abs(keywords["y0"] - abstract["y0"]) < height * .06):
+        group = [keywords]
+        for row in visual(rows):
+            if (row["y0"] <= keywords["y0"] or abs(row["x0"] - keywords["x0"]) > 3
+                    or row["x1"] >= abstract["x0"] - 3):
+                continue
+            if (row["y0"] - group[-1]["y1"] > max(keywords["font_sizes"] or [0]) * 1.2
+                    or len(row["normalized"].split()) > 5 or len(group) >= 12):
+                break
+            group.append(row)
+        if len(group) >= 3:
+            identities = {id(row) for row in group}
+            remaining = [row for row in ordered if id(row) not in identities]
+            position = remaining.index(abstract)
+            ordered = remaining[:position] + group + remaining[position:]
+            reasons.append("keyword_sidebar")
+
+    anchor = next((row for row in rows if re.match(
+        r"All correspondence should be directed\b", row["normalized"], re.I
+    ) and row["y0"] > height * .65), None)
+    if anchor and anchor["x1"] - anchor["x0"] < width * .50:
+        column_left = anchor["x0"] < width * .50
+        group = [row for row in rows if row["y0"] >= anchor["y0"]
+                 and (row["x1"] < width * .51 if column_left else row["x0"] >= width * .49)
+                 and max(row["font_sizes"] or [0]) <= max(anchor["font_sizes"] or [0]) + .1]
+        if (len(group) >= 3 and any("@" in row["text"] for row in group)
+                and any("published" in row["text"].casefold() for row in group)):
+            # Preserve publisher furniture after the body rather than broaden
+            # the separate footnote-exclusion policy to unnumbered prose.
+            identities = {id(row) for row in group}
+            ordered = [row for row in ordered if id(row) not in identities] + visual(group)
+            reasons.append("correspondence_tail")
+    return ordered, order, reasons
+
+
 def _layout_has_scan_background(pdf_path, page_number):
     """Margin handwriting recovery requires an actual page-sized raster."""
     with fitz.open(pdf_path) as document:
@@ -5629,6 +5745,279 @@ def native_layout_ocr_page_evidence(layout_evidence, *, start_page=1, end_page=N
     return ledger
 
 
+def _layout_note_marker(row):
+    # A decimal table cell is not a footnote marker: require a boundary after
+    # punctuation rather than accepting the dot in e.g. "91.3".
+    return re.match(r"^\s*(\d{1,3}|[*†‡])(?:[.)\]](?=\s|$)|\s)", row["normalized"])
+
+
+def _layout_note_units(rows):
+    """Classification-only joins of detached markers; preserve original rows."""
+    used, units = set(), []
+    for index, row in enumerate(rows):
+        if index in used:
+            continue
+        unit = {**row, "source_rows": [row]}
+        if re.fullmatch(r"\d{1,3}[.)]?|[*†‡]", row["normalized"]):
+            choices = [(j, other) for j, other in enumerate(rows)
+                       if j != index and j not in used
+                       and abs(other["y1"] - row["y1"]) <= max(row["font_sizes"] or [8]) * .7
+                       and 0 <= other["x0"] - row["x1"] <= 25
+                       and len(other["normalized"]) > 12]
+            if choices:
+                j, other = min(choices, key=lambda pair: pair[1]["x0"])
+                unit.update(normalized=row["normalized"] + " " + other["normalized"],
+                            x1=other["x1"], y0=min(row["y0"], other["y0"]),
+                            y1=max(row["y1"], other["y1"]), font_sizes=other["font_sizes"],
+                            source_rows=[row, other])
+                used.add(j)
+        used.add(index)
+        units.append(unit)
+    return sorted(units, key=lambda row: (row["y0"], row["x0"]))
+
+
+def _layout_reference_note_blocks(rows, width, height, rules, protected):
+    """Match raised body references to contiguous, smaller lower-page notes.
+
+    The matched prose font is the baseline, not a page-wide statistic which
+    can itself be dominated by footnotes. No OCR, vocabulary or source-name
+    rules are used. Geometry checks work only on already extracted rows.
+    """
+    references = defaultdict(list)
+    for row in rows:
+        if len(row["normalized"]) < 25:
+            continue
+        spans = row.get("spans", [])
+        prose = [span for span in spans if len(span["text"].strip()) >= 12]
+        if not prose:
+            continue
+        size = max(prose, key=lambda span: len(span["text"]))["size"]
+        for span in spans:
+            marker = span["text"].strip()
+            if (re.fullmatch(r"\d{1,3}|[*†‡]", marker) and span["size"] <= size - 1
+                    and span["y1"] < row["y1"] - 1):
+                references[marker].append((row["y1"], size))
+    if not references:
+        return []
+    units, groups, covered = _layout_note_units(rows), [], set()
+    for start in units:
+        marker = _layout_note_marker(start)
+        if not marker or start["y0"] < height * .45 or protected(start):
+            continue
+        body_size = next((size for y, size in references.get(marker[1], []) if y < start["y0"]), 0)
+        if not body_size or not start["font_sizes"] or max(start["font_sizes"]) > body_size - 1.5:
+            continue
+        separator = any(height * .35 < y < start["y0"] and start["y0"] - y < 24
+                        and abs(x0 - start["x0"]) < 8 and width * .04 < x1 - x0 < width * .65
+                        for x0, y, x1 in rules)
+        above = [row for row in units if row["y1"] < start["y0"]
+                 and row["x0"] < start["x0"] + 40 and row["x1"] > start["x0"] + 30]
+        if not above or (start["y0"] - max(row["y1"] for row in above) < body_size * .5 and not separator):
+            continue
+        group = []
+        for row in units:
+            if row["y0"] < start["y0"] - .1 or not start["x0"] - 40 <= row["x0"] <= start["x0"] + 40:
+                continue
+            if (not row["font_sizes"] or max(row["font_sizes"]) > body_size - 1.5 or protected(row)
+                    or (group and row["y0"] - group[-1]["y1"] > max(start["font_sizes"]) * 1.6)):
+                break
+            group.append(row)
+        # Matched references also identify genuine one-line citations. Keep
+        # tiny labels out; the raised-reference, font, gap and position gates
+        # above still apply, unlike the unreferenced legacy lower-page route.
+        note_chars = sum(len(row["normalized"]) for row in group)
+        meaningful = (len(group) >= 2 and note_chars >= 60) or (len(group) == 1 and note_chars >= 40)
+        if not meaningful or group[-1]["y1"] < height * .78:
+            continue
+        # A referenced note can follow an unnumbered continuation. Extend only
+        # within the same small-font block bounded above by a real separator.
+        separators = [(x0, y, x1) for x0, y, x1 in rules
+                      if height * .35 <= y < start["y0"]
+                      and abs(x0 - start["x0"]) <= 40
+                      and width * .04 < x1 - x0 < width * .90]
+        if separators:
+            rule = max(separators, key=lambda item: item[1])
+            before = [row for row in units if rule[1] < row["y0"] < start["y0"] - .1
+                      and start["x0"] - 40 <= row["x0"] <= start["x0"] + 40]
+            chain = before + [start]
+            if (before and before[0]["y0"] - rule[1] <= 24
+                    and all(row["font_sizes"] and max(row["font_sizes"]) <= body_size - 1.5
+                            and not protected(row)
+                            and not re.search(r"©|\bcopyright\b|\ball rights reserved\b", row["normalized"], re.I)
+                            for row in before)
+                    and all(b["y0"] - a["y1"] <= max(start["font_sizes"]) * 1.6
+                            for a, b in zip(chain, chain[1:]))):
+                group = before + group
+        originals = [original for row in group for original in row["source_rows"]]
+        identities = {id(row) for row in originals}
+        if not identities <= covered:
+            covered.update(identities)
+            groups.append(originals)
+    return groups
+
+
+def _layout_numeric_table_cells(rows, height):
+    """Do not mistake a same-font numeric grid at the margin for page numbers."""
+    numeric = [row for row in rows if re.fullmatch(r"[-+]?\d+(?:[.,]\d+)?\s*%?", row["normalized"])]
+    protected = set()
+    for row in numeric:
+        if not (row["y1"] <= height * .15 or row["y0"] >= height * .90):
+            continue
+        size = max(row["font_sizes"] or [10])
+        cy = (row["y0"] + row["y1"]) / 2
+        peer = any(other is not row and abs(max(other["font_sizes"] or [0]) - size) <= 1
+                   and abs((other["y0"] + other["y1"]) / 2 - cy) < size * .6
+                   and (other["x0"] > row["x1"] + 2 or other["x1"] < row["x0"] - 2)
+                   for other in numeric)
+        aligned = peer and any(other is not row
+                              and size * .5 < abs(other["y0"] - row["y0"]) < size * 5
+                              and abs(other["x1"] - row["x1"]) < max(3, size * .5)
+                              for other in numeric)
+        if aligned:
+            protected.add(id(row))
+    return protected
+
+
+def _layout_note_groups(rows, width, height, body_size, rules=(), *, disabled=False):
+    """Keep established notes; extend with separator or matched-reference evidence.
+
+    Explicit end-matter headings belong to the later inclusion policy. All
+    returned rows are original objects; this function never alters their text.
+    """
+    excluded, groups, candidates = set(), [], []
+    if disabled or not body_size:
+        return excluded, groups, candidates
+
+    def small(row):
+        return bool(row["font_sizes"] and max(row["font_sizes"]) <= body_size - 1.5)
+
+    def lower(row):
+        return small(row) and row["y0"] >= height * .78
+
+    headings = [row for row in rows if re.fullmatch(
+        r"(?:references|bibliography|end\s*notes|notes|works cited|(?:table of )?contents|learning outcomes(?: of the course unit)?)[:.]?", row["normalized"], re.I
+    )]
+
+    def protected(row):
+        return bool(re.match(r"^\s*\d{1,4}\s*\(\d[^)]*\)\s*[,;:]\s*\d", row["normalized"])) or any(
+            row["y0"] > heading["y0"] and row["x0"] >= heading["x0"] - 3
+            and (heading["x0"] >= width * .5 or row["x0"] < width * .5)
+            for heading in headings
+        )
+
+    def add(group, reason):
+        fresh = [row for row in group if id(row) not in excluded]
+        if not fresh:
+            return
+        excluded.update(id(row) for row in group)
+        groups.append({
+            "text": " ".join(row["normalized"] for row in fresh),
+            "reason": reason, "line_count": len(fresh),
+            "bbox": [min(row["x0"] for row in fresh), min(row["y0"] for row in fresh),
+                     max(row["x1"] for row in fresh), max(row["y1"] for row in fresh)],
+        })
+
+    for x0, y, x1 in rules:
+        if not height * .65 <= y <= height * .85 or not width * .04 <= x1 - x0 <= width * .5:
+            continue
+        after = sorted([row for row in rows if row["y0"] > y and row["x0"] >= x0 - 3],
+                       key=lambda row: (row["y0"], row["x0"]))
+        if (not after or after[0]["y0"] - y > 24 or abs(after[0]["x0"] - x0) > 4
+                or not _layout_note_marker(after[0])):
+            continue
+        first, group = after[0], []
+        for row in after:
+            if (not small(row) or protected(row) or abs(row["x0"] - first["x0"]) > 18
+                    or (group and row["y0"] - group[-1]["y1"] > max(first["font_sizes"]) * 2)
+                    or row["y0"] - first["y0"] > height * .28):
+                break
+            group.append(row)
+        numbers = [int(match[1]) for row in group
+                   if (match := _layout_note_marker(row)) and match[1].isdigit()]
+        if (len(numbers) >= 2 and all(b == a + 1 for a, b in zip(numbers, numbers[1:]))
+                and any(lower(row) for row in group)
+                and sum(len(row["normalized"]) for row in group) >= 45):
+            add(group, "separator_confirmed_footnote_block")
+
+    for group in _layout_reference_note_blocks(rows, width, height, rules, protected):
+        add(group, "body_reference_confirmed_footnote_block")
+
+    for index, row in enumerate(rows):
+        if id(row) in excluded or not lower(row) or not _layout_note_marker(row) or protected(row):
+            continue
+        group, previous_y = [row], row["y1"]
+        for following in rows[index + 1:]:
+            if (following["y0"] < row["y0"] or following["y0"] - previous_y > 42
+                    or not lower(following) or protected(following)):
+                break
+            group.append(following)
+            previous_y = following["y1"]
+        if len(group) >= 2 and sum(len(item["normalized"]) for item in group) >= 45:
+            add(group, "high_confidence_lower_page_footnote")
+        else:
+            candidates.append({"text": row["normalized"],
+                               "bbox": [row["x0"], row["y0"], row["x1"], row["y1"]]})
+    return excluded, groups, candidates
+
+
+def _layout_note_separator_rules(page, rows):
+    if not any(row["y0"] >= page.rect.height * .45 and
+               (_layout_note_marker(row) or re.fullmatch(r"\d{1,3}[.)]?|[*†‡]", row["normalized"])) for row in rows):
+        return [], "not_required"
+    try:
+        rules = []
+        for drawing in page.get_drawings():
+            for item in drawing["items"]:
+                if item[0] == "l" and abs(item[1].y - item[2].y) <= .5:
+                    rules.append((min(item[1].x, item[2].x), item[1].y, max(item[1].x, item[2].x)))
+                elif item[0] == "re" and item[1].height <= 1:
+                    rules.append((item[1].x0, item[1].y0, item[1].x1))
+        return rules, "inspected"
+    except Exception:
+        # Drawing evidence is optional. A malformed graphics stream must not
+        # turn a successful native text parse into a failed preparation.
+        return [], "unavailable"
+
+
+def _reconcile_layout_note_evidence(evidence, pages):
+    """Report exclusions of the chosen pages, not only the nominal backend."""
+    by_page = {int(row["pdf_page"]): dict(row) for row in evidence.get("pages", [])}
+    for page in pages:
+        if "layout_excluded_footnotes" not in page:
+            continue
+        number = int(page["page"])
+        row = by_page.setdefault(number, {"pdf_page": number})
+        row["excluded_footnotes"] = list(page["layout_excluded_footnotes"])
+        row["note_candidates_retained"] = list(page.get("layout_note_candidates", []))
+        row["note_evidence_origin"] = "selected_native_page"
+    chosen = {int(page["page"]) for page in pages}
+    result = dict(evidence)
+    result["pages"] = [row for number, row in sorted(by_page.items()) if number in chosen]
+    result["excluded_footnote_count"] = sum(len(row.get("excluded_footnotes", [])) for row in result["pages"])
+    result["note_candidates_retained_count"] = sum(len(row.get("note_candidates_retained", [])) for row in result["pages"])
+    result["note_evidence_scope"] = "selected_reconciled_pages"
+    return result
+
+
+def _layout_vertical_copyright_key(row, width):
+    """Identify explicit notices in a narrow outer vertical strip, not prose.
+
+    A key is only a candidate; the caller also requires distinct-page reuse.
+    Central copyright pages, author affiliations and ordinary discussion of
+    copyright are not selected by this margin-only rule.
+    """
+    text = normalize_text(row["text"])
+    if not re.match(r"^(?:copyright\b|©)", text, flags=re.I):
+        return ""
+    if not re.search(r"\b(?:19|20)\d{2}\b", text):
+        return ""
+    row_width = max(1.0, row["x1"] - row["x0"])
+    if (row["y1"] - row["y0"] <= row_width * 3
+            or not (row["x1"] <= width * .15 or row["x0"] >= width * .85)):
+        return ""
+    return text.casefold()
+
+
 def apply_region_aware_native_layout(pdf_path, pages, progress_callback=None):
     """Create conservative semantic text from positioned native PDF lines.
 
@@ -5646,15 +6035,23 @@ def apply_region_aware_native_layout(pdf_path, pages, progress_callback=None):
         for page_number in range(1, page_total + 1):
             page = document.load_page(page_number - 1)
             rows = _layout_line_rows(page)
+            note_rules, note_rule_status = _layout_note_separator_rules(page, rows)
             page_layouts[page_number] = {
                 "width": float(page.rect.width), "height": float(page.rect.height), "rows": rows,
+                "note_separator_rules": note_rules, "note_separator_scan": note_rule_status,
             }
             if progress_callback:
                 progress_callback(page_number, page_total, "native_layout_scan")
     top_counts = Counter()
     bottom_counts = Counter()
+    copyright_counts = Counter()
     for layout in page_layouts.values():
+        top_keys, bottom_keys = set(), set()
+        copyright_keys = set()
         for row in layout["rows"]:
+            copyright_key = _layout_vertical_copyright_key(row, layout["width"])
+            if copyright_key:
+                copyright_keys.add(copyright_key)
             # PDF media boxes sometimes retain a large blank printer margin.
             # In those files a visually top-of-page running head can sit at
             # thirteen percent of the coordinate height. The broader band is
@@ -5671,11 +6068,15 @@ def apply_region_aware_native_layout(pdf_path, pages, progress_callback=None):
             ):
                 key = _layout_text_key(row["text"])
                 if key:
-                    top_counts[key] += 1
+                    top_keys.add(key)
             if row["y0"] >= layout["height"] * 0.90 and not _layout_is_number(row["text"]):
                 key = _layout_text_key(row["text"])
                 if key:
-                    bottom_counts[key] += 1
+                    bottom_keys.add(key)
+        # Repeated means distinct pages, not duplicate cells/labels on one page.
+        top_counts.update(top_keys)
+        bottom_counts.update(bottom_keys)
+        copyright_counts.update(copyright_keys)
     # Journals commonly alternate a running author header with a running title
     # header. In a short five-page article, each legitimate repeating header
     # may therefore occur only twice. Two exact top-margin repetitions are
@@ -5774,12 +6175,17 @@ def apply_region_aware_native_layout(pdf_path, pages, progress_callback=None):
         # The upper quartile is a safer body-text baseline than the median on
         # a short page dominated by a multi-line footnote.
         body_text_size = body_sizes[min(len(body_sizes) - 1, math.ceil(len(body_sizes) * 0.75))] if body_sizes else 0
+        table_cells = _layout_numeric_table_cells(layout_rows, layout_height)
         for row in layout_rows:
             top = row["y1"] <= layout["height"] * 0.15
             bottom = row["y0"] >= layout["height"] * 0.90
             key = _layout_text_key(row["text"])
             reason = ""
-            if (top or bottom) and _layout_is_number(row["text"]):
+            if id(row) in table_cells:
+                pass
+            elif copyright_counts.get(_layout_vertical_copyright_key(row, layout["width"]), 0) >= 2:
+                reason = "repeated_vertical_copyright_notice"
+            elif (top or bottom) and _layout_is_number(row["text"]):
                 reason = "positioned_page_number"
             elif top and top_counts.get(key, 0) >= repeat_threshold:
                 reason = "repeated_running_header"
@@ -5806,45 +6212,20 @@ def apply_region_aware_native_layout(pdf_path, pages, progress_callback=None):
                     retained_body_rows.append(row)
             body_rows = retained_body_rows
 
-        def small_lower_rows(row):
-            return (
-                annotation_plan.get("reason") != "readable_margin_content_preserved"
-                and row["y0"] >= layout_height * 0.78
-                and body_text_size
-                and row["font_sizes"]
-                and max(row["font_sizes"]) <= body_text_size - 1.5
-            )
-        excluded_ids = set()
-        for index, row in enumerate(body_rows):
-            if not (
-                small_lower_rows(row)
-                and re.match(r"^\s*(?:\d{1,3}|[*†‡])(?:[.)\]]|\s)", row["normalized"])
-            ):
-                continue
-            group = [row]
-            previous_y = row["y1"]
-            for following in body_rows[index + 1:]:
-                if following["y0"] < row["y0"] or following["y0"] - previous_y > 42:
-                    break
-                if not small_lower_rows(following):
-                    break
-                group.append(following)
-                previous_y = following["y1"]
-            if len(group) >= 2 and sum(len(item["normalized"]) for item in group) >= 45:
-                for item in group:
-                    excluded_ids.add(id(item))
-                excluded_footnotes.append({
-                    "text": " ".join(item["normalized"] for item in group),
-                    "reason": "high_confidence_lower_page_footnote",
-                    "line_count": len(group),
-                    "bbox": [group[0]["x0"], group[0]["y0"], group[-1]["x1"], group[-1]["y1"]],
-                })
-            else:
-                retained_note_candidates.append({"text": row["normalized"], "bbox": [row["x0"], row["y0"], row["x1"], row["y1"]]})
+        excluded_ids, excluded_footnotes, retained_note_candidates = _layout_note_groups(
+            body_rows, layout["width"], layout_height, body_text_size,
+            layout["note_separator_rules"],
+            disabled=annotation_plan.get("reason") == "readable_margin_content_preserved",
+        )
         retained = [row for row in body_rows if id(row) not in excluded_ids]
         ordered, reading_order, reading_regions = _layout_reading_order(
             retained, layout["width"], layout["height"]
         )
+        reading_adjustments = []
+        if reading_regions is None:
+            ordered, reading_order, reading_adjustments = _layout_refine_reading_order(
+                retained, ordered, reading_order, layout["width"], layout["height"]
+            )
         if annotation_plan.get("reason") == "readable_margin_content_preserved":
             left_bound, right_bound = annotation_plan["body_bounds"]
             margin = [row for row in retained if row["x1"] < left_bound or row["x0"] > right_bound]
@@ -5862,11 +6243,29 @@ def apply_region_aware_native_layout(pdf_path, pages, progress_callback=None):
             }
         else:
             annotation_plan["body_reocr"] = body_reocr_decision
+        # An otherwise blank publisher-furniture page can legitimately become
+        # empty. Do not resurrect its raw notices merely because cleanup has
+        # removed the last repeated copyright strip. Keep the existing raw
+        # fallback for all other empty/uncertain extraction cases.
+        marginalia_only = (
+            not retained and not excluded_footnotes
+            and len(removed) == len(layout_rows)
+            and any(row["reason"] == "repeated_vertical_copyright_notice" for row in removed)
+            and all(row["reason"] in {
+                "repeated_vertical_copyright_notice", "repeated_running_header",
+                "repeated_running_footer", "positioned_page_number", "italic_running_author",
+            } for row in removed)
+        )
         transformed.append({
             **page_info,
             "raw_text": page_info.get("text", ""),
-            "text": semantic_text or page_info.get("text", ""),
+            "text": semantic_text if semantic_text or marginalia_only else page_info.get("text", ""),
+            **({"layout_marginalia_only_page": True} if marginalia_only else {}),
             "layout_reading_order": reading_order,
+            "native_ligature_space_repairs": (
+                sum(row.get("native_ligature_space_repairs", 0) for row in retained)
+                if not body_reocr_text else 0
+            ),
             "layout_removed_marginalia": removed,
             "layout_note_candidates": retained_note_candidates,
             "layout_excluded_footnotes": excluded_footnotes,
@@ -5877,10 +6276,13 @@ def apply_region_aware_native_layout(pdf_path, pages, progress_callback=None):
         review_pages.append({
             "pdf_page": page_number,
             "reading_order": reading_order,
+            "reading_order_adjustments": reading_adjustments,
+            "native_ligature_space_repairs": transformed[-1]["native_ligature_space_repairs"],
             "outer_margin_annotation": annotation_plan,
             "removed_marginalia": removed,
             "note_candidates_retained": retained_note_candidates,
             "excluded_footnotes": excluded_footnotes,
+            "note_separator_scan": layout["note_separator_scan"],
             "photographed_spread": {
                 "detected": bool(reading_regions),
                 "reading_region_count": len(reading_regions or []),
@@ -8731,7 +9133,13 @@ def evaluate_edge_cases(
     )
     add(
         "native_payload_metadata_description",
-        check_status("PDF page:" in payload_meta.get("description", "") and "Segment:" in payload_meta.get("description", "")),
+        # Whole-file and grouped-page payloads use the range label; both are
+        # canonical outputs of pdf_page_metadata_label, not missing provenance.
+        check_status(
+            any(label in payload_meta.get("description", "")
+                for label in ("PDF page:", "PDF page range:"))
+            and "Segment:" in payload_meta.get("description", "")
+        ),
         payload_meta.get("description", "")[:220],
     )
     add(
@@ -24180,6 +24588,10 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                     pages, native_ocr_reconciliation = reconcile_native_ocr_pages(
                         native_peer["pages"], pages
                     )
+                    # This peer was parsed earlier in this preparation; it is
+                    # not loaded from another run or an older export folder.
+                    native_ocr_reconciliation["native_candidate_origin"] = "fresh_parse_in_current_preparation"
+                    layout_evidence = _reconcile_layout_note_evidence(layout_evidence, pages)
                 else:
                     native_ocr_reconciliation = {
                         "status": "not_available",
@@ -27616,6 +28028,9 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         ),
         "layout_note_candidates_retained_count": (selected.get("layout_evidence") or {}).get("note_candidates_retained_count", 0),
         "layout_excluded_footnote_count": (selected.get("layout_evidence") or {}).get("excluded_footnote_count", 0),
+        "native_ligature_space_repairs": sum(
+            int(page.get("native_ligature_space_repairs", 0)) for page in selected.get("pages", [])
+        ),
         "layout_two_column_page_count": (selected.get("layout_evidence") or {}).get("two_column_page_count", 0),
         "retrieval_lane_status": (selected.get("lane_review") or {}).get("status", "not_available"),
         "retrieval_lane_primary_payload_changed": bool((selected.get("lane_review") or {}).get("primary_payload_changed")),

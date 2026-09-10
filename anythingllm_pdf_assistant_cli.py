@@ -23,6 +23,7 @@ from pathlib import Path
 
 from portable_paths import application_paths, ensure_application_directories, package_resource_path
 from authenticated_http import RejectAuthenticatedRedirects
+from server_exit_log import record_server_event
 
 
 def _notify_browser_stop(record, event):
@@ -482,6 +483,15 @@ def _server_marker_path() -> Path:
     return ensure_application_directories()["config"] / SERVER_MARKER_NAME
 
 
+def _server_marker_for_diagnostics():
+    # Never used to authorize process actions.
+    try:
+        value = json.loads(_server_marker_path().read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
 def _read_json_object(path: Path) -> dict:
     """Read one local JSON object, treating absent/corrupt state as unusable."""
     try:
@@ -883,6 +893,7 @@ def _stop_under_start_lock() -> int:
         # Never remove it when something is listening: that could be a PID
         # reuse or an unrelated application and must remain diagnostic-only.
         if _port_is_available(port):
+            record_server_event("stale_marker_removed", record=record, reason="recorded_process_not_owned_or_absent", previous_exit_code=None)
             marker.unlink(missing_ok=True)
             print("Removed a stale local PDF assistant server marker; no owned server is running.")
             return 0
@@ -925,6 +936,7 @@ def _stop_pinned_server(marker, record, pid, port):
             file=sys.stderr,
         )
         return 1
+    record_server_event("intentional_stop_requested", record=record, reason="stop_command")
     _notify_browser_stop(record, "stop_requested")
     try:
         stopped = subprocess.run(
@@ -936,16 +948,19 @@ def _stop_pinned_server(marker, record, pid, port):
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
+        record_server_event("stop_command_failed", record=record, error=exc, reason="termination_command_exception")
         _notify_browser_stop(record, "stop_cancelled")
         print(f"Could not stop the owned local PDF assistant server: {exc}", file=sys.stderr)
         return 1
     if stopped.returncode != 0:
+        record_server_event("stop_command_failed", record=record, command_exit_code=stopped.returncode)
         _notify_browser_stop(record, "stop_cancelled")
         print((stopped.stderr or stopped.stdout or "Could not stop the local server.").strip(), file=sys.stderr)
         return 1
     try:
         _finalize_owned_runs_after_server_stop(stopped_runs, pid)
     except OSError as exc:
+        record_server_event("stop_recovery_write_failed", record=record, error=exc, termination_command_exit_code=0)
         print(
             "The owned server stopped, but final cancellation recovery could not be retained: "
             f"{exc}",
@@ -955,11 +970,13 @@ def _stop_pinned_server(marker, record, pid, port):
     deadline = time.monotonic() + 12
     while time.monotonic() < deadline:
         if _port_is_available(port):
+            record_server_event("intentional_stop_completed", record=record, termination_command_exit_code=0)
             marker.unlink(missing_ok=True)
             suffix = f" Preserved cancellation recovery for {len(stopped_runs)} active run(s)." if stopped_runs else ""
             print(f"Stopped the owned local PDF assistant server.{suffix}")
             return 0
         time.sleep(0.15)
+    record_server_event("stop_port_still_occupied", record=record, termination_command_exit_code=0)
     print("The owned server process stopped, but port %s is still in use; keeping the marker for diagnosis." % port, file=sys.stderr)
     return 1
 
@@ -976,6 +993,10 @@ def _start(port: int, browser: bool) -> int:
                 if _doctor(port, allow_owned_running_server=False) != 0:
                     raise RuntimeError("The local port or data directories are unavailable. No existing server was stopped. Run the assistant doctor command for details.")
                 os.environ.setdefault(SERVER_ROOT_PID_ENV, str(os.getpid()))
+                previous = _server_marker_for_diagnostics()
+                if previous:
+                    record_server_event("previous_server_marker_found", record=previous,
+                                        reason="previous_instance_not_reused", previous_exit_code=None)
                 marker = _write_server_marker(port)
     except RuntimeError as exc:
         message = f"Could not claim local server startup ownership: {exc}"
@@ -1001,6 +1022,8 @@ def _start(port: int, browser: bool) -> int:
     # same port.
     cancelled = threading.Event()
     loaded = threading.Event()
+    diagnostic_record = _server_marker_for_diagnostics()
+    record_server_event("server_starting", record=diagnostic_record)
     if browser:
         _open_browser_when_local_app_is_ready(port, cancelled=cancelled, loaded=loaded)
     try:
@@ -1011,11 +1034,22 @@ def _start(port: int, browser: bool) -> int:
         os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
         from rag_pdf_gradio_app import launch_application
         loaded.set()
+        record_server_event("server_application_loaded", record=diagnostic_record)
         # Browser opening is owned by the readiness watcher above. In
         # particular, do not rely on Gradio to open a tab from a hidden
         # shortcut process after the relatively heavy app build completes.
         launch_application(port=port, inbrowser=False)
+        record_server_event("server_returned", record=diagnostic_record, exit_code=0)
+    except KeyboardInterrupt as exc:
+        record_server_event("server_interrupted", record=diagnostic_record, error=exc, reason="keyboard_interrupt")
+        raise
+    except SystemExit as exc:
+        record_server_event("server_system_exit", record=diagnostic_record,
+                            exit_code=exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1))
+        raise
     except Exception as exc:
+        record_server_event("server_failed", record=diagnostic_record, error=exc, exit_code=1,
+                            phase="server" if loaded.is_set() else "application_import")
         cancelled.set()
         message = f"PDF assistant startup/server failed ({type(exc).__name__}): {exc}"
         if browser:

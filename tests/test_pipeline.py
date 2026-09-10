@@ -4238,7 +4238,7 @@ class PipelineCoreTests(unittest.TestCase):
             self.assertFalse((root / "segments").exists())
             self.assertTrue((root / "Example-p001-s01.txt").exists())
 
-    def test_compact_local_only_batch_promotion_uses_one_first_to_last_folder(self):
+    def test_compact_local_only_batch_promotion_uses_one_timestamped_folder(self):
         import rag_pdf_gradio_app as app
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4271,7 +4271,8 @@ class PipelineCoreTests(unittest.TestCase):
                 summaries,
             )
 
-            self.assertEqual(moved.name, "A-source-title--Z-final-title")
+            self.assertRegex(moved.name, r"^r-\d{8}-\d{6}(?:-\d+)?$")
+            self.assertNotEqual(moved, run_root)
             self.assertEqual(
                 {path.name for path in moved.iterdir()},
                 {first_text.name, first_segment.name, last_text.name},
@@ -9125,7 +9126,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn("Two test segments", source)
         self.assertIn('label="AnythingLLM output folder"', source)
         self.assertIn('label="Include foreword/preface"', source)
-        self.assertIn('label="Include notes/bibliography/index"', source)
+        self.assertIn('label="Include bibliography/index/end notes"', source)
         self.assertIn("Run read-only storage audit", source)
         self.assertIn("Generate dry-run stale-artifact repair plan", source)
         self.assertIn("[data-testid='accordion-content']", app.APP_CSS)
