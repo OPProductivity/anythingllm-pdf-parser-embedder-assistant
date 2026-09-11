@@ -2454,7 +2454,7 @@ class PipelineCoreTests(unittest.TestCase):
             for records in (3, 25, 8)
         ]
         with mock.patch.object(app, "hydrated_timing_model_history", return_value=[]), \
-             mock.patch.object(app, "_append_timing_jsonl", side_effect=lambda _path, row: captured.append(row)), \
+             mock.patch.object(app, "append_private_history_records", side_effect=lambda _path, rows, _keys: captured.extend(rows)), \
              mock.patch.object(app, "_read_timing_jsonl", return_value=[]):
             row = app.record_timing_model_run(
                 Path("C:/tmp/timing-fixture"),
@@ -4271,11 +4271,11 @@ class PipelineCoreTests(unittest.TestCase):
                 summaries,
             )
 
-            self.assertRegex(moved.name, r"^r-\d{8}-\d{6}(?:-\d+)?$")
+            self.assertRegex(moved.name, r"^r-\d{8}-\d{6}-[0-9a-f]{10}(?:-\d+)?$")
             self.assertNotEqual(moved, run_root)
             self.assertEqual(
                 {path.name for path in moved.iterdir()},
-                {first_text.name, first_segment.name, last_text.name},
+                {"A-source-title-complete-pdf-parsed.txt", "A-source-title-p001-s01.txt", "Z-final-title-complete-pdf-parsed.txt"},
             )
             self.assertTrue(first_dir.is_dir())
             self.assertTrue(last_dir.is_dir())
@@ -4283,8 +4283,8 @@ class PipelineCoreTests(unittest.TestCase):
             self.assertTrue(last_receipt.is_file())
             self.assertFalse((moved / first_receipt.name).exists())
             self.assertFalse((moved / last_receipt.name).exists())
-            self.assertEqual(summaries[0]["upload_file"], str(moved / first_text.name))
-            self.assertEqual(summaries[1]["upload_file"], str(moved / last_text.name))
+            self.assertEqual(summaries[0]["upload_file"], str(moved / "A-source-title-complete-pdf-parsed.txt"))
+            self.assertEqual(summaries[1]["upload_file"], str(moved / "Z-final-title-complete-pdf-parsed.txt"))
 
     def test_generated_output_directory_prefers_the_prepared_text_parent(self):
         import rag_pdf_gradio_app as app

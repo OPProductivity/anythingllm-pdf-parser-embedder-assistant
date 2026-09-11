@@ -4534,11 +4534,20 @@ body.dark .automatic-run-timing.cache-reuse-confirmed strong {
     white-space: nowrap;
 }
 .automatic-run-progress-phase {
-    grid-column: 2;
     min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    white-space: normal;
+    overflow-wrap: anywhere;
+}
+.automatic-run-progress-description {
+    /* Share the existing heading/detail space without growing the card or
+       displacing its bottom timer. Long phase messages must remain readable. */
+    grid-column: 1 / -1;
+    grid-row: 1 / 3;
+    align-self: stretch;
+    min-width: 0;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-wrap: anywhere;
 }
 .automatic-run-progress-details,
 .automatic-run-batch-timing {
@@ -4575,6 +4584,7 @@ body.dark .automatic-run-timing.cache-reuse-confirmed strong {
        natural receipt/timer height and sits against the bottom edge. A fixed
        3.75em lane left a conspicuous blank strip beneath Est during a run. */
     align-self: end;
+    grid-row: 3;
     min-height: 0;
     max-height: none;
     overflow: hidden;
@@ -7853,8 +7863,12 @@ def create_fresh_automatic_run_root(output_root_base, *, prefix="r"):
     base = Path(output_root_base)
     normalized_prefix = safe_stem(str(prefix or "r")) or "r"
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    # A run-owned identifier, not a hash of any selected PDF. Keep document
+    # identity out of the delivered TXT names and diagnostics prefixes intact.
+    run_hash = hashlib.sha256(uuid.uuid4().bytes).hexdigest()[:10] if normalized_prefix == "r" else ""
+    name_base = f"{normalized_prefix}-{stamp}" + (f"-{run_hash}" if run_hash else "")
     for suffix in range(1, 1000):
-        label = f"{normalized_prefix}-{stamp}" if suffix == 1 else f"{normalized_prefix}-{stamp}-{suffix}"
+        label = name_base if suffix == 1 else f"{name_base}-{suffix}"
         candidate = base / label
         if len(str(candidate)) > 250:
             raise OSError(
@@ -7868,19 +7882,54 @@ def create_fresh_automatic_run_root(output_root_base, *, prefix="r"):
     raise OSError("Could not reserve a fresh automatic run folder after 999 attempts.")
 
 
+def local_export_canonical_summaries(summaries):
+    """Resolve only proven selection duplicates, never missing/failed sources."""
+    by_source = {
+        str(row.get("pdf") or "").casefold(): row
+        for row in summaries if row.get("pdf")
+    }
+    resolved = []
+    for row in summaries:
+        canonical = row
+        if row.get("api_upload_status") == "skipped_exact_duplicate":
+            canonical = by_source.get(str(row.get("selected_input_duplicate_of") or "").casefold())
+            if (
+                not canonical
+                or canonical.get("api_upload_status") == "skipped_exact_duplicate"
+                or not row.get("source_sha256")
+                or row["source_sha256"] != canonical.get("source_sha256")
+            ):
+                raise ValueError("Local export duplicate has no matching canonical source evidence.")
+        resolved.append(canonical)
+    return resolved
+
+
+def local_export_retention_complete(summaries):
+    try:
+        canonical = local_export_canonical_summaries(summaries)
+    except ValueError:
+        return False
+    return bool(canonical) and all(
+        (row.get("lean_retention") or {}).get("applied")
+        and (row.get("lean_retention") or {}).get("policy") == "flat_local_no_logs_v1"
+        for row in canonical
+    )
+
+
 def promote_flat_no_logs_batch_output(output_root, temporary_run_dir, pdf_paths, summaries):
     """Promote successful no-log document exports into one timestamped folder.
 
     The worker still stages output in a uniquely owned ``r-*`` directory while
     it is running. Once every document is ready, only its plain-text export is
-    moved to the user-selected root; the staging receipts are deleted by the
+    copied to the user-selected root; the staging receipts are deleted by the
     caller. This keeps a multi-PDF run as one convenient folder without
     flattening identities from different source documents into subfolders.
     """
     base = Path(output_root)
     run_root = Path(temporary_run_dir)
+    canonical_summaries = local_export_canonical_summaries(summaries)
     document_dirs = []
-    for summary in summaries or []:
+    for summary in canonical_summaries:
         upload_file = Path(str((summary or {}).get("upload_file") or ""))
         source_dir = upload_file.parent
         if not upload_file.is_file() or not source_dir.is_dir() or source_dir.parent != run_root:
@@ -7893,32 +7942,174 @@ def promote_flat_no_logs_batch_output(output_root, temporary_run_dir, pdf_paths,
     # that retention has run.  Never promote every child of the staging
     # directory: doing so leaks those diagnostic JSON/JSONL files back into a
     # user-selected no-logs export.
-    prepared_paths = {
-        Path(str((summary or {}).get("upload_file") or ""))
-        for summary in summaries or []
-    }
     segment_name = re.compile(r"-p\d{3,}-s\d+\.txt$", re.IGNORECASE)
-    planned = [
-        (source_dir, child)
-        for source_dir in document_dirs
-        for child in sorted(source_dir.iterdir(), key=lambda path: path.name.casefold())
-        if child.is_file()
-        and (child in prepared_paths or bool(segment_name.search(child.name)))
-    ]
-    names = [child.name.casefold() for _source_dir, child in planned]
-    if len(names) != len(set(names)):
-        raise FileExistsError("No-log batch export would create duplicate filenames.")
-
     # Use the same short, atomically reserved names as ordinary app runs.
     # Do not reuse the staging directory: its receipts are cleaned afterwards.
     target = create_fresh_automatic_run_root(base)
-    for _source_dir, child in planned:
-        shutil.move(str(child), str(target / child.name))
-    for summary in summaries or []:
-        upload_file = Path(str(summary.get("upload_file") or ""))
-        summary["upload_file"] = str(target / upload_file.name)
+    planned = []
+    prepared_targets = []
+    used_names = set()
+    created = []
+    try:
+        for index, (summary, canonical) in enumerate(zip(summaries, canonical_summaries)):
+            prepared = Path(canonical["upload_file"])
+            selected_pdf = summary.get("pdf") or (pdf_paths[index] if index < len(pdf_paths) else "")
+            stem = safe_stem(Path(str(selected_pdf)).stem) if selected_pdf else prepared.stem
+            children = [prepared, *sorted(
+                (p for p in prepared.parent.iterdir() if p.is_file() and segment_name.search(p.name)),
+                key=lambda p: p.name.casefold(),
+            )]
+            suffixes = ["-complete-pdf-parsed.txt", *[
+                segment_name.search(p.name).group(0) for p in children[1:]
+            ]]
+            if summary.get("api_upload_status") == "skipped_exact_duplicate":
+                suffixes = [suffix.removesuffix(".txt") + "-(duplicate).txt" for suffix in suffixes]
+            # Friendly names are presentation only. Internal hashes and source
+            # identities remain unchanged. Reserve space for numeric collisions
+            # after Windows case-folding, sanitization, or title truncation.
+            available = min(150, 250 - len(str(target)) - 1 - max(map(len, suffixes)))
+            number = 1
+            while True:
+                disambiguator = "" if number == 1 else f"-{number}"
+                if available <= len(disambiguator):
+                    raise OSError("Output path is too long for readable local export names.")
+                prefix = (stem or "document")[:available - len(disambiguator)].rstrip(" .-") or "d"
+                names = [prefix + disambiguator + suffix for suffix in suffixes]
+                if not any(name.casefold() in used_names for name in names):
+                    break
+                number += 1
+            used_names.update(name.casefold() for name in names)
+            prepared_targets.append(target / names[0])
+            planned.extend(zip(children, (target / name for name in names)))
+        # Copy before the caller's existing success-only staging cleanup. A
+        # partial export failure must not strand the sole prepared transcript.
+        for source, destination in planned:
+            with destination.open("xb") as writer:
+                created.append(destination)
+                with source.open("rb") as reader:
+                    shutil.copyfileobj(reader, writer)
+        for source, destination in planned:
+            if source.stat().st_size != destination.stat().st_size:
+                raise OSError("Local export copy did not retain the complete prepared file.")
+    except Exception:
+        for path in created:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        try:
+            target.rmdir()
+        except OSError:
+            pass
+        raise
+    for summary, prepared_target in zip(summaries, prepared_targets):
+        summary["upload_file"] = str(prepared_target)
         summary["flat_no_logs_output_directory"] = str(target)
     return target
+
+
+def append_private_history_records(path, records, identity_fields):
+    """Durably append missing compact facts at a terminal boundary only.
+
+    A failed write must keep run evidence available. This is deliberately not
+    used for high-frequency queue observations. Replays use the same keys and
+    cannot silently multiply a run's calibration weight.
+    """
+    path = Path(path)
+
+    def identity(row):
+        if not isinstance(row, dict):
+            raise ValueError("private history record is not a JSON object")
+        return tuple(
+            row.get(field) or (row.get("run_root", "") if field == "run_key" else "")
+            for field in identity_fields
+        )
+
+    with PERSISTED_HISTORY_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        existing = set()
+        raw = b""
+        if path.exists():
+            raw = path.read_bytes()
+            valid_lines = []
+            damaged = 0
+            for line in raw.split(b"\n"):
+                if line.strip():
+                    try:
+                        decoded = line.decode("utf-8")
+                        key = identity(json.loads(decoded))
+                        hash(key)
+                    except (UnicodeError, ValueError, TypeError):
+                        damaged += 1
+                        continue
+                    existing.add(key)
+                    valid_lines.append(decoded.rstrip("\r"))
+            if damaged:
+                # Preserve the exact damaged bytes before an atomic repair.
+                # A failed backup/replace leaves the run's cleanup gate closed.
+                backup = path.with_name(path.name + ".damaged-" + hashlib.sha256(raw).hexdigest()[:16])
+                if backup.exists() and backup.read_bytes() != raw:
+                    # A previous disk-full interruption may have truncated the
+                    # backup itself. Keep it, and retry into a fresh sibling.
+                    backup = backup.with_name(backup.name + "-" + uuid.uuid4().hex[:8])
+                try:
+                    with backup.open("xb") as handle:
+                        handle.write(raw)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                except FileExistsError:
+                    if backup.read_bytes() != raw:
+                        raise OSError("Damaged history backup did not match the original")
+                repaired = "".join(line + "\n" for line in valid_lines)
+                atomic_write_text(path, repaired)
+                raw = repaired.encode("utf-8")
+                APP_LOGGER.warning("Repaired %s malformed private-history line(s); original retained at %s", damaged, backup)
+        with path.open("a", encoding="utf-8") as handle:
+            if raw and not raw.endswith(b"\n"):
+                handle.write("\n")
+            for row in records:
+                key = identity(row)
+                if key not in existing:
+                    handle.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+                    existing.add(key)
+            handle.flush()
+            os.fsync(handle.fileno())
+    return True
+
+
+def cleanup_flat_local_staging(run_root):
+    """Report locked staging files without reclassifying valid TXT exports."""
+    try:
+        shutil.rmtree(run_root)
+    except FileNotFoundError:
+        if not Path(run_root).exists():
+            return ""
+        return f"Temporary run logs remain at {run_root}; a file changed during cleanup. Exported TXT files are ready."
+    except OSError as exc:
+        message = f"Temporary run logs remain at {run_root}; cleanup could not finish ({type(exc).__name__}). Exported TXT files are ready."
+        APP_LOGGER.warning(message)
+        return message
+    return ""
+
+
+def persist_terminal_phase_history(run_root):
+    """Repair any missed phase-history append before deleting run evidence."""
+    try:
+        timeline = Path(run_root) / "timing-evidence-timeline.jsonl"
+        events = []
+        if timeline.is_file():
+            for line in timeline.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    compact = compact_global_timing_event(json.loads(line))
+                    if compact is not None:
+                        events.append(compact)
+        return append_private_history_records(
+            TIMING_MODEL_EVENTS_PATH, events,
+            ("run_key", "recorded_at", "event", "stage", "phase_elapsed_seconds"),
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        APP_LOGGER.warning("could not retain terminal phase history: %s", exc)
+        return False
 
 
 def append_ingestion_history(
@@ -7929,6 +8120,9 @@ def append_ingestion_history(
     workspace_slug,
     processing_settings=None,
     mode=None,
+    *,
+    export_root=None,
+    timing_row=None,
 ):
     """Persist a compact audit trail after every terminal app run."""
     docs = []
@@ -7949,16 +8143,24 @@ def append_ingestion_history(
             "chunk_size": summary.get("chunk_size", ""),
             "chunk_overlap": summary.get("chunk_overlap", ""),
             "segment_mode": summary.get("segment_mode", ""),
+            "selected_input_duplicate_of": Path(str(summary.get("selected_input_duplicate_of") or "")).name if summary.get("selected_input_duplicate_of") else "",
         })
     record = {
         "recorded_at": datetime.now().isoformat(timespec="seconds"),
-        "run_root": str(run_root),
+        "run_root": str(export_root or run_root),
+        "run_key": str(run_root),
+        "assistant_version": APP_VERSION,
         "state": completion.get("state"),
         "message": completion.get("message"),
         "mode": mode or (MODE_NATIVE_UPLOAD_LABEL if prepare_and_upload else MODE_LOCAL_ONLY_LABEL),
         "workspace_slug": workspace_slug or "",
         "documents": docs,
         "processing_settings": processing_settings or {},
+        "timing": {
+            key: (timing_row or {}).get(key)
+            for key in ("actual_seconds", "expected_seconds", "final_expected_seconds", "duration_provenance")
+            if key in (timing_row or {})
+        },
     }
     try:
         Path(run_root).mkdir(parents=True, exist_ok=True)
@@ -7974,16 +8176,35 @@ def append_ingestion_history(
             terminal_record["ocr_diagnostics"] = {"status": "unavailable", "error_type": type(exc).__name__}
             APP_LOGGER.warning("could not summarize OCR run evidence: %s", type(exc).__name__)
         atomic_write_text(Path(run_root) / "ingestion-terminal-record.json", json.dumps(terminal_record, indent=2, default=str))
-        AUTO_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        with PERSISTED_HISTORY_LOCK:
-            prune_background_jsonl(INGESTION_HISTORY_PATH)
-            with INGESTION_HISTORY_PATH.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
+        append_private_history_records(INGESTION_HISTORY_PATH, [record], ("run_key",))
     except (OSError, TypeError, ValueError) as exc:
         APP_LOGGER.warning("could not append ingestion history: %s", exc)
+        return {}
     return record
+
+
+def retain_early_terminal_history(run_root, state, message, elapsed_seconds, expected_seconds, mode=""):
+    """Retain an owned early stop, without treating partial work as calibration.
+
+    Normal terminal runs use their complete summaries. This fallback covers
+    cancellation before the first PDF finishes and an unhandled owned-worker
+    exception. It does not create a run for a mere preview/validation failure.
+    """
+    if not run_root or not Path(run_root).is_dir() or state not in {"cancelled", "failed"}:
+        return
+    completion = {"state": state, "message": message}
+    timing = record_timing_model_run(
+        run_root, [], completion,
+        {"timing_estimate": {"expected_seconds": expected_seconds, "features": {"mode": mode}},
+         "duration_provenance": "early_terminal_wall_clock"},
+        elapsed_seconds,
+    )
+    append_ingestion_history(
+        run_root, [], completion, mode == MODE_NATIVE_UPLOAD_LABEL, "",
+        mode=mode or "unknown", timing_row=timing,
+        processing_settings={"history_evidence": "early terminal result; no complete source summary available"},
+    )
+    persist_terminal_phase_history(run_root)
 
 
 FAILED_PREPARATION_MARKER_DIRECTORY = "_Run failed to create parsed files"
@@ -14281,9 +14502,10 @@ def automatic_live_status_html(status=None):
         f'aria-valuemin="0" aria-valuemax="100" aria-valuenow="{percent:d}">'
         f'<div class="automatic-run-progress-fill" style="width: {percent:d}%"></div></div>'
         f'<div class="automatic-run-progress-label">'
-        f'<strong class="automatic-run-progress-overall">Overall progress: {percent_text}</strong>'
+        f'<div class="automatic-run-progress-description">'
+        f'<strong class="automatic-run-progress-overall">Overall progress: {percent_text}</strong> '
         f'<span class="automatic-run-progress-phase">{phase}</span>'
-        f'{details_suffix}{batch_timing_suffix}</div></div>'
+        f'{details_suffix}</div>{batch_timing_suffix}</div></div>'
     )
 
 
@@ -15789,6 +16011,10 @@ def automatic_run_cancelled_outputs(
         if actual_seconds is not None
         else max(0.0, time.perf_counter() - float(started_at or time.perf_counter()))
     )
+    retain_early_terminal_history(
+        run_root, "cancelled", message, elapsed_seconds, expected_seconds,
+        mode=str(live.get("mode") or ""),
+    )
     return (
         gr.update(value=run_summary_html("Status: cancelled\n" + message), visible=True),
         download_files_update(files, download_full_folder, download_segments_folder),
@@ -17119,6 +17345,7 @@ def compact_timing_document_row(document):
     }
     return {
         "filename": str(value.get("filename") or ""),
+        "selected_input_duplicate": bool(value.get("selected_input_duplicate")),
         "pages": max(0, int(value.get("pages") or 0)),
         "records": max(0, int(value.get("records") or 0)),
         "extraction_seconds": round(
@@ -18784,6 +19011,7 @@ def timing_model_observation_usable(row):
         and timing_model_formula_compatible(row)
         and not is_all_existing_recheck
         and not is_cache_accelerated_submission
+        and not timing_model_has_selected_duplicates(row)
     )
 
 
@@ -18811,6 +19039,19 @@ def timing_model_legacy_observation_usable(row):
         and timing_model_formula_compatible(row)
         and not is_all_existing_recheck
         and not is_cache_accelerated_submission
+        and not timing_model_has_selected_duplicates(row)
+    )
+
+
+def timing_model_has_selected_duplicates(row):
+    """Selection-copy wall time cannot teach full unique-workload throughput.
+
+    Keep measured provider batches usable through their separate eligibility
+    path; do not rewrite the opening features or invent a unique-page profile.
+    """
+    return bool(row.get("selected_input_duplicate_documents")) or any(
+        document.get("selected_input_duplicate") for document in row.get("document_timing") or []
+        if isinstance(document, dict)
     )
 
 
@@ -21937,11 +22178,13 @@ def record_timing_model_run(
                 "state": str(batch.get("submission_state") or "unknown"),
                 "searchability_proven": bool(batch.get("searchability_proven")),
             })
-        if not profile.get("page_count") or float(actual_seconds or 0) < 5.0:
-            # Test fixtures and rejected preflight attempts are useful in their
-            # own run summaries, but must never distort a user's future ETA.
-            return {}
-        latest_summary = (summaries or [{}])[-1]
+        # Keep short/failed observations for audit too. The existing learning
+        # gates, not storage omissions, determine whether they can teach ETA.
+        prepared_summaries = [
+            summary for summary in summaries or []
+            if summary.get("api_upload_status") != "skipped_exact_duplicate"
+        ]
+        latest_summary = (prepared_summaries or [{}])[-1]
         configured_documents = list((settings or {}).get("source_documents") or [])
         document_timing = []
         for index, document_summary in enumerate(summaries or []):
@@ -21960,6 +22203,7 @@ def record_timing_model_run(
                 # expose a user's folder structure. The run artifact retains
                 # the full provenance separately when requested.
                 "filename": Path(str(configured.get("path") or "")).name,
+                "selected_input_duplicate": document_summary.get("api_upload_status") == "skipped_exact_duplicate",
                 "pages": document_pages,
                 "records": int(document_summary.get("api_embedding_update_requested") or document_summary.get("segments") or 0),
                 "phase_timing": dict(document_summary.get("phase_timing") or {}),
@@ -22007,8 +22251,9 @@ def record_timing_model_run(
         )
         # Preserve the requested backend as a pre-run comparison feature and
         # store the selected backend separately as an observed outcome.
-        features["selected_backend"] = str(latest_summary.get("selected_backend") or "unknown")
-        features["ocr_used"] = bool(latest_summary.get("ocr_assisted_extraction_used"))
+        observed_backends = sorted({str(summary.get("selected_backend")) for summary in prepared_summaries if summary.get("selected_backend")})
+        features["selected_backend"] = observed_backends[0] if len(observed_backends) == 1 else "mixed" if observed_backends else "unknown"
+        features["ocr_used"] = any(bool(summary.get("ocr_assisted_extraction_used")) for summary in prepared_summaries)
         timing_run_key = str(run_key_override or run_root)
         all_selected_records_already_indexed = bool(summaries) and (
             submitted_records == 0
@@ -22035,6 +22280,8 @@ def record_timing_model_run(
             timing_cache_outcome = "no_full_document_duplicate_skip"
         row = {
             "schema_version": TIMING_MODEL_VERSION,
+            "assistant_version": APP_VERSION,
+            "export_root": str((settings or {}).get("export_root") or run_root),
             "timing_formula_revision": TIMING_MODEL_FORMULA_REVISION,
             "recorded_at": datetime.now().isoformat(timespec="seconds"),
             "run_key": timing_run_key,
@@ -22042,7 +22289,7 @@ def record_timing_model_run(
             "state": str((completion or {}).get("state") or "unknown"),
             "actual_seconds": round(float(actual_seconds or 0), 3),
             "wall_clock_seconds": round(float(wall_clock_seconds or actual_seconds or 0), 3),
-            "duration_provenance": "active_observation_window",
+            "duration_provenance": str((settings or {}).get("duration_provenance") or "active_observation_window"),
             # Keep the reviewed opening estimate separate from later evidence
             # reprices. A terminal row must never pair a pre-run formula with a
             # post-cache or live-queue total and make future diagnosis guess.
@@ -22060,6 +22307,10 @@ def record_timing_model_run(
             "submitted_records": submitted_records,
             "existing_workspace_records": existing_workspace_records,
             "existing_workspace_documents": existing_workspace_documents,
+            "selected_input_duplicate_documents": len(summaries or []) - len(prepared_summaries),
+            "unique_processed_documents": sum(bool(summary.get("selected_backend")) for summary in prepared_summaries),
+            "unique_processed_pages": sum(document["pages"] for document, summary in zip(document_timing, summaries or []) if summary.get("selected_backend") and not document["selected_input_duplicate"]),
+            "observed_backends": observed_backends,
             "cached_attachment_reused_records": cached_attachment_reused_records,
             "new_workspace_attachment_records": new_workspace_attachment_records,
             "timing_cache_outcome": timing_cache_outcome,
@@ -22084,9 +22335,9 @@ def record_timing_model_run(
             row,
             hydrated_timing_model_history(),
         )
-        _append_timing_jsonl(
+        append_private_history_records(
             TIMING_MODEL_RUNS_PATH,
-            compact_timing_run_history_row(row),
+            [compact_timing_run_history_row(row)], ("run_key",),
         )
         summary = {
             "schema_version": TIMING_MODEL_VERSION,
@@ -24682,6 +24933,12 @@ def _finalize_owned_confirmation_stream_failure(owner_token, error=None):
         confirmed_fraction=record.get("confirmed_fraction", 0.0),
         cancel_available=False,
         confirmation_in_flight=False,
+    )
+    retain_early_terminal_history(
+        record.get("run_root"), "failed", details,
+        max(0.0, time.time() - float(record.get("started_epoch") or time.time())),
+        record.get("expected_seconds", 0),
+        mode=str(record.get("mode") or ""),
     )
 
 
@@ -28995,7 +29252,6 @@ def run_automatic(
             anythingllm_embedder_preflight
         )
     downloadable = []
-    flat_no_logs_exports = []
     total_files = max(len(files), 1)
     prepared_checkpoint_error = ""
     prepared_checkpoint_artifact_cache = {}
@@ -30821,13 +31077,6 @@ def run_automatic(
             worker_context = worker_result.get("batch_inspection_context")
             if isinstance(worker_context, dict):
                 batch_inspection_context.update(worker_context)
-            flat_retention = dict(summary.get("lean_retention") or {})
-            if (
-                flat_no_logs_output
-                and flat_retention.get("applied")
-                and flat_retention.get("policy") == "flat_local_no_logs_v1"
-            ):
-                flat_no_logs_exports.append(out_dir)
         except Exception as exc:
             classified_error = classify_pipeline_exception(
                 exc, stage="source_preparation", source_path=pdf_path,
@@ -32288,10 +32537,24 @@ def run_automatic(
                 "did not finish. Detailed source artifacts were retained; no upload was repeated."
             ),
         })
+    if (
+        flat_no_logs_output
+        and completion["state"] == "successful"
+        and not local_export_retention_complete(summaries)
+    ):
+        completion = with_error_dimensions({
+            "state": "warning",
+            "code": "AUTO-LOCAL-EXPORT-PROMOTION-001",
+            "message": (
+                "Preparation finished, but compact local export is incomplete. "
+                "Prepared text and diagnostic evidence remain in the staging folder; "
+                "no source was reprocessed."
+            ),
+        }, stage="local_reporting", outcome="export_incomplete", scope="artifact", category="compact_export_promotion_failed")
     flat_no_logs_complete = (
         flat_no_logs_output
         and completion["state"] == "successful"
-        and len(flat_no_logs_exports) == len(summaries)
+        and local_export_retention_complete(summaries)
     )
     flat_no_logs_output_dir = None
     if flat_no_logs_complete:
@@ -32302,7 +32565,7 @@ def run_automatic(
                 files,
                 summaries,
             )
-        except (OSError, FileNotFoundError) as exc:
+        except (OSError, ValueError) as exc:
             flat_no_logs_complete = False
             completion = with_error_dimensions({
                 "state": "warning",
@@ -32329,6 +32592,7 @@ def run_automatic(
     wall_clock_seconds = time.perf_counter() - started_at
     live_timing_status = dict(LIVE_AUTOMATIC_RUN_STATUS or {})
     if live_timing_status.get("run_root") == str(run_root):
+        duration_provenance = "active_observation_window"
         active_finished_epoch = float(
             live_timing_status.get("last_activity_epoch")
             or live_timing_status.get("updated_epoch")
@@ -32340,11 +32604,14 @@ def run_automatic(
         # This is a defensive fallback for an early failure before progress
         # could be persisted. It is intentionally marked separately below.
         actual_seconds = wall_clock_seconds
+        duration_provenance = "wall_clock"
     terminal_timing_row = record_timing_model_run(
         run_root,
         summaries,
         completion,
         {
+            "export_root": str(flat_no_logs_output_dir or run_root),
+            "duration_provenance": duration_provenance,
             "timing_estimate": run_timing_estimate,
             "batch_upload_timing_outcome": {
                 "prepared_record_cache_reused_count": int(
@@ -32370,45 +32637,41 @@ def run_automatic(
         },
         actual_seconds,
         wall_clock_seconds=wall_clock_seconds,
-        run_key_override=(
-            f"local-only-{hashlib.sha256(str(run_root).encode('utf-8')).hexdigest()[:12]}"
-            if flat_no_logs_complete
-            else None
-        ),
     )
     slow_stage_note = unusually_slow_stage_message(
         terminal_timing_row.get("stage_anomalies") if terminal_timing_row else []
     )
     if slow_stage_note:
         completion["message"] = f"{completion['message']} {slow_stage_note}"
-    if not flat_no_logs_complete:
-        terminal_processing_settings = {
-            **dict(processing_settings or {}),
-            "successful_output_retention": {
-                "status": str(batch_retention_report.get("status") or "not_required"),
-                "documents": len(batch_retention_report.get("documents") or []),
-            },
-            "output_capacity_preflight": terminal_output_capacity_evidence(batch_capacity),
-        }
-        append_ingestion_history(
-            run_root,
-            summaries,
-            completion,
-            prepare_and_upload,
-            workspace_slug,
-            processing_settings=terminal_processing_settings,
-            mode=mode,
-        )
-        if (
-            completion["state"] == "successful"
-            and batch_retention_report.get("status") == "complete"
-        ):
-            root_cleanup = compact_successful_automatic_batch_root(run_root)
-            if root_cleanup["pending"]:
-                APP_LOGGER.warning(
-                    "successful batch root cleanup left %s active/recovery artifact(s)",
-                    len(root_cleanup["pending"]),
-                )
+    terminal_processing_settings = {
+        **dict(processing_settings or {}),
+        "successful_output_retention": {
+            "status": "flat_local_export" if flat_no_logs_complete else str(batch_retention_report.get("status") or "not_required"),
+            "documents": len(summaries) if flat_no_logs_complete else len(batch_retention_report.get("documents") or []),
+        },
+        "output_capacity_preflight": terminal_output_capacity_evidence(batch_capacity),
+    }
+    terminal_history_row = append_ingestion_history(
+        run_root, summaries, completion, prepare_and_upload, workspace_slug,
+        processing_settings=terminal_processing_settings, mode=mode,
+        export_root=flat_no_logs_output_dir, timing_row=terminal_timing_row,
+    )
+    terminal_phase_history_ready = persist_terminal_phase_history(run_root)
+    history_ready = bool(terminal_timing_row and terminal_history_row and terminal_phase_history_ready)
+    if not history_ready:
+        lines.append("History retention pending: prepared files are usable; the staging logs were kept because private run/timing history could not be fully saved.")
+        APP_LOGGER.warning("private history incomplete; keeping terminal run evidence at %s", run_root)
+    if (
+        history_ready and not flat_no_logs_complete
+        and completion["state"] == "successful"
+        and batch_retention_report.get("status") == "complete"
+    ):
+        root_cleanup = compact_successful_automatic_batch_root(run_root)
+        if root_cleanup["pending"]:
+            APP_LOGGER.warning(
+                "successful batch root cleanup left %s active/recovery artifact(s)",
+                len(root_cleanup["pending"]),
+            )
     if flat_no_logs_output_dir:
         lines[0] = f"Output folder: {flat_no_logs_output_dir}"
     display_status = "completed" if completion["state"] == "successful" else completion["state"]
@@ -32475,10 +32738,17 @@ def run_automatic(
         batch_current_file_index=0,
         authoritative_batch_completed_files=True,
     )
-    if flat_no_logs_complete:
+    if flat_no_logs_complete and history_ready:
         # The temporary app-run directory contains worker/progress receipts.
         # Only the promoted flat text folder is intentionally user-visible.
-        shutil.rmtree(run_root, ignore_errors=True)
+        cleanup_message = cleanup_flat_local_staging(run_root)
+        if cleanup_message:
+            lines.append(cleanup_message)
+            completion["message"] += " " + cleanup_message
+            update_live_automatic_run_status(
+                run_root, state=completion["state"], phase=automatic_completion_phase(completion, prepare_and_upload), details=completion["message"],
+                cancel_available=False, activity_observed=False,
+            )
     return (
         gr.update(value=run_summary_html("\n".join(lines)), visible=True),
         download_files_update(prepared_paths, False, False),
