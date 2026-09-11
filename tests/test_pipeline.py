@@ -11233,11 +11233,11 @@ class PipelineCoreTests(unittest.TestCase):
         # Local-only preparation is not subject to the native-upload floor;
         # a tiny ordinary text PDF can now receive the tested 8-second
         # minimum while a true upload retains a conservative larger budget.
-        # The displayed opening estimate is intentionally 30% more optimistic;
-        # the model value remains intact in a separate durable DOM field.
+        # Plain local output exposes the model estimate; upload retains the
+        # intentionally optimistic opening presentation separately from it.
         self.assertGreaterEqual(local_model_seconds, 8)
         self.assertGreater(upload_model_seconds, local_model_seconds)
-        self.assertLess(local_seconds, local_model_seconds)
+        self.assertEqual(local_seconds, local_model_seconds)
         self.assertLess(upload_seconds, upload_model_seconds)
         self.assertIn("Est:", local_timer)
         self.assertIn("Est:", upload_timer)

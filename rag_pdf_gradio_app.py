@@ -16878,7 +16878,7 @@ def cancel_or_reset_automatic_run(
     )
 
 
-def opening_eta_presentation_seconds(expected_seconds, *, exact_cache_reuse_records=0):
+def opening_eta_presentation_seconds(expected_seconds, *, exact_cache_reuse_records=0, mode=None):
     """Return the UI-only opening ETA without changing the timing model."""
     try:
         expected = max(0, int(round(float(expected_seconds or 0))))
@@ -16888,7 +16888,7 @@ def opening_eta_presentation_seconds(expected_seconds, *, exact_cache_reuse_reco
         cached = max(0, int(exact_cache_reuse_records or 0))
     except (TypeError, ValueError):
         cached = 0
-    if not expected or cached:
+    if not expected or cached or mode == MODE_LOCAL_ONLY_LABEL:
         return expected
     return max(1, int(math.ceil(expected * OPENING_NONCACHE_ETA_DISPLAY_FACTOR)))
 
@@ -19058,6 +19058,54 @@ def timing_model_has_selected_duplicates(row):
 def timing_model_learning_observation_usable(row):
     """Accept active observations first, with guarded legacy fallback."""
     return timing_model_observation_usable(row) or timing_model_legacy_observation_usable(row)
+
+
+def timing_model_unique_local_workload(row):
+    """Return a multiplier-only learning view, never rewrite retained history.
+
+    Exact selected copies have no parsing/record workload. Use the completed
+    unique workload as the historical denominator, not the original selected
+    (possibly sampled) page total. Keep measured run time, including real
+    setup/copy overhead: do not invent saved seconds or counterfeit a faster
+    run. Upload and local embedding simulations need separate accounting.
+    """
+    if not timing_model_has_selected_duplicates(row):
+        return row
+    if (row.get("mode") not in {MODE_LOCAL_ONLY_LABEL, MODE_LOCAL_WITH_LOGS_LABEL}
+            or row.get("embedding_engine") != "disabled"
+            or row.get("state") != "successful"
+            or row.get("duration_provenance") != "active_observation_window"):
+        return row
+    documents = row.get("document_timing") or []
+    if not documents or not all(isinstance(d, dict) for d in documents):
+        return row
+    try:
+        unique = [d for d in documents if not d.get("selected_input_duplicate")]
+        copies = [d for d in documents if d.get("selected_input_duplicate")]
+        pages = sum(int(d.get("pages") or 0) for d in unique)
+        records = sum(int(d.get("records") or 0) for d in unique)
+        if (not unique or not copies
+                or len(documents) != int(row.get("document_count") or 0)
+                or len(copies) != int(row.get("selected_input_duplicate_documents") or 0)
+                or len(unique) != int(row.get("unique_processed_documents") or 0)
+                or pages != int(row.get("unique_processed_pages") or 0)
+                or records != int(row.get("actual_records") or 0)
+                or any(int(d.get("pages") or 0) <= 0 or int(d.get("records") or 0) <= 0
+                       or not math.isfinite(float(d.get("total_pipeline_seconds") or 0))
+                       or float(d.get("total_pipeline_seconds") or 0) <= 0 for d in unique)
+                or any(int(d.get("records") or 0) != 0 for d in copies)):
+            return row
+    except (ValueError, TypeError, OverflowError):
+        return row
+    return {
+        **row,
+        "document_count": len(unique), "page_count": pages,
+        "estimated_records": records,
+        "selected_input_duplicate_documents": 0,
+        "document_timing": unique,
+        "calibration_workload_basis": "verified_unique_local_workload",
+        "calibration_selected_documents": len(documents),
+    }
 
 
 def timing_model_batch_observation_usable(row):
@@ -21718,7 +21766,7 @@ def estimate_automatic_run(
     comparable = sorted(
         (
             (timing_model_similarity(features, row), row)
-            for row in history
+            for row in map(timing_model_unique_local_workload, history)
             if timing_model_learning_observation_usable(row)
             and timing_model_multiplier_observation_comparable(features, row)
         ),
@@ -21727,6 +21775,7 @@ def estimate_automatic_run(
     ratios = []
     active_ratio_count = 0
     legacy_ratio_count = 0
+    unique_workload_ratio_count = 0
     for score, row in comparable:
         # A timing correction must agree on the upload plan and segmentation
         # family and come from a run with a real sampled document profile.
@@ -21775,6 +21824,8 @@ def estimate_automatic_run(
         historical_base = timing_model_base_seconds(row, batch_seconds_prior=historical_batch_prior)
         if historical_base > 0:
             ratio = float(row["actual_seconds"]) / historical_base
+            if row.get("calibration_workload_basis") == "verified_unique_local_workload":
+                unique_workload_ratio_count += 1
             # Active-window timing is stronger evidence. A guarded legacy
             # record still teaches broad scale, but receives half influence
             # and cannot swing a prediction by itself.
@@ -21800,6 +21851,8 @@ def estimate_automatic_run(
     else:
         multiplier = 1.0
         source = f"conservative first-run formula; {batch_source}"
+    if unique_workload_ratio_count:
+        source += f"; {unique_workload_ratio_count} duplicate-selection run(s) calibrated on verified unique workload"
     if profile.get("profile_sampling_ratio", 1) > 1:
         source += f"; initial profile sampled {profile.get('profiled_documents')} of {profile.get('documents')} PDFs"
     minimum_expected = 60 if mode == MODE_NATIVE_UPLOAD_LABEL else 8
@@ -22582,7 +22635,7 @@ def refresh_automatic_run_estimate(
         estimate["source"],
         state="ready",
         presentation_expected_seconds=opening_eta_presentation_seconds(
-            estimate["expected_seconds"]
+            estimate["expected_seconds"], mode=mode
         ),
     )
 
@@ -24450,7 +24503,7 @@ def run_automatic_from_confirmation(*values, progress=gr.Progress(track_tqdm=Fal
                 phase="Pre-processing: creating document workspace",
                 expected_seconds=confirmed_settings.get("expected_seconds", 0),
                 presentation_expected_seconds=opening_eta_presentation_seconds(
-                    confirmed_settings.get("expected_seconds", 0)
+                    confirmed_settings.get("expected_seconds", 0), mode=confirmed_settings.get("mode")
                 ),
                 details="Creating the isolated AnythingLLM workspace before document processing.",
                 confirmed_fraction=0.0,
@@ -24647,6 +24700,10 @@ def _run_automatic_from_confirmation_stream_body(
     if not _confirmation_preclaimed:
         yield automatic_preprocessing_started_response()
     preflight_started_at = time.perf_counter()
+    # Read only the existing mode field; validation remains owned by the
+    # canonical settings builder below. Do not discount early preflight and
+    # then expose the undiscounted local estimate when the worker starts.
+    confirmation_mode = dict(zip(AUTOMATIC_RUN_FIELDS, values)).get("mode")
     preflight_status_events = []
     preflight_completed_sources = set()
 
@@ -24737,7 +24794,7 @@ def _run_automatic_from_confirmation_stream_body(
             phase=phase,
             expected_seconds=max(0, int(payload.get("expected_seconds") or 0)),
             presentation_expected_seconds=opening_eta_presentation_seconds(
-                max(0, int(payload.get("expected_seconds") or 0))
+                max(0, int(payload.get("expected_seconds") or 0)), mode=confirmation_mode
             ),
             details=detail,
             confirmed_fraction=0.0,
@@ -24846,7 +24903,7 @@ def _run_automatic_from_confirmation_stream_body(
             phase="Pre-flight complete — starting run workspace",
             expected_seconds=settings.get("expected_seconds", 0),
             presentation_expected_seconds=opening_eta_presentation_seconds(
-                settings.get("expected_seconds", 0)
+                settings.get("expected_seconds", 0), mode=settings.get("mode")
             ),
             details=(
                 f"Native text and OCR signals were checked for {len(settings.get('files') or [])} selected PDF(s). "
@@ -24868,7 +24925,7 @@ def _run_automatic_from_confirmation_stream_body(
             phase="Pre-flight complete — starting run workspace",
             expected_seconds=settings.get("expected_seconds", 0),
             presentation_expected_seconds=opening_eta_presentation_seconds(
-                settings.get("expected_seconds", 0)
+                settings.get("expected_seconds", 0), mode=settings.get("mode")
             ),
             details=(
                 f"Native text and OCR signals were checked for {len(settings.get('files') or [])} selected PDF(s). "
@@ -28858,7 +28915,7 @@ def run_automatic(
             state="running",
             phase="Preparing PDF and checking AnythingLLM",
             expected_seconds=expected_seconds,
-            presentation_expected_seconds=opening_eta_presentation_seconds(expected_seconds),
+            presentation_expected_seconds=opening_eta_presentation_seconds(expected_seconds, mode=mode),
             comparable_runs=(
                 run_timing_estimate.get("comparable_runs")
                 if estimate_comparable_runs is None else estimate_comparable_runs
@@ -29002,7 +29059,7 @@ def run_automatic(
                 phase=live_phase,
                 expected_seconds=expected_seconds,
                 presentation_expected_seconds=opening_eta_presentation_seconds(
-                    expected_seconds
+                    expected_seconds, mode=mode
                 ),
                 details=details,
                 confirmed_fraction=AUTOMATIC_RUN_PREFLIGHT_DISPLAY_END,

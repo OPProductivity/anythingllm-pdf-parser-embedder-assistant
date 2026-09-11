@@ -7318,14 +7318,22 @@ def collapse_unsegmented_document_segments(page_segments, source_hash_prefix):
     text_parts = []
     page_spans = []
     offset = 0
+    previous_pdf_page = None
     for row in page_segments:
         text = str(row.get("text") or "").strip()
+        # Whole-file output keeps line breaks, but not empty/whitespace-only
+        # lines. Compact before measuring spans so their offsets remain exact.
+        text = re.sub(r"\n(?:[^\S\n]*\n)+", "\n", text)
         if not text:
             continue
         if text_parts:
-            offset += 2
+            # Pagination alone does not create a line break in whole-file
+            # output. Keep separation between reading regions on one page.
+            text_parts.append("\n" if row.get("pdf_page") == previous_pdf_page else " ")
+            offset += 1
         start = offset
         text_parts.append(text)
+        previous_pdf_page = row.get("pdf_page")
         offset += len(text)
         page_spans.append(
             {
@@ -7335,7 +7343,7 @@ def collapse_unsegmented_document_segments(page_segments, source_hash_prefix):
                 "text_char_end": offset,
             }
         )
-    text = "\n\n".join(text_parts)
+    text = "".join(text_parts)
     first.update(
         {
             "segment_id": f"pdf_{source_hash_prefix}_p{int(first['pdf_page']):04d}_s00001",
