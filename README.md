@@ -69,9 +69,9 @@ flowchart LR
 
 | Mode | Result |
 | --- | --- |
-| **Create local files only** | Creates a compact transcript/segment export directly in one folder named after the selected PDF, or the first and last PDF when processing a batch. Nothing is submitted to AnythingLLM. |
-| **Create local files with diagnostic logs** | Creates a local transcript, segments, and ordinary run evidence. The transcript and segment files sit directly in the document output folder. Nothing is submitted to AnythingLLM. |
-| **Create local files and upload to AnythingLLM** | Creates local output, with the transcript and segments directly in the document output folder, then submits prepared records to an explicitly selected existing workspace or a newly created workspace after confirmation. |
+| **Create local files only** | Publishes the transcript and selected segment/page text files into one flat, text-only run folder. Nothing is submitted to AnythingLLM. |
+| **Create local files with diagnostic logs** | Publishes the same flat, text-only output while retaining ordinary run evidence privately under `run-state`. Nothing is submitted to AnythingLLM. |
+| **Create local files and upload to AnythingLLM** | Publishes flat, text-only output, retains upload/verification evidence under `run-state`, and submits prepared records to the confirmed workspace. |
 
 ### Segmentation choices
 
@@ -115,16 +115,17 @@ Checkout the full screenshot collection here: [docs/screenshots](docs/screenshot
 PDF extraction, OCR text, file segments, metadata remains local. Whenever you let the assistant upload your texts to AnythingLLM it will expose the PDF files to AI models and text embedding providers that you have selected inside AnythingLLM.
 Embedding providers and AI models configured in AnythingLLM may be local or cloud-hosted (OpenRouter). Review the respective provider's policy before processing sensitive text.
 
-By default, generated output, logs, and local configuration are kept under
+By default, generated output, run state, logs, and local configuration are kept under
 `%LOCALAPPDATA%\AnythingLLM PDF Parser Embedder Assistant`. Set
 `ANYTHINGLLM_PDF_ASSISTANT_HOME` before launch to use another writable location.
 Generated paths must stay within the app's Windows-compatible 250-character
 safety limit; choose a shorter output root if necessary.
 
-Compact local-only exports contain no run logs. The app retains only its
-privacy-minimal ETA calibration records under `private-run-history\timing-model`
-inside this app-data folder; that folder is separate from the chosen export
-location and contains no extracted PDF text or API keys.
+The `outputs\automatic-runs` and `outputs\interactive-runs` trees contain only
+root-level TXT files inside each timestamped run folder. Operational JSON,
+JSONL, receipts, and recovery evidence live under `run-state`; long-lived,
+privacy-minimal ETA calibration records remain under
+`private-run-history\timing-model`. API keys are not retained in these records.
 
 Never commit or publish private PDFs, local paths, AnythingLLM Desktop storage,
 raw run reports, API keys, or provider credentials.

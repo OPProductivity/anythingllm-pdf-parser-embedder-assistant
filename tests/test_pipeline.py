@@ -3414,6 +3414,7 @@ class PipelineCoreTests(unittest.TestCase):
         import rag_pdf_gradio_app as app
 
         original_output_root = app.AUTO_OUTPUT_DIR
+        original_state_root = app.AUTO_RUN_STATE_DIR
         original_timing_dir = app.TIMING_MODEL_DIR
         original_runs_path = app.TIMING_MODEL_RUNS_PATH
         original_append = app._append_timing_jsonl
@@ -3436,6 +3437,7 @@ class PipelineCoreTests(unittest.TestCase):
                 json.dumps({"state": "successful"}), encoding="utf-8"
             )
             app.AUTO_OUTPUT_DIR = output_root
+            app.AUTO_RUN_STATE_DIR = output_root
             app.TIMING_MODEL_DIR = Path(tmpdir) / "timing"
             app.TIMING_MODEL_RUNS_PATH = app.TIMING_MODEL_DIR / "timing-runs.jsonl"
 
@@ -3472,6 +3474,7 @@ class PipelineCoreTests(unittest.TestCase):
                 ]
             finally:
                 app.AUTO_OUTPUT_DIR = original_output_root
+                app.AUTO_RUN_STATE_DIR = original_state_root
                 app.TIMING_MODEL_DIR = original_timing_dir
                 app.TIMING_MODEL_RUNS_PATH = original_runs_path
                 app._append_timing_jsonl = original_append
@@ -3986,8 +3989,9 @@ class PipelineCoreTests(unittest.TestCase):
             self.assertFalse(selected.exists())
             self.assertFalse((root / "metadata-api").exists())
             self.assertTrue((root / "Example-pdf-parsed.txt").is_file())
-            self.assertFalse((root / "Example-p001-s01.txt").exists())
-            self.assertEqual(result["retained_segment_files"], 0)
+            self.assertTrue((root / "Example-p001-s01.txt").is_file())
+            self.assertTrue((root / "Example-p002-s01.txt").is_file())
+            self.assertEqual(result["retained_segment_files"], 2)
             self.assertEqual(compact["verification_receipt"]["shared_batch"]["expected_records"], 2)
             self.assertEqual(compact["verification_receipt"]["shared_batch"]["confirmed_vectors"], 2)
             storage = compact["verification_receipt"]["storage"]
@@ -8596,13 +8600,16 @@ class PipelineCoreTests(unittest.TestCase):
                 encoding="utf-8",
             )
             original_output_root = app.AUTO_OUTPUT_DIR
+            original_state_root = app.AUTO_RUN_STATE_DIR
             original_live = app.LIVE_AUTOMATIC_RUN_STATUS
             try:
                 app.AUTO_OUTPUT_DIR = output_root
+                app.AUTO_RUN_STATE_DIR = output_root
                 app.LIVE_AUTOMATIC_RUN_STATUS = {}
                 self.assertIsNone(app.active_automatic_run_root())
             finally:
                 app.AUTO_OUTPUT_DIR = original_output_root
+                app.AUTO_RUN_STATE_DIR = original_state_root
                 app.LIVE_AUTOMATIC_RUN_STATUS = original_live
 
     def test_stale_progress_with_a_live_owned_worker_remains_an_active_run(self):
@@ -8620,14 +8627,17 @@ class PipelineCoreTests(unittest.TestCase):
             stale = time.time() - app.AUTOMATIC_RUN_PROGRESS_STALE_SECONDS - 30
             os.utime(progress_path, (stale, stale))
             original_output_root = app.AUTO_OUTPUT_DIR
+            original_state_root = app.AUTO_RUN_STATE_DIR
             original_live = app.LIVE_AUTOMATIC_RUN_STATUS
             try:
                 app.AUTO_OUTPUT_DIR = output_root
+                app.AUTO_RUN_STATE_DIR = output_root
                 app.LIVE_AUTOMATIC_RUN_STATUS = {}
                 with mock.patch.object(app, "automatic_worker_is_live", return_value=True):
                     self.assertEqual(app.active_automatic_run_root(), run_root)
             finally:
                 app.AUTO_OUTPUT_DIR = original_output_root
+                app.AUTO_RUN_STATE_DIR = original_state_root
                 app.LIVE_AUTOMATIC_RUN_STATUS = original_live
 
     def test_worker_creation_token_restores_ownership_when_cim_times_out(self):
@@ -14247,9 +14257,11 @@ class PipelineCoreTests(unittest.TestCase):
                 encoding="utf-8",
             )
             original_root = app.AUTO_OUTPUT_DIR
+            original_state_root = app.AUTO_RUN_STATE_DIR
             original_live = app.LIVE_AUTOMATIC_RUN_STATUS
             try:
                 app.AUTO_OUTPUT_DIR = output_root
+                app.AUTO_RUN_STATE_DIR = output_root
                 app.LIVE_AUTOMATIC_RUN_STATUS = {}
                 app.cancel_or_reset_automatic_run(
                     run_activity_html='<div data-run-state="running"></div>'
@@ -14258,6 +14270,7 @@ class PipelineCoreTests(unittest.TestCase):
                 self.assertTrue(app.automatic_run_cancellation_requested(run_root))
             finally:
                 app.AUTO_OUTPUT_DIR = original_root
+                app.AUTO_RUN_STATE_DIR = original_state_root
                 app.LIVE_AUTOMATIC_RUN_STATUS = original_live
                 app.CANCELLED_AUTOMATIC_RUN_ROOTS.discard(str(run_root))
 
@@ -18455,6 +18468,7 @@ class PipelineCoreTests(unittest.TestCase):
     def test_short_native_heading_leaf_survives_segment_threshold(self):
         self.assertTrue(pipeline.credible_short_page_leaf("Chapter Four\nParis Is Devine"))
         self.assertTrue(pipeline.credible_short_page_leaf("To\nJohn Emerson"))
+        self.assertTrue(pipeline.credible_short_page_leaf("Also by JD Vance\nHillbilly Elegy"))
         self.assertFalse(pipeline.credible_short_page_leaf("58"))
         self.assertFalse(pipeline.credible_short_page_leaf("isolated incidental words"))
 

@@ -4618,10 +4618,10 @@ def finalize_deferred_batch_lean_retention(out_root: Path, summary):
         allow_exact_vector_runtime_deferred=True,
         shared_batch_receipt=receipt,
         # Exact-vector-proven automatic uploads retain the complete parsed
-        # transcript and compact source receipt. Individual segment files are
-        # a manual/local-export convenience and need not become thousands of
-        # permanent filesystem objects after an automatic upload succeeds.
-        retain_segment_files=False,
+        # transcript and compact source receipt. The private run-state tree
+        # also keeps generated page/segment text until the parent has
+        # published those records into the flat user-facing output folder.
+        retain_segment_files=True,
         preserve_preexisting_children=False,
     )
     if retained.get("applied"):
@@ -7173,6 +7173,7 @@ def credible_short_page_leaf(text):
                 r"(?i)\b(?:chapter|part|book|prologue|epilogue|introduction|preface|dedicated|to)\b",
                 clean,
             )
+            or re.match(r"(?i)^also\s+by\b", clean)
             or all(word[:1].isupper() for word in words)
         )
     )
@@ -28481,6 +28482,58 @@ def create_fresh_cli_run_root(base_output: Path, *, timestamp: str | None = None
     raise OSError(f"Could not allocate a unique CLI run directory below {base}")
 
 
+def publish_cli_text_outputs(output_base: Path, _state_run_root: Path, summaries):
+    """Copy only user-consumable TXT records into one flat CLI run folder."""
+    target = create_fresh_cli_run_root(output_base)
+    segment_name = re.compile(r"-p\d{3,}-s\d+\.txt$", re.IGNORECASE)
+    used_names = set()
+    published = []
+    try:
+        for index, summary in enumerate(summaries or [], start=1):
+            if not isinstance(summary, dict):
+                continue
+            prepared = Path(str(summary.get("upload_file") or ""))
+            retained = dict(summary.get("lean_retention") or {})
+            retained_prepared = Path(str(retained.get("prepared_text") or ""))
+            if retained_prepared.is_file():
+                prepared = retained_prepared
+            if not prepared.is_file():
+                continue
+            source = Path(str(summary.get("pdf") or f"document-{index}.pdf"))
+            candidates = [prepared, *sorted(
+                (path for path in prepared.parent.iterdir() if path.is_file() and segment_name.search(path.name)),
+                key=lambda path: path.name.casefold(),
+            )]
+            suffixes = ["-complete-pdf-parsed.txt"]
+            for path in candidates[1:]:
+                match = segment_name.search(path.name)
+                if match:
+                    suffixes.append(match.group(0))
+            stem = safe_stem(source.stem)
+            for candidate, suffix in zip(candidates, suffixes):
+                name = f"{stem}{suffix}"
+                collision = 2
+                while name.casefold() in used_names or (target / name).exists():
+                    name = f"{stem}-{collision}{suffix}"
+                    collision += 1
+                used_names.add(name.casefold())
+                destination = target / name
+                shutil.copy2(candidate, destination)
+                published.append(str(destination))
+        if not published:
+            target.rmdir()
+            return None, []
+        return target, published
+    except Exception:
+        for path in published:
+            Path(path).unlink(missing_ok=True)
+        try:
+            target.rmdir()
+        except OSError:
+            pass
+        raise
+
+
 def discover_pdfs(input_path: Path):
     if input_path.is_file() and input_path.suffix.lower() == ".pdf":
         return [input_path]
@@ -28657,9 +28710,10 @@ def main():
         )
 
     input_path = Path(args.input)
-    default_out = application_paths()["automatic_outputs"]
+    paths = application_paths()
+    default_out = paths["automatic_outputs"]
     base_out = Path(args.out_dir) if args.out_dir else default_out
-    run_root = create_fresh_cli_run_root(base_out)
+    run_root = create_fresh_cli_run_root(paths["automatic_run_state"])
 
     summaries = []
     for pdf in discover_pdfs(input_path):
@@ -28674,12 +28728,19 @@ def main():
         summaries.append(
             {
                 **legacy_summary,
+                "pdf": str(pdf),
                 "run_control": run_result.to_dict(),
             }
         )
 
     write_json(run_root / "batch-summary.json", summaries)
-    print(json.dumps({"run_root": str(run_root), "documents": summaries}, indent=2, ensure_ascii=False))
+    published_root, published_files = publish_cli_text_outputs(base_out, run_root, summaries)
+    print(json.dumps({
+        "run_state_root": str(run_root),
+        "output_root": str(published_root) if published_root else "",
+        "output_files": published_files,
+        "documents": summaries,
+    }, indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":

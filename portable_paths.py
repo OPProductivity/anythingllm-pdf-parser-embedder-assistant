@@ -45,11 +45,15 @@ def application_paths() -> dict[str, Path]:
 
     root = application_data_dir()
     outputs = root / "outputs"
+    run_state = root / "run-state"
     return {
         "root": root,
         "outputs": outputs,
         "automatic_outputs": outputs / "automatic-runs",
         "interactive_outputs": outputs / "interactive-runs",
+        "run_state": run_state,
+        "automatic_run_state": run_state / "automatic-runs",
+        "interactive_run_state": run_state / "interactive-runs",
         # Long-lived, app-private aggregates. These are deliberately separate
         # from a user-selected export folder so a compact local export stays
         # compact even while the app retains ETA calibration data.
@@ -66,6 +70,7 @@ def ensure_application_directories() -> dict[str, Path]:
     paths = application_paths()
     for key in (
         "root", "outputs", "automatic_outputs", "interactive_outputs",
+        "run_state", "automatic_run_state", "interactive_run_state",
         "private_history", "logs", "config",
     ):
         paths[key].mkdir(parents=True, exist_ok=True)

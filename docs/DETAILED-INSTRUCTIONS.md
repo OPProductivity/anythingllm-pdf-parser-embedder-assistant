@@ -101,19 +101,20 @@ Choose one output mode:
 
 | Mode | What happens |
 | --- | --- |
-| **Create local files only** | A compact transcript/segment export with no run logs. Its one output folder is named after the selected PDF, or the first and last PDF in a batch. Nothing is submitted to AnythingLLM. |
-| **Create local files with diagnostic logs** | Text extraction, selected OCR/segmentation, local output, and ordinary run evidence. The transcript and segment files are directly in the document output folder. Nothing is submitted to AnythingLLM. |
-| **Create local files and upload to AnythingLLM** | Local output, with the transcript and segment files directly in the document output folder, plus submission of prepared records to an explicitly selected workspace or a newly created workspace. |
+| **Create local files only** | A flat, text-only transcript/segment export. Nothing is submitted to AnythingLLM. |
+| **Create local files with diagnostic logs** | The same flat, text-only export; ordinary run evidence is retained separately under the app's `run-state` folder. Nothing is submitted to AnythingLLM. |
+| **Create local files and upload to AnythingLLM** | Flat, text-only output plus submission to the confirmed workspace; upload and verification evidence is retained under `run-state`. |
 
-The output-root chooser controls where local run folders are created. Each
-diagnostic-log run receives its own subfolder. Compact local-only exports are
-placed directly in the selected root instead. Keep the selected root reasonably
-short: generated paths have a 250-character Windows-compatible safety limit.
+The output-root chooser controls where timestamped local run folders are
+created. Every such folder contains only TXT outputs at its root, including all
+page-parent TXT files from a multi-PDF run; there are no per-document subfolders.
+Keep the selected root reasonably short: generated paths have a 250-character
+Windows-compatible safety limit.
 
-The compact export itself contains only the prepared transcript and any chosen
-segments, all at that folder's root. The app keeps its ETA calibration history
-separately under `%LOCALAPPDATA%\AnythingLLM PDF Parser Embedder Assistant\private-run-history\timing-model`.
-Those records contain timing and aggregate counts, not extracted PDF text or API keys.
+Operational run receipts, summaries, JSON/JSONL evidence, and recovery state are
+kept separately under `%LOCALAPPDATA%\AnythingLLM PDF Parser Embedder Assistant\run-state`.
+ETA calibration history remains under `private-run-history\timing-model`; API
+keys are not retained in either location.
 
 For upload mode, choose an existing workspace or **New workspace for this
 document**. A new workspace is created only after confirmation. The selection

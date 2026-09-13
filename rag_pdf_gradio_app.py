@@ -194,7 +194,11 @@ APP_LOGGER = configure_structured_logger(
 # never clutter a user-selected local-only export.
 BASE_OUTPUT_DIR = PORTABLE_APPLICATION_PATHS["interactive_outputs"]
 AUTO_OUTPUT_DIR = PORTABLE_APPLICATION_PATHS["automatic_outputs"]
-ADVANCED_DIAGNOSTICS_OUTPUT_DIR = BASE_OUTPUT_DIR / "advanced-diagnostics"
+RUN_STATE_DIR = PORTABLE_APPLICATION_PATHS["run_state"]
+AUTO_RUN_STATE_DIR = PORTABLE_APPLICATION_PATHS["automatic_run_state"]
+INTERACTIVE_RUN_STATE_DIR = PORTABLE_APPLICATION_PATHS["interactive_run_state"]
+ADVANCED_DIAGNOSTICS_OUTPUT_DIR = BASE_OUTPUT_DIR
+ADVANCED_DIAGNOSTICS_STATE_DIR = INTERACTIVE_RUN_STATE_DIR / "advanced-diagnostics"
 PRIVATE_RUN_HISTORY_DIR = PORTABLE_APPLICATION_PATHS["private_history"]
 INGESTION_HISTORY_PATH = PRIVATE_RUN_HISTORY_DIR / "ingestion-history.jsonl"
 TIMING_MODEL_DIR = PRIVATE_RUN_HISTORY_DIR / "timing-model"
@@ -7296,7 +7300,7 @@ def export_workspace_duplicate_cleanup_review_html(workspace_slug):
             }
         )
     try:
-        review_root = create_fresh_automatic_run_root(AUTO_OUTPUT_DIR, prefix="workspace-duplicate-review")
+        review_root = create_fresh_automatic_run_root(AUTO_RUN_STATE_DIR, prefix="workspace-duplicate-review")
         review_path = review_root / "workspace-duplicate-cleanup-review.json"
         _write_automatic_run_json(
             review_path,
@@ -7345,7 +7349,7 @@ def _latest_workspace_runtime_payloads(workspace_slug, limit=600):
     slug = str(workspace_slug or "").strip()
     documents_root = default_anythingllm_documents_dir().resolve()
     candidates = sorted(
-        automatic_run_artifact_paths(AUTO_OUTPUT_DIR, "**/batch-native-upload-report.json"),
+        automatic_run_artifact_paths(AUTO_RUN_STATE_DIR, "**/batch-native-upload-report.json"),
         key=lambda path: path.stat().st_mtime if path.exists() else 0,
         reverse=True,
     )
@@ -7916,26 +7920,32 @@ def local_export_retention_complete(summaries):
     )
 
 
-def promote_flat_no_logs_batch_output(output_root, temporary_run_dir, pdf_paths, summaries):
-    """Promote successful no-log document exports into one timestamped folder.
+def automatic_text_outputs_ready(summaries):
+    """Return true when every selected source has a publishable transcript."""
+    try:
+        canonical = local_export_canonical_summaries(summaries)
+    except ValueError:
+        return False
+    return bool(canonical) and all(
+        Path(str((row or {}).get("upload_file") or "")).is_file()
+        for row in canonical
+    )
 
-    The worker still stages output in a uniquely owned ``r-*`` directory while
-    it is running. Once every document is ready, only its plain-text export is
-    copied to the user-selected root; the staging receipts are deleted by the
-    caller. This keeps a multi-PDF run as one convenient folder without
-    flattening identities from different source documents into subfolders.
+
+def promote_flat_no_logs_batch_output(output_root, temporary_run_dir, pdf_paths, summaries):
+    """Publish successful text outputs into one flat timestamped folder.
+
+    Operational evidence is staged in a uniquely owned ``run-state/r-*``
+    directory. Once every document is ready, only plain-text output is copied
+    to the user-selected root, without document subfolders or log leakage.
     """
     base = Path(output_root)
-    run_root = Path(temporary_run_dir)
     canonical_summaries = local_export_canonical_summaries(summaries)
-    document_dirs = []
     for summary in canonical_summaries:
         upload_file = Path(str((summary or {}).get("upload_file") or ""))
         source_dir = upload_file.parent
-        if not upload_file.is_file() or not source_dir.is_dir() or source_dir.parent != run_root:
+        if not upload_file.is_file() or not source_dir.is_dir():
             raise FileNotFoundError(f"No-log export is missing a prepared text file: {upload_file}")
-        if source_dir not in document_dirs:
-            document_dirs.append(source_dir)
     # ``retain_successful_run_without_logs`` leaves exactly one prepared
     # transcript per document plus page/group records named ``-pNNN-sNN``.
     # The orchestration wrapper can write its own checkpoint receipts *after*
@@ -8299,7 +8309,7 @@ def ingestion_history_html(workspace_slug="", limit=12):
 
 def latest_resume_manifest(workspace_slug):
     slug = (workspace_slug or "").strip()
-    candidates = sorted(automatic_run_artifact_paths(AUTO_OUTPUT_DIR, "**/resume-embedding-manifest.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+    candidates = sorted(automatic_run_artifact_paths(AUTO_RUN_STATE_DIR, "**/resume-embedding-manifest.json"), key=lambda path: path.stat().st_mtime, reverse=True)
     for path in candidates:
         try:
             manifest = json.loads(path.read_text(encoding="utf-8"))
@@ -10420,18 +10430,14 @@ def retained_run_diagnostics_update(run_directory):
 
 def latest_automatic_pdf_output_directory():
     """Find the newest completed per-PDF output below the default Automatic root."""
-    candidates = sorted(
-        automatic_run_artifact_paths(AUTO_OUTPUT_DIR, "*/run-summary.json"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
+    candidates = sorted(AUTO_OUTPUT_DIR.glob("r-*/*.txt"), key=lambda path: path.stat().st_mtime, reverse=True)
     return str(candidates[0].parent) if candidates else ""
 
 
 def latest_advanced_diagnostics_output_directory(output_root_override=""):
     """Find the latest completed local-only Advanced diagnostic run."""
     root = Path(
-        str(output_root_override or "").strip() or str(ADVANCED_DIAGNOSTICS_OUTPUT_DIR)
+        str(output_root_override or "").strip() or str(ADVANCED_DIAGNOSTICS_STATE_DIR)
     )
     candidates = sorted(
         automatic_run_artifact_paths(root, "*/run-summary.json"),
@@ -12179,7 +12185,8 @@ def run_advanced_diagnostics(
         output_root = Path(
             str(output_root_override or "").strip() or str(ADVANCED_DIAGNOSTICS_OUTPUT_DIR)
         )
-        run_root = create_fresh_automatic_run_root(output_root)
+        ADVANCED_DIAGNOSTICS_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        run_root = create_fresh_automatic_run_root(ADVANCED_DIAGNOSTICS_STATE_DIR)
         output_dir = compatible_output_document_directory(run_root, pdf_path)
     except OSError as exc:
         raise gr.Error(f"Could not create the Advanced diagnostic output folder: {exc}") from exc
@@ -12261,6 +12268,16 @@ def run_advanced_diagnostics(
                 f"Advanced diagnostic preparation failed: {exc}. Failure evidence could not be written: {failure_exc}"
             ) from failure_exc
 
+    published_dir = None
+    if not summary.get("app_error_code") and automatic_text_outputs_ready([summary]):
+        try:
+            published_dir = promote_flat_no_logs_batch_output(
+                output_root, run_root, [pdf_path], [summary]
+            )
+        except (OSError, ValueError) as exc:
+            summary["app_error_code"] = "ADVANCED-TEXT-OUTPUT-PUBLISH-001"
+            summary["app_error_title"] = "Prepared text could not be published"
+            summary["app_error_message"] = str(exc)
     progress(1.0, desc="Advanced diagnostic run complete")
     primary = primary_prepared_download_paths([summary])
     if not primary:
@@ -12270,7 +12287,7 @@ def run_advanced_diagnostics(
             value=advanced_diagnostics_result_html(output_dir, summary, selection_reason),
             visible=True,
         ),
-        str(output_dir),
+        str(published_dir or output_dir),
         download_files_update(primary, False, False),
         advanced_diagnostic_completion_status(summary),
         gr.update(visible=False),
@@ -14887,7 +14904,7 @@ def active_automatic_run_root(*, allow_recent_unowned=False):
     if live_root:
         return Path(live_root)
     candidates = sorted(
-        automatic_run_artifact_paths(AUTO_OUTPUT_DIR, "run-progress.json"),
+        automatic_run_artifact_paths(AUTO_RUN_STATE_DIR, "run-progress.json"),
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
@@ -14970,7 +14987,7 @@ def _recovery_ledger_groups(run_root):
 def _is_most_recent_recovery_run(run_root):
     root = Path(run_root)
     candidates = sorted(
-        automatic_run_artifact_paths(AUTO_OUTPUT_DIR, "**/resume-embedding-manifest.json"),
+        automatic_run_artifact_paths(AUTO_RUN_STATE_DIR, "**/resume-embedding-manifest.json"),
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
@@ -15718,7 +15735,7 @@ def interrupted_automatic_batch_notice(output_root=None):
     if str((LIVE_AUTOMATIC_RUN_STATUS or {}).get("run_root") or ""):
         return {"visible": False, "html": "", "state": "owned"}
 
-    root = Path(output_root) if output_root is not None else Path(AUTO_OUTPUT_DIR)
+    root = Path(output_root) if output_root is not None else Path(AUTO_RUN_STATE_DIR)
     candidates = sorted(
         automatic_run_artifact_paths(root, "run-progress.json"),
         key=lambda path: path.stat().st_mtime if path.exists() else 0,
@@ -16094,6 +16111,8 @@ def finalize_successful_automatic_batch_retention(summaries):
         result = finalize_deferred_batch_lean_retention(output_root, summary)
         if result.get("applied"):
             summary["lean_retention"] = dict(result)
+            if result.get("prepared_text"):
+                summary["upload_file"] = result["prepared_text"]
             worker_cleanup = automatic_success_worker_artifact_cleanup_report(output_root, summary)
             result["worker_receipts_deleted"] = worker_cleanup["removed"]
             if worker_cleanup["pending"]:
@@ -21423,7 +21442,7 @@ def _ensure_timing_model_backfill():
     existing = {str(row.get("run_key") or "") for row in _read_timing_jsonl(TIMING_MODEL_RUNS_PATH, limit=1000)}
     cutover_epoch = timing_model_backfill_cutover_epoch()
     seeded = 0
-    for summary_path in sorted(automatic_run_artifact_paths(AUTO_OUTPUT_DIR, "*/run-summary.json"), key=lambda path: path.stat().st_mtime)[-100:]:
+    for summary_path in sorted(automatic_run_artifact_paths(AUTO_RUN_STATE_DIR, "*/run-summary.json"), key=lambda path: path.stat().st_mtime)[-100:]:
         if cutover_epoch and summary_path.stat().st_mtime < cutover_epoch:
             continue
         run_root = summary_path.parent.parent
@@ -24894,8 +24913,7 @@ def _run_automatic_from_confirmation_stream_body(
     # action.  Cancel can now reach the same marker even while a new AnythingLLM
     # workspace is being created, rather than being blind during "preparing".
     try:
-        reserved_base = Path((settings.get("output_root_override") or "").strip() or str(AUTO_OUTPUT_DIR))
-        reserved_run_root = create_fresh_automatic_run_root(reserved_base)
+        reserved_run_root = create_fresh_automatic_run_root(AUTO_RUN_STATE_DIR)
         settings["_reserved_run_root"] = str(reserved_run_root)
         update_live_automatic_run_status(
             reserved_run_root,
@@ -28881,7 +28899,8 @@ def run_automatic(
         batch_capacity = automatic_batch_output_capacity_preflight(files, output_root_base)
         if batch_capacity["status"] != "pass":
             raise RuntimeError(batch_capacity["message"])
-        run_root = Path(run_root_override) if run_root_override else create_fresh_automatic_run_root(output_root_base)
+        AUTO_RUN_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        run_root = Path(run_root_override) if run_root_override else create_fresh_automatic_run_root(AUTO_RUN_STATE_DIR)
         run_root.mkdir(parents=True, exist_ok=True)
         update_eta_checkpoint_record(
             run_root,
@@ -30796,7 +30815,7 @@ def run_automatic(
             # those artifacts on both success and failure until that batch
             # boundary decides what is safe to remove.
             defer_lean_retention=bool(prepare_and_upload and not retain_detailed_evidence),
-            flat_output_without_logs=flat_no_logs_output,
+            flat_output_without_logs=False,
             run_vector_eval=bool(run_vector_eval),
             simulation_adapter=simulation_adapter,
             simulation_embedder_choice=local_choice,
@@ -32594,25 +32613,17 @@ def run_automatic(
                 "did not finish. Detailed source artifacts were retained; no upload was repeated."
             ),
         })
-    if (
-        flat_no_logs_output
-        and completion["state"] == "successful"
-        and not local_export_retention_complete(summaries)
-    ):
+    if completion["state"] == "successful" and not automatic_text_outputs_ready(summaries):
         completion = with_error_dimensions({
             "state": "warning",
-            "code": "AUTO-LOCAL-EXPORT-PROMOTION-001",
+            "code": "AUTO-TEXT-OUTPUT-PUBLISH-001",
             "message": (
-                "Preparation finished, but compact local export is incomplete. "
-                "Prepared text and diagnostic evidence remain in the staging folder; "
+                "Processing finished, but the text-only output publication is incomplete. "
+                "Prepared text and diagnostic evidence remain in the private run-state folder; "
                 "no source was reprocessed."
             ),
         }, stage="local_reporting", outcome="export_incomplete", scope="artifact", category="compact_export_promotion_failed")
-    flat_no_logs_complete = (
-        flat_no_logs_output
-        and completion["state"] == "successful"
-        and local_export_retention_complete(summaries)
-    )
+    flat_no_logs_complete = completion["state"] == "successful" and automatic_text_outputs_ready(summaries)
     flat_no_logs_output_dir = None
     if flat_no_logs_complete:
         try:
@@ -32628,8 +32639,8 @@ def run_automatic(
                 "state": "warning",
                 "code": "AUTO-LOCAL-EXPORT-PROMOTION-001",
                 "message": (
-                    "The local files were prepared, but their compact export could not be promoted. "
-                    f"Detailed staging output was retained for review: {exc}"
+                    "The text files were prepared, but their text-only output folder could not be published. "
+                    f"Detailed run state was retained for review: {exc}"
                 ),
             }, stage="local_reporting", outcome="export_incomplete", scope="artifact", category="compact_export_promotion_failed")
     completion, terminal_audit = terminal_integrity_audit(
@@ -32703,7 +32714,7 @@ def run_automatic(
     terminal_processing_settings = {
         **dict(processing_settings or {}),
         "successful_output_retention": {
-            "status": "flat_local_export" if flat_no_logs_complete else str(batch_retention_report.get("status") or "not_required"),
+            "status": "text_only_output_published" if flat_no_logs_complete else str(batch_retention_report.get("status") or "not_required"),
             "documents": len(summaries) if flat_no_logs_complete else len(batch_retention_report.get("documents") or []),
         },
         "output_capacity_preflight": terminal_output_capacity_evidence(batch_capacity),
@@ -32719,7 +32730,7 @@ def run_automatic(
         lines.append("History retention pending: prepared files are usable; the staging logs were kept because private run/timing history could not be fully saved.")
         APP_LOGGER.warning("private history incomplete; keeping terminal run evidence at %s", run_root)
     if (
-        history_ready and not flat_no_logs_complete
+        history_ready
         and completion["state"] == "successful"
         and batch_retention_report.get("status") == "complete"
     ):
@@ -32795,22 +32806,11 @@ def run_automatic(
         batch_current_file_index=0,
         authoritative_batch_completed_files=True,
     )
-    if flat_no_logs_complete and history_ready:
-        # The temporary app-run directory contains worker/progress receipts.
-        # Only the promoted flat text folder is intentionally user-visible.
-        cleanup_message = cleanup_flat_local_staging(run_root)
-        if cleanup_message:
-            lines.append(cleanup_message)
-            completion["message"] += " " + cleanup_message
-            update_live_automatic_run_status(
-                run_root, state=completion["state"], phase=automatic_completion_phase(completion, prepare_and_upload), details=completion["message"],
-                cancel_available=False, activity_observed=False,
-            )
     return (
         gr.update(value=run_summary_html("\n".join(lines)), visible=True),
         download_files_update(prepared_paths, False, False),
         artifact_display_html(prepared_paths, "Prepared text ready to download"),
-        downloadable,
+        prepared_paths,
         automatic_completion_button_state(completion),
         latest_readiness_html,
         automatic_run_timing_html(
@@ -32835,7 +32835,7 @@ def run_edge_case_tests(
     if not files:
         raise gr.Error("Choose at least one PDF.")
 
-    run_root = create_fresh_automatic_run_root(AUTO_OUTPUT_DIR, prefix="edge-case-run")
+    run_root = create_fresh_automatic_run_root(AUTO_RUN_STATE_DIR, prefix="edge-case-run")
     summaries = []
     downloadable = []
     for file_path in files:

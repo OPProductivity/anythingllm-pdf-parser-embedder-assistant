@@ -541,7 +541,8 @@ def _owned_active_run_roots(server_root_pid: int) -> list[Path]:
     Older run records have no owner PID and are deliberately excluded: a Stop
     shortcut must never reinterpret an unknown historical run as its own.
     """
-    output_root = application_paths()["automatic_outputs"]
+    paths = application_paths()
+    output_root = paths.get("automatic_run_state") or paths["automatic_outputs"]
     try:
         candidates = [path for path in output_root.iterdir() if path.is_dir()]
     except OSError:
