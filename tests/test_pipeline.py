@@ -4247,6 +4247,7 @@ class PipelineCoreTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
+            output_root = root / "outputs"
             first_pdf = root / "A source title.pdf"
             last_pdf = root / "Z final title.pdf"
             first_pdf.write_bytes(b"first source fixture")
@@ -4269,13 +4270,13 @@ class PipelineCoreTests(unittest.TestCase):
             summaries = [{"upload_file": str(first_text)}, {"upload_file": str(last_text)}]
 
             moved = app.promote_flat_no_logs_batch_output(
-                root,
+                output_root,
                 run_root,
                 [first_pdf, last_pdf],
                 summaries,
             )
 
-            self.assertRegex(moved.name, r"^r-\d{8}-\d{6}-[0-9a-f]{10}(?:-\d+)?$")
+            self.assertEqual(moved.name, run_root.name)
             self.assertNotEqual(moved, run_root)
             self.assertEqual(
                 {path.name for path in moved.iterdir()},

@@ -108,6 +108,9 @@ Choose one output mode:
 The output-root chooser controls where timestamped local run folders are
 created. Every such folder contains only TXT outputs at its root, including all
 page-parent TXT files from a multi-PDF run; there are no per-document subfolders.
+The corresponding private `run-state` folder uses the exact same final folder
+name, including its hash, and does not retain any TXT payload after verified
+publication.
 Keep the selected root reasonably short: generated paths have a 250-character
 Windows-compatible safety limit.
 

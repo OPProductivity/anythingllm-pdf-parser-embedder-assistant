@@ -28482,9 +28482,15 @@ def create_fresh_cli_run_root(base_output: Path, *, timestamp: str | None = None
     raise OSError(f"Could not allocate a unique CLI run directory below {base}")
 
 
-def publish_cli_text_outputs(output_base: Path, _state_run_root: Path, summaries):
+def publish_cli_text_outputs(output_base: Path, state_run_root: Path, summaries):
     """Copy only user-consumable TXT records into one flat CLI run folder."""
-    target = create_fresh_cli_run_root(output_base)
+    state_root = Path(state_run_root).resolve()
+    target = Path(output_base) / state_root.name
+    target.mkdir(parents=True, exist_ok=True)
+    if any(path.is_dir() or path.suffix.casefold() != ".txt" for path in target.iterdir()):
+        raise OSError(f"Matched output run folder contains a non-TXT item: {target}")
+    if any(target.iterdir()):
+        raise FileExistsError(f"Matched CLI output run folder is not empty: {target}")
     segment_name = re.compile(r"-p\d{3,}-s\d+\.txt$", re.IGNORECASE)
     used_names = set()
     published = []
@@ -28510,19 +28516,27 @@ def publish_cli_text_outputs(output_base: Path, _state_run_root: Path, summaries
                 if match:
                     suffixes.append(match.group(0))
             stem = safe_stem(source.stem)
+            summary_destinations = []
             for candidate, suffix in zip(candidates, suffixes):
                 name = f"{stem}{suffix}"
                 collision = 2
-                while name.casefold() in used_names or (target / name).exists():
+                while name.casefold() in used_names:
                     name = f"{stem}-{collision}{suffix}"
                     collision += 1
                 used_names.add(name.casefold())
                 destination = target / name
                 shutil.copy2(candidate, destination)
                 published.append(str(destination))
+                summary_destinations.append(destination)
+            if summary_destinations:
+                summary["upload_file"] = str(summary_destinations[0])
+                summary["published_output_directory"] = str(target)
         if not published:
             target.rmdir()
             return None, []
+        for source in state_root.rglob("*"):
+            if source.is_file() and source.suffix.casefold() == ".txt":
+                source.unlink()
         return target, published
     except Exception:
         for path in published:
@@ -28733,8 +28747,8 @@ def main():
             }
         )
 
-    write_json(run_root / "batch-summary.json", summaries)
     published_root, published_files = publish_cli_text_outputs(base_out, run_root, summaries)
+    write_json(run_root / "batch-summary.json", summaries)
     print(json.dumps({
         "run_state_root": str(run_root),
         "output_root": str(published_root) if published_root else "",

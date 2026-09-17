@@ -125,7 +125,10 @@ The `outputs\automatic-runs` and `outputs\interactive-runs` trees contain only
 root-level TXT files inside each timestamped run folder. Operational JSON,
 JSONL, receipts, and recovery evidence live under `run-state`; long-lived,
 privacy-minimal ETA calibration records remain under
-`private-run-history\timing-model`. API keys are not retained in these records.
+`private-run-history\timing-model`. Each output folder has the exact same
+timestamp-and-hash name as its matching `run-state` folder, and every TXT
+payload is removed from private run state after verified copying. API keys are
+not retained in these records.
 
 Never commit or publish private PDFs, local paths, AnythingLLM Desktop storage,
 raw run reports, API keys, or provider credentials.

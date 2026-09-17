@@ -36,12 +36,14 @@ def duplicate(row, name="Alias.pdf"):
 @pytest.mark.parametrize("snippets", [False, True])
 def test_duplicate_exports_flat_without_reparsing_or_receipts(tmp_path, snippets):
     staging = tmp_path / "staging"
+    output_root = tmp_path / "outputs"
     first = prepared(staging, 1, snippets=snippets)
     alias = duplicate(first)
     rows = [first, alias]
     source = Path(first["upload_file"])
     assert app.local_export_retention_complete(rows)
-    result = app.promote_flat_no_logs_batch_output(tmp_path, staging, [], rows)
+    result = app.promote_flat_no_logs_batch_output(output_root, staging, [], rows)
+    assert result.name == staging.name
     assert len(list(result.iterdir())) == (4 if snippets else 2)
     assert all(p.is_file() and p.suffix == ".txt" for p in result.iterdir())
     assert Path(first["upload_file"]).name == "Paper-complete-pdf-parsed.txt"
@@ -78,7 +80,7 @@ def test_friendly_names_handle_collisions_and_windows_paths(tmp_path, names):
     staging = tmp_path / "staging"
     rows = [prepared(staging, i, name) for i, name in enumerate(names)]
     original_bytes = [Path(r["upload_file"]).read_bytes() for r in rows]
-    result = app.promote_flat_no_logs_batch_output(tmp_path, staging, [], rows)
+    result = app.promote_flat_no_logs_batch_output(tmp_path / "outputs", staging, [], rows)
     assert len(list(result.iterdir())) == len(names)
     assert len({p.name.casefold() for p in result.iterdir()}) == len(names)
     assert all(len(str(p)) <= 250 for p in result.iterdir())
@@ -87,6 +89,7 @@ def test_friendly_names_handle_collisions_and_windows_paths(tmp_path, names):
 
 def test_failed_copy_preserves_all_staging_and_summary_paths(tmp_path, monkeypatch):
     staging = tmp_path / "staging"
+    output_root = tmp_path / "outputs"
     rows = [prepared(staging, i) for i in (1, 2)]
     originals = [r["upload_file"] for r in rows]
     actual_copy = app.shutil.copyfileobj
@@ -102,10 +105,10 @@ def test_failed_copy_preserves_all_staging_and_summary_paths(tmp_path, monkeypat
 
     monkeypatch.setattr(app.shutil, "copyfileobj", fail_second)
     with pytest.raises(OSError, match="simulated"):
-        app.promote_flat_no_logs_batch_output(tmp_path, staging, [], rows)
+        app.promote_flat_no_logs_batch_output(output_root, staging, [], rows)
     assert [r["upload_file"] for r in rows] == originals
     assert all(Path(p).is_file() for p in originals)
-    assert list(tmp_path.iterdir()) == [staging]
+    assert not output_root.exists() or not any(output_root.iterdir())
 
 
 def test_missing_text_never_promotes(tmp_path):
@@ -113,7 +116,7 @@ def test_missing_text_never_promotes(tmp_path):
     row = prepared(staging, 1)
     Path(row["upload_file"]).unlink()
     with pytest.raises(FileNotFoundError):
-        app.promote_flat_no_logs_batch_output(tmp_path, staging, [], [row])
+        app.promote_flat_no_logs_batch_output(tmp_path / "outputs", staging, [], [row])
     assert list(tmp_path.iterdir()) == [staging]
 
 
@@ -123,7 +126,7 @@ def test_long_duplicate_collision_keeps_marker_at_end(tmp_path):
     alias = duplicate(first, "LongTitle" * 30 + ".pdf")
     another = dict(alias, pdf=str(staging / "other" / Path(alias["pdf"]).name))
     rows = [first, alias, another]
-    result = app.promote_flat_no_logs_batch_output(tmp_path, staging, [], rows)
+    result = app.promote_flat_no_logs_batch_output(tmp_path / "outputs", staging, [], rows)
     assert len(list(result.iterdir())) == 3
     assert alias["upload_file"] != another["upload_file"]
     for row in (alias, another):

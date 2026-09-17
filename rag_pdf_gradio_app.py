@@ -7940,6 +7940,7 @@ def promote_flat_no_logs_batch_output(output_root, temporary_run_dir, pdf_paths,
     to the user-selected root, without document subfolders or log leakage.
     """
     base = Path(output_root)
+    run_root = Path(temporary_run_dir)
     canonical_summaries = local_export_canonical_summaries(summaries)
     for summary in canonical_summaries:
         upload_file = Path(str((summary or {}).get("upload_file") or ""))
@@ -7953,9 +7954,13 @@ def promote_flat_no_logs_batch_output(output_root, temporary_run_dir, pdf_paths,
     # directory: doing so leaks those diagnostic JSON/JSONL files back into a
     # user-selected no-logs export.
     segment_name = re.compile(r"-p\d{3,}-s\d+\.txt$", re.IGNORECASE)
-    # Use the same short, atomically reserved names as ordinary app runs.
-    # Do not reuse the staging directory: its receipts are cleaned afterwards.
-    target = create_fresh_automatic_run_root(base)
+    # The public output and private state directories are two views of one run.
+    # Their final component must match exactly so an operator can pair them
+    # without opening either directory.
+    target = base / run_root.name
+    target.mkdir(parents=True, exist_ok=True)
+    if any(path.is_dir() or path.suffix.casefold() != ".txt" for path in target.iterdir()):
+        raise OSError(f"Matched output run folder contains a non-TXT item: {target}")
     planned = []
     prepared_targets = []
     used_names = set()
@@ -7991,9 +7996,21 @@ def promote_flat_no_logs_batch_output(output_root, temporary_run_dir, pdf_paths,
             used_names.update(name.casefold() for name in names)
             prepared_targets.append(target / names[0])
             planned.extend(zip(children, (target / name for name in names)))
+        planned_names = {destination.name.casefold() for _source, destination in planned}
+        if any(path.name.casefold() not in planned_names for path in target.iterdir()):
+            raise FileExistsError(f"Matched output run folder contains unexpected TXT files: {target}")
         # Copy before the caller's existing success-only staging cleanup. A
         # partial export failure must not strand the sole prepared transcript.
         for source, destination in planned:
+            if source.resolve() == destination.resolve():
+                continue
+            if destination.exists():
+                if (
+                    source.stat().st_size != destination.stat().st_size
+                    or sha256_file(source) != sha256_file(destination)
+                ):
+                    raise FileExistsError(f"Matched output file already exists with different content: {destination}")
+                continue
             with destination.open("xb") as writer:
                 created.append(destination)
                 with source.open("rb") as reader:
@@ -8012,10 +8029,59 @@ def promote_flat_no_logs_batch_output(output_root, temporary_run_dir, pdf_paths,
         except OSError:
             pass
         raise
-    for summary, prepared_target in zip(summaries, prepared_targets):
+    for summary, canonical, prepared_target in zip(summaries, canonical_summaries, prepared_targets):
+        original_prepared = Path(str(canonical.get("upload_file") or ""))
         summary["upload_file"] = str(prepared_target)
         summary["flat_no_logs_output_directory"] = str(target)
+        summary["_published_state_text_source_paths"] = [
+            str(source)
+            for source, _destination in planned
+            if source.parent == original_prepared.parent
+        ]
     return target
+
+
+def finalize_published_text_separation(run_root, summaries):
+    """Remove every TXT payload from private state and refresh receipts.
+
+    Publication is the commit boundary: before it, private TXT payloads remain
+    available for safe recovery; afterwards, the matching public run directory
+    is their sole durable location. JSON/JSONL/CSV and other operational
+    evidence stays in private state.
+    """
+    state_root = Path(run_root).resolve()
+    removed = []
+    for summary in summaries or []:
+        if not isinstance(summary, dict):
+            continue
+        summary.pop("_published_state_text_source_paths", None)
+        document_root = Path(str(summary.get("output_root") or ""))
+        summary_path = document_root / "run-summary.json"
+        if not summary_path.is_file():
+            continue
+        stored = _read_automatic_run_json(summary_path)
+        if not stored:
+            continue
+        stored["upload_file"] = summary.get("upload_file") or stored.get("upload_file")
+        stored["published_output_directory"] = (
+            summary.get("flat_no_logs_output_directory")
+            or summary.get("published_output_directory")
+            or stored.get("published_output_directory")
+        )
+        stored["private_run_state_root"] = str(state_root)
+        retention = stored.get("lean_retention")
+        if isinstance(retention, dict) and retention.get("prepared_text"):
+            retention["prepared_text"] = summary.get("upload_file")
+        _write_automatic_run_json(summary_path, stored)
+    for source in state_root.rglob("*"):
+        if not source.is_file() or source.suffix.casefold() != ".txt":
+            continue
+        try:
+            source.unlink()
+            removed.append(str(source))
+        except OSError as exc:
+            APP_LOGGER.warning("could not remove TXT payload from private run state: %s", exc)
+    return removed
 
 
 def append_private_history_records(path, records, identity_fields):
@@ -12274,6 +12340,7 @@ def run_advanced_diagnostics(
             published_dir = promote_flat_no_logs_batch_output(
                 output_root, run_root, [pdf_path], [summary]
             )
+            finalize_published_text_separation(run_root, [summary])
         except (OSError, ValueError) as exc:
             summary["app_error_code"] = "ADVANCED-TEXT-OUTPUT-PUBLISH-001"
             summary["app_error_title"] = "Prepared text could not be published"
@@ -32613,7 +32680,8 @@ def run_automatic(
                 "did not finish. Detailed source artifacts were retained; no upload was repeated."
             ),
         })
-    if completion["state"] == "successful" and not automatic_text_outputs_ready(summaries):
+    text_outputs_ready = automatic_text_outputs_ready(summaries)
+    if completion["state"] == "successful" and not text_outputs_ready:
         completion = with_error_dimensions({
             "state": "warning",
             "code": "AUTO-TEXT-OUTPUT-PUBLISH-001",
@@ -32623,9 +32691,9 @@ def run_automatic(
                 "no source was reprocessed."
             ),
         }, stage="local_reporting", outcome="export_incomplete", scope="artifact", category="compact_export_promotion_failed")
-    flat_no_logs_complete = completion["state"] == "successful" and automatic_text_outputs_ready(summaries)
+    flat_no_logs_complete = False
     flat_no_logs_output_dir = None
-    if flat_no_logs_complete:
+    if text_outputs_ready:
         try:
             flat_no_logs_output_dir = promote_flat_no_logs_batch_output(
                 output_root_base,
@@ -32633,16 +32701,20 @@ def run_automatic(
                 files,
                 summaries,
             )
+            flat_no_logs_complete = True
         except (OSError, ValueError) as exc:
-            flat_no_logs_complete = False
-            completion = with_error_dimensions({
-                "state": "warning",
-                "code": "AUTO-LOCAL-EXPORT-PROMOTION-001",
-                "message": (
-                    "The text files were prepared, but their text-only output folder could not be published. "
-                    f"Detailed run state was retained for review: {exc}"
-                ),
-            }, stage="local_reporting", outcome="export_incomplete", scope="artifact", category="compact_export_promotion_failed")
+            publication_message = (
+                "The text files were prepared, but their text-only output folder could not be published. "
+                f"Detailed run state was retained for review: {exc}"
+            )
+            if completion["state"] == "successful":
+                completion = with_error_dimensions({
+                    "state": "warning",
+                    "code": "AUTO-LOCAL-EXPORT-PROMOTION-001",
+                    "message": publication_message,
+                }, stage="local_reporting", outcome="export_incomplete", scope="artifact", category="compact_export_promotion_failed")
+            else:
+                completion["message"] = f"{completion['message']} {publication_message}"
     completion, terminal_audit = terminal_integrity_audit(
         run_root,
         completion,
@@ -32657,6 +32729,8 @@ def run_automatic(
                 else str(terminal_audit.get("audit_status") or "unavailable")
             )
         )
+    if flat_no_logs_complete:
+        finalize_published_text_separation(run_root, summaries)
     wall_clock_seconds = time.perf_counter() - started_at
     live_timing_status = dict(LIVE_AUTOMATIC_RUN_STATUS or {})
     if live_timing_status.get("run_root") == str(run_root):
