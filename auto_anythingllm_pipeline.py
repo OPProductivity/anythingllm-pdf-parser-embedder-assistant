@@ -49,7 +49,7 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from portable_paths import application_paths
+from portable_paths import application_paths, is_private_run_state_path
 from authenticated_http import AuthenticatedRedirectError, RejectAuthenticatedRedirects
 from anythingllm_persistence import AnythingLLMPersistenceAdapter
 from typing import Any, cast
@@ -4173,6 +4173,7 @@ def retain_successful_run_leanly(
             "runtime_validation_status": runtime_status,
         }
     out_root = Path(out_root)
+    preserve_private_evidence = is_private_run_state_path(out_root)
     prepared_text_path = Path(prepared_text_path)
     if not prepared_text_path.is_file():
         return {"applied": False, "reason": "prepared_text_missing"}
@@ -4236,7 +4237,10 @@ def retain_successful_run_leanly(
         if existing_target:
             raise FileExistsError(f"Refusing to overwrite existing retained output: {existing_target}")
         if prepared_text_path != retained_text_path:
-            shutil.move(str(prepared_text_path), str(retained_text_path))
+            if preserve_private_evidence:
+                shutil.copy2(prepared_text_path, retained_text_path)
+            else:
+                shutil.move(str(prepared_text_path), str(retained_text_path))
         retained_segments = []
         for segment_path, direct_path in zip(staged_segments, planned_direct_segments):
             shutil.move(str(segment_path), str(direct_path))
@@ -4253,6 +4257,28 @@ def retain_successful_run_leanly(
     # its paths before returning so downloads and output links never point to
     # the selected/ files we are about to remove.
     summary["upload_file"] = str(retained_text_path)
+    if preserve_private_evidence:
+        retained = {
+            "applied": True,
+            "prepared_text": str(retained_text_path),
+            "segments_directory": "",
+            "retained_segment_files": len(retained_segments),
+            "retained_segment_paths": [str(path) for path in retained_segments],
+            "deleted": [],
+            "detailed_evidence_retained": True,
+            "cleanup_pending": False,
+        }
+        try:
+            write_json(out_root / "run-summary.json", {**summary, "lean_retention": retained})
+        except OSError as exc:
+            return {
+                "applied": False,
+                "reason": "private_summary_write_deferred",
+                "cleanup_pending": True,
+                "prepared_text": str(retained_text_path),
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        return retained
     for key in LEAN_SUCCESS_NONRETAINED_SUMMARY_PATH_FIELDS:
         summary[key] = ""
     summary["variant_outputs"] = {}
@@ -4657,6 +4683,9 @@ def retain_successful_run_without_logs(
         preexisting_children=preexisting_children,
     )
     if not retained.get("applied"):
+        return retained
+    if retained.get("detailed_evidence_retained"):
+        retained["policy"] = "flat_local_no_logs_v1"
         return retained
 
     root = Path(out_root)
@@ -25607,7 +25636,10 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     # plans and source files intact until the outer batch has made its upload
     # and verification decision.
     defer_lean_retention = bool(getattr(args, "defer_lean_retention", False))
-    lean_retention = requested_lean_retention and not defer_lean_retention
+    lean_retention = (
+        requested_lean_retention and not defer_lean_retention
+        and not is_private_run_state_path(out_root)
+    )
     requested_upload_transport = getattr(args, "native_upload_transport", "raw_text")
     materialize_metadata_artifacts = not lean_retention or requested_upload_transport == "file_upload"
     report_upload_phase(
@@ -28431,7 +28463,8 @@ def publish_cli_text_outputs(output_base: Path, state_run_root: Path, summaries)
             target.rmdir()
             return None, []
         for source in state_root.rglob("*"):
-            if source.is_file() and source.suffix.casefold() == ".txt":
+            if (not is_private_run_state_path(state_root)
+                    and source.is_file() and source.suffix.casefold() == ".txt"):
                 source.unlink()
         return target, published
     except Exception:

@@ -61,7 +61,7 @@ from prepared_batch_recovery import (
 )
 from anythingllm_compatibility import characterize as characterize_anythingllm_compatibility
 from anythingllm_source_atomic_server import ensure_source_atomic_embedding_server
-from portable_paths import ensure_application_directories, package_resource_path
+from portable_paths import ensure_application_directories, is_private_run_state_path, package_resource_path
 from run_request import LOCAL_ONLY, NATIVE_UPLOAD, RunRequest
 from automatic_defaults import (
     PERSISTABLE_AUTOMATIC_DEFAULT_FIELDS,
@@ -8094,12 +8094,12 @@ def promote_flat_no_logs_batch_output(output_root, temporary_run_dir, pdf_paths,
 
 
 def finalize_published_text_separation(run_root, summaries):
-    """Remove every TXT payload from private state and refresh receipts.
+    """Refresh publication receipts without pruning the private evidence tree.
 
     Publication is the commit boundary: before it, private TXT payloads remain
-    available for safe recovery; afterwards, the matching public run directory
-    is their sole durable location. JSON/JSONL/CSV and other operational
-    evidence stays in private state.
+    available for safe recovery; the matching public run directory afterwards
+    contains only selected text exports. The full operational evidence tree
+    stays private, including TXT diagnostics and recovery payloads.
     """
     state_root = Path(run_root).resolve()
     removed = []
@@ -8125,6 +8125,8 @@ def finalize_published_text_separation(run_root, summaries):
         if isinstance(retention, dict) and retention.get("prepared_text"):
             retention["prepared_text"] = summary.get("upload_file")
         _write_automatic_run_json(summary_path, stored)
+    if is_private_run_state_path(state_root):
+        return removed
     for source in state_root.rglob("*"):
         if not source.is_file() or source.suffix.casefold() != ".txt":
             continue
@@ -8207,6 +8209,8 @@ def append_private_history_records(path, records, identity_fields):
 
 def cleanup_flat_local_staging(run_root):
     """Report locked staging files without reclassifying valid TXT exports."""
+    if is_private_run_state_path(Path(run_root)):
+        return ""
     try:
         shutil.rmtree(run_root)
     except FileNotFoundError:
@@ -16081,6 +16085,8 @@ def automatic_success_worker_artifact_cleanup_report(output_dir, summary):
     if not bool((dict(summary or {}).get("lean_retention") or {}).get("applied")):
         return {"removed": [], "pending": []}
     output = Path(output_dir)
+    if is_private_run_state_path(output):
+        return {"removed": [], "pending": []}
     removed = []
     pending = []
     post_exit_artifacts = (
@@ -16194,6 +16200,8 @@ def compact_successful_automatic_batch_root(run_root):
     root = Path(run_root)
     removed = []
     pending = []
+    if is_private_run_state_path(root):
+        return {"removed": removed, "pending": pending}
     for name in SUCCESSFUL_BATCH_TRANSIENT_ARTIFACTS:
         path = root / name
         if not path.exists():

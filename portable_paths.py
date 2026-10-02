@@ -64,6 +64,11 @@ def application_paths() -> dict[str, Path]:
     }
 
 
+def is_private_run_state_path(path: Path) -> bool:
+    """Identify the configured evidence tree, not similarly named exports."""
+    return Path(path).resolve().is_relative_to(application_paths()["run_state"].resolve())
+
+
 def ensure_application_directories() -> dict[str, Path]:
     """Create the writable application locations and return them."""
 
