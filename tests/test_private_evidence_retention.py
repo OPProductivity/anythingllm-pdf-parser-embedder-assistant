@@ -5,6 +5,7 @@ import pytest
 import auto_anythingllm_pipeline as pipeline
 import portable_paths
 import rag_pdf_gradio_app as app
+from run_evidence import read_run_json
 
 
 pytestmark = pytest.mark.offline_deterministic
@@ -43,6 +44,7 @@ def test_private_evidence_survives_with_identical_flat_exports(tmp_path, monkeyp
             'api_upload_status': 'skipped_prepare_only',
             'post_upload_verification_status': 'not_checked_no_upload',
             'anythingllm_runtime_validation_status': 'not_checked_no_upload',
+            'compatibility': {'qualified_runtime': 'runtime evidence ' * 1000},
         }
         if transport == 'shared_upload':
             summary.update({
@@ -75,8 +77,9 @@ def test_private_evidence_survives_with_identical_flat_exports(tmp_path, monkeyp
         exports.append({path.name: path.read_bytes() for path in children})
         if private:
             assert all(path.read_bytes() == content for path, content in before.items())
-            stored = json.loads((document / 'run-summary.json').read_text(encoding='utf8'))
+            stored = read_run_json(document / 'run-summary.json')
             assert stored['include_back_matter'] is True
+            assert stored['compatibility'] == summary['compatibility']
             assert stored['manifest'] == str(manifest)
             assert app.cleanup_flat_local_staging(root) == ''
             assert root.is_dir()

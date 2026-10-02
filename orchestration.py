@@ -19,6 +19,7 @@ from anythingllm_compatibility import characterize
 from anythingllm_state import resolve_state
 from preflight import validate_planned_path
 from run_control import RunRecorder, RunResult, atomic_write_json
+from run_evidence import read_run_json
 from segmentation_policy import policy_for
 from validation_contract import evidence_layers_succeeded
 
@@ -107,7 +108,7 @@ def persist_phase_timing_breakdown(output: Path, breakdown: dict):
     if not summary_path.is_file():
         return
     try:
-        stored = json.loads(summary_path.read_text(encoding="utf-8"))
+        stored = read_run_json(summary_path)
     except (OSError, json.JSONDecodeError):
         return
     if not isinstance(stored, dict):
@@ -128,7 +129,7 @@ def compact_ready_run_control(output: Path, result: RunResult, summary: dict):
     if not summary_path.is_file():
         return
     try:
-        compact = json.loads(summary_path.read_text(encoding="utf-8"))
+        compact = read_run_json(summary_path)
     except (OSError, json.JSONDecodeError):
         return
     compact["recovery"] = {

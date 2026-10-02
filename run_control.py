@@ -18,6 +18,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from portable_paths import is_private_run_state_path
+from run_evidence import prepare_private_json
+
 
 RUN_SCHEMA_VERSION = 1
 MAJOR_STAGES = (
@@ -49,6 +52,7 @@ def atomic_write_json(path: Path, payload: dict, *, retries: int = 3) -> None:
     remain visible to the caller and the previous checkpoint is preserved.
     """
     path = Path(path)
+    payload = prepare_private_json(path, payload)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = None
     try:
@@ -61,7 +65,10 @@ def atomic_write_json(path: Path, payload: dict, *, retries: int = 3) -> None:
             delete=False,
         ) as handle:
             temporary = Path(handle.name)
-            json.dump(payload, handle, indent=2, ensure_ascii=False)
+            private = is_private_run_state_path(path)
+            json.dump(payload, handle, ensure_ascii=False,
+                      indent=None if private else 2,
+                      separators=(",", ":") if private else None)
             handle.flush()
             os.fsync(handle.fileno())
         attempts = max(1, int(retries or 1))

@@ -25,7 +25,8 @@ SAFE_REJECTED_RECEIPT_STATES = frozenset({"rejected"})
 
 
 def _read_object(path: Path) -> dict[str, Any]:
-    value = json.loads(path.read_text(encoding="utf-8"))
+    from run_evidence import read_run_json
+    value = read_run_json(path)
     if not isinstance(value, dict):
         raise ValueError(f"{path.name} is not a JSON object")
     return value

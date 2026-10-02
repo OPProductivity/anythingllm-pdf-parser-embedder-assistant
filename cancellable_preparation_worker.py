@@ -20,6 +20,8 @@ from types import SimpleNamespace
 from automatic_worker_protocol import AUTOMATIC_WORKER_TRANSPORT_ARTIFACTS
 from auto_anythingllm_pipeline import prepare_pdf
 from orchestration import execute_preparation, legacy_summary_from_run
+from portable_paths import is_private_run_state_path
+from run_evidence import prepare_private_json, read_run_json
 
 
 _EVENT_WRITE_LOCK = threading.Lock()
@@ -43,6 +45,9 @@ def _write_json(path: Path, payload: dict) -> None:
     # and indexing can still hold the old destination briefly, so retain the
     # same bounded sharing-violation retry used for durable run controls.
     with _RESULT_WRITE_LOCK:
+        # Preserve this transport's established default=str normalization
+        # before canonicalizing immutable evidence shared with the parent.
+        payload = prepare_private_json(path, json.loads(json.dumps(payload, default=str)))
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = None
         try:
@@ -55,7 +60,10 @@ def _write_json(path: Path, payload: dict) -> None:
                 suffix=".tmp",
             ) as handle:
                 temporary = Path(handle.name)
-                handle.write(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+                private = is_private_run_state_path(path)
+                handle.write(json.dumps(payload, ensure_ascii=False, default=str,
+                                        indent=None if private else 2,
+                                        separators=(",", ":") if private else None))
                 handle.flush()
                 os.fsync(handle.fileno())
             for attempt in range(3):
@@ -147,7 +155,7 @@ def _emit_timing_event(path: Path, stage: str, event=None, **details) -> None:
 
 def main(config_path: str) -> int:
     config_file = Path(config_path)
-    config = json.loads(config_file.read_text(encoding="utf-8"))
+    config = read_run_json(config_file)
     run_root = Path(config["run_root"])
     result_path = Path(config["result_path"])
     events_path = Path(config["events_path"])

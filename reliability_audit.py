@@ -148,11 +148,12 @@ def _read_json(path: Path) -> tuple[dict[str, Any] | None, Finding | None]:
                 f"Artifact exceeds the {MAX_ARTIFACT_BYTES}-byte audit safety limit.",
                 path.name,
             )
-        value = json.loads(path.read_text(encoding="utf-8"))
+        from run_evidence import read_run_json, RunEvidenceError
+        value = read_run_json(path)
         if not isinstance(value, dict):
             raise ValueError("top-level JSON value is not an object")
         return value, None
-    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError, RunEvidenceError) as exc:
         return None, Finding(
             "AUDIT-ARTIFACT-UNREADABLE-001",
             "error",

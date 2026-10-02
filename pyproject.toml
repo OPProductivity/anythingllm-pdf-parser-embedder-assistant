@@ -88,6 +88,8 @@ py-modules = [
   "rag_pdf_gradio_app",
   "rag_pdf_tools",
   "run_control",
+  "run_evidence",
+  "ingestion_observation",
   "run_request",
   "reliability_audit",
   "reliability_acceptance",

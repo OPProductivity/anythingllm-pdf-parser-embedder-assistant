@@ -38,6 +38,8 @@ import urllib.error
 import urllib.request
 import uuid
 import zipfile
+from run_evidence import prepare_private_json, read_run_json
+from ingestion_observation import SubmissionCommitSignal
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -8307,7 +8309,11 @@ def append_ingestion_history(
         except Exception as exc:
             terminal_record["ocr_diagnostics"] = {"status": "unavailable", "error_type": type(exc).__name__}
             APP_LOGGER.warning("could not summarize OCR run evidence: %s", type(exc).__name__)
-        atomic_write_text(Path(run_root) / "ingestion-terminal-record.json", json.dumps(terminal_record, indent=2, default=str))
+        terminal_path = Path(run_root) / "ingestion-terminal-record.json"
+        private = is_private_run_state_path(terminal_path)
+        atomic_write_text(terminal_path, json.dumps(terminal_record, default=str,
+                                                   indent=None if private else 2,
+                                                   separators=(",", ":") if private else None))
         append_private_history_records(INGESTION_HISTORY_PATH, [record], ("run_key",))
     except (OSError, TypeError, ValueError) as exc:
         APP_LOGGER.warning("could not append ingestion history: %s", exc)
@@ -10394,7 +10400,7 @@ def primary_prepared_download_paths(summaries):
         compact_summary = output_root / "run-summary.json"
         if compact_summary.is_file():
             try:
-                compact = json.loads(compact_summary.read_text(encoding="utf-8"))
+                compact = read_run_json(compact_summary)
                 relative = str((compact.get("artifacts") or {}).get("parsed_text") or "")
                 restored = output_root / relative if relative else None
                 if restored and restored.is_file():
@@ -10492,7 +10498,7 @@ def retained_run_diagnostics_html(run_directory):
     if not root.is_dir() or not summary_path.is_file():
         return '<div class="run-diagnostics-summary warning">Choose a completed PDF output folder containing <code>run-summary.json</code>.</div>'
     try:
-        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        summary = read_run_json(summary_path)
     except (OSError, json.JSONDecodeError) as exc:
         return f'<div class="run-diagnostics-summary warning">Could not read the compact summary: {html.escape(str(exc))}</div>'
     outcome = dict(summary.get("outcome") or {})
@@ -14965,7 +14971,7 @@ def active_automatic_run_root(*, allow_recent_unowned=False):
 
 def _read_automatic_run_json(path):
     try:
-        value = json.loads(Path(path).read_text(encoding="utf-8"))
+        value = read_run_json(path)
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return {}
     return value if isinstance(value, dict) else {}
@@ -15274,6 +15280,7 @@ def automatic_run_cancellation_requested(run_root):
 def _write_automatic_run_json(path, payload, *, compact=False):
     """Atomically persist small control records used across concurrent callbacks."""
     target = Path(path)
+    payload = prepare_private_json(target, payload)
     # Windows can reject simultaneous replacements of the same destination,
     # even when each writer owns a distinct temporary file. These files are
     # tiny control records, so serialising only their final write avoids a
@@ -15284,7 +15291,7 @@ def _write_automatic_run_json(path, payload, *, compact=False):
         # artifacts. Antivirus/indexing briefly holds Windows files open in
         # practice; failing one progress write must not make a running job
         # appear permanently stalled after a server refresh.
-        if compact:
+        if compact or is_private_run_state_path(target):
             content = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         else:
             content = json.dumps(payload, ensure_ascii=False, indent=2)
@@ -16782,7 +16789,7 @@ def execute_automatic_preparation_in_worker(
             recovery = write_automatic_cancellation_recovery(root, pdf_path, worker_record)
             return {"status": "cancelled", "recovery": recovery}
         try:
-            result = json.loads(result_path.read_text(encoding="utf-8"))
+            result = read_run_json(result_path)
         except (OSError, json.JSONDecodeError) as exc:
             return {
                 "status": "failed",
@@ -27798,6 +27805,7 @@ def upload_prepared_automatic_batch(
         original_expected_batch = list(expected_batch)
         original_locations = list(batch_report.get("locations") or [])
         active_vector_locations = list(original_locations)
+        commit_signal = SubmissionCommitSignal(storage_dir, workspace_slug)
         precommit_rejected_sources = set()
         precommit_rejected_locations = []
 
@@ -28000,6 +28008,7 @@ def upload_prepared_automatic_batch(
                     "desktop_queue_estimated_remaining_seconds": None,
                     "desktop_queue_rate_stale": True,
                 }
+            committed_records_complete = commit_signal.observe(active_vector_locations)
             should_read_storage = storage_observation_due_for_queue(
                 queue,
                 len(expected_batch),
@@ -28008,6 +28017,7 @@ def upload_prepared_automatic_batch(
                 elapsed_seconds=elapsed,
                 last_observation_elapsed_seconds=last_storage_observation_elapsed,
                 poll_interval_seconds=2.0,
+                committed_records_complete=committed_records_complete,
             )
             quiet_queue_recovery_observation = bool(
                 quiet_queue_recovery and should_read_storage
@@ -28048,6 +28058,7 @@ def upload_prepared_automatic_batch(
                 # the owned queue window.
                 if isinstance(observed_report, dict):
                     last_report = dict(observed_report)
+                    last_report["submission_mapping_commit_observed"] = committed_records_complete
                 else:
                     last_report = {
                         "status": "review",
@@ -29000,10 +29011,7 @@ def run_automatic(
             batch_total_files=max(len(files), 1),
         )
         if ocr_preflight_manifest:
-            (run_root / "ocr-preflight-manifest.json").write_text(
-                json.dumps(ocr_preflight_manifest, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            _write_automatic_run_json(run_root / "ocr-preflight-manifest.json", ocr_preflight_manifest)
     except OSError as exc:
         progress(None)
         return automatic_error_outputs(
@@ -29525,16 +29533,13 @@ def run_automatic(
             for index, path in enumerate(files)
         ]
     try:
-        (run_root / "progress-allocation.json").write_text(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "purpose": "general preflight difficulty allocation for evidence progress; not an ETA or per-document learned prediction",
-                    "allocations": progress_allocations,
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
+        _write_automatic_run_json(
+            run_root / "progress-allocation.json",
+            {
+                "schema_version": 1,
+                "purpose": "general preflight difficulty allocation for evidence progress; not an ETA or per-document learned prediction",
+                "allocations": progress_allocations,
+            },
         )
     except OSError as exc:
         APP_LOGGER.warning("could not write automatic progress allocation: %s", exc)

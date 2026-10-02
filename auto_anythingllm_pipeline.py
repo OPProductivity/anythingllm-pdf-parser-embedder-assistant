@@ -50,6 +50,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from portable_paths import application_paths, is_private_run_state_path
+from run_evidence import prepare_private_json, read_run_json
+from ingestion_observation import SubmissionCommitSignal
 from authenticated_http import AuthenticatedRedirectError, RejectAuthenticatedRedirects
 from anythingllm_persistence import AnythingLLMPersistenceAdapter
 from typing import Any, cast
@@ -918,7 +920,8 @@ def pdf_date_to_epoch_ms(value):
 
 
 def write_json(path: Path, data, *, compact=False):
-    if compact:
+    data = prepare_private_json(path, data)
+    if compact or is_private_run_state_path(path):
         content = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
     else:
         content = json.dumps(data, indent=2, ensure_ascii=False)
@@ -4602,7 +4605,7 @@ def finalize_deferred_batch_lean_retention(out_root: Path, summary):
     profile = {}
     if profile_path.is_file():
         try:
-            candidate = json.loads(profile_path.read_text(encoding="utf-8"))
+            candidate = read_run_json(profile_path)
             if isinstance(candidate, dict):
                 profile = candidate
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
@@ -13758,24 +13761,39 @@ def observe_workspace_embedding_queue_activity(
     uncertainty, while an event whose filename is outside this run's durable
     submission ledger is positive evidence that another workflow is active.
     """
+    owned = {
+        _normalized_anythingllm_document_location(location)
+        for location in (owned_locations or [])
+        if str(location or "").strip()
+    }
+    foreign_activity = threading.Event()
+
+    def on_event(event):
+        filenames = [event.get("filename")]
+        for field in ("filenames", "embeddedFiles", "failedFiles"):
+            filenames.extend(event.get(field) or [])
+        names = {_normalized_anythingllm_document_location(name)
+                 for name in filenames if str(name or "").strip()}
+        if names - owned:
+            # Positive foreign activity already settles the conservative
+            # decision. Waiting longer cannot authorize a mutation.
+            foreign_activity.set()
+
+    budget = max(0.0, min(10.0, float(observation_seconds or 0.0)))
+    deadline = time.monotonic() + budget
     listener = start_anythingllm_embed_progress_listener(
         api_url,
         api_key,
         workspace_slug,
         owned_locations,
         include_unmatched_events=True,
+        observer_callback=on_event,
     )
-    budget = max(0.0, min(10.0, float(observation_seconds or 0.0)))
-    listener["connected_event"].wait(timeout=min(1.0, budget))
+    # Stream establishment and observation share one budget, not additive waits.
     if budget:
-        listener["stop_event"].wait(timeout=budget)
+        foreign_activity.wait(timeout=max(0.0, deadline - time.monotonic()))
     listener["stop_event"].set()
     listener["thread"].join(timeout=1.0)
-    owned = {
-        _normalized_anythingllm_document_location(location)
-        for location in (owned_locations or [])
-        if str(location or "").strip()
-    }
     owned_events, non_owned_events = [], []
     for event in listener["events"]:
         filenames = [event.get("filename")]
@@ -16375,6 +16393,7 @@ def storage_observation_due_for_queue(
     elapsed_seconds,
     last_observation_elapsed_seconds,
     poll_interval_seconds=2.0,
+    committed_records_complete=False,
 ):
     """Decide whether a status poll should reopen mutable local vector storage.
 
@@ -16384,6 +16403,11 @@ def storage_observation_due_for_queue(
     giving a reliable transition.  All quiet, uncertain, or completed queues
     retain exact-vector observation so recovery never relies on stale SSE.
     """
+    if committed_records_complete:
+        # Missing completion telemetry must not impose a quiet-period wait
+        # after the selected records have committed their mappings. This
+        # schedules exact verification; it never declares success itself.
+        return True
     queue = dict(queue or {})
     try:
         previous_observation_elapsed = float(
@@ -26437,6 +26461,8 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             if unresolved_submission else ANYTHINGLLM_EMBEDDING_RECONCILIATION_TIMEOUT_SECONDS
         )
 
+        commit_signal = SubmissionCommitSignal(storage_dir, target_workspace_slug)
+
         def inspect_batch_vectors():
             # A status poll is not automatically a storage poll.  While the
             # owned SSE queue is connected and moving, wait for a new queue
@@ -26453,6 +26479,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             last_observation_position = int(reconciliation_tracker["last_fast_observation_queue_position"] or -1)
             healthy_queue = healthy_owned_queue_active(queue)
             cached_evidence = reconciliation_tracker.get("last_fast_evidence")
+            committed_records_complete = commit_signal.observe(batch_report.get("locations") or [])
             should_read_storage = storage_observation_due_for_queue(
                 queue,
                 len(expected_batch),
@@ -26461,6 +26488,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 elapsed_seconds=elapsed,
                 last_observation_elapsed_seconds=last_observation_elapsed,
                 poll_interval_seconds=float(getattr(args, "post_upload_poll_interval", 2.0)),
+                committed_records_complete=committed_records_complete,
             )
             if should_read_storage:
                 storage_observation_started = time.perf_counter()
@@ -26472,6 +26500,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                     upload_locations=(batch_report.get("locations") or []),
                     observation_mode="fast",
                 )
+                evidence["submission_mapping_commit_observed"] = committed_records_complete
                 storage_observation_seconds = max(
                     0.0, time.perf_counter() - storage_observation_started
                 )

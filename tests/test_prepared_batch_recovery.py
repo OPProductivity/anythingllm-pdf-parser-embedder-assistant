@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import pytest
+from run_control import atomic_write_json
 
 from prepared_batch_recovery import (
     load_verified_prepared_summaries,
@@ -55,6 +56,22 @@ def test_complete_checkpoint_verifies_and_loads_summaries(tmp_path):
     assert result["reusable"] is True
     assert result["api_origin"] == "http://127.0.0.1:3001/api"
     assert loaded == [summary]
+
+
+def test_missing_shared_snapshot_blocks_checkpoint_reuse(tmp_path, monkeypatch):
+    monkeypatch.setenv('ANYTHINGLLM_PDF_ASSISTANT_HOME', str(tmp_path))
+    root = tmp_path / 'run-state' / 'automatic-runs' / 'r-check'
+    summary = _prepared_summary(root)
+    summary['compatibility'] = {'runtime': 'retained runtime evidence ' * 1000}
+    atomic_write_json(Path(summary['output_root']) / 'run-summary.json', summary)
+    write_prepared_batch_checkpoint(root, [summary], total_sources=1,
+                                    workspace_slug='workspace', api_url='http://local',
+                                    stage='preparation_complete')
+    assert verify_prepared_batch_checkpoint(root)['reusable']
+    next((root / '.run-evidence').glob('*.json')).unlink()
+    result = verify_prepared_batch_checkpoint(root)
+    assert not result['reusable']
+    assert 'unreadable:source_summary' in result['reason']
 
 
 def test_changed_prepared_text_blocks_reuse(tmp_path):

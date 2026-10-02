@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from run_control import atomic_write_json
+from run_evidence import read_run_json, RunEvidenceError
 
 
 SCHEMA = "anythingllm_pdf_assistant_prepared_batch_checkpoint_v1"
@@ -272,7 +273,13 @@ def verify_prepared_batch_checkpoint(run_root: str | Path) -> dict[str, Any]:
                     continue
                 if _sha256(artifact_path) != str(artifact.get("sha256") or ""):
                     source_problems.append(f"hash_changed:{artifact.get('role') or 'artifact'}")
-            except (OSError, TypeError, ValueError):
+                    continue
+                if artifact.get("role") == "source_summary":
+                    # The summary's unchanged hash does not prove its shared
+                    # snapshot dependencies survived. Validate them before
+                    # granting any replay authority.
+                    read_run_json(artifact_path)
+            except (OSError, TypeError, ValueError, RunEvidenceError):
                 source_problems.append(f"unreadable:{artifact.get('role') or 'artifact'}")
         if source_problems:
             problems.extend(
@@ -353,7 +360,7 @@ def load_verified_prepared_summaries(run_root: str | Path) -> list[dict[str, Any
             # still normally has a durable summary. Exact-selection duplicates
             # use their dedicated receipt as the source summary.
             raise RuntimeError("verified source has no durable source-summary artifact")
-        value = json.loads(Path(summary_artifact["path"]).read_text(encoding="utf-8"))
+        value = read_run_json(summary_artifact["path"])
         if not isinstance(value, dict):
             raise RuntimeError("run-summary artifact is not a JSON object")
         summaries.append(value)
