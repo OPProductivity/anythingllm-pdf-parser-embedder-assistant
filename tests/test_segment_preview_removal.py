@@ -10,7 +10,7 @@ pytestmark = pytest.mark.offline_deterministic
 def test_preview_controls_and_dedicated_readers_are_removed():
     labels = {component['props'].get('label') for component in app.demo.config['components']}
     assert not labels.intersection({'Segment preview', 'Segment number', 'Segment text', 'AnythingLLM storage match'})
-    assert 'Open output folder' in labels
+    assert 'Open Output Folder' in labels
     for name in ('selected_manifest_path', 'preview_manifest_segment', 'preview_workspace_segment',
                  'navigate_manifest_segment', 'navigate_manifest_segment_with_storage'):
         assert not hasattr(app, name)
@@ -19,8 +19,9 @@ def test_preview_controls_and_dedicated_readers_are_removed():
 
 def test_existing_output_action_is_inside_visible_replacement_section():
     components = app.demo.config['components']
-    section = next(component for component in components if component['props'].get('label') == 'Open output folder')
+    section = next(component for component in components if component['props'].get('label') == 'Open Output Folder')
     button = next(component for component in components if component['props'].get('elem_id') == 'open-generated-output-button')
+    assert button['props']['value'] == 'Open Output Folder'
     assert section['props'].get('visible', True)
 
     def find(node, identity):

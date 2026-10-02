@@ -11892,7 +11892,7 @@ def output_folder_button_state(paths, output_root=""):
     target = generated_output_directory(paths, output_root)
     enabled = target.is_dir()
     return gr.update(
-        value="Open Generated Output Folder",
+        value="Open Output Folder",
         interactive=enabled,
         visible=enabled,
     )
@@ -33842,10 +33842,10 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                         elem_classes=["downloads-artifacts-html"],
                     )
                     auto_files = gr.File(label="Downloads", file_count="multiple", visible=False, show_label=False)
-            with gr.Accordion("Open output folder", open=False, elem_classes=["top-level-accordion"]):
+            with gr.Accordion("Open Output Folder", open=False, elem_classes=["top-level-accordion"]):
                 # Reuse the terminal-folder action without changing stream outputs.
                 open_generated_output_button = gr.Button(
-                    "Open Generated Output Folder",
+                    "Open Output Folder",
                     interactive=False,
                     visible=False,
                     elem_id="open-generated-output-button",

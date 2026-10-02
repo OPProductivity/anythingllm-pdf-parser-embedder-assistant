@@ -4310,7 +4310,7 @@ class PipelineCoreTests(unittest.TestCase):
             self.assertEqual(target, flat_export)
             self.assertTrue(state["visible"])
             self.assertTrue(state["interactive"])
-            self.assertEqual(state["value"], "Open Generated Output Folder")
+            self.assertEqual(state["value"], "Open Output Folder")
 
     def test_generated_output_directory_opens_the_shared_root_for_a_batch(self):
         import rag_pdf_gradio_app as app
