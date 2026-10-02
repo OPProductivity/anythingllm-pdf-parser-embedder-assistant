@@ -7880,7 +7880,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn('aria-valuenow="0"', updates[0]["value"])
         self.assertIn("Ready — Confirm to begin processing.", updates[0]["value"])
         self.assertIn("Est: 00m00s", updates[1]["value"])
-        self.assertEqual(len(updates), 19)
+        self.assertEqual(len(updates), 16)
         self.assertFalse(updates[3]["interactive"])
         self.assertNotIn("visible", updates[4])
         self.assertNotIn("visible", updates[7])
@@ -7946,7 +7946,7 @@ class PipelineCoreTests(unittest.TestCase):
             app.LIVE_AUTOMATIC_RUN_STATUS = original_status
 
         self.assertEqual(observed_status, reserved)
-        self.assertEqual(len(presentation), 19)
+        self.assertEqual(len(presentation), 16)
         self.assertTrue(all(update.get("__type__") == "update" for update in presentation))
         self.assertEqual(len(settings), 45)
         self.assertTrue(all(update.get("__type__") == "update" for update in settings))
@@ -9741,15 +9741,17 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn("valid.pdf", rendered)
         self.assertIn("Ignored 2 malformed history record(s)", rendered)
 
-    def test_segment_preview_reports_non_object_jsonl_record_without_attribute_error(self):
+    def test_segment_preview_is_removed_without_retiring_segmentation(self):
         import rag_pdf_gradio_app as app
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            manifest = Path(temp_dir) / "segment-manifest.jsonl"
-            manifest.write_text(json.dumps(["invalid-record"]) + "\n", encoding="utf-8")
-            rendered = app.preview_manifest_segment([str(manifest)], 1)
-
-        self.assertIn("non-object record", rendered)
+        self.assertFalse(hasattr(app, "preview_manifest_segment"))
+        self.assertFalse(hasattr(app, "preview_workspace_segment"))
+        self.assertFalse(hasattr(pipeline, "workspace_segment_preview"))
+        segmentation = next(
+            component for component in app.demo.config["components"]
+            if component["props"].get("label") == "Segmentation mode"
+        )
+        self.assertIn(app.SEGMENT_PAGE_LIMIT_LABEL, [choice[0] for choice in segmentation["props"]["choices"]])
 
     def test_version_and_system_theme_are_explicit_ui_contracts(self):
         import rag_pdf_gradio_app as app

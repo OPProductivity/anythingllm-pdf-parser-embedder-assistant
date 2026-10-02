@@ -124,7 +124,6 @@ from auto_anythingllm_pipeline import (
     load_upload_plan_rows,
     managed_anythingllm_upload_folder_name,
     maybe_upload_to_anythingllm,
-    native_identity_stem,
     normalize_text,
     normalize_metadata_author,
     observe_indexed_source_identity_hint,
@@ -162,7 +161,6 @@ from auto_anythingllm_pipeline import (
     # runtime preflight/test doubles. The canonical implementation remains in
     # the pipeline module.
     verify_anythingllm_runtime_embedder,  # noqa: F401 - public app-level test/extension seam
-    workspace_segment_preview,
     workspace_duplicate_identity_audit,
     workspace_storage_inspector,
     write_failure_package,
@@ -11920,155 +11918,6 @@ def deferred_pdf_inspection_preview(pdf_files=None, folder_pdf_files=None):
     return f'<div class="metadata-summary"><div class="metadata-status">{message}</div></div>'
 
 
-def selected_manifest_path(paths):
-    candidates = []
-    for item in paths or []:
-        if not item:
-            continue
-        path = Path(str(item))
-        if path.name == "segment-manifest.jsonl" and path.exists():
-            return path
-        if path.name.startswith("segment-manifest") and path.suffix == ".jsonl" and path.exists():
-            candidates.append(path)
-    return candidates[0] if candidates else None
-
-
-def preview_manifest_segment(paths, segment_number):
-    manifest = selected_manifest_path(paths)
-    if not manifest:
-        return "No segment manifest is available yet. Run the PDF pipeline first."
-
-    try:
-        index = int(float(segment_number or 1))
-    except (TypeError, ValueError):
-        return "Enter a whole segment number, for example 1."
-    if index < 1:
-        return "Segment numbers start at 1."
-
-    try:
-        rows = [
-            json.loads(line)
-            for line in manifest.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
-        if not all(isinstance(row, dict) for row in rows):
-            return "Could not read segment manifest: it contains a non-object record."
-        for position, row in enumerate(rows):
-            if int(row.get("segment_index") or position + 1) != index:
-                continue
-            headings = row.get("headings_on_page") or []
-            provenance = row.get("metadata_provenance") or {}
-            previous_row = rows[position - 1] if position > 0 else None
-            next_row = rows[position + 1] if position + 1 < len(rows) else None
-            header = [
-                f"Segment {row.get('segment_index')} of {len(rows)} | {row.get('segment_id')}",
-                f"Region: {row.get('document_region') or 'unknown'} | backend: {row.get('backend') or 'unknown'}",
-                f"PDF page: {row.get('pdf_page')} | logical page: {row.get('logical_page') or 'not detected'}",
-                f"Page lines: {row.get('page_line_start') or 'not detected'} - {row.get('page_line_end') or 'not detected'}",
-                f"Chapter: {row.get('chapter') or 'not detected'}",
-                f"Section: {row.get('section') or 'not detected'}",
-                f"Headings on page: {', '.join(headings) if headings else 'none'}",
-                f"Character offsets on page: {row.get('char_start_page')} - {row.get('char_end_page')}",
-                f"Estimated tokens: {row.get('estimated_tokens') or 'unknown'}",
-                f"Boundary confidence: {row.get('boundary_confidence') or 'unknown'}",
-                "Metadata provenance: "
-                + (", ".join(f"{key}={value}" for key, value in provenance.items()) or "not recorded"),
-                f"Quality flags: {', '.join(row.get('quality_flags') or []) or 'none'}",
-                f"Previous: {previous_row.get('segment_id') if previous_row else 'none'}",
-                f"Next: {next_row.get('segment_id') if next_row else 'none'}",
-                "",
-            ]
-            return "\n".join(header) + (row.get("text") or "")
-    except Exception as exc:
-        return f"Could not read segment manifest: {exc}"
-
-    return f"Segment {index} was not found in {manifest.name}."
-
-
-def preview_workspace_segment(paths, workspace_slug, segment_number):
-    manifest = selected_manifest_path(paths)
-    if not manifest:
-        return "No segment manifest is available yet. Run the PDF pipeline first."
-    if not (workspace_slug or "").strip():
-        return "Select a workspace first to compare the prepared segment against AnythingLLM storage."
-
-    try:
-        index = int(float(segment_number or 1))
-    except (TypeError, ValueError):
-        return "Enter a whole segment number, for example 1."
-    if index < 1:
-        return "Segment numbers start at 1."
-
-    try:
-        rows = [
-            json.loads(line)
-            for line in manifest.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
-        if not all(isinstance(row, dict) for row in rows):
-            return "Could not read segment manifest: it contains a non-object record."
-    except Exception as exc:
-        return f"Could not read segment manifest: {exc}"
-
-    target = None
-    for position, row in enumerate(rows):
-        if int(row.get("segment_index") or position + 1) == index:
-            target = row
-            break
-    if not target:
-        return f"Segment {index} was not found in {manifest.name}."
-
-    report = workspace_segment_preview(
-        default_anythingllm_storage_dir(),
-        workspace_slug,
-        chunk_source=f"segment://{target.get('segment_id')}",
-        title="",
-        segment_id=str(target.get("segment_id") or ""),
-    )
-    lines = [
-        f"Prepared segment: {target.get('segment_id')}",
-        f"Workspace: {workspace_slug}",
-        f"Prepared page lines: {target.get('page_line_start') or 'not detected'} - {target.get('page_line_end') or 'not detected'}",
-        f"Title stem: {native_identity_stem(target, include_segment=True)}",
-        f"Chunk source: segment://{target.get('segment_id')}",
-        f"Preview status: {report.get('status')}",
-        f"Matching workspace documents: {report.get('matching_workspace_documents', 0)}",
-        f"Matching vector rows: {report.get('matching_vector_rows', 0)}",
-    ]
-    if report.get("error"):
-        lines.extend(["", f"Error: {report['error']}"])
-    if report.get("workspace_document"):
-        lines.extend(["", "workspace_documents row", pretty_json_preview(report.get("workspace_document"))])
-    if report.get("custom_document_record"):
-        lines.extend(["", "custom-documents record", pretty_json_preview(report.get("custom_document_record"))])
-    lancedb_rows = report.get("lancedb_rows") or []
-    if lancedb_rows:
-        lines.extend(["", "LanceDB row 1", pretty_json_preview(lancedb_rows[0])])
-    return "\n".join(lines)
-
-
-def navigate_manifest_segment(paths, segment_number, delta):
-    try:
-        current = int(float(segment_number or 1))
-    except (TypeError, ValueError):
-        current = 1
-    target = max(1, current + int(delta))
-    return target, preview_manifest_segment(paths, target)
-
-
-def navigate_manifest_segment_with_storage(paths, workspace_slug, segment_number, delta):
-    try:
-        current = int(float(segment_number or 1))
-    except (TypeError, ValueError):
-        current = 1
-    target = max(1, current + int(delta))
-    return (
-        target,
-        preview_manifest_segment(paths, target),
-        preview_workspace_segment(paths, workspace_slug, target),
-    )
-
-
 def advanced_diagnostic_backend_settings(choice, unstructured_strategy="auto"):
     """Translate the Advanced diagnostic selector into the normal pipeline contract.
 
@@ -14880,7 +14729,7 @@ def reset_automatic_run_presentation(pdf_files=None, folder_pdf_files=None, sele
     """
     global LIVE_AUTOMATIC_RUN_STATUS
     if selection_state is not None and str(selection_state.get("state") or "") in {"ready", "idle"}:
-        return tuple(gr.update() for _ in range(19))
+        return tuple(gr.update() for _ in range(16))
     live_status = LIVE_AUTOMATIC_RUN_STATUS or {}
     # File-change events can be delivered after Confirm has reserved a run
     # folder but before the worker changes the status to ``running``.  That
@@ -14897,7 +14746,7 @@ def reset_automatic_run_presentation(pdf_files=None, folder_pdf_files=None, sele
         # A selection event must not erase an in-flight run's durable evidence
         # or make a completed batch look like a fresh idle state. The selected
         # files are still preserved by Gradio for the next explicit run.
-        return tuple(gr.update() for _ in range(19))
+        return tuple(gr.update() for _ in range(16))
     # Selection preparation belongs exclusively to the browser-owned
     # ``automatic_selection_state``.  Leaving the global run record empty
     # prevents the independent status timer from mistaking an ordinary file
@@ -14934,9 +14783,6 @@ def reset_automatic_run_presentation(pdf_files=None, folder_pdf_files=None, sele
         [],
         gr.update(visible=False, interactive=False),
         gr.update(open=False),
-        gr.update(value=1),
-        gr.update(value="Run the PDF pipeline first, then type a segment number."),
-        gr.update(value="After native upload, this shows the matching workspace_documents record, custom-documents JSON, and a sample LanceDB row for the selected segment."),
     )
 
 
@@ -33972,18 +33818,6 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 elem_classes=["top-level-accordion", "output-downloads-accordion"],
             ) as run_output_downloads_section:
                 auto_summary = gr.HTML(value="", visible=False, elem_classes=["automatic-run-summary"])
-                # This action becomes available only after a terminal run.
-                # Keeping it inside the already-mounted output accordion
-                # avoids creating a new top-level row at completion, which
-                # previously made the page visibly jump just as the success
-                # state arrived.
-                with gr.Row():
-                    open_generated_output_button = gr.Button(
-                        "Open Generated Output Folder",
-                        interactive=False,
-                        visible=False,
-                        elem_id="open-generated-output-button",
-                    )
                 with gr.Group(elem_id="automatic-download-section", elem_classes=["automatic-download-section"]):
                     with gr.Row(elem_classes=["downloads-header-row"]):
                         gr.HTML('<div class="downloads-header-title">Prepared text files</div>')
@@ -34008,28 +33842,13 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                         elem_classes=["downloads-artifacts-html"],
                     )
                     auto_files = gr.File(label="Downloads", file_count="multiple", visible=False, show_label=False)
-            with gr.Accordion("Segment preview", open=False, elem_classes=["top-level-accordion"]):
-                with gr.Row(elem_classes=["control-row"]):
-                    previous_segment = gr.Button("←", size="sm", min_width=48)
-                    segment_number = gr.Number(
-                        label="Segment number",
-                        value=1,
-                        precision=0,
-                        minimum=1,
-                        step=1,
-                    )
-                    next_segment = gr.Button("→", size="sm", min_width=48)
-                segment_preview = gr.Textbox(
-                    label="Segment text",
-                    value="Run the PDF pipeline first, then type a segment number.",
-                    lines=14,
+            with gr.Accordion("Open output folder", open=False, elem_classes=["top-level-accordion"]):
+                # Reuse the terminal-folder action without changing stream outputs.
+                open_generated_output_button = gr.Button(
+                    "Open Generated Output Folder",
                     interactive=False,
-                )
-                segment_storage_preview = gr.Textbox(
-                    label="AnythingLLM storage match",
-                    value="After native upload, this shows the matching workspace_documents record, custom-documents JSON, and a sample LanceDB row for the selected segment.",
-                    lines=16,
-                    interactive=False,
+                    visible=False,
+                    elem_id="open-generated-output-button",
                 )
 
             refresh_workspace_button.click(
@@ -34266,9 +34085,6 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 auto_download_state,
                 open_generated_output_button,
                 run_output_downloads_section,
-                segment_number,
-                segment_preview,
-                segment_storage_preview,
             ]
             fresh_run_settings_outputs = [
                 auto_label,
@@ -35805,56 +35621,6 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     workspace_selection_section,
                 ],
             )
-            segment_number.change(
-                fn=preview_manifest_segment,
-                inputs=[auto_download_state, segment_number],
-                outputs=segment_preview,
-                show_progress="hidden",
-                queue=False,
-            )
-            segment_number.change(
-                fn=preview_workspace_segment,
-                inputs=[auto_download_state, workspace_slug, segment_number],
-                outputs=segment_storage_preview,
-                show_progress="hidden",
-                queue=False,
-            )
-            segment_number.submit(
-                fn=preview_manifest_segment,
-                inputs=[auto_download_state, segment_number],
-                outputs=segment_preview,
-                show_progress="hidden",
-                queue=False,
-            )
-            segment_number.submit(
-                fn=preview_workspace_segment,
-                inputs=[auto_download_state, workspace_slug, segment_number],
-                outputs=segment_storage_preview,
-                show_progress="hidden",
-                queue=False,
-            )
-            previous_segment.click(
-                fn=lambda paths, workspace, number: navigate_manifest_segment_with_storage(paths, workspace, number, -1),
-                inputs=[auto_download_state, workspace_slug, segment_number],
-                outputs=[segment_number, segment_preview, segment_storage_preview],
-                show_progress="hidden",
-                queue=False,
-            )
-            next_segment.click(
-                fn=lambda paths, workspace, number: navigate_manifest_segment_with_storage(paths, workspace, number, 1),
-                inputs=[auto_download_state, workspace_slug, segment_number],
-                outputs=[segment_number, segment_preview, segment_storage_preview],
-                show_progress="hidden",
-                queue=False,
-            )
-            workspace_slug.change(
-                fn=preview_workspace_segment,
-                inputs=[auto_download_state, workspace_slug, segment_number],
-                outputs=segment_storage_preview,
-                show_progress="hidden",
-                queue=False,
-            )
-
         with gr.Tab("Advanced"):
             with gr.Row(elem_classes=["advanced-app-meta"]):
                 gr.HTML(
