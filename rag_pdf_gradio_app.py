@@ -28188,7 +28188,7 @@ def upload_prepared_automatic_batch(
                     and queue_position < queue_total
                     and str(queue.get("desktop_queue_observer_state") or "") == "connected"
                     and queue_event_age is not None
-                    and queue_event_age <= 15.0
+                    and queue_event_age < ANYTHINGLLM_EMBEDDING_RECONCILIATION_STALL_SECONDS
                     and recent_queue_progress
                 )
                 extension_granted = False
