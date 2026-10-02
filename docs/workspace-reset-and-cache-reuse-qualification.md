@@ -98,3 +98,42 @@ final state-contract adjustment. Core configured type checking, Ruff, secret
 scanning and whitespace checks passed. The earlier full-suite baseline has two
 existing compact-run-name fixture failures, described in the v1.17 qualification
 record; neither that implementation nor those fixtures was changed here.
+
+## Uninterrupted X/Y Batch Qualification
+
+Additional production browser testing used one page session without any reload
+or server restart between batches. Twelve distinct PDFs were processed: six
+newly generated, unique custom-text PDFs and six original Film II articles.
+All twelve were confirmed as fresh uploads, not cached skips.
+
+| Sequence | Settings and actual result |
+| --- | --- |
+| Clear X | Three custom PDFs; X title/author; page-preserving preparation; front/back matter off; explicit X workspace/output root; detailed evidence on. Six fresh records confirmed. |
+| Clear, then Y | X removed all files and restored per-run defaults. Three different custom PDFs; Y title/author; all-in-one; front/back matter on; explicit Y workspace/output root; detailed evidence off. Three fresh records confirmed. |
+| Retry X | Mekas, Rombes and Gunning articles; X title/author; page-preserving preparation; explicit first page 2; front/back matter off; explicit X workspace/output root; detailed evidence on. Nine fresh page-parent records confirmed. |
+| Round arrow, then Y | Retry retained the original three PDFs and reset settings. Three different articles (Deren, Gabriel and Bordwell/Staiger/Thompson) were added; the three old selections were individually removed, without using Clear. Y title/author; all-in-one; first-page override 0; front/back matter on; explicit Y workspace/output root; evidence off. Three fresh records, comprising thirteen vectors, confirmed. |
+
+Immutable worker configuration observations, retained source summaries, terminal
+records, native upload reports, SQLite metadata and actual LanceDB vectors were
+compared against the selected settings. Automated assertions passed. No X
+settings leaked into either Y run; no extra automatically named workspace was
+created. Normal additive file-picker behavior was preserved.
+
+A fifth run used the round arrow with the same three Film II Y PDFs, explicitly
+selected the existing Clear X test workspace, refreshed workspace information,
+and selected all-in-one preparation again. All three cached records were linked
+to that different workspace; all thirteen underlying vectors were present there.
+The earlier Y workspace retained its records. This was target-workspace cache
+attachment, not a global-cache-only skip.
+
+All five runs finished successfully. The established deferred optional live
+retrieval policy was preserved. The related reset/export regression modules
+passed all 46 tests; no additional application edit was required.
+
+Cleanup removed four test workspaces, their four vector namespaces, twenty-four
+test links and their test-owned vector mappings, and twenty-one exact test-only
+document JSON files. No preexisting global document file was deleted. All 3448
+pretest global document JSON paths were restored, all sixteen inventoried Film II
+PDF hashes were unchanged, and the original workspace/link/vector/file/LanceDB
+snapshot matched. The temporary cleanup credential was removed. Evidence remains
+in ignored `tmp-output/reset-sequence-qualification`.
