@@ -39,8 +39,10 @@ V116_PROFILE_ID = "anythingllm-desktop-1.16.0-fingerprinted-settings-profile-1"
 V116_NATIVE_CONTRACT_ID = "anythingllm-desktop-1.16.0-native-pdf-contract-1"
 V1161_PROFILE_ID = "anythingllm-desktop-1.16.1-fingerprinted-settings-profile-1"
 V1161_NATIVE_CONTRACT_ID = "anythingllm-desktop-1.16.1-native-pdf-contract-1"
+V117_PROFILE_ID = "anythingllm-desktop-1.17.0-fingerprinted-settings-profile-1"
+V117_NATIVE_CONTRACT_ID = "anythingllm-desktop-1.17.0-native-pdf-contract-1"
 OBSERVED_COMPATIBLE_DESKTOP_VERSIONS = ("1.14.2", "1.15.0-r2")
-OBSERVED_CANDIDATE_DESKTOP_VERSIONS = ("1.16.0", "1.16.1")
+OBSERVED_CANDIDATE_DESKTOP_VERSIONS = ("1.16.0", "1.16.1", "1.17.0")
 OBSERVED_CANDIDATE_PACKAGE_FINGERPRINTS = {
     # Official Desktop v1.16.0 package observed during the isolated native
     # upload/confirmation run.  A release label alone does not identify a
@@ -50,10 +52,14 @@ OBSERVED_CANDIDATE_PACKAGE_FINGERPRINTS = {
     # an isolated create/upload/link/vector/retrieval/cleanup contract run on
     # 2026-08-28.  The exact package remains part of the authority boundary.
     "1.16.1": "4f00651eb1a421a3a37fb60dc9486e0dc5577d21efac96dcf4b05ad2887ea910",  # pragma: allowlist secret -- public package SHA-256 fingerprint, not a credential
+    # Windows Desktop v1.17.0 qualified through the existing isolated native
+    # upload, exact-vector, retrieval, and cleanup path on 2026-10-02.
+    "1.17.0": "32aaa9e127ff27b0d909ce90146eab74ff0b694adbaba8e9a8a00a364ac4786a",  # pragma: allowlist secret -- public package SHA-256 fingerprint, not a credential
 }
 OBSERVED_CANDIDATE_SETTINGS_PROFILES = {
     "1.16.0": V116_PROFILE_ID,
     "1.16.1": V1161_PROFILE_ID,
+    "1.17.0": V117_PROFILE_ID,
 }
 # Mutation authority is capability-specific. This immutable record comes from
 # the isolated 2026-08-22 real-PDF run: workspace creation, native metadata
@@ -61,6 +67,20 @@ OBSERVED_CANDIDATE_SETTINGS_PROFILES = {
 # It intentionally does not claim temporary-key deletion or workspace cleanup,
 # which require their own opt-in contract probe evidence.
 OBSERVED_NATIVE_MUTATION_CONTRACTS = {
+    "32aaa9e127ff27b0d909ce90146eab74ff0b694adbaba8e9a8a00a364ac4786a": {  # pragma: allowlist secret -- package SHA-256
+        "contract_id": V117_NATIVE_CONTRACT_ID,
+        "desktop_version": "1.17.0",
+        "observed_at": "2026-10-02T12:14:24+00:00",
+        "capabilities": (
+            "can_create_temp_api_key",
+            "can_delete_temp_api_key",
+            "can_create_workspace",
+            "can_delete_workspace",
+            "can_upload_native_metadata",
+            "can_poll_post_upload_state",
+            "can_runtime_verify_embedder",
+        ),
+    },
     "a40a9bb5915e6383f51fd2a02e76052724a6c9d2576d852025eefcbb23d4282b": {  # pragma: allowlist secret -- package SHA-256
         "contract_id": V116_NATIVE_CONTRACT_ID,
         "desktop_version": "1.16.0",

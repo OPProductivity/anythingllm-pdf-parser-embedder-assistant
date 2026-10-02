@@ -359,6 +359,8 @@ try {
     $r2StartAnchor = 'he.app.whenReady().then(XX).catch(e=>{'
     $v116ImportAnchor = 'const ZX=Ee.join(__dirname,"../preload/index.js");'
     $v116StartAnchor = 'he.app.whenReady().then(XX).catch(e=>{'
+    $v117ImportAnchor = 'const KX=Ee.join(__dirname,"../preload/index.js");'
+    $v117StartAnchor = 'he.app.whenReady().then(ZX).catch(e=>{'
 
     # An AnythingLLM release label is not a compatibility guarantee.  The
     # profile below first narrows the intended release family, then demands
@@ -391,6 +393,17 @@ try {
         $main.Contains('const __pdfPrepRefreshBridge=require("./pdf-prep-refresh-bridge.cjs");' + $v116ImportAnchor) -and
         $main.Contains('he.app.whenReady().then(XX).then(()=>__pdfPrepRefreshBridge.startPdfPrepRefreshBridge({app:he.app,getMainWindow:()=>$X})).catch(e=>{')
     )
+    $v117AnchorMatch = (
+        $versionText -match '^[vV]?1\.17\.0$' -and
+        [regex]::Matches($main, [regex]::Escape($v117ImportAnchor)).Count -eq 1 -and
+        [regex]::Matches($main, [regex]::Escape($v117StartAnchor)).Count -eq 1
+    )
+    $patchedV117AnchorMatch = (
+        $versionText -match '^[vV]?1\.17\.0$' -and
+        $bridgeModulePresent -and
+        $main.Contains('const __pdfPrepRefreshBridge=require("./pdf-prep-refresh-bridge.cjs");' + $v117ImportAnchor) -and
+        $main.Contains('he.app.whenReady().then(ZX).then(()=>__pdfPrepRefreshBridge.startPdfPrepRefreshBridge({app:he.app,getMainWindow:()=>jX})).catch(e=>{')
+    )
     $anchorProfile = if ($legacyAnchorMatch) {
         "legacy-main-window-v1"
     }
@@ -405,6 +418,12 @@ try {
     }
     elseif ($patchedV116AnchorMatch) {
         "anythingllm-1.16-main-window-x-installed"
+    }
+    elseif ($v117AnchorMatch) {
+        "anythingllm-1.17-main-window-j"
+    }
+    elseif ($patchedV117AnchorMatch) {
+        "anythingllm-1.17-main-window-j-installed"
     }
     else {
         "unsupported"
@@ -455,6 +474,13 @@ try {
             $importAnchor = $v116ImportAnchor
             $startAnchor = $v116StartAnchor
             $startReplacement = 'he.app.whenReady().then(XX).then(()=>__pdfPrepRefreshBridge.startPdfPrepRefreshBridge({app:he.app,getMainWindow:()=>$X})).catch(e=>{'
+        }
+        elseif ($v117AnchorMatch) {
+            # The audited v1.17.0 startup function ZX creates main window jX.
+            # Start the unchanged bridge only after that function resolves.
+            $importAnchor = $v117ImportAnchor
+            $startAnchor = $v117StartAnchor
+            $startReplacement = 'he.app.whenReady().then(ZX).then(()=>__pdfPrepRefreshBridge.startPdfPrepRefreshBridge({app:he.app,getMainWindow:()=>jX})).catch(e=>{'
         }
         else {
             throw "AnythingLLM Desktop $version did not match an explicitly verified safe bridge anchor set. No files were changed."

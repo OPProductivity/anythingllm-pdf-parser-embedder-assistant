@@ -131,9 +131,13 @@ def test_v116_exact_package_contract_grants_only_observed_native_capabilities(tm
     assert result["capabilities"]["can_create_temp_api_key"]["status"] == "unknown"
 
 
-def test_v1161_exact_package_contract_grants_qualified_probe_capabilities(tmp_path, monkeypatch):
-    expected = anythingllm_compatibility.OBSERVED_CANDIDATE_PACKAGE_FINGERPRINTS["1.16.1"]
-    monkeypatch.setattr(anythingllm_compatibility, "_desktop_version", lambda _exe: ("1.16.1.0", [], []))
+@pytest.mark.parametrize("version,profile,contract", [
+    ("1.16.1", anythingllm_compatibility.V1161_PROFILE_ID, anythingllm_compatibility.V1161_NATIVE_CONTRACT_ID),
+    ("1.17.0", anythingllm_compatibility.V117_PROFILE_ID, anythingllm_compatibility.V117_NATIVE_CONTRACT_ID),
+])
+def test_exact_package_contract_grants_qualified_probe_capabilities(tmp_path, monkeypatch, version, profile, contract):
+    expected = anythingllm_compatibility.OBSERVED_CANDIDATE_PACKAGE_FINGERPRINTS[version]
+    monkeypatch.setattr(anythingllm_compatibility, "_desktop_version", lambda _exe: (version + ".0", [], []))
     monkeypatch.setattr(
         anythingllm_compatibility,
         "_desktop_package_identity",
@@ -148,8 +152,8 @@ def test_v1161_exact_package_contract_grants_qualified_probe_capabilities(tmp_pa
 
     result = anythingllm_compatibility.characterize(tmp_path, include_package_fingerprint=True)
 
-    assert result["matched_profile"] == anythingllm_compatibility.V1161_PROFILE_ID
-    assert result["native_mutation_contract"] == anythingllm_compatibility.V1161_NATIVE_CONTRACT_ID
+    assert result["matched_profile"] == profile
+    assert result["native_mutation_contract"] == contract
     for capability in (
         "can_create_temp_api_key",
         "can_delete_temp_api_key",
@@ -160,6 +164,27 @@ def test_v1161_exact_package_contract_grants_qualified_probe_capabilities(tmp_pa
         "can_runtime_verify_embedder",
     ):
         assert result["capabilities"][capability]["status"] == "supported"
+
+
+@pytest.mark.parametrize("version,fingerprint", [
+    ("1.17.0.0", "f" * 64),
+    ("1.17.1.0", anythingllm_compatibility.OBSERVED_CANDIDATE_PACKAGE_FINGERPRINTS["1.17.0"]),
+])
+def test_v117_contract_rejects_changed_package_or_release(tmp_path, monkeypatch, version, fingerprint):
+    monkeypatch.setattr(anythingllm_compatibility, "_desktop_version", lambda _exe: (version, [], []))
+    monkeypatch.setattr(
+        anythingllm_compatibility, "_desktop_package_identity",
+        lambda _path, include_fingerprint: ({"app_asar_sha256": fingerprint}, [], []),
+    )
+    (tmp_path / ".env").write_text("EMBEDDING_ENGINE='openrouter'\n", encoding="utf-8")
+    create_profile_database(tmp_path / "anythingllm.db")
+
+    result = characterize(tmp_path, include_package_fingerprint=True)
+
+    assert result["capabilities"]["can_read_sqlite_state"]["status"] == "supported"
+    assert result["capabilities"]["can_upload_native_metadata"]["status"] == "blocked"
+    assert result["capabilities"]["can_write_env_settings"]["status"] == "blocked"
+    assert result["capabilities"]["can_write_sqlite_settings"]["status"] == "blocked"
 
 
 def test_unknown_package_blocks_native_mutation_without_hiding_read_only_storage(tmp_path, monkeypatch):
