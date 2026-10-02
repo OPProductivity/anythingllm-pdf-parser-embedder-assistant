@@ -10,30 +10,30 @@ pytestmark = pytest.mark.offline_deterministic
 def test_preview_controls_and_dedicated_readers_are_removed():
     labels = {component['props'].get('label') for component in app.demo.config['components']}
     assert not labels.intersection({'Segment preview', 'Segment number', 'Segment text', 'AnythingLLM storage match'})
-    assert 'Open Output Folder' in labels
+    assert 'Open Output Folder' not in labels
     for name in ('selected_manifest_path', 'preview_manifest_segment', 'preview_workspace_segment',
                  'navigate_manifest_segment', 'navigate_manifest_segment_with_storage'):
         assert not hasattr(app, name)
     assert not hasattr(pipeline, 'workspace_segment_preview')
 
 
-def test_existing_output_action_is_inside_visible_replacement_section():
+def test_existing_output_action_has_no_accordion_wrapper():
     components = app.demo.config['components']
-    section = next(component for component in components if component['props'].get('label') == 'Open Output Folder')
     button = next(component for component in components if component['props'].get('elem_id') == 'open-generated-output-button')
     assert button['props']['value'] == 'Open Output Folder'
-    assert section['props'].get('visible', True)
 
-    def find(node, identity):
+    def ancestors(node, identity, parents=()):
         if node.get('id') == identity:
-            return node
+            return parents
         for child in node.get('children', []):
-            found = find(child, identity)
-            if found:
+            found = ancestors(child, identity, (*parents, node['id']))
+            if found is not None:
                 return found
         return None
 
-    assert find(find(app.demo.config['layout'], section['id']), button['id'])
+    parents = ancestors(app.demo.config['layout'], button['id'])
+    assert parents is not None
+    assert not any(component['type'] == 'accordion' and component['id'] in parents for component in components)
     actions = [fn for fn in app.demo.fns.values() if fn.fn is app.open_generated_output_directory]
     assert len(actions) == 1
     assert len(actions[0].inputs) == 2

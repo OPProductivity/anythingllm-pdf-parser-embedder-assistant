@@ -43,3 +43,31 @@ without a page reload between these actions. Preview controls were absent.
 This bounded UI qualification did not upload or mutate AnythingLLM data.
 Local test artifacts and the browser screenshot are retained in ignored
 `tmp-output/reset-sequence-qualification`.
+
+## Standalone Folder Button
+
+The subsequent user correction removes the Open Output Folder accordion
+wrapper entirely. The existing button remains at the same top-level location,
+with centered white text, a gray background and a white border. Its identity,
+callback, visibility updates, state inputs and folder resolution are unchanged.
+The component test now checks that it has no accordion ancestor.
+
+The latest two user runs were inspected before this edit: the 17:42 run
+(`r-20261002-174214-6ed75fa968`) used whole-file uploads to the Harkins workspace
+and confirmed three records. The 17:45 run (`r-20261002-174505-94101bd49f`)
+used page-local passages in `second-time-but-different-workspace`, preparing
+214 records with a passage target of 750. Both used the same source hashes,
+all 47 pages and effective embedding chunk size/overlap 8191/20. The second
+run's terminal warning records incomplete vector confirmation within the
+bounded reconciliation window, not identical segmentation settings.
+
+63 focused regression tests and all configured pre-commit checks passed.
+Successful-run lean retention means not every original first-run checkbox
+value remains available; no missing settings were inferred from the GUI.
+
+The idle production assistant was restarted and a preserved custom-text PDF
+was processed in local-only mode. The browser showed a successful run and one
+enabled Open Output Folder button, with no accordion ancestor. Computed styles
+confirmed gray RGB(55,65,81), a white solid border and centered text. Screenshot:
+`tmp-output/reset-sequence-qualification/standalone-output-folder.png`.
+Neither user run was retried; AnythingLLM data was not mutated by this check.

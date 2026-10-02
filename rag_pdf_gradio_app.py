@@ -2592,6 +2592,13 @@ body.dark .anythingllm-startup-status-module:has(.anythingllm-startup-status--of
     opacity: 1 !important;
     box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.25) !important;
 }
+#open-generated-output-button,
+#open-generated-output-button button {
+    background: #374151 !important;
+    border: 1px solid #ffffff !important;
+    color: #ffffff !important;
+    text-align: center !important;
+}
 /* The disabled review action is intentionally quieter than the actionable
    primary buttons in dark mode, while remaining easy to read. */
 body.dark #automatic-process-button[disabled="disabled"],
@@ -33842,14 +33849,12 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                         elem_classes=["downloads-artifacts-html"],
                     )
                     auto_files = gr.File(label="Downloads", file_count="multiple", visible=False, show_label=False)
-            with gr.Accordion("Open Output Folder", open=False, elem_classes=["top-level-accordion"]):
-                # Reuse the terminal-folder action without changing stream outputs.
-                open_generated_output_button = gr.Button(
-                    "Open Output Folder",
-                    interactive=False,
-                    visible=False,
-                    elem_id="open-generated-output-button",
-                )
+            open_generated_output_button = gr.Button(
+                "Open Output Folder",
+                interactive=False,
+                visible=False,
+                elem_id="open-generated-output-button",
+            )
 
             refresh_workspace_button.click(
                 fn=refresh_workspaces_with_readiness,
