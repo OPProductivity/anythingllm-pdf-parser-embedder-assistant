@@ -4955,20 +4955,30 @@ def is_new_document_workspace_choice(workspace_slug):
     return (workspace_slug or "").strip() == NEW_DOCUMENT_WORKSPACE_VALUE
 
 
-def workspace_update_from_local(prefix="", auto_select=True, include_new_document_choice=False):
+def refreshed_workspace_value(choices, auto_select, include_new_document_choice, selected_workspace=None):
+    """Explicit refresh keeps intent by slug, never by a mutable display name."""
+    if selected_workspace is not None:
+        selected = str(selected_workspace or "").strip()
+        return selected if selected in {slug for _label, slug in choices} else None
+    return (
+        preferred_workspace_slug(choices) if auto_select
+        else NEW_DOCUMENT_WORKSPACE_VALUE if include_new_document_choice else None
+    )
+
+
+def workspace_update_from_local(prefix="", auto_select=True, include_new_document_choice=False, selected_workspace=None):
     choices, status = local_workspace_choices()
     if include_new_document_choice:
         choices = workspace_choices_with_new_document(choices)
-    value = (
-        preferred_workspace_slug(choices)
-        if auto_select
-        else NEW_DOCUMENT_WORKSPACE_VALUE
-        if include_new_document_choice
-        else None
-    )
+    value = refreshed_workspace_value(choices, auto_select, include_new_document_choice, selected_workspace)
     if prefix:
         status = f"{prefix}\n{status}"
-    if choices and not auto_select:
+    if selected_workspace is not None:
+        status += (
+            f"\nKept selected workspace `{value}`."
+            if value else "\nThe selected workspace is unavailable or cleared. Select a target explicitly before upload."
+        )
+    elif choices and not auto_select:
         status += (
             "\nA new document workspace will be created after confirmation."
             if include_new_document_choice
@@ -5238,6 +5248,7 @@ def refresh_workspaces(
     autostart_runtime=False,
     auto_select=True,
     include_new_document_choice=False,
+    selected_workspace=None,
 ):
     resolution = ensure_anythingllm_runtime(
         api_url,
@@ -5272,22 +5283,22 @@ def refresh_workspaces(
                 resolution_note + "API connected, but returned no workspaces. Falling back to local desktop database.",
                 auto_select=auto_select,
                 include_new_document_choice=include_new_document_choice,
+                selected_workspace=selected_workspace,
             )
         if include_new_document_choice:
             choices = workspace_choices_with_new_document(choices)
-        selected = (
-            preferred_workspace_slug(choices)
-            if auto_select
-            else NEW_DOCUMENT_WORKSPACE_VALUE
-            if include_new_document_choice
-            else None
-        )
+        selected = refreshed_workspace_value(choices, auto_select, include_new_document_choice, selected_workspace)
         selection_message = (
             f"Auto-selected `{selected}`."
             if selected
             else "Select a target workspace explicitly before native upload."
         )
-        if include_new_document_choice and not auto_select:
+        if selected_workspace is not None:
+            selection_message = (
+                f"Kept selected workspace `{selected}`." if selected
+                else "The selected workspace is unavailable or cleared. Select a target explicitly before upload."
+            )
+        elif include_new_document_choice and not auto_select:
             selection_message = "A new document workspace will be created after confirmation."
         return gr.update(choices=choices, value=selected), (
             resolution_note + f"Found {len(choices)} workspace(s). {selection_message}"
@@ -5297,12 +5308,14 @@ def refresh_workspaces(
             resolution_note + f"{describe_api_exception(exc, 'AnythingLLM')}\nUsing read-only local database fallback.",
             auto_select=auto_select,
             include_new_document_choice=include_new_document_choice,
+            selected_workspace=selected_workspace,
         )
     except Exception as exc:
         return workspace_update_from_local(
             resolution_note + f"{describe_api_exception(exc, 'AnythingLLM')}\nUsing read-only local database fallback.",
             auto_select=auto_select,
             include_new_document_choice=include_new_document_choice,
+            selected_workspace=selected_workspace,
         )
 
 
@@ -5393,12 +5406,13 @@ def refresh_workspaces_with_readiness(api_url, api_key, workspace_slug):
         autostart_runtime=True,
         auto_select=False,
         include_new_document_choice=True,
+        selected_workspace=workspace_slug,
     )
     readiness = native_upload_readiness_html(
         native_upload_readiness_report(
             api_url,
             api_key,
-            workspace_slug or workspace_update.get("value"),
+            workspace_update.get("value"),
             autostart_runtime=True,
             verify_authentication=True,
         )
@@ -7930,6 +7944,39 @@ def automatic_text_outputs_ready(summaries):
         Path(str((row or {}).get("upload_file") or "")).is_file()
         for row in canonical
     )
+
+
+def automatic_local_text_export_selection(summaries, native_run, upload_report):
+    """Only exact target-workspace skips are exempt from new local exports."""
+    if not native_run:
+        return summaries, 0
+    try:
+        canonical = local_export_canonical_summaries(summaries)
+    except ValueError:
+        return summaries, 0
+    documents = upload_report.get("document_results") or {}
+    required = []
+    skipped = 0
+    for original, summary in zip(summaries, canonical):
+        proof = documents.get(str(summary.get("pdf") or ""), {})
+        selected = _report_nonnegative_count(proof, "selected_records", "records")
+        if (
+            summary.get("post_upload_classification") == "workspace_existing_content_skipped"
+            and summary.get("post_upload_verification_status") == "pass"
+            and (summary.get("workspace_duplicate_preflight") or {}).get("status") == "fast_physical_page_identity_skip"
+            and not summary.get("upload_file")
+            and proof.get("post_classification") == "workspace_existing_content_skipped"
+            and proof.get("searchability_proven") is True
+            and proof.get("post_status") == "pass"
+            and selected > 0
+            and _report_nonnegative_count(proof, "existing_workspace_records") >= selected
+            and _report_nonnegative_count(proof, "vector_confirmed_records", "embedded") >= selected
+            and _report_nonnegative_count(proof, "newly_attached_records", "uploaded") == 0
+        ):
+            skipped += 1
+        else:
+            required.append(original)
+    return required, skipped
 
 
 def promote_flat_no_logs_batch_output(output_root, temporary_run_dir, pdf_paths, summaries):
@@ -11314,6 +11361,7 @@ def merge_uploaded_pdfs_into_direct_selection(pdf_files=None, folder_manifest=No
     return merge_uploaded_pdfs_into_folder_batch(pdf_files, folder_manifest)[:6]
 
 
+@automatic_next_run_callback(1)
 def reuse_selected_pdf_files(pdf_files=None):
     """Re-emit the current ordinary-picker paths without opening a file dialog.
 
@@ -11331,6 +11379,7 @@ def selected_pdf_files_retry_button_update(pdf_files=None):
     return gr.update(visible=bool(selected))
 
 
+@automatic_next_run_callback(5)
 def reuse_selected_pdf_batch(manifest=None, selected_paths=None):
     """Refresh a batch selection while retaining its checked PDF paths."""
     updated = dict(manifest or {}) if isinstance(manifest, dict) else {}
@@ -11352,6 +11401,7 @@ def reuse_selected_pdf_batch(manifest=None, selected_paths=None):
     )
 
 
+@automatic_next_run_callback(8)
 def clear_selected_pdf_batch():
     """Forget the current batch selection without touching any source files."""
     return (
@@ -12744,6 +12794,7 @@ def _automatic_selection_begin_state(
     *,
     preserve_ordinary_picker=False,
     selection_not_yet_chosen=False,
+    force_reset=False,
 ):
     """Lock run-defining controls until a new picker selection has settled.
 
@@ -12785,7 +12836,18 @@ def _automatic_selection_begin_state(
         pdf_files, folder_pdf_files, folder_manifest
     )
     if (
-        not selection_not_yet_chosen
+        not force_reset
+        and not selection_not_yet_chosen
+        and state.get("state") == "pending"
+        and state.get("reset_per_run_defaults")
+        and (state.get("accept_next_signature") or state.get("selection_signature") == signature)
+    ):
+        # Retained File values can emit a concurrent change during explicit
+        # retry/clear. That acknowledgement belongs to the same reset intent.
+        return state, "", gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+    if (
+        not force_reset
+        and not selection_not_yet_chosen
         and signature
         and state.get("state") == "ready"
         and state.get("selection_signature") == signature
@@ -12800,6 +12862,7 @@ def _automatic_selection_begin_state(
             "revision": revision,
             "selection_signature": "" if selection_not_yet_chosen else signature,
             "accept_next_signature": bool(selection_not_yet_chosen),
+            **({"reset_per_run_defaults": True} if force_reset else {}),
         },
         "",
         # Folder batches and ordinary-file selections are intentionally
@@ -12846,6 +12909,22 @@ def automatic_selection_begin_state(
         folder_manifest,
         preserve_ordinary_picker=False,
     )
+
+
+def automatic_retry_selection_begin_state(previous_state=None, viewed_run_root=None, pdf_files=None, folder_pdf_files=None, folder_manifest=None):
+    """An explicit retry owns a new reset even when the file paths are unchanged."""
+    return _automatic_selection_begin_state(
+        previous_state, viewed_run_root, pdf_files, folder_pdf_files, folder_manifest,
+        preserve_ordinary_picker=bool(normalize_file_list(folder_pdf_files)), force_reset=True,
+    )
+
+
+def automatic_clear_selection_begin_state(previous_state=None, viewed_run_root=None, pdf_files=None, folder_pdf_files=None, folder_manifest=None):
+    result = automatic_retry_selection_begin_state(previous_state, viewed_run_root, pdf_files, folder_pdf_files, folder_manifest)
+    if result[0].get("state") == "pending" and not automatic_lifecycle_busy():
+        result[0]["selection_signature"] = ""
+        result[0]["accept_next_signature"] = True
+    return result
 
 
 def automatic_folder_selection_begin_state(
@@ -14791,7 +14870,7 @@ def clear_live_automatic_run_status():
 
 
 @_synchronized_live_automatic_status
-def reset_automatic_run_presentation(pdf_files=None, folder_pdf_files=None):
+def reset_automatic_run_presentation(pdf_files=None, folder_pdf_files=None, selection_state=None):
     """Return the complete fresh-run presentation after a selection change.
 
     A new selection is never a resume request.  Clear every transient
@@ -14800,6 +14879,8 @@ def reset_automatic_run_presentation(pdf_files=None, folder_pdf_files=None):
     history lookup that cannot resume or otherwise alter the new run.
     """
     global LIVE_AUTOMATIC_RUN_STATUS
+    if selection_state is not None and str(selection_state.get("state") or "") in {"ready", "idle"}:
+        return tuple(gr.update() for _ in range(19))
     live_status = LIVE_AUTOMATIC_RUN_STATUS or {}
     # File-change events can be delivered after Confirm has reserved a run
     # folder but before the worker changes the status to ``running``.  That
@@ -14950,6 +15031,27 @@ def reset_automatic_run_settings_to_defaults(selected_workspace=""):
         gr.update(value=defaults["unstructured_strategy"]),
         gr.update(value=defaults["generate_inline_fallback"]),
     )
+
+
+@automatic_next_run_callback(46)
+def reset_automatic_run_selection_settings(selected_workspace="", pdf_files=None, folder_pdf_files=None, selection_state=None):
+    """Clearing the picker clears its target; adding files preserves current intent."""
+    if selection_state is not None and str(selection_state.get("state") or "") in {"ready", "idle"}:
+        return tuple(gr.update() for _ in range(46))
+    has_files = bool(normalize_file_list(pdf_files) or (selection_state is None and normalize_file_list(folder_pdf_files)))
+    explicit_reset = bool((selection_state or {}).get("reset_per_run_defaults"))
+    workspace = selected_workspace if has_files and not explicit_reset else ""
+    updates = reset_automatic_run_settings_to_defaults(workspace)
+    evidence = gr.update(value=False) if "value" in updates[0] else gr.update()
+    return (*updates, evidence)
+
+
+@automatic_next_run_callback(46)
+def reset_automatic_run_retry_settings():
+    """Explicit clear/retry restores all per-run defaults, not the previous target."""
+    updates = reset_automatic_run_settings_to_defaults()
+    evidence = gr.update(value=False) if "value" in updates[0] else gr.update()
+    return (*updates, evidence)
 
 
 @automatic_next_run_callback(45)
@@ -27287,6 +27389,26 @@ def explicit_upload_count_schema(report):
     return result
 
 
+def automatic_terminal_document_counts(report):
+    """Count ready source receipts, including non-mutating workspace skips."""
+    documents = report.get("document_results")
+    if isinstance(documents, dict) and documents:
+        rows = [row for row in documents.values() if isinstance(row, dict)]
+        confirmed = sum(
+            1 for row in rows
+            if row.get("searchability_proven") is True
+            and str(row.get("post_status") or "") == "pass"
+            and _report_nonnegative_count(row, "selected_records", "records") > 0
+            and _report_nonnegative_count(row, "vector_confirmed_records", "embedded")
+            >= _report_nonnegative_count(row, "selected_records", "records")
+        )
+    else:
+        rows = [row for row in (report.get("source_transactions") or []) if isinstance(row, dict)]
+        confirmed = sum(1 for row in rows if row.get("state") == "exact_vectors_proven")
+    accepted = sum(1 for row in rows if _report_nonnegative_count(row, "newly_attached_records", "uploaded") > 0)
+    return accepted, confirmed
+
+
 def upload_report_has_complete_vector_proof(report):
     """Return whether a grouped upload has proved every submitted vector.
 
@@ -27711,6 +27833,9 @@ def upload_prepared_automatic_batch(
                 "records": int(summary.get("post_upload_expected_payloads") or summary.get("api_uploaded") or 0),
                 "uploaded": int(summary.get("api_uploaded") or 0),
                 "embedded": int(summary.get("api_embedded") or 0),
+                "vector_confirmed_records": int(summary.get("api_embedded") or 0),
+                "existing_workspace_records": int(summary.get("workspace_existing_records") or 0),
+                "queue_completed_records": 0,
                 "error": str(summary.get("api_upload_error") or ""),
                 "warning": str(summary.get("api_upload_warning") or ""),
                 "post_status": "pass",
@@ -32680,8 +32805,16 @@ def run_automatic(
                 "did not finish. Detailed source artifacts were retained; no upload was repeated."
             ),
         })
-    text_outputs_ready = automatic_text_outputs_ready(summaries)
-    if completion["state"] == "successful" and not text_outputs_ready:
+    local_text_summaries, workspace_skip_exports = automatic_local_text_export_selection(
+        summaries, prepare_and_upload, batch_upload_report,
+    )
+    text_outputs_ready = automatic_text_outputs_ready(local_text_summaries)
+    if workspace_skip_exports:
+        completion["message"] += (
+            f" No new local TXT export for {workspace_skip_exports} already-indexed PDF selection(s); "
+            "their selected records are proven vector-backed in the target workspace."
+        )
+    if completion["state"] == "successful" and not text_outputs_ready and (local_text_summaries or not workspace_skip_exports):
         completion = with_error_dimensions({
             "state": "warning",
             "code": "AUTO-TEXT-OUTPUT-PUBLISH-001",
@@ -32699,7 +32832,7 @@ def run_automatic(
                 output_root_base,
                 run_root,
                 files,
-                summaries,
+                local_text_summaries,
             )
             flat_no_logs_complete = True
         except (OSError, ValueError) as exc:
@@ -32789,7 +32922,7 @@ def run_automatic(
         **dict(processing_settings or {}),
         "successful_output_retention": {
             "status": "text_only_output_published" if flat_no_logs_complete else str(batch_retention_report.get("status") or "not_required"),
-            "documents": len(summaries) if flat_no_logs_complete else len(batch_retention_report.get("documents") or []),
+            "documents": len(local_text_summaries) if flat_no_logs_complete else len(batch_retention_report.get("documents") or []),
         },
         "output_capacity_preflight": terminal_output_capacity_evidence(batch_capacity),
     }
@@ -32830,18 +32963,7 @@ def run_automatic(
     else:
         progress(1.0, desc="Document(s) ready in AnythingLLM" if prepare_and_upload else "Preparation complete")
     prepared_paths = primary_prepared_download_paths(summaries)
-    terminal_source_transactions = [
-        row for row in (batch_upload_report.get("source_transactions") or [])
-        if isinstance(row, dict)
-    ]
-    terminal_vector_confirmed_files = sum(
-        1 for row in terminal_source_transactions
-        if str(row.get("state") or "") == "exact_vectors_proven"
-    )
-    terminal_accepted_files = sum(
-        1 for row in terminal_source_transactions
-        if int(row.get("newly_attached_records") or row.get("uploaded") or 0) > 0
-    )
+    terminal_accepted_files, terminal_vector_confirmed_files = automatic_terminal_document_counts(batch_upload_report)
     update_live_automatic_run_status(
         run_root,
         state=completion["state"],
@@ -34416,7 +34538,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             )
             retry_selected_pdf_files_button.click(
-                fn=automatic_selection_begin_state,
+                fn=automatic_retry_selection_begin_state,
                 inputs=[automatic_selection_state, automatic_viewed_run_root, auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
                 outputs=[
                     automatic_selection_state,
@@ -34436,7 +34558,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 show_progress="minimal",
                 queue=False,
             ).then(
-                fn=merge_uploaded_pdfs_into_folder_batch,
+                fn=merge_uploaded_pdfs_into_direct_selection,
                 inputs=[auto_pdfs, auto_folder_manifest],
                 outputs=[
                     auto_pdfs,
@@ -34463,9 +34585,9 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 show_progress="hidden",
                 queue=False,
             ).then(
-                fn=reset_automatic_run_settings_to_defaults,
-                inputs=[workspace_slug],
-                outputs=fresh_run_settings_outputs,
+                fn=reset_automatic_run_retry_settings,
+                inputs=None,
+                outputs=[*fresh_run_settings_outputs, retain_detailed_evidence],
                 show_progress="hidden",
                 queue=False,
             ).then(
@@ -34586,7 +34708,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 concurrency_id="automatic-native-page-inspection",
             ).then(
                 fn=reset_automatic_run_presentation,
-                inputs=[auto_pdfs, auto_folder_pdfs],
+                inputs=[auto_pdfs, auto_folder_pdfs, automatic_selection_state],
                 outputs=fresh_run_presentation_outputs,
                 show_progress="hidden",
                 queue=False,
@@ -34603,9 +34725,9 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 show_progress="hidden",
                 queue=False,
             ).then(
-                fn=reset_automatic_run_settings_to_defaults,
-                inputs=[workspace_slug],
-                outputs=fresh_run_settings_outputs,
+                fn=reset_automatic_run_selection_settings,
+                inputs=[workspace_slug, auto_pdfs, auto_folder_pdfs, automatic_selection_state],
+                outputs=[*fresh_run_settings_outputs, retain_detailed_evidence],
                 show_progress="hidden",
                 queue=False,
             ).then(
@@ -34700,9 +34822,9 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 show_progress="hidden",
                 queue=False,
             ).then(
-                fn=reset_automatic_run_settings_to_defaults,
-                inputs=[workspace_slug],
-                outputs=fresh_run_settings_outputs,
+                fn=reset_automatic_run_selection_settings,
+                inputs=[workspace_slug, auto_pdfs, auto_folder_pdfs],
+                outputs=[*fresh_run_settings_outputs, retain_detailed_evidence],
                 show_progress="hidden",
                 queue=False,
             ).then(
@@ -34771,7 +34893,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             )
             retry_selected_pdf_batch_button.click(
-                fn=automatic_folder_selection_begin_state,
+                fn=automatic_retry_selection_begin_state,
                 inputs=[automatic_selection_state, automatic_viewed_run_root, auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
                 outputs=[
                     automatic_selection_state,
@@ -34811,9 +34933,9 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 show_progress="hidden",
                 queue=False,
             ).then(
-                fn=reset_automatic_run_settings_to_defaults,
-                inputs=[workspace_slug],
-                outputs=fresh_run_settings_outputs,
+                fn=reset_automatic_run_retry_settings,
+                inputs=None,
+                outputs=[*fresh_run_settings_outputs, retain_detailed_evidence],
                 show_progress="hidden",
                 queue=False,
             ).then(
@@ -34882,6 +35004,20 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             )
             clear_selected_pdf_batch_button.click(
+                fn=automatic_clear_selection_begin_state,
+                inputs=[automatic_selection_state, automatic_viewed_run_root, auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
+                outputs=[
+                    automatic_selection_state,
+                    automatic_viewed_run_root,
+                    auto_pdfs,
+                    auto_mode,
+                    confirm_automatic_run_button,
+                    cancel_automatic_run_button,
+                    automatic_run_activity,
+                ],
+                show_progress="hidden",
+                queue=False,
+            ).then(
                 fn=clear_selected_pdf_batch,
                 outputs=[
                     auto_folder_path,
@@ -34908,18 +35044,21 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 show_progress="hidden",
                 queue=False,
             ).then(
-                fn=reset_automatic_run_settings_to_defaults,
-                inputs=[workspace_slug],
-                outputs=fresh_run_settings_outputs,
+                fn=reset_automatic_run_retry_settings,
+                inputs=None,
+                outputs=[*fresh_run_settings_outputs, retain_detailed_evidence],
                 show_progress="hidden",
                 queue=False,
             ).then(
-                fn=automatic_selection_action_states,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state],
+                fn=automatic_selection_finish_state,
+                inputs=[automatic_selection_state, auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
                 outputs=[
+                    automatic_selection_state,
+                    auto_mode,
                     confirm_automatic_run_button,
                     cancel_automatic_run_button,
                     automatic_run_activity,
+                    auto_pdfs,
                 ],
                 show_progress="hidden",
                 queue=False,

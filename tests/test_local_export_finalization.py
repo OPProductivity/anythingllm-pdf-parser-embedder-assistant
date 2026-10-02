@@ -139,6 +139,8 @@ def test_long_duplicate_collision_keeps_marker_at_end(tmp_path):
 def test_parent_gate_is_retention_based_not_selected_count():
     import inspect
     code = inspect.getsource(app.run_automatic)
-    assert "automatic_text_outputs_ready(summaries)" in code
+    assert "automatic_local_text_export_selection(" in code
+    assert "automatic_text_outputs_ready(local_text_summaries)" in code
+    assert '"documents": len(local_text_summaries)' in code
     assert "len(flat_no_logs_exports) == len(summaries)" not in code
     assert "text-only output publication is incomplete" in code
