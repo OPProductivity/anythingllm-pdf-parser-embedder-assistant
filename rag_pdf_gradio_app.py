@@ -13254,11 +13254,14 @@ def current_source_vector_progress_count(report, *, expected_records=None):
     Workspace-wide matching-row counts and the broader identity-set count can
     include earlier source windows. They remain useful diagnostics, but must
     never advance a later source's progress or liveness clock. The only count
-    allowed here is the verifier's exact current-upload count, optionally
+    allowed here is the verifier's covered current-upload record count, optionally
     bounded by the current source's prepared-record total.
     """
     try:
-        observed = max(0, int((report or {}).get("current_upload_document_vector_count") or 0))
+        coverage = (report or {}).get("current_upload_documents_with_vectors")
+        if coverage is None:
+            coverage = (report or {}).get("current_upload_document_vector_count")
+        observed = max(0, int(coverage or 0))
     except (TypeError, ValueError):
         observed = 0
     try:
@@ -13508,6 +13511,26 @@ def should_publish_vector_observation_status(
         max(0, int(unique_identities or 0)),
     )
     return max(current_signature) > 0 and current_signature != previous_signature
+
+
+def vector_observation_status_message(*, quiet_queue_recovery, covered_records,
+                                      unique_identities, expected_records,
+                                      queue_event_age=None, queue_position=0, queue_total=0):
+    """Construct every admitted status without treating identities as ownership."""
+    if quiet_queue_recovery:
+        return (
+            f"Desktop queue has been quiet for {queue_event_age:.0f}s at record "
+            f"{queue_position}/{queue_total}; exact vector check found "
+            f"{covered_records}/{expected_records} selected record(s) with vector mappings. "
+            "No upload was retried.",
+            "exact_vector_observation_quiet_queue_recovery",
+        )
+    if covered_records:
+        return (f"Checking exact vector evidence: {covered_records}/{expected_records} "
+                "selected record(s) have vector mappings", "exact_vector_observation")
+    return (f"Checking exact vector evidence: {unique_identities}/{expected_records} "
+            "selected source identities observed; submission confirmation pending",
+            "exact_vector_observation")
 
 
 @_synchronized_live_automatic_status
@@ -23152,6 +23175,7 @@ ERROR_DIMENSIONS_BY_CODE = {
     "AUTO-EMBEDDING-SOURCE-PRECOMMIT-001": ("provider_embedding", "rejected_before_mutation", "source", "source_provider_rejected_precommit"),
     "AUTO-EMBEDDING-PARTIAL-001": ("vector_confirmation", "partially_confirmed", "queue_group", "exact_partial_vector_coverage"),
     "AUTO-EMBEDDING-RECONCILE-001": ("desktop_submission", "external_outcome_unknown", "queue_group", "submission_outcome_unknown"),
+    "AUTO-EMBEDDING-VERIFIER-001": ("vector_confirmation", "verification_interrupted", "queue_group", "verification_callback_exception"),
     "EXTERNAL-QUEUE-EVIDENCE-PENDING-001": ("desktop_queue", "externally_active", "queue_group", "external_queue_still_active"),
     "AUTO-EMBEDDING-VERIFY-001": ("vector_confirmation", "confirmation_absent", "queue_group", "vector_confirmation_unavailable"),
     "AUTO-OCR-REVIEW-001": ("ocr_reconciliation", "deliberately_withheld", "source", "ocr_evidence_disagreement"),
@@ -23268,6 +23292,8 @@ def _automatic_completion_decision(summaries, prepare_and_upload):
     for summary in summaries:
         status = summary.get("api_upload_status")
         error_classification = str(summary.get("api_upload_error_classification") or "")
+        if summary.get("api_verification_error_type"):
+            continue
         if error_classification in {
             "source_atomic_provider_rejected_before_commit",
             "source_provider_rejected_precommit",
@@ -23485,6 +23511,18 @@ def _automatic_completion_decision(summaries, prepare_and_upload):
             "state": "warning",
             "code": "AUTO-RETRIEVAL-UNVERIFIED-001",
             "message": "Documents were stored, but no conclusive live retrieval result was recorded. The runtime report identifies whether the check was blocked, failed, or unavailable.",
+        }
+    verifier_errors = [summary for summary in summaries if summary.get("api_verification_error_type")]
+    if verifier_errors:
+        detail = str(verifier_errors[0].get("api_upload_error") or "See the retained verification traceback.")
+        return {
+            "state": "warning", "code": "AUTO-EMBEDDING-VERIFIER-001",
+            "message": (
+                f"Assistant vector confirmation was interrupted by {verifier_errors[0]['api_verification_error_type']}: "
+                f"{detail} This was not a reconciliation timeout. AnythingLLM may still finish indexing. "
+                "Prepared files and recovery evidence were retained; no upload was retried. "
+                "Use Run history to reconcile the existing submission before considering a retry."
+            ),
         }
     partial = [summary for summary in summaries if str(summary.get("post_upload_verification_status") or "") == "partial_vector_coverage"]
     if partial:
@@ -23747,6 +23785,8 @@ def automatic_completion_phase(completion, prepare_and_upload):
         return "Document(s) ready in AnythingLLM"
     if code == "AUTO-EMBEDDING-RECONCILE-001":
         return "Preparation complete — AnythingLLM verification pending"
+    if code == "AUTO-EMBEDDING-VERIFIER-001":
+        return "Assistant vector confirmation interrupted"
     if code == "AUTO-EMBEDDING-PARTIAL-001":
         return "Partial embedding completed — recovery available"
     if code == "AUTO-EMBEDDING-SOURCE-PRECOMMIT-001":
@@ -26702,6 +26742,7 @@ def persist_grouped_upload_outcome(summary, document_result):
             "workspace_existing_records": int(document_result.get("existing_workspace_records") or 0),
             "cached_attachment_reused_records": int(document_result.get("cached_attachment_reused_records") or 0),
             "api_upload_error": error,
+            "api_verification_error_type": str(document_result.get("verification_error_type") or ""),
             "api_upload_warning": str(document_result.get("warning") or ""),
             "api_embedding_update_requested": int(document_result.get("queue_requested") or 0),
             "api_embedding_update_accepted": int(document_result.get("queue_accepted") or 0),
@@ -28123,8 +28164,9 @@ def upload_prepared_automatic_batch(
                 last_report,
                 expected_records=len(expected_batch),
             )
-            if current_source_vectors > last_vector_count:
-                last_vector_count = current_source_vectors
+            owned_vector_count = int(last_report.get("current_upload_document_vector_count") or 0)
+            if owned_vector_count > last_vector_count:
+                last_vector_count = owned_vector_count
                 last_vector_progress_elapsed = elapsed
             exact = (
                 current_submission_complete
@@ -28310,7 +28352,7 @@ def upload_prepared_automatic_batch(
                 continue
             if not should_publish_vector_observation_status(
                 quiet_queue_recovery=quiet_queue_recovery_observation,
-                current_submission_vectors=current_submission_vectors,
+                current_submission_vectors=current_source_vectors,
                 unique_identities=unique_identities,
                 previous_signature=last_published_vector_observation_signature,
             ):
@@ -28320,21 +28362,14 @@ def upload_prepared_automatic_batch(
                 # or terminal reconciliation result supplies the next fact.
                 time.sleep(2.0)
                 continue
-            elif quiet_queue_recovery_observation:
-                visible_vectors = current_submission_vectors or unique_identities
-                progress_detail = (
-                    f"Desktop queue has been quiet for {queue_event_age:.0f}s at record "
-                    f"{queue_position}/{queue_total}; exact vector check found "
-                    f"{visible_vectors}/{len(expected_batch)} selected record(s) currently searchable. "
-                    "No upload was retried."
-                )
-                timing_event = "exact_vector_observation_quiet_queue_recovery"
-            elif current_submission_vectors:
-                progress_detail = (
-                    f"Checking exact vector evidence: {current_submission_vectors}/{len(expected_batch)} "
-                    "selected record(s) currently searchable"
-                )
-                timing_event = "exact_vector_observation"
+            progress_detail, timing_event = vector_observation_status_message(
+                quiet_queue_recovery=quiet_queue_recovery_observation,
+                covered_records=current_source_vectors,
+                unique_identities=unique_identities,
+                expected_records=len(expected_batch),
+                queue_event_age=queue_event_age, queue_position=queue_position,
+                queue_total=queue_total,
+            )
             publish_verification_status(
                 progress_detail,
                 {
@@ -28342,7 +28377,9 @@ def upload_prepared_automatic_batch(
                     "batch": batch_report.get("batch"),
                     "total_batches": batch_report.get("total_batches"),
                     "requested": len(expected_batch),
-                    "matching_vectors": current_submission_vectors or unique_identities,
+                    "matching_vectors": current_source_vectors,
+                    "current_upload_documents_with_vectors": current_source_vectors,
+                    "current_upload_document_vector_count": current_submission_vectors,
                     "raw_workspace_vectors": observed,
                     "workspace_duplicate_vectors": duplicate_identities,
                     "observation_status": last_report.get("status"),
@@ -28358,7 +28395,7 @@ def upload_prepared_automatic_batch(
             )
             if not quiet_queue_recovery_observation:
                 last_published_vector_observation_signature = (
-                    max(0, int(current_submission_vectors or 0)),
+                    max(0, int(current_source_vectors or 0)),
                     max(0, int(unique_identities or 0)),
                 )
             time.sleep(2.0)
@@ -28560,10 +28597,19 @@ def upload_prepared_automatic_batch(
             if str(attachment.get("location") or "").replace("\\", "/").lstrip("/")
             in observed_vector_locations
         }
+        scoped_location_evidence = any(
+            "current_upload_vector_evidence_complete" in (batch.get("verification") or {})
+            or "current_upload_locations_with_vectors" in (batch.get("verification") or {})
+            for batch in batch_reports
+            if set(source_locations).intersection(batch.get("locations") or [])
+        )
         matched_sources = (
             expected_sources
             if searchable and source_transaction_state != "source_queue_rejected_without_remote_mutation"
-            else (expected_sources & (observed_sources | source_confirmed_sources))
+            else (expected_sources & (
+                source_confirmed_sources if scoped_location_evidence
+                else (observed_sources | source_confirmed_sources)
+            ))
         )
         # The aggregate submission can remain unresolved after an earlier
         # source has already reached exact current-upload proof.  Preserve
@@ -28696,6 +28742,12 @@ def upload_prepared_automatic_batch(
             "queue_batches": queue_batches,
             "ledger_path": ledger_path,
             "searchability_proven": exact,
+            "verification_error_type": next((
+                str((batch.get("verification") or {}).get("exception_type") or "")
+                for batch in batch_reports
+                if not exact and set(source_locations).intersection(batch.get("locations") or [])
+                and (batch.get("verification") or {}).get("classification") == "verification_callback_exception"
+            ), ""),
             "filename_disambiguations": [
                 remap for remap in filename_disambiguations
                 if remap["source_path"] == source_path

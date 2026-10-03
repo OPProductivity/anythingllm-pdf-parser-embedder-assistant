@@ -51,7 +51,7 @@ from pathlib import Path
 
 from portable_paths import application_paths, is_private_run_state_path
 from run_evidence import prepare_private_json, read_run_json
-from ingestion_observation import SubmissionCommitSignal
+from ingestion_observation import SubmissionCommitSignal, observe_submission_vector_ids
 from authenticated_http import AuthenticatedRedirectError, RejectAuthenticatedRedirects
 from anythingllm_persistence import AnythingLLMPersistenceAdapter
 from typing import Any, cast
@@ -17563,6 +17563,7 @@ def _update_workspace_embeddings_batched_serial(
                 # a live queue recovery.
                 verification = {
                     "status": "error",
+                    "classification": "verification_callback_exception",
                     "error": str(exc),
                     "exception_type": type(exc).__name__,
                     "traceback": traceback.format_exc(),
@@ -22809,18 +22810,19 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
         current_upload_doc_ids = [
             row.get("docId") for row in current_upload_docs if row.get("docId")
         ]
-        current_upload_vector_doc_ids = []
+        current_upload_vector_rows = []
         for offset in range(0, len(current_upload_doc_ids), 800):
             doc_id_slice = current_upload_doc_ids[offset:offset + 800]
             if not doc_id_slice:
                 continue
             placeholders = ",".join("?" for _ in doc_id_slice)
-            current_upload_vector_doc_ids.extend(
-                row[0] for row in cur.execute(
-                    f"select docId from document_vectors where docId in ({placeholders})",
+            current_upload_vector_rows.extend(
+                cur.execute(
+                    f"select docId,vectorId from document_vectors where docId in ({placeholders})",
                     doc_id_slice,
                 ).fetchall()
             )
+        current_upload_vector_doc_ids = [row[0] for row in current_upload_vector_rows]
         result["current_upload_document_vector_count"] = len(current_upload_vector_doc_ids)
         current_upload_vector_doc_id_set = set(current_upload_vector_doc_ids)
         result["current_upload_documents_with_vectors"] = len(current_upload_vector_doc_id_set)
@@ -22855,6 +22857,32 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
             result["current_upload_vector_expanded"] = bool(
                 current_raw_documents_complete
                 and result["current_upload_document_vector_count"] > expected_count
+            )
+            result["current_upload_mapping_evidence_complete"] = result["current_upload_vector_evidence_complete"]
+            vector_ids_by_doc = {}
+            for doc_id, vector_id in current_upload_vector_rows:
+                if vector_id:
+                    vector_ids_by_doc.setdefault(doc_id, set()).add(str(vector_id))
+            location_vector_ids = {
+                str(doc.get("docpath") or "").replace("\\", "/").lstrip("/"):
+                vector_ids_by_doc.get(doc.get("docId"), set())
+                for doc in current_upload_docs
+            }
+            # The initial live snapshot stays cheap. Only a complete mapping
+            # candidate or an explicit recovery/deep read opens physical IDs.
+            physical = (
+                observe_submission_vector_ids(storage_dir, workspace_slug, location_vector_ids)
+                if current_raw_documents_complete or attachment_only_observation
+                or normalized_observation_mode not in {"fast"}
+                else {"status": "deferred", "complete": False, "locations_with_vectors": []}
+            )
+            result["current_upload_physical_vector_observation"] = {
+                key: value for key, value in physical.items() if key != "locations_with_vectors"
+            }
+            result["current_upload_locations_with_vectors"] = physical["locations_with_vectors"]
+            result["current_upload_vector_evidence_complete"] = bool(
+                current_raw_documents_complete and physical["complete"]
+                and len(physical["locations_with_vectors"]) == expected_count
             )
         matching_docs = []
         for doc in docs:
@@ -23038,6 +23066,14 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
                 f"This submission attached {result['expected_payload_count']}/"
                 f"{result['expected_payload_count']} planned record(s) and confirmed searchable-vector evidence "
                 f"for every attached document ({result['current_upload_document_vector_count']} internal vector row(s))."
+            )
+        elif result.get("current_upload_mapping_evidence_complete"):
+            result["status"] = "partial_vector_coverage"
+            result["classification"] = "current_submission_physical_vectors_pending"
+            result["message"] = (
+                "Selected attachments have SQLite vector mappings, but their exact vector IDs "
+                "are not yet all observable in the target workspace namespace. Continue read-only "
+                "confirmation; do not re-upload or re-embed."
             )
         elif attachment_only_observation:
             if result["current_upload_locations_with_vectors"]:
