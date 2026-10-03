@@ -11,6 +11,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+import tempfile
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -29,6 +30,10 @@ def write(path, value):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--limit', type=int, help='Bound an explicit smoke test to this many PDFs')
+    parser.add_argument('--include-run', help='Also replay sources from this retained automatic run ID')
+    parser.add_argument('--source-name', action='append', help='Restrict a requalification to exact source filenames')
+    parser.add_argument('--short-home', action='store_true', help='Use a short isolated Windows test home')
+    parser.add_argument('--code-root', type=Path, help='Run workers from an explicitly preserved baseline checkout')
     options = parser.parse_args()
     if options.limit is not None and options.limit < 1:
         parser.error('--limit must be positive')
@@ -39,15 +44,41 @@ def main():
     for path in sorted(original_root.glob('*/**/.automatic-worker-config.json')):
         row = read_run_json(path)
         configs[row['pdf_path']] = (path, row)
+    if options.include_run:
+        included = original_root / options.include_run
+        if included.parent != original_root or not included.is_dir():
+            parser.error('--include-run must name an existing direct child of automatic-runs')
+        for path in sorted(included.glob('*/.automatic-worker-config.json')):
+            row = read_run_json(path)
+            summary = read_run_json(path.parent / 'run-summary.json')
+            source = row['pdf_path']
+            digest = hashlib.sha256(Path(source).read_bytes()).hexdigest()
+            assert digest == summary['source_sha256'], 'Retained source PDF changed'
+            configs[source] = (path, row)
+            if digest not in inventory['unique_content']:
+                inventory['unique_content'][digest] = [source]
+                inventory['sources'].append({'path': source, 'pages': summary['pdf_page_count']})
     report = {'kind': 'fresh_preparation_not_live_embedding', 'commit': subprocess.check_output(
         ['git', 'rev-parse', 'HEAD'], cwd=REPO, text=True).strip(), 'cases': []}
     invocation = receipt / ('preparation-' + uuid.uuid4().hex)
     invocation.mkdir()
     results_path = invocation / 'results.json'
-    home = invocation / 'home'
+    home = Path(tempfile.mkdtemp(prefix='hpr-')) / 'home' if options.short_home else invocation / 'home'
+    report['test_home'] = str(home)
     env = dict(os.environ)
     env[DATA_DIRECTORY_ENVIRONMENT_VARIABLE] = str(home)
+    code_root = options.code_root.resolve() if options.code_root else REPO
+    if not (code_root / 'cancellable_preparation_worker.py').is_file():
+        parser.error('--code-root has no preparation worker')
+    report['worker_code_root'] = str(code_root)
+    report['worker_pipeline_sha256'] = hashlib.sha256((code_root / 'auto_anythingllm_pipeline.py').read_bytes()).hexdigest()
     inputs = list(inventory['unique_content'].items())
+    if options.source_name:
+        selected = set(options.source_name)
+        inputs = [(digest, paths) for digest, paths in inputs
+                  if any(Path(path).name in selected for path in paths)]
+        if not inputs:
+            parser.error('--source-name did not match any inventoried PDF')
     if options.limit is not None:
         inputs = inputs[:options.limit]
     report['invocation'] = str(invocation)
@@ -80,7 +111,7 @@ def main():
         try:
             with (run_root / 'stdout.log').open('a') as stdout, (run_root / 'stderr.log').open('a') as stderr:
                 process = subprocess.Popen([sys.executable, '-m', 'cancellable_preparation_worker', str(config_path)],
-                                           cwd=REPO, env=env, stdout=stdout, stderr=stderr,
+                                           cwd=code_root, env=env, stdout=stdout, stderr=stderr,
                                            creationflags=subprocess.CREATE_NO_WINDOW)
                 try:
                     code = process.wait(timeout=240)
@@ -107,8 +138,8 @@ def main():
                             'native_upload_representation', 'native_upload_transport')},
                         boundary_before=[previous.get('start_page'), previous.get('end_page')],
                         boundary_after=[current.get('start_page'), current.get('end_page')],
-                        metadata_before={key: previous.get(key) for key in ('title', 'author')},
-                        metadata_after={key: current.get(key) for key in ('title', 'author')})
+                        metadata_before={key: previous.get(key) for key in ('detected_title', 'detected_author')},
+                        metadata_after={key: current.get(key) for key in ('detected_title', 'detected_author')})
             for path in run_root.rglob('*.json'):
                 read_run_json(path)
             assert all(isinstance(row.get('text'), str) for row in after)

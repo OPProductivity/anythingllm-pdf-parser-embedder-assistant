@@ -80,6 +80,7 @@ from embedder_capabilities import (
 
 from auto_anythingllm_pipeline import (
     _api_urlopen,
+    local_segment_export_sources,
     summarize_ocr_run_evidence,
     AUTOMATIC_UPLOAD_PHASE_RANGES,
     ANYTHINGLLM_EMBEDDING_RECONCILIATION_STALL_SECONDS,
@@ -8007,7 +8008,6 @@ def promote_flat_no_logs_batch_output(output_root, temporary_run_dir, pdf_paths,
     # that retention has run.  Never promote every child of the staging
     # directory: doing so leaks those diagnostic JSON/JSONL files back into a
     # user-selected no-logs export.
-    segment_name = re.compile(r"-p\d{3,}-s\d+\.txt$", re.IGNORECASE)
     # The public output and private state directories are two views of one run.
     # Their final component must match exactly so an operator can pair them
     # without opening either directory.
@@ -8024,13 +8024,11 @@ def promote_flat_no_logs_batch_output(output_root, temporary_run_dir, pdf_paths,
             prepared = Path(canonical["upload_file"])
             selected_pdf = summary.get("pdf") or (pdf_paths[index] if index < len(pdf_paths) else "")
             stem = safe_stem(Path(str(selected_pdf)).stem) if selected_pdf else prepared.stem
-            children = [prepared, *sorted(
-                (p for p in prepared.parent.iterdir() if p.is_file() and segment_name.search(p.name)),
-                key=lambda p: p.name.casefold(),
-            )]
-            suffixes = ["-complete-pdf-parsed.txt", *[
-                segment_name.search(p.name).group(0) for p in children[1:]
-            ]]
+            segment_exports = local_segment_export_sources(
+                prepared, canonical.get("lean_retention") or {},
+            )
+            children = [prepared, *(path for path, _suffix in segment_exports)]
+            suffixes = ["-complete-pdf-parsed.txt", *(suffix for _path, suffix in segment_exports)]
             if summary.get("api_upload_status") == "skipped_exact_duplicate":
                 suffixes = [suffix.removesuffix(".txt") + "-(duplicate).txt" for suffix in suffixes]
             # Friendly names are presentation only. Internal hashes and source

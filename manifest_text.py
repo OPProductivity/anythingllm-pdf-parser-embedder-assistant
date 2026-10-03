@@ -6,6 +6,9 @@ import os
 from pathlib import Path
 
 STORE = 'manifest-text.jsonl'
+# At 512 bytes, sharing even two copies pays for the store and reference metadata.
+# Tiny titles/labels remain inline; page bodies no longer need to exceed 4 KiB.
+MIN_SHARED_TEXT_BYTES = 512
 
 
 class ManifestTextWriter:
@@ -22,23 +25,44 @@ class ManifestTextWriter:
                 self.bodies[row['sha256']] = row['body_id']
 
     def record(self, row):
-        result = dict(row)
-        for key in ('text', 'textContent'):
-            text = result.get(key)
-            if not isinstance(text, str) or len(text.encode('utf8')) < 4096:
-                continue
-            digest = hashlib.sha256(text.encode('utf8')).hexdigest()
-            if digest not in self.bodies:
-                body_id = len(self.bodies) + 1
-                self.path.parent.mkdir(parents=True, exist_ok=True)
-                with self.path.open('a', encoding='utf8', newline='\n') as handle:
-                    handle.write(json.dumps({'body_id': body_id, 'sha256': digest, 'text': text},
-                                            ensure_ascii=False, separators=(',', ':')) + '\n')
-                    handle.flush()
+        return self.records([row])[0]
+
+    def records(self, rows):
+        bodies = dict(self.bodies)
+        pending = []
+        results = []
+        for row in rows:
+            result = dict(row)
+            for key in ('text', 'textContent'):
+                text = result.get(key)
+                if not isinstance(text, str) or len(text.encode('utf8')) < MIN_SHARED_TEXT_BYTES:
+                    continue
+                digest = hashlib.sha256(text.encode('utf8')).hexdigest()
+                if digest not in bodies:
+                    body_id = len(bodies) + 1
+                    pending.append(json.dumps({'body_id': body_id, 'sha256': digest, 'text': text},
+                                              ensure_ascii=False, separators=(',', ':')) + '\n')
+                    bodies[digest] = body_id
+                result[key] = {'$manifest_text': 1, 'body_id': bodies[digest], 'sha256': digest}
+            results.append(result)
+        if pending:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            # Commit evidence before publishing any manifest that refers to it.
+            with self.path.open('ab', buffering=0) as handle:
+                boundary = handle.tell()
+                try:
+                    encoded = ''.join(pending).encode('utf8')
+                    if handle.write(encoded) != len(encoded):
+                        raise OSError('Incomplete manifest text evidence write')
                     os.fsync(handle.fileno())
-                self.bodies[digest] = body_id
-            result[key] = {'$manifest_text': 1, 'body_id': self.bodies[digest], 'sha256': digest}
-        return result
+                except OSError:
+                    # Failed candidate preparation may reuse this catalog. Do
+                    # not leave partial lines or reused ordinal IDs behind.
+                    handle.truncate(boundary)
+                    os.fsync(handle.fileno())
+                    raise
+            self.bodies = bodies
+        return results
 
 
 def read_manifest_rows(path):

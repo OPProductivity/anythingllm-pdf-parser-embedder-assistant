@@ -1,6 +1,7 @@
 """Production preparation/export parity across sources and settings; no API writes."""
 
 import hashlib
+import argparse
 import json
 import os
 from pathlib import Path
@@ -54,14 +55,18 @@ def digest(path):
 
 
 def run():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--receipts', type=Path, help='New receipt directory; preserve earlier qualification results')
+    options, _ = parser.parse_known_args()
     kit_followup = '--kit-followup' in sys.argv
     optional_followup = '--optional-followup' in sys.argv
     parent_followup = '--parent-followup' in sys.argv
-    receipts = Path('tmp-output/' + ('run-log-repair-matrix-20261003' if '--repair-followup' in sys.argv else
+    receipts = options.receipts or Path('tmp-output/' + ('run-log-repair-matrix-20261003' if '--repair-followup' in sys.argv else
                                    'optional-parent-followup-20261003' if parent_followup else
                                    'optional-artifact-followup-20261003' if optional_followup else
                                    'canonical-kit-followup-20261003' if kit_followup
-                                   else 'canonical-settings-matrix-20261003')).resolve()
+                                   else 'canonical-settings-matrix-20261003'))
+    receipts = receipts.resolve()
     receipts.mkdir(parents=True, exist_ok=True)
     resume = '--resume' in sys.argv and (receipts / 'results.json').is_file()
     report = json.loads((receipts / 'results.json').read_text(encoding='utf8')) if resume else None

@@ -2700,9 +2700,9 @@ def infer_author_from_strict_credit_blocks(samples, path: Path, title_hint=""):
                 return []
         return names
 
-    def widest_complete_block(values, left, right, *, from_start=False):
+    def widest_complete_block(values, left, right, *, from_start=False, maximum_lines=3):
         candidates = []
-        maximum = min(3, max(0, right - left))
+        maximum = min(maximum_lines, max(0, right - left))
         for width in range(1, maximum + 1):
             block = values[left:left + width] if from_start else values[right - width:right]
             if width > 1:
@@ -2744,13 +2744,16 @@ def infer_author_from_strict_credit_blocks(samples, path: Path, title_hint=""):
         for index, line in enumerate(values[:40]):
             inline = re.match(r"^(?:by|written\s+by|edited\s+by)\s+(.+)$", line, flags=re.I)
             if inline:
-                names = names_from_block([inline.group(1)])
+                credit_lines = [inline.group(1), *values[index + 1:index + 6]]
+                _, _, names, block = widest_complete_block(
+                    credit_lines, 0, len(credit_lines), from_start=True, maximum_lines=6,
+                )
                 if names:
                     return {
                         "author": ", ".join(names[:12]),
                         "source": "text_strict_credit_block",
                         "page": page,
-                        "evidence": line,
+                        "evidence": " / ".join([line, *block[1:]]),
                     }
             if not re.fullmatch(r"(?:by|written\s+by|edited\s+by)\s*:?", line, flags=re.I):
                 continue
@@ -4095,6 +4098,33 @@ def materialize_retained_segments(prepared_text_path: Path, segments_dir: Path, 
     return retained
 
 
+def local_segment_export_sources(prepared_text_path: Path, retained):
+    """Separate a local export's presentation name from its canonical bytes."""
+    root = Path(prepared_text_path).parent.resolve()
+    pattern = re.compile(r"-p\d{3,}-s\d+\.txt$", re.IGNORECASE)
+    exports = retained.get("retained_segment_exports")
+    if exports is None:
+        result = []
+        for path in sorted(root.iterdir(), key=lambda path: path.name.casefold()):
+            match = pattern.search(path.name)
+            if path.is_file() and match:
+                result.append((path, match.group(0)))
+        return result
+    result = []
+    names = set()
+    for row in sorted(exports, key=lambda row: row["filename"].casefold()):
+        name = row["filename"]
+        path = root / row["path"]
+        match = pattern.search(name)
+        if (Path(name).name != name or not match or name.casefold() in names
+                or path.is_symlink() or not path.resolve().is_relative_to(root)
+                or not path.is_file() or path.suffix.casefold() != ".txt"):
+            raise ValueError("Missing or unsafe canonical local segment export")
+        names.add(name.casefold())
+        result.append((path, match.group(0)))
+    return result
+
+
 def _best_effort_remove_success_artifact(candidate: Path, deleted: list[str], cleanup_warnings: list[str], out_root: Path) -> None:
     """Prune one non-retained artifact without changing a proven run outcome.
 
@@ -4252,9 +4282,31 @@ def retain_successful_run_leanly(
             else:
                 shutil.move(str(prepared_text_path), str(retained_text_path))
         retained_segments = []
+        retained_segment_exports = []
+        catalog = None
+        artifact_index = out_root / "artifact-locations.json"
+        if preserve_private_evidence and artifact_index.is_file():
+            from canonical_artifacts import CanonicalArtifacts, checked_role_path
+
+            roles = read_run_json(artifact_index)["roles"]
+            catalog = CanonicalArtifacts(out_root, atomic_write_text, existing=(
+                checked_role_path(out_root, actual) for actual in set(roles.values())
+                if Path(actual).suffix.casefold() == ".txt"
+            ))
         for segment_path, direct_path in zip(staged_segments, planned_direct_segments):
-            shutil.move(str(segment_path), str(direct_path))
-            retained_segments.append(direct_path)
+            existing = catalog.existing_bytes(segment_path.read_bytes()) if catalog else None
+            if existing is None:
+                shutil.move(str(segment_path), str(direct_path))
+                actual = catalog.register(direct_path) if catalog else direct_path
+            else:
+                actual = existing
+            if catalog:
+                catalog.role(direct_path, actual)
+            retained_segments.append(actual)
+            retained_segment_exports.append({"filename": direct_path.name,
+                                             "path": os.path.relpath(actual, out_root)})
+        if catalog:
+            write_json(artifact_index, {"schema_version": 1, "roles": {**roles, **catalog.roles}})
     finally:
         # The directory is private to this call, even when an exception stops
         # retention before the transcript is moved. Its removal cannot affect
@@ -4274,6 +4326,7 @@ def retain_successful_run_leanly(
             "segments_directory": "",
             "retained_segment_files": len(retained_segments),
             "retained_segment_paths": [str(path) for path in retained_segments],
+            "retained_segment_exports": retained_segment_exports,
             "deleted": [],
             "detailed_evidence_retained": True,
             "cleanup_pending": False,
@@ -28620,7 +28673,6 @@ def publish_cli_text_outputs(output_base: Path, state_run_root: Path, summaries)
         raise OSError(f"Matched output run folder contains a non-TXT item: {target}")
     if any(target.iterdir()):
         raise FileExistsError(f"Matched CLI output run folder is not empty: {target}")
-    segment_name = re.compile(r"-p\d{3,}-s\d+\.txt$", re.IGNORECASE)
     used_names = set()
     published = []
     try:
@@ -28635,15 +28687,9 @@ def publish_cli_text_outputs(output_base: Path, state_run_root: Path, summaries)
             if not prepared.is_file():
                 continue
             source = Path(str(summary.get("pdf") or f"document-{index}.pdf"))
-            candidates = [prepared, *sorted(
-                (path for path in prepared.parent.iterdir() if path.is_file() and segment_name.search(path.name)),
-                key=lambda path: path.name.casefold(),
-            )]
-            suffixes = ["-complete-pdf-parsed.txt"]
-            for path in candidates[1:]:
-                match = segment_name.search(path.name)
-                if match:
-                    suffixes.append(match.group(0))
+            segment_exports = local_segment_export_sources(prepared, retained)
+            candidates = [prepared, *(path for path, _suffix in segment_exports)]
+            suffixes = ["-complete-pdf-parsed.txt", *(suffix for _path, suffix in segment_exports)]
             stem = safe_stem(source.stem)
             summary_destinations = []
             for candidate, suffix in zip(candidates, suffixes):

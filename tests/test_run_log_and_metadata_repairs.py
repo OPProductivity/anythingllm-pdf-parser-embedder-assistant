@@ -9,6 +9,34 @@ import rag_pdf_gradio_app as app
 pytestmark = pytest.mark.offline_deterministic
 
 
+@pytest.mark.parametrize('role', ['Edited by', 'EDITED BY', 'By', 'Written by'])
+def test_inline_credit_retains_wrapped_names_and_evidence(role):
+    text = (f'Collected Essays\n{role} CATHERINE S. RAM\u00cdREZ, SYLVANNA M. FALC\u00d3N,\n'
+            'JUAN POBLETE, STEVEN C. MCKAY, AND\nFELICITY AMAYA SCHAEFFER\nRutgers University Press')
+    result = pipeline.infer_author_from_strict_credit_blocks(
+        [{'page': 3, 'text': text}], Path('PRECAR~1.PDF'), title_hint='PRECAR~1')
+    assert result['author'] == ('CATHERINE S. RAM\u00cdREZ, SYLVANNA M. FALC\u00d3N, '
+                                'JUAN POBLETE, STEVEN C. MCKAY, FELICITY AMAYA SCHAEFFER')
+    assert 'FELICITY AMAYA SCHAEFFER' in result['evidence']
+    assert result['page'] == 3
+
+
+@pytest.mark.parametrize('following', ['Harvard University Press', 'Social Worlds',
+                                       'Department of Sociology', 'Series editors Jane Doe and John Roe'])
+def test_inline_credit_does_not_swallow_unadvertised_following_lines(following):
+    result = pipeline.infer_author_from_strict_credit_blocks(
+        [{'page': 1, 'text': f'Collected Essays\nEdited by Jane Doe\n{following}'}],
+        Path('Collected Essays.pdf'), title_hint='Collected Essays')
+    assert result['author'] == 'Jane Doe'
+
+
+def test_explicit_user_author_override_still_wins_over_extended_credit():
+    result = pipeline.resolve_author_from_metadata_and_inference(
+        '', {'author': 'Jane Doe, John Roe', 'source': 'text_strict_credit_block'},
+        author_override='Chosen Author')
+    assert result['author'] == 'Chosen Author'
+
+
 @pytest.mark.parametrize('title', ['No Job Name', 'OP-MELU180025 86..102'])
 def test_producer_placeholder_titles_are_not_metadata_titles(title):
     result = pipeline.resolve_title_from_metadata_or_filename(title, Path('Real Article Title.pdf'))

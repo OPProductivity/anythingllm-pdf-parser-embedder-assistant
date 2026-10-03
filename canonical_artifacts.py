@@ -107,6 +107,10 @@ class CanonicalArtifacts:
     def existing_text(self, content, suffix='.txt'):
         """Find reusable text without materializing an optional artifact."""
         encoded = content.replace('\n', os.linesep).encode('utf8')
+        return self.existing_bytes(encoded, suffix)
+
+    def existing_bytes(self, encoded, suffix='.txt'):
+        """Reuse a staged export only when its physical bytes are identical."""
         key = (suffix, len(encoded), hashlib.sha256(encoded).digest())
         for path in self.index.get(key, []):
             if path.is_file() and path.read_bytes() == encoded:
@@ -114,9 +118,9 @@ class CanonicalArtifacts:
         return None
 
     def jsonl(self, preferred, rows):
-        return self.text(preferred, ''.join(json.dumps(self.manifest_text.record(row),
+        return self.text(preferred, ''.join(json.dumps(row,
                                                       ensure_ascii=False, separators=(',', ':')) + '\n'
-                                            for row in rows))
+                                            for row in self.manifest_text.records(rows)))
 
     def remove_empty_alias_directories(self):
         for role, actual in self.roles.items():
