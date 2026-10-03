@@ -9207,23 +9207,24 @@ def evaluate_edge_cases(
                     or selected_dir / f"anythingllm-upload-{variant}.txt")
         add(check, check_status(path.exists(), warn=True), "optional variant")
     layout = selected.get("layout_evidence") or {}
+    layout_review_path = selected_artifact_path(selected, selected_dir, "layout-region-review.json")
     if int(layout.get("removed_marginalia_count") or 0):
         add(
             "PDF_LAYOUT_MARGINALIA_EXCLUDED",
             "info",
-            f"excluded={layout['removed_marginalia_count']}; review layout-region-review.json",
+            f"excluded={layout['removed_marginalia_count']}; review {layout_review_path}",
         )
     if int(layout.get("note_candidates_retained_count") or 0):
         add(
             "PDF_LAYOUT_NOTE_CANDIDATES_RETAINED",
             "warning",
-            f"retained_note_candidates={layout['note_candidates_retained_count']}; review layout-region-review.json",
+            f"retained_note_candidates={layout['note_candidates_retained_count']}; review {layout_review_path}",
         )
     if int(layout.get("excluded_footnote_count") or 0):
         add(
             "PDF_LAYOUT_FOOTNOTES_EXCLUDED",
             "info",
-            f"excluded_footnote_groups={layout['excluded_footnote_count']}; review layout-region-review.json",
+            f"excluded_footnote_groups={layout['excluded_footnote_count']}; review {layout_review_path}",
         )
     lane_review = selected.get("lane_review") or {}
     if int(lane_review.get("proposed_supplementary_count") or 0):
@@ -9231,7 +9232,8 @@ def evaluate_edge_cases(
             add(
                 "PDF_SUPPLEMENTARY_REFERENCE_REGIONS_EXCLUDED",
                 "info",
-                f"excluded_segments={lane_review.get('primary_excluded_segment_count', 0)}; original text retained in retrieval-lane-review.json",
+                f"excluded_segments={lane_review.get('primary_excluded_segment_count', 0)}; original text retained in "
+                f"{selected_artifact_path(selected, selected_dir, 'retrieval-lane-review.json')}",
             )
         else:
             add(
@@ -9388,13 +9390,21 @@ def build_run_diagnostics(
     if int(quality.get("duplicate_pages") or 0):
         add("PDF_DUPLICATE_TEXT_PAGES", "warning", "extraction", f"{quality['duplicate_pages']} exact duplicate text page(s) were excluded.", "Review page_profile in source-profile.json.")
     layout = selected.get("layout_evidence") or {}
+    layout_review_path = str(
+        (selected.get("artifact_paths") or {}).get("layout-region-review.json")
+        or "artifact-locations.json (layout_region_review)"
+    )
+    lane_review_path = str(
+        (selected.get("artifact_paths") or {}).get("retrieval-lane-review.json")
+        or "artifact-locations.json (retrieval_lane_review)"
+    )
     if int(layout.get("removed_marginalia_count") or 0):
         add(
             "PDF_LAYOUT_MARGINALIA_EXCLUDED",
             "info",
             "extraction",
             f"Excluded {layout['removed_marginalia_count']} high-confidence positioned header/footer item(s).",
-            "Review selected/layout-region-review.json before using content-quality retrieval evidence.",
+            f"Review {layout_review_path} before using content-quality retrieval evidence.",
         )
     if int(layout.get("note_candidates_retained_count") or 0):
         add(
@@ -9402,7 +9412,7 @@ def build_run_diagnostics(
             "warning",
             "extraction",
             f"Detected {layout['note_candidates_retained_count']} possible lower-page note line(s), retained in semantic text.",
-            "Review selected/layout-region-review.json; possible notes are not silently removed.",
+            f"Review {layout_review_path}; possible notes are not silently removed.",
         )
     if int(layout.get("excluded_footnote_count") or 0):
         add(
@@ -9410,7 +9420,7 @@ def build_run_diagnostics(
             "info",
             "extraction",
             f"Excluded {layout['excluded_footnote_count']} high-confidence lower-page footnote group(s).",
-            "Review selected/layout-region-review.json before relying on content-quality retrieval evidence.",
+            f"Review {layout_review_path} before relying on content-quality retrieval evidence.",
         )
     visual_text = selected.get("visual_text_review") or {}
     if int(visual_text.get("unresolved_page_count") or 0):
@@ -9458,7 +9468,7 @@ def build_run_diagnostics(
                 "info",
                 "extraction",
                 f"Excluded {lane_review.get('primary_excluded_segment_count', 0)} segment(s) from automatically classified sustained reference/index regions.",
-                "Original text and page-level reasons remain in retrieval-lane-review.json; readable TXT reports can be rendered on demand.",
+                f"Original text and page-level reasons remain in {lane_review_path}; readable TXT reports can be rendered on demand.",
             )
         else:
             add(
@@ -9466,7 +9476,7 @@ def build_run_diagnostics(
                 "warning",
                 "extraction",
                 f"Found {lane_review['proposed_supplementary_count']} medium-confidence supplementary candidate(s); retained because no narrow automatic exclusion rule matched.",
-                "Inspect retrieval-lane-review.json if the document-specific evidence should inform a future narrow rule.",
+                f"Inspect {lane_review_path} if the document-specific evidence should inform a future narrow rule.",
             )
     if selected.get("backend_word_disagreement", 0) > 0.35:
         disagreement_resolution = selected.get("backend_word_disagreement_resolution") or {}
@@ -24587,6 +24597,17 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             if first_page_override > 0:
                 candidate_start_page = min(max(1, first_page_override), page_count)
                 candidate_start_reason = "user_override"
+            elif getattr(args, "include_front_matter", False):
+                # Reserve verified opening OCR gaps before the native peer
+                # freezes the shared range. Recovered cover text must not be
+                # excluded merely because native extraction could not read it.
+                opening_ocr_pages = [
+                    int(page) for page in preflight_visual_text_targets.get("page_numbers", [])
+                    if 0 < int(page) < candidate_start_page
+                ]
+                if opening_ocr_pages:
+                    candidate_start_page = min(opening_ocr_pages)
+                    candidate_start_reason = "include_front_matter_opening_ocr_scope"
             end_headings = getattr(args, "end_section_names", None) or DEFAULT_END_SECTION_HEADINGS
             candidate_end_detected = detect_end_section_from_outline(usable_outline, page_count) or detect_end_section_start(
                 pages, end_headings
