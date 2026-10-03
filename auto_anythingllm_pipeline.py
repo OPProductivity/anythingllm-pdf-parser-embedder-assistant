@@ -50,16 +50,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from portable_paths import application_paths, is_private_run_state_path
-from desktop_service_trust import (desktop_listener, register_managed_key, require_managed_key_origin,
-                                   managed_key_storage, verify_connected_desktop_socket)
-from source_guard import locked_pdf_source
-from pdf_budgets import check_source, check_document, check_pages, check as check_pdf_budget
 from run_evidence import prepare_private_json, read_run_json
 from ingestion_observation import SubmissionCommitSignal, observe_submission_vector_ids
-from authenticated_http import (AuthenticatedRedirectError, authenticated_opener,
-                                read_bounded_response, validate_authenticated_url,
-                                MAX_JSON_RESPONSE_BYTES, MAX_ERROR_RESPONSE_BYTES,
-                                MAX_HTTP_HEADER_BYTES, ResponseBudgetExceeded)
+from authenticated_http import AuthenticatedRedirectError, RejectAuthenticatedRedirects
 from anythingllm_persistence import AnythingLLMPersistenceAdapter
 from typing import Any, cast
 
@@ -11082,7 +11075,7 @@ def normalize_simulation_adapter(adapter_or_model, url=None):
     return build_ollama_simulation_adapter(adapter_or_model, url)
 
 
-def resolve_default_simulation_adapter(storage_dir=None, env_path=None, allow_anythingllm_fallback=True, prefer_anythingllm_fallback=False, *, resolve_credentials=True):
+def resolve_default_simulation_adapter(storage_dir=None, env_path=None, allow_anythingllm_fallback=True, prefer_anythingllm_fallback=False):
     storage = Path(storage_dir) if storage_dir else default_anythingllm_storage_dir()
     config = anythingllm_embedding_config(storage)
     engine = (config.get("normalized_engine") or config.get("engine") or "").strip().casefold()
@@ -11115,7 +11108,7 @@ def resolve_default_simulation_adapter(storage_dir=None, env_path=None, allow_an
             storage_dir=storage,
             allow_anythingllm_fallback=allow_anythingllm_fallback,
             prefer_anythingllm_fallback=prefer_anythingllm_fallback,
-        ) if resolve_credentials else None
+        )
         details["message"] = f"Retrieval simulation will use OpenRouter model: {model}"
         return details
     if engine == "ollama":
@@ -11129,7 +11122,7 @@ def resolve_default_simulation_adapter(storage_dir=None, env_path=None, allow_an
     if engine in {"anythingllm", "native", "built-in", "default"}:
         try:
             details["status"] = "ready"
-            details["adapter"] = build_anythingllm_runtime_simulation_adapter(storage_dir=storage) if resolve_credentials else None
+            details["adapter"] = build_anythingllm_runtime_simulation_adapter(storage_dir=storage)
             details["message"] = (
                 f"Retrieval simulation will use the live AnythingLLM runtime embedder: {model or 'native embedder'}."
             )
@@ -11146,7 +11139,7 @@ def resolve_default_simulation_adapter(storage_dir=None, env_path=None, allow_an
     if engine in ANYTHINGLLM_CLOUD_ONLY_UNSUPPORTED_SIMULATION_ENGINES:
         try:
             details["status"] = "ready"
-            details["adapter"] = build_anythingllm_runtime_simulation_adapter(storage_dir=storage) if resolve_credentials else None
+            details["adapter"] = build_anythingllm_runtime_simulation_adapter(storage_dir=storage)
             details["message"] = (
                 f"Retrieval simulation will use the live AnythingLLM runtime embedder: {engine or 'unspecified'} / {model or 'unspecified model'}."
             )
@@ -11763,8 +11756,6 @@ def resolve_anythingllm_api_key(api_url, api_key=None, storage_dir=None):
     if not is_local_anythingllm_url(api_url):
         return "", "none"
     storage = Path(storage_dir) if storage_dir else default_anythingllm_storage_dir()
-    if not desktop_listener(api_url, storage):
-        return "", "untrusted_local_service"
     db_path = storage / "anythingllm.db"
     if not db_path.exists():
         return "", "none"
@@ -11776,8 +11767,6 @@ def resolve_anythingllm_api_key(api_url, api_key=None, storage_dir=None):
             (LOCAL_DESKTOP_SERVICE_API_KEY_NAME,),
         ).fetchone()
         secret = str(row[0] or "").strip() if row else ""
-        if secret:
-            register_managed_key(secret, storage)
         return (secret, "managed_local_service_key") if secret else ("", "none")
     except (OSError, sqlite3.Error):
         return "", "none"
@@ -12575,10 +12564,7 @@ def _api_urlopen(request, timeout):
     # Keep this policy local, leaving unauthenticated HTTP and the owned queue
     # socket transport unchanged. Authenticated endpoints must not redirect.
     if request.has_header("Authorization") or request.has_header("X-anythingllm-pdf-prep-bridge"):
-        authorization = request.get_header("Authorization", "")
-        if authorization.startswith("Bearer "):
-            require_managed_key_origin(request.full_url, authorization[7:])
-        return authenticated_opener(request).open(request, timeout=timeout)
+        return urllib.request.build_opener(RejectAuthenticatedRedirects()).open(request, timeout=timeout)
     return urllib.request.urlopen(request, timeout=timeout)
 
 
@@ -12589,7 +12575,7 @@ def post_json(url, body, api_key=None, timeout: float = ANYTHINGLLM_HTTP_RESPONS
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(url, data=data, headers=headers)
     with _api_urlopen(req, timeout=timeout) as response:
-        return response.status, read_bounded_response(response).decode("utf-8", errors="replace")
+        return response.status, response.read().decode("utf-8", errors="replace")
 
 
 class _JsonPostResponseTracker:
@@ -12740,17 +12726,12 @@ class _JsonPostResponseTracker:
     def _run(self):
         owned_socket = None
         try:
-            if self.api_key:
-                require_managed_key_origin(self.url, self.api_key)
-            parsed = validate_authenticated_url(self.url) if self.api_key else urllib.parse.urlsplit(self.url)
+            parsed = urllib.parse.urlsplit(self.url)
             scheme = str(parsed.scheme or "").casefold()
             if scheme not in {"http", "https"} or not parsed.hostname:
                 raise ValueError("AnythingLLM JSON request requires an absolute http(s) URL.")
             port = parsed.port or (443 if scheme == "https" else 80)
             owned_socket = socket.create_connection((parsed.hostname, port), timeout=self.timeout)
-            storage = managed_key_storage(self.api_key) if self.api_key else None
-            if storage:
-                verify_connected_desktop_socket(owned_socket, self.url, storage)
             if scheme == "https":
                 owned_socket = ssl.create_default_context().wrap_socket(
                     owned_socket,
@@ -12801,17 +12782,9 @@ class _JsonPostResponseTracker:
                     })
                     return
                 response_buffer += response_chunk
-                header_end = response_buffer.find(b"\r\n\r\n")
-                if ((header_end < 0 and len(response_buffer) > MAX_HTTP_HEADER_BYTES)
-                        or header_end > MAX_HTTP_HEADER_BYTES
-                        or len(response_buffer) > MAX_JSON_RESPONSE_BYTES + MAX_HTTP_HEADER_BYTES):
-                    raise ResponseBudgetExceeded("AnythingLLM HTTP response exceeds its byte budget.")
                 parsed_response = self._response_from_bytes(response_buffer)
                 if parsed_response is not None:
                     status, body_bytes, content_length = parsed_response
-                    if ((content_length is not None and content_length > MAX_JSON_RESPONSE_BYTES)
-                            or len(body_bytes) > MAX_JSON_RESPONSE_BYTES):
-                        raise ResponseBudgetExceeded("AnythingLLM HTTP body exceeds its byte budget.")
                     if content_length is not None and len(body_bytes) < content_length:
                         # The body is still arriving, but this loop remains
                         # interruptible every 50 ms by an owned queue receipt.
@@ -13674,10 +13647,8 @@ def listen_for_anythingllm_embed_progress(
     }
     matched_locations = set()
     seen_events = set()
-    seen_event_bytes = 0
 
     def receive_payload(payload):
-        nonlocal seen_event_bytes
         if stop_event.is_set():
             return
         event = parse_anythingllm_embed_progress_event(payload)
@@ -13687,15 +13658,9 @@ def listen_for_anythingllm_embed_progress(
             event, expected, matched_locations
         ):
             return
-        event_bytes = json.dumps(event, sort_keys=True, default=str).encode("utf-8")
-        event_key = hashlib.sha256(event_bytes).digest()
+        event_key = json.dumps(event, sort_keys=True, default=str)
         if event_key in seen_events:
             return
-        if len(seen_events) >= 100_000:
-            raise ResponseBudgetExceeded("Progress observer exceeded 100000 unique events; exact vector verification remains authoritative.")
-        if seen_event_bytes + len(event_bytes) > 64 * 1024 * 1024:
-            raise ResponseBudgetExceeded("Progress observer exceeded 64 MiB of unique event data; exact vector verification remains authoritative.")
-        seen_event_bytes += len(event_bytes)
         seen_events.add(event_key)
         if callable(event_callback):
             event_callback(event)
@@ -13964,7 +13929,7 @@ def post_multipart_form(
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(url, data=bytes(body), headers=headers)
     with _api_urlopen(req, timeout=timeout) as response:
-        return response.status, read_bounded_response(response).decode("utf-8", errors="replace")
+        return response.status, response.read().decode("utf-8", errors="replace")
 
 
 def get_json(url, api_key=None, timeout: float = 30.0):
@@ -13973,7 +13938,7 @@ def get_json(url, api_key=None, timeout: float = 30.0):
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(url, headers=headers)
     with _api_urlopen(req, timeout=timeout) as response:
-        return response.status, read_bounded_response(response).decode("utf-8", errors="replace")
+        return response.status, response.read().decode("utf-8", errors="replace")
 
 
 def get_json_with_retry(url, api_key=None, timeout: float = 5.0, max_attempts=3, sleeper=time.sleep, jitter=random.uniform):
@@ -13994,7 +13959,7 @@ def get_json_with_retry(url, api_key=None, timeout: float = 5.0, max_attempts=3,
         except urllib.error.HTTPError as exc:
             status = int(exc.code)
             try:
-                body = str(exc.reason) if isinstance(exc, AuthenticatedRedirectError) else read_bounded_response(exc, MAX_ERROR_RESPONSE_BYTES).decode("utf-8", errors="replace")
+                body = str(exc.reason) if isinstance(exc, AuthenticatedRedirectError) else exc.read().decode("utf-8", errors="replace")
             finally:
                 exc.close()
             retry_after = exc.headers.get("Retry-After") if exc.headers else None
@@ -14023,7 +13988,7 @@ def delete_json(url, api_key=None, timeout=30, body=None):
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(url, data=data, headers=headers, method="DELETE")
     with _api_urlopen(req, timeout=timeout) as response:
-        return response.status, read_bounded_response(response).decode("utf-8", errors="replace")
+        return response.status, response.read().decode("utf-8", errors="replace")
 
 
 def is_local_anythingllm_url(api_url):
@@ -14563,7 +14528,7 @@ def _read_http_error_body(exc):
     if not isinstance(exc, urllib.error.HTTPError):
         return ""
     try:
-        body = read_bounded_response(exc, MAX_ERROR_RESPONSE_BYTES).decode("utf-8", errors="replace")
+        body = exc.read().decode("utf-8", errors="replace")
     except Exception:
         body = ""
     finally:
@@ -14722,9 +14687,6 @@ def verify_anythingllm_upload_auth(api_url, api_key=None):
     result["status"] = "authenticated"
     result["message"] = "AnythingLLM Desktop temporary API key route is available."
     result["temporary_key_cleanup"] = cleanup_temporary_desktop_api_key(normalized, temporary_key.get("id"))
-    if result["temporary_key_cleanup"].get("status") == "delete_failed":
-        result["status"] = "authenticated_cleanup_needs_review"
-        result["message"] += " Temporary API key deletion failed after retry; review the retained cleanup obligation."
     return result
 
 
@@ -14736,9 +14698,6 @@ def create_temporary_desktop_api_key(api_url):
             "secret": "",
             "error": "Temporary API keys are only created for loopback AnythingLLM Desktop URLs.",
         }
-    if not desktop_listener(api_url, default_anythingllm_storage_dir()):
-        return {"status": "rejected_untrusted_service", "id": None, "secret": "",
-                "error": "Temporary API keys require an owned Desktop listener bound to the expected storage."}
     endpoint = api_url.rstrip("/") + "/api/system/generate-api-key"
     try:
         status, response_text = post_json(
@@ -14753,7 +14712,6 @@ def create_temporary_desktop_api_key(api_url):
         secret = api_key.get("secret")
         if not key_id or not secret:
             raise RuntimeError("AnythingLLM returned an incomplete temporary API key.")
-        register_managed_key(str(secret), default_anythingllm_storage_dir())
         return {
             "status": "created",
             "id": key_id,
@@ -14804,20 +14762,6 @@ def cleanup_temporary_desktop_api_key(api_url, key_id, api_key=None):
     result["attempt_count"] = 2
     result["retry_attempted"] = True
     result["first_attempt_status"] = str((first or {}).get("status") or "delete_failed")
-    if result.get("status") == "delete_failed":
-        # Failure-only evidence. Never persist credential values or the peer's
-        # potentially sensitive response body.
-        evidence_path = application_paths()["config"] / "temporary-key-cleanup-obligations.jsonl"
-        endpoint = urllib.parse.urlsplit(str(api_url))
-        obligation = {"status": "needs_review", "kind": "temporary_desktop_api_key",
-                      "key_id": str(key_id), "api_origin": f"{endpoint.scheme}://{endpoint.hostname}:{endpoint.port or 80}",
-                      "attempt_count": 2, "recorded_at": datetime.now(timezone.utc).isoformat()}
-        try:
-            evidence_path.parent.mkdir(parents=True, exist_ok=True)
-            append_jsonl_receipt(evidence_path, obligation)
-            result["cleanup_obligation_path"] = str(evidence_path)
-        except OSError:
-            result["cleanup_evidence_write_failed"] = True
     return result
 
 
@@ -16295,15 +16239,7 @@ def relocate_uploaded_document(storage_dir: Path, location: str, folder_name: st
         except Exception:
             return raw_location, ""
     else:
-        # Desktop locations are relative paths, not URLs or drive-relative
-        # paths. Reject traversal before normalization can conceal it.
-        pieces = normalized_location.split("/")
-        if (any(piece in {"", ".", ".."} for piece in pieces)
-                or any(character in normalized_location for character in (":", "\x00"))):
-            return raw_location, "Uploaded document location is not a safe relative storage path."
-    source_path = (documents_root / normalized_location).resolve()
-    if not source_path.is_relative_to(documents_root):
-        return raw_location, "Uploaded document source is outside AnythingLLM documents storage."
+        normalized_location = normalized_location.lstrip("/")
     if normalized_location.startswith("custom-documents/") is False:
         return raw_location, ""
     # Validate each path piece again at this filesystem boundary: an explicit
@@ -16318,6 +16254,7 @@ def relocate_uploaded_document(storage_dir: Path, location: str, folder_name: st
         # drawer root; normalize the endpoint response to its canonical
         # relative document location before embedding.
         return normalized_location.replace("\\", "/"), ""
+    source_path = storage / "documents" / normalized_location
     if not source_path.exists():
         return raw_location, f"Uploaded document path was not found on disk: {source_path}"
     target_relative = f"{target_folder}/{Path(normalized_location).name}"
@@ -24155,22 +24092,34 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             evidence_kind="source_hash_progress",
         )
 
-    # Parent fingerprints are useful for scheduling, not authority to skip
-    # content verification. The public preparation boundary holds the source
-    # read-only while hashing, metadata inspection and every backend run.
+    # The Automatic batch runner may have just calculated this identity while
+    # checking whether a later selected path is byte-identical to an earlier
+    # one.  Reuse it only when the source still has the exact same inexpensive
+    # filesystem fingerprint.  A changed file falls back to the established
+    # streaming hash rather than trusting a stale parent-process value.
     supplied_sha = str(getattr(args, "precomputed_source_sha256", "") or "").strip().lower()
-    source_sha = sha256_file(pdf_path, progress_callback=report_hash_progress)
-    if re.fullmatch(r"[0-9a-f]{64}", supplied_sha):
-        if source_sha != supplied_sha:
-            raise ValueError("Source PDF changed after selection verification; no stale source identity was reused.")
+    supplied_fingerprint = getattr(args, "precomputed_source_fingerprint", {}) or {}
+    try:
+        current_stat = pdf_path.stat()
+        source_unchanged = (
+            isinstance(supplied_fingerprint, dict)
+            and int(supplied_fingerprint.get("size") or -1) == int(current_stat.st_size)
+            and int(supplied_fingerprint.get("mtime_ns") or -1) == int(current_stat.st_mtime_ns)
+        )
+    except OSError:
+        source_unchanged = False
+    if re.fullmatch(r"[0-9a-f]{64}", supplied_sha) and source_unchanged:
+        source_sha = supplied_sha
         report_upload_phase(
             "metadata",
-            "Source identity verified against the selected revision",
+            "Source identity already verified for this run",
             completed_units=0,
             total_units=1,
             fallback_fraction=0.0,
-            evidence_kind="source_hash_reverified",
+            evidence_kind="source_hash_reused",
         )
+    else:
+        source_sha = sha256_file(pdf_path, progress_callback=report_hash_progress)
     def report_metadata_progress(step, completed, total):
         detail = (
             "Profiling PDF page geometry"
@@ -24873,8 +24822,6 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 effective_limit=chunk_size,
                 custom_page_group_sizes=getattr(args, "custom_page_group_sizes", ()),
             )
-            check_pages(segment_pages)
-            check_pdf_budget("SEGMENTS", len(segments))
             lane_review = proposed_supplementary_lane_review(
                 segments,
                 stats,
@@ -28600,11 +28547,6 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
 
 
 def prepare_pdf(pdf_path: Path, out_root: Path, args):
-    with locked_pdf_source(pdf_path) as stable_source:
-        return _prepare_stable_pdf(stable_source, out_root, args)
-
-
-def _prepare_stable_pdf(pdf_path: Path, out_root: Path, args):
     """Prepare one PDF through the stable compatibility boundary.
 
     The public API is intentionally thin. Runtime control, preflight, persisted
@@ -28652,9 +28594,7 @@ def pdf_input_preflight(pdf_path: Path, sample_pages=8):
     try:
         if not path.is_file() or not os.access(path, os.R_OK):
             raise OSError("The PDF path is not readable.")
-        check_source(path)
         with fitz.open(path) as document:
-            check_document(document)
             result["readable"] = True
             result["encrypted"] = bool(document.needs_pass)
             if document.needs_pass:

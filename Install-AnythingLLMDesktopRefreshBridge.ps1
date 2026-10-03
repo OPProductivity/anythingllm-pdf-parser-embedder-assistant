@@ -5,8 +5,6 @@ param(
     [string]$ResourcesPath = "",
     [switch]$Uninstall,
     [switch]$Upgrade,
-    [string]$AsarToolBundle = "",
-    [string]$AsarToolSha256 = "",
     # Read and report the installed Desktop version, bridge status, and exact
     # supported startup-anchor profile without changing AnythingLLM files.
     [switch]$Validate
@@ -238,40 +236,12 @@ module.exports = { startPdfPrepRefreshBridge };
 }
 
 function Get-NodeRunner {
-    if (-not $AsarToolBundle -or $AsarToolSha256 -notmatch '^[0-9a-fA-F]{64}$') {
-        throw "Supply a reviewed immutable ASAR tool bundle and its SHA256; implicit npx downloads are no longer allowed."
+    $npx = Get-Command npx.cmd -ErrorAction SilentlyContinue
+    if (-not $npx) { $npx = Get-Command npx -ErrorAction SilentlyContinue }
+    if (-not $npx) {
+        throw "npx was not found. Install Node.js, then rerun this script."
     }
-    $node = Get-Command node.exe -ErrorAction SilentlyContinue
-    if (-not $node) { $node = Get-Command node -ErrorAction SilentlyContinue }
-    if (-not $node) { throw "Node.js is required for the verified ASAR tool." }
-    $script:VerifiedToolScratch = Join-Path ([IO.Path]::GetTempPath()) ("pdf-assistant-asar-" + [guid]::NewGuid().ToString("N"))
-    New-Item -ItemType Directory -Path $script:VerifiedToolScratch | Out-Null
-    try {
-        $toolArchive = Join-Path $script:VerifiedToolScratch "tool.zip"
-        Copy-Item -LiteralPath $AsarToolBundle -Destination $toolArchive
-        if ((Get-FileHash -LiteralPath $toolArchive -Algorithm SHA256).Hash -ne $AsarToolSha256) { throw "ASAR tool hash mismatch; no tool code was executed." }
-        $toolRoot = Join-Path $script:VerifiedToolScratch "verified"
-        Expand-Archive -LiteralPath $toolArchive -DestinationPath $toolRoot
-        $toolManifest = Get-Content -LiteralPath (Join-Path $toolRoot "release-manifest.json") -Raw | ConvertFrom-Json
-        if ($toolManifest.schema_version -ne 1 -or $toolManifest.kind -ne "asar-tool") { throw "Invalid ASAR tool bundle." }
-        $root = [IO.Path]::GetFullPath($toolRoot) + [IO.Path]::DirectorySeparatorChar
-        foreach ($file in $toolManifest.files) {
-            $candidate = [IO.Path]::GetFullPath((Join-Path $toolRoot $file.path))
-            if (-not $candidate.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { throw "Invalid ASAR tool path." }
-            if ((Get-FileHash -LiteralPath $candidate -Algorithm SHA256).Hash -ne $file.sha256) { throw "ASAR tool member hash mismatch." }
-        }
-        $script:AsarEntryPoint = [IO.Path]::GetFullPath((Join-Path $toolRoot $toolManifest.entrypoint))
-        if (-not $script:AsarEntryPoint.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { throw "Invalid ASAR entrypoint." }
-        $nodeVersion = (& $node.Source --version).Trim().TrimStart('v')
-        if ([version]$nodeVersion -lt [version]$toolManifest.node_minimum_version) { throw "The verified ASAR tool needs Node.js $($toolManifest.node_minimum_version) or newer." }
-        return $node.Source
-    } catch {
-        $target = [IO.Path]::GetFullPath($script:VerifiedToolScratch)
-        $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
-        if (-not $target.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase)) { throw "Refusing ASAR scratch cleanup outside Temp." }
-        Remove-Item -LiteralPath $target -Recurse -Force
-        throw
-    }
+    return $npx.Source
 }
 
 function Assert-AnythingLLMIsClosed {
@@ -333,12 +303,12 @@ if ($Uninstall) {
     exit 0
 }
 
-$nodeRunner = Get-NodeRunner
+$npx = Get-NodeRunner
 $work = Join-Path ([System.IO.Path]::GetTempPath()) ("anythingllm-pdf-prep-bridge-" + [guid]::NewGuid().ToString("N"))
 $backupPath = Join-Path $resources ("app.asar.pdf-prep-refresh-bridge-backup-" + (Get-Date -Format "yyyyMMdd-HHmmss"))
 
 try {
-    & $nodeRunner $script:AsarEntryPoint extract $asarPath $work
+    & $npx --yes @electron/asar extract $asarPath $work
     if ($LASTEXITCODE -ne 0) { throw "Could not extract AnythingLLM app.asar." }
 
     $packagePath = Join-Path $work "package.json"
@@ -528,11 +498,11 @@ try {
     [System.IO.File]::WriteAllText($bridgePath, (Get-BridgeModuleSource), $utf8WithoutBom)
 
     Copy-Item -LiteralPath $asarPath -Destination $backupPath -ErrorAction Stop
-    & $nodeRunner $script:AsarEntryPoint pack $work $asarPath
+    & $npx --yes @electron/asar pack $work $asarPath
     if ($LASTEXITCODE -ne 0) { throw "Could not repack AnythingLLM app.asar." }
     # Do not report success merely because asar returned. Confirm the patched
     # capability module made it into the final archive before retaining it.
-    $packedEntries = @(& $nodeRunner $script:AsarEntryPoint list $asarPath)
+    $packedEntries = @(& $npx --yes @electron/asar list $asarPath)
     $packedBridgeEntries = @($packedEntries | Where-Object {
         ($_ -replace '\\', '/') -eq '/dist-electron/main/pdf-prep-refresh-bridge.cjs'
     })
@@ -552,15 +522,6 @@ catch {
 }
 finally {
     if (Test-Path -LiteralPath $work) {
-        $workTarget = [IO.Path]::GetFullPath($work)
-        $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
-        if (-not $workTarget.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase)) { throw "Refusing bridge scratch cleanup outside Temp." }
         Remove-Item -LiteralPath $work -Recurse -Force
-    }
-    if ($script:VerifiedToolScratch -and (Test-Path -LiteralPath $script:VerifiedToolScratch)) {
-        $toolTarget = [IO.Path]::GetFullPath($script:VerifiedToolScratch)
-        $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
-        if (-not $toolTarget.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase)) { throw "Refusing ASAR scratch cleanup outside Temp." }
-        Remove-Item -LiteralPath $toolTarget -Recurse -Force
     }
 }

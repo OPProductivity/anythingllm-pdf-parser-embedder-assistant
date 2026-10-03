@@ -48,7 +48,6 @@ dependencies = [
   "pydantic==2.13.4",
   "requests==2.34.2",
   "httpx==0.28.1",
-  "httpcore==1.0.9",
 ]
 
 [project.scripts]
@@ -63,11 +62,6 @@ Issues = "https://github.com/OPProductivity/anythingllm-pdf-parser-embedder-assi
 [tool.setuptools]
 packages = ["benchmarks"]
 py-modules = [
-  "browser_access",
-  "desktop_service_trust",
-  "source_guard",
-  "cli_exports",
-  "pdf_budgets",
   "authenticated_http",
   "diagnostic_runner",
   "anythingllm_compatibility",

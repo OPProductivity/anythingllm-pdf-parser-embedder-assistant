@@ -1,5 +1,4 @@
 from pathlib import Path
-import io
 
 import pytest
 
@@ -91,14 +90,12 @@ def test_multipart_can_keep_upload_identity_when_disk_name_is_canonical(tmp_path
 
     class Response:
         status = 200
-        def __init__(self):
-            self.body = io.BytesIO(b'{}')
         def __enter__(self):
             return self
         def __exit__(self, *_):
             return False
-        def read(self, size=-1):
-            return self.body.read(size)
+        def read(self):
+            return b'{}'
 
     def open_request(request, **_):
         requests.append(request.data)
