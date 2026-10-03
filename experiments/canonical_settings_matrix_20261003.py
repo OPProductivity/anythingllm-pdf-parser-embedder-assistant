@@ -16,6 +16,8 @@ import auto_anythingllm_pipeline as pipeline
 import portable_paths
 import rag_pdf_gradio_app as app
 from run_evidence import read_run_json
+from run_artifact_tools import evidence_path, materialize_optional_artifacts, read_rows
+from prepared_batch_recovery import write_prepared_batch_checkpoint, verify_prepared_batch_checkpoint
 
 
 PROFILES = [
@@ -53,7 +55,11 @@ def digest(path):
 
 def run():
     kit_followup = '--kit-followup' in sys.argv
-    receipts = Path('tmp-output/' + ('canonical-kit-followup-20261003' if kit_followup
+    optional_followup = '--optional-followup' in sys.argv
+    parent_followup = '--parent-followup' in sys.argv
+    receipts = Path('tmp-output/' + ('optional-parent-followup-20261003' if parent_followup else
+                                   'optional-artifact-followup-20261003' if optional_followup else
+                                   'canonical-kit-followup-20261003' if kit_followup
                                    else 'canonical-settings-matrix-20261003')).resolve()
     receipts.mkdir(parents=True, exist_ok=True)
     resume = '--resume' in sys.argv and (receipts / 'results.json').is_file()
@@ -81,9 +87,18 @@ def run():
     report['cases'] = list(unique_cases.values())
     for source_index, source in enumerate(sources):
         for profile_index, settings in enumerate(PROFILES):
-            if kit_followup and profile_index != source_index:
+            if parent_followup and (source_index != 2 or profile_index not in (1, 3)):
+                continue
+            if (kit_followup or optional_followup) and profile_index != source_index:
                 continue
             settings = json.loads(json.dumps(settings))
+            if parent_followup:
+                settings.update(segment_mode='page_passages', target_passage_length=350,
+                                anythingllm_chunk_size=8191, native_upload_representation='page_parents',
+                                first_page_override=1, end_page_override=2, include_front_matter=True,
+                                backend_mode='pymupdf',
+                                native_upload_transport='file_upload' if profile_index == 1 else 'raw_text',
+                                native_metadata_upload_mode='native_header' if profile_index == 1 else 'strict')
             if source_index in (0, 1, 4) and settings['backend_mode'] == 'pymupdf4llm':
                 settings['backend_mode'] = 'pymupdf'
             identity = f'c{source_index}{profile_index}'
@@ -121,13 +136,16 @@ def run():
                                 run_author_inference_sample_evaluation=False)
                     args.update(settings)
                     summary = pipeline.prepare_pdf(source, root, SimpleNamespace(**args))
+                    if parent_followup:
+                        assert summary['native_upload_representation'] == 'page_parents'
                     assert summary['segment_mode'] == settings['segment_mode']
                     assert summary['include_back_matter'] == settings['include_back_matter']
                     if settings['segment_mode'] == 'custom_page_ranges':
                         assert summary['custom_page_group_sizes'] == [2, 3]
                     manifest = [json.loads(line) for line in Path(summary['manifest']).read_text(encoding='utf8').splitlines()]
                     if settings.get('first_page_override'):
-                        assert all(2 <= row['pdf_page'] <= 7 for row in manifest)
+                        assert all(settings['first_page_override'] <= row['pdf_page'] <= settings['end_page_override']
+                                   for row in manifest)
                     plan = pipeline.load_upload_plan_rows(Path(summary['native_upload_plan'])) if Path(summary['native_upload_plan']).is_file() else []
                     normalized = [{**{key: value for key, value in row.items() if key != 'text_file'},
                                    'body_sha256': digest(row['text_file'])} for row in plan]
@@ -149,11 +167,22 @@ def run():
                                 continue
                             manual_rows = pipeline.load_upload_plan_rows(Path(kit['upload_plan']))
                             assert len(manual_rows) == kit['file_count']
-                            assert all(Path(row['text_file']).is_file() for row in manual_rows)
+                            assert all(Path(row['text_file']).is_file() if row['text_file'] else
+                                       Path(row['text_manifest']).is_file() for row in manual_rows)
                             assert not list(Path(kit['upload_plan']).parent.rglob('*.txt'))
                         index = json.loads((root / 'artifact-locations.json').read_text(encoding='utf8'))
                         assert all((root / relative).is_file() for relative in index['roles'].values())
                         assert all(path.stat().st_nlink == 1 for path in root.rglob('*') if path.is_file())
+                        assert not list(root.rglob('supplementary-content-candidates.txt'))
+                        assert not list(root.rglob('page-transition-companions/*.txt'))
+                        expected_plans = (2 if summary['native_upload_representation'] == 'page_parents'
+                                          and settings.get('native_metadata_upload_mode') == 'strict' else 1)
+                        assert len(list((root / 'metadata-api').glob('file-upload-plan-*.csv'))) == expected_plans
+                        write_prepared_batch_checkpoint(
+                            root, [summary], total_sources=1, workspace_slug='test', api_url='http://localhost',
+                            stage='preparation_complete')
+                        recovery = verify_prepared_batch_checkpoint(root)
+                        assert recovery['reusable'], recovery
                         evidence, error = app.diagnostic_evidence_paths(root)
                         assert not error, error
                         app.gradio_download_cache_path = lambda name: base / name
@@ -165,6 +194,25 @@ def run():
                             moved = next(Path(scratch).rglob('artifact-locations.json')).parent
                             assert all((moved / relative).is_file() for relative in index['roles'].values())
                             assert read_run_json(moved / 'run-summary.json') == read_run_json(root / 'run-summary.json')
+                            before_summary = (moved / 'run-summary.json').read_bytes()
+                            for kind in ('diagnostic-text', 'manual-kits', 'upload-alternatives'):
+                                generated = materialize_optional_artifacts(moved, kind)
+                                assert all(path.is_file() and path.resolve().is_relative_to(moved.resolve())
+                                           for path in generated)
+                            for representation in ('segments', 'page-parents'):
+                                for mode in ('strict', 'native_header'):
+                                    name = ('raw-text-payloads-' + ('page-parents-' if representation == 'page-parents' else '')
+                                            + mode.replace('_', '-') + '.jsonl')
+                                    expected = read_rows(evidence_path(moved, 'metadata-api/' + name))
+                                    actual = pipeline.load_upload_plan_rows(
+                                        moved / 'on-demand/upload-alternatives' / f'upload-plan-{representation}-{mode}.csv')
+                                    assert len(actual) == len(expected)
+                                    for row, payload in zip(actual, expected):
+                                        assert row['filename'] == payload['filename']
+                                        assert Path(row['text_file']).read_text(encoding='utf8') == payload['textContent']
+                                        assert all(row[key] == str(payload['metadata'].get(key) or '')
+                                                   for key in ('title', 'docAuthor', 'description', 'docSource', 'chunkSource'))
+                            assert (moved / 'run-summary.json').read_bytes() == before_summary
                     size = sum(path.stat().st_size for path in root.rglob('*') if path.is_file())
                     retention = pipeline.retain_successful_run_without_logs(
                         root, summary, {'filename': source.name}, Path(summary['upload_file']),

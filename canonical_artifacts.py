@@ -62,17 +62,25 @@ class CanonicalArtifacts:
 
     def text(self, preferred, content):
         preferred = self.checked(preferred)
+        existing = self.existing_text(content, preferred.suffix)
+        if existing is not None:
+            return self.role(preferred, existing)
         # Match the established Windows writer's newline translation exactly.
         encoded = content.replace('\n', os.linesep).encode('utf8')
-        key = (preferred.suffix, len(encoded), hashlib.sha256(encoded).digest())
-        for path in self.index.get(key, []):
-            if path.is_file() and path.read_bytes() == encoded:
-                return self.role(preferred, path)
         if preferred.exists() and preferred.read_bytes() != encoded:
             raise ValueError('Refusing to modify an existing static canonical artifact')
         self.writer(preferred, content)
         self.register(preferred)
         return self.role(preferred, preferred)
+
+    def existing_text(self, content, suffix='.txt'):
+        """Find reusable text without materializing an optional artifact."""
+        encoded = content.replace('\n', os.linesep).encode('utf8')
+        key = (suffix, len(encoded), hashlib.sha256(encoded).digest())
+        for path in self.index.get(key, []):
+            if path.is_file() and path.read_bytes() == encoded:
+                return path
+        return None
 
     def jsonl(self, preferred, rows):
         return self.text(preferred, ''.join(json.dumps(row, ensure_ascii=False) + '\n' for row in rows))

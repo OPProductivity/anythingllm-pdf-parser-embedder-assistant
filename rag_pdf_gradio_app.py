@@ -10447,6 +10447,7 @@ DIAGNOSTIC_EVIDENCE_DIRECTORIES = (
     "native-metadata-compatibility-probe",
     "native-metadata-test-kit",
     "retrieval-eval",
+    "on-demand",
 )
 DIAGNOSTIC_EVIDENCE_ROOT_FILES = (
     "diagnostics.csv",
@@ -10461,6 +10462,7 @@ DIAGNOSTIC_EVIDENCE_ROOT_FILES = (
     "run-summary.json",
     "source-profile.json",
     "artifact-locations.json",
+    "page-transition-manifest.jsonl",
 )
 
 

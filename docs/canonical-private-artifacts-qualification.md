@@ -38,6 +38,12 @@ Explicit legacy standalone preparation without a private catalog still produces
 its portable kit. Historical runs and existing `.run-evidence` storage are unchanged.
 This is deliberately not a claim of zero duplication across every artifact.
 
+Subsequent on-demand consolidation also stops diagnostic TXT rendering and
+unused upload-representation TXT creation during private preparation. Manual
+plan rows without an existing TXT refer to the retained segment manifest instead.
+See `on-demand-private-artifacts-qualification-20261003.md` for explicit rendering
+commands, recovery boundaries and qualification.
+
 ## Production-Path Qualification
 
 Prepare-only legacy and private runs used the actual Gunning nine-page article

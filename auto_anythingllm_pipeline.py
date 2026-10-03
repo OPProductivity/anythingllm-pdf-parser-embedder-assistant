@@ -9001,8 +9001,9 @@ def write_provenance_review_manifest(
         "provenance_checks": {
             "page_transition_boundaries_checked": len(transition_rows),
             "page_transition_companions_created": sum(
-                1 for row in transition_rows if row.get("continuation_detected")
+                1 for row in transition_rows if row.get("artifact_path")
             ),
+            "page_transition_continuations_detected": sum(bool(row.get("continuation_detected")) for row in transition_rows),
             "readiness_status": selected.get("readiness_status", ""),
             "readiness_reasons": selected.get("readiness_reasons", []),
         },
@@ -9457,7 +9458,7 @@ def build_run_diagnostics(
                 "info",
                 "extraction",
                 f"Excluded {lane_review.get('primary_excluded_segment_count', 0)} segment(s) from automatically classified sustained reference/index regions.",
-                "Original text and page-level reasons remain in selected/retrieval-lane-review.json and supplementary-content-candidates.txt.",
+                "Original text and page-level reasons remain in retrieval-lane-review.json; readable TXT reports can be rendered on demand.",
             )
         else:
             add(
@@ -9465,7 +9466,7 @@ def build_run_diagnostics(
                 "warning",
                 "extraction",
                 f"Found {lane_review['proposed_supplementary_count']} medium-confidence supplementary candidate(s); retained because no narrow automatic exclusion rule matched.",
-                "Inspect selected/retrieval-lane-review.json and supplementary-content-candidates.txt if the document-specific evidence should inform a future narrow rule.",
+                "Inspect retrieval-lane-review.json if the document-specific evidence should inform a future narrow rule.",
             )
     if selected.get("backend_word_disagreement", 0) > 0.35:
         disagreement_resolution = selected.get("backend_word_disagreement_resolution") or {}
@@ -10264,7 +10265,8 @@ def representation_recommendation_rows(harmonization_report_rows):
     ]
 
 
-def write_native_metadata_test_kit(segments, out_dir: Path, workspace_slug="test", artifact_prefix="", *, artifact_catalog=None):
+def write_native_metadata_test_kit(segments, out_dir: Path, workspace_slug="test", artifact_prefix="", *, artifact_catalog=None,
+                                 defer_payloads=False, text_manifest=""):
     out_dir.mkdir(parents=True, exist_ok=True)
     prefix = f"{safe_stem(artifact_prefix)}-" if artifact_prefix else "manual-"
     files_dir = out_dir / f"{prefix}segment-files"
@@ -10274,7 +10276,10 @@ def write_native_metadata_test_kit(segments, out_dir: Path, workspace_slug="test
     for row in segments:
         filename = native_segment_filename(row)
         path = files_dir / filename
-        if artifact_catalog:
+        if artifact_catalog and defer_payloads:
+            existing = artifact_catalog.existing_text(row["text"])
+            path = artifact_catalog.role(path, existing) if existing is not None else None
+        elif artifact_catalog:
             path = artifact_catalog.text(path, row["text"])
         else:
             path.write_text(row["text"], encoding="utf-8")
@@ -10293,7 +10298,8 @@ def write_native_metadata_test_kit(segments, out_dir: Path, workspace_slug="test
                 ).strip(),
                 "docSource": f"local-pdf://sha256/{row['source_sha256']}",
                 "chunkSource": f"segment://{row['segment_id']}",
-                "text_file": str(path),
+                "text_file": str(path) if path is not None else "",
+                **({"text_manifest": str(text_manifest)} if defer_payloads else {}),
             }
         )
     write_csv(out_dir / f"{prefix}upload-plan.csv", rows)
@@ -10318,6 +10324,11 @@ def write_native_metadata_test_kit(segments, out_dir: Path, workspace_slug="test
             "", "The plan references canonical files elsewhere in this run; this kit folder alone is not portable.",
             "Use the complete diagnostics evidence bundle to include those files for inspection or transfer.",
             "The CSV records expected metadata; uploading a TXT through the Desktop UI does not automatically apply its CSV fields.",
+        ])
+    if defer_payloads:
+        checklist.extend([
+            "", "Rows without text_file retain their source text in text_manifest, keyed by segment_id.",
+            'Materialize manual payloads when needed: python -m run_artifact_tools "DOCUMENT_RUN_DIRECTORY" --kind manual-kits',
         ])
     (out_dir / f"{prefix}test-checklist.md").write_text("\n".join(checklist) + "\n", encoding="utf-8")
     return {
@@ -16013,6 +16024,22 @@ def choose_native_upload_transport(api_url, requested_transport="raw_text", uplo
     # local storage is visible forced every normal run to materialize thousands
     # of metadata-api files despite AnythingLLM raw-text upload being proven.
     return transport
+
+
+def resolve_native_upload_representation(requested, harmonization_report_rows):
+    """Resolve oversized page parents before materializing the upload plan."""
+    # Desktop re-chunks oversized parents and repeats their chunkSource identity;
+    # page-local child segments retain the existing exact-reconciliation guard.
+    oversized = int(next((row.get("units_exceeding_effective_limit", 0)
+                          for row in harmonization_report_rows
+                          if str(row.get("representation") or "") == "page_parents"), 0) or 0)
+    if requested == "page_parents" and oversized:
+        return "segments", {
+            "applied": True, "requested": "page_parents", "effective": "segments",
+            "reason": "page_parent_exceeds_effective_splitter_limit",
+            "oversized_page_parent_units": oversized,
+        }
+    return requested, {}
 
 
 def build_file_upload_rows_from_payloads(payloads, files_dir: Path, *, artifact_catalog=None):
@@ -24731,9 +24758,10 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             candidate_artifact_paths["anythingllm-upload.txt"] = str(body_path)
             write_json(candidate_dir / "retrieval-lane-review.json", lane_review)
             write_json(candidate_dir / "visual-text-review.json", visual_text_review)
-            write_supplementary_lane_candidate_text(
-                candidate_dir / "supplementary-content-candidates.txt", lane_review
-            )
+            if not artifact_catalog:
+                write_supplementary_lane_candidate_text(
+                    candidate_dir / "supplementary-content-candidates.txt", lane_review
+                )
             if generate_inline_fallback:
                 fallback_path = candidate_dir / "anythingllm-upload-inline-metadata-fallback.txt"
                 if artifact_catalog:
@@ -25480,7 +25508,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         )
         transition["left_source_segment_ids"] = [row["segment_id"] for row in left_segments[-2:]]
         transition["right_source_segment_ids"] = [row["segment_id"] for row in right_segments[:2]]
-        if transition["continuation_detected"]:
+        if transition["continuation_detected"] and not artifact_catalog:
             companion_dir.mkdir(parents=True, exist_ok=True)
             companion_path = companion_dir / f"{transition['boundary_id']}.txt"
             companion_path.write_text(transition["reconstructed_text"], encoding="utf-8")
@@ -25488,7 +25516,9 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             transition["materialization_status"] = "local_artifact"
         else:
             transition["artifact_path"] = ""
-            transition["materialization_status"] = "manifest_only"
+            transition["materialization_status"] = (
+                "on_demand" if transition["continuation_detected"] else "manifest_only"
+            )
         transition_rows.append(transition)
     append_jsonl(selected_dir / "page-transition-manifest.jsonl", transition_rows)
     layout_review = src_candidate_dir / "layout-region-review.json"
@@ -25664,6 +25694,10 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
 
     metadata_artifact_started = time.perf_counter()
     metadata_dir = out_root / "metadata-api"
+    requested_upload_representation = getattr(args, "native_upload_representation", "segments")
+    upload_representation, upload_representation_adjustment = resolve_native_upload_representation(
+        requested_upload_representation, harmonization_report_rows
+    )
     requested_lean_retention = bool(getattr(args, "lean_retention", False))
     # Automatic native uploads stage every PDF locally and submit their plans
     # together only after the final PDF has finished. A per-PDF compacting
@@ -25697,7 +25731,47 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     payload_artifacts = {}
     segment_upload_plan_path = metadata_dir / "upload-plan.csv"
     parent_upload_plan_path = metadata_dir / "page-parent-upload-plan.csv"
-    if materialize_metadata_artifacts:
+    segment_strict_upload_rows = []
+    segment_native_upload_rows = []
+    page_parent_strict_upload_rows = []
+    page_parent_native_upload_rows = []
+    if materialize_metadata_artifacts and artifact_catalog:
+        selected_mode = getattr(args, "native_metadata_upload_mode", "native_header")
+        strict = selected_mode == "strict"
+        parents = upload_representation == "page_parents"
+        resolved_payloads = (page_parent_strict_payloads if strict else page_parent_native_payloads) if parents else (
+            strict_payloads if strict else native_payloads
+        )
+        representation_name = "page-parents" if parents else "segments"
+        mode_name = "strict" if strict else "native-header"
+        resolved_rows = build_file_upload_rows_from_payloads(
+            resolved_payloads, metadata_dir / f"file-upload-{representation_name}-{mode_name}",
+            artifact_catalog=artifact_catalog,
+        )
+        resolved_plan_path = metadata_dir / f"file-upload-plan-{representation_name}-{mode_name}.csv"
+        write_csv(resolved_plan_path, resolved_rows)
+        if parents:
+            parent_upload_plan_path = resolved_plan_path
+            if strict:
+                page_parent_strict_upload_rows = resolved_rows
+                # Preserve the existing native-header grouped handoff while
+                # direct strict uploads keep their selected metadata. Bodies
+                # are identical and share the same canonical TXT files.
+                page_parent_native_upload_rows = build_file_upload_rows_from_payloads(
+                    page_parent_native_payloads, metadata_dir / "file-upload-page-parents-native-header",
+                    artifact_catalog=artifact_catalog,
+                )
+                parent_upload_plan_path = metadata_dir / "file-upload-plan-page-parents-native-header.csv"
+                write_csv(parent_upload_plan_path, page_parent_native_upload_rows)
+            else:
+                page_parent_native_upload_rows = resolved_rows
+        else:
+            segment_upload_plan_path = resolved_plan_path
+            if strict:
+                segment_strict_upload_rows = resolved_rows
+            else:
+                segment_native_upload_rows = resolved_rows
+    elif materialize_metadata_artifacts:
         segment_strict_upload_rows = build_file_upload_rows_from_payloads(
             strict_payloads, metadata_dir / "file-upload-segments-strict",
             **({"artifact_catalog": artifact_catalog} if artifact_catalog else {}),
@@ -25714,6 +25788,13 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             page_parent_native_payloads, metadata_dir / "file-upload-page-parents-native-header",
             **({"artifact_catalog": artifact_catalog} if artifact_catalog else {}),
         )
+        write_csv(metadata_dir / "file-upload-plan-segments-strict.csv", segment_strict_upload_rows)
+        write_csv(metadata_dir / "file-upload-plan-segments-native-header.csv", segment_native_upload_rows)
+        write_csv(metadata_dir / "file-upload-plan-page-parents-strict.csv", page_parent_strict_upload_rows)
+        write_csv(metadata_dir / "file-upload-plan-page-parents-native-header.csv", page_parent_native_upload_rows)
+        write_csv(segment_upload_plan_path, segment_native_upload_rows)
+        write_csv(parent_upload_plan_path, page_parent_native_upload_rows)
+    if materialize_metadata_artifacts:
         for name, payloads in (
             ("raw-text-payloads-strict.jsonl", strict_payloads),
             ("raw-text-payloads-native-header.jsonl", native_payloads),
@@ -25726,21 +25807,6 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             else:
                 append_jsonl(target, payloads)
             payload_artifacts[name] = str(target)
-        write_csv(metadata_dir / "file-upload-plan-segments-strict.csv", segment_strict_upload_rows)
-        write_csv(metadata_dir / "file-upload-plan-segments-native-header.csv", segment_native_upload_rows)
-        write_csv(metadata_dir / "file-upload-plan-page-parents-strict.csv", page_parent_strict_upload_rows)
-        write_csv(metadata_dir / "file-upload-plan-page-parents-native-header.csv", page_parent_native_upload_rows)
-        if artifact_catalog:
-            segment_upload_plan_path = metadata_dir / "file-upload-plan-segments-native-header.csv"
-            parent_upload_plan_path = metadata_dir / "file-upload-plan-page-parents-native-header.csv"
-        else:
-            write_csv(segment_upload_plan_path, segment_native_upload_rows)
-            write_csv(parent_upload_plan_path, page_parent_native_upload_rows)
-    else:
-        segment_strict_upload_rows = []
-        segment_native_upload_rows = []
-        page_parent_strict_upload_rows = []
-        page_parent_native_upload_rows = []
     selected_workspace_slug = getattr(args, "workspace_slug", "")
     target_workspace_slug = (
         selected_workspace_slug
@@ -25751,6 +25817,8 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         native_test_kit = write_native_metadata_test_kit(
             selected["segments"], out_root / "native-metadata-test-kit", workspace_slug=target_workspace_slug,
             **({"artifact_catalog": artifact_catalog} if artifact_catalog else {}),
+            defer_payloads=bool(artifact_catalog),
+            text_manifest=str(selected_artifact_path(selected, selected_dir, "segment-manifest.jsonl")),
         )
         compatibility_probe_segments = (
             [selected["segments"][0], selected["segments"][len(selected["segments"]) // 2]]
@@ -25760,6 +25828,8 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             compatibility_probe_segments, out_root / "native-metadata-compatibility-probe",
             workspace_slug=target_workspace_slug, artifact_prefix="compatibility",
             **({"artifact_catalog": artifact_catalog} if artifact_catalog else {}),
+            defer_payloads=bool(artifact_catalog),
+            text_manifest=str(selected_artifact_path(selected, selected_dir, "segment-manifest.jsonl")),
         )
     else:
         native_test_kit = {"files_dir": "", "upload_plan": "", "checklist": "", "file_count": 0}
@@ -25994,37 +26064,6 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 pass
 
     payloads_to_upload = []
-    requested_upload_representation = getattr(args, "native_upload_representation", "segments")
-    upload_representation = requested_upload_representation
-    # ``page_parents`` normally provides the clearest page-level identity.
-    # It is unsafe when a source page already exceeds the active splitter
-    # ceiling: Desktop will silently re-chunk that parent, duplicate its
-    # chunkSource identity, and make exact batch reconciliation impossible.
-    # The selected child segments are already page-local and ceiling-bounded,
-    # so switch only those affected documents to segment records. This keeps
-    # page parents for ordinary pages while making "Page - preserve
-    # automatically" honour its promise to subdivide oversized pages.
-    parent_units_over_limit = int(
-        next(
-            (
-                row.get("units_exceeding_effective_limit", 0)
-                for row in harmonization_report_rows
-                if str(row.get("representation") or "") == "page_parents"
-            ),
-            0,
-        )
-        or 0
-    )
-    upload_representation_adjustment = {}
-    if upload_representation == "page_parents" and parent_units_over_limit:
-        upload_representation = "segments"
-        upload_representation_adjustment = {
-            "applied": True,
-            "requested": "page_parents",
-            "effective": "segments",
-            "reason": "page_parent_exceeds_effective_splitter_limit",
-            "oversized_page_parent_units": parent_units_over_limit,
-        }
     requested_upload_transport = getattr(args, "native_upload_transport", "raw_text")
     # Keep legacy callers that do not yet provide this option compatible with
     # the Desktop 1.15 Documents drawer: it only enumerates direct children of
@@ -28086,8 +28125,10 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         "page_transition_manifest": str(selected_dir / "page-transition-manifest.jsonl"),
         "page_transition_boundaries_checked": len(transition_rows),
         "page_transition_companions_created": sum(
-            1 for row in transition_rows if row.get("continuation_detected")
+            1 for row in transition_rows if row.get("artifact_path")
         ),
+        "page_transition_continuations_detected": sum(bool(row.get("continuation_detected")) for row in transition_rows),
+        "optional_text_artifact_policy": "on_demand" if artifact_catalog else "standalone",
         "page_parent_manifest": str(selected_dir / "page-parent-manifest.jsonl"),
         "child_parent_map": str(selected_dir / "child-parent-map.csv"),
         "layout_region_review": str(selected_artifact_path(selected, selected_dir, "layout-region-review.json")),
@@ -28106,7 +28147,9 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         "variant_summary": str(selected_dir / "output-variant-summary.csv"),
         "metadata_payloads": payload_artifacts.get("raw-text-payloads-native-header.jsonl", str(metadata_dir / "raw-text-payloads-native-header.jsonl")),
         "page_parent_metadata_payloads": payload_artifacts.get("raw-text-payloads-page-parents-native-header.jsonl", str(metadata_dir / "raw-text-payloads-page-parents-native-header.jsonl")),
-        "page_parent_upload_plan": str(parent_upload_plan_path),
+        "page_parent_upload_plan": (
+            str(parent_upload_plan_path) if not artifact_catalog or parent_upload_plan_path.is_file() else ""
+        ),
         # The selected representation may be page parents or individual
         # segments.  Automatic grouped uploads consume this exact plan after
         # every PDF has been staged, instead of rediscovering files by name.
