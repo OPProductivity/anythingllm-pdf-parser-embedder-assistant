@@ -75,7 +75,7 @@ source-attribution qualification. The corrected harness supplies the coordinator
 
 The corrected full replay (`isolated-full-878099`) passed all 34 sources: 310
 selected records, 310 exact vector-confirmed records, 483 physical vectors, zero
-cache reuse and no reported errors. Its complete journals retain 1,032 queue-control
+cache reuse and no reported errors. Its aggregate journals retain 1,032 queue-control
 events. The evidence audit checks hydrated reports, per-source confirmation,
 canonical references and journal lengths rather than relying on completion labels.
 
@@ -97,3 +97,13 @@ artifacts remain intact. Test receipts are retained locally, not provider secret
 This qualification adds only experiment scripts and this record. It does not
 change production OCR, the UI, ETA or public-output cleanup. No production service
 restart is necessary for these test-only additions.
+
+## Subsequent evidence review
+
+The later strict audit found that the aggregate histories above were retained,
+but individual queue-group ledgers were saved before SSE observations were added.
+The corrected full and mixed receipts therefore qualify record/source confirmation,
+not complete group-level history. The pilot lacking its source-local report is not
+source-identity qualification either. Earlier receipts remain unchanged. See
+evidence-review-followups-qualification-20261003.md for the fixes and a fresh
+isolated nine-source replay passing exact identity and group-history checks.

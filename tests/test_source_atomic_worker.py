@@ -435,6 +435,9 @@ def test_installer_preserves_an_unknown_existing_backup(tmp_path, monkeypatch):
 
 def test_explicit_precommit_rejection_allows_the_next_source_window():
     class FakeThread:
+        def is_alive(self):
+            return False
+
         def join(self, timeout=None):
             return None
 

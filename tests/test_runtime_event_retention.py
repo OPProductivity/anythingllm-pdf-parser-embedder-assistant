@@ -56,7 +56,7 @@ def test_journal_restart_and_new_sequence_preserve_prior_evidence(tmp_path):
     path = tmp_path / 'events.jsonl'
     first = [{'event': 'first'}, {'event': 'second'}]
     journal.retain_runtime_events(path, first)
-    journal._STATE.pop(path.resolve())
+    assert not hasattr(journal, '_STATE')
     journal.retain_runtime_events(path, first + [{'event': 'third'}])
     journal.retain_runtime_events(path, first)
     result = journal.retain_runtime_events(path, [{'event': 'resumed'}])
@@ -64,3 +64,43 @@ def test_journal_restart_and_new_sequence_preserve_prior_evidence(tmp_path):
     assert [row['event']['event'] for row in rows] == ['first', 'second', 'third', 'resumed']
     assert [row['sequence'] for row in rows] == [1, 1, 1, 2]
     assert result['retained_events'] == 4
+
+
+def test_observation_scope_marks_intermediate_ledger_and_resets_after_error(tmp_path):
+    import runtime_event_journal as journal
+
+    path = tmp_path / 'ledger.json'
+    aggregate = {'runtime_events': [{'event': 'receipt'}]}
+    with pytest.raises(RuntimeError):
+        with journal.observation_scope(path.with_suffix('.events.jsonl')):
+            pipeline._write_embedding_batch_ledger(path, 'workspace', aggregate)
+            assert json.loads(path.read_text())['runtime_event_history_complete'] is False
+            raise RuntimeError('observer interrupted')
+    pipeline._write_embedding_batch_ledger(path, 'workspace', aggregate)
+    assert json.loads(path.read_text())['runtime_event_history_complete'] is True
+
+
+def test_unstopped_observer_cannot_claim_complete_history(tmp_path):
+    path = tmp_path / 'ledger.json'
+    aggregate = {'runtime_events': [{'event': 'receipt'}],
+                 'runtime_event_observation_complete': False}
+    pipeline._write_embedding_batch_ledger(path, 'workspace', aggregate)
+    assert json.loads(path.read_text())['runtime_event_history_complete'] is False
+
+
+def test_journal_rejects_corrupt_position(tmp_path):
+    import runtime_event_journal as journal
+
+    path = tmp_path / 'events.jsonl'
+    path.write_text(json.dumps({'sequence': 1, 'position': 2, 'event': {}}) + '\n')
+    with pytest.raises(ValueError, match='position'):
+        journal.retain_runtime_events(path, [{}])
+
+
+def test_shorter_prefix_does_not_claim_exact_complete_history(tmp_path):
+    path = tmp_path / 'ledger.json'
+    pipeline._write_embedding_batch_ledger(path, 'workspace', {
+        'runtime_events': [{'event': 'first'}, {'event': 'second'}]})
+    pipeline._write_embedding_batch_ledger(path, 'workspace', {
+        'runtime_events': [{'event': 'first'}]})
+    assert json.loads(path.read_text())['runtime_event_history_complete'] is False

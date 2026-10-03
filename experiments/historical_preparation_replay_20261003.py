@@ -4,12 +4,14 @@ Never uploads or mutates AnythingLLM. Each document gets new OCR checkpoints.
 """
 
 import hashlib
+import argparse
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 import time
+import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from manifest_text import read_manifest_rows
@@ -25,6 +27,11 @@ def write(path, value):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--limit', type=int, help='Bound an explicit smoke test to this many PDFs')
+    options = parser.parse_args()
+    if options.limit is not None and options.limit < 1:
+        parser.error('--limit must be positive')
     original_root = application_paths()['run_state'] / 'automatic-runs'
     receipt = REPO / 'tmp-output/historical-replay-20261003'
     inventory = json.loads((receipt / 'inventory.json').read_text())
@@ -34,17 +41,22 @@ def main():
         configs[row['pdf_path']] = (path, row)
     report = {'kind': 'fresh_preparation_not_live_embedding', 'commit': subprocess.check_output(
         ['git', 'rev-parse', 'HEAD'], cwd=REPO, text=True).strip(), 'cases': []}
-    home = receipt / 'home'
+    invocation = receipt / ('preparation-' + uuid.uuid4().hex)
+    invocation.mkdir()
+    results_path = invocation / 'results.json'
+    home = invocation / 'home'
     env = dict(os.environ)
     env[DATA_DIRECTORY_ENVIRONMENT_VARIABLE] = str(home)
-    for index, (digest, paths) in enumerate(inventory['unique_content'].items(), 1):
+    inputs = list(inventory['unique_content'].items())
+    if options.limit is not None:
+        inputs = inputs[:options.limit]
+    report['invocation'] = str(invocation)
+    report['fresh_worker_required'] = True
+    for index, (digest, paths) in enumerate(inputs, 1):
         source = next(path for path in paths if path in configs)
         historical_config, config = configs[source]
         run_root = home / 'run-state/automatic-runs' / f'r-replay-{index:02d}'
-        already_prepared = (run_root / 'result.json').is_file()
-        if run_root.exists() and not already_prepared:
-            run_root = run_root.with_name(run_root.name + '-retry')
-        run_root.mkdir(parents=True, exist_ok=already_prepared)
+        run_root.mkdir(parents=True, exist_ok=False)
         doc = run_root / 'document'
         args = config['args']
         args.update(prepare_and_upload=False, run_vector_eval=False,
@@ -62,23 +74,21 @@ def main():
                 'pages': next(item.get('pages') for item in inventory['sources'] if item['path'] == source),
                 'status': 'running', 'run_root': str(run_root)}
         report['cases'].append(case)
-        write(receipt / 'results.json', report)
-        print(f"START {index}/34 {Path(source).name}", flush=True)
+        write(results_path, report)
+        print(f"START {index}/{len(inputs)} {Path(source).name}", flush=True)
         started = time.monotonic()
         try:
             with (run_root / 'stdout.log').open('a') as stdout, (run_root / 'stderr.log').open('a') as stderr:
-                if already_prepared:
-                    code = 0
-                else:
-                    process = subprocess.Popen([sys.executable, '-m', 'cancellable_preparation_worker', str(config_path)],
-                                               cwd=REPO, env=env, stdout=stdout, stderr=stderr)
-                    try:
-                        code = process.wait(timeout=240)
-                    except subprocess.TimeoutExpired:
-                        subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'], check=False,
-                                       capture_output=True)
-                        process.wait(timeout=15)
-                        raise RuntimeError('Owned preparation exceeded the 240-second per-document bound')
+                process = subprocess.Popen([sys.executable, '-m', 'cancellable_preparation_worker', str(config_path)],
+                                           cwd=REPO, env=env, stdout=stdout, stderr=stderr,
+                                           creationflags=subprocess.CREATE_NO_WINDOW)
+                try:
+                    code = process.wait(timeout=240)
+                except subprocess.TimeoutExpired:
+                    subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'], check=False,
+                                   capture_output=True)
+                    process.wait(timeout=15)
+                    raise RuntimeError('Owned preparation exceeded the 240-second per-document bound')
             result = read_run_json(run_root / 'result.json')
             if code or result.get('status') != 'completed':
                 raise RuntimeError(f"Worker exit {code}, status {result.get('status')}: {result.get('message', '')}")
@@ -107,10 +117,11 @@ def main():
         except Exception as exc:
             case.update(status='failed', error=f'{type(exc).__name__}: {exc}')
         case['seconds'] = round(time.monotonic() - started, 3)
-        write(receipt / 'results.json', report)
-        print(f"END {index}/34 {case['status']} {case['seconds']}s", flush=True)
+        write(results_path, report)
+        print(f"END {index}/{len(inputs)} {case['status']} {case['seconds']}s", flush=True)
     print(json.dumps({'complete': sum(row['status'] == 'complete' for row in report['cases']),
-                      'failed': sum(row['status'] == 'failed' for row in report['cases'])}), flush=True)
+                      'failed': sum(row['status'] == 'failed' for row in report['cases']),
+                      'results': str(results_path)}), flush=True)
     return int(any(row['status'] != 'complete' for row in report['cases']))
 
 

@@ -9293,6 +9293,10 @@ def build_run_diagnostics(
 ):
     diagnostics = []
 
+    def review_artifact(name):
+        return str((selected.get("artifact_paths") or {}).get(name)
+                   or f"artifact-locations.json (role: {name})")
+
     def add(code, severity, stage, message, action=""):
         diagnostics.append(
             {
@@ -9354,12 +9358,12 @@ def build_run_diagnostics(
                 else "Some pages may be scanned or have a weak text layer."
             ),
             (
-                "Review low-text pages in extraction-report.csv to confirm OCR quality."
+                f"Review low-text pages in {review_artifact('extraction-report.csv')} to confirm OCR quality."
                 if ocr_assisted_selection
                 else (
                     "No OCR retry is needed unless those specific image pages contain text you expect to retrieve."
                     if native_text_was_complete
-                    else "Review low-text pages in extraction-report.csv."
+                    else f"Review low-text pages in {review_artifact('extraction-report.csv')}."
                 )
             ),
         )
@@ -9395,14 +9399,8 @@ def build_run_diagnostics(
     if int(quality.get("duplicate_pages") or 0):
         add("PDF_DUPLICATE_TEXT_PAGES", "warning", "extraction", f"{quality['duplicate_pages']} exact duplicate text page(s) were excluded.", "Review page_profile in source-profile.json.")
     layout = selected.get("layout_evidence") or {}
-    layout_review_path = str(
-        (selected.get("artifact_paths") or {}).get("layout-region-review.json")
-        or "artifact-locations.json (layout_region_review)"
-    )
-    lane_review_path = str(
-        (selected.get("artifact_paths") or {}).get("retrieval-lane-review.json")
-        or "artifact-locations.json (retrieval_lane_review)"
-    )
+    layout_review_path = review_artifact("layout-region-review.json")
+    lane_review_path = review_artifact("retrieval-lane-review.json")
     if int(layout.get("removed_marginalia_count") or 0):
         add(
             "PDF_LAYOUT_MARGINALIA_EXCLUDED",
@@ -9441,7 +9439,7 @@ def build_run_diagnostics(
                 f"{visual_text.get('unresolved_page_count')} image-containing page(s) have low-signal or no indexed text; publisher logos and illustrations are not distinguished from unread text"
                 + (f" (PDF page(s): {pages})." if pages else ".")
             ),
-            "No text was guessed or added. Review visual-text-review.json and the original PDF page if an image caption or label matters for retrieval.",
+            f"No text was guessed or added. Review {review_artifact('visual-text-review.json')} and the original PDF page if an image caption or label matters for retrieval.",
         )
     elif str(visual_text.get("status") or "") == "assessment_incomplete":
         assessment = visual_text.get("assessment") or {}
@@ -9455,7 +9453,7 @@ def build_run_diagnostics(
             "extraction",
             "Image-page visual-text coverage could not be fully assessed because page or extractor metadata was incomplete."
             + (f" Missing geometry for PDF page(s): {missing}." if missing else ""),
-            "No text was changed. Inspect the original PDF and visual-text-review.json before relying on image-page labels for retrieval.",
+            f"No text was changed. Inspect the original PDF and {review_artifact('visual-text-review.json')} before relying on image-page labels for retrieval.",
         )
     elif str(visual_text.get("status") or "") == "not_assessed":
         add(
@@ -16606,6 +16604,11 @@ def _merge_embedding_runtime_events(aggregate, incoming):
         + max(len(additions), int(incoming.get("runtime_event_count") or 0))
     )
     aggregate["runtime_events"] = previous + additions
+    if "runtime_event_observation_complete" in incoming:
+        aggregate["runtime_event_observation_complete"] = (
+            aggregate.get("runtime_event_observation_complete", True)
+            and bool(incoming["runtime_event_observation_complete"])
+        )
 
 
 def _write_embedding_batch_ledger(ledger_path, workspace_slug, result):
@@ -16645,7 +16648,12 @@ def _write_embedding_batch_ledger(ledger_path, workspace_slug, result):
         "runtime_event_count": runtime_event_count,
         "runtime_events_truncated": runtime_event_count > len(runtime_event_tail),
         "runtime_event_journal": journal,
-        "runtime_event_history_complete": runtime_event_count == len(runtime_events),
+        "runtime_event_history_complete": (
+            runtime_event_count == len(runtime_events)
+            and journal["sequence_events"] == len(runtime_events)
+            and not journal["observation_pending"]
+            and result.get("runtime_event_observation_complete", True)
+        ),
         "errors": result.get("errors", []),
         # Keep the prepared location's originating PDF beside the recovery
         # plan.  Locations are the only authority for resubmission, while the
@@ -19350,28 +19358,32 @@ def update_workspace_embeddings_desktop_queue(
             return {**verification, "desktop_queue_observer": queue_snapshot()}
         return verification
 
+    from runtime_event_journal import observation_scope
+
     try:
-        result = update_workspace_embeddings_batched(
-            api_url,
-            api_key,
-            workspace_slug,
-            unique_locations,
-            # One request containing all managed locations: Desktop serializes the
-            # individual documents inside its own queue.
-            batch_size=requested,
-            warmup_batch_size=0,
-            warmup_batch_count=0,
-            ledger_path=ledger_path,
-            status_callback=desktop_queue_status,
-            batch_verifier=queue_aware_batch_verifier if callable(batch_verifier) else None,
-            batch_inspector=batch_inspector,
-            cancel_callback=cancel_callback,
-            verification_mode="checkpoint",
-            concurrent_batch_limit=1,
-            submission_timeout_override=ANYTHINGLLM_DESKTOP_QUEUE_RECEIPT_TIMEOUT_SECONDS,
-            location_sources=location_sources,
-            receipt_observer=owned_desktop_queue_receipt,
-        )
+        journal_path = Path(ledger_path).with_suffix('.events.jsonl') if ledger_path else None
+        with observation_scope(journal_path):
+            result = update_workspace_embeddings_batched(
+                api_url,
+                api_key,
+                workspace_slug,
+                unique_locations,
+                # One request containing all managed locations: Desktop serializes the
+                # individual documents inside its own queue.
+                batch_size=requested,
+                warmup_batch_size=0,
+                warmup_batch_count=0,
+                ledger_path=ledger_path,
+                status_callback=desktop_queue_status,
+                batch_verifier=queue_aware_batch_verifier if callable(batch_verifier) else None,
+                batch_inspector=batch_inspector,
+                cancel_callback=cancel_callback,
+                verification_mode="checkpoint",
+                concurrent_batch_limit=1,
+                submission_timeout_override=ANYTHINGLLM_DESKTOP_QUEUE_RECEIPT_TIMEOUT_SECONDS,
+                location_sources=location_sources,
+                receipt_observer=owned_desktop_queue_receipt,
+            )
     finally:
         # The HTTP response and the local SSE relay are independent loopback
         # streams.  Desktop can finish the request a few scheduler ticks
@@ -19424,6 +19436,8 @@ def update_workspace_embeddings_desktop_queue(
         "prequeue_fresh_records": max(0, requested - len(preexisting_cached_locations)),
         "first_queue_progress_epoch": float(queue_state.get("first_progress_epoch") or 0.0),
     }
+    result["runtime_event_observation_complete"] = not progress_listener["thread"].is_alive()
+    _write_embedding_batch_ledger(ledger_path, workspace_slug, result)
     return result
 
 

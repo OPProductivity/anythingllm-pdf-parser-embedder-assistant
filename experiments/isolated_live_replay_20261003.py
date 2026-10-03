@@ -1,6 +1,7 @@
 """Fresh native backend test with entirely separate data and owned processes."""
 
 import json
+import argparse
 import os
 from pathlib import Path
 import secrets
@@ -21,9 +22,16 @@ API = f'http://127.0.0.1:{PORT}'
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--pilot', action='store_true')
+    mode.add_argument('--mixed', action='store_true')
+    parser.add_argument('--prepared-results', type=Path,
+                        default=REPO / 'tmp-output/historical-replay-20261003/results.json')
+    options = parser.parse_args()
     production = Path.home() / 'AppData/Roaming/anythingllm-desktop/storage'
     receipt = REPO / 'tmp-output/historical-replay-20261003'
-    kind = 'isolated-mixed-' if '--mixed' in sys.argv else 'isolated-pilot-' if '--pilot' in sys.argv else 'isolated-full-'
+    kind = 'isolated-mixed-' if options.mixed else 'isolated-pilot-' if options.pilot else 'isolated-full-'
     base = receipt / (kind + secrets.token_hex(3))
     storage = base / 'roaming/anythingllm-desktop/storage'
     assert not storage.exists(), 'Every live qualification must start with empty storage'
@@ -95,10 +103,10 @@ def main():
         os.environ['ANYTHINGLLM_PDF_ASSISTANT_HOME'] = str(base / 'assistant-home')
         import rag_pdf_gradio_app as app
         assert app.default_anythingllm_storage_dir().resolve() == storage.resolve()
-        prepared = json.loads((receipt / 'results.json').read_text())['cases']
-        if '--pilot' in sys.argv:
+        prepared = json.loads(options.prepared_results.read_text())['cases']
+        if options.pilot:
             prepared = prepared[:1]
-        groups = [prepared[-9:]] if '--mixed' in sys.argv else [[case] for case in prepared]
+        groups = [prepared[-9:]] if options.mixed else [[case] for case in prepared]
         for index, group in enumerate(groups, 1):
             assert all(case['status'] == 'complete' for case in group)
             summaries = [read_run_json(Path(case['run_root']) / 'document/run-summary.json') for case in group]
@@ -128,6 +136,7 @@ def main():
             assert not result['cache_reused'], 'Cache reuse invalidates fresh qualification'
             assert result['status'] == 'complete', 'Fresh upload did not complete'
             assert len(outcome['document_results']) == len(group)
+            assert set(outcome['document_results']) == {case['source'] for case in group}
             assert all(value['status'] == 'complete' and value['post_status'] == 'pass'
                        and value['searchability_proven'] and not value.get('error')
                        for value in outcome['document_results'].values())
@@ -169,9 +178,13 @@ def main():
             handle.close()
         report['cleanup_errors'] = cleanup_errors
         report['owned_test_processes_stopped'] = True
+        assert storage.resolve().is_relative_to(base.resolve())
+        assert not storage.resolve().is_relative_to(production.resolve())
+        with sqlite3.connect(storage / 'anythingllm.db') as db:
+            db.execute('delete from api_keys')
         with sqlite3.connect((storage / 'anythingllm.db').as_uri() + '?mode=ro', uri=True) as db:
             report['remaining_test_rows'] = {table: db.execute('select count(*) from ' + table).fetchone()[0]
-                                            for table in ('workspaces', 'workspace_documents', 'document_vectors')}
+                                            for table in ('workspaces', 'workspace_documents', 'document_vectors', 'api_keys')}
         report['remaining_cache_files'] = len([p for p in (storage / 'vector-cache').rglob('*') if p.is_file()])
         (base / 'report.json').write_text(json.dumps(report, indent=2), encoding='utf8')
     return 0

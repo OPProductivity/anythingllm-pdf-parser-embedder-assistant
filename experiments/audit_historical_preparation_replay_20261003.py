@@ -1,6 +1,7 @@
 """Compare retained historical and fresh preparation evidence without API calls."""
 
 import difflib
+import argparse
 import json
 from pathlib import Path
 import sys
@@ -12,8 +13,12 @@ from run_evidence import read_run_json
 
 
 def main():
-    receipt = Path('tmp-output/historical-replay-20261003')
-    replay = json.loads((receipt / 'results.json').read_text())
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--results', type=Path,
+                        default=Path('tmp-output/historical-replay-20261003/results.json'))
+    options = parser.parse_args()
+    receipt = options.results.parent
+    replay = json.loads(options.results.read_text())
     comparisons = []
     for case in replay['cases']:
         if case['status'] != 'complete':
