@@ -10463,6 +10463,7 @@ DIAGNOSTIC_EVIDENCE_ROOT_FILES = (
     "source-profile.json",
     "artifact-locations.json",
     "page-transition-manifest.jsonl",
+    "manifest-text.jsonl",
 )
 
 
@@ -10490,10 +10491,13 @@ def diagnostic_evidence_paths(run_directory):
             resolved_root = root.resolve()
             directories = [path.resolve() for path in paths if path.is_dir()]
             for relative in set(index["roles"].values()):
-                candidate = root / relative
-                if (Path(relative).is_absolute() or candidate.is_symlink()
-                        or not candidate.resolve().is_relative_to(resolved_root)
-                        or not candidate.is_file()):
+                from canonical_artifacts import checked_role_path
+
+                try:
+                    candidate = checked_role_path(resolved_root, relative)
+                except (ValueError, OSError) as exc:
+                    raise ValueError(f"Missing or unsafe canonical artifact: {relative}") from exc
+                if not candidate.is_file():
                     raise ValueError(f"Missing or unsafe canonical artifact: {relative}")
                 if not any(candidate.resolve().is_relative_to(directory) for directory in directories):
                     paths.append(candidate)
@@ -22515,6 +22519,30 @@ def record_timing_model_run(
         return {}
 
 
+def persist_confirmation_preflight(run_root, elapsed_seconds, rows):
+    sources = {}
+    events = []
+    for row in rows:
+        source = int(row.get("source_index") or 0)
+        if source:
+            sources.setdefault(str(source), {"name": row.get("source_name") or ""})
+            if row.get("page_count"):
+                sources[str(source)]["page_count"] = int(row["page_count"])
+        events.append({key: value for key, value in row.items()
+                       if key not in {"source_name", "source_total", "page_count"}
+                       and value not in ("", None)})
+    _write_automatic_run_json(Path(run_root) / "confirmation-preflight.json", {
+        "schema_version": 1, "elapsed_seconds": float(elapsed_seconds),
+        "event_count": len(events), "sources_checked": len(sources),
+        "sources": sources, "events": events,
+    })
+    record_timing_model_event(run_root, "confirmation_preflight", {
+        "timing_event": "confirmation_preflight_completed",
+        "phase_elapsed_seconds": float(elapsed_seconds),
+        "source_progress_events": len(events), "sources_checked": len(sources),
+    })
+
+
 def record_timing_model_event(run_root, stage, batch_report=None):
     """Persist compact timing evidence without making queue polling an I/O lane.
 
@@ -22581,6 +22609,9 @@ def record_timing_model_event(run_root, stage, batch_report=None):
         "candidate_success": bool(batch.get("candidate_success")),
     }
     event_name = str(event.get("event") or "status")
+    for key in ("source_progress_events", "sources_checked"):
+        if key in batch:
+            event[key] = int(batch[key] or 0)
     repeated_observations = {
         "attachment_progress",
         "cached_attachment_reuse",
@@ -24912,7 +24943,6 @@ def _run_automatic_from_confirmation_stream_body(
             "page_count": page_count,
             "coverage_origin": str(payload.get("coverage_origin") or ""),
         })
-        del preflight_status_events[:-96]
         update_live_automatic_run_status(
             state="preparing",
             phase=phase,
@@ -29054,20 +29084,8 @@ def run_automatic(
             },
         )
         if confirmation_preflight_elapsed_seconds:
-            record_timing_model_event(
-                run_root,
-                "confirmation_preflight",
-                {
-                    "timing_event": "confirmation_preflight_completed",
-                    "phase_elapsed_seconds": max(
-                        0.0, float(confirmation_preflight_elapsed_seconds or 0.0)
-                    ),
-                    "source_progress_events": len(preflight_status_rows),
-                    "sources_checked": run_timing_estimate[
-                        "confirmation_preflight_sources_checked"
-                    ],
-                },
-            )
+            persist_confirmation_preflight(run_root, confirmation_preflight_elapsed_seconds,
+                                           preflight_status_rows)
         _write_automatic_run_json(run_root / "output-capacity-preflight.json", batch_capacity)
         APP_LOGGER.info(
             "automatic run output folder created",

@@ -28,8 +28,10 @@ SNAPSHOT_FIELDS = frozenset({
     'run_control', 'batch_inspection_context', 'anythingllm_resolved_state',
     'compatibility', 'resolved_state', 'global_read_only',
     'resolved_runtime_state', 'legacy_summary', 'evidence',
+    'storage_report',
 })
 MINIMUM_BYTES = 4096
+ROOT_SNAPSHOT_ARTIFACTS = frozenset({'lancedb-before.json', 'column-explanations.json'})
 
 
 class RunEvidenceError(RuntimeError):
@@ -52,10 +54,10 @@ def _private_root(path):
     return application_paths()['run_state'].resolve().joinpath(*relative.parts[:2])
 
 
-def _store(pool, data):
+def _store(pool, data, suffix='.json'):
     digest = hashlib.sha256(data).hexdigest()
     pool.mkdir(parents=True, exist_ok=True)
-    target = pool / (digest + '.json')
+    target = pool / (digest + suffix)
     if target.exists():
         if target.read_bytes() != data:
             raise ValueError('Run evidence snapshot integrity mismatch')
@@ -91,10 +93,23 @@ def _store(pool, data):
     return digest
 
 
+def store_shared_static_file(path):
+    """Share audited static CSV/Markdown bytes within one private run."""
+    path = Path(path)
+    root = _private_root(path)
+    if root is None:
+        return path
+    if path.suffix not in {'.csv', '.md'} or path.is_symlink():
+        raise ValueError('Unsupported shared static artifact')
+    pool = root / DIRECTORY
+    digest = _store(pool, path.read_bytes(), path.suffix)
+    return pool / (digest + path.suffix)
+
+
 def prepare_private_json(path, payload: Any) -> Any:
     """Return a storage representation without mutating the caller's objects."""
     root = _private_root(path)
-    if root is None or Path(path).name not in ARTIFACTS:
+    if root is None or Path(path).name not in ARTIFACTS | ROOT_SNAPSHOT_ARTIFACTS:
         return payload
     pool = root / DIRECTORY
 
@@ -111,7 +126,12 @@ def prepare_private_json(path, payload: Any) -> Any:
                 return {'$run_evidence': 1, 'sha256': _store(pool, data)}
         return transformed
 
-    return visit(payload)
+    transformed = visit(payload)
+    if Path(path).name in ROOT_SNAPSHOT_ARTIFACTS:
+        data = _encoded(transformed)
+        if len(data) >= MINIMUM_BYTES:
+            return {'$run_evidence': 1, 'sha256': _store(pool, data)}
+    return transformed
 
 
 def read_run_json(path) -> Any:

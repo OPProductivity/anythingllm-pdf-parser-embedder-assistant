@@ -1,9 +1,28 @@
-"""Run-local static artifact aliases, without filesystem links or blob names."""
+"""Canonical document artifacts and verified run-local shared static evidence."""
 
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
+
+
+def checked_role_path(root, relative):
+    root = Path(root).resolve()
+    relative = Path(relative)
+    path = root / relative
+    if relative.is_absolute() or path.is_symlink():
+        raise ValueError('Unsafe canonical artifact role')
+    target = path.resolve()
+    if target.is_relative_to(root):
+        return target
+    pool = next((parent / '.run-evidence' for parent in root.parents
+                 if (parent / '.run-evidence').is_dir()), None)
+    if (pool is None or pool.is_symlink() or target.parent != pool.resolve()
+            or target.suffix not in {'.csv', '.md'} or not re.fullmatch(r'[0-9a-f]{64}', target.stem)
+            or hashlib.sha256(target.read_bytes()).hexdigest() != target.stem):
+        raise ValueError('Unsafe canonical artifact escapes its document or verified shared pool')
+    return target
 
 
 class CanonicalArtifacts:
@@ -14,15 +33,16 @@ class CanonicalArtifacts:
         self.writer = writer
         self.index = {}
         self.roles = {}
+        from manifest_text import ManifestTextWriter
+
+        self.manifest_text = ManifestTextWriter(self.root)
         for path in existing:
             if Path(path).is_file():
                 self.register(path)
 
     def checked(self, path):
         path = Path(path)
-        if path.is_symlink() or not path.resolve().is_relative_to(self.root):
-            raise ValueError('Canonical artifact must stay within its document run')
-        return path.resolve()
+        return checked_role_path(self.root, os.path.relpath(path, self.root))
 
     def register(self, path):
         path = self.checked(path)
@@ -35,7 +55,18 @@ class CanonicalArtifacts:
 
     def role(self, preferred, actual):
         preferred, actual = self.checked(preferred), self.checked(actual)
-        self.roles[str(preferred.relative_to(self.root))] = str(actual.relative_to(self.root))
+        self.roles[str(preferred.relative_to(self.root))] = os.path.relpath(actual, self.root)
+        return actual
+
+    def shared_file(self, preferred):
+        from run_evidence import store_shared_static_file
+
+        preferred = self.checked(preferred)
+        actual = store_shared_static_file(preferred)
+        self.register(actual)
+        self.role(preferred, actual)
+        if actual != preferred:
+            preferred.unlink()
         return actual
 
     def copy(self, source, preferred):
@@ -83,7 +114,9 @@ class CanonicalArtifacts:
         return None
 
     def jsonl(self, preferred, rows):
-        return self.text(preferred, ''.join(json.dumps(row, ensure_ascii=False) + '\n' for row in rows))
+        return self.text(preferred, ''.join(json.dumps(self.manifest_text.record(row),
+                                                      ensure_ascii=False, separators=(',', ':')) + '\n'
+                                            for row in rows))
 
     def remove_empty_alias_directories(self):
         for role, actual in self.roles.items():

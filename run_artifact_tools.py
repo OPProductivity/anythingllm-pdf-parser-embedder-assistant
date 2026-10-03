@@ -1,10 +1,9 @@
 """Explicit, local-only rendering of optional artifacts from retained run evidence."""
 
 import argparse
-import json
 from pathlib import Path, PureWindowsPath
 
-from canonical_artifacts import CanonicalArtifacts
+from canonical_artifacts import CanonicalArtifacts, checked_role_path
 from run_evidence import read_run_json
 
 
@@ -14,16 +13,18 @@ def evidence_path(root, role):
     index = read_run_json(index_path) if index_path.is_file() else {}
     roles = {PureWindowsPath(key).as_posix(): value for key, value in index.get('roles', {}).items()}
     relative = PureWindowsPath(roles.get(PureWindowsPath(role).as_posix(), role))
-    path = root.joinpath(*relative.parts)
-    if relative.anchor or path.is_symlink() or not path.resolve().is_relative_to(root):
+    if relative.anchor:
         raise ValueError(f'Unsafe run artifact: {role}')
+    path = checked_role_path(root, Path(*relative.parts))
     if not path.is_file():
         raise FileNotFoundError(f'Missing run artifact: {role}')
     return path
 
 
 def read_rows(path):
-    return [json.loads(line) for line in Path(path).read_text(encoding='utf8').splitlines() if line.strip()]
+    from manifest_text import read_manifest_rows
+
+    return read_manifest_rows(path)
 
 
 def artifact_catalog(root, writer):

@@ -3153,9 +3153,11 @@ def normalize_metadata_title(value):
     lowered = title.casefold().strip()
     if re.fullmatch(
         r"(?:untitled(?: document)?|new document|document(?: \d+)?|scan(?: \d+)?|"
-        r"some[ _-]?title|document[ _-]?title|pdf[ _-]?title)",
+        r"some[ _-]?title|document[ _-]?title|pdf[ _-]?title|no job name)",
         lowered,
     ):
+        return ""
+    if re.fullmatch(r"OP-[A-Z]+\d+\s+\d+\.\.\d+", title):
         return ""
     # A source-layout/office extension in Title metadata is a strong sign of
     # an internal production filename, including short names such as
@@ -3180,6 +3182,11 @@ def resolve_title_from_metadata_or_filename(
     if metadata_value:
         return {"title": metadata_value, "source": "pdf_metadata"}
     filename_value = normalize_text(Path(path).stem)
+    catalog_parts = filename_value.split("--")
+    if len(catalog_parts) >= 3 and looks_like_person_name(
+        catalog_parts[1].strip(), title_hint=catalog_parts[0], allow_all_caps=True,
+    ):
+        filename_value = normalize_text(catalog_parts[0])
     if use_file_title_fallback and filename_value:
         return {"title": filename_value, "source": "filename_fallback"}
     return {"title": "Untitled PDF", "source": "generated_placeholder"}
@@ -4574,19 +4581,17 @@ def finalize_deferred_batch_lean_retention(out_root: Path, summary):
 
     segments = []
     try:
-        with manifest_path.open("r", encoding="utf-8") as handle:
-            for line_number, line in enumerate(handle, start=1):
-                if not line.strip():
-                    continue
-                row = json.loads(line)
-                if not isinstance(row, dict) or "text" not in row:
-                    return {
-                        "applied": False,
-                        "reason": "selected_segment_manifest_invalid",
-                        "line": line_number,
-                    }
-                segments.append(row)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        from manifest_text import read_manifest_rows
+
+        for line_number, row in enumerate(read_manifest_rows(manifest_path), start=1):
+            if not isinstance(row, dict) or not isinstance(row.get("text"), str):
+                return {
+                    "applied": False,
+                    "reason": "selected_segment_manifest_invalid",
+                    "line": line_number,
+                }
+            segments.append(row)
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
         return {
             "applied": False,
             "reason": "selected_segment_manifest_unreadable",
@@ -10340,12 +10345,15 @@ def write_native_metadata_test_kit(segments, out_dir: Path, workspace_slug="test
             "", "Rows without text_file retain their source text in text_manifest, keyed by segment_id.",
             'Materialize manual payloads when needed: python -m run_artifact_tools "DOCUMENT_RUN_DIRECTORY" --kind manual-kits',
         ])
-    (out_dir / f"{prefix}test-checklist.md").write_text("\n".join(checklist) + "\n", encoding="utf-8")
+    checklist_path = out_dir / f"{prefix}test-checklist.md"
+    checklist_path.write_text("\n".join(checklist) + "\n", encoding="utf-8")
+    if artifact_catalog:
+        checklist_path = artifact_catalog.shared_file(checklist_path)
     return {
         "files_dir": "" if artifact_catalog else str(files_dir),
         "zip_file": "",
         "upload_plan": str(out_dir / f"{prefix}upload-plan.csv"),
-        "checklist": str(out_dir / f"{prefix}test-checklist.md"),
+        "checklist": str(checklist_path),
         "file_count": len(rows),
     }
 
@@ -16590,16 +16598,14 @@ def unique_lancedb_workspace_name(value, storage_dir=None):
 
 
 def _merge_embedding_runtime_events(aggregate, incoming):
-    """Preserve total observations independently of the bounded event tail."""
+    """Keep complete observations; only the recovery ledger uses a short tail."""
     previous = list(aggregate.get("runtime_events") or [])
     additions = list(incoming.get("runtime_events") or [])
     aggregate["runtime_event_count"] = (
         max(len(previous), int(aggregate.get("runtime_event_count") or 0))
         + max(len(additions), int(incoming.get("runtime_event_count") or 0))
     )
-    aggregate["runtime_events"] = (
-        previous + additions
-    )[-ANYTHINGLLM_EMBEDDING_RUNTIME_EVENT_TAIL_LIMIT:]
+    aggregate["runtime_events"] = previous + additions
 
 
 def _write_embedding_batch_ledger(ledger_path, workspace_slug, result):
@@ -16612,6 +16618,9 @@ def _write_embedding_batch_ledger(ledger_path, workspace_slug, result):
         int(result.get("runtime_event_count") or 0),
     )
     runtime_event_tail = runtime_events[-ANYTHINGLLM_EMBEDDING_RUNTIME_EVENT_TAIL_LIMIT:]
+    from runtime_event_journal import retain_runtime_events
+
+    journal = retain_runtime_events(ledger_path.with_suffix('.events.jsonl'), runtime_events)
     payload = {
             "updated_at": datetime.now().isoformat(timespec="seconds"),
             "workspace_slug": workspace_slug,
@@ -16630,14 +16639,13 @@ def _write_embedding_batch_ledger(ledger_path, workspace_slug, result):
         "final_verification_required": bool(result.get("final_verification_required")),
         "batches": result.get("batches", []),
         "inflight_batch": result.get("inflight_batch"),
-        # Full SSE transcripts are diagnostic noise once a source window is
-        # terminal. Retaining all of them made this ledger grow with every PDF
-        # and then rewrote that growth after every later source. Keep a fixed
-        # tail plus an honest total so recovery state remains compact and
-        # operators can still see the immediately preceding events.
+        # Recovery stays bounded; complete observations are appended once to
+        # the journal rather than lost or repeatedly rewritten in this ledger.
         "runtime_events": runtime_event_tail,
         "runtime_event_count": runtime_event_count,
         "runtime_events_truncated": runtime_event_count > len(runtime_event_tail),
+        "runtime_event_journal": journal,
+        "runtime_event_history_complete": runtime_event_count == len(runtime_events),
         "errors": result.get("errors", []),
         # Keep the prepared location's originating PDF beside the recovery
         # plan.  Locations are the only authority for resubmission, while the
@@ -25618,7 +25626,11 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         shutil.copy2(src_candidate_dir / "native-header-chunk-audit.csv", selected_dir / "native-header-chunk-audit.csv")
     page_parent_rows = build_page_parent_rows(selected["segments"])
     child_parent_rows = build_child_parent_map(selected["segments"], page_parent_rows)
-    append_jsonl(selected_dir / "page-parent-manifest.jsonl", page_parent_rows)
+    page_parent_manifest_path = selected_dir / "page-parent-manifest.jsonl"
+    if artifact_catalog:
+        page_parent_manifest_path = artifact_catalog.jsonl(page_parent_manifest_path, page_parent_rows)
+    else:
+        append_jsonl(page_parent_manifest_path, page_parent_rows)
     write_csv(selected_dir / "child-parent-map.csv", child_parent_rows)
     provenance_review_manifest = write_provenance_review_manifest(
         selected_dir,
@@ -25658,18 +25670,13 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             target_path = selected_dir / filename
             if source_path.exists():
                 if key == "manifest":
-                    variant_rows_for_identity = []
-                    for raw_line in source_path.read_text(encoding="utf-8").splitlines():
-                        if not raw_line.strip():
-                            continue
-                        try:
-                            variant_rows_for_identity.append(json.loads(raw_line))
-                        except json.JSONDecodeError:
-                            # The candidate artifact remains available for
-                            # diagnostics; do not convert a malformed optional
-                            # variant manifest into a preparation failure.
-                            variant_rows_for_identity = []
-                            break
+                    from manifest_text import read_manifest_rows
+
+                    try:
+                        variant_rows_for_identity = read_manifest_rows(source_path)
+                    except ValueError:
+                        # Keep a malformed optional variant diagnostic-only.
+                        variant_rows_for_identity = []
                     if variant_rows_for_identity:
                         apply_source_identity_to_segments(variant_rows_for_identity, source_meta)
                         if artifact_catalog:
@@ -26066,6 +26073,9 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     column_explanation_rows = explain_observed_columns(workspace_layer_report)
     write_csv(inspection_dir / "column-explanations.csv", column_explanation_rows)
     write_json(inspection_dir / "column-explanations.json", column_explanation_rows)
+    column_explanations_path = inspection_dir / "column-explanations.csv"
+    if artifact_catalog:
+        column_explanations_path = artifact_catalog.shared_file(column_explanations_path)
 
     upload_report = {"status": "skipped_prepare_only", "uploaded": 0, "errors": []}
     embedding_batch_ledger_path = inspection_dir / "embedding-batch-ledger.json"
@@ -27060,6 +27070,9 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     column_explanation_rows = explain_observed_columns(workspace_layer_report)
     write_csv(inspection_dir / "column-explanations.csv", column_explanation_rows)
     write_json(inspection_dir / "column-explanations.json", column_explanation_rows)
+    column_explanations_path = inspection_dir / "column-explanations.csv"
+    if artifact_catalog:
+        column_explanations_path = artifact_catalog.shared_file(column_explanations_path)
     failed_embedding_checkpoint = next(
         (
             batch
@@ -28186,7 +28199,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         ),
         "page_transition_continuations_detected": sum(bool(row.get("continuation_detected")) for row in transition_rows),
         "optional_text_artifact_policy": "on_demand" if artifact_catalog else "standalone",
-        "page_parent_manifest": str(selected_dir / "page-parent-manifest.jsonl"),
+        "page_parent_manifest": str(page_parent_manifest_path),
         "child_parent_map": str(selected_dir / "child-parent-map.csv"),
         "layout_region_review": str(selected_artifact_path(selected, selected_dir, "layout-region-review.json")),
         "visual_text_review_artifact": str(selected_artifact_path(selected, selected_dir, "visual-text-review.json")),
@@ -28223,7 +28236,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         "storage_sample_custom_document_title": sample_custom_document_title,
         "storage_sample_lancedb_title": sample_lancedb_title,
         "metadata_layer_visibility": str(inspection_dir / "metadata-layer-visibility.csv"),
-        "column_explanations": str(inspection_dir / "column-explanations.csv"),
+        "column_explanations": str(column_explanations_path),
         "author_inference_evaluation_status": author_eval.get("status", "complete"),
         "author_inference_evaluation_csv": author_eval.get("csv", ""),
         "author_inference_evaluation_json": author_eval.get("json", ""),

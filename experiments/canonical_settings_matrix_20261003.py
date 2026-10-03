@@ -57,7 +57,8 @@ def run():
     kit_followup = '--kit-followup' in sys.argv
     optional_followup = '--optional-followup' in sys.argv
     parent_followup = '--parent-followup' in sys.argv
-    receipts = Path('tmp-output/' + ('optional-parent-followup-20261003' if parent_followup else
+    receipts = Path('tmp-output/' + ('run-log-repair-matrix-20261003' if '--repair-followup' in sys.argv else
+                                   'optional-parent-followup-20261003' if parent_followup else
                                    'optional-artifact-followup-20261003' if optional_followup else
                                    'canonical-kit-followup-20261003' if kit_followup
                                    else 'canonical-settings-matrix-20261003')).resolve()
@@ -142,7 +143,7 @@ def run():
                     assert summary['include_back_matter'] == settings['include_back_matter']
                     if settings['segment_mode'] == 'custom_page_ranges':
                         assert summary['custom_page_group_sizes'] == [2, 3]
-                    manifest = [json.loads(line) for line in Path(summary['manifest']).read_text(encoding='utf8').splitlines()]
+                    manifest = read_rows(Path(summary['manifest']))
                     if settings.get('first_page_override'):
                         assert all(settings['first_page_override'] <= row['pdf_page'] <= settings['end_page_override']
                                    for row in manifest)
@@ -197,7 +198,7 @@ def run():
                             before_summary = (moved / 'run-summary.json').read_bytes()
                             for kind in ('diagnostic-text', 'manual-kits', 'upload-alternatives'):
                                 generated = materialize_optional_artifacts(moved, kind)
-                                assert all(path.is_file() and path.resolve().is_relative_to(moved.resolve())
+                                assert all(path.is_file() and path.resolve().is_relative_to(Path(scratch).resolve())
                                            for path in generated)
                             for representation in ('segments', 'page-parents'):
                                 for mode in ('strict', 'native_header'):
