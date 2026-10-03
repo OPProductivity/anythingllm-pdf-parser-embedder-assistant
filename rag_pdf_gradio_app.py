@@ -10460,6 +10460,7 @@ DIAGNOSTIC_EVIDENCE_ROOT_FILES = (
     "run-result.json",
     "run-summary.json",
     "source-profile.json",
+    "artifact-locations.json",
 )
 
 
@@ -10477,7 +10478,32 @@ def diagnostic_evidence_paths(run_directory):
         candidate = root / name
         if candidate.is_file():
             paths.append(candidate)
-    return paths, ""
+    from run_evidence import RunEvidenceError, run_json_snapshot_dependencies
+
+    dependencies = set()
+    try:
+        index_path = root / "artifact-locations.json"
+        if index_path.is_file():
+            index = json.loads(index_path.read_text(encoding="utf-8"))
+            resolved_root = root.resolve()
+            directories = [path.resolve() for path in paths if path.is_dir()]
+            for relative in set(index["roles"].values()):
+                candidate = root / relative
+                if (Path(relative).is_absolute() or candidate.is_symlink()
+                        or not candidate.resolve().is_relative_to(resolved_root)
+                        or not candidate.is_file()):
+                    raise ValueError(f"Missing or unsafe canonical artifact: {relative}")
+                if not any(candidate.resolve().is_relative_to(directory) for directory in directories):
+                    paths.append(candidate)
+        for path in paths:
+            records = path.rglob("*.json") if path.is_dir() else [path]
+            for record in records:
+                if record.suffix == ".json":
+                    dependencies.update(run_json_snapshot_dependencies(record))
+    except (OSError, ValueError, KeyError, TypeError, RunEvidenceError) as exc:
+        return [], f"Could not collect complete diagnostics evidence: {exc}"
+    paths.extend(sorted(dependencies))
+    return clean_existing_paths(paths), ""
 
 
 def export_run_diagnostics_evidence(run_directory):
@@ -31392,7 +31418,7 @@ def run_automatic(
         if summary.get("upload_file"):
             base_dir = Path(summary["upload_file"]).parent
             for derived in ["outline-validation.csv", "native-header-chunk-audit.csv"]:
-                candidate = base_dir / derived
+                candidate = Path((summary.get("artifact_paths") or {}).get(derived) or base_dir / derived)
                 if candidate.exists():
                     downloadable.append(str(candidate))
         native_kit = summary.get("native_test_kit") or {}

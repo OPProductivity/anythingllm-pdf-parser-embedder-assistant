@@ -121,6 +121,17 @@ def read_run_json(path) -> Any:
     cannot escape the nearest run-local evidence pool. Missing or corrupt
     evidence fails visibly rather than masquerading as an empty setting.
     """
+    return _read_run_json(path, set())
+
+
+def run_json_snapshot_dependencies(path):
+    """Return only the verified snapshots needed to transport one record."""
+    dependencies = set()
+    _read_run_json(path, dependencies)
+    return sorted(dependencies)
+
+
+def _read_run_json(path, dependencies):
     path = Path(path)
     pool = None
     cache = {}
@@ -143,6 +154,7 @@ def read_run_json(path) -> Any:
                 target = pool / (digest + '.json')
                 if target.is_symlink() or not target.resolve().is_relative_to(pool.resolve()):
                     raise RunEvidenceError('Run evidence snapshot escapes its pool')
+                dependencies.add(target)
                 if digest in resolving:
                     raise RunEvidenceError('Cyclic run evidence reference')
                 if digest not in cache:

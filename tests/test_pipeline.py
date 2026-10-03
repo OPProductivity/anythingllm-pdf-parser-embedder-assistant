@@ -3643,96 +3643,40 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn("(attempt 2)", retry)
         self.assertNotIn("unrecognized", record)
 
-    def test_sse_observer_survives_idle_disconnects_until_owner_stops_it(self):
-        """A restarted Desktop must not lose its queue observer after two idle reads."""
-        class FakeStopEvent:
-            def __init__(self):
-                self.stopped = False
-                self.waits = []
-
-            def is_set(self):
-                return self.stopped
-
-            def set(self):
-                self.stopped = True
-
-            def wait(self, seconds=None):
-                self.waits.append(seconds)
-                return self.stopped
-
-        class FakeResponse:
-            def __init__(self, *, timeout=False):
-                self.timeout = timeout
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return False
-
-            def __iter__(self):
-                return self
-
-            def __next__(self):
-                if self.timeout:
-                    raise TimeoutError("idle stream boundary")
-                raise StopIteration
-
-        original_urlopen = pipeline.urllib.request.urlopen
-        stop = FakeStopEvent()
-        calls = []
-        try:
-            def urlopen(_request, timeout):
-                calls.append(timeout)
-                if len(calls) < 3:
-                    return FakeResponse(timeout=True)
-                stop.set()
-                return FakeResponse()
-
-            pipeline.urllib.request.urlopen = urlopen
-            pipeline.listen_for_anythingllm_embed_progress(
-                "http://127.0.0.1:3001",
-                "",
-                "workspace",
-                [],
-                stop,
-            )
-        finally:
-            pipeline.urllib.request.urlopen = original_urlopen
-
-        self.assertEqual(len(calls), 3)
-        self.assertTrue(stop.stopped)
-        self.assertEqual(stop.waits, [0.75, 0.75])
-
-    def test_sse_observer_stops_before_relaying_buffered_events_after_owner_returns(self):
-        """A stopped owner must not publish a second buffered SSE frame."""
-        class FakeResponse:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return False
-
-            def __iter__(self):
-                return iter([
-                    b'data: {"type":"doc_starting","filename":"custom/a.json"}\n',
-                    b'\n',
-                    b'data: {"type":"doc_complete","filename":"custom/a.json"}\n',
-                    b'\n',
-                ])
+    def test_sse_observer_relays_correlated_payloads_from_transport(self):
+        from unittest.mock import patch
 
         stop = threading.Event()
         observed = []
-        original_urlopen = pipeline.urllib.request.urlopen
-        try:
-            pipeline.urllib.request.urlopen = lambda *_args, **_kwargs: FakeResponse()
+
+        def transport(_endpoints, _key, _stop, callback, **_kwargs):
+            callback('{"type":"doc_starting","filename":"custom/foreign.json"}')
+            callback('{"type":"doc_starting","filename":"custom/a.json"}')
+            callback('{"type":"doc_starting","filename":"custom/a.json"}')
+            callback('{"type":"all_complete"}')
+
+        with patch("ingestion_observation.listen_to_progress_stream", side_effect=transport):
+            pipeline.listen_for_anythingllm_embed_progress(
+                "http://127.0.0.1:3001", "", "workspace", ["custom/a.json"], stop,
+                event_callback=observed.append,
+            )
+        self.assertEqual([event["type"] for event in observed], ["doc_starting", "all_complete"])
+
+    def test_sse_observer_stops_before_relaying_buffered_events_after_owner_returns(self):
+        from unittest.mock import patch
+
+        stop = threading.Event()
+        observed = []
+
+        def transport(_endpoints, _key, _stop, callback, **_kwargs):
+            callback('{"type":"doc_starting","filename":"custom/a.json"}')
+            callback('{"type":"doc_complete","filename":"custom/a.json"}')
+
+        with patch("ingestion_observation.listen_to_progress_stream", side_effect=transport):
             pipeline.listen_for_anythingllm_embed_progress(
                 "http://127.0.0.1:3001", "", "workspace", ["custom/a.json"], stop,
                 event_callback=lambda event: observed.append(event) or stop.set(),
             )
-        finally:
-            pipeline.urllib.request.urlopen = original_urlopen
-
         self.assertEqual([event["type"] for event in observed], ["doc_starting"])
 
     def test_automatic_timing_html_shows_one_estimate_without_a_range(self):

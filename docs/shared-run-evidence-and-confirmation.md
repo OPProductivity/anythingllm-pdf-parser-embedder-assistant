@@ -32,7 +32,7 @@ Stopping/joining the listener remains separately bounded.
 
 Other inspected waits serve distinct purposes and are retained: transient
 Windows sharing-violation backoff, explicit HTTP 429 refusal recovery, SSE
-reconnection without a server heartbeat, runtime-readiness probing, and bounded
+reconnection after an actual disconnect, runtime-readiness probing, and bounded
 ambiguous attachment recovery. Resolved observer errors and deliberately
 abandoned late HTTP responses remain diagnostic evidence, not automatic reasons
 to resubmit. This is not a claim that every timer has been audited or removed.
@@ -67,6 +67,12 @@ Small fields, mutable status envelopes, JSONL journals, source text, alternate
 extraction artifacts and native payloads remain self-contained. Therefore this
 is deliberately not zero duplication across every artifact. Further text/file
 consolidation requires proving its extraction, provenance and replay contracts.
+
+The optional diagnostics exporter includes the verified, transitively reachable
+snapshot files beside the selected record. It does not include unrelated pool
+entries. Its existing ZIP layout preserves the common run parent so extracted
+records resolve normally. Missing or corrupt dependencies block that export.
+Normal TXT downloads and output-folder retention are unaffected.
 
 ## Qualification
 

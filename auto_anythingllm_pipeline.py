@@ -8952,6 +8952,11 @@ def write_provenance_review_manifest(
     canonical files and explains whether the selected extraction had observed
     OCR assistance.  All paths remain inside this run's artifact directory.
     """
+    from canonical_artifacts import selected_artifact_path
+
+    def artifact(name):
+        return os.path.relpath(selected_artifact_path(selected, selected_dir, name), selected_dir)
+
     quality = selected.get("quality") or {}
     selected_backend = str(selected.get("backend") or "")
     ocr_execution = dict(selected.get("pymupdf4llm_execution") or {})
@@ -8979,17 +8984,17 @@ def write_provenance_review_manifest(
             "pymupdf4llm_execution": ocr_execution,
         },
         "review_artifacts": {
-            "canonical_extracted_text": "anythingllm-upload.txt",
-            "segment_manifest": "segment-manifest.jsonl",
-            "extraction_report": "extraction-report.csv",
+            "canonical_extracted_text": artifact("anythingllm-upload.txt"),
+            "segment_manifest": artifact("segment-manifest.jsonl"),
+            "extraction_report": artifact("extraction-report.csv"),
             "page_parent_manifest": "page-parent-manifest.jsonl",
             "child_parent_map": "child-parent-map.csv",
             "page_transition_manifest": "page-transition-manifest.jsonl",
-            "layout_region_review": "layout-region-review.json",
-            "retrieval_lane_review": "retrieval-lane-review.json",
+            "layout_region_review": artifact("layout-region-review.json"),
+            "retrieval_lane_review": artifact("retrieval-lane-review.json"),
             "supplementary_lane_candidates": (
-                "supplementary-content-candidates.txt"
-                if (selected_dir / "supplementary-content-candidates.txt").is_file()
+                artifact("supplementary-content-candidates.txt")
+                if selected_artifact_path(selected, selected_dir, "supplementary-content-candidates.txt").is_file()
                 else ""
             ),
         },
@@ -9183,22 +9188,23 @@ def evaluate_edge_cases(
         ),
         payload_meta.get("description", "")[:220],
     )
-    add(
-        "primary_clean_text_artifact",
-        check_status((selected_dir / "anythingllm-upload.txt").exists()),
-        str(selected_dir / "anythingllm-upload.txt"),
-    )
+    from canonical_artifacts import selected_artifact_path
+
+    primary_body = selected_artifact_path(selected, selected_dir, "anythingllm-upload.txt")
+    add("primary_clean_text_artifact", check_status(primary_body.exists()), str(primary_body))
     if selected.get("chunk_eval", {}).get("status") != "disabled":
         add(
             "fallback_inline_artifact",
             check_status(
-                (selected_dir / "anythingllm-upload-inline-metadata-fallback.txt").exists(),
+                selected_artifact_path(selected, selected_dir, "anythingllm-upload-inline-metadata-fallback.txt").exists(),
                 warn=True,
             ),
-            str(selected_dir / "anythingllm-upload-inline-metadata-fallback.txt"),
+            str(selected_artifact_path(selected, selected_dir, "anythingllm-upload-inline-metadata-fallback.txt")),
         )
-    add("frontmatter_variant", check_status((selected_dir / "anythingllm-upload-frontmatter-and-body.txt").exists(), warn=True), "optional variant")
-    add("endmatter_variant", check_status((selected_dir / "anythingllm-upload-body-with-endmatter.txt").exists(), warn=True), "optional variant")
+    for check, variant in (("frontmatter_variant", "frontmatter-and-body"), ("endmatter_variant", "body-with-endmatter")):
+        path = Path((selected.get("variant_outputs", {}).get(variant) or {}).get("upload_file")
+                    or selected_dir / f"anythingllm-upload-{variant}.txt")
+        add(check, check_status(path.exists(), warn=True), "optional variant")
     layout = selected.get("layout_evidence") or {}
     if int(layout.get("removed_marginalia_count") or 0):
         add(
@@ -10258,16 +10264,20 @@ def representation_recommendation_rows(harmonization_report_rows):
     ]
 
 
-def write_native_metadata_test_kit(segments, out_dir: Path, workspace_slug="test", artifact_prefix=""):
+def write_native_metadata_test_kit(segments, out_dir: Path, workspace_slug="test", artifact_prefix="", *, artifact_catalog=None):
     out_dir.mkdir(parents=True, exist_ok=True)
     prefix = f"{safe_stem(artifact_prefix)}-" if artifact_prefix else "manual-"
     files_dir = out_dir / f"{prefix}segment-files"
-    files_dir.mkdir(parents=True, exist_ok=True)
+    if not artifact_catalog:
+        files_dir.mkdir(parents=True, exist_ok=True)
     rows = []
     for row in segments:
         filename = native_segment_filename(row)
         path = files_dir / filename
-        path.write_text(row["text"], encoding="utf-8")
+        if artifact_catalog:
+            path = artifact_catalog.text(path, row["text"])
+        else:
+            path.write_text(row["text"], encoding="utf-8")
         rows.append(
             {
                 "filename": filename,
@@ -10293,7 +10303,9 @@ def write_native_metadata_test_kit(segments, out_dir: Path, workspace_slug="test
         f"Target workspace: `{workspace_slug}`",
         "",
         "1. Confirm the target workspace's configured chat model is available in AnythingLLM.",
-        "2. Upload the generated manual segment files, or use the raw-text payloads if API access becomes available.",
+        ("2. Upload the TXT files referenced by the upload plan, or use the raw-text payloads if API access becomes available."
+         if artifact_catalog else
+         "2. Upload the generated manual segment files, or use the raw-text payloads if API access becomes available."),
         "3. After upload, run the tool's read-only verification again against the same workspace.",
         "4. Check whether page/segment information survives in workspace document metadata and LanceDB rows.",
         "5. Ask an AnythingLLM query for a known phrase and verify whether the answer can cite page/segment from native metadata.",
@@ -10301,9 +10313,15 @@ def write_native_metadata_test_kit(segments, out_dir: Path, workspace_slug="test
         "Primary native metadata strategy: clean passage text plus page/segment/chapter in title, description, docSource, and chunkSource.",
         "Fallback strategy: use the generated inline-marker upload file only if native metadata is not LLM-visible.",
     ]
+    if artifact_catalog:
+        checklist.extend([
+            "", "The plan references canonical files elsewhere in this run; this kit folder alone is not portable.",
+            "Use the complete diagnostics evidence bundle to include those files for inspection or transfer.",
+            "The CSV records expected metadata; uploading a TXT through the Desktop UI does not automatically apply its CSV fields.",
+        ])
     (out_dir / f"{prefix}test-checklist.md").write_text("\n".join(checklist) + "\n", encoding="utf-8")
     return {
-        "files_dir": str(files_dir),
+        "files_dir": "" if artifact_catalog else str(files_dir),
         "zip_file": "",
         "upload_plan": str(out_dir / f"{prefix}upload-plan.csv"),
         "checklist": str(out_dir / f"{prefix}test-checklist.md"),
@@ -13523,10 +13541,8 @@ def listen_for_anythingllm_embed_progress(
     """Read Desktop's advisory SSE queue feed while a single update request is active.
 
     The feed is observational: failed or unavailable SSE must never fail an
-    embedding request.  A short socket timeout lets the daemon listener stop
-    promptly after the synchronous update response returns. Once the stream
-    has connected, an idle socket timeout is treated as an ordinary polling
-    boundary, not as evidence that Desktop's queue is unavailable.
+    embedding request. A heartbeat-free stream stays connected through quiet
+    embedding intervals; its owner's stop event cancels the pending async read.
     """
     # Desktop builds have shipped both route mounts.  The ordinary API calls
     # accept ``/api/v1`` on this installation, while the live progress stream
@@ -13538,7 +13554,6 @@ def listen_for_anythingllm_embed_progress(
         api_url.rstrip("/") + f"/api/v1/workspace/{workspace_slug}/embed-progress",
         api_url.rstrip("/") + f"/api/workspace/{workspace_slug}/embed-progress",
     ]
-    endpoint_index = 0
     expected = {
         _normalized_anythingllm_document_location(location)
         for location in (expected_locations or [])
@@ -13546,119 +13561,31 @@ def listen_for_anythingllm_embed_progress(
     }
     matched_locations = set()
     seen_events = set()
-    failures = 0
-    connected_once = False
-    while not stop_event.is_set():
-        headers = {"Accept": "text/event-stream", "Cache-Control": "no-cache"}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-        request = urllib.request.Request(endpoint_candidates[endpoint_index], headers=headers)
-        payload_lines = []
-        try:
-            with _api_urlopen(request, timeout=5) as response:
-                failures = 0
-                connected_once = True
-                if callable(state_callback):
-                    state_callback("connected", {"at_monotonic": time.monotonic(), "failures": 0})
-                if isinstance(connected_event, threading.Event):
-                    connected_event.set()
-                for raw_line in response:
-                    # Once the owning queue wrapper has returned, this
-                    # listener must not keep publishing a stale external
-                    # queue as though the assistant still owned a live run.
-                    # ``urlopen`` may have already buffered additional SSE
-                    # frames, so checking only the outer ``while`` allowed
-                    # progress updates to arrive after a terminal record.
-                    if stop_event.is_set():
-                        break
-                    # Do not abandon bytes that urllib has already buffered
-                    # just because the synchronous update returned. Its final
-                    # queue event is often sent immediately before that
-                    # response, and dropping it makes a completed document
-                    # look silently unobserved. The outer loop still honours
-                    # the stop request before opening another SSE connection.
-                    line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
-                    if line.startswith("data:"):
-                        payload_lines.append(line[5:].lstrip())
-                        continue
-                    if line or not payload_lines:
-                        continue
-                    event = parse_anythingllm_embed_progress_event("\n".join(payload_lines))
-                    payload_lines = []
-                    if not event:
-                        continue
-                    if not include_unmatched_events and not _anythingllm_embed_event_matches_locations(
-                        event, expected, matched_locations
-                    ):
-                        continue
-                    event_key = json.dumps(event, sort_keys=True, default=str)
-                    if event_key in seen_events:
-                        continue
-                    seen_events.add(event_key)
-                    if callable(event_callback):
-                        event_callback(event)
-            # A healthy Desktop stream stays open until the client closes it.
-            # Treat a clean EOF as a transient disconnect, rather than a
-            # zero-delay reconnect loop when Desktop is restarting. Do not
-            # retire the observer after two disconnects: a Desktop restart
-            # can occur while the app-owned queue remains active, and later
-            # SSE events are valuable progress evidence after it recovers.
-            if not stop_event.is_set():
-                if callable(state_callback):
-                    state_callback("reconnecting", {"at_monotonic": time.monotonic(), "reason": "stream_eof", "failures": failures})
-                if not connected_once:
-                    failures += 1
-                stop_event.wait(0.75 if connected_once else min(5.0, 0.25 * (2 ** min(failures, 4))))
-        except AuthenticatedRedirectError as exc:
-            if callable(state_callback):
-                state_callback("unavailable", {"at_monotonic": time.monotonic(), "reason": str(exc.reason), "failures": 1})
-            if callable(error_callback):
-                error_callback(str(exc.reason), 1)
+
+    def receive_payload(payload):
+        if stop_event.is_set():
             return
-        except urllib.error.HTTPError as exc:
-            if exc.code == 404 and endpoint_index + 1 < len(endpoint_candidates):
-                endpoint_index += 1
-                continue
-            if stop_event.is_set():
-                return
-            failures += 1
-            if callable(state_callback):
-                state_callback("reconnecting", {"at_monotonic": time.monotonic(), "reason": f"HTTP {exc.code}", "failures": failures})
-            # Keep the durable report useful during a long restart: record
-            # the first error and exponentially spaced repeats, not one row
-            # for every reconnect attempt.
-            if callable(error_callback) and (failures == 1 or failures & (failures - 1) == 0):
-                error_callback(f"HTTP {exc.code}", failures)
-            stop_event.wait(min(5.0, 0.25 * (2 ** min(failures, 4))))
-        except Exception as exc:
-            if stop_event.is_set():
-                return
-            failures += 1
-            # Desktop's SSE endpoint sends no heartbeat. A read timeout after
-            # a successful connection therefore means only that no new queue
-            # event arrived in this five-second observation window. Recording
-            # it as an outage produced a noisy and misleading run receipt.
-            if not connected_once:
-                failures += 1
-            if callable(state_callback):
-                state_callback(
-                    "reconnecting" if connected_once else "connecting",
-                    {"at_monotonic": time.monotonic(), "reason": type(exc).__name__, "failures": failures},
-                )
-            if (
-                not connected_once
-                and callable(error_callback)
-                and (failures == 1 or failures & (failures - 1) == 0)
-            ):
-                error_callback(str(exc), failures)
-            # After a successful connection, a socket timeout is merely an
-            # idle SSE boundary. Reconnect indefinitely (until the owning
-            # request ends) so a Desktop restart cannot silently remove the
-            # only live queue observer. Before the first connection use a
-            # small bounded exponential backoff instead of hammering a down
-            # local server.
-            delay = 0.75 if connected_once else min(5.0, 0.25 * (2 ** min(failures, 4)))
-            stop_event.wait(delay)
+        event = parse_anythingllm_embed_progress_event(payload)
+        if not event:
+            return
+        if not include_unmatched_events and not _anythingllm_embed_event_matches_locations(
+            event, expected, matched_locations
+        ):
+            return
+        event_key = json.dumps(event, sort_keys=True, default=str)
+        if event_key in seen_events:
+            return
+        seen_events.add(event_key)
+        if callable(event_callback):
+            event_callback(event)
+
+    from ingestion_observation import listen_to_progress_stream
+
+    listen_to_progress_stream(
+        endpoint_candidates, api_key, stop_event, receive_payload,
+        error_callback=error_callback, state_callback=state_callback,
+        connected_event=connected_event,
+    )
 
 
 def start_anythingllm_embed_progress_listener(
@@ -13684,7 +13611,9 @@ def start_anythingllm_embed_progress_listener(
     observed_errors = []
     observer_health = {"state": "connecting", "last_state_monotonic": time.monotonic(), "failures": 0, "reason": ""}
     health_lock = threading.Lock()
-    stop_event = threading.Event()
+    from ingestion_observation import StreamStopEvent
+
+    stop_event = StreamStopEvent()
     connected_event = threading.Event()
 
     def receive(event):
@@ -13864,6 +13793,7 @@ def post_multipart_form(
     api_key=None,
     timeout=120,
     file_bytes=None,
+    upload_filename=None,
 ):
     """POST one multipart file without reopening a validated staged file.
 
@@ -13889,7 +13819,9 @@ def post_multipart_form(
         add_text_part(key, value)
 
     mime_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
-    filename = Path(file_path).name
+    filename = str(upload_filename or Path(file_path).name)
+    if Path(filename).name != filename or any(value in filename for value in ('"', '\r', '\n')):
+        raise ValueError("Invalid multipart upload filename")
     if file_bytes is None:
         file_bytes = Path(file_path).read_bytes()
     else:
@@ -16083,7 +16015,7 @@ def choose_native_upload_transport(api_url, requested_transport="raw_text", uplo
     return transport
 
 
-def build_file_upload_rows_from_payloads(payloads, files_dir: Path):
+def build_file_upload_rows_from_payloads(payloads, files_dir: Path, *, artifact_catalog=None):
     files_dir = Path(files_dir)
     files_dir.mkdir(parents=True, exist_ok=True)
     rows = []
@@ -16094,7 +16026,11 @@ def build_file_upload_rows_from_payloads(payloads, files_dir: Path):
             title = str(metadata.get("title") or f"upload-{index:05d}").strip()
             filename = safe_stem(title)[:140].rstrip("-._ ") + ".txt"
         text_path = files_dir / filename
-        atomic_write_text(text_path, str(payload.get("textContent") or ""))
+        content = str(payload.get("textContent") or "")
+        if artifact_catalog:
+            text_path = artifact_catalog.text(text_path, content)
+        else:
+            atomic_write_text(text_path, content)
         rows.append(
             {
                 "filename": filename,
@@ -16614,6 +16550,19 @@ def unique_lancedb_workspace_name(value, storage_dir=None):
         if available(candidate):
             return candidate, suffix
     raise RuntimeError("Could not choose a unique safe workspace name after 9,999 attempts.")
+
+
+def _merge_embedding_runtime_events(aggregate, incoming):
+    """Preserve total observations independently of the bounded event tail."""
+    previous = list(aggregate.get("runtime_events") or [])
+    additions = list(incoming.get("runtime_events") or [])
+    aggregate["runtime_event_count"] = (
+        max(len(previous), int(aggregate.get("runtime_event_count") or 0))
+        + max(len(additions), int(incoming.get("runtime_event_count") or 0))
+    )
+    aggregate["runtime_events"] = (
+        previous + additions
+    )[-ANYTHINGLLM_EMBEDDING_RUNTIME_EVENT_TAIL_LIMIT:]
 
 
 def _write_embedding_batch_ledger(ledger_path, workspace_slug, result):
@@ -18484,20 +18433,7 @@ def update_workspace_embeddings_desktop_queue(
             })
             aggregate["batches"].append(child_batch)
             aggregate["accepted"] += int(child.get("accepted") or 0)
-            child_runtime_events = list(child.get("runtime_events") or [])
-            aggregate["runtime_event_count"] = (
-                int(aggregate.get("runtime_event_count") or 0)
-                + max(
-                    len(child_runtime_events),
-                    int(child.get("runtime_event_count") or 0),
-                )
-            )
-            # Do not retain every earlier source's raw SSE transcript in the
-            # aggregate. The counter above remains complete; this bounded
-            # diagnostic tail prevents O(n²) ledger rewrites for large runs.
-            aggregate["runtime_events"] = (
-                list(aggregate.get("runtime_events") or []) + child_runtime_events
-            )[-ANYTHINGLLM_EMBEDDING_RUNTIME_EVENT_TAIL_LIMIT:]
+            _merge_embedding_runtime_events(aggregate, child)
             child_errors = list(child.get("errors") or [])
             for error in child_errors:
                 aggregate["errors"].append({**dict(error), "source_path": source_path, "batch": window_index})
@@ -20051,6 +19987,8 @@ def maybe_upload_segment_files(
                     file_path=text_file,
                     api_key=api_key,
                     file_bytes=prepared_file_bytes,
+                    **({"upload_filename": row["filename"]}
+                       if row.get("filename") and row["filename"] != text_file.name else {}),
                 )
                 if 200 <= status < 300:
                     uploaded += 1
@@ -20994,10 +20932,7 @@ def maybe_upload_segment_files_source_transactions(
                     "source_paths": list(queue_source_paths),
                 })
                 aggregate["embedding_update"]["batches"].append(batch_copy)
-            aggregate["embedding_update"]["runtime_events"] = (
-                aggregate["embedding_update"]["runtime_events"]
-                + list(queue_update.get("runtime_events") or [])
-            )[-ANYTHINGLLM_EMBEDDING_RUNTIME_EVENT_TAIL_LIMIT:]
+            _merge_embedding_runtime_events(aggregate["embedding_update"], queue_update)
             queue_errors = list(queue_update.get("errors") or [])
             for error in queue_errors:
                 error_copy: dict[str, Any] = (
@@ -23908,7 +23843,7 @@ code{{background:#eee;padding:1px 4px}}</style></head>
 <p><b>Inline fallback marker overhead:</b> {marker_stats.get('marker_char_ratio', '')} of marker+content characters |
 <b>Average content chars:</b> {marker_stats.get('avg_content_chars', '')} |
 <b>Short segments under 180 chars:</b> {marker_stats.get('short_segments_under_180_chars', '')}</p>
-<p>The primary <code>anythingllm-upload.txt</code> contains clean passage text. {html.escape(fallback_note)}</p>
+<p>The primary <code>{html.escape(Path((selected.get('artifact_paths') or {}).get('anythingllm-upload.txt') or 'anythingllm-upload.txt').name)}</code> contains clean passage text. {html.escape(fallback_note)}</p>
 <p><b>PDF outline validation:</b> {html.escape(outline_validation.get('reliability', 'unknown'))}
 ({outline_validation.get('pass_rate', '')} sampled pass rate). Bookmark mismatches are treated as warnings/fallback signals.</p>
 <h2>Backend Scores</h2>
@@ -24281,6 +24216,9 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     ocr_cache_reused_pages = 0
 
     candidates = []
+    from canonical_artifacts import CanonicalArtifacts, selected_artifact_path
+
+    artifact_catalog = CanonicalArtifacts(out_root, atomic_write_text) if is_private_run_state_path(out_root) else None
     for backend_index, backend in enumerate(backend_names):
         complete_native_candidate = has_complete_native_text_candidate(
             candidates,
@@ -24394,6 +24332,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         )
         candidate_dir = out_root / "candidates" / backend
         candidate_dir.mkdir(parents=True, exist_ok=True)
+        candidate_artifact_paths = {}
         unstructured_circuit = getattr(args, "unstructured_circuit_breaker", None)
         if backend == "unstructured" and isinstance(unstructured_circuit, dict) and unstructured_circuit.get("blocked"):
             extraction_attempt_decisions[-1]["action"] = "blocked_by_existing_circuit"
@@ -24784,18 +24723,30 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 end_page=end_page,
             )
 
-            (candidate_dir / "anythingllm-upload.txt").write_text(upload_text, encoding="utf-8")
+            body_path = candidate_dir / "anythingllm-upload.txt"
+            if artifact_catalog:
+                body_path = artifact_catalog.text(body_path, upload_text)
+            else:
+                body_path.write_text(upload_text, encoding="utf-8")
+            candidate_artifact_paths["anythingllm-upload.txt"] = str(body_path)
             write_json(candidate_dir / "retrieval-lane-review.json", lane_review)
             write_json(candidate_dir / "visual-text-review.json", visual_text_review)
             write_supplementary_lane_candidate_text(
                 candidate_dir / "supplementary-content-candidates.txt", lane_review
             )
             if generate_inline_fallback:
-                (candidate_dir / "anythingllm-upload-inline-metadata-fallback.txt").write_text(
-                    fallback_upload_text,
-                    encoding="utf-8",
-                )
-            append_jsonl(candidate_dir / "segment-manifest.jsonl", segments)
+                fallback_path = candidate_dir / "anythingllm-upload-inline-metadata-fallback.txt"
+                if artifact_catalog:
+                    fallback_path = artifact_catalog.text(fallback_path, fallback_upload_text)
+                else:
+                    fallback_path.write_text(fallback_upload_text, encoding="utf-8")
+                candidate_artifact_paths["anythingllm-upload-inline-metadata-fallback.txt"] = str(fallback_path)
+            manifest_path = candidate_dir / "segment-manifest.jsonl"
+            if artifact_catalog:
+                manifest_path = artifact_catalog.jsonl(manifest_path, segments)
+            else:
+                append_jsonl(manifest_path, segments)
+            candidate_artifact_paths["segment-manifest.jsonl"] = str(manifest_path)
             write_csv(candidate_dir / "extraction-report.csv", [asdict(s) for s in stats])
             if outline_validation["rows"]:
                 write_csv(candidate_dir / "outline-validation.csv", outline_validation["rows"])
@@ -24864,10 +24815,19 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 variant_path = candidate_dir / f"anythingllm-upload-{name}.txt"
                 variant_fallback_path = candidate_dir / f"anythingllm-upload-{name}-inline-metadata-fallback.txt"
                 variant_manifest = candidate_dir / f"segment-manifest-{name}.jsonl"
-                variant_path.write_text(variant_text, encoding="utf-8")
+                if artifact_catalog:
+                    variant_path = artifact_catalog.text(variant_path, variant_text)
+                else:
+                    variant_path.write_text(variant_text, encoding="utf-8")
                 if generate_inline_fallback:
-                    variant_fallback_path.write_text(variant_fallback_text, encoding="utf-8")
-                append_jsonl(variant_manifest, variant_segments)
+                    if artifact_catalog:
+                        variant_fallback_path = artifact_catalog.text(variant_fallback_path, variant_fallback_text)
+                    else:
+                        variant_fallback_path.write_text(variant_fallback_text, encoding="utf-8")
+                if artifact_catalog:
+                    variant_manifest = artifact_catalog.jsonl(variant_manifest, variant_segments)
+                else:
+                    append_jsonl(variant_manifest, variant_segments)
                 variant_outputs[name] = {
                     "upload_file": str(variant_path),
                     "fallback_upload_file": str(variant_fallback_path) if generate_inline_fallback else "",
@@ -24944,6 +24904,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 "vector_error_detail": "",
                 "candidate_dir": str(candidate_dir),
                 "error": "",
+                "artifact_paths": candidate_artifact_paths,
             }
 
             if args.run_vector_eval:
@@ -25465,19 +25426,40 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     selected_dir = out_root
     selected_dir.mkdir(parents=True, exist_ok=True)
     src_candidate_dir = Path(selected["candidate_dir"])
-    shutil.copy2(src_candidate_dir / "anythingllm-upload.txt", selected_dir / "anythingllm-upload.txt")
     prepared_text_path = selected_dir / parsed_pdf_text_filename(pdf_path, selected_dir)
-    shutil.copy2(selected_dir / "anythingllm-upload.txt", prepared_text_path)
-    candidate_fallback = src_candidate_dir / "anythingllm-upload-inline-metadata-fallback.txt"
+    source_body = selected_artifact_path(selected, src_candidate_dir, "anythingllm-upload.txt")
+    selected_artifacts = {}
+    if not artifact_catalog:
+        selected["artifact_paths"] = {}
+    if artifact_catalog:
+        artifact_catalog.promote(source_body, prepared_text_path)
+        for candidate in candidates:
+            for role, path in (candidate.get("artifact_paths") or {}).items():
+                if Path(path) == source_body:
+                    candidate["artifact_paths"][role] = str(prepared_text_path)
+            for variant in (candidate.get("variant_outputs") or {}).values():
+                for key in ("upload_file", "fallback_upload_file", "manifest"):
+                    if variant.get(key) and Path(variant[key]) == source_body:
+                        variant[key] = str(prepared_text_path)
+        selected_artifacts["anythingllm-upload.txt"] = str(prepared_text_path)
+    else:
+        shutil.copy2(source_body, selected_dir / "anythingllm-upload.txt")
+        shutil.copy2(selected_dir / "anythingllm-upload.txt", prepared_text_path)
+    candidate_fallback = selected_artifact_path(selected, src_candidate_dir, "anythingllm-upload-inline-metadata-fallback.txt")
     if candidate_fallback.exists():
-        shutil.copy2(
-            candidate_fallback,
-            selected_dir / "anythingllm-upload-inline-metadata-fallback.txt",
-        )
+        if artifact_catalog:
+            selected_artifacts["anythingllm-upload-inline-metadata-fallback.txt"] = str(artifact_catalog.copy(
+                candidate_fallback, selected_dir / "anythingllm-upload-inline-metadata-fallback.txt"))
+        else:
+            shutil.copy2(candidate_fallback, selected_dir / "anythingllm-upload-inline-metadata-fallback.txt")
     # Candidate manifests are written before final candidate selection. Write
     # the selected records instead so a post-selection OCR author recovery is
     # reflected consistently in the public manifest and upload plans.
-    append_jsonl(selected_dir / "segment-manifest.jsonl", selected["segments"])
+    if artifact_catalog:
+        artifact_catalog.register(selected_artifact_path(selected, src_candidate_dir, "segment-manifest.jsonl"))
+        selected_artifacts["segment-manifest.jsonl"] = str(artifact_catalog.jsonl(selected_dir / "segment-manifest.jsonl", selected["segments"]))
+    else:
+        append_jsonl(selected_dir / "segment-manifest.jsonl", selected["segments"])
     transition_rows = []
     page_text_by_number = {}
     for segment in selected["segments"]:
@@ -25511,10 +25493,16 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     append_jsonl(selected_dir / "page-transition-manifest.jsonl", transition_rows)
     layout_review = src_candidate_dir / "layout-region-review.json"
     if layout_review.exists():
-        shutil.copy2(layout_review, selected_dir / "layout-region-review.json")
+        if artifact_catalog:
+            selected_artifacts["layout-region-review.json"] = str(artifact_catalog.copy(layout_review, selected_dir / "layout-region-review.json"))
+        else:
+            shutil.copy2(layout_review, selected_dir / "layout-region-review.json")
     reconciliation_review = src_candidate_dir / "native-ocr-reconciliation.json"
     if reconciliation_review.exists():
-        shutil.copy2(reconciliation_review, selected_dir / "native-ocr-reconciliation.json")
+        if artifact_catalog:
+            selected_artifacts["native-ocr-reconciliation.json"] = str(artifact_catalog.copy(reconciliation_review, selected_dir / "native-ocr-reconciliation.json"))
+        else:
+            shutil.copy2(reconciliation_review, selected_dir / "native-ocr-reconciliation.json")
     for filename in (
         "retrieval-lane-review.json",
         "supplementary-content-candidates.txt",
@@ -25522,15 +25510,25 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     ):
         source_path = src_candidate_dir / filename
         if source_path.exists():
-            shutil.copy2(source_path, selected_dir / filename)
-    shutil.copy2(src_candidate_dir / "extraction-report.csv", selected_dir / "extraction-report.csv")
+            if artifact_catalog:
+                selected_artifacts[filename] = str(artifact_catalog.copy(source_path, selected_dir / filename))
+            else:
+                shutil.copy2(source_path, selected_dir / filename)
+    if artifact_catalog:
+        selected_artifacts["extraction-report.csv"] = str(artifact_catalog.copy(src_candidate_dir / "extraction-report.csv", selected_dir / "extraction-report.csv"))
+    else:
+        shutil.copy2(src_candidate_dir / "extraction-report.csv", selected_dir / "extraction-report.csv")
     candidate_outline = src_candidate_dir / "outline-validation.csv"
     if candidate_outline.is_file() and candidate_outline.stat().st_size > 3:
-        shutil.copy2(candidate_outline, selected_dir / "outline-validation.csv")
-    shutil.copy2(
-        src_candidate_dir / "native-header-chunk-audit.csv",
-        selected_dir / "native-header-chunk-audit.csv",
-    )
+        if artifact_catalog:
+            selected_artifacts["outline-validation.csv"] = str(artifact_catalog.copy(candidate_outline, selected_dir / "outline-validation.csv"))
+        else:
+            shutil.copy2(candidate_outline, selected_dir / "outline-validation.csv")
+    if artifact_catalog:
+        selected_artifacts["native-header-chunk-audit.csv"] = str(artifact_catalog.copy(src_candidate_dir / "native-header-chunk-audit.csv", selected_dir / "native-header-chunk-audit.csv"))
+        selected["artifact_paths"] = selected_artifacts
+    else:
+        shutil.copy2(src_candidate_dir / "native-header-chunk-audit.csv", selected_dir / "native-header-chunk-audit.csv")
     page_parent_rows = build_page_parent_rows(selected["segments"])
     child_parent_rows = build_child_parent_map(selected["segments"], page_parent_rows)
     append_jsonl(selected_dir / "page-parent-manifest.jsonl", page_parent_rows)
@@ -25587,19 +25585,33 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                             break
                     if variant_rows_for_identity:
                         apply_source_identity_to_segments(variant_rows_for_identity, source_meta)
-                        append_jsonl(target_path, variant_rows_for_identity)
+                        if artifact_catalog:
+                            target_path = artifact_catalog.jsonl(target_path, variant_rows_for_identity)
+                        else:
+                            append_jsonl(target_path, variant_rows_for_identity)
+                    else:
+                        if artifact_catalog:
+                            target_path = artifact_catalog.copy(source_path, target_path)
+                        else:
+                            shutil.copy2(source_path, target_path)
+                else:
+                    if artifact_catalog:
+                        target_path = artifact_catalog.copy(source_path, target_path)
                     else:
                         shutil.copy2(source_path, target_path)
-                else:
-                    shutil.copy2(source_path, target_path)
                 copied[key] = str(target_path)
         if variant.get("fallback_upload_file"):
             source_path = Path(variant["fallback_upload_file"])
             if source_path.exists():
                 target_path = selected_dir / f"anythingllm-upload-{variant_name}-inline-metadata-fallback.txt"
-                shutil.copy2(source_path, target_path)
+                if artifact_catalog:
+                    target_path = artifact_catalog.copy(source_path, target_path)
+                else:
+                    shutil.copy2(source_path, target_path)
                 copied["fallback_upload_file"] = str(target_path)
         selected_variants[variant_name] = {**variant, **copied}
+    if artifact_catalog:
+        selected["variant_outputs"] = selected_variants
 
     variant_labels = {
         "recommended-body": "Recommended body only",
@@ -25682,29 +25694,48 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     native_payloads = generate_api_payloads(selected["segments"], "native_header")
     page_parent_strict_payloads = generate_page_parent_payloads(page_parent_rows, "strict")
     page_parent_native_payloads = generate_page_parent_payloads(page_parent_rows, "native_header")
+    payload_artifacts = {}
+    segment_upload_plan_path = metadata_dir / "upload-plan.csv"
+    parent_upload_plan_path = metadata_dir / "page-parent-upload-plan.csv"
     if materialize_metadata_artifacts:
         segment_strict_upload_rows = build_file_upload_rows_from_payloads(
-            strict_payloads, metadata_dir / "file-upload-segments-strict"
+            strict_payloads, metadata_dir / "file-upload-segments-strict",
+            **({"artifact_catalog": artifact_catalog} if artifact_catalog else {}),
         )
         segment_native_upload_rows = build_file_upload_rows_from_payloads(
-            native_payloads, metadata_dir / "file-upload-segments-native-header"
+            native_payloads, metadata_dir / "file-upload-segments-native-header",
+            **({"artifact_catalog": artifact_catalog} if artifact_catalog else {}),
         )
         page_parent_strict_upload_rows = build_file_upload_rows_from_payloads(
-            page_parent_strict_payloads, metadata_dir / "file-upload-page-parents-strict"
+            page_parent_strict_payloads, metadata_dir / "file-upload-page-parents-strict",
+            **({"artifact_catalog": artifact_catalog} if artifact_catalog else {}),
         )
         page_parent_native_upload_rows = build_file_upload_rows_from_payloads(
-            page_parent_native_payloads, metadata_dir / "file-upload-page-parents-native-header"
+            page_parent_native_payloads, metadata_dir / "file-upload-page-parents-native-header",
+            **({"artifact_catalog": artifact_catalog} if artifact_catalog else {}),
         )
-        append_jsonl(metadata_dir / "raw-text-payloads-strict.jsonl", strict_payloads)
-        append_jsonl(metadata_dir / "raw-text-payloads-native-header.jsonl", native_payloads)
-        append_jsonl(metadata_dir / "raw-text-payloads-page-parents-strict.jsonl", page_parent_strict_payloads)
-        append_jsonl(metadata_dir / "raw-text-payloads-page-parents-native-header.jsonl", page_parent_native_payloads)
+        for name, payloads in (
+            ("raw-text-payloads-strict.jsonl", strict_payloads),
+            ("raw-text-payloads-native-header.jsonl", native_payloads),
+            ("raw-text-payloads-page-parents-strict.jsonl", page_parent_strict_payloads),
+            ("raw-text-payloads-page-parents-native-header.jsonl", page_parent_native_payloads),
+        ):
+            target = metadata_dir / name
+            if artifact_catalog:
+                target = artifact_catalog.jsonl(target, payloads)
+            else:
+                append_jsonl(target, payloads)
+            payload_artifacts[name] = str(target)
         write_csv(metadata_dir / "file-upload-plan-segments-strict.csv", segment_strict_upload_rows)
         write_csv(metadata_dir / "file-upload-plan-segments-native-header.csv", segment_native_upload_rows)
         write_csv(metadata_dir / "file-upload-plan-page-parents-strict.csv", page_parent_strict_upload_rows)
         write_csv(metadata_dir / "file-upload-plan-page-parents-native-header.csv", page_parent_native_upload_rows)
-        write_csv(metadata_dir / "upload-plan.csv", segment_native_upload_rows)
-        write_csv(metadata_dir / "page-parent-upload-plan.csv", page_parent_native_upload_rows)
+        if artifact_catalog:
+            segment_upload_plan_path = metadata_dir / "file-upload-plan-segments-native-header.csv"
+            parent_upload_plan_path = metadata_dir / "file-upload-plan-page-parents-native-header.csv"
+        else:
+            write_csv(segment_upload_plan_path, segment_native_upload_rows)
+            write_csv(parent_upload_plan_path, page_parent_native_upload_rows)
     else:
         segment_strict_upload_rows = []
         segment_native_upload_rows = []
@@ -25718,7 +25749,8 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     )
     if materialize_metadata_artifacts:
         native_test_kit = write_native_metadata_test_kit(
-            selected["segments"], out_root / "native-metadata-test-kit", workspace_slug=target_workspace_slug
+            selected["segments"], out_root / "native-metadata-test-kit", workspace_slug=target_workspace_slug,
+            **({"artifact_catalog": artifact_catalog} if artifact_catalog else {}),
         )
         compatibility_probe_segments = (
             [selected["segments"][0], selected["segments"][len(selected["segments"]) // 2]]
@@ -25727,6 +25759,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         native_probe_kit = write_native_metadata_test_kit(
             compatibility_probe_segments, out_root / "native-metadata-compatibility-probe",
             workspace_slug=target_workspace_slug, artifact_prefix="compatibility",
+            **({"artifact_catalog": artifact_catalog} if artifact_catalog else {}),
         )
     else:
         native_test_kit = {"files_dir": "", "upload_plan": "", "checklist": "", "file_count": 0}
@@ -27658,12 +27691,16 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             evidence_kind="partial_vector_coverage",
         )
     retrieval_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src_candidate_dir / "probes.jsonl", retrieval_dir / "probes.jsonl")
-    shutil.copy2(src_candidate_dir / "literal-results.csv", retrieval_dir / "literal-results.csv")
-    if (src_candidate_dir / "vector-results.csv").exists():
-        shutil.copy2(src_candidate_dir / "vector-results.csv", retrieval_dir / "vector-results.csv")
-    else:
-        write_csv(retrieval_dir / "vector-results.csv", [])
+    for name in ("probes.jsonl", "literal-results.csv", "vector-results.csv"):
+        source = src_candidate_dir / name
+        target = retrieval_dir / name
+        if source.exists():
+            if artifact_catalog:
+                artifact_catalog.copy(source, target)
+            else:
+                shutil.copy2(source, target)
+        else:
+            write_csv(target, [])
 
     profile["backends"] = [
         {
@@ -27685,6 +27722,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             "native_chunk_eval": c.get("native_chunk_eval", {}),
             "outline_validation": c.get("outline_validation", {}),
             "variant_outputs": c.get("variant_outputs", {}),
+            "artifact_paths": c.get("artifact_paths", {}),
             "unstructured_execution": c.get("unstructured_execution", {}),
             "unstructured_strategy": c.get("unstructured_strategy", ""),
             "ocr_processing_seconds": c.get("ocr_processing_seconds", 0.0),
@@ -27838,6 +27876,12 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         out_root / "diagnostics.html",
         out_root / "diagnostics.csv",
     ]
+    if artifact_catalog:
+        output_paths = [
+            out_root / artifact_catalog.roles.get(str(path.relative_to(out_root)), str(path.relative_to(out_root)))
+            for path in output_paths
+        ]
+        output_paths.extend([segment_upload_plan_path, parent_upload_plan_path])
     for kit in (native_test_kit, native_probe_kit):
         for key in ("files_dir", "upload_plan", "checklist"):
             if kit.get(key):
@@ -28031,13 +28075,14 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         "simulation_model": selected.get("vector_model", ""),
         "selected_region_embedding_coverage": "100%",
         "variant_outputs": selected_variants,
+        "artifact_paths": selected_artifacts,
         "upload_file": str(prepared_text_path),
         "inline_metadata_fallback": (
-            str(selected_dir / "anythingllm-upload-inline-metadata-fallback.txt")
-            if (selected_dir / "anythingllm-upload-inline-metadata-fallback.txt").exists()
+            str(selected_artifact_path(selected, selected_dir, "anythingllm-upload-inline-metadata-fallback.txt"))
+            if selected_artifact_path(selected, selected_dir, "anythingllm-upload-inline-metadata-fallback.txt").exists()
             else ""
         ),
-        "manifest": str(selected_dir / "segment-manifest.jsonl"),
+        "manifest": str(selected_artifact_path(selected, selected_dir, "segment-manifest.jsonl")),
         "page_transition_manifest": str(selected_dir / "page-transition-manifest.jsonl"),
         "page_transition_boundaries_checked": len(transition_rows),
         "page_transition_companions_created": sum(
@@ -28045,12 +28090,12 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         ),
         "page_parent_manifest": str(selected_dir / "page-parent-manifest.jsonl"),
         "child_parent_map": str(selected_dir / "child-parent-map.csv"),
-        "layout_region_review": str(selected_dir / "layout-region-review.json"),
-        "visual_text_review_artifact": str(selected_dir / "visual-text-review.json"),
-        "retrieval_lane_review": str(selected_dir / "retrieval-lane-review.json"),
+        "layout_region_review": str(selected_artifact_path(selected, selected_dir, "layout-region-review.json")),
+        "visual_text_review_artifact": str(selected_artifact_path(selected, selected_dir, "visual-text-review.json")),
+        "retrieval_lane_review": str(selected_artifact_path(selected, selected_dir, "retrieval-lane-review.json")),
         "supplementary_lane_candidates": (
-            str(selected_dir / "supplementary-content-candidates.txt")
-            if (selected_dir / "supplementary-content-candidates.txt").is_file()
+            str(selected_artifact_path(selected, selected_dir, "supplementary-content-candidates.txt"))
+            if selected_artifact_path(selected, selected_dir, "supplementary-content-candidates.txt").is_file()
             else ""
         ),
         "provenance_review_manifest": str(provenance_review_manifest),
@@ -28059,19 +28104,14 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         "representation_recommendation": str(selected_dir / "representation-recommendation.json"),
         "report": "",
         "variant_summary": str(selected_dir / "output-variant-summary.csv"),
-        "metadata_payloads": str(metadata_dir / "raw-text-payloads-native-header.jsonl"),
-        "page_parent_metadata_payloads": str(metadata_dir / "raw-text-payloads-page-parents-native-header.jsonl"),
-        "page_parent_upload_plan": str(metadata_dir / "page-parent-upload-plan.csv"),
+        "metadata_payloads": payload_artifacts.get("raw-text-payloads-native-header.jsonl", str(metadata_dir / "raw-text-payloads-native-header.jsonl")),
+        "page_parent_metadata_payloads": payload_artifacts.get("raw-text-payloads-page-parents-native-header.jsonl", str(metadata_dir / "raw-text-payloads-page-parents-native-header.jsonl")),
+        "page_parent_upload_plan": str(parent_upload_plan_path),
         # The selected representation may be page parents or individual
         # segments.  Automatic grouped uploads consume this exact plan after
         # every PDF has been staged, instead of rediscovering files by name.
         "native_upload_plan": str(
-            metadata_dir
-            / (
-                "page-parent-upload-plan.csv"
-                if upload_representation == "page_parents"
-                else "upload-plan.csv"
-            )
+            parent_upload_plan_path if upload_representation == "page_parents" else segment_upload_plan_path
         ),
         "native_upload_representation": upload_representation,
         "native_upload_transport": upload_transport,
@@ -28267,6 +28307,11 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         "workspace_model_configuration": str(inspection_dir / "workspace-model-configuration.csv"),
         "post_upload_verification": str(inspection_dir / "post-upload-verification.csv"),
     }
+    if artifact_catalog:
+        artifact_catalog.remove_empty_alias_directories()
+        index_path = out_root / "artifact-locations.json"
+        write_json(index_path, {"schema_version": 1, "roles": artifact_catalog.roles})
+        summary["artifact_locations"] = str(index_path)
     write_json(out_root / "run-summary.json", summary)
     # The Automatic parent tails these direct transport records until its child
     # has exited, then removes them at its post-exit cleanup boundary. Ordinary
