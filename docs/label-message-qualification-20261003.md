@@ -69,3 +69,13 @@ scan was performed as part of these narrowly scoped changes.
 The separate short-label repair for the malformed HernÃ¡ndez byline was proposed
 to the user for approval and is not included in this change. No broad encoding
 repair was applied to metadata, OCR or extracted content.
+
+## Deployment
+
+Source changes committed locally as 7e7858b; no push performed. Checked the
+owned assistant server (PID 9948) had zero active runs, then stopped it through
+the ownership-checked CLI and started the normal launcher hidden from this
+repository. New assistant root PID 22840, started 2026-10-03 22:08:53 local time;
+repository cwd verified and http://127.0.0.1:7860 returned HTTP 200.
+AnythingLLM PID 9676 and its creation timestamp 1791034250.083542 were unchanged.
+The subsequent documentation commit does not require another server restart.
