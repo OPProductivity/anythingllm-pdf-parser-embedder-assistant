@@ -33,9 +33,40 @@ package are different threat scenarios and need separate current-code review.
 The latest production run's verified API key cleanup does not establish that
 every other UI/recovery credential lifecycle is correct.
 
-Narrow current checks confirmed that the UI launch still has no auth/auth
-dependency, the main installer still defaults to a main-branch archive, and the
-optional bridge installer still invokes unversioned npx @electron/asar.
-The other findings require current-code validation before accepting, dismissing
-or repairing them. No proposed security repair should silently remove existing
-remote-server, installer, export, or large-PDF functionality.
+## Local remediation, 2026-10-03
+
+The paragraphs above describe the original scan review, not the modified source.
+The following changes preserve the visible interface and production OCR logic:
+
+- Launcher-issued single-use tickets establish per-launch browser cookies;
+  middleware guards mounted HTTP and WebSocket routes and rejects foreign
+  hosts/origins. Health readiness remains public; existing authenticated Stop
+  notifications remain available.
+- Installers accept externally hash-verified offline bundles, not mutable main
+  archives, online pip bootstrap, or unversioned npx. The release builder and
+  procedure are documented in VERIFIED-RELEASES.md. An existing runtime is not
+  modified by installation.
+- Automatic Desktop credential discovery requires matching OS process, listener
+  and configured storage evidence. Managed transports verify the established
+  socket before sending credentials. Explicit custom-server keys remain supported.
+- Windows preparation holds a read-only sharing lock and rehashes the source
+  before accepting its parent identity. POSIX advisory locking is not equivalent
+  to this Windows mandatory-sharing protection.
+- Authenticated remote endpoints require HTTPS; implicit proxies and redirects
+  are rejected. Main JSON/error and SSE readers have explicit byte budgets.
+- Relocation rejects relative traversal and verifies resolved source containment.
+- CLI exports are staged and refuse overwrite unless explicitly requested.
+- Read-only adapter descriptions no longer create temporary keys; failed key
+  cleanup creates a secret-free durable obligation record.
+
+Approved configurable per-PDF defaults: 6 GiB source, 10,000 pages, 50 million
+OCR pixels per rendered page, 2 MiB text per page, 150 MiB aggregate UTF-8 text,
+100,000 segments and six hours automatic local preparation excluding embedding
+waits. Exceeding a limit is an explicit failure, never silent truncation.
+
+This is not a claim that every finding is closed. Resource runtime enforcement
+is not yet uniform across CLI/advanced/preflight paths, and post-extraction text
+checks do not constitute an OS memory sandbox. Remaining provider/error readers
+need a complete bounds audit. A real verified release installation and complete
+credential-lifecycle/transport fault matrix remain to be qualified. No follow-up
+cloud scan or release publication has been performed.

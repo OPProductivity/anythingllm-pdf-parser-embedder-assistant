@@ -18031,6 +18031,7 @@ class PipelineCoreTests(unittest.TestCase):
             samples=b"\xff" * (width * height * 3),
         )
         page = SimpleNamespace(
+            rect=SimpleNamespace(width=width / 2, height=height / 2),
             get_text=lambda _kind: "",
             get_pixmap=lambda **_kwargs: pixmap,
         )
@@ -18226,6 +18227,7 @@ class PipelineCoreTests(unittest.TestCase):
             samples=b"\xff" * (width * height * 3),
         )
         page = SimpleNamespace(
+            rect=SimpleNamespace(width=width / 2, height=height / 2),
             get_text=lambda _kind: "",
             get_pixmap=lambda **_kwargs: pixmap,
         )
