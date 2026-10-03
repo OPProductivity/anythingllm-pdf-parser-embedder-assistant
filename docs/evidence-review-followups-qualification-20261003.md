@@ -65,3 +65,43 @@ The revised audit also correctly rejects older incomplete group histories and
 missing source-local reports. It still records the 1,032 retained aggregate events
 from isolated-full-878099; rejecting group completeness does not erase valid
 record-level confirmation evidence. Original PDFs and research storage are intact.
+
+## Deployment
+
+Code commit 93891b6 passed all commit hooks. The owned assistant was verified idle,
+stopped through its ownership-checked CLI, and started detached with a hidden
+window. At 19:49 local time, new root PID 20368 owned port 7860 and the Gradio
+configuration endpoint returned HTTP 200. The original AnythingLLM process stayed
+PID 9676 with its 15:30:50 start time; its port-3001 ping also returned HTTP 200.
+No push was performed.
+
+## Larger-case timing observation
+
+In the additional full-corpus embedding replay, the 103-record source completed
+in 464.9164 seconds, compared with 134.5462 seconds in the earlier qualification.
+The owned queue receipt took 0.0529 seconds and exact-vector observation took
+0.292 seconds. Cache files continued appearing during ingestion; recent progress
+kept the source live. Its final history retains all 312 events despite the bounded
+96-event ledger tail. The journal was not repeatedly rewritten during this stretch.
+This distinguishes active ingestion from an idle final-confirmation delay, but
+does not establish which native/provider factor caused the slower throughput.
+No ETA or liveness deadline was changed to accommodate the replay.
+
+## Full-corpus live qualification
+
+The additional replay isolated-full-d1d0b6 passed all 34 source identities and all
+310 selected records, confirming 483 physical vectors with zero cache reuse and
+no errors. All 1,032 observed control events match the individual queue-group and
+aggregate histories. The strict audit returned zero and qualification_passed=true.
+Receipt: live-audit-acf44d221e5f4e20981effc0ce1b8444.json in the ignored receipt root.
+
+This phase reused retained prepared canonical TXT inputs deliberately, but used
+fresh empty AnythingLLM vector storage; it was not another complete OCR replay.
+The two independent Harkins preparation invocations and automated fresh-worker
+test separately verified that the preparation harness no longer skips workers.
+
+Cleanup verified zero workspaces, document links, vector mappings, API keys,
+vector-cache files and LanceDB namespaces, with no cleanup errors. All owned test
+processes stopped. Research workspaces, vectors, PDFs and historical evidence were
+not modified. The strict audit still distinguishes older retained aggregate
+evidence from incomplete historical group journals instead of relabeling them.
