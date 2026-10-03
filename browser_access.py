@@ -8,30 +8,12 @@ import threading
 import time
 from http.cookies import SimpleCookie
 
-import psutil
-
 from starlette.responses import HTMLResponse, PlainTextResponse, Response
 
 KEY_ENV = "ANYTHINGLLM_PDF_ASSISTANT_BROWSER_KEY"
 COOKIE = "pdf_assistant_session"
 BOOTSTRAP_PATH = "/assistant-browser-session"
 TICKET_SECONDS = 90
-
-
-def same_process_request(scope):
-    """Authorize Gradio's self-probe by its established outbound socket."""
-    client, server = scope.get("client"), scope.get("server")
-    if not client or not server or client[0] not in {"127.0.0.1", "::1"}:
-        return False
-    try:
-        for connection in psutil.Process().net_connections(kind="tcp"):
-            if (connection.status == psutil.CONN_ESTABLISHED and connection.raddr
-                    and tuple(connection.laddr) == tuple(client)
-                    and tuple(connection.raddr) == tuple(server)):
-                return True
-    except (OSError, psutil.Error):
-        pass
-    return False
 
 
 def browser_ticket(key, *, now=None):
@@ -80,11 +62,6 @@ class BrowserAccessMiddleware:
         same_origin = origin is None or origin == f"http://{host}"
         path = scope.get("path", "")
         if allowed_host and same_origin and scope["type"] == "http":
-            # Gradio initializes its queue through a self-request and checks
-            # readiness with HEAD /. No external localhost client may use this.
-            if ((path == "/gradio_api/startup-events" and scope["method"] == "GET")
-                    or (path == "/" and scope["method"] == "HEAD")) and same_process_request(scope):
-                return await self.app(scope, receive, send)
             if path == "/healthz" and scope["method"] == "GET":
                 return await self.app(scope, receive, send)
             if path == BOOTSTRAP_PATH and scope["method"] == "GET":

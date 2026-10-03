@@ -1,5 +1,4 @@
 import pytest
-from unittest.mock import patch
 from starlette.applications import Starlette
 from starlette.responses import PlainTextResponse
 from starlette.routing import Route, WebSocketRoute
@@ -18,7 +17,6 @@ def client():
         await ws.accept()
         await ws.send_text("ok")
     app = Starlette(routes=[Route("/", ok), Route("/healthz", ok),
-                            Route("/gradio_api/startup-events", ok),
                             Route("/gradio_api/queue/join", ok, methods=["POST"]),
                             WebSocketRoute("/socket", socket)])
     app.add_middleware(BrowserAccessMiddleware, key=KEY)
@@ -34,7 +32,6 @@ def test_routes_reject_unauthorized_clients_and_accept_launcher_session():
         assert c.get("/healthz").status_code == 200
         assert c.get("/").status_code == 403
         assert c.post("/gradio_api/queue/join").status_code == 403
-        assert c.get("/gradio_api/startup-events").status_code == 403
         assert authenticate(c).status_code == 204
         cookie = c.cookies.get("pdf_assistant_session")
         assert cookie
@@ -42,15 +39,6 @@ def test_routes_reject_unauthorized_clients_and_accept_launcher_session():
         assert c.post("/gradio_api/queue/join").status_code == 200
         with c.websocket_connect("ws://127.0.0.1:7860/socket") as ws:
             assert ws.receive_text() == "ok"
-
-
-def test_internal_probe_exemption_is_exact_and_process_bound():
-    with client() as c, patch("browser_access.same_process_request", return_value=True):
-        assert c.get("/gradio_api/startup-events").status_code == 200
-        assert c.head("/").status_code == 200
-        assert c.get("/").status_code == 403
-        assert c.post("/gradio_api/queue/join").status_code == 403
-        assert c.get("/gradio_api/startup-events", headers={"Origin":"https://evil.invalid"}).status_code == 403
 
 
 def test_ticket_is_one_use_and_session_does_not_cross_server_instances():
