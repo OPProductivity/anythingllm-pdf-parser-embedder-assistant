@@ -83,3 +83,12 @@ Baseline code was extracted from Git into an owned temporary directory. The
 baseline replay records that directory and its pipeline file hash. No embedding
 provider was called, and no AnythingLLM workspaces/vectors were created or removed.
 The main AnythingLLM application was left running throughout qualification.
+
+## Deployment
+
+Implementation and qualification tooling were committed locally as `1f9f856`.
+All staged checks passed. After verifying zero active owned PDF runs, the owned
+assistant server PID 23116 was stopped and relaunched from this repository.
+The new server root PID 17232 returned HTTP 200 on port 7860 and its working
+directory matched the repository. Main AnythingLLM PID 9676 retained its original
+creation time 1791034250.083542; it was not restarted. No push was performed.
