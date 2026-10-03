@@ -15656,7 +15656,7 @@ def terminal_integrity_audit(run_root, completion, *, native_run):
             "code": "EXTERNAL-QUEUE-EVIDENCE-PENDING-001",
             "message": (
                 "No complete embedding evidence yet. AnythingLLM was still processing the submitted "
-                f"page-parent records when assistant-side observation ended ({unresolved} not yet confirmed). "
+                f"upload records when assistant-side observation ended ({unresolved} not yet confirmed). "
                 "No upload was retried; check the workspace or Run history before resuming."
             ),
         }), audit
@@ -27338,7 +27338,7 @@ def explicit_upload_count_schema(report):
         # do not let schema normalisation erase evidence of a bad producer.
         result["count_alias_conflicts"] = alias_conflicts
     result["count_semantics"] = {
-        "selected_records": "all selected page-parent records, including already indexed records",
+        "selected_records": "all selected upload records, including already indexed records",
         "selected_documents": "all selected PDFs represented by this report",
         "cache_eligible_records": "selected records with reusable staged document locations; not queue completion",
         "cache_eligible_documents": "fully cache-eligible selected PDFs; not workspace-vector proof",
@@ -27598,7 +27598,7 @@ def upload_prepared_automatic_batch(
     if callable(status_callback):
         prepared_record_count = len(all_rows)
         status_callback(
-            f"Prepared records ready: {prepared_record_count} selected page record(s); checking workspace coverage before submission",
+            f"Prepared records ready: {prepared_record_count} selected upload record(s); checking workspace coverage before submission",
             {
                 "timing_event": "prepared_batch_complete",
                 "prepared_records": prepared_record_count,
@@ -28346,7 +28346,7 @@ def upload_prepared_automatic_batch(
                         ),
                         "message": (
                             f"The AnythingLLM receipt was unresolved and only {current_source_vectors}/{len(expected_batch)} exact "
-                            f"page-parent vectors were observed before the {effective_deadline_seconds:.0f}-second "
+                            f"upload records with vectors were observed before the {effective_deadline_seconds:.0f}-second "
                             f"reconciliation boundary because {progress_basis}."
                         ),
                         "reconciliation_elapsed_seconds": round(elapsed, 3),
@@ -28500,12 +28500,10 @@ def upload_prepared_automatic_batch(
         cancel_callback=cancel_callback,
         submission_receipt_path=Path(run_root) / "batch-submission-receipts.jsonl",
         run_id=Path(run_root).name,
-        # The Desktop queue advances one prepared page-parent document at a
-        # time.  Calling that counter a PDF count was both grammatically
-        # wrong (for example, ``480/1264 12 selected PDFs``) and suggested
-        # that upload had completed when only local preparation had.
+        # Queue counters measure upload records, not selected PDFs. A record
+        # can contain a whole file, a segment, or a page parent.
         record_label=(
-            f"page-parent record(s) from {len(grouped_rows)} selected PDF(s)"
+            f"upload record(s) from {len(grouped_rows)} selected PDF(s)"
         ),
     )
     # Keep installer authority and the worker's provider-batch observations

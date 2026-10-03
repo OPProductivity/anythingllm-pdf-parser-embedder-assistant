@@ -12547,10 +12547,16 @@ def read_validation_workspace_template(storage_dir: Path):
 
 
 def default_short_label(title, author):
-    author_words = re.findall(r"[A-Za-z][A-Za-z'-]+", author or "")
+    # Fold diacritics only for compact labels, never for source metadata/text.
+    def label_words(value):
+        folded = ''.join(character for character in unicodedata.normalize("NFKD", value or "")
+                         if not unicodedata.combining(character))
+        return re.findall(r"[A-Za-z][A-Za-z'-]+", folded)
+
+    author_words = label_words(author)
     if author_words:
         return author_words[-1]
-    title_words = [w for w in re.findall(r"[A-Za-z][A-Za-z'-]+", title or "") if w.casefold() not in HEADING_STOPWORDS]
+    title_words = [w for w in label_words(title) if w.casefold() not in HEADING_STOPWORDS]
     return title_words[0] if title_words else "PDF"
 
 
@@ -18510,7 +18516,7 @@ def update_workspace_embeddings_desktop_queue(
                     if callable(batch_inspector) else None
                 ),
                 cancel_callback=cancel_callback,
-                record_label=f"page-parent record(s) for {display_name}",
+                record_label=f"upload record(s) for {display_name}",
                 storage_dir=storage_dir,
                 location_sources=[
                     {"location": location, "source_path": source_path}
@@ -19181,7 +19187,7 @@ def update_workspace_embeddings_desktop_queue(
             if cache_hit:
                 message = (
                     f"AnythingLLM Desktop queue: record {current}/{total} is reusing cached embeddings; "
-                    f"writing its page-parent record to this workspace; "
+                    f"writing its upload record to this workspace; "
                     f"{completed}/{total} completed"
                 )
             else:
@@ -20853,7 +20859,7 @@ def maybe_upload_segment_files_source_transactions(
                     cancel_callback=cancel_callback,
                     submission_receipt_path=submission_receipt_path,
                     run_id=run_id,
-                    record_label=f"page-parent record(s) for {source_name}",
+                    record_label=f"upload record(s) for {source_name}",
                     defer_embedding_update=True,
                 )
                 transaction.update({
@@ -21000,7 +21006,7 @@ def maybe_upload_segment_files_source_transactions(
                     if callable(batch_inspector) else None
                 ),
                 cancel_callback=cancel_callback,
-                record_label=f"page-parent record(s) from {len(pending_queue_sources)} selected PDF(s)",
+                record_label=f"upload record(s) from {len(pending_queue_sources)} selected PDF(s)",
                 storage_dir=storage_dir,
                 location_sources=[
                     {"location": str(attachment.get("location") or ""), "source_path": str(attachment.get("source_path") or ""), "filename": str(attachment.get("filename") or "")}
@@ -21257,7 +21263,7 @@ def maybe_upload_segment_files_source_transactions(
     aggregate["count_semantics"] = {
         "uploaded": "legacy alias of newly_attached_records",
         "embedded": "legacy alias of vector_confirmed_records",
-        "selected_records": "all selected page-parent records submitted to this coordinator",
+        "selected_records": "all selected upload records submitted to this coordinator",
         "selected_documents": "selected PDF source windows submitted to this coordinator",
         "cache_eligible_records": "records with reusable staged locations; not queue completion",
         "cache_eligible_documents": "fully cache-eligible source windows; not workspace-vector proof",

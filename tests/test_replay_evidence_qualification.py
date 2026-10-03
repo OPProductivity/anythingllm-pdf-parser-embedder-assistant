@@ -89,6 +89,7 @@ def test_diagnostic_directions_use_canonical_roles(status, canonical):
 def test_replay_always_launches_fresh_workers_without_replacing_old_receipt(tmp_path, monkeypatch):
     from experiments import historical_preparation_replay_20261003 as replay
 
+    code_root = replay.REPO
     source = tmp_path / 'source.pdf'
     source.write_bytes(b'unchanged fixture source')
     digest = hashlib.sha256(source.read_bytes()).hexdigest()
@@ -104,11 +105,13 @@ def test_replay_always_launches_fresh_workers_without_replacing_old_receipt(tmp_
     monkeypatch.setattr(replay, 'application_paths', lambda: {'run_state': tmp_path / 'original'})
     monkeypatch.setattr(replay.subprocess, 'check_output', lambda *a, **k: 'fixture-commit')
     monkeypatch.setattr(replay, 'read_manifest_rows', lambda path: [{'text': 'body'}])
-    monkeypatch.setattr(replay.sys, 'argv', ['replay', '--limit', '1'])
+    monkeypatch.setattr(replay.sys, 'argv', ['replay', '--limit', '1', '--code-root', str(code_root)])
     launched = []
 
     class FreshWorker:
         def __init__(self, command, **kwargs):
+            assert kwargs['cwd'] == code_root
+            assert command[1:3] == ['-m', 'cancellable_preparation_worker']
             config = json.loads(Path(command[-1]).read_text())
             result = Path(config['result_path'])
             assert not result.exists()
@@ -124,4 +127,10 @@ def test_replay_always_launches_fresh_workers_without_replacing_old_receipt(tmp_
     assert replay.main() == 0
     assert len(launched) == 2 and launched[0] != launched[1]
     assert historical_receipt.read_text() == 'preserve earlier evidence'
-    assert len(list(receipts.glob('preparation-*/results.json'))) == 2
+    new_receipts = list(receipts.glob('preparation-*/results.json'))
+    assert len(new_receipts) == 2
+    for path in new_receipts:
+        report = json.loads(path.read_text())
+        assert report['worker_code_root'] == str(code_root)
+        assert report['worker_pipeline_sha256'] == hashlib.sha256(
+            (code_root / 'auto_anythingllm_pipeline.py').read_bytes()).hexdigest()

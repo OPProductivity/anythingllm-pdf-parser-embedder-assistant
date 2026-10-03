@@ -24312,7 +24312,7 @@ class PipelineCoreTests(unittest.TestCase):
             captured["verification"]["classification"],
             "batch_exact_vector_confirmation_stalled_after_queue_completion",
         )
-        self.assertIn("2/3 exact page-parent vectors", captured["verification"]["message"])
+        self.assertIn("2/3 exact upload records with vectors", captured["verification"]["message"])
 
     def test_grouped_batch_verifier_keeps_exact_reconciliation_when_status_callback_fails(self):
         """A Gradio/progress callback has no authority to abort an owned queue."""
