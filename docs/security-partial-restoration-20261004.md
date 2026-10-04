@@ -69,33 +69,6 @@ updates, producing six fixture failures and 2239 passes. Fresh focused checks
 pass; a clean complete suite and restarted live test are required before final
 qualification. No production OCR algorithm was changed to accommodate a mock.
 
-Final clean suite: 2248 passed, one privilege-dependent skip, 34 deselected,
-three existing dependency deprecation warnings, 15 subtests passed (295.59 s).
-The source protection and resource checks retained byte-identical body text
-and identical record counts for all eight historical PDFs.
-
-The assistant was restarted with the partial restoration. Fresh normal-browser
-tests used three unique PDFs and a dedicated document folder per batch:
-54.092 seconds and 61.089 seconds respectively; each confirmed nine of nine
-fresh records, zero cache reuse, and passed the terminal integrity audit.
-All pre-existing workspace-document rows and vector-mapping rows were unchanged;
-all original AnythingLLM Desktop process identities were unchanged.
-
-The test harness initially submitted a newly created workspace before refreshing
-the browser's choices. Gradio rejected it before any run or upload. Its empty
-workspace was deleted. The harness now performs the normal refresh callback.
-Its first completed run supplied a relative cleanup directory where the existing
-cleanup API requires an absolute path; containment correctly rejected that
-directory. Documents and workspace were deleted; the owned empty folder was
-then separately removed using the API's managed default path. The corrected
-harness uses that default, and the repeated batch completed cleanup automatically.
-Neither issue required a production change or weakening path containment.
-
-Verified all three disposable workspace namespaces absent, all 18 uploaded
-test document files absent, and their location-derived vector cache files absent.
-Generated test PDFs and diagnostic receipts are retained locally. Research
-workspaces, research documents and the eight-PDF rollback replay remain intact.
-
 Reproducible probes: experiments/security_transport_ab_20261004.py and
 experiments/security_partial_live_20261004.py. The first creates and removes a
 temporary API key only. The second owns a uniquely named disposable workspace

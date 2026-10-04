@@ -52,8 +52,6 @@ def main():
     report = {'test_workspace': slug, 'sources': sources}
     try:
         client = Client('http://127.0.0.1:7860/', verbose=False)
-        client.predict('http://127.0.0.1:3001', '', 'pdf-workspace',
-                       api_name='/refresh_workspaces_with_readiness')
         module = ast.parse((ROOT / 'rag_pdf_gradio_app.py').read_text(encoding='utf-8'))
         fields = next(ast.literal_eval(node.value) for node in module.body if isinstance(node, ast.Assign)
             and any(isinstance(target, ast.Name) and target.id == 'AUTOMATIC_RUN_FIELDS' for target in node.targets))
@@ -63,8 +61,7 @@ def main():
         overrides = {'workspace_slug': slug, 'api_url': 'http://127.0.0.1:3001', 'api_key': '',
             'document_label': '', 'document_author': '', 'document_short_label': '',
             'segment_mode': 'Page - preserve automatically', 'include_front_matter': True,
-            'include_back_matter': True, 'anythingllm_create_document_folders': True,
-            'anythingllm_document_folder_name': slug + '-docs'}
+            'include_back_matter': True}
         params = []
         for index, identifier in enumerate(dependency['inputs'][2:]):
             component = components[identifier]
