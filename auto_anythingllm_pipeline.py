@@ -50,8 +50,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from portable_paths import application_paths, is_private_run_state_path
-from source_guard import locked_pdf_source
-from pdf_budgets import check_source, check_document, check_pages, check as check_pdf_budget
 from run_evidence import prepare_private_json, read_run_json
 from ingestion_observation import SubmissionCommitSignal, observe_submission_vector_ids
 from authenticated_http import AuthenticatedRedirectError, RejectAuthenticatedRedirects
@@ -11077,7 +11075,7 @@ def normalize_simulation_adapter(adapter_or_model, url=None):
     return build_ollama_simulation_adapter(adapter_or_model, url)
 
 
-def resolve_default_simulation_adapter(storage_dir=None, env_path=None, allow_anythingllm_fallback=True, prefer_anythingllm_fallback=False, *, resolve_credentials=True):
+def resolve_default_simulation_adapter(storage_dir=None, env_path=None, allow_anythingllm_fallback=True, prefer_anythingllm_fallback=False):
     storage = Path(storage_dir) if storage_dir else default_anythingllm_storage_dir()
     config = anythingllm_embedding_config(storage)
     engine = (config.get("normalized_engine") or config.get("engine") or "").strip().casefold()
@@ -11110,7 +11108,7 @@ def resolve_default_simulation_adapter(storage_dir=None, env_path=None, allow_an
             storage_dir=storage,
             allow_anythingllm_fallback=allow_anythingllm_fallback,
             prefer_anythingllm_fallback=prefer_anythingllm_fallback,
-        ) if resolve_credentials else None
+        )
         details["message"] = f"Retrieval simulation will use OpenRouter model: {model}"
         return details
     if engine == "ollama":
@@ -11124,7 +11122,7 @@ def resolve_default_simulation_adapter(storage_dir=None, env_path=None, allow_an
     if engine in {"anythingllm", "native", "built-in", "default"}:
         try:
             details["status"] = "ready"
-            details["adapter"] = build_anythingllm_runtime_simulation_adapter(storage_dir=storage) if resolve_credentials else None
+            details["adapter"] = build_anythingllm_runtime_simulation_adapter(storage_dir=storage)
             details["message"] = (
                 f"Retrieval simulation will use the live AnythingLLM runtime embedder: {model or 'native embedder'}."
             )
@@ -11141,7 +11139,7 @@ def resolve_default_simulation_adapter(storage_dir=None, env_path=None, allow_an
     if engine in ANYTHINGLLM_CLOUD_ONLY_UNSUPPORTED_SIMULATION_ENGINES:
         try:
             details["status"] = "ready"
-            details["adapter"] = build_anythingllm_runtime_simulation_adapter(storage_dir=storage) if resolve_credentials else None
+            details["adapter"] = build_anythingllm_runtime_simulation_adapter(storage_dir=storage)
             details["message"] = (
                 f"Retrieval simulation will use the live AnythingLLM runtime embedder: {engine or 'unspecified'} / {model or 'unspecified model'}."
             )
@@ -14689,9 +14687,6 @@ def verify_anythingllm_upload_auth(api_url, api_key=None):
     result["status"] = "authenticated"
     result["message"] = "AnythingLLM Desktop temporary API key route is available."
     result["temporary_key_cleanup"] = cleanup_temporary_desktop_api_key(normalized, temporary_key.get("id"))
-    if result["temporary_key_cleanup"].get("status") == "delete_failed":
-        result["status"] = "authenticated_cleanup_needs_review"
-        result["message"] += " Temporary API key deletion failed after retry; review the retained cleanup obligation."
     return result
 
 
@@ -14767,20 +14762,6 @@ def cleanup_temporary_desktop_api_key(api_url, key_id, api_key=None):
     result["attempt_count"] = 2
     result["retry_attempted"] = True
     result["first_attempt_status"] = str((first or {}).get("status") or "delete_failed")
-    if result.get("status") == "delete_failed":
-        # Failure-only evidence. Never persist credential values or the peer's
-        # potentially sensitive response body.
-        evidence_path = application_paths()["config"] / "temporary-key-cleanup-obligations.jsonl"
-        endpoint = urllib.parse.urlsplit(str(api_url))
-        obligation = {"status": "needs_review", "kind": "temporary_desktop_api_key",
-                      "key_id": str(key_id), "api_origin": f"{endpoint.scheme}://{endpoint.hostname}:{endpoint.port or 80}",
-                      "attempt_count": 2, "recorded_at": datetime.now(timezone.utc).isoformat()}
-        try:
-            evidence_path.parent.mkdir(parents=True, exist_ok=True)
-            append_jsonl_receipt(evidence_path, obligation)
-            result["cleanup_obligation_path"] = str(evidence_path)
-        except OSError:
-            result["cleanup_evidence_write_failed"] = True
     return result
 
 
@@ -16258,15 +16239,7 @@ def relocate_uploaded_document(storage_dir: Path, location: str, folder_name: st
         except Exception:
             return raw_location, ""
     else:
-        # Desktop locations are relative paths, not URLs or drive-relative
-        # paths. Reject traversal before normalization can conceal it.
-        pieces = normalized_location.split("/")
-        if (any(piece in {"", ".", ".."} for piece in pieces)
-                or any(character in normalized_location for character in (":", "\x00"))):
-            return raw_location, "Uploaded document location is not a safe relative storage path."
-    source_path = (documents_root / normalized_location).resolve()
-    if not source_path.is_relative_to(documents_root):
-        return raw_location, "Uploaded document source is outside AnythingLLM documents storage."
+        normalized_location = normalized_location.lstrip("/")
     if normalized_location.startswith("custom-documents/") is False:
         return raw_location, ""
     # Validate each path piece again at this filesystem boundary: an explicit
@@ -16281,6 +16254,7 @@ def relocate_uploaded_document(storage_dir: Path, location: str, folder_name: st
         # drawer root; normalize the endpoint response to its canonical
         # relative document location before embedding.
         return normalized_location.replace("\\", "/"), ""
+    source_path = storage / "documents" / normalized_location
     if not source_path.exists():
         return raw_location, f"Uploaded document path was not found on disk: {source_path}"
     target_relative = f"{target_folder}/{Path(normalized_location).name}"
@@ -24118,22 +24092,34 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             evidence_kind="source_hash_progress",
         )
 
-    # Parent fingerprints are useful for scheduling, not authority to skip
-    # content verification. The public preparation boundary holds the source
-    # read-only while hashing, metadata inspection and every backend run.
+    # The Automatic batch runner may have just calculated this identity while
+    # checking whether a later selected path is byte-identical to an earlier
+    # one.  Reuse it only when the source still has the exact same inexpensive
+    # filesystem fingerprint.  A changed file falls back to the established
+    # streaming hash rather than trusting a stale parent-process value.
     supplied_sha = str(getattr(args, "precomputed_source_sha256", "") or "").strip().lower()
-    source_sha = sha256_file(pdf_path, progress_callback=report_hash_progress)
-    if re.fullmatch(r"[0-9a-f]{64}", supplied_sha):
-        if source_sha != supplied_sha:
-            raise ValueError("Source PDF changed after selection verification; no stale source identity was reused.")
+    supplied_fingerprint = getattr(args, "precomputed_source_fingerprint", {}) or {}
+    try:
+        current_stat = pdf_path.stat()
+        source_unchanged = (
+            isinstance(supplied_fingerprint, dict)
+            and int(supplied_fingerprint.get("size") or -1) == int(current_stat.st_size)
+            and int(supplied_fingerprint.get("mtime_ns") or -1) == int(current_stat.st_mtime_ns)
+        )
+    except OSError:
+        source_unchanged = False
+    if re.fullmatch(r"[0-9a-f]{64}", supplied_sha) and source_unchanged:
+        source_sha = supplied_sha
         report_upload_phase(
             "metadata",
-            "Source identity verified against the selected revision",
+            "Source identity already verified for this run",
             completed_units=0,
             total_units=1,
             fallback_fraction=0.0,
-            evidence_kind="source_hash_reverified",
+            evidence_kind="source_hash_reused",
         )
+    else:
+        source_sha = sha256_file(pdf_path, progress_callback=report_hash_progress)
     def report_metadata_progress(step, completed, total):
         detail = (
             "Profiling PDF page geometry"
@@ -24836,8 +24822,6 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 effective_limit=chunk_size,
                 custom_page_group_sizes=getattr(args, "custom_page_group_sizes", ()),
             )
-            check_pages(segment_pages)
-            check_pdf_budget("SEGMENTS", len(segments))
             lane_review = proposed_supplementary_lane_review(
                 segments,
                 stats,
@@ -28563,11 +28547,6 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
 
 
 def prepare_pdf(pdf_path: Path, out_root: Path, args):
-    with locked_pdf_source(pdf_path) as stable_source:
-        return _prepare_stable_pdf(stable_source, out_root, args)
-
-
-def _prepare_stable_pdf(pdf_path: Path, out_root: Path, args):
     """Prepare one PDF through the stable compatibility boundary.
 
     The public API is intentionally thin. Runtime control, preflight, persisted
@@ -28615,9 +28594,7 @@ def pdf_input_preflight(pdf_path: Path, sample_pages=8):
     try:
         if not path.is_file() or not os.access(path, os.R_OK):
             raise OSError("The PDF path is not readable.")
-        check_source(path)
         with fitz.open(path) as document:
-            check_document(document)
             result["readable"] = True
             result["encrypted"] = bool(document.needs_pass)
             if document.needs_pass:

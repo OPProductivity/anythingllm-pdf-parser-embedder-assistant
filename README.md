@@ -21,11 +21,6 @@ AnythingLLM Desktop for Windows is open-source software that allows you to chat 
 
 ## Start here
 
-Current installers require a trusted SHA-256 verified offline release bundle.
-Follow [Verified releases](docs/VERIFIED-RELEASES.md) instead of older
-source-ZIP/pipx installation examples below. Existing installations and the
-assistant's normal Start shortcut are unchanged by this installer policy.
-
 1. Install and open AnythingLLM Desktop. Configure and test its embedding
    provider there.
 2. Download [Install-AnythingLLMPdfAssistant.ps1](https://github.com/OPProductivity/anythingllm-pdf-parser-embedder-assistant/releases/download/v0.5.1/Install-AnythingLLMPdfAssistant.ps1).
