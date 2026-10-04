@@ -62,6 +62,9 @@ Issues = "https://github.com/OPProductivity/anythingllm-pdf-parser-embedder-assi
 [tool.setuptools]
 packages = ["benchmarks"]
 py-modules = [
+  "source_guard",
+  "cli_exports",
+  "pdf_budgets",
   "authenticated_http",
   "diagnostic_runner",
   "anythingllm_compatibility",

@@ -55,6 +55,7 @@ from gradio.routes import App as GradioFastAPIApp
 from server_lifecycle import LIFECYCLE_HEAD, install_lifecycle_routes
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
+from pdf_budgets import check_source, check_document, check as check_pdf_budget, limit as pdf_budget_limit
 from structured_logging import configure_structured_logger
 from reliability_audit import audit_run_directory, write_failure_bundle
 from prepared_batch_recovery import (
@@ -108,7 +109,7 @@ from auto_anythingllm_pipeline import (
     create_validation_workspace,
     confirmed_submission_locations_from_ledger,
     create_temporary_desktop_api_key,
-    delete_temporary_desktop_api_key,
+    cleanup_temporary_desktop_api_key,
     detect_anythingllm_api_url,
     default_short_label,
     describe_simulation_adapter,
@@ -5066,6 +5067,7 @@ def native_upload_readiness_report(
         report["authenticated"] = bool(auth.get("authenticated"))
         report["authentication_status"] = auth.get("status") or "not_checked"
         report["authentication_message"] = auth.get("message") or "Authentication not checked yet."
+        report["temporary_key_cleanup"] = dict(auth.get("temporary_key_cleanup") or {})
         if report["authenticated"] and report["workspace_slug"] and not is_new_document_workspace_choice(report["workspace_slug"]):
             api_found, api_message = api_workspace_slug_exists(
                 report["runtime_api_url"],
@@ -6527,7 +6529,7 @@ def preview_anythingllm_embedder_policy(engine_value, model_value, current_limit
 
 def default_simulation_resolution():
     try:
-        return resolve_default_simulation_adapter()
+        return resolve_default_simulation_adapter(resolve_credentials=False)
     except Exception as exc:
         config = anythingllm_embedding_config(default_anythingllm_storage_dir())
         return {
@@ -9117,7 +9119,11 @@ def submit_embedding_resume_manifest(
             release_automatic_anythingllm_mutation_lease()
     finally:
         if temporary_key_id:
-            delete_temporary_desktop_api_key(resolved_api, temporary_key_id)
+            cleanup = cleanup_temporary_desktop_api_key(resolved_api, temporary_key_id)
+            result["temporary_key_cleanup"] = cleanup
+            if cleanup.get("status") == "delete_failed":
+                result["cleanup_needs_review"] = True
+                result["message"] += " Temporary API key cleanup failed; review the retained cleanup obligation."
     if report.get("stopped_after_source_window"):
         result.update(
             status="resume_source_window_held",
@@ -12339,7 +12345,8 @@ def iter_uploaded_pdf_candidate_inspection(files, *, progress_interval=32):
             continue
         try:
             size = path.stat().st_size
-        except OSError as exc:
+            check_source(path)
+        except (OSError, ValueError) as exc:
             unreadable_pdf_files.append(f"{path.name}: {exc}")
             continue
         if size == 0:
@@ -16600,6 +16607,9 @@ def execute_automatic_preparation_in_worker(
     background_runtime_recovery_attempted = False
     runtime_guard = new_automatic_runtime_guard()
     worker_record = active_automatic_run_worker(root)
+    budget_observed_at = time.monotonic()
+    local_preparation_seconds = 0.0
+    preparation_budget_seconds = pdf_budget_limit("PREPARATION_SECONDS")
 
     def worker_failure_evidence():
         try:
@@ -16615,6 +16625,15 @@ def execute_automatic_preparation_in_worker(
 
     try:
         while process.poll() is None:
+            budget_now = time.monotonic()
+            if not stage_requires_desktop:
+                local_preparation_seconds += budget_now - budget_observed_at
+            budget_observed_at = budget_now
+            if local_preparation_seconds > preparation_budget_seconds:
+                stop_automatic_run_worker_and_wait(root, process)
+                return {"status": "failed", "error": "PDF local preparation resource budget exceeded; owned worker stopped without restarting AnythingLLM.",
+                        "resource_budget": {"local_preparation_seconds": local_preparation_seconds,
+                                            "limit_seconds": preparation_budget_seconds}, **worker_failure_evidence()}
             if automatic_run_cancellation_requested(root):
                 stop_automatic_run_worker_and_wait(root, process)
                 recovery = write_automatic_cancellation_recovery(root, pdf_path, worker_record)
@@ -17872,8 +17891,11 @@ def automatic_full_native_text_coverage(path):
     native_text_seconds = 0.0
     image_geometry_seconds = 0.0
     image_geometry_fallbacks = 0
+    text_budget_bytes = 0
     try:
+        check_source(pdf_path)
         with fitz.open(pdf_path) as document:
+            check_document(document)
             result["page_count"] = int(document.page_count or 0)
             # Confirmation historically samples three representative pages.
             # Capture those same observations during the all-page picker pass
@@ -17888,6 +17910,10 @@ def automatic_full_native_text_coverage(path):
                 page = document.load_page(index)
                 native_text_started = time.perf_counter()
                 native_text = page.get_text("text") or ""
+                page_text_bytes = len(native_text.encode("utf-8"))
+                check_pdf_budget("PAGE_TEXT_BYTES", page_text_bytes)
+                text_budget_bytes += page_text_bytes
+                check_pdf_budget("TEXT_BYTES", text_budget_bytes)
                 native_text_seconds += time.perf_counter() - native_text_started
                 text_characters = len(native_text.strip())
                 sampled_image_records = None

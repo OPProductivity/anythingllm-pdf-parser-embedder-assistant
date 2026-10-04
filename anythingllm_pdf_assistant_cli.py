@@ -1070,7 +1070,7 @@ def _bridge_script_path() -> Path:
     return package_resource_path("Install-AnythingLLMDesktopRefreshBridge.ps1")
 
 
-def _bridge(action: str, resources_path: str) -> int:
+def _bridge(action: str, resources_path: str, *, asar_tool_bundle="", asar_tool_sha256="") -> int:
     powershell = shutil.which("powershell.exe") or shutil.which("pwsh.exe") or shutil.which("pwsh")
     if not powershell:
         print("PowerShell is required for the optional Desktop refresh bridge.", file=sys.stderr)
@@ -1078,6 +1078,8 @@ def _bridge(action: str, resources_path: str) -> int:
     command = [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(_bridge_script_path())]
     if resources_path:
         command.extend(["-ResourcesPath", resources_path])
+    if asar_tool_bundle:
+        command.extend(["-AsarToolBundle", asar_tool_bundle, "-AsarToolSha256", asar_tool_sha256])
     if action == "validate":
         command.append("-Validate")
     elif action == "uninstall":
@@ -1210,6 +1212,8 @@ def build_parser() -> argparse.ArgumentParser:
     bridge = subcommands.add_parser("bridge", help="manage the optional AnythingLLM Desktop refresh bridge")
     bridge.add_argument("action", choices=("install", "validate", "upgrade", "uninstall"))
     bridge.add_argument("--resources-path", default="", help="non-standard AnythingLLM Desktop resources directory")
+    bridge.add_argument("--asar-tool-bundle", default="", help="reviewed immutable ASAR tool bundle")
+    bridge.add_argument("--asar-tool-sha256", default="", help="trusted SHA256 of the complete ASAR tool bundle")
 
     compatibility = subcommands.add_parser(
         "compatibility",
@@ -1282,7 +1286,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Desktop shortcut ready: {path}")
         return 0
     if command == "bridge":
-        return _bridge(args.action, args.resources_path)
+        return _bridge(args.action, args.resources_path, asar_tool_bundle=args.asar_tool_bundle,
+                       asar_tool_sha256=args.asar_tool_sha256)
     if command == "compatibility":
         return _compatibility_inspect(args.storage_dir, args.package_fingerprint, args.json, args.api_url)
     if command == "reliability":
