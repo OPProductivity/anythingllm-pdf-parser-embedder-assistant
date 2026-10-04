@@ -18992,7 +18992,15 @@ def update_workspace_embeddings_desktop_queue(
         # success signal and does not alter queue ownership.
         snapshot = queue_snapshot()
         precommit_rejection = source_atomic_precommit_rejection(snapshot)
-        if precommit_rejection is not None:
+        source_paths = {
+            str(row.get("source_path") or "").strip()
+            for row in (location_sources or [])
+            if str(row.get("source_path") or "").strip()
+        }
+        # Before the first document starts, one rejected PDF says nothing
+        # about its still-staging siblings. The grouped verifier owns that
+        # partition; retain the established shortcut only for a single source.
+        if precommit_rejection is not None and len(source_paths) <= 1:
             return {
                 "status": "source_atomic_precommit_rejection",
                 "safe_source_rejection": True,

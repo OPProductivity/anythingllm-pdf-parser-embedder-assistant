@@ -27,6 +27,7 @@ TERMINAL_STATES = frozenset({"successful", "warning", "failed", "cancelled"})
 COMPLETE_UPLOAD_STATES = frozenset({"complete", "complete_with_key_cleanup_warning"})
 PROVEN_SOURCE_STATE = "exact_vectors_proven"
 REJECTED_SOURCE_STATE = "source_rejected_without_remote_mutation"
+QUEUE_REJECTED_SOURCE_STATE = "source_queue_rejected_without_remote_mutation"
 HELD_SOURCE_STATES = frozenset({"ambiguous_external_mutation_held", "global_run_hold"})
 
 
@@ -276,6 +277,20 @@ def _audit_source_transactions(
                  "A definitely rejected source nevertheless claims a remote mutation." + suffix, artifact)
             _add(findings, not later_released, "AUDIT-REJECTED-SOURCE-002",
                  "A definitely rejected source did not release later sources." + suffix, artifact)
+        elif state == QUEUE_REJECTED_SOURCE_STATE:
+            # Global document staging preceded this rejection; only the
+            # workspace/vector commit was prevented. Do not conflate it with
+            # a source rejected before any remote file was stored.
+            _add(findings, planned <= 0 or not (planned == uploaded == len(locations)),
+                 "AUDIT-QUEUE-REJECTED-SOURCE-001",
+                 "A queue-rejected source does not reconcile its staged document counts." + suffix, artifact)
+            _add(findings, embedded != 0, "AUDIT-QUEUE-REJECTED-SOURCE-002",
+                 "A queue-rejected source nevertheless claims confirmed vectors." + suffix, artifact)
+            _add(findings, len(set(locations)) != len(locations),
+                 "AUDIT-QUEUE-REJECTED-SOURCE-003",
+                 "A queue-rejected source contains duplicate document locations." + suffix, artifact)
+            _add(findings, not later_released, "AUDIT-QUEUE-REJECTED-SOURCE-004",
+                 "A queue-rejected source did not release later sources." + suffix, artifact)
         elif state in HELD_SOURCE_STATES:
             _add(findings, later_released, "AUDIT-HELD-SOURCE-001",
                  "A held external mutation incorrectly released later sources." + suffix, artifact)

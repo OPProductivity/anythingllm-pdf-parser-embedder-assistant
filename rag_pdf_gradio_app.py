@@ -27458,9 +27458,13 @@ def partition_precommit_rejected_vector_expectation(expected_payloads, locations
     payloads = list(expected_payloads or [])
     location_rows = list(locations or [])
     raw = observer if isinstance(observer, dict) else {}
+    # The live observer keys rejections by source; durable snapshots use a list.
+    rejection_rows = raw.get("source_atomic_precommit_rejections") or []
+    if isinstance(rejection_rows, dict):
+        rejection_rows = list(rejection_rows.values())
     rejections = [
         dict(rejection)
-        for rejection in (raw.get("source_atomic_precommit_rejections") or [])
+        for rejection in rejection_rows
         if isinstance(rejection, dict)
     ]
     if not rejections:
@@ -27476,12 +27480,19 @@ def partition_precommit_rejected_vector_expectation(expected_payloads, locations
     rejection_by_key.pop(str(ambiguity.get("source_key") or "").strip(), None)
     if not rejection_by_key:
         return payloads, location_rows, {}
+    # Without an aligned receipt, removing a payload could credit the wrong file.
+    if len(payloads) != len(location_rows) or any(not str(value or "").strip() for value in location_rows):
+        return payloads, location_rows, {}
     kept_payloads = []
     kept_locations = []
     rejected_locations = []
+    rejected_source_keys = set()
     for index, payload in enumerate(payloads):
         location = location_rows[index] if index < len(location_rows) else ""
-        if str((payload or {}).get("docSource") or "").strip() in rejection_by_key:
+        metadata = (payload or {}).get("metadata") or {}
+        source_key = str(metadata.get("docSource") or (payload or {}).get("docSource") or "").strip()
+        if source_key in rejection_by_key:
+            rejected_source_keys.add(source_key)
             if location:
                 rejected_locations.append(location)
             continue
@@ -27491,8 +27502,8 @@ def partition_precommit_rejected_vector_expectation(expected_payloads, locations
     if not rejected_locations:
         return payloads, location_rows, {}
     return kept_payloads, kept_locations, {
-        "source_keys": sorted(rejection_by_key),
-        "rejections": [rejection_by_key[key] for key in sorted(rejection_by_key)],
+        "source_keys": sorted(rejected_source_keys),
+        "rejections": [rejection_by_key[key] for key in sorted(rejected_source_keys)],
         "rejected_locations": rejected_locations,
         "rejected_records": len(rejected_locations),
         "remaining_vector_expectation": len(kept_payloads),
@@ -27975,7 +27986,7 @@ def upload_prepared_automatic_batch(
             nonlocal expected_batch, active_vector_locations, precommit_rejected_sources, precommit_rejected_locations
             raw = batch_report.get("desktop_queue_observer")
             if not isinstance(raw, dict):
-                return
+                return False
             kept_payloads, kept_locations, rejection = (
                 partition_precommit_rejected_vector_expectation(
                     original_expected_batch, original_locations, raw
@@ -27983,7 +27994,7 @@ def upload_prepared_automatic_batch(
             )
             source_keys = set(rejection.get("source_keys") or [])
             if not source_keys or source_keys == precommit_rejected_sources:
-                return
+                return False
             expected_batch = kept_payloads
             active_vector_locations = kept_locations
             precommit_rejected_sources = source_keys
@@ -27991,6 +28002,7 @@ def upload_prepared_automatic_batch(
             batch_report["source_atomic_precommit_rejections"] = list(
                 rejection["rejections"]
             )
+            return True
         # This verifier partitions a shared workspace queue back into the
         # selected PDFs.  It must retain the pipeline's reconciliation
         # contract: a lost HTTP receipt is not a rejection, and an actively
@@ -28132,7 +28144,19 @@ def upload_prepared_automatic_batch(
             }
 
         while True:
-            apply_source_local_precommit_rejection()
+            if apply_source_local_precommit_rejection():
+                # Observations belong to their exact payload/location target.
+                cached_storage_report = None
+            if precommit_rejected_sources and not expected_batch:
+                return with_callback_diagnostics({
+                    "status": "source_atomic_precommit_rejection",
+                    "classification": "source_atomic_provider_rejected_before_commit",
+                    "safe_source_rejection": True,
+                    "message": "AnythingLLM rejected every source in this queue group before namespace commit; no vectors were committed.",
+                    "current_upload_locations_with_vectors": [],
+                    "current_upload_vector_evidence_complete": False,
+                    "current_upload_document_vector_count": 0,
+                })
             elapsed = time.monotonic() - started
             queue = owned_queue_snapshot()
             queue_position = max(
