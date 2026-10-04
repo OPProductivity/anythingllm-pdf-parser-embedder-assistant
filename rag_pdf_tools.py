@@ -39,6 +39,7 @@ from typing import Any
 
 from portable_paths import package_resource_path
 from cli_exports import staged_cli_exports
+from pdf_budgets import check_source, check_document, check_raster, check_pages
 
 try:
     import fitz
@@ -498,6 +499,8 @@ def get_pages_with_pymupdf(pdf_path: Path, progress_callback=None):
     # the user try to move/delete it; all returned page text is already plain
     # Python data and does not need the document to stay alive.
     with fitz.open(pdf_path) as doc:
+        check_source(pdf_path)
+        check_document(doc)
         page_count = len(doc)
         for page_index in range(page_count):
             page_num = page_index + 1
@@ -1448,6 +1451,7 @@ def photographed_page_ocr_regions(page, runtime, *, page_number=None):
     except ImportError:
         return []
 
+    check_raster(page, PHOTOGRAPHED_PAGE_OCR_DPI)
     pix = page.get_pixmap(matrix=fitz.Matrix(PHOTOGRAPHED_PAGE_OCR_DPI / 72, PHOTOGRAPHED_PAGE_OCR_DPI / 72), alpha=False)
     image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
     width, height = image.size
@@ -1466,6 +1470,7 @@ def photographed_page_ocr_regions(page, runtime, *, page_number=None):
         # Two pages share the raster: 144 DPI can silently omit small body
         # lines even with correct crops. Render once at 180 for this route,
         # rather than OCRing several candidates or changing ordinary scans.
+        check_raster(page, spread_dpi)
         pix = page.get_pixmap(matrix=fitz.Matrix(spread_dpi / 72, spread_dpi / 72), alpha=False)
         image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
     route_recovery = None
@@ -3895,13 +3900,19 @@ def get_backend_pages(
     progress_callback=None,
     unstructured_page_numbers=None,
 ):
+    check_source(pdf_path)
+    with fitz.open(pdf_path) as budget_document:
+        check_document(budget_document)
+        if backend.lower() in {"pymupdf4llm", "unstructured"}:
+            for page_index in range(budget_document.page_count):
+                check_raster(budget_document[page_index], PYMUPDF4LLM_OCR_DPI)
     backend_key = backend.lower()
     if backend_key == "pymupdf":
         pages, page_count = get_pages_with_pymupdf(pdf_path, progress_callback=progress_callback)
-        return pages, page_count, []
+        return check_pages(pages), page_count, []
     if backend_key == "pymupdf4llm":
         pages, page_count = get_pages_with_pymupdf4llm(pdf_path, progress_callback=progress_callback)
-        return pages, page_count, []
+        return check_pages(pages), page_count, []
     if backend_key == "unstructured":
         result = get_pages_with_unstructured(
             pdf_path,
@@ -3911,6 +3922,7 @@ def get_backend_pages(
             progress_callback=progress_callback,
             page_numbers=unstructured_page_numbers,
         )
+        check_pages(result[0])
         return result
     raise ValueError(f"Unsupported backend: {backend}")
 

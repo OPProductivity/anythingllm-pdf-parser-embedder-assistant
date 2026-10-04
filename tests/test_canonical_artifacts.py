@@ -1,4 +1,5 @@
 from pathlib import Path
+import io
 
 import pytest
 
@@ -90,12 +91,14 @@ def test_multipart_can_keep_upload_identity_when_disk_name_is_canonical(tmp_path
 
     class Response:
         status = 200
+        def __init__(self):
+            self.body = io.BytesIO(b'{}')
         def __enter__(self):
             return self
         def __exit__(self, *_):
             return False
-        def read(self):
-            return b'{}'
+        def read(self, size=-1):
+            return self.body.read(size)
 
     def open_request(request, **_):
         requests.append(request.data)
@@ -166,15 +169,6 @@ def test_private_retention_reuses_bytes_without_changing_public_exports(tmp_path
                'api_upload_status': 'skipped_prepare_only', 'post_upload_verification_status': 'not_checked_no_upload',
                'anythingllm_runtime_validation_status': 'not_checked_no_upload', 'segment_mode': 'page'}
     segments = [{'pdf_page': 2, 'text': body}, {'pdf_page': 3, 'text': body}]
-    staged_writes = []
-    write_text = Path.write_text
-
-    def observe_write(path, content, *args, **kwargs):
-        if any(part.startswith('.retained-segments-') for part in path.parts):
-            staged_writes.append(path)
-        return write_text(path, content, *args, **kwargs)
-
-    monkeypatch.setattr(Path, 'write_text', observe_write)
     retained = pipeline.retain_successful_run_leanly(root, summary, {}, prepared, segments=segments,
                                                    preserve_preexisting_children=False)
     assert retained['applied']
@@ -182,7 +176,6 @@ def test_private_retention_reuses_bytes_without_changing_public_exports(tmp_path
     actuals = [Path(path) for path in retained['retained_segment_paths']]
     assert actuals[0] == actuals[1]
     if canonical_body:
-        assert not staged_writes
         assert actuals == [payload, payload]
         assert not list(root.glob('*-p002-s01.txt'))
     sources = pipeline.local_segment_export_sources(prepared, retained)

@@ -135,7 +135,8 @@ def test_valid_bundled_asset_is_usable():
 def test_region_reports_selected_call_not_last_attempt(case, selected):
     image = Image.new("RGB", (800, 1100), "white")
     pixmap = SimpleNamespace(width=800, height=1100, samples=image.tobytes())
-    page = SimpleNamespace(get_text=lambda *_: "", get_pixmap=lambda **_: pixmap)
+    page = SimpleNamespace(rect=SimpleNamespace(width=400, height=550),
+                           get_text=lambda *_: "", get_pixmap=lambda **_: pixmap)
     fraction = (0.1, 0.1, 0.9, 0.9)
     body = "Trustworthy ordinary recognized source words. " * 30
 

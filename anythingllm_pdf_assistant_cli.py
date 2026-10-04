@@ -24,6 +24,7 @@ from pathlib import Path
 from portable_paths import application_paths, ensure_application_directories, package_resource_path
 from authenticated_http import RejectAuthenticatedRedirects
 from server_exit_log import record_server_event
+from browser_access import BOOTSTRAP_PATH, KEY_ENV, browser_ticket
 
 
 def _notify_browser_stop(record, event):
@@ -211,7 +212,8 @@ def _local_app_url(port: int) -> str:
 def _local_app_is_responding(port: int, *, timeout_seconds: float = 0.75) -> bool:
     """Return whether the assistant's HTTP endpoint can serve a browser now."""
     try:
-        with urllib.request.urlopen(_local_app_url(port), timeout=timeout_seconds) as response:
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
+                _local_app_url(port) + "healthz", timeout=timeout_seconds) as response:
             return int(getattr(response, "status", response.getcode())) == 200
     except (OSError, urllib.error.URLError, ValueError):
         return False
@@ -220,13 +222,16 @@ def _local_app_is_responding(port: int, *, timeout_seconds: float = 0.75) -> boo
 def _open_local_app_browser(port: int) -> None:
     """Open the local URL through the operating system's normal browser route."""
     url = _local_app_url(port)
+    record = _server_marker_for_diagnostics()
+    if record and record.get("browser_auth_key") and int(record.get("port") or 0) == int(port):
+        url = url.rstrip("/") + BOOTSTRAP_PATH + "#" + browser_ticket(record["browser_auth_key"])
     try:
         if sys.platform == "win32":
             os.startfile(url)  # type: ignore[attr-defined]  # Windows ShellExecute
         else:
             webbrowser.open_new_tab(url)
     except OSError as exc:
-        _notify_launcher_message(f"The assistant is ready, but Windows could not open the browser ({type(exc).__name__}). Open {url} manually.")
+        _notify_launcher_message(f"The assistant is ready, but Windows could not open the browser ({type(exc).__name__}). Please retry the Start shortcut.")
 
 
 def _open_browser_when_local_app_is_ready(port: int, *, cancelled=None, loaded=None) -> threading.Thread:
@@ -639,8 +644,10 @@ def _write_server_marker(port: int) -> Path:
         "command": "anythingllm-pdf-assistant start",
         "started_at": time.time(),
         "stop_notification_token": secrets.token_urlsafe(32),
+        "browser_auth_key": secrets.token_urlsafe(32),
     }
     os.environ["ANYTHINGLLM_PDF_ASSISTANT_STOP_TOKEN"] = payload["stop_notification_token"]
+    os.environ[KEY_ENV] = payload["browser_auth_key"]
     if sys.platform == "win32":
         with _pinned_server_process(root_pid) as ticks:
             payload["process_creation_ticks"] = str(ticks)

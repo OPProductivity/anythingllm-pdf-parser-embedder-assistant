@@ -21,13 +21,10 @@ AnythingLLM Desktop for Windows is open-source software that allows you to chat 
 
 ## Start here
 
-Current source-tree installers require a trusted SHA-256 verified offline release
-bundle. Follow [Verified releases](docs/VERIFIED-RELEASES.md); the older published
-installer and source-ZIP/pipx examples below are historical, not the hardened
-installation path. Existing installations and normal Start shortcuts are unchanged.
-
-Standalone `rag_pdf_tools` CLI exports now reject existing destinations unless
-`--overwrite` is supplied. Automatic GUI processing does not use this CLI wrapper.
+**Security update:** current installers require a trusted SHA-256 verified
+offline release bundle. Follow [Verified releases](docs/VERIFIED-RELEASES.md)
+instead of older source-ZIP/pipx installation examples below. Open the running
+assistant through its Start shortcut to establish its browser session.
 
 1. Install and open AnythingLLM Desktop. Configure and test its embedding
    provider there.

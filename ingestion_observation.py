@@ -6,8 +6,27 @@ import sqlite3
 import threading
 import time
 from contextlib import closing
+from authenticated_http import validate_authenticated_url, ResponseBudgetExceeded
+from desktop_service_trust import require_managed_key_origin, managed_async_transport
 
 STREAM_CONNECT_TIMEOUT_SECONDS = 5
+MAX_STREAM_LINE_BYTES = 2 * 1024 * 1024
+MAX_STREAM_EVENT_BYTES = 4 * 1024 * 1024
+
+
+async def bounded_stream_lines(response):
+    pending = bytearray()
+    async for chunk in response.aiter_raw():
+        pending.extend(chunk)
+        while (newline := pending.find(b"\n")) >= 0:
+            if newline > MAX_STREAM_LINE_BYTES:
+                raise ResponseBudgetExceeded("Progress stream line exceeds its byte budget.")
+            yield bytes(pending[:newline]).rstrip(b"\r").decode("utf-8", errors="replace")
+            del pending[:newline + 1]
+        if len(pending) > MAX_STREAM_LINE_BYTES:
+            raise ResponseBudgetExceeded("Progress stream line exceeds its byte budget.")
+    if pending:
+        yield bytes(pending).rstrip(b"\r").decode("utf-8", errors="replace")
 
 
 def observe_submission_vector_ids(storage_dir, workspace_slug, location_vector_ids):
@@ -99,17 +118,22 @@ def listen_to_progress_stream(endpoints, api_key, stop_event, payload_callback,
                     await asyncio.sleep(0.05)
                 task.cancel()
             watcher = asyncio.create_task(watch_stop())
-        headers = {'Accept': 'text/event-stream', 'Cache-Control': 'no-cache'}
+        headers = {'Accept': 'text/event-stream', 'Cache-Control': 'no-cache', 'Accept-Encoding': 'identity'}
         if api_key:
             headers['Authorization'] = f'Bearer {api_key}'
         endpoint = 0
         failures = 0
         connected_once = False
         try:
+            owned_transport = managed_async_transport(endpoints[0], api_key) if api_key else None
             async with httpx.AsyncClient(timeout=httpx.Timeout(STREAM_CONNECT_TIMEOUT_SECONDS, read=None),
-                                         follow_redirects=False) as client:
+                                         follow_redirects=False, trust_env=False,
+                                         **({"transport": owned_transport} if owned_transport else {})) as client:
                 while not stop_event.is_set():
                     try:
+                        if api_key:
+                            validate_authenticated_url(endpoints[endpoint])
+                            require_managed_key_origin(endpoints[endpoint], api_key)
                         async with client.stream('GET', endpoints[endpoint], headers=headers) as response:
                             if response.status_code == 404 and endpoint + 1 < len(endpoints):
                                 endpoint += 1
@@ -121,6 +145,8 @@ def listen_to_progress_stream(endpoints, api_key, stop_event, payload_callback,
                                     error_callback(reason, 1)
                                 return
                             response.raise_for_status()
+                            if response.headers.get('Content-Encoding', 'identity').lower() != 'identity':
+                                raise ResponseBudgetExceeded('Compressed progress streams are not accepted.')
                             failures = 0
                             connected_once = True
                             state('connected')
@@ -128,15 +154,26 @@ def listen_to_progress_stream(endpoints, api_key, stop_event, payload_callback,
                                 connected_event.set()
                             response.encoding = 'utf-8'
                             payload_lines = []
-                            async for line in response.aiter_lines():
+                            payload_bytes = 0
+                            async for line in bounded_stream_lines(response):
                                 if stop_event.is_set():
                                     return
                                 if line.startswith('data:'):
+                                    payload_bytes += len(line.encode('utf-8'))
+                                    if payload_bytes > MAX_STREAM_EVENT_BYTES:
+                                        raise ResponseBudgetExceeded('Progress stream event exceeds its byte budget.')
                                     payload_lines.append(line[5:].lstrip())
                                 elif not line and payload_lines:
                                     payload_callback('\n'.join(payload_lines))
                                     payload_lines = []
+                                    payload_bytes = 0
                         reason = 'stream_eof'
+                    except (ResponseBudgetExceeded, ValueError) as exc:
+                        reason = str(exc)
+                        state('unavailable', reason, 1)
+                        if callable(error_callback):
+                            error_callback(reason, 1)
+                        return
                     except httpx.HTTPError as exc:
                         reason = (f'HTTP {exc.response.status_code}' if isinstance(exc, httpx.HTTPStatusError)
                                   else type(exc).__name__)
