@@ -39,6 +39,7 @@ import urllib.request
 import uuid
 import zipfile
 from run_evidence import prepare_private_json, read_run_json
+from finalization_timing import finalization_checkpoint
 from ingestion_observation import SubmissionCommitSignal
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -32217,6 +32218,7 @@ def run_automatic(
             # ``submission_started`` marker when the app stayed alive.
             persist_prepared_checkpoint("submission_terminal")
 
+    finalization_clock = time.perf_counter()
     batch_retention_report = {"status": "not_required", "documents": []}
     batch_retention_report_path = run_root / "batch-retention-report.json"
     # Worker-level lean cleanup was deferred solely because this outer batch
@@ -32249,6 +32251,7 @@ def run_automatic(
             _write_automatic_run_json(batch_retention_report_path, batch_retention_report, compact=True)
             downloadable.append(str(batch_retention_report_path))
 
+    finalization_clock = finalization_checkpoint(run_root, "batch_retention", finalization_clock)
     if automatic_batch_diagnostics_required(
         summaries,
         prepare_and_upload,
@@ -32297,6 +32300,8 @@ def run_automatic(
             lines_for_batch_audit = "Batch-global AnythingLLM storage audit: unavailable"
     else:
         lines_for_batch_audit = ""
+
+    finalization_clock = finalization_checkpoint(run_root, "optional_storage_diagnostics", finalization_clock)
 
     if not summaries:
         if cancellation_requested:
@@ -32653,6 +32658,7 @@ def run_automatic(
                 ]
             )
     aggregate_upload = aggregate_upload_result(summaries)
+    finalization_clock = finalization_checkpoint(run_root, "completion_reporting", finalization_clock)
     if prepare_and_upload and aggregate_upload:
         latest_readiness_html = native_upload_readiness_html(
             native_upload_readiness_report(
@@ -32664,6 +32670,7 @@ def run_automatic(
                 verify_authentication=True,
             )
         )
+    finalization_clock = finalization_checkpoint(run_root, "final_readiness_check", finalization_clock)
     # The final source-window receipt has already proved every submitted
     # vector. Promote that evidence into the durable UI status before the
     # small local report/integrity tail begins. Previously the grouped queue
@@ -32808,11 +32815,13 @@ def run_automatic(
                 }, stage="local_reporting", outcome="export_incomplete", scope="artifact", category="compact_export_promotion_failed")
             else:
                 completion["message"] = f"{completion['message']} {publication_message}"
+    finalization_clock = finalization_checkpoint(run_root, "public_text_publication", finalization_clock)
     completion, terminal_audit = terminal_integrity_audit(
         run_root,
         completion,
         native_run=bool(prepare_and_upload and summaries and batch_upload_report),
     )
+    finalization_clock = finalization_checkpoint(run_root, "terminal_integrity_audit", finalization_clock)
     if terminal_audit:
         lines.append(
             "Internal integrity audit: "
@@ -32824,6 +32833,7 @@ def run_automatic(
         )
     if flat_no_logs_complete:
         finalize_published_text_separation(run_root, summaries)
+    finalization_clock = finalization_checkpoint(run_root, "publication_receipt_refresh", finalization_clock)
     wall_clock_seconds = time.perf_counter() - started_at
     live_timing_status = dict(LIVE_AUTOMATIC_RUN_STATUS or {})
     if live_timing_status.get("run_root") == str(run_root):

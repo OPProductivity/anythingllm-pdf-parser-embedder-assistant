@@ -4061,22 +4061,12 @@ LEAN_SUCCESS_NONRETAINED_SUMMARY_PATH_FIELDS = (
 )
 
 
-def materialize_retained_segments(prepared_text_path: Path, segments_dir: Path, segments):
-    """Write the selected, local chunks as plain text files for a ready run.
-
-    These are the exact chunks selected by this pipeline, named by PDF page and
-    their within-page order.  They are intentionally not described as
-    AnythingLLM's final chunks: AnythingLLM may normalize or rechunk a stored
-    document during its own processing step.
-    """
+def retained_segment_texts(prepared_text_path: Path, segments_dir: Path, segments):
+    """Plan the established names and exact text before writing export files."""
     prepared_text_path = Path(prepared_text_path)
     segments_dir = Path(segments_dir)
-    if segments_dir.exists():
-        shutil.rmtree(segments_dir)
-    segments_dir.mkdir(parents=True, exist_ok=True)
     base_name = safe_stem(prepared_text_path.stem.removesuffix("-pdf-parsed")) or "document"
     page_counts = Counter()
-    retained = []
     for segment in segments or ():
         if not isinstance(segment, dict):
             continue
@@ -4093,7 +4083,18 @@ def materialize_retained_segments(prepared_text_path: Path, segments_dir: Path, 
             fallback="segment",
         )
         target = segments_dir / filename
-        target.write_text(str(segment.get("text") or ""), encoding="utf-8")
+        yield target, str(segment.get("text") or "")
+
+
+def materialize_retained_segments(prepared_text_path: Path, segments_dir: Path, segments):
+    """Write selected local chunks, not AnythingLLM's downstream chunks."""
+    segments_dir = Path(segments_dir)
+    if segments_dir.exists():
+        shutil.rmtree(segments_dir)
+    segments_dir.mkdir(parents=True, exist_ok=True)
+    retained = []
+    for target, text in retained_segment_texts(prepared_text_path, segments_dir, segments):
+        target.write_text(text, encoding="utf-8")
         retained.append(target)
     return retained
 
@@ -4257,11 +4258,25 @@ def retain_successful_run_leanly(
     stage_parent = selected_dir if selected_dir.is_dir() else out_root
     stage_dir = Path(tempfile.mkdtemp(prefix=".retained-segments-", dir=stage_parent))
     try:
-        staged_segments = (
-            materialize_retained_segments(prepared_text_path, stage_dir, segments)
-            if retain_segment_files
-            else []
-        )
+        catalog = None
+        artifact_index = out_root / "artifact-locations.json"
+        if preserve_private_evidence and artifact_index.is_file():
+            from canonical_artifacts import CanonicalArtifacts, checked_role_path
+
+            roles = read_run_json(artifact_index)["roles"]
+            catalog = CanonicalArtifacts(out_root, atomic_write_text, existing=(
+                checked_role_path(out_root, actual) for actual in set(roles.values())
+                if Path(actual).suffix.casefold() == ".txt"
+            ))
+        staged_segments = []
+        reused_segments = []
+        if retain_segment_files:
+            for segment_path, text in retained_segment_texts(prepared_text_path, stage_dir, segments):
+                existing = catalog.existing_text(text) if catalog else None
+                if existing is None:
+                    segment_path.write_text(text, encoding="utf-8")
+                staged_segments.append(segment_path)
+                reused_segments.append(existing)
         planned_direct_segments = [out_root / segment_path.name for segment_path in staged_segments]
         planned_targets = [retained_text_path, *planned_direct_segments]
         if len({str(path).casefold() for path in planned_targets}) != len(planned_targets):
@@ -4283,18 +4298,9 @@ def retain_successful_run_leanly(
                 shutil.move(str(prepared_text_path), str(retained_text_path))
         retained_segments = []
         retained_segment_exports = []
-        catalog = None
-        artifact_index = out_root / "artifact-locations.json"
-        if preserve_private_evidence and artifact_index.is_file():
-            from canonical_artifacts import CanonicalArtifacts, checked_role_path
-
-            roles = read_run_json(artifact_index)["roles"]
-            catalog = CanonicalArtifacts(out_root, atomic_write_text, existing=(
-                checked_role_path(out_root, actual) for actual in set(roles.values())
-                if Path(actual).suffix.casefold() == ".txt"
-            ))
-        for segment_path, direct_path in zip(staged_segments, planned_direct_segments):
-            existing = catalog.existing_bytes(segment_path.read_bytes()) if catalog else None
+        for segment_path, direct_path, existing in zip(staged_segments, planned_direct_segments, reused_segments):
+            if existing is None and catalog:
+                existing = catalog.existing_bytes(segment_path.read_bytes())
             if existing is None:
                 shutil.move(str(segment_path), str(direct_path))
                 actual = catalog.register(direct_path) if catalog else direct_path

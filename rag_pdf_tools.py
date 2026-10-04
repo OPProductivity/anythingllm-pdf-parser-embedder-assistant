@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any
 
 from portable_paths import package_resource_path
+from cli_exports import staged_cli_exports
 
 try:
     import fitz
@@ -3914,6 +3915,7 @@ def get_backend_pages(
     raise ValueError(f"Unsupported backend: {backend}")
 
 
+@staged_cli_exports("extract", safe_stem)
 def extract_pdf(args):
     pdf_path = Path(args.pdf)
     out_dir = Path(args.out_dir)
@@ -3995,6 +3997,7 @@ def extract_pdf(args):
         print("Validation report:", validation_report)
 
 
+@staged_cli_exports("segment", safe_stem)
 def segment_pdf(args):
     pdf_path = Path(args.pdf)
     out_dir = Path(args.out_dir)
@@ -4129,6 +4132,7 @@ def add_common_args(parser):
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--output-base-name", default="")
     parser.add_argument("--validation-phrase", action="append", default=[])
+    parser.add_argument("--overwrite", action="store_true", help="Explicitly replace existing CLI export files after successful staging.")
     parser.add_argument(
         "--backend",
         choices=["pymupdf", "pymupdf4llm", "unstructured"],
