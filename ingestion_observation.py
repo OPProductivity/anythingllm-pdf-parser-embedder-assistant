@@ -10,40 +10,6 @@ from contextlib import closing
 STREAM_CONNECT_TIMEOUT_SECONDS = 5
 
 
-def observe_submission_vector_ids(storage_dir, workspace_slug, location_vector_ids):
-    """Prove mapped IDs in only the selected namespace, without loading text."""
-    expected = {str(value) for values in location_vector_ids.values() for value in values}
-    result = {'status': 'pending', 'expected_vector_count': len(expected),
-              'matched_vector_count': 0, 'locations_with_vectors': [], 'complete': False}
-    vector_store = Path(storage_dir) / 'lancedb'
-    if not expected or not workspace_slug or not vector_store.is_dir():
-        return result
-    try:
-        import lancedb
-
-        table = lancedb.connect(str(vector_store)).open_table(workspace_slug)
-        present = set()
-        ids = sorted(expected)
-        for start in range(0, len(ids), 256):
-            batch = ids[start:start + 256]
-            quoted = ','.join("'" + value.replace("'", "''") + "'" for value in batch)
-            rows = (table.search().where(f'id IN ({quoted})', prefilter=True)
-                    .select(['id']).limit(len(batch)).to_arrow().to_pylist())
-            present.update(str(row['id']) for row in rows)
-        result.update({
-            'status': 'complete', 'matched_vector_count': len(expected & present),
-            'locations_with_vectors': sorted(
-                location for location, values in location_vector_ids.items()
-                if values and set(values).issubset(present)
-            ),
-            'complete': expected.issubset(present),
-        })
-    except Exception as exc:
-        # Missing/busy physical storage is uncertainty, never retry authority.
-        result.update({'status': 'unavailable', 'error_type': type(exc).__name__, 'error': str(exc)})
-    return result
-
-
 class StreamStopEvent(threading.Event):
     """Cancel an async observer without waiting for a quiet socket timeout."""
 

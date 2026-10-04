@@ -92,22 +92,13 @@ def test_captured_redirects_are_clear_and_not_retried(wire, status):
     assert len(transport.requests) == 1
 
 
-def test_observer_redirect_is_unavailable_without_reconnect(monkeypatch):
-    import httpx
-
-    requests = []
-    def redirect(request):
-        requests.append(request)
-        return httpx.Response(302, headers={'Location': 'https://other.invalid/target'})
-
-    client = httpx.AsyncClient
-    monkeypatch.setattr(httpx, 'AsyncClient', lambda **kwargs: client(
-        transport=httpx.MockTransport(redirect), **kwargs))
+def test_observer_redirect_is_unavailable_without_reconnect(wire):
+    transport = wire(302)
     states, errors = [], []
     pipeline.listen_for_anythingllm_embed_progress(
         'https://original.invalid', 'synthetic', 'workspace', [], threading.Event(),  # pragma: allowlist secret -- dummy offline fixture
         state_callback=lambda *args: states.append(args), error_callback=lambda *args: errors.append(args))
-    assert len(requests) == 1
+    assert len(transport.requests) == 1
     assert states[-1][0] == 'unavailable'
     assert len(errors) == 1
 

@@ -80,7 +80,6 @@ from embedder_capabilities import (
 
 from auto_anythingllm_pipeline import (
     _api_urlopen,
-    local_segment_export_sources,
     summarize_ocr_run_evidence,
     AUTOMATIC_UPLOAD_PHASE_RANGES,
     ANYTHINGLLM_EMBEDDING_RECONCILIATION_STALL_SECONDS,
@@ -8008,6 +8007,7 @@ def promote_flat_no_logs_batch_output(output_root, temporary_run_dir, pdf_paths,
     # that retention has run.  Never promote every child of the staging
     # directory: doing so leaks those diagnostic JSON/JSONL files back into a
     # user-selected no-logs export.
+    segment_name = re.compile(r"-p\d{3,}-s\d+\.txt$", re.IGNORECASE)
     # The public output and private state directories are two views of one run.
     # Their final component must match exactly so an operator can pair them
     # without opening either directory.
@@ -8024,11 +8024,13 @@ def promote_flat_no_logs_batch_output(output_root, temporary_run_dir, pdf_paths,
             prepared = Path(canonical["upload_file"])
             selected_pdf = summary.get("pdf") or (pdf_paths[index] if index < len(pdf_paths) else "")
             stem = safe_stem(Path(str(selected_pdf)).stem) if selected_pdf else prepared.stem
-            segment_exports = local_segment_export_sources(
-                prepared, canonical.get("lean_retention") or {},
-            )
-            children = [prepared, *(path for path, _suffix in segment_exports)]
-            suffixes = ["-complete-pdf-parsed.txt", *(suffix for _path, suffix in segment_exports)]
+            children = [prepared, *sorted(
+                (p for p in prepared.parent.iterdir() if p.is_file() and segment_name.search(p.name)),
+                key=lambda p: p.name.casefold(),
+            )]
+            suffixes = ["-complete-pdf-parsed.txt", *[
+                segment_name.search(p.name).group(0) for p in children[1:]
+            ]]
             if summary.get("api_upload_status") == "skipped_exact_duplicate":
                 suffixes = [suffix.removesuffix(".txt") + "-(duplicate).txt" for suffix in suffixes]
             # Friendly names are presentation only. Internal hashes and source
@@ -10461,7 +10463,6 @@ DIAGNOSTIC_EVIDENCE_ROOT_FILES = (
     "source-profile.json",
     "artifact-locations.json",
     "page-transition-manifest.jsonl",
-    "manifest-text.jsonl",
 )
 
 
@@ -10489,13 +10490,10 @@ def diagnostic_evidence_paths(run_directory):
             resolved_root = root.resolve()
             directories = [path.resolve() for path in paths if path.is_dir()]
             for relative in set(index["roles"].values()):
-                from canonical_artifacts import checked_role_path
-
-                try:
-                    candidate = checked_role_path(resolved_root, relative)
-                except (ValueError, OSError) as exc:
-                    raise ValueError(f"Missing or unsafe canonical artifact: {relative}") from exc
-                if not candidate.is_file():
+                candidate = root / relative
+                if (Path(relative).is_absolute() or candidate.is_symlink()
+                        or not candidate.resolve().is_relative_to(resolved_root)
+                        or not candidate.is_file()):
                     raise ValueError(f"Missing or unsafe canonical artifact: {relative}")
                 if not any(candidate.resolve().is_relative_to(directory) for directory in directories):
                     paths.append(candidate)
@@ -13256,14 +13254,11 @@ def current_source_vector_progress_count(report, *, expected_records=None):
     Workspace-wide matching-row counts and the broader identity-set count can
     include earlier source windows. They remain useful diagnostics, but must
     never advance a later source's progress or liveness clock. The only count
-    allowed here is the verifier's covered current-upload record count, optionally
+    allowed here is the verifier's exact current-upload count, optionally
     bounded by the current source's prepared-record total.
     """
     try:
-        coverage = (report or {}).get("current_upload_documents_with_vectors")
-        if coverage is None:
-            coverage = (report or {}).get("current_upload_document_vector_count")
-        observed = max(0, int(coverage or 0))
+        observed = max(0, int((report or {}).get("current_upload_document_vector_count") or 0))
     except (TypeError, ValueError):
         observed = 0
     try:
@@ -13513,26 +13508,6 @@ def should_publish_vector_observation_status(
         max(0, int(unique_identities or 0)),
     )
     return max(current_signature) > 0 and current_signature != previous_signature
-
-
-def vector_observation_status_message(*, quiet_queue_recovery, covered_records,
-                                      unique_identities, expected_records,
-                                      queue_event_age=None, queue_position=0, queue_total=0):
-    """Construct every admitted status without treating identities as ownership."""
-    if quiet_queue_recovery:
-        return (
-            f"Desktop queue has been quiet for {queue_event_age:.0f}s at record "
-            f"{queue_position}/{queue_total}; exact vector check found "
-            f"{covered_records}/{expected_records} selected record(s) with vector mappings. "
-            "No upload was retried.",
-            "exact_vector_observation_quiet_queue_recovery",
-        )
-    if covered_records:
-        return (f"Checking exact vector evidence: {covered_records}/{expected_records} "
-                "selected record(s) have vector mappings", "exact_vector_observation")
-    return (f"Checking exact vector evidence: {unique_identities}/{expected_records} "
-            "selected source identities observed; submission confirmation pending",
-            "exact_vector_observation")
 
 
 @_synchronized_live_automatic_status
@@ -15656,7 +15631,7 @@ def terminal_integrity_audit(run_root, completion, *, native_run):
             "code": "EXTERNAL-QUEUE-EVIDENCE-PENDING-001",
             "message": (
                 "No complete embedding evidence yet. AnythingLLM was still processing the submitted "
-                f"upload records when assistant-side observation ended ({unresolved} not yet confirmed). "
+                f"page-parent records when assistant-side observation ended ({unresolved} not yet confirmed). "
                 "No upload was retried; check the workspace or Run history before resuming."
             ),
         }), audit
@@ -22517,30 +22492,6 @@ def record_timing_model_run(
         return {}
 
 
-def persist_confirmation_preflight(run_root, elapsed_seconds, rows):
-    sources = {}
-    events = []
-    for row in rows:
-        source = int(row.get("source_index") or 0)
-        if source:
-            sources.setdefault(str(source), {"name": row.get("source_name") or ""})
-            if row.get("page_count"):
-                sources[str(source)]["page_count"] = int(row["page_count"])
-        events.append({key: value for key, value in row.items()
-                       if key not in {"source_name", "source_total", "page_count"}
-                       and value not in ("", None)})
-    _write_automatic_run_json(Path(run_root) / "confirmation-preflight.json", {
-        "schema_version": 1, "elapsed_seconds": float(elapsed_seconds),
-        "event_count": len(events), "sources_checked": len(sources),
-        "sources": sources, "events": events,
-    })
-    record_timing_model_event(run_root, "confirmation_preflight", {
-        "timing_event": "confirmation_preflight_completed",
-        "phase_elapsed_seconds": float(elapsed_seconds),
-        "source_progress_events": len(events), "sources_checked": len(sources),
-    })
-
-
 def record_timing_model_event(run_root, stage, batch_report=None):
     """Persist compact timing evidence without making queue polling an I/O lane.
 
@@ -22607,9 +22558,6 @@ def record_timing_model_event(run_root, stage, batch_report=None):
         "candidate_success": bool(batch.get("candidate_success")),
     }
     event_name = str(event.get("event") or "status")
-    for key in ("source_progress_events", "sources_checked"):
-        if key in batch:
-            event[key] = int(batch[key] or 0)
     repeated_observations = {
         "attachment_progress",
         "cached_attachment_reuse",
@@ -23204,7 +23152,6 @@ ERROR_DIMENSIONS_BY_CODE = {
     "AUTO-EMBEDDING-SOURCE-PRECOMMIT-001": ("provider_embedding", "rejected_before_mutation", "source", "source_provider_rejected_precommit"),
     "AUTO-EMBEDDING-PARTIAL-001": ("vector_confirmation", "partially_confirmed", "queue_group", "exact_partial_vector_coverage"),
     "AUTO-EMBEDDING-RECONCILE-001": ("desktop_submission", "external_outcome_unknown", "queue_group", "submission_outcome_unknown"),
-    "AUTO-EMBEDDING-VERIFIER-001": ("vector_confirmation", "verification_interrupted", "queue_group", "verification_callback_exception"),
     "EXTERNAL-QUEUE-EVIDENCE-PENDING-001": ("desktop_queue", "externally_active", "queue_group", "external_queue_still_active"),
     "AUTO-EMBEDDING-VERIFY-001": ("vector_confirmation", "confirmation_absent", "queue_group", "vector_confirmation_unavailable"),
     "AUTO-OCR-REVIEW-001": ("ocr_reconciliation", "deliberately_withheld", "source", "ocr_evidence_disagreement"),
@@ -23321,8 +23268,6 @@ def _automatic_completion_decision(summaries, prepare_and_upload):
     for summary in summaries:
         status = summary.get("api_upload_status")
         error_classification = str(summary.get("api_upload_error_classification") or "")
-        if summary.get("api_verification_error_type"):
-            continue
         if error_classification in {
             "source_atomic_provider_rejected_before_commit",
             "source_provider_rejected_precommit",
@@ -23540,18 +23485,6 @@ def _automatic_completion_decision(summaries, prepare_and_upload):
             "state": "warning",
             "code": "AUTO-RETRIEVAL-UNVERIFIED-001",
             "message": "Documents were stored, but no conclusive live retrieval result was recorded. The runtime report identifies whether the check was blocked, failed, or unavailable.",
-        }
-    verifier_errors = [summary for summary in summaries if summary.get("api_verification_error_type")]
-    if verifier_errors:
-        detail = str(verifier_errors[0].get("api_upload_error") or "See the retained verification traceback.")
-        return {
-            "state": "warning", "code": "AUTO-EMBEDDING-VERIFIER-001",
-            "message": (
-                f"Assistant vector confirmation was interrupted by {verifier_errors[0]['api_verification_error_type']}: "
-                f"{detail} This was not a reconciliation timeout. AnythingLLM may still finish indexing. "
-                "Prepared files and recovery evidence were retained; no upload was retried. "
-                "Use Run history to reconcile the existing submission before considering a retry."
-            ),
         }
     partial = [summary for summary in summaries if str(summary.get("post_upload_verification_status") or "") == "partial_vector_coverage"]
     if partial:
@@ -23814,8 +23747,6 @@ def automatic_completion_phase(completion, prepare_and_upload):
         return "Document(s) ready in AnythingLLM"
     if code == "AUTO-EMBEDDING-RECONCILE-001":
         return "Preparation complete — AnythingLLM verification pending"
-    if code == "AUTO-EMBEDDING-VERIFIER-001":
-        return "Assistant vector confirmation interrupted"
     if code == "AUTO-EMBEDDING-PARTIAL-001":
         return "Partial embedding completed — recovery available"
     if code == "AUTO-EMBEDDING-SOURCE-PRECOMMIT-001":
@@ -24941,6 +24872,7 @@ def _run_automatic_from_confirmation_stream_body(
             "page_count": page_count,
             "coverage_origin": str(payload.get("coverage_origin") or ""),
         })
+        del preflight_status_events[:-96]
         update_live_automatic_run_status(
             state="preparing",
             phase=phase,
@@ -26770,7 +26702,6 @@ def persist_grouped_upload_outcome(summary, document_result):
             "workspace_existing_records": int(document_result.get("existing_workspace_records") or 0),
             "cached_attachment_reused_records": int(document_result.get("cached_attachment_reused_records") or 0),
             "api_upload_error": error,
-            "api_verification_error_type": str(document_result.get("verification_error_type") or ""),
             "api_upload_warning": str(document_result.get("warning") or ""),
             "api_embedding_update_requested": int(document_result.get("queue_requested") or 0),
             "api_embedding_update_accepted": int(document_result.get("queue_accepted") or 0),
@@ -27338,7 +27269,7 @@ def explicit_upload_count_schema(report):
         # do not let schema normalisation erase evidence of a bad producer.
         result["count_alias_conflicts"] = alias_conflicts
     result["count_semantics"] = {
-        "selected_records": "all selected upload records, including already indexed records",
+        "selected_records": "all selected page-parent records, including already indexed records",
         "selected_documents": "all selected PDFs represented by this report",
         "cache_eligible_records": "selected records with reusable staged document locations; not queue completion",
         "cache_eligible_documents": "fully cache-eligible selected PDFs; not workspace-vector proof",
@@ -27598,7 +27529,7 @@ def upload_prepared_automatic_batch(
     if callable(status_callback):
         prepared_record_count = len(all_rows)
         status_callback(
-            f"Prepared records ready: {prepared_record_count} selected upload record(s); checking workspace coverage before submission",
+            f"Prepared records ready: {prepared_record_count} selected page record(s); checking workspace coverage before submission",
             {
                 "timing_event": "prepared_batch_complete",
                 "prepared_records": prepared_record_count,
@@ -28192,9 +28123,8 @@ def upload_prepared_automatic_batch(
                 last_report,
                 expected_records=len(expected_batch),
             )
-            owned_vector_count = int(last_report.get("current_upload_document_vector_count") or 0)
-            if owned_vector_count > last_vector_count:
-                last_vector_count = owned_vector_count
+            if current_source_vectors > last_vector_count:
+                last_vector_count = current_source_vectors
                 last_vector_progress_elapsed = elapsed
             exact = (
                 current_submission_complete
@@ -28346,7 +28276,7 @@ def upload_prepared_automatic_batch(
                         ),
                         "message": (
                             f"The AnythingLLM receipt was unresolved and only {current_source_vectors}/{len(expected_batch)} exact "
-                            f"upload records with vectors were observed before the {effective_deadline_seconds:.0f}-second "
+                            f"page-parent vectors were observed before the {effective_deadline_seconds:.0f}-second "
                             f"reconciliation boundary because {progress_basis}."
                         ),
                         "reconciliation_elapsed_seconds": round(elapsed, 3),
@@ -28380,7 +28310,7 @@ def upload_prepared_automatic_batch(
                 continue
             if not should_publish_vector_observation_status(
                 quiet_queue_recovery=quiet_queue_recovery_observation,
-                current_submission_vectors=current_source_vectors,
+                current_submission_vectors=current_submission_vectors,
                 unique_identities=unique_identities,
                 previous_signature=last_published_vector_observation_signature,
             ):
@@ -28390,14 +28320,21 @@ def upload_prepared_automatic_batch(
                 # or terminal reconciliation result supplies the next fact.
                 time.sleep(2.0)
                 continue
-            progress_detail, timing_event = vector_observation_status_message(
-                quiet_queue_recovery=quiet_queue_recovery_observation,
-                covered_records=current_source_vectors,
-                unique_identities=unique_identities,
-                expected_records=len(expected_batch),
-                queue_event_age=queue_event_age, queue_position=queue_position,
-                queue_total=queue_total,
-            )
+            elif quiet_queue_recovery_observation:
+                visible_vectors = current_submission_vectors or unique_identities
+                progress_detail = (
+                    f"Desktop queue has been quiet for {queue_event_age:.0f}s at record "
+                    f"{queue_position}/{queue_total}; exact vector check found "
+                    f"{visible_vectors}/{len(expected_batch)} selected record(s) currently searchable. "
+                    "No upload was retried."
+                )
+                timing_event = "exact_vector_observation_quiet_queue_recovery"
+            elif current_submission_vectors:
+                progress_detail = (
+                    f"Checking exact vector evidence: {current_submission_vectors}/{len(expected_batch)} "
+                    "selected record(s) currently searchable"
+                )
+                timing_event = "exact_vector_observation"
             publish_verification_status(
                 progress_detail,
                 {
@@ -28405,9 +28342,7 @@ def upload_prepared_automatic_batch(
                     "batch": batch_report.get("batch"),
                     "total_batches": batch_report.get("total_batches"),
                     "requested": len(expected_batch),
-                    "matching_vectors": current_source_vectors,
-                    "current_upload_documents_with_vectors": current_source_vectors,
-                    "current_upload_document_vector_count": current_submission_vectors,
+                    "matching_vectors": current_submission_vectors or unique_identities,
                     "raw_workspace_vectors": observed,
                     "workspace_duplicate_vectors": duplicate_identities,
                     "observation_status": last_report.get("status"),
@@ -28423,7 +28358,7 @@ def upload_prepared_automatic_batch(
             )
             if not quiet_queue_recovery_observation:
                 last_published_vector_observation_signature = (
-                    max(0, int(current_source_vectors or 0)),
+                    max(0, int(current_submission_vectors or 0)),
                     max(0, int(unique_identities or 0)),
                 )
             time.sleep(2.0)
@@ -28500,10 +28435,12 @@ def upload_prepared_automatic_batch(
         cancel_callback=cancel_callback,
         submission_receipt_path=Path(run_root) / "batch-submission-receipts.jsonl",
         run_id=Path(run_root).name,
-        # Queue counters measure upload records, not selected PDFs. A record
-        # can contain a whole file, a segment, or a page parent.
+        # The Desktop queue advances one prepared page-parent document at a
+        # time.  Calling that counter a PDF count was both grammatically
+        # wrong (for example, ``480/1264 12 selected PDFs``) and suggested
+        # that upload had completed when only local preparation had.
         record_label=(
-            f"upload record(s) from {len(grouped_rows)} selected PDF(s)"
+            f"page-parent record(s) from {len(grouped_rows)} selected PDF(s)"
         ),
     )
     # Keep installer authority and the worker's provider-batch observations
@@ -28623,19 +28560,10 @@ def upload_prepared_automatic_batch(
             if str(attachment.get("location") or "").replace("\\", "/").lstrip("/")
             in observed_vector_locations
         }
-        scoped_location_evidence = any(
-            "current_upload_vector_evidence_complete" in (batch.get("verification") or {})
-            or "current_upload_locations_with_vectors" in (batch.get("verification") or {})
-            for batch in batch_reports
-            if set(source_locations).intersection(batch.get("locations") or [])
-        )
         matched_sources = (
             expected_sources
             if searchable and source_transaction_state != "source_queue_rejected_without_remote_mutation"
-            else (expected_sources & (
-                source_confirmed_sources if scoped_location_evidence
-                else (observed_sources | source_confirmed_sources)
-            ))
+            else (expected_sources & (observed_sources | source_confirmed_sources))
         )
         # The aggregate submission can remain unresolved after an earlier
         # source has already reached exact current-upload proof.  Preserve
@@ -28768,12 +28696,6 @@ def upload_prepared_automatic_batch(
             "queue_batches": queue_batches,
             "ledger_path": ledger_path,
             "searchability_proven": exact,
-            "verification_error_type": next((
-                str((batch.get("verification") or {}).get("exception_type") or "")
-                for batch in batch_reports
-                if not exact and set(source_locations).intersection(batch.get("locations") or [])
-                and (batch.get("verification") or {}).get("classification") == "verification_callback_exception"
-            ), ""),
             "filename_disambiguations": [
                 remap for remap in filename_disambiguations
                 if remap["source_path"] == source_path
@@ -29080,8 +29002,20 @@ def run_automatic(
             },
         )
         if confirmation_preflight_elapsed_seconds:
-            persist_confirmation_preflight(run_root, confirmation_preflight_elapsed_seconds,
-                                           preflight_status_rows)
+            record_timing_model_event(
+                run_root,
+                "confirmation_preflight",
+                {
+                    "timing_event": "confirmation_preflight_completed",
+                    "phase_elapsed_seconds": max(
+                        0.0, float(confirmation_preflight_elapsed_seconds or 0.0)
+                    ),
+                    "source_progress_events": len(preflight_status_rows),
+                    "sources_checked": run_timing_estimate[
+                        "confirmation_preflight_sources_checked"
+                    ],
+                },
+            )
         _write_automatic_run_json(run_root / "output-capacity-preflight.json", batch_capacity)
         APP_LOGGER.info(
             "automatic run output folder created",

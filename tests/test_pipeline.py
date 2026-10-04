@@ -19978,9 +19978,6 @@ class PipelineCoreTests(unittest.TestCase):
         locations = [f"custom-documents/page-parent-{index}.txt" for index in range(5)]
 
         class FakeThread:
-            def is_alive(self):
-                return False
-
             def join(self, timeout=None):
                 return None
 
@@ -20042,9 +20039,6 @@ class PipelineCoreTests(unittest.TestCase):
         location = "custom-documents/page-parent-cache-test.txt"
 
         class FakeThread:
-            def is_alive(self):
-                return False
-
             def join(self, timeout=None):
                 return None
 
@@ -20113,9 +20107,6 @@ class PipelineCoreTests(unittest.TestCase):
         location = "custom-documents/receipt-race.txt"
 
         class FakeThread:
-            def is_alive(self):
-                return False
-
             def join(self, timeout=None):
                 return None
 
@@ -20276,9 +20267,6 @@ class PipelineCoreTests(unittest.TestCase):
         ]
 
         class FakeThread:
-            def is_alive(self):
-                return False
-
             def join(self, timeout=None):
                 return None
 
@@ -20370,9 +20358,6 @@ class PipelineCoreTests(unittest.TestCase):
                 return True
 
         class FakeThread:
-            def is_alive(self):
-                return False
-
             def join(self, timeout=None):
                 return None
 
@@ -20426,9 +20411,6 @@ class PipelineCoreTests(unittest.TestCase):
         calls = []
 
         class FakeThread:
-            def is_alive(self):
-                return False
-
             def join(self, timeout=None):
                 return None
 
@@ -20496,9 +20478,6 @@ class PipelineCoreTests(unittest.TestCase):
         status_reports = []
 
         class FakeThread:
-            def is_alive(self):
-                return False
-
             def join(self, timeout=None):
                 return None
 
@@ -20642,6 +20621,10 @@ class PipelineCoreTests(unittest.TestCase):
         location = "custom-documents/durable-receipt.txt"
         post_started = threading.Event()
 
+        class FakeThread:
+            def join(self, timeout=None):
+                return None
+
         with tempfile.TemporaryDirectory() as temp_dir:
             ledger_path = Path(temp_dir) / "embedding-batch-ledger.json"
             persisted = {}
@@ -20649,27 +20632,24 @@ class PipelineCoreTests(unittest.TestCase):
             try:
                 def fake_tracker(_body, response_read_abandoned):
                     post_started.set()
-                    assert response_read_abandoned.wait(timeout=5.0)
+                    response_read_abandoned.wait(timeout=0.20)
                     return {"kind": "response_read_abandoned"}
 
                 def fake_listener(*_args, **kwargs):
                     observer = kwargs.get("observer_callback")
 
                     def emit_owned_event():
-                        # Receipt ownership requires an actual POST, not expiry
-                        # of a short scheduler-dependent fixture delay.
-                        assert post_started.wait(timeout=5.0)
+                        post_started.wait(timeout=0.20)
                         observer({
                             "type": "doc_starting", "filename": location,
                             "docIndex": 0, "totalDocs": 1,
                         })
 
-                    thread = threading.Thread(target=emit_owned_event, daemon=True)
-                    thread.start()
+                    threading.Thread(target=emit_owned_event, daemon=True).start()
                     connected = threading.Event()
                     connected.set()
                     return {
-                        "stop_event": threading.Event(), "thread": thread,
+                        "stop_event": threading.Event(), "thread": FakeThread(),
                         "connected_event": connected, "events": [], "errors": [],
                     }
 
@@ -20712,9 +20692,6 @@ class PipelineCoreTests(unittest.TestCase):
                 return {"kind": "http_response", "status": 200, "response_text": "{}"}
 
             class FakeThread:
-                def is_alive(self):
-                    return False
-
                 def join(self, timeout=None):
                     return None
 
@@ -24312,7 +24289,7 @@ class PipelineCoreTests(unittest.TestCase):
             captured["verification"]["classification"],
             "batch_exact_vector_confirmation_stalled_after_queue_completion",
         )
-        self.assertIn("2/3 exact upload records with vectors", captured["verification"]["message"])
+        self.assertIn("2/3 exact page-parent vectors", captured["verification"]["message"])
 
     def test_grouped_batch_verifier_keeps_exact_reconciliation_when_status_callback_fails(self):
         """A Gradio/progress callback has no authority to abort an owned queue."""

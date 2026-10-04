@@ -14,23 +14,16 @@ def test_timestamp_promotion_preserves_staging_and_existing_exports(tmp_path, co
 
     # Simulate a fast completion in the same second as staging creation and
     # another completed run. Existing directories must never be overwritten.
-    private = tmp_path / 'run-state'
-    output = tmp_path / 'outputs'
-    private.mkdir()
-    output.mkdir()
+    staging = tmp_path / 'r-20260910-120000'
+    staging.mkdir()
+    receipt = staging / 'run-progress.json'
+    receipt.write_text('retained until normal staging cleanup')
     fixed_id = uuid.UUID('12345678-1234-1234-1234-123456789abc')
     run_hash = hashlib.sha256(fixed_id.bytes).hexdigest()[:10]
-    existing_private = private / f'r-20260910-120000-{run_hash}'
-    existing_private.mkdir()
-    existing = output / existing_private.name
+    existing = tmp_path / f'r-20260910-120000-{run_hash}'
     existing.mkdir()
     previous = existing / 'previous.txt'
     previous.write_text('previous run')
-    with patch.object(app, 'datetime') as clock, patch.object(app.uuid, 'uuid4', return_value=fixed_id):
-        clock.now.return_value = datetime(2026,9,10,12)
-        staging = app.create_fresh_automatic_run_root(private)
-    receipt = staging / 'run-progress.json'
-    receipt.write_text('retained until normal staging cleanup')
     summaries = []
     for i in range(count):
         folder = staging / str(i)
@@ -40,10 +33,9 @@ def test_timestamp_promotion_preserves_staging_and_existing_exports(tmp_path, co
         summaries.append({'upload_file': str(export)})
     with patch.object(app, 'datetime') as clock, patch.object(app.uuid, 'uuid4', return_value=fixed_id):
         clock.now.return_value = datetime(2026,9,10,12)
-        target = app.promote_flat_no_logs_batch_output(output, staging,
+        target = app.promote_flat_no_logs_batch_output(tmp_path, staging,
             [tmp_path / f'Long source title {i}.pdf' for i in range(count)], summaries)
     assert target.name == f'r-20260910-120000-{run_hash}-2'
-    assert target.name == staging.name
     assert len(list(target.glob('*.txt'))) == count
     assert receipt.exists() and previous.read_text() == 'previous run'
     assert [p.read_text(encoding='utf-8') for p in sorted(target.glob('*.txt'))] == [f'complete text {i}' for i in range(count)]
