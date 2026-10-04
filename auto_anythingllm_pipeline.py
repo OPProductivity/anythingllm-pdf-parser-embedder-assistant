@@ -51,7 +51,7 @@ from pathlib import Path
 
 from portable_paths import application_paths, is_private_run_state_path
 from run_evidence import prepare_private_json, read_run_json
-from ingestion_observation import SubmissionCommitSignal
+from ingestion_observation import SubmissionCommitSignal, observe_submission_vector_ids
 from authenticated_http import AuthenticatedRedirectError, RejectAuthenticatedRedirects
 from anythingllm_persistence import AnythingLLMPersistenceAdapter
 from typing import Any, cast
@@ -2700,9 +2700,9 @@ def infer_author_from_strict_credit_blocks(samples, path: Path, title_hint=""):
                 return []
         return names
 
-    def widest_complete_block(values, left, right, *, from_start=False):
+    def widest_complete_block(values, left, right, *, from_start=False, maximum_lines=3):
         candidates = []
-        maximum = min(3, max(0, right - left))
+        maximum = min(maximum_lines, max(0, right - left))
         for width in range(1, maximum + 1):
             block = values[left:left + width] if from_start else values[right - width:right]
             if width > 1:
@@ -2744,13 +2744,16 @@ def infer_author_from_strict_credit_blocks(samples, path: Path, title_hint=""):
         for index, line in enumerate(values[:40]):
             inline = re.match(r"^(?:by|written\s+by|edited\s+by)\s+(.+)$", line, flags=re.I)
             if inline:
-                names = names_from_block([inline.group(1)])
+                credit_lines = [inline.group(1), *values[index + 1:index + 6]]
+                _, _, names, block = widest_complete_block(
+                    credit_lines, 0, len(credit_lines), from_start=True, maximum_lines=6,
+                )
                 if names:
                     return {
                         "author": ", ".join(names[:12]),
                         "source": "text_strict_credit_block",
                         "page": page,
-                        "evidence": line,
+                        "evidence": " / ".join([line, *block[1:]]),
                     }
             if not re.fullmatch(r"(?:by|written\s+by|edited\s+by)\s*:?", line, flags=re.I):
                 continue
@@ -3153,9 +3156,11 @@ def normalize_metadata_title(value):
     lowered = title.casefold().strip()
     if re.fullmatch(
         r"(?:untitled(?: document)?|new document|document(?: \d+)?|scan(?: \d+)?|"
-        r"some[ _-]?title|document[ _-]?title|pdf[ _-]?title)",
+        r"some[ _-]?title|document[ _-]?title|pdf[ _-]?title|no job name)",
         lowered,
     ):
+        return ""
+    if re.fullmatch(r"OP-[A-Z]+\d+\s+\d+\.\.\d+", title):
         return ""
     # A source-layout/office extension in Title metadata is a strong sign of
     # an internal production filename, including short names such as
@@ -3180,6 +3185,11 @@ def resolve_title_from_metadata_or_filename(
     if metadata_value:
         return {"title": metadata_value, "source": "pdf_metadata"}
     filename_value = normalize_text(Path(path).stem)
+    catalog_parts = filename_value.split("--")
+    if len(catalog_parts) >= 3 and looks_like_person_name(
+        catalog_parts[1].strip(), title_hint=catalog_parts[0], allow_all_caps=True,
+    ):
+        filename_value = normalize_text(catalog_parts[0])
     if use_file_title_fallback and filename_value:
         return {"title": filename_value, "source": "filename_fallback"}
     return {"title": "Untitled PDF", "source": "generated_placeholder"}
@@ -4088,6 +4098,33 @@ def materialize_retained_segments(prepared_text_path: Path, segments_dir: Path, 
     return retained
 
 
+def local_segment_export_sources(prepared_text_path: Path, retained):
+    """Separate a local export's presentation name from its canonical bytes."""
+    root = Path(prepared_text_path).parent.resolve()
+    pattern = re.compile(r"-p\d{3,}-s\d+\.txt$", re.IGNORECASE)
+    exports = retained.get("retained_segment_exports")
+    if exports is None:
+        result = []
+        for path in sorted(root.iterdir(), key=lambda path: path.name.casefold()):
+            match = pattern.search(path.name)
+            if path.is_file() and match:
+                result.append((path, match.group(0)))
+        return result
+    result = []
+    names = set()
+    for row in sorted(exports, key=lambda row: row["filename"].casefold()):
+        name = row["filename"]
+        path = root / row["path"]
+        match = pattern.search(name)
+        if (Path(name).name != name or not match or name.casefold() in names
+                or path.is_symlink() or not path.resolve().is_relative_to(root)
+                or not path.is_file() or path.suffix.casefold() != ".txt"):
+            raise ValueError("Missing or unsafe canonical local segment export")
+        names.add(name.casefold())
+        result.append((path, match.group(0)))
+    return result
+
+
 def _best_effort_remove_success_artifact(candidate: Path, deleted: list[str], cleanup_warnings: list[str], out_root: Path) -> None:
     """Prune one non-retained artifact without changing a proven run outcome.
 
@@ -4245,9 +4282,31 @@ def retain_successful_run_leanly(
             else:
                 shutil.move(str(prepared_text_path), str(retained_text_path))
         retained_segments = []
+        retained_segment_exports = []
+        catalog = None
+        artifact_index = out_root / "artifact-locations.json"
+        if preserve_private_evidence and artifact_index.is_file():
+            from canonical_artifacts import CanonicalArtifacts, checked_role_path
+
+            roles = read_run_json(artifact_index)["roles"]
+            catalog = CanonicalArtifacts(out_root, atomic_write_text, existing=(
+                checked_role_path(out_root, actual) for actual in set(roles.values())
+                if Path(actual).suffix.casefold() == ".txt"
+            ))
         for segment_path, direct_path in zip(staged_segments, planned_direct_segments):
-            shutil.move(str(segment_path), str(direct_path))
-            retained_segments.append(direct_path)
+            existing = catalog.existing_bytes(segment_path.read_bytes()) if catalog else None
+            if existing is None:
+                shutil.move(str(segment_path), str(direct_path))
+                actual = catalog.register(direct_path) if catalog else direct_path
+            else:
+                actual = existing
+            if catalog:
+                catalog.role(direct_path, actual)
+            retained_segments.append(actual)
+            retained_segment_exports.append({"filename": direct_path.name,
+                                             "path": os.path.relpath(actual, out_root)})
+        if catalog:
+            write_json(artifact_index, {"schema_version": 1, "roles": {**roles, **catalog.roles}})
     finally:
         # The directory is private to this call, even when an exception stops
         # retention before the transcript is moved. Its removal cannot affect
@@ -4267,6 +4326,7 @@ def retain_successful_run_leanly(
             "segments_directory": "",
             "retained_segment_files": len(retained_segments),
             "retained_segment_paths": [str(path) for path in retained_segments],
+            "retained_segment_exports": retained_segment_exports,
             "deleted": [],
             "detailed_evidence_retained": True,
             "cleanup_pending": False,
@@ -4574,19 +4634,17 @@ def finalize_deferred_batch_lean_retention(out_root: Path, summary):
 
     segments = []
     try:
-        with manifest_path.open("r", encoding="utf-8") as handle:
-            for line_number, line in enumerate(handle, start=1):
-                if not line.strip():
-                    continue
-                row = json.loads(line)
-                if not isinstance(row, dict) or "text" not in row:
-                    return {
-                        "applied": False,
-                        "reason": "selected_segment_manifest_invalid",
-                        "line": line_number,
-                    }
-                segments.append(row)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        from manifest_text import read_manifest_rows
+
+        for line_number, row in enumerate(read_manifest_rows(manifest_path), start=1):
+            if not isinstance(row, dict) or not isinstance(row.get("text"), str):
+                return {
+                    "applied": False,
+                    "reason": "selected_segment_manifest_invalid",
+                    "line": line_number,
+                }
+            segments.append(row)
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
         return {
             "applied": False,
             "reason": "selected_segment_manifest_unreadable",
@@ -9207,23 +9265,24 @@ def evaluate_edge_cases(
                     or selected_dir / f"anythingllm-upload-{variant}.txt")
         add(check, check_status(path.exists(), warn=True), "optional variant")
     layout = selected.get("layout_evidence") or {}
+    layout_review_path = selected_artifact_path(selected, selected_dir, "layout-region-review.json")
     if int(layout.get("removed_marginalia_count") or 0):
         add(
             "PDF_LAYOUT_MARGINALIA_EXCLUDED",
             "info",
-            f"excluded={layout['removed_marginalia_count']}; review layout-region-review.json",
+            f"excluded={layout['removed_marginalia_count']}; review {layout_review_path}",
         )
     if int(layout.get("note_candidates_retained_count") or 0):
         add(
             "PDF_LAYOUT_NOTE_CANDIDATES_RETAINED",
             "warning",
-            f"retained_note_candidates={layout['note_candidates_retained_count']}; review layout-region-review.json",
+            f"retained_note_candidates={layout['note_candidates_retained_count']}; review {layout_review_path}",
         )
     if int(layout.get("excluded_footnote_count") or 0):
         add(
             "PDF_LAYOUT_FOOTNOTES_EXCLUDED",
             "info",
-            f"excluded_footnote_groups={layout['excluded_footnote_count']}; review layout-region-review.json",
+            f"excluded_footnote_groups={layout['excluded_footnote_count']}; review {layout_review_path}",
         )
     lane_review = selected.get("lane_review") or {}
     if int(lane_review.get("proposed_supplementary_count") or 0):
@@ -9231,7 +9290,8 @@ def evaluate_edge_cases(
             add(
                 "PDF_SUPPLEMENTARY_REFERENCE_REGIONS_EXCLUDED",
                 "info",
-                f"excluded_segments={lane_review.get('primary_excluded_segment_count', 0)}; original text retained in retrieval-lane-review.json",
+                f"excluded_segments={lane_review.get('primary_excluded_segment_count', 0)}; original text retained in "
+                f"{selected_artifact_path(selected, selected_dir, 'retrieval-lane-review.json')}",
             )
         else:
             add(
@@ -9285,6 +9345,10 @@ def build_run_diagnostics(
     temporary_workspace_validation,
 ):
     diagnostics = []
+
+    def review_artifact(name):
+        return str((selected.get("artifact_paths") or {}).get(name)
+                   or f"artifact-locations.json (role: {name})")
 
     def add(code, severity, stage, message, action=""):
         diagnostics.append(
@@ -9347,12 +9411,12 @@ def build_run_diagnostics(
                 else "Some pages may be scanned or have a weak text layer."
             ),
             (
-                "Review low-text pages in extraction-report.csv to confirm OCR quality."
+                f"Review low-text pages in {review_artifact('extraction-report.csv')} to confirm OCR quality."
                 if ocr_assisted_selection
                 else (
                     "No OCR retry is needed unless those specific image pages contain text you expect to retrieve."
                     if native_text_was_complete
-                    else "Review low-text pages in extraction-report.csv."
+                    else f"Review low-text pages in {review_artifact('extraction-report.csv')}."
                 )
             ),
         )
@@ -9388,13 +9452,15 @@ def build_run_diagnostics(
     if int(quality.get("duplicate_pages") or 0):
         add("PDF_DUPLICATE_TEXT_PAGES", "warning", "extraction", f"{quality['duplicate_pages']} exact duplicate text page(s) were excluded.", "Review page_profile in source-profile.json.")
     layout = selected.get("layout_evidence") or {}
+    layout_review_path = review_artifact("layout-region-review.json")
+    lane_review_path = review_artifact("retrieval-lane-review.json")
     if int(layout.get("removed_marginalia_count") or 0):
         add(
             "PDF_LAYOUT_MARGINALIA_EXCLUDED",
             "info",
             "extraction",
             f"Excluded {layout['removed_marginalia_count']} high-confidence positioned header/footer item(s).",
-            "Review selected/layout-region-review.json before using content-quality retrieval evidence.",
+            f"Review {layout_review_path} before using content-quality retrieval evidence.",
         )
     if int(layout.get("note_candidates_retained_count") or 0):
         add(
@@ -9402,7 +9468,7 @@ def build_run_diagnostics(
             "warning",
             "extraction",
             f"Detected {layout['note_candidates_retained_count']} possible lower-page note line(s), retained in semantic text.",
-            "Review selected/layout-region-review.json; possible notes are not silently removed.",
+            f"Review {layout_review_path}; possible notes are not silently removed.",
         )
     if int(layout.get("excluded_footnote_count") or 0):
         add(
@@ -9410,7 +9476,7 @@ def build_run_diagnostics(
             "info",
             "extraction",
             f"Excluded {layout['excluded_footnote_count']} high-confidence lower-page footnote group(s).",
-            "Review selected/layout-region-review.json before relying on content-quality retrieval evidence.",
+            f"Review {layout_review_path} before relying on content-quality retrieval evidence.",
         )
     visual_text = selected.get("visual_text_review") or {}
     if int(visual_text.get("unresolved_page_count") or 0):
@@ -9426,7 +9492,7 @@ def build_run_diagnostics(
                 f"{visual_text.get('unresolved_page_count')} image-containing page(s) have low-signal or no indexed text; publisher logos and illustrations are not distinguished from unread text"
                 + (f" (PDF page(s): {pages})." if pages else ".")
             ),
-            "No text was guessed or added. Review visual-text-review.json and the original PDF page if an image caption or label matters for retrieval.",
+            f"No text was guessed or added. Review {review_artifact('visual-text-review.json')} and the original PDF page if an image caption or label matters for retrieval.",
         )
     elif str(visual_text.get("status") or "") == "assessment_incomplete":
         assessment = visual_text.get("assessment") or {}
@@ -9440,7 +9506,7 @@ def build_run_diagnostics(
             "extraction",
             "Image-page visual-text coverage could not be fully assessed because page or extractor metadata was incomplete."
             + (f" Missing geometry for PDF page(s): {missing}." if missing else ""),
-            "No text was changed. Inspect the original PDF and visual-text-review.json before relying on image-page labels for retrieval.",
+            f"No text was changed. Inspect the original PDF and {review_artifact('visual-text-review.json')} before relying on image-page labels for retrieval.",
         )
     elif str(visual_text.get("status") or "") == "not_assessed":
         add(
@@ -9458,7 +9524,7 @@ def build_run_diagnostics(
                 "info",
                 "extraction",
                 f"Excluded {lane_review.get('primary_excluded_segment_count', 0)} segment(s) from automatically classified sustained reference/index regions.",
-                "Original text and page-level reasons remain in retrieval-lane-review.json; readable TXT reports can be rendered on demand.",
+                f"Original text and page-level reasons remain in {lane_review_path}; readable TXT reports can be rendered on demand.",
             )
         else:
             add(
@@ -9466,7 +9532,7 @@ def build_run_diagnostics(
                 "warning",
                 "extraction",
                 f"Found {lane_review['proposed_supplementary_count']} medium-confidence supplementary candidate(s); retained because no narrow automatic exclusion rule matched.",
-                "Inspect retrieval-lane-review.json if the document-specific evidence should inform a future narrow rule.",
+                f"Inspect {lane_review_path} if the document-specific evidence should inform a future narrow rule.",
             )
     if selected.get("backend_word_disagreement", 0) > 0.35:
         disagreement_resolution = selected.get("backend_word_disagreement_resolution") or {}
@@ -10330,12 +10396,15 @@ def write_native_metadata_test_kit(segments, out_dir: Path, workspace_slug="test
             "", "Rows without text_file retain their source text in text_manifest, keyed by segment_id.",
             'Materialize manual payloads when needed: python -m run_artifact_tools "DOCUMENT_RUN_DIRECTORY" --kind manual-kits',
         ])
-    (out_dir / f"{prefix}test-checklist.md").write_text("\n".join(checklist) + "\n", encoding="utf-8")
+    checklist_path = out_dir / f"{prefix}test-checklist.md"
+    checklist_path.write_text("\n".join(checklist) + "\n", encoding="utf-8")
+    if artifact_catalog:
+        checklist_path = artifact_catalog.shared_file(checklist_path)
     return {
         "files_dir": "" if artifact_catalog else str(files_dir),
         "zip_file": "",
         "upload_plan": str(out_dir / f"{prefix}upload-plan.csv"),
-        "checklist": str(out_dir / f"{prefix}test-checklist.md"),
+        "checklist": str(checklist_path),
         "file_count": len(rows),
     }
 
@@ -12478,10 +12547,16 @@ def read_validation_workspace_template(storage_dir: Path):
 
 
 def default_short_label(title, author):
-    author_words = re.findall(r"[A-Za-z][A-Za-z'-]+", author or "")
+    # Fold diacritics only for compact labels, never for source metadata/text.
+    def label_words(value):
+        folded = ''.join(character for character in unicodedata.normalize("NFKD", value or "")
+                         if not unicodedata.combining(character))
+        return re.findall(r"[A-Za-z][A-Za-z'-]+", folded)
+
+    author_words = label_words(author)
     if author_words:
         return author_words[-1]
-    title_words = [w for w in re.findall(r"[A-Za-z][A-Za-z'-]+", title or "") if w.casefold() not in HEADING_STOPWORDS]
+    title_words = [w for w in label_words(title) if w.casefold() not in HEADING_STOPWORDS]
     return title_words[0] if title_words else "PDF"
 
 
@@ -16580,16 +16655,19 @@ def unique_lancedb_workspace_name(value, storage_dir=None):
 
 
 def _merge_embedding_runtime_events(aggregate, incoming):
-    """Preserve total observations independently of the bounded event tail."""
+    """Keep complete observations; only the recovery ledger uses a short tail."""
     previous = list(aggregate.get("runtime_events") or [])
     additions = list(incoming.get("runtime_events") or [])
     aggregate["runtime_event_count"] = (
         max(len(previous), int(aggregate.get("runtime_event_count") or 0))
         + max(len(additions), int(incoming.get("runtime_event_count") or 0))
     )
-    aggregate["runtime_events"] = (
-        previous + additions
-    )[-ANYTHINGLLM_EMBEDDING_RUNTIME_EVENT_TAIL_LIMIT:]
+    aggregate["runtime_events"] = previous + additions
+    if "runtime_event_observation_complete" in incoming:
+        aggregate["runtime_event_observation_complete"] = (
+            aggregate.get("runtime_event_observation_complete", True)
+            and bool(incoming["runtime_event_observation_complete"])
+        )
 
 
 def _write_embedding_batch_ledger(ledger_path, workspace_slug, result):
@@ -16602,6 +16680,9 @@ def _write_embedding_batch_ledger(ledger_path, workspace_slug, result):
         int(result.get("runtime_event_count") or 0),
     )
     runtime_event_tail = runtime_events[-ANYTHINGLLM_EMBEDDING_RUNTIME_EVENT_TAIL_LIMIT:]
+    from runtime_event_journal import retain_runtime_events
+
+    journal = retain_runtime_events(ledger_path.with_suffix('.events.jsonl'), runtime_events)
     payload = {
             "updated_at": datetime.now().isoformat(timespec="seconds"),
             "workspace_slug": workspace_slug,
@@ -16620,14 +16701,18 @@ def _write_embedding_batch_ledger(ledger_path, workspace_slug, result):
         "final_verification_required": bool(result.get("final_verification_required")),
         "batches": result.get("batches", []),
         "inflight_batch": result.get("inflight_batch"),
-        # Full SSE transcripts are diagnostic noise once a source window is
-        # terminal. Retaining all of them made this ledger grow with every PDF
-        # and then rewrote that growth after every later source. Keep a fixed
-        # tail plus an honest total so recovery state remains compact and
-        # operators can still see the immediately preceding events.
+        # Recovery stays bounded; complete observations are appended once to
+        # the journal rather than lost or repeatedly rewritten in this ledger.
         "runtime_events": runtime_event_tail,
         "runtime_event_count": runtime_event_count,
         "runtime_events_truncated": runtime_event_count > len(runtime_event_tail),
+        "runtime_event_journal": journal,
+        "runtime_event_history_complete": (
+            runtime_event_count == len(runtime_events)
+            and journal["sequence_events"] == len(runtime_events)
+            and not journal["observation_pending"]
+            and result.get("runtime_event_observation_complete", True)
+        ),
         "errors": result.get("errors", []),
         # Keep the prepared location's originating PDF beside the recovery
         # plan.  Locations are the only authority for resubmission, while the
@@ -17563,6 +17648,7 @@ def _update_workspace_embeddings_batched_serial(
                 # a live queue recovery.
                 verification = {
                     "status": "error",
+                    "classification": "verification_callback_exception",
                     "error": str(exc),
                     "exception_type": type(exc).__name__,
                     "traceback": traceback.format_exc(),
@@ -18430,7 +18516,7 @@ def update_workspace_embeddings_desktop_queue(
                     if callable(batch_inspector) else None
                 ),
                 cancel_callback=cancel_callback,
-                record_label=f"page-parent record(s) for {display_name}",
+                record_label=f"upload record(s) for {display_name}",
                 storage_dir=storage_dir,
                 location_sources=[
                     {"location": location, "source_path": source_path}
@@ -19101,7 +19187,7 @@ def update_workspace_embeddings_desktop_queue(
             if cache_hit:
                 message = (
                     f"AnythingLLM Desktop queue: record {current}/{total} is reusing cached embeddings; "
-                    f"writing its page-parent record to this workspace; "
+                    f"writing its upload record to this workspace; "
                     f"{completed}/{total} completed"
                 )
             else:
@@ -19331,28 +19417,32 @@ def update_workspace_embeddings_desktop_queue(
             return {**verification, "desktop_queue_observer": queue_snapshot()}
         return verification
 
+    from runtime_event_journal import observation_scope
+
     try:
-        result = update_workspace_embeddings_batched(
-            api_url,
-            api_key,
-            workspace_slug,
-            unique_locations,
-            # One request containing all managed locations: Desktop serializes the
-            # individual documents inside its own queue.
-            batch_size=requested,
-            warmup_batch_size=0,
-            warmup_batch_count=0,
-            ledger_path=ledger_path,
-            status_callback=desktop_queue_status,
-            batch_verifier=queue_aware_batch_verifier if callable(batch_verifier) else None,
-            batch_inspector=batch_inspector,
-            cancel_callback=cancel_callback,
-            verification_mode="checkpoint",
-            concurrent_batch_limit=1,
-            submission_timeout_override=ANYTHINGLLM_DESKTOP_QUEUE_RECEIPT_TIMEOUT_SECONDS,
-            location_sources=location_sources,
-            receipt_observer=owned_desktop_queue_receipt,
-        )
+        journal_path = Path(ledger_path).with_suffix('.events.jsonl') if ledger_path else None
+        with observation_scope(journal_path):
+            result = update_workspace_embeddings_batched(
+                api_url,
+                api_key,
+                workspace_slug,
+                unique_locations,
+                # One request containing all managed locations: Desktop serializes the
+                # individual documents inside its own queue.
+                batch_size=requested,
+                warmup_batch_size=0,
+                warmup_batch_count=0,
+                ledger_path=ledger_path,
+                status_callback=desktop_queue_status,
+                batch_verifier=queue_aware_batch_verifier if callable(batch_verifier) else None,
+                batch_inspector=batch_inspector,
+                cancel_callback=cancel_callback,
+                verification_mode="checkpoint",
+                concurrent_batch_limit=1,
+                submission_timeout_override=ANYTHINGLLM_DESKTOP_QUEUE_RECEIPT_TIMEOUT_SECONDS,
+                location_sources=location_sources,
+                receipt_observer=owned_desktop_queue_receipt,
+            )
     finally:
         # The HTTP response and the local SSE relay are independent loopback
         # streams.  Desktop can finish the request a few scheduler ticks
@@ -19405,6 +19495,8 @@ def update_workspace_embeddings_desktop_queue(
         "prequeue_fresh_records": max(0, requested - len(preexisting_cached_locations)),
         "first_queue_progress_epoch": float(queue_state.get("first_progress_epoch") or 0.0),
     }
+    result["runtime_event_observation_complete"] = not progress_listener["thread"].is_alive()
+    _write_embedding_batch_ledger(ledger_path, workspace_slug, result)
     return result
 
 
@@ -20767,7 +20859,7 @@ def maybe_upload_segment_files_source_transactions(
                     cancel_callback=cancel_callback,
                     submission_receipt_path=submission_receipt_path,
                     run_id=run_id,
-                    record_label=f"page-parent record(s) for {source_name}",
+                    record_label=f"upload record(s) for {source_name}",
                     defer_embedding_update=True,
                 )
                 transaction.update({
@@ -20914,7 +21006,7 @@ def maybe_upload_segment_files_source_transactions(
                     if callable(batch_inspector) else None
                 ),
                 cancel_callback=cancel_callback,
-                record_label=f"page-parent record(s) from {len(pending_queue_sources)} selected PDF(s)",
+                record_label=f"upload record(s) from {len(pending_queue_sources)} selected PDF(s)",
                 storage_dir=storage_dir,
                 location_sources=[
                     {"location": str(attachment.get("location") or ""), "source_path": str(attachment.get("source_path") or ""), "filename": str(attachment.get("filename") or "")}
@@ -21171,7 +21263,7 @@ def maybe_upload_segment_files_source_transactions(
     aggregate["count_semantics"] = {
         "uploaded": "legacy alias of newly_attached_records",
         "embedded": "legacy alias of vector_confirmed_records",
-        "selected_records": "all selected page-parent records submitted to this coordinator",
+        "selected_records": "all selected upload records submitted to this coordinator",
         "selected_documents": "selected PDF source windows submitted to this coordinator",
         "cache_eligible_records": "records with reusable staged locations; not queue completion",
         "cache_eligible_documents": "fully cache-eligible source windows; not workspace-vector proof",
@@ -22809,18 +22901,19 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
         current_upload_doc_ids = [
             row.get("docId") for row in current_upload_docs if row.get("docId")
         ]
-        current_upload_vector_doc_ids = []
+        current_upload_vector_rows = []
         for offset in range(0, len(current_upload_doc_ids), 800):
             doc_id_slice = current_upload_doc_ids[offset:offset + 800]
             if not doc_id_slice:
                 continue
             placeholders = ",".join("?" for _ in doc_id_slice)
-            current_upload_vector_doc_ids.extend(
-                row[0] for row in cur.execute(
-                    f"select docId from document_vectors where docId in ({placeholders})",
+            current_upload_vector_rows.extend(
+                cur.execute(
+                    f"select docId,vectorId from document_vectors where docId in ({placeholders})",
                     doc_id_slice,
                 ).fetchall()
             )
+        current_upload_vector_doc_ids = [row[0] for row in current_upload_vector_rows]
         result["current_upload_document_vector_count"] = len(current_upload_vector_doc_ids)
         current_upload_vector_doc_id_set = set(current_upload_vector_doc_ids)
         result["current_upload_documents_with_vectors"] = len(current_upload_vector_doc_id_set)
@@ -22855,6 +22948,32 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
             result["current_upload_vector_expanded"] = bool(
                 current_raw_documents_complete
                 and result["current_upload_document_vector_count"] > expected_count
+            )
+            result["current_upload_mapping_evidence_complete"] = result["current_upload_vector_evidence_complete"]
+            vector_ids_by_doc = {}
+            for doc_id, vector_id in current_upload_vector_rows:
+                if vector_id:
+                    vector_ids_by_doc.setdefault(doc_id, set()).add(str(vector_id))
+            location_vector_ids = {
+                str(doc.get("docpath") or "").replace("\\", "/").lstrip("/"):
+                vector_ids_by_doc.get(doc.get("docId"), set())
+                for doc in current_upload_docs
+            }
+            # The initial live snapshot stays cheap. Only a complete mapping
+            # candidate or an explicit recovery/deep read opens physical IDs.
+            physical = (
+                observe_submission_vector_ids(storage_dir, workspace_slug, location_vector_ids)
+                if current_raw_documents_complete or attachment_only_observation
+                or normalized_observation_mode not in {"fast"}
+                else {"status": "deferred", "complete": False, "locations_with_vectors": []}
+            )
+            result["current_upload_physical_vector_observation"] = {
+                key: value for key, value in physical.items() if key != "locations_with_vectors"
+            }
+            result["current_upload_locations_with_vectors"] = physical["locations_with_vectors"]
+            result["current_upload_vector_evidence_complete"] = bool(
+                current_raw_documents_complete and physical["complete"]
+                and len(physical["locations_with_vectors"]) == expected_count
             )
         matching_docs = []
         for doc in docs:
@@ -23038,6 +23157,14 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
                 f"This submission attached {result['expected_payload_count']}/"
                 f"{result['expected_payload_count']} planned record(s) and confirmed searchable-vector evidence "
                 f"for every attached document ({result['current_upload_document_vector_count']} internal vector row(s))."
+            )
+        elif result.get("current_upload_mapping_evidence_complete"):
+            result["status"] = "partial_vector_coverage"
+            result["classification"] = "current_submission_physical_vectors_pending"
+            result["message"] = (
+                "Selected attachments have SQLite vector mappings, but their exact vector IDs "
+                "are not yet all observable in the target workspace namespace. Continue read-only "
+                "confirmation; do not re-upload or re-embed."
             )
         elif attachment_only_observation:
             if result["current_upload_locations_with_vectors"]:
@@ -24551,6 +24678,17 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             if first_page_override > 0:
                 candidate_start_page = min(max(1, first_page_override), page_count)
                 candidate_start_reason = "user_override"
+            elif getattr(args, "include_front_matter", False):
+                # Reserve verified opening OCR gaps before the native peer
+                # freezes the shared range. Recovered cover text must not be
+                # excluded merely because native extraction could not read it.
+                opening_ocr_pages = [
+                    int(page) for page in preflight_visual_text_targets.get("page_numbers", [])
+                    if 0 < int(page) < candidate_start_page
+                ]
+                if opening_ocr_pages:
+                    candidate_start_page = min(opening_ocr_pages)
+                    candidate_start_reason = "include_front_matter_opening_ocr_scope"
             end_headings = getattr(args, "end_section_names", None) or DEFAULT_END_SECTION_HEADINGS
             candidate_end_detected = detect_end_section_from_outline(usable_outline, page_count) or detect_end_section_start(
                 pages, end_headings
@@ -25561,7 +25699,11 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         shutil.copy2(src_candidate_dir / "native-header-chunk-audit.csv", selected_dir / "native-header-chunk-audit.csv")
     page_parent_rows = build_page_parent_rows(selected["segments"])
     child_parent_rows = build_child_parent_map(selected["segments"], page_parent_rows)
-    append_jsonl(selected_dir / "page-parent-manifest.jsonl", page_parent_rows)
+    page_parent_manifest_path = selected_dir / "page-parent-manifest.jsonl"
+    if artifact_catalog:
+        page_parent_manifest_path = artifact_catalog.jsonl(page_parent_manifest_path, page_parent_rows)
+    else:
+        append_jsonl(page_parent_manifest_path, page_parent_rows)
     write_csv(selected_dir / "child-parent-map.csv", child_parent_rows)
     provenance_review_manifest = write_provenance_review_manifest(
         selected_dir,
@@ -25601,18 +25743,13 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             target_path = selected_dir / filename
             if source_path.exists():
                 if key == "manifest":
-                    variant_rows_for_identity = []
-                    for raw_line in source_path.read_text(encoding="utf-8").splitlines():
-                        if not raw_line.strip():
-                            continue
-                        try:
-                            variant_rows_for_identity.append(json.loads(raw_line))
-                        except json.JSONDecodeError:
-                            # The candidate artifact remains available for
-                            # diagnostics; do not convert a malformed optional
-                            # variant manifest into a preparation failure.
-                            variant_rows_for_identity = []
-                            break
+                    from manifest_text import read_manifest_rows
+
+                    try:
+                        variant_rows_for_identity = read_manifest_rows(source_path)
+                    except ValueError:
+                        # Keep a malformed optional variant diagnostic-only.
+                        variant_rows_for_identity = []
                     if variant_rows_for_identity:
                         apply_source_identity_to_segments(variant_rows_for_identity, source_meta)
                         if artifact_catalog:
@@ -26009,6 +26146,9 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     column_explanation_rows = explain_observed_columns(workspace_layer_report)
     write_csv(inspection_dir / "column-explanations.csv", column_explanation_rows)
     write_json(inspection_dir / "column-explanations.json", column_explanation_rows)
+    column_explanations_path = inspection_dir / "column-explanations.csv"
+    if artifact_catalog:
+        column_explanations_path = artifact_catalog.shared_file(column_explanations_path)
 
     upload_report = {"status": "skipped_prepare_only", "uploaded": 0, "errors": []}
     embedding_batch_ledger_path = inspection_dir / "embedding-batch-ledger.json"
@@ -27003,6 +27143,9 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     column_explanation_rows = explain_observed_columns(workspace_layer_report)
     write_csv(inspection_dir / "column-explanations.csv", column_explanation_rows)
     write_json(inspection_dir / "column-explanations.json", column_explanation_rows)
+    column_explanations_path = inspection_dir / "column-explanations.csv"
+    if artifact_catalog:
+        column_explanations_path = artifact_catalog.shared_file(column_explanations_path)
     failed_embedding_checkpoint = next(
         (
             batch
@@ -28129,7 +28272,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         ),
         "page_transition_continuations_detected": sum(bool(row.get("continuation_detected")) for row in transition_rows),
         "optional_text_artifact_policy": "on_demand" if artifact_catalog else "standalone",
-        "page_parent_manifest": str(selected_dir / "page-parent-manifest.jsonl"),
+        "page_parent_manifest": str(page_parent_manifest_path),
         "child_parent_map": str(selected_dir / "child-parent-map.csv"),
         "layout_region_review": str(selected_artifact_path(selected, selected_dir, "layout-region-review.json")),
         "visual_text_review_artifact": str(selected_artifact_path(selected, selected_dir, "visual-text-review.json")),
@@ -28166,7 +28309,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         "storage_sample_custom_document_title": sample_custom_document_title,
         "storage_sample_lancedb_title": sample_lancedb_title,
         "metadata_layer_visibility": str(inspection_dir / "metadata-layer-visibility.csv"),
-        "column_explanations": str(inspection_dir / "column-explanations.csv"),
+        "column_explanations": str(column_explanations_path),
         "author_inference_evaluation_status": author_eval.get("status", "complete"),
         "author_inference_evaluation_csv": author_eval.get("csv", ""),
         "author_inference_evaluation_json": author_eval.get("json", ""),
@@ -28536,7 +28679,6 @@ def publish_cli_text_outputs(output_base: Path, state_run_root: Path, summaries)
         raise OSError(f"Matched output run folder contains a non-TXT item: {target}")
     if any(target.iterdir()):
         raise FileExistsError(f"Matched CLI output run folder is not empty: {target}")
-    segment_name = re.compile(r"-p\d{3,}-s\d+\.txt$", re.IGNORECASE)
     used_names = set()
     published = []
     try:
@@ -28551,15 +28693,9 @@ def publish_cli_text_outputs(output_base: Path, state_run_root: Path, summaries)
             if not prepared.is_file():
                 continue
             source = Path(str(summary.get("pdf") or f"document-{index}.pdf"))
-            candidates = [prepared, *sorted(
-                (path for path in prepared.parent.iterdir() if path.is_file() and segment_name.search(path.name)),
-                key=lambda path: path.name.casefold(),
-            )]
-            suffixes = ["-complete-pdf-parsed.txt"]
-            for path in candidates[1:]:
-                match = segment_name.search(path.name)
-                if match:
-                    suffixes.append(match.group(0))
+            segment_exports = local_segment_export_sources(prepared, retained)
+            candidates = [prepared, *(path for path, _suffix in segment_exports)]
+            suffixes = ["-complete-pdf-parsed.txt", *(suffix for _path, suffix in segment_exports)]
             stem = safe_stem(source.stem)
             summary_destinations = []
             for candidate, suffix in zip(candidates, suffixes):

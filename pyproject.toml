@@ -77,6 +77,8 @@ py-modules = [
   "auto_anythingllm_pipeline",
   "cancellable_preparation_worker",
   "canonical_artifacts",
+  "manifest_text",
+  "runtime_event_journal",
   "run_artifact_tools",
   "embedder_capabilities",
   "orchestration",
