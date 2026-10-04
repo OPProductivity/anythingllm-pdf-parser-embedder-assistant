@@ -75,6 +75,7 @@ py-modules = [
   "assistant_browser_launcher",
   "assistant_stop_launcher",
   "anythingllm_source_atomic_server",
+  "anythingllm_source_atomic_v117",
   "anythingllm_source_atomic_worker",
   "anythingllm_persistence",
   "anythingllm_state",

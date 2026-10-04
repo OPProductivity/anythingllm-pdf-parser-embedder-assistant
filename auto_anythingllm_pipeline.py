@@ -17022,9 +17022,19 @@ def _update_workspace_embeddings_batched_serial(
         # cancellation state are durable.  In particular, a late 429 after an
         # owned queue receipt cannot silently re-submit a request Desktop has
         # already begun processing.
+        request_body = {"adds": batch, "deletes": []}
+        source_record_counts = Counter(
+            source_by_location[location]["source_path"]
+            for location in batch
+            if source_by_location.get(location, {}).get("source_path")
+        )
+        # Whole-file records already batch their chunks natively. Opt in only
+        # when provider calls can be combined across records of a known PDF.
+        if is_local_anythingllm_url(endpoint) and any(count > 1 for count in source_record_counts.values()):
+            request_body["pdfAssistantSourceAtomic"] = True
         request_tracker = start_json_post_response_tracker(
             endpoint,
-            {"adds": batch, "deletes": []},
+            request_body,
             api_key=api_key,
             timeout=max(1, int(math.ceil(timeout_seconds))),
         )

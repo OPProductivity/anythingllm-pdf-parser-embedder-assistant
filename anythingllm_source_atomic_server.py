@@ -150,6 +150,11 @@ def patch_v1161_server_source(source: str) -> str:
 
 
 def ensure_source_atomic_embedding_server(compatibility_report: dict[str, Any]) -> dict[str, Any]:
+    compatibility_report = dict(compatibility_report or {})
+    if dict(compatibility_report.get("characterization") or {}).get("desktop_version_normalized") == "1.17.0":
+        from anythingllm_source_atomic_v117 import ensure_v117_embedding_server
+
+        return ensure_v117_embedding_server(compatibility_report)
     qualified, reason = _qualified_v1161_authority(compatibility_report)
     target = _server_path(compatibility_report)
     result = {

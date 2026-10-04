@@ -28475,7 +28475,7 @@ def upload_prepared_automatic_batch(
     if callable(status_callback):
         if source_atomic_worker.get("enabled"):
             status_callback(
-                "AnythingLLM v1.16.1 source-atomic provider staging is active after the Desktop restart (serial batches of up to 36 chunks)",
+                "AnythingLLM source-atomic provider staging is active after the Desktop restart (serial batches of up to 36 chunks)",
                 {
                     "timing_event": "source_atomic_worker_active",
                     "source_atomic_worker": dict(source_atomic_worker),
