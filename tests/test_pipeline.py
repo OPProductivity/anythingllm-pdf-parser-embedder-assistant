@@ -9780,42 +9780,6 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(capability["recommended_anythingllm_limit"], 4096)
         self.assertEqual(capability["safe_max_chunk_length"], 4096)
 
-    def test_read_validation_workspace_template_uses_most_recent_configured_workspace(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            storage = Path(tmpdir)
-            db_path = storage / "anythingllm.db"
-            con = sqlite3.connect(db_path)
-            try:
-                con.execute(
-                    """
-                    create table workspaces(
-                        id integer primary key,
-                        name text,
-                        slug text,
-                        chatProvider text,
-                        chatModel text,
-                        topN integer,
-                        similarityThreshold real,
-                        vectorSearchMode text,
-                        chatMode text
-                    )
-                    """
-                )
-                con.execute(
-                    "insert into workspaces(id,name,slug,chatProvider,chatModel,topN,similarityThreshold,vectorSearchMode,chatMode) values (1,'Other','other','openrouter','gpt-4.1-mini',4,0.25,'default','query')"
-                )
-                con.execute(
-                    "insert into workspaces(id,name,slug,chatProvider,chatModel,topN,similarityThreshold,vectorSearchMode,chatMode) values (2,'Qwen','qwen-main','generic-openai','qwen3-8-max',8,0.3,'default','query')"
-                )
-                con.commit()
-            finally:
-                con.close()
-
-            template = pipeline.read_validation_workspace_template(storage)
-            self.assertEqual(template["status"], "pass")
-            self.assertEqual(template["source_workspace_slug"], "qwen-main")
-            self.assertEqual(template["chat_model"], "qwen3-8-max")
-
     def test_workspace_model_configuration_is_provider_neutral(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             storage = Path(tmpdir)

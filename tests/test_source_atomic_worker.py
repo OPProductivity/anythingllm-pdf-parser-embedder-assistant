@@ -1,385 +1,43 @@
-import hashlib
-import json
-import shutil
-import subprocess
-import sys
 import threading
-from pathlib import Path
 from unittest import mock
-
 import pytest
-
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT))
-
-import anythingllm_source_atomic_worker as source_atomic  # noqa: E402
-import auto_anythingllm_pipeline as pipeline  # noqa: E402
-
-
+import anythingllm_source_atomic_common as source_atomic
+import anythingllm_source_atomic_worker as legacy_helpers
+import auto_anythingllm_pipeline as pipeline
 pytestmark = pytest.mark.offline_deterministic
 
 
-def _qualified_report(executable):
-    return {
-        "status": "pass",
-        "characterization": {
-            "desktop_version_normalized": "1.16.1",
-            "native_mutation_contract": source_atomic.V1161_NATIVE_CONTRACT_ID,
-            "desktop_package": {
-                "app_asar_sha256": source_atomic.OBSERVED_CANDIDATE_PACKAGE_FINGERPRINTS["1.16.1"],
-            },
-            "desktop_executable": str(executable),
-        },
-    }
+def test_neutral_atomic_writer_replaces_complete_bytes_and_cleans_staging(tmp_path):
+    target = tmp_path / "nested" / "artifact.json"
+    source_atomic._atomic_write(target, b"old")
+    source_atomic._atomic_write(target, b"new complete bytes")
+    assert target.read_bytes() == b"new complete bytes"
+    assert list(target.parent.iterdir()) == [target]
 
 
-def _fixture_worker():
-    return (
-        '"use strict";\n'
-        'async function ah(){let legacyWorkerBehavior=true;return legacyWorkerBehavior}\n'
-        'process.on("message",async s=>{});\n'
-    )
+def test_neutral_atomic_writer_failure_preserves_previous_artifact(tmp_path, monkeypatch):
+    target = tmp_path / "artifact.json"
+    target.write_bytes(b"previous")
+
+    def blocked(*_):
+        raise PermissionError("fixture")
+
+    monkeypatch.setattr(source_atomic.os, "replace", blocked)
+    with pytest.raises(PermissionError):
+        source_atomic._atomic_write(target, b"new")
+    assert target.read_bytes() == b"previous"
+    assert list(tmp_path.iterdir()) == [target]
 
 
-def test_hybrid_patch_keeps_legacy_branch_and_is_idempotent():
-    patched = source_atomic.patch_v1161_embedding_worker_source(_fixture_worker())
-
-    assert source_atomic.SOURCE_ATOMIC_PATCH_ID in patched
-    assert source_atomic.SOURCE_ATOMIC_OPENROUTER_GATE in patched
-    configured_cap = source_atomic.SOURCE_ATOMIC_DEFAULT_PROVIDER_BATCH_SIZE
-    assert (
-        f'SOURCE_ATOMIC_EMBED_BATCH_SIZE||"{configured_cap}",10)||{configured_cap}'
-        in patched
-    )
-    assert "legacyWorkerBehavior=true" in patched
-    assert "maxRetries:0" in patched
-    assert str(source_atomic.SOURCE_ATOMIC_PROVIDER_FIRST_ATTEMPT_TIMEOUT_MS) in patched
-    assert str(source_atomic.SOURCE_ATOMIC_PROVIDER_RECOVERY_ATTEMPT_TIMEOUT_MS) in patched
-    assert str(source_atomic.SOURCE_ATOMIC_PROVIDER_RETRY_DELAY_CAP_MS) in patched
-    assert "source_staging_provider_batch_retrying" in patched
-    assert "__sourceAtomicAttemptId" in patched
-    assert "attempt_id" in patched
-    assert source_atomic.patch_v1161_embedding_worker_source(patched) == patched
-
-
-def _run_provider_policy_probe(script: str) -> dict:
-    """Run the generated Desktop helper without a provider or Desktop process."""
-    node = shutil.which("node")
-    if not node:
-        pytest.skip("Node.js is required to exercise generated Desktop JavaScript")
-    result = subprocess.run(
-        [node, "-"],
-        input=script,
-        text=True,
-        capture_output=True,
-        check=False,
-        timeout=10,
-    )
-    assert result.returncode == 0, result.stderr
-    return json.loads(result.stdout)
-
-
-def test_generated_provider_policy_caps_retry_and_disables_sdk_retries():
-    probe = _run_provider_policy_probe(
-        """
-let emitted=[],calls=[],intervals=[];
-global.setInterval=(callback,delay)=>{intervals.push({callback,delay});return intervals.length};
-global.clearInterval=()=>{};
-global.setTimeout=(callback)=>{queueMicrotask(callback);return 1};
-let l={openai:{embeddings:{create:async(request,options)=>{
-  calls.push(options);
-  if(calls.length===1){let error=new Error("rate limited");error.name="RateLimitError";error.status=429;error.headers={"retry-after-ms":"9000"};throw error}
-  return {data:request.input.map((text,index)=>({embedding:[index,text.length]}))}
-}}}};
-let __sourceAtomicEmit=(event)=>emitted.push(event);
-"""
-        + source_atomic.SOURCE_ATOMIC_PROVIDER_POLICY_HELPER
-        + """
-(async()=>{let result=await __sourceAtomicEmbedBatch(["one","two"],{batchIndex:0,sourceKey:"probe"});console.log(JSON.stringify({calls,attemptCount:result.attemptCount,retryDelayMs:result.retryDelayMs,events:emitted.map(event=>event.type)}))})().catch(error=>{console.error(error);process.exit(1)});
-"""
-    )
-
-    assert probe["calls"] == [
-        {"maxRetries": 0, "timeout": 35_000},
-        {"maxRetries": 0, "timeout": 45_000},
-    ]
-    assert probe["attemptCount"] == 2
-    assert probe["retryDelayMs"] == 5_000
-    assert "source_staging_provider_batch_retrying" in probe["events"]
-    # Backoff is reported as retrying, never as an active provider wait.
-    assert "source_staging_provider_batch_waiting" not in probe["events"]
-
-
-def test_generated_provider_policy_retries_generic_error_with_timeout_message():
-    """OpenAI-compatible clients can surface a timeout as plain ``Error``."""
-    probe = _run_provider_policy_probe(
-        """
-let emitted=[],calls=[];
-global.setInterval=()=>1;global.clearInterval=()=>{};
-global.setTimeout=(callback)=>{queueMicrotask(callback);return 1};
-let l={openai:{embeddings:{create:async(request,options)=>{
-  calls.push(options);
-  if(calls.length===1)throw new Error("Request timed out.");
-  return {data:request.input.map((text,index)=>({embedding:[index,text.length]}))}
-}}}};
-let __sourceAtomicEmit=(event)=>emitted.push(event);
-"""
-        + source_atomic.SOURCE_ATOMIC_PROVIDER_POLICY_HELPER
-        + """
-(async()=>{let result=await __sourceAtomicEmbedBatch(["one"],{batchIndex:0,sourceKey:"probe"});console.log(JSON.stringify({calls,attemptCount:result.attemptCount,events:emitted.map(event=>event.type)}))})().catch(error=>{console.error(error);process.exit(1)});
-"""
-    )
-
-    assert probe["attemptCount"] == 2
-    assert probe["calls"] == [
-        {"maxRetries": 0, "timeout": 35_000},
-        {"maxRetries": 0, "timeout": 45_000},
-    ]
-    assert probe["events"].count("source_staging_provider_batch_retrying") == 1
-
-
-def test_generated_provider_policy_never_retries_bad_request_and_heartbeats_active_request():
-    probe = _run_provider_policy_probe(
-        """
-let emitted=[],calls=0,pulse=null;
-global.setInterval=(callback)=>{pulse=callback;return 1};
-global.clearInterval=()=>{};
-let l={openai:{embeddings:{create:async(request,options)=>{
-  calls++;
-  if(calls===1){let error=new Error("invalid input");error.name="BadRequestError";error.status=400;throw error}
-  pulse();
-  return {data:request.input.map((text,index)=>({embedding:[index]}))}
-}}}};
-let __sourceAtomicEmit=(event)=>emitted.push(event);
-"""
-        + source_atomic.SOURCE_ATOMIC_PROVIDER_POLICY_HELPER
-        + """
-(async()=>{let firstError="";try{await __sourceAtomicEmbedBatch(["bad"],{batchIndex:0,sourceKey:"bad"})}catch(error){firstError=error.message};let result=await __sourceAtomicEmbedBatch(["good"],{batchIndex:1,sourceKey:"good"});console.log(JSON.stringify({calls,firstError,attemptCount:result.attemptCount,events:emitted.map(event=>event.type)}))})().catch(error=>{console.error(error);process.exit(1)});
-"""
-    )
-
-    assert probe["calls"] == 2
-    assert "HTTP 400" in probe["firstError"]
-    assert probe["attemptCount"] == 1
-    assert probe["events"].count("source_staging_provider_batch_retrying") == 0
-    assert probe["events"].count("source_staging_provider_batch_waiting") == 1
-
-
-def test_current_patch_migrates_only_the_exact_known_v1_worker(tmp_path, monkeypatch):
-    worker = tmp_path / "embedding-worker.js"
-    original = _fixture_worker()
-    worker.write_text(original, encoding="utf-8")
+def test_neutral_activation_unknown_is_not_a_restart_or_active_claim(tmp_path, monkeypatch):
     executable = tmp_path / "AnythingLLM.exe"
-    executable.write_bytes(b"desktop")
-    report = _qualified_report(executable)
-
-    backup = worker.with_name(f"{worker.name}.pdf-assistant-v1161.backup")
-    backup.write_text(original, encoding="utf-8")
-    monkeypatch.setattr(
-        source_atomic,
-        "V1161_EMBEDDING_WORKER_SHA256",
-        hashlib.sha256(backup.read_bytes()).hexdigest(),
-    )
-    legacy = source_atomic._legacy_v1_patched_worker_source(
-        backup.read_bytes().decode("utf-8")
-    )
-    worker.write_bytes(legacy.encode("utf-8"))
-
-    migrated = source_atomic.ensure_source_atomic_embedding_worker(report, worker_path=worker)
-
-    assert migrated["status"] == "restart_required", migrated
-    assert migrated["upgraded_from_patch_id"] == source_atomic.SOURCE_ATOMIC_LEGACY_PATCH_ID
-    patched = worker.read_text(encoding="utf-8")
-    assert source_atomic.SOURCE_ATOMIC_PATCH_ID in patched
-    assert source_atomic.SOURCE_ATOMIC_OPENROUTER_GATE in patched
-
-
-def test_current_patch_migrates_only_the_exact_known_v2_worker(tmp_path, monkeypatch):
-    worker = tmp_path / "embedding-worker.js"
-    original = _fixture_worker()
-    worker.write_text(original, encoding="utf-8")
-    executable = tmp_path / "AnythingLLM.exe"
-    executable.write_bytes(b"desktop")
-    report = _qualified_report(executable)
-    backup = worker.with_name(f"{worker.name}.pdf-assistant-v1161.backup")
-    backup.write_text(original, encoding="utf-8")
-    monkeypatch.setattr(
-        source_atomic,
-        "V1161_EMBEDDING_WORKER_SHA256",
-        hashlib.sha256(backup.read_bytes()).hexdigest(),
-    )
-    previous = source_atomic._previous_v2_patched_worker_source(
-        backup.read_bytes().decode("utf-8")
-    )
-    worker.write_bytes(previous.encode("utf-8"))
-
-    migrated = source_atomic.ensure_source_atomic_embedding_worker(report, worker_path=worker)
-
-    assert migrated["status"] == "restart_required", migrated
-    assert migrated["upgraded_from_patch_id"] == source_atomic.SOURCE_ATOMIC_PREVIOUS_PATCH_ID
-    patched = worker.read_text(encoding="utf-8")
-    assert source_atomic.SOURCE_ATOMIC_PATCH_ID in patched
-    assert "source_atomic_gate_observed" in patched
-
-
-def test_current_patch_migrates_manifest_bound_v3_worker(tmp_path, monkeypatch):
-    """v3 is upgraded only when its recorded pristine backup proves ownership."""
-    worker = tmp_path / "embedding-worker.js"
-    original = _fixture_worker()
-    worker.write_text(original, encoding="utf-8")
-    executable = tmp_path / "AnythingLLM.exe"
-    executable.write_bytes(b"desktop")
-    report = _qualified_report(executable)
-    backup = worker.with_name(f"{worker.name}.pdf-assistant-v1161.backup")
-    backup.write_text(original, encoding="utf-8")
-    monkeypatch.setattr(
-        source_atomic,
-        "V1161_EMBEDDING_WORKER_SHA256",
-        hashlib.sha256(backup.read_bytes()).hexdigest(),
-    )
-    previous = source_atomic.patch_v1161_embedding_worker_source(original).replace(
-        source_atomic.SOURCE_ATOMIC_PATCH_ID,
-        source_atomic.SOURCE_ATOMIC_PREVIOUS_V3_PATCH_ID,
-    )
-    worker.write_text(previous, encoding="utf-8")
-    manifest = worker.with_name(f"{worker.name}.pdf-assistant-source-atomic.json")
-    manifest.write_text(
-        json.dumps(
-            {
-                "patch_id": source_atomic.SOURCE_ATOMIC_PREVIOUS_V3_PATCH_ID,
-                "original_worker_sha256": hashlib.sha256(backup.read_bytes()).hexdigest(),
-                "patched_worker_sha256": hashlib.sha256(worker.read_bytes()).hexdigest(),
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    migrated = source_atomic.ensure_source_atomic_embedding_worker(report, worker_path=worker)
-
-    assert migrated["status"] == "restart_required", migrated
-    assert migrated["upgraded_from_patch_id"] == source_atomic.SOURCE_ATOMIC_PREVIOUS_V3_PATCH_ID
-    assert source_atomic.SOURCE_ATOMIC_PATCH_ID in worker.read_text(encoding="utf-8")
-    written_manifest = json.loads(manifest.read_text(encoding="utf-8"))
-    assert written_manifest["provider_retry_policy"] == source_atomic.source_atomic_provider_retry_policy()
-
-
-@pytest.mark.parametrize("previous_id", [source_atomic.SOURCE_ATOMIC_PREVIOUS_V7_PATCH_ID, source_atomic.SOURCE_ATOMIC_PREVIOUS_V10_PATCH_ID])
-def test_current_patch_migrates_manifest_bound_recent_worker(tmp_path, monkeypatch, previous_id):
-    """The last deployed worker upgrades to runtime-self-identifying v8."""
-    worker = tmp_path / "embedding-worker.js"
-    original = _fixture_worker()
-    worker.write_text(original, encoding="utf-8")
-    executable = tmp_path / "AnythingLLM.exe"
-    executable.write_bytes(b"desktop")
-    report = _qualified_report(executable)
-    backup = worker.with_name(f"{worker.name}.pdf-assistant-v1161.backup")
-    backup.write_text(original, encoding="utf-8")
-    monkeypatch.setattr(
-        source_atomic,
-        "V1161_EMBEDDING_WORKER_SHA256",
-        hashlib.sha256(backup.read_bytes()).hexdigest(),
-    )
-    previous = source_atomic.patch_v1161_embedding_worker_source(original).replace(
-        source_atomic.SOURCE_ATOMIC_PATCH_ID,
-        previous_id,
-    )
-    worker.write_text(previous, encoding="utf-8")
-    manifest = worker.with_name(f"{worker.name}.pdf-assistant-source-atomic.json")
-    manifest.write_text(
-        json.dumps({
-            "patch_id": previous_id,
-            "original_worker_sha256": hashlib.sha256(backup.read_bytes()).hexdigest(),
-            "patched_worker_sha256": hashlib.sha256(worker.read_bytes()).hexdigest(),
-        }),
-        encoding="utf-8",
-    )
-
-    migrated = source_atomic.ensure_source_atomic_embedding_worker(
-        report, worker_path=worker
-    )
-
-    assert migrated["status"] == "restart_required", migrated
-    assert migrated["upgraded_from_patch_id"] == previous_id
-    patched = worker.read_text(encoding="utf-8")
-    assert source_atomic.SOURCE_ATOMIC_PATCH_ID in patched
-    assert f'patchId:"{source_atomic.SOURCE_ATOMIC_PATCH_ID}"' in patched
-
-
-def test_installer_is_a_noop_without_exact_v1161_authority(tmp_path):
-    worker = tmp_path / "embedding-worker.js"
-    original = _fixture_worker()
-    worker.write_text(original, encoding="utf-8")
-    executable = tmp_path / "AnythingLLM.exe"
-    executable.write_bytes(b"desktop")
-    report = _qualified_report(executable)
-    report["characterization"]["desktop_version_normalized"] = "1.16.0"
-
-    result = source_atomic.ensure_source_atomic_embedding_worker(report, worker_path=worker)
-
-    assert result["enabled"] is False
-    assert result["status"] == "disabled"
-    assert worker.read_text(encoding="utf-8") == original
-    assert not worker.with_name(f"{worker.name}.pdf-assistant-v1161.backup").exists()
-
-
-def test_installer_is_exact_backuped_and_idempotent(tmp_path, monkeypatch):
-    worker = tmp_path / "embedding-worker.js"
-    original = _fixture_worker()
-    worker.write_text(original, encoding="utf-8")
-    # Text-mode fixtures can acquire CRLF line endings on Windows; the
-    # installer fingerprints the actual worker bytes, as production does.
-    original_sha = hashlib.sha256(worker.read_bytes()).hexdigest()
-    monkeypatch.setattr(source_atomic, "V1161_EMBEDDING_WORKER_SHA256", original_sha)
-
-    executable = tmp_path / "AnythingLLM.exe"
-    executable.write_bytes(b"desktop")
-    report = _qualified_report(executable)
-    installed = source_atomic.ensure_source_atomic_embedding_worker(report, worker_path=worker)
-
-    assert installed["status"] == "restart_required"
-    assert installed["installed"] is True
-    assert installed["enabled"] is False
-    assert installed["restart_required"] is True
-    assert source_atomic.SOURCE_ATOMIC_PATCH_ID in worker.read_text(encoding="utf-8")
-    backup = worker.with_name(f"{worker.name}.pdf-assistant-v1161.backup")
-    assert backup.read_text(encoding="utf-8") == original
-    manifest = json.loads(
-        worker.with_name(f"{worker.name}.pdf-assistant-source-atomic.json").read_text(encoding="utf-8")
-    )
-    assert manifest["original_worker_sha256"] == original_sha
-    assert manifest["provider_batch_size"] == 36
-    assert manifest["provider_retry_policy"] == source_atomic.source_atomic_provider_retry_policy()
-
-    monkeypatch.setattr(source_atomic, "_desktop_root_started_after", lambda *_args: (True, ""))
-    repeated = source_atomic.ensure_source_atomic_embedding_worker(report, worker_path=worker)
-    assert repeated["status"] == "already_enabled"
-    assert repeated["enabled"] is True
-    assert repeated["restart_required"] is False
-
-
-def test_existing_patch_requires_desktop_restart_until_a_new_root_is_observed(tmp_path, monkeypatch):
-    worker = tmp_path / "embedding-worker.js"
-    original = _fixture_worker()
-    worker.write_text(original, encoding="utf-8")
-    original_sha = hashlib.sha256(worker.read_bytes()).hexdigest()
-    monkeypatch.setattr(source_atomic, "V1161_EMBEDDING_WORKER_SHA256", original_sha)
-    executable = tmp_path / "AnythingLLM.exe"
-    executable.write_bytes(b"desktop")
-    report = _qualified_report(executable)
-
-    source_atomic.ensure_source_atomic_embedding_worker(report, worker_path=worker)
-    monkeypatch.setattr(
-        source_atomic,
-        "_desktop_root_started_after",
-        lambda *_args: (False, "anythingllm_desktop_not_running"),
-    )
-    waiting = source_atomic.ensure_source_atomic_embedding_worker(report, worker_path=worker)
-
-    assert waiting["status"] == "restart_required"
-    assert waiting["enabled"] is False
-    assert waiting["restart_required"] is True
-    assert waiting["reason"] == "anythingllm_desktop_not_running"
+    executable.touch()
+    worker = tmp_path / "server.js"
+    worker.touch()
+    monkeypatch.setattr(source_atomic, "_desktop_root_started_after", lambda *_: (None, "unknown_fixture"))
+    assert source_atomic._activation_state_for_installed_worker(
+        executable, worker, tmp_path / "missing-manifest.json",
+    ) == (False, "unknown_fixture", False)
 
 
 def test_desktop_restart_observer_accepts_live_cim_datetime_output(tmp_path, monkeypatch):
@@ -399,38 +57,6 @@ def test_desktop_restart_observer_accepts_live_cim_datetime_output(tmp_path, mon
 
     assert active is True
     assert reason == ""
-
-
-def test_installer_refuses_unexpected_worker_hash(tmp_path):
-    worker = tmp_path / "embedding-worker.js"
-    worker.write_text(_fixture_worker(), encoding="utf-8")
-
-    result = source_atomic.ensure_source_atomic_embedding_worker(
-        _qualified_report(tmp_path / "AnythingLLM.exe"), worker_path=worker
-    )
-
-    assert result["enabled"] is False
-    assert result["reason"] == "v1_16_1_embedding_worker_hash_not_matched"
-
-
-def test_installer_preserves_an_unknown_existing_backup(tmp_path, monkeypatch):
-    worker = tmp_path / "embedding-worker.js"
-    worker.write_text(_fixture_worker(), encoding="utf-8")
-    monkeypatch.setattr(
-        source_atomic,
-        "V1161_EMBEDDING_WORKER_SHA256",
-        hashlib.sha256(worker.read_bytes()).hexdigest(),
-    )
-    backup = worker.with_name(f"{worker.name}.pdf-assistant-v1161.backup")
-    backup.write_text("unrelated backup", encoding="utf-8")
-
-    result = source_atomic.ensure_source_atomic_embedding_worker(
-        _qualified_report(tmp_path / "AnythingLLM.exe"), worker_path=worker
-    )
-
-    assert result["enabled"] is False
-    assert result["reason"] == "source_atomic_worker_existing_backup_hash_mismatch"
-    assert backup.read_text(encoding="utf-8") == "unrelated backup"
 
 
 def test_explicit_precommit_rejection_allows_the_next_source_window():
@@ -524,3 +150,10 @@ def test_explicit_precommit_rejection_allows_the_next_source_window():
 )
 def test_precommit_rejection_is_not_safe_after_any_namespace_write_evidence(queue):
     assert pipeline.source_atomic_precommit_rejection(queue) is None
+
+
+def test_legacy_module_keeps_helpers_but_has_no_worker_installer():
+    assert legacy_helpers._atomic_write is source_atomic._atomic_write
+    assert legacy_helpers._sha256_bytes is source_atomic._sha256_bytes
+    assert not hasattr(legacy_helpers, "ensure_source_atomic_embedding_worker")
+    assert not hasattr(legacy_helpers, "patch_v1161_embedding_worker_source")

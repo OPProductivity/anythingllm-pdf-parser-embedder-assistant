@@ -12463,105 +12463,6 @@ def read_workspace_model_configuration(storage_dir: Path, workspace_slug="test")
     return result
 
 
-def read_validation_workspace_template(storage_dir: Path):
-    result = {
-        "status": "not_checked",
-        "source_workspace_slug": "",
-        "source_workspace_name": "",
-        "chat_provider": "",
-        "chat_model": "",
-        "top_n": 8,
-        "similarity_threshold": 0.25,
-        "vector_search_mode": "default",
-        "chat_mode": "query",
-        "message": "",
-        "error": "",
-    }
-    db_path = storage_dir / "anythingllm.db"
-    env_values = read_env_file_values(storage_dir / ".env")
-    llm_info = anythingllm_llm_config_from_values(env_values)
-    if not db_path.exists():
-        if llm_info.get("provider") and llm_info.get("model"):
-            result.update(
-                {
-                    "status": "pass",
-                    "source_workspace_slug": "",
-                    "source_workspace_name": "AnythingLLM global LLM settings",
-                    "chat_provider": llm_info.get("provider") or "",
-                    "chat_model": llm_info.get("model") or "",
-                    "message": (
-                        f"Using AnythingLLM global LLM settings "
-                        f"`{llm_info.get('provider')}` / `{llm_info.get('model')}`."
-                    ),
-                }
-            )
-            return result
-        result["status"] = "missing_db"
-        result["message"] = "AnythingLLM SQLite database was not found."
-        return result
-    try:
-        con = sqlite_readonly_connection(db_path)
-        con.row_factory = sqlite3.Row
-        cur = con.cursor()
-        workspaces = [dict(row) for row in cur.execute(
-            "select id,name,slug,chatProvider,chatModel,topN,similarityThreshold,vectorSearchMode,chatMode from workspaces order by id desc"
-        )]
-        chosen = None
-        for workspace in workspaces:
-            provider = str(workspace.get("chatProvider") or "")
-            model = str(workspace.get("chatModel") or "")
-            if provider or model:
-                chosen = workspace
-                break
-        if not chosen:
-            if llm_info.get("provider") and llm_info.get("model"):
-                result.update(
-                    {
-                        "status": "pass",
-                        "source_workspace_slug": "",
-                        "source_workspace_name": "AnythingLLM global LLM settings",
-                        "chat_provider": llm_info.get("provider") or "",
-                        "chat_model": llm_info.get("model") or "",
-                        "message": (
-                            f"Using AnythingLLM global LLM settings "
-                            f"`{llm_info.get('provider')}` / `{llm_info.get('model')}` because "
-                            "workspace rows do not carry explicit chat models."
-                        ),
-                    }
-                )
-                return result
-            result["status"] = "workspace_missing"
-            result["message"] = "No AnythingLLM workspace with a configured chat model was found."
-            return result
-        result.update(
-            {
-                "status": "pass",
-                "source_workspace_slug": chosen.get("slug") or "",
-                "source_workspace_name": chosen.get("name") or "",
-                "chat_provider": chosen.get("chatProvider") or "",
-                "chat_model": chosen.get("chatModel") or "",
-                "top_n": int(chosen.get("topN") or 8),
-                "similarity_threshold": chosen.get("similarityThreshold") if chosen.get("similarityThreshold") is not None else 0.25,
-                "vector_search_mode": chosen.get("vectorSearchMode") or "default",
-                "chat_mode": chosen.get("chatMode") or "query",
-                "message": (
-                    f"Using workspace template `{chosen.get('slug')}` with "
-                    f"`{chosen.get('chatProvider')}` / `{chosen.get('chatModel')}`."
-                ),
-            }
-        )
-    except Exception as exc:
-        result["status"] = "error"
-        result["error"] = str(exc)
-        result["message"] = "Failed to read a workspace template from AnythingLLM SQLite data."
-    finally:
-        try:
-            con.close()
-        except Exception:
-            pass
-    return result
-
-
 def default_short_label(title, author):
     # Fold diacritics only for compact labels, never for source metadata/text.
     def label_words(value):
@@ -15118,16 +15019,6 @@ def create_validation_workspace(
         requested_workspace_name,
         storage_dir=storage_dir,
     )
-    workspace_template = (
-        read_validation_workspace_template(Path(storage_dir))
-        if storage_dir
-        else {"status": "not_checked"}
-    )
-    # Validation may intentionally use a smaller retrieval context for large
-    # page-parent records. Preserve provider/model/template settings, but make
-    # the requested bounded top-N authoritative for this disposable workspace.
-    if workspace_template.get("status") == "pass":
-        workspace_template = {**workspace_template, "top_n": int(top_n)}
     cleanup = {"status": "not_applicable", "error": ""}
     try:
         status, response_text = post_json(
@@ -15165,8 +15056,6 @@ def create_validation_workspace(
                 "workspace_name_sanitized": workspace_name,
                 "workspace_name_collision_suffix": collision_suffix,
                 "authentication_mode": authentication_mode,
-                "workspace_template": workspace_template,
-                "workspace_template_apply": {"status": "not_attempted", "message": "", "error": ""},
                 "temporary_key_cleanup": cleanup,
                 "error": (
                     f"AnythingLLM returned unsafe workspace slug `{workspace_slug}`; the app removed that workspace. "
@@ -15174,15 +15063,6 @@ def create_validation_workspace(
                     + (f" Cleanup error: {cleanup_error}" if cleanup_error else "")
                 ),
             }
-        template_apply = {
-            "status": "not_applied",
-            "write_method": "none",
-            "message": (
-                "The validation workspace retains AnythingLLM's API-created settings; "
-                "the assistant does not copy settings through SQLite."
-            ),
-            "error": "",
-        }
         return {
             "status": "created" if 200 <= status < 300 and workspace_slug else "error",
             "workspace_slug": workspace_slug,
@@ -15191,8 +15071,6 @@ def create_validation_workspace(
             "workspace_name_sanitized": workspace_name,
             "workspace_name_collision_suffix": collision_suffix,
             "authentication_mode": authentication_mode,
-            "workspace_template": workspace_template,
-            "workspace_template_apply": template_apply,
             "temporary_key_cleanup": cleanup,
             "error": "" if 200 <= status < 300 else (data.get("error") if isinstance(data, dict) else response_text),
         }
@@ -15205,8 +15083,6 @@ def create_validation_workspace(
             "workspace_name_sanitized": workspace_name,
             "workspace_name_collision_suffix": collision_suffix,
             "authentication_mode": authentication_mode,
-            "workspace_template": workspace_template,
-            "workspace_template_apply": {"status": "not_attempted", "message": "", "error": ""},
             "temporary_key_cleanup": cleanup,
             "error": str(exc),
         }
@@ -15473,8 +15349,6 @@ def run_temporary_workspace_validation(
         "post_upload_report": {},
         "runtime_validation_report": {},
         "upload_report": {},
-        "workspace_template": {},
-        "workspace_template_apply": {},
         "cleanup_policy": cleanup_policy,
         "cleanup_result": {"status": "not_run", "error": ""},
         "error": "",
@@ -15501,8 +15375,6 @@ def run_temporary_workspace_validation(
     result["workspace_create_status"] = workspace.get("status", "error")
     result["workspace_slug"] = workspace.get("workspace_slug", "")
     result["workspace_name"] = workspace.get("workspace_name", "")
-    result["workspace_template"] = workspace.get("workspace_template") or {}
-    result["workspace_template_apply"] = workspace.get("workspace_template_apply") or {}
     if callable(status_callback):
         status_callback(
             "Creating temporary AnythingLLM validation workspace",
@@ -16357,8 +16229,6 @@ ANYTHINGLLM_SOURCE_QUEUE_GROUP_MAX_RECORDS = 512
 # This is deliberately a hard cap, rather than a default.  Callers must not
 # accidentally restore the unsafe four-to-six ramp by passing a larger limit.
 ANYTHINGLLM_EMBEDDING_MAX_CONCURRENT_BATCHES = 1
-ANYTHINGLLM_EMBEDDING_INITIAL_CONCURRENT_BATCHES = 1
-ANYTHINGLLM_EMBEDDING_FAILURE_FALLBACK_CONCURRENT_BATCHES = 1
 # This deadline applies to one ``update-embeddings`` HTTP request, not to a
 # whole PDF. The first request gets a modest cold-start allowance; later
 # requests learn from accepted warm-up throughput and their actual record
@@ -16583,10 +16453,6 @@ def storage_observation_due_for_queue(
 # per-batch checkpoint and final document check observe the same Desktop work;
 # they must not add independent 45- and 180-second waits.
 ANYTHINGLLM_VALIDATION_RECONCILIATION_TIMEOUT_SECONDS = 180.0
-# HTTP 429 is an explicit refusal to start a request, unlike an interrupted
-# response where Desktop may already have accepted the write. Only this narrow
-# case may retry in the same run at reduced concurrency.
-ANYTHINGLLM_EMBEDDING_SAFE_PARALLEL_FALLBACK_HTTP_STATUSES = frozenset({429})
 # The serialized ingestion path may retry one *explicitly refused* request.
 # This is deliberately narrower than generic retry logic: a timeout, transport
 # failure, 5xx response, or failed vector check can still conceal accepted work.
@@ -18057,7 +17923,7 @@ def update_workspace_embeddings_batched(
     verification_interval=ANYTHINGLLM_EMBEDDING_VERIFICATION_CHECKPOINT_INTERVAL,
     adaptive_single_record_threshold_seconds=60.0,
     concurrent_batch_limit=1,
-    initial_concurrent_batches=ANYTHINGLLM_EMBEDDING_INITIAL_CONCURRENT_BATCHES,
+    initial_concurrent_batches=1,
     submission_timeout_override=None,
     location_sources=None,
     receipt_observer=None,
@@ -18068,374 +17934,25 @@ def update_workspace_embeddings_batched(
     exposes no asynchronous job receipt, so uncertain submissions are kept for
     reconciliation rather than retried speculatively.
     """
-    try:
-        limit = max(1, min(int(concurrent_batch_limit or 1), ANYTHINGLLM_EMBEDDING_MAX_CONCURRENT_BATCHES))
-    except (TypeError, ValueError):
-        limit = 1
-    if limit <= 1:
-        return _update_workspace_embeddings_batched_serial(
-            api_url, api_key, workspace_slug, locations,
-            batch_size=batch_size,
-            warmup_batch_size=warmup_batch_size,
-            warmup_batch_count=warmup_batch_count,
-            ledger_path=ledger_path,
-            status_callback=status_callback,
-            batch_verifier=batch_verifier,
-            batch_inspector=batch_inspector,
-            cancel_callback=cancel_callback,
-            verification_mode=verification_mode,
-            verification_interval=verification_interval,
-            adaptive_single_record_threshold_seconds=adaptive_single_record_threshold_seconds,
-            submission_timeout_override=submission_timeout_override,
-            location_sources=location_sources,
-            receipt_observer=receipt_observer,
-        )
-
-    unique_locations = list(dict.fromkeys(str(location) for location in locations if location))
-    steady_size = max(1, int(batch_size or ANYTHINGLLM_EMBEDDING_UPDATE_BATCH_SIZE))
-    # An embedding-update response is synchronous in AnythingLLM Desktop. A
-    # one-record warm-up therefore costs a full provider/LanceDB round trip
-    # without making the following four-request wave safer. Keep the request
-    # body at two records but begin the bounded concurrency test at four.
-    warmup_size = 0
-    warmups = 0
-    if warmup_size >= steady_size:
-        warmup_size, warmups = 0, 0
-    plan, start = [], 0
-    while start < len(unique_locations):
-        size = warmup_size if len(plan) < warmups else steady_size
-        end = min(len(unique_locations), start + max(1, size))
-        plan.append((start, end))
-        start = end
-    total = len(plan)
-    result = {
-        "accepted": 0,
-        "requested": len(unique_locations),
-        "planned_locations": unique_locations,
-        "batch_size": steady_size,
-        "warmup_batch_size": warmup_size,
-        "warmup_batch_count": warmups,
-        "verification_mode": str(verification_mode or "checkpoint"),
-        "verification_interval": max(1, int(verification_interval or 1)),
-        "concurrent_batch_limit": limit,
-        "initial_concurrent_batches": min(limit, max(1, int(initial_concurrent_batches or 1))),
-        "failure_fallback_concurrent_batches": min(
-            limit, ANYTHINGLLM_EMBEDDING_FAILURE_FALLBACK_CONCURRENT_BATCHES
-        ),
-        "parallelism_schedule": [],
-        "submission_timeout_policy": {
-            "bootstrap_seconds": ANYTHINGLLM_EMBEDDING_SUBMISSION_BOOTSTRAP_TIMEOUT_SECONDS,
-            "floor_seconds": ANYTHINGLLM_EMBEDDING_SUBMISSION_TIMEOUT_FLOOR_SECONDS,
-            "cap_seconds": ANYTHINGLLM_EMBEDDING_SUBMISSION_TIMEOUT_CAP_SECONDS,
-            "safety_factor": ANYTHINGLLM_EMBEDDING_SUBMISSION_TIMEOUT_SAFETY_FACTOR,
-            "observed_seconds_per_record": None,
-        },
-        "deferred_verification_batches": [],
-        "final_verification_required": bool(batch_verifier),
-        "batches": [], "runtime_events": [], "errors": [],
-    }
-    _write_embedding_batch_ledger(ledger_path, workspace_slug, result)
-    if not plan:
-        return result
-
-    try:
-        parallelism = min(limit, max(1, int(initial_concurrent_batches or 1)))
-    except (TypeError, ValueError):
-        parallelism = min(limit, ANYTHINGLLM_EMBEDDING_INITIAL_CONCURRENT_BATCHES)
-    # Keep a queue of logical batch indexes instead of a single contiguous
-    # cursor. A safe retry after a 429 must revisit only the explicitly
-    # rejected request; siblings already acknowledged in the same wave must
-    # never be submitted again.
-    pending_plan_indexes = list(range(total))
-    while pending_plan_indexes:
-        if callable(cancel_callback) and cancel_callback():
-            plan_index = pending_plan_indexes[0]
-            start_index, end_index = plan[plan_index]
-            cancelled = {
-                "batch": plan_index + 1, "total_batches": total,
-                "start_index": start_index, "end_index": end_index,
-                "requested": end_index - start_index, "accepted": 0,
-                "locations": unique_locations[start_index:end_index],
-                "submission_state": "cancelled_before_submission",
-                "error": "The operator requested a stop before this batch was submitted.",
-            }
-            result["batches"].append(cancelled)
-            result["errors"].append({"endpoint": "operator-cancellation", "batch": plan_index + 1, "error": cancelled["error"]})
-            _write_embedding_batch_ledger(ledger_path, workspace_slug, result)
-            break
-        wave_count = min(parallelism, len(pending_plan_indexes))
-        wave_indexes = pending_plan_indexes[:wave_count]
-        batch_numbers = [item + 1 for item in wave_indexes]
-        result["parallelism_schedule"].append({
-            "start_batch": min(batch_numbers),
-            "end_batch": max(batch_numbers),
-            "batch_numbers": batch_numbers,
-            "parallelism": wave_count,
-        })
-        if callable(status_callback):
-            if wave_count == 1:
-                plan_index = wave_indexes[0]
-                status_callback(f"Submitting AnythingLLM batch {plan_index + 1} of {total} ({plan[plan_index][1] - plan[plan_index][0]} records)", {"batch": plan_index + 1, "total_batches": total, "requested": plan[plan_index][1] - plan[plan_index][0], "parallelism": 1})
-            else:
-                labels = ", ".join(str(item) for item in batch_numbers)
-                status_callback(f"Submitting AnythingLLM batches {labels} of {total} concurrently ({steady_size} records each)", {"batch": batch_numbers[0], "total_batches": total, "requested": sum(plan[item][1] - plan[item][0] for item in wave_indexes), "parallelism": wave_count})
-
-        require_wave_exact_vector_evidence = (
-            callable(batch_verifier)
-            and str(verification_mode or "checkpoint").casefold() != "none"
-        )
-
-        def submit_one(plan_index):
-            start_index, end_index = plan[plan_index]
-            actual_batch = plan_index + 1
-            # The serial helper journals state transitions eagerly.  Giving
-            # several concurrent helpers the aggregate ledger path let their
-            # last write temporarily replace the scheduler's own wave state.
-            # Keep those operation journals separate; the outer scheduler
-            # remains the sole writer of the aggregate ledger.
-            operation_ledger_path = None
-            if ledger_path:
-                aggregate_ledger = Path(ledger_path)
-                operation_ledger_path = aggregate_ledger.with_name(
-                    f"{aggregate_ledger.stem}.operation-{actual_batch}{aggregate_ledger.suffix}"
-                )
-            # ``update-embeddings`` may acknowledge file attachment while
-            # AnythingLLM continues indexing in the background.  A second
-            # concurrent wave launched solely on HTTP 2xx receipts can stack
-            # another four or six jobs behind that hidden work.  When the
-            # caller supplied an exact-vector verifier, use it as the wave
-            # gate for *every* concurrent member.  This keeps the scheduler
-            # bounded by observed AnythingLLM work, not just client replies.
-            verify_here = (
-                require_wave_exact_vector_evidence
-                or str(verification_mode or "checkpoint").casefold() == "every_batch"
-                or actual_batch == 1 or actual_batch == total
-                or actual_batch % max(1, int(verification_interval or 1)) == 0
-            )
-            def remap(callback, local_report):
-                report = dict(local_report)
-                report.update({"batch": actual_batch, "total_batches": total, "start_index": start_index, "end_index": end_index, "locations": unique_locations[start_index:end_index]})
-                return callback(report)
-            inner = _update_workspace_embeddings_batched_serial(
-                api_url, api_key, workspace_slug, unique_locations[start_index:end_index],
-                batch_size=end_index - start_index, warmup_batch_size=0, warmup_batch_count=0,
-                ledger_path=operation_ledger_path,
-                batch_verifier=(lambda report: remap(batch_verifier, report)) if callable(batch_verifier) and verify_here else None,
-                batch_inspector=(lambda report: remap(batch_inspector, report)) if callable(batch_inspector) else None,
-                cancel_callback=cancel_callback, verification_mode="every_batch" if verify_here else "none",
-                verification_interval=1, adaptive_single_record_threshold_seconds=adaptive_single_record_threshold_seconds,
-            )
-            if inner.get("runtime_events"):
-                inner["runtime_events"] = [
-                    {
-                        **dict(event),
-                        "batch": actual_batch
-                        if int((event or {}).get("batch") or 0) == 1
-                        else (event or {}).get("batch"),
-                    }
-                    for event in (inner.get("runtime_events") or [])
-                    if isinstance(event, dict)
-                ]
-            report = dict((inner.get("batches") or [{}])[0])
-            report.update({"batch": actual_batch, "total_batches": total, "start_index": start_index, "end_index": end_index, "locations": unique_locations[start_index:end_index], "parallelism": wave_count})
-            return report, inner
-
-        completed = {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=wave_count, thread_name_prefix="anythingllm-embed") as executor:
-            futures = {executor.submit(submit_one, item): item for item in wave_indexes}
-            for future in concurrent.futures.as_completed(futures):
-                plan_index = futures[future]
-                try:
-                    completed[plan_index] = future.result()
-                except Exception as exc:
-                    start_index, end_index = plan[plan_index]
-                    completed[plan_index] = ({"batch": plan_index + 1, "total_batches": total, "start_index": start_index, "end_index": end_index, "requested": end_index - start_index, "accepted": 0, "locations": unique_locations[start_index:end_index], "submission_state": "unresolved", "error": str(exc), "parallelism": wave_count}, {"errors": [{"error": str(exc)}]})
-        wave_reports = [(plan_index, *completed[plan_index]) for plan_index in wave_indexes]
-        failed_wave_reports = [
-            (plan_index, report, inner)
-            for plan_index, report, inner in wave_reports
-            if str(report.get("submission_state") or "") != "accepted"
-        ]
-        # A 429 is the one explicitly documented retryable outcome. It means
-        # Desktop refused this request before it entered its embedding queue.
-        # Do not extend this exception to timeouts, transport errors, failed
-        # verification, or generic 5xx responses: those can still conceal an
-        # accepted write and must retain the normal reconciliation workflow.
-        safe_parallel_fallback = (
-            len(wave_indexes) >= ANYTHINGLLM_EMBEDDING_INITIAL_CONCURRENT_BATCHES
-            and bool(failed_wave_reports)
-            and all(
-                str(report.get("submission_state") or "") == "rejected"
-                and int(report.get("http_status") or 0)
-                in ANYTHINGLLM_EMBEDDING_SAFE_PARALLEL_FALLBACK_HTTP_STATUSES
-                for _plan_index, report, _inner in failed_wave_reports
-            )
-        )
-
-        for plan_index, report, inner in wave_reports:
-            result["runtime_events"].extend(inner.get("runtime_events") or [])
-            rate = float(report.get("submission_seconds") or 0.0) / max(
-                1, int(report.get("accepted") or report.get("requested") or 1)
-            )
-            if rate > 0:
-                result["submission_timeout_policy"]["observed_seconds_per_record"] = round(
-                    max(
-                        float(result["submission_timeout_policy"].get("observed_seconds_per_record") or 0.0),
-                        rate,
-                    ),
-                    4,
-                )
-            if safe_parallel_fallback and any(
-                failed_plan_index == plan_index
-                for failed_plan_index, _failed_report, _failed_inner in failed_wave_reports
-            ):
-                result["runtime_events"].append(
-                    {
-                        "event": "parallelism_fallback_retry_scheduled",
-                        "batch": report.get("batch"),
-                        "http_status": report.get("http_status"),
-                        "failed_parallelism": wave_count,
-                        "retry_parallelism": ANYTHINGLLM_EMBEDDING_FAILURE_FALLBACK_CONCURRENT_BATCHES,
-                        "reason": "HTTP 429 explicitly rejected this request before submission; it will retry at reduced concurrency.",
-                    }
-                )
-                continue
-            result["batches"].append(report)
-            result["accepted"] += int(report.get("accepted") or 0)
-            if str(report.get("submission_state") or "") != "accepted":
-                result["errors"].extend(inner.get("errors") or [{"endpoint": "update-embeddings", "batch": report.get("batch"), "error": report.get("error") or "submission did not complete"}])
-            elif str((report.get("verification") or {}).get("status") or "") in {
-                "deferred_to_checkpoint",
-                "pending_delayed_indexing",
-            }:
-                result["deferred_verification_batches"].append(int(report["batch"]))
-        if safe_parallel_fallback:
-            # Persist the explicit rejection before retrying it. If this
-            # process dies between waves, the recovery manifest must still
-            # describe the rejected batch instead of losing it merely because
-            # its retry had already been scheduled in memory.
-            result["batches"].extend(
-                report
-                for _plan_index, report, _inner in failed_wave_reports
-            )
-        result["batches"].sort(key=lambda row: int(row.get("batch") or 0))
-        _write_embedding_batch_ledger(ledger_path, workspace_slug, result)
-        wave_failed = bool(failed_wave_reports)
-        if callable(status_callback):
-            status_callback(
-                f"AnythingLLM concurrent wave {', '.join(str(item) for item in batch_numbers)} {'accepted' if not wave_failed else 'needs reconciliation'}",
-                {"batch": batch_numbers[-1], "total_batches": total, "parallelism": wave_count, "wave_failed": wave_failed},
-            )
-        if safe_parallel_fallback:
-            fallback = min(limit, ANYTHINGLLM_EMBEDDING_FAILURE_FALLBACK_CONCURRENT_BATCHES)
-            retry_indexes = [plan_index for plan_index, _report, _inner in failed_wave_reports]
-            retry_batch_numbers = {plan_index + 1 for plan_index in retry_indexes}
-            accepted_indexes = {
-                plan_index
-                for plan_index, report, _inner in wave_reports
-                if str(report.get("submission_state") or "") == "accepted"
-            }
-            pending_plan_indexes = retry_indexes + [
-                plan_index
-                for plan_index in pending_plan_indexes[wave_count:]
-                if plan_index not in accepted_indexes
-            ]
-            # Keep the rejected attempt durable until the retry begins, then
-            # replace it in memory with the final logical batch result. The
-            # retry evidence remains in ``runtime_events``; a completed
-            # ledger therefore has one final record per logical batch.
-            result["batches"] = [
-                report
-                for report in result["batches"]
-                if int(report.get("batch") or 0) not in retry_batch_numbers
-            ]
-            parallelism = fallback
-            result["parallelism_fallback_applied"] = True
-            result["runtime_events"].append(
-                {
-                    "event": "parallelism_fallback_applied",
-                    "failed_parallelism": wave_count,
-                    "fallback_parallelism": fallback,
-                    "retry_batches": [plan_index + 1 for plan_index in retry_indexes],
-                    "reason": "HTTP 429 rejections are safe to retry; accepted sibling batches were retained and not replayed.",
-                }
-            )
-            if callable(status_callback):
-                status_callback(
-                    f"AnythingLLM rate-limited the concurrent wave; retrying only rejected batches at {fallback} concurrent requests",
-                    {"batch": batch_numbers[-1], "total_batches": total, "parallelism": fallback, "wave_failed": True, "fallback_applied": True},
-                )
-            continue
-        wave_observation_pending = [
-            report
-            for _plan_index, report, _inner in wave_reports
-            if str(report.get("submission_state") or "") == "accepted"
-            and str(report.get("lifecycle_state") or "") != "vector_observed"
-        ]
-        if require_wave_exact_vector_evidence and wave_observation_pending:
-            pending_batches = [int(report.get("batch") or 0) for report in wave_observation_pending]
-            result["runtime_events"].append(
-                {
-                    "event": "concurrent_wave_exact_vector_gate_pending",
-                    "parallelism": wave_count,
-                    "accepted_batches": pending_batches,
-                    "reason": (
-                        "AnythingLLM accepted the concurrent wave but had not exposed exact vectors for every "
-                        "submitted batch. No later requests were submitted, preventing hidden indexing work from "
-                        "being overfilled."
-                    ),
-                }
-            )
-            _write_embedding_batch_ledger(ledger_path, workspace_slug, result)
-            if callable(status_callback):
-                status_callback(
-                    (
-                        "AnythingLLM accepted the concurrent wave but is still indexing it; "
-                        "no later requests were submitted pending exact vector evidence"
-                    ),
-                    {
-                        "batch": batch_numbers[-1],
-                        "total_batches": total,
-                        "parallelism": wave_count,
-                        "wave_observation_pending": True,
-                        "pending_batches": pending_batches,
-                    },
-                )
-            break
-        if wave_failed:
-            if parallelism >= ANYTHINGLLM_EMBEDDING_INITIAL_CONCURRENT_BATCHES:
-                fallback = min(
-                    limit,
-                    ANYTHINGLLM_EMBEDDING_FAILURE_FALLBACK_CONCURRENT_BATCHES,
-                )
-                result["recommended_resume_parallelism"] = fallback
-                result["runtime_events"].append(
-                    {
-                        "event": "parallelism_fallback_recommended",
-                        "failed_parallelism": parallelism,
-                        "recommended_resume_parallelism": fallback,
-                        "reason": "A four-or-more concurrent AnythingLLM wave did not complete cleanly; unresolved writes are not replayed automatically.",
-                    }
-                )
-                _write_embedding_batch_ledger(ledger_path, workspace_slug, result)
-                if callable(status_callback):
-                    status_callback(
-                        f"AnythingLLM four-request wave did not complete cleanly; recovery is limited to {fallback} concurrent requests after exact-vector reconciliation",
-                        {"batch": batch_numbers[-1], "total_batches": total, "parallelism": fallback, "wave_failed": True},
-                    )
-            break
-        # A clean four-request wave (HTTP acknowledgement plus exact vector
-        # evidence when a verifier is available) earns the six-request cap.
-        # An uncertain response deliberately does not get replayed here:
-        # AnythingLLM may have completed it after the client lost the
-        # response, so recovery must reconcile exact vectors first.
-        pending_plan_indexes = pending_plan_indexes[wave_count:]
-        # A clean initial wave earns six. Once a rate-limit fallback has been
-        # applied, keep the remainder of this run at two: probing six again
-        # would turn one known overload signal into repeated avoidable load.
-        if not result.get("parallelism_fallback_applied"):
-            parallelism = min(limit, ANYTHINGLLM_EMBEDDING_MAX_CONCURRENT_BATCHES)
-    return result
+    # Retain the concurrency keyword slots for existing callers, but never
+    # revive the retired concurrent mutation path regardless of their values.
+    return _update_workspace_embeddings_batched_serial(
+        api_url, api_key, workspace_slug, locations,
+        batch_size=batch_size,
+        warmup_batch_size=warmup_batch_size,
+        warmup_batch_count=warmup_batch_count,
+        ledger_path=ledger_path,
+        status_callback=status_callback,
+        batch_verifier=batch_verifier,
+        batch_inspector=batch_inspector,
+        cancel_callback=cancel_callback,
+        verification_mode=verification_mode,
+        verification_interval=verification_interval,
+        adaptive_single_record_threshold_seconds=adaptive_single_record_threshold_seconds,
+        submission_timeout_override=submission_timeout_override,
+        location_sources=location_sources,
+        receipt_observer=receipt_observer,
+    )
 
 
 def update_workspace_embeddings_desktop_queue(
@@ -21681,6 +21198,16 @@ def expected_page_segment_tokens(payload):
     }
 
 
+def _runtime_validation_prose_score(text):
+    letters = sum(character.isalpha() for character in text)
+    digits = sum(character.isdigit() for character in text)
+    words = re.findall(r"[A-Za-z]{3,}", text)
+    unique_words = len({word.casefold() for word in words})
+    # Contents leaders and OCR punctuation runs are not hundreds of sentences.
+    sentence_marks = min(sum(text.count(mark) for mark in ".;:"), len(words) // 5)
+    return letters + (unique_words * 5) + (sentence_marks * 8) - (digits * 3)
+
+
 def runtime_validation_query_text(payload, limit=240):
     """Choose a dense prose window for an exact runtime retrieval probe.
 
@@ -21719,12 +21246,7 @@ def runtime_validation_query_text(payload, limit=240):
     best_score = float("-inf")
     for start in sorted(starts):
         candidate = text[start:start + limit].strip()
-        letters = sum(character.isalpha() for character in candidate)
-        digits = sum(character.isdigit() for character in candidate)
-        words = re.findall(r"[A-Za-z]{3,}", candidate)
-        unique_words = len({word.casefold() for word in words})
-        sentence_marks = candidate.count(".") + candidate.count(";") + candidate.count(":")
-        score = letters + (unique_words * 5) + (sentence_marks * 8) - (digits * 3)
+        score = _runtime_validation_prose_score(candidate)
         if score > best_score:
             best_score = score
             best_text = candidate
@@ -21747,13 +21269,19 @@ def select_runtime_validation_payloads(payloads, upload_limit=0, limit=2, upload
     scored = []
     for index, payload in enumerate(candidates):
         query = runtime_validation_query_text(payload)
-        words = re.findall(r"[A-Za-z]{3,}", query)
-        alpha = sum(character.isalpha() for character in query)
-        digits = sum(character.isdigit() for character in query)
-        punctuation = sum(character in ".;:" for character in query)
         expected = expected_page_segment_tokens(payload)
-        score = alpha + (len({word.casefold() for word in words}) * 5) + (punctuation * 8) - (digits * 3)
-        scored.append((score, index, expected.get("page_number"), payload))
+        score = _runtime_validation_prose_score(query)
+        metadata = payload.get("metadata") or {}
+        source = str(metadata.get("docSource") or "").strip()
+        if not source:
+            source = re.sub(
+                r"(?i)(?:[_:]|::pdf-)p?\d+(?:[_:]s\d+)?$",
+                "",
+                str(expected.get("chunk_source") or ""),
+            )
+        page = expected.get("page_number")
+        page_identity = (source, page) if page is not None else None
+        scored.append((score, index, page_identity, payload))
     if requested == 1:
         return [max(scored, key=lambda row: (row[0], -row[1]))[3]]
 

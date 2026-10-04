@@ -1123,6 +1123,12 @@ def _compatibility_inspect(
     print(f"Storage schema status: {result['storage_schema_status']}")
     print(f"Guarded settings profile: {result['matched_profile'] or 'not qualified'}")
     print(f"Package fingerprint: {result['desktop_package']['fingerprint_status']}")
+    assessment = result.get("assessment") or {}
+    if assessment:
+        print(f"Runtime endpoint: {assessment['runtime_endpoint']} ({assessment['runtime_scope']})")
+        print(f"Native operations: {assessment['native_operations']}")
+        print("Fresh embedding/retrieval tests: not run by this inspection.")
+        print(f"Next diagnostic: {assessment['next_action']}")
     for name in (
         "can_read_sqlite_state",
         "can_write_sqlite_settings",

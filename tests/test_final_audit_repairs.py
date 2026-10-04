@@ -8,7 +8,8 @@ from unittest.mock import patch
 import pytest
 import auto_anythingllm_pipeline as pipeline
 import rag_pdf_tools as tools
-import anythingllm_source_atomic_worker as worker
+import anythingllm_source_atomic_common as worker
+from anythingllm_source_atomic_v1161_policy import SOURCE_ATOMIC_PROVIDER_POLICY_HELPER
 from anythingllm_source_atomic_server import SOURCE_ATOMIC_SERVER_BODY
 from anythingllm_persistence import AnythingLLMPersistenceAdapter
 from anythingllm_state import read_env_values
@@ -232,7 +233,7 @@ def test_provider_shape_validation(vectors, ok):
     let calls=0;f({openai:{embeddings:{create:async()=>{calls++;return {data:p.vectors.map(embedding=>({embedding}))}}}}},()=>{}).then(()=>console.log(JSON.stringify({ok:true,calls}))).catch(()=>console.log(JSON.stringify({ok:false,calls})));"""
     result = node(
         script,
-        {"helper": worker.SOURCE_ATOMIC_PROVIDER_POLICY_HELPER, "vectors": vectors},
+        {"helper": SOURCE_ATOMIC_PROVIDER_POLICY_HELPER, "vectors": vectors},
     )
     assert result == {"ok": ok, "calls": 1}
 
@@ -279,5 +280,5 @@ def test_provider_identity_and_finiteness_validation(case, ok):
     if(p.case==='reversed')data.reverse();if(p.case==='duplicate')data[1].index=0;if(p.case==='nonfinite')data[1].embedding[0]=NaN;
     f({openai:{embeddings:{create:async()=>{calls++;return {data}}}}},()=>{}).then(()=>console.log(JSON.stringify({ok:true,calls}))).catch(()=>console.log(JSON.stringify({ok:false,calls})));"""
     assert node(
-        script, {"helper": worker.SOURCE_ATOMIC_PROVIDER_POLICY_HELPER, "case": case}
+        script, {"helper": SOURCE_ATOMIC_PROVIDER_POLICY_HELPER, "case": case}
     ) == {"ok": ok, "calls": 1}

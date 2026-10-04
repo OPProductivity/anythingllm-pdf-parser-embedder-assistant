@@ -7,11 +7,10 @@ from pathlib import Path
 from typing import Any
 
 from anythingllm_compatibility import OBSERVED_CANDIDATE_PACKAGE_FINGERPRINTS, V117_NATIVE_CONTRACT_ID
-from anythingllm_source_atomic_server import OPENROUTER_GATE, SOURCE_ATOMIC_SERVER_BODY
-from anythingllm_source_atomic_worker import (
+from anythingllm_source_atomic_server import OPENROUTER_GATE, SOURCE_ATOMIC_SERVER_BODY_TEMPLATE
+from anythingllm_source_atomic_common import (
     SOURCE_ATOMIC_DEFAULT_PROVIDER_BATCH_SIZE,
     SOURCE_ATOMIC_MAX_PROVIDER_BATCH_SIZE,
-    SOURCE_ATOMIC_PROVIDER_POLICY_HELPER,
     _activation_state_for_installed_worker,
     _atomic_write,
     _sha256_bytes,
@@ -65,9 +64,11 @@ def provider_staging_body() -> str:
         "anythingllm_pdf_assistant_source_atomic_server_v5": PATCH_ID,
         "numberOfDocuments:e.length": "numberOfDocumentsAdded:e.length",
     }
-    if SOURCE_ATOMIC_SERVER_BODY.count(SOURCE_ATOMIC_PROVIDER_POLICY_HELPER) != 1:
+    if SOURCE_ATOMIC_SERVER_BODY_TEMPLATE.count("__SOURCE_ATOMIC_PROVIDER_POLICY_HELPER__") != 1:
         raise ValueError("Expected one assistant-owned provider helper.")
-    value = SOURCE_ATOMIC_SERVER_BODY.replace(SOURCE_ATOMIC_PROVIDER_POLICY_HELPER, NATIVE_PROVIDER_HELPER)
+    value = SOURCE_ATOMIC_SERVER_BODY_TEMPLATE.replace("__SOURCE_ATOMIC_PROVIDER_POLICY_HELPER__", NATIVE_PROVIDER_HELPER)
+    value = value.replace("__SOURCE_ATOMIC_DEFAULT_PROVIDER_BATCH_SIZE__", str(SOURCE_ATOMIC_DEFAULT_PROVIDER_BATCH_SIZE))
+    value = value.replace("__SOURCE_ATOMIC_SERVER_PATCH_ID__", "anythingllm_pdf_assistant_source_atomic_server_v5")
     for old, new in substitutions.items():
         if old not in value:
             raise ValueError(f"Source staging contract changed: {old}")

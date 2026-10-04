@@ -7385,13 +7385,25 @@ def _latest_workspace_runtime_payloads(workspace_slug, limit=600):
     for report_path in candidates:
         run_root = report_path.parent
         config = _read_automatic_run_json(run_root / ".automatic-batch-upload-config.json")
-        if str(config.get("workspace_slug") or "") != slug:
-            continue
         report = _read_automatic_run_json(report_path)
+        if str(report.get("workspace_slug") or config.get("workspace_slug") or "") != slug:
+            continue
         if str(report.get("status") or "") not in {"complete", "complete_with_key_cleanup_warning"}:
             continue
         payloads = []
-        for location in (report.get("locations") or [])[:max(1, int(limit or 1))]:
+        locations = report.get("locations") or []
+        if not isinstance(locations, list):
+            continue
+        maximum = max(1, int(limit or 1))
+        if len(locations) > maximum:
+            # Bound file reads while retaining coverage of the whole receipt,
+            # rather than silently examining only the first book's pages.
+            locations = [locations[(index * (len(locations) - 1)) // max(1, maximum - 1)]
+                         for index in range(maximum)]
+        seen_identities = set()
+        for location in locations:
+            if not isinstance(location, str) or not location.strip():
+                continue
             relative = str(location or "").replace("\\", "/").lstrip("/")
             candidate = (documents_root / Path(relative)).resolve()
             try:
@@ -7406,8 +7418,9 @@ def _latest_workspace_runtime_payloads(workspace_slug, limit=600):
                 continue
             text = str(raw.get("pageContent") or raw.get("textContent") or "").strip()
             chunk_source = str(raw.get("chunkSource") or "").strip()
-            if not text or not chunk_source:
+            if not text or not chunk_source or chunk_source in seen_identities:
                 continue
+            seen_identities.add(chunk_source)
             payloads.append({
                 "textContent": text,
                 "metadata": {
@@ -7431,19 +7444,29 @@ def optional_workspace_live_retrieval_check(api_url, api_key, workspace_slug, in
             '<div class="artifact-placeholder"><strong>No assistant-owned successful upload receipt was found for this workspace.</strong>'
             '<br>Run this check after a successful PDF Parser Embedder Assistant upload.</div>'
         )
-    report = validate_anythingllm_native_runtime(
-        str(api_url or DEFAULT_ANYTHINGLLM_API_URL).strip(),
-        str(api_key or "").strip(),
-        slug,
-        payloads,
-        0,
-        default_anythingllm_storage_dir(),
-        include_chat_probe=bool(include_chat_probe),
-        runtime_probe_limit=min(3, max(1, int(math.ceil(math.sqrt(len(payloads)))))),
-        vector_timeout_seconds=20,
-        vector_max_attempts=1,
-        retry_timed_out_siblings=False,
-    )
+    try:
+        report = validate_anythingllm_native_runtime(
+            str(api_url or DEFAULT_ANYTHINGLLM_API_URL).strip(),
+            str(api_key or "").strip(),
+            slug,
+            payloads,
+            0,
+            default_anythingllm_storage_dir(),
+            include_chat_probe=bool(include_chat_probe),
+            runtime_probe_limit=min(3, max(1, int(math.ceil(math.sqrt(len(payloads)))))),
+            vector_timeout_seconds=20,
+            vector_max_attempts=1,
+            retry_timed_out_siblings=False,
+        )
+    except Exception as exc:
+        APP_LOGGER.warning("optional retrieval diagnostic failed: %s", type(exc).__name__)
+        report = {
+            "status": "diagnostic_error",
+            "message": "The optional retrieval check could not complete; the upload result is unchanged.",
+            "error_class": type(exc).__name__,
+            "vector_checks": [],
+            "chat_check": {},
+        }
     report["requested_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     report["source_run_root"] = str(run_root)
     report["mutation_policy"] = "read_only_runtime_query; no upload, embedding, delete, or retry"
@@ -7460,17 +7483,19 @@ def optional_workspace_live_retrieval_check(api_url, api_key, workspace_slug, in
         ("Vector probes", f"{passed}/{len(vector_checks)} expected source identities found"),
         ("Chat citation probe", (report.get("chat_check") or {}).get("status") or ("requested" if include_chat_probe else "not requested")),
         ("Runtime model", " / ".join(filter(None, [str((report.get("model_configuration") or {}).get("chat_provider") or ""), str((report.get("model_configuration") or {}).get("chat_model") or "")])) or "not reported"),
-        ("Saved report", str(artifact_path)),
+        ("Saved report", str(artifact_path) if not report.get("artifact_write_error") else "Could not save this diagnostic report"),
     ]
     grid = "".join(
         f'<div class="metadata-key">{html.escape(str(key))}</div><div class="metadata-value">{html.escape(str(value))}</div>'
         for key, value in rows
     )
-    detail = (
+    detail = report.get("message") or (
         "Optional diagnostic completed. It queried existing workspace retrieval only; it did not upload, embed, delete, or retry any PDF."
     )
     if report.get("error"):
         detail += f" {report['error']}"
+    if vector_checks and passed < len(vector_checks):
+        detail += " A source not returned in the sampled top results needs retrieval review; this alone does not prove that its embeddings are missing."
     return (
         '<div class="workspace-verification-card"><strong>Optional live retrieval check</strong>'
         f'<div>{html.escape(detail)}</div><div class="metadata-grid">{grid}</div></div>'
@@ -10863,6 +10888,7 @@ def compact_native_mutation_authority(compatibility_report):
             name: str((capabilities.get(name) or {}).get("status") or "unknown")
             for name in required
         },
+        "assessment": dict(characterization.get("assessment") or {}),
     }
 
 

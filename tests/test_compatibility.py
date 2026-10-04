@@ -320,3 +320,71 @@ def test_package_fingerprint_is_cached_only_for_unchanged_package_identity(tmp_p
     )
     assert third["app_asar_sha256"] == "b" * 64
     assert calls == [b"package-one", b"package-two-with-different-size"]
+
+
+def test_packaged_documentation_does_not_hide_offline_runtime(tmp_path, monkeypatch):
+    import json
+
+    def offline(*args, **kwargs):
+        raise ConnectionRefusedError("fixture offline")
+
+    monkeypatch.setattr(anythingllm_compatibility.urllib.request, "urlopen", offline)
+    openapi = tmp_path / "openapi.json"
+    openapi.write_text(json.dumps({
+        "paths": {route: {} for route in anythingllm_compatibility.REQUIRED_API_CONTRACT_ROUTES}
+    }))
+    api = probe_api_contract("http://127.0.0.1:3001", installed_openapi_path=openapi)
+    assert api["status"] == "qualified_read_only_contract"
+    assert api["runtime_reachable"] is False
+    assert api["runtime_probe_error"] == "api_docs_probe_error:ConnectionRefusedError"
+    assessment = anythingllm_compatibility.compatibility_assessment({
+        "storage_schema_status": "matched", "native_mutation_contract_status": "matched",
+        "api_contract": api,
+    })
+    assert assessment["runtime_endpoint"] == "unreachable"
+    assert assessment["api_documentation"] == "installed_package_openapi"
+    assert assessment["next_action"] == "start_or_check_desktop_runtime"
+    assert assessment["embedding_test"] == assessment["retrieval_test"] == "not_run"
+
+
+@pytest.mark.parametrize("runtime,expected", [
+    (True, "optional_live_retrieval_check"), (False, "start_or_check_desktop_runtime"),
+    (None, "check_runtime_when_needed"),
+])
+def test_assessment_never_calls_historical_qualification_a_fresh_test(runtime, expected):
+    result = {
+        "storage_schema_status": "matched", "native_mutation_contract_status": "matched",
+        "api_contract": {"runtime_reachable": runtime},
+    }
+    assessment = anythingllm_compatibility.compatibility_assessment(result)
+    assert assessment["native_operations"] == "previously_qualified_for_exact_package"
+    assert assessment["next_action"] == expected
+    assert assessment["embedding_test"] == "not_run"
+    assert assessment["retrieval_test"] == "not_run"
+    assert "capabilities" not in result
+
+
+def test_assessment_fingerprint_request_does_not_infer_runtime_failure():
+    assessment = anythingllm_compatibility.compatibility_assessment({
+        "storage_schema_status": "matched",
+        "desktop_release_status": "candidate_version_requires_package_fingerprint",
+    })
+    assert assessment["next_action"] == "inspect_package_fingerprint"
+    assert assessment["runtime_endpoint"] == "not_checked"
+
+
+def test_http_documentation_rejection_is_not_a_desktop_outage(monkeypatch):
+    import urllib.error
+
+    def reject(*_, **__):
+        raise urllib.error.HTTPError("http://127.0.0.1:3001/api/docs", 404, "Not found", {}, None)
+
+    monkeypatch.setattr(anythingllm_compatibility.urllib.request, "urlopen", reject)
+    api = probe_api_contract("http://127.0.0.1:3001")
+    assessment = anythingllm_compatibility.compatibility_assessment({
+        "storage_schema_status": "matched", "native_mutation_contract_status": "matched",
+        "api_contract": api,
+    })
+    assert assessment["runtime_endpoint"] == "reachable"
+    assert assessment["runtime_http_status"] == 404
+    assert assessment["next_action"] == "inspect_documentation_endpoint"

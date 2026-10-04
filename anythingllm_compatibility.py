@@ -15,6 +15,7 @@ import platform
 import sqlite3
 import subprocess
 import threading
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass, field
@@ -468,6 +469,9 @@ def probe_api_contract(
             route: "not_checked" for route in ADVISORY_API_CONTRACT_ROUTES
         },
         "contract_evidence_source": "",
+        "runtime_reachable": None,
+        "runtime_http_status": None,
+        "runtime_probe_error": "",
         "error": validation_error,
     }
     if validation_error:
@@ -479,6 +483,8 @@ def probe_api_contract(
             method="GET",
         )
         with urllib.request.urlopen(request, timeout=max(0.25, min(15.0, float(timeout_seconds)))) as response:
+            result["runtime_reachable"] = True
+            result["runtime_http_status"] = int(getattr(response, "status", 200))
             body = response.read(2 * 1024 * 1024 + 1)
         if len(body) > 2 * 1024 * 1024:
             result["error"] = "api_docs_response_too_large"
@@ -486,8 +492,17 @@ def probe_api_contract(
         paths = _documented_openapi_paths(body.decode("utf-8", errors="replace"))
         if paths:
             result["contract_evidence_source"] = "loopback_swagger_initializer"
+    except urllib.error.HTTPError as exc:
+        # An HTTP rejection proves endpoint contact, not a stopped Desktop.
+        result["error"] = f"api_docs_probe_error:{type(exc).__name__}"
+        result["runtime_reachable"] = True
+        result["runtime_http_status"] = exc.code
+        result["runtime_probe_error"] = result["error"]
+        paths = set()
     except Exception as exc:
         result["error"] = f"api_docs_probe_error:{type(exc).__name__}"
+        result["runtime_reachable"] = result["runtime_reachable"] is True
+        result["runtime_probe_error"] = result["error"]
         paths = set()
     if not paths and installed_openapi_path is not None:
         paths, fallback_error = _openapi_paths_from_file(installed_openapi_path)
@@ -507,6 +522,50 @@ def probe_api_contract(
     result["status"] = "qualified_read_only_contract" if not missing else "incomplete_documented_contract"
     result["error"] = ""
     return result
+
+
+def compatibility_assessment(result: dict) -> dict:
+    """Summarize evidence scope without granting or changing any capability.
+
+    Packaged API documentation is not a live server; a previous native-contract
+    qualification is not a fresh embedding/retrieval test. Keep these facts
+    independent so an offline but recognized installation is not called ready.
+    """
+    package = result.get("desktop_package") or {}
+    api = result.get("api_contract") or {}
+    contract = OBSERVED_NATIVE_MUTATION_CONTRACTS.get(str(package.get("app_asar_sha256") or ""), {})
+    native_matched = result.get("native_mutation_contract_status") == "matched"
+    reachable = api.get("runtime_reachable")
+    runtime = "reachable" if reachable is True else "unreachable" if reachable is False else "not_checked"
+    if result.get("storage_schema_status") != "matched":
+        action = "inspect_storage_schema"
+    elif result.get("desktop_release_status") == "candidate_version_requires_package_fingerprint":
+        action = "inspect_package_fingerprint"
+    elif not native_matched:
+        action = "qualify_exact_desktop_package"
+    elif runtime == "unreachable":
+        action = "start_or_check_desktop_runtime"
+    elif runtime == "not_checked":
+        action = "check_runtime_when_needed"
+    elif api.get("runtime_probe_error"):
+        action = "inspect_documentation_endpoint"
+    elif api.get("missing_core_routes"):
+        action = "inspect_documented_api_contract"
+    else:
+        action = "optional_live_retrieval_check"
+    return {
+        "installed_identity": result.get("desktop_release_status") or "unidentified",
+        "storage_schema": result.get("storage_schema_status") or "not_checked",
+        "api_documentation": api.get("contract_evidence_source") or "not_observed",
+        "runtime_endpoint": runtime,
+        "runtime_http_status": api.get("runtime_http_status"),
+        "runtime_scope": "documentation_endpoint_only" if api else "not_checked",
+        "native_operations": "previously_qualified_for_exact_package" if native_matched else "not_qualified",
+        "qualification_observed_at": contract.get("observed_at", "") if native_matched else "",
+        "embedding_test": "not_run",
+        "retrieval_test": "not_run",
+        "next_action": action,
+    }
 
 
 def characterize(
@@ -669,6 +728,7 @@ def characterize(
             api_url,
             installed_openapi_path=installed_openapi,
         )
+    result["assessment"] = compatibility_assessment(result)
     return result
 
 

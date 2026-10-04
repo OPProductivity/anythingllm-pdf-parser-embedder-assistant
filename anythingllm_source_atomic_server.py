@@ -7,14 +7,16 @@ from pathlib import Path
 from typing import Any
 
 from anythingllm_compatibility import V1161_NATIVE_CONTRACT_ID
-from anythingllm_source_atomic_worker import (
+from anythingllm_source_atomic_common import (
     SOURCE_ATOMIC_DEFAULT_PROVIDER_BATCH_SIZE,
     SOURCE_ATOMIC_MAX_PROVIDER_BATCH_SIZE,
-    SOURCE_ATOMIC_PROVIDER_POLICY_HELPER,
     _activation_state_for_installed_worker,
     _atomic_write,
-    _qualified_v1161_authority,
     _sha256_bytes,
+)
+from anythingllm_source_atomic_v1161_policy import (
+    SOURCE_ATOMIC_PROVIDER_POLICY_HELPER,
+    _qualified_v1161_authority,
     source_atomic_provider_retry_policy,
 )
 
@@ -45,7 +47,7 @@ OPENROUTER_GATE = (
 )
 
 
-SOURCE_ATOMIC_SERVER_BODY = r'''
+SOURCE_ATOMIC_SERVER_BODY_TEMPLATE = r'''
 let r=FM();if(e.length===0)return{failedToEmbed:[],errors:[],embedded:[]};
 let{fileData:n,storeVectorResult:q,cachedVectorInformation:U}=Q(),{emitProgress:o}=ra(),a=[],i=[],c=new Set;
 o(s.slug,{type:"batch_starting",workspaceSlug:s.slug,userId:t,filenames:e,totalDocs:e.length});
@@ -111,7 +113,8 @@ for(let [N,R]of d){
   o(s.slug,{type:"source_committed",workspaceSlug:s.slug,sourceKey:N,filename:H,recordCount:R.length});
 }
 return global.__embeddingProgress=null,o(s.slug,{type:"all_complete",workspaceSlug:s.slug,userId:t,totalDocs:e.length,embedded:a.length,failed:i.length,embeddedFiles:a,failedFiles:i}),await a8.sendTelemetry("documents_embedded_in_workspace",{LLMSelection:process.env.LLM_PROVIDER||"openai",Embedder:process.env.EMBEDDING_ENGINE||"inherit",VectorDbSelection:process.env.VECTOR_DB||"lancedb",TTSSelection:process.env.TTS_PROVIDER||"native",LLMModel:c8()}),await jM.logEvent("workspace_documents_added",{workspaceName:s?.name||"Unknown Workspace",numberOfDocuments:e.length},t),{failedToEmbed:i,errors:Array.from(c),embedded:a};
-'''.replace(
+'''
+SOURCE_ATOMIC_SERVER_BODY = SOURCE_ATOMIC_SERVER_BODY_TEMPLATE.replace(
     "__SOURCE_ATOMIC_DEFAULT_PROVIDER_BATCH_SIZE__",
     str(SOURCE_ATOMIC_DEFAULT_PROVIDER_BATCH_SIZE),
 ).replace(

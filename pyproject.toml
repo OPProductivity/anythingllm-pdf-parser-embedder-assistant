@@ -77,6 +77,8 @@ py-modules = [
   "anythingllm_source_atomic_server",
   "anythingllm_source_atomic_v117",
   "anythingllm_source_atomic_worker",
+  "anythingllm_source_atomic_common",
+  "anythingllm_source_atomic_v1161_policy",
   "anythingllm_persistence",
   "anythingllm_state",
   "automatic_defaults",
