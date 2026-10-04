@@ -61,6 +61,7 @@ from authenticated_http import (AuthenticatedRedirectError, authenticated_opener
                                 MAX_JSON_RESPONSE_BYTES, MAX_ERROR_RESPONSE_BYTES,
                                 MAX_HTTP_HEADER_BYTES, ResponseBudgetExceeded)
 from anythingllm_persistence import AnythingLLMPersistenceAdapter
+from automatic_worker_protocol import native_batch_runtime_probe, remember_native_batch_runtime
 from typing import Any, cast
 
 import fitz
@@ -89,6 +90,7 @@ from source_transaction_journal import (
 from rag_pdf_tools import (
     DEFAULT_END_SECTION_HEADINGS,
     detect_end_section_start,
+    ensure_tesseract_runtime,
     get_backend_pages,
     normalize_text,
     pymupdf4llm_execution_evidence,
@@ -424,9 +426,12 @@ def get_batch_inspection_context(args, storage_dir: Path, workspace_slug: str):
                 "anythingllm_preparation_config",
                 "resolved_anythingllm_runtime_state",
                 "anythingllm_runtime_embedder_probe",
+                "share_native_runtime_probe",
             )
             if key in context
         }
+        if context.get("share_native_runtime_probe") is True and context.get("unstructured_runtime_probe"):
+            preserved_preflight["unstructured_runtime_probe"] = context["unstructured_runtime_probe"]
         context.clear()
         context.update(preserved_preflight)
         context["fingerprint"] = fingerprint
@@ -24361,15 +24366,11 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         if isinstance(shared_runtime_context, dict):
             shared_runtime_context["resolved_anythingllm_runtime_state"] = dict(resolved_runtime_state)
     requested_unstructured_strategy = getattr(args, "unstructured_strategy", "auto") or "auto"
-    # The Automatic UI performs one batch-scoped capability check before the
-    # user confirms. Reuse that immutable result for every PDF; a missing
-    # preflight remains fully supported for CLI/direct callers.
+    # OCR preflight can supply a batch-scoped capability check. Text-first
+    # batches instead reuse their first worker's observation. Direct callers
+    # still probe locally when neither observation exists.
     supplied_runtime_probe = getattr(args, "unstructured_runtime_probe", None)
-    shared_unstructured_probe = (
-        shared_runtime_context.get("unstructured_runtime_probe")
-        if isinstance(shared_runtime_context, dict)
-        else None
-    )
+    shared_unstructured_probe = native_batch_runtime_probe(shared_runtime_context, ensure_tesseract_runtime)
     # ``None`` means "probe now". An empty dictionary used to be passed to
     # ``resolve_unstructured_strategy`` as if it were a completed negative
     # probe, so explicit OCR modes falsely reported Tesseract missing even
@@ -24392,6 +24393,10 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         ocr_preflight_hint=ocr_preflight_hint,
         pdf_page_count=profile.get("pdf_page_count"),
     )
+    # The first existing worker owns the real import/probe and its cancellation
+    # boundary. Only environment capabilities return through the batch context.
+    remember_native_batch_runtime(shared_runtime_context, resolved_unstructured["runtime"])
+    profile["unstructured_runtime_probe_reused"] = unstructured_runtime_probe is not None
     profile["unstructured_runtime"] = {
         **resolved_unstructured["runtime"],
         "requested_strategy": resolved_unstructured["requested"],

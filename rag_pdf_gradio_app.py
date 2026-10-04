@@ -46,6 +46,7 @@ from types import SimpleNamespace
 
 from automatic_worker_protocol import (
     AUTOMATIC_WORKER_TRANSPORT_ARTIFACTS,
+    can_share_native_batch_runtime,
     serializable_automatic_worker_arguments,
 )
 
@@ -29508,6 +29509,11 @@ def run_automatic(
     # run only. The pipeline invalidates this context if its storage/config
     # fingerprint changes, and performs one final mutable storage audit below.
     batch_inspection_context = {}
+    if can_share_native_batch_runtime(
+        files, ocr_preflight_manifest, backend_mode, unstructured_strategy,
+        deep_extraction=bool(deep_extraction),
+    ):
+        batch_inspection_context["share_native_runtime_probe"] = True
     if anythingllm_embedder_preflight:
         batch_inspection_context["anythingllm_runtime_embedder_probe"] = dict(
             anythingllm_embedder_preflight

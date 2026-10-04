@@ -84,6 +84,58 @@ AUTOMATIC_WORKER_EPHEMERAL_ARGUMENT_FIELDS = frozenset({
 })
 
 
+def can_share_native_batch_runtime(files, preflight, backend_mode, strategy, *, deep_extraction=False):
+    """Share a deferred capability observation only within a verified native batch."""
+    rows = (preflight or {}).get("files") or []
+    return (
+        len(files) >= 2
+        and not deep_extraction
+        and str(backend_mode or "").casefold() == "automatic"
+        and str(strategy or "").casefold() == "auto"
+        and str((preflight or {}).get("backend_mode") or "").casefold() == "automatic"
+        and str((preflight or {}).get("unstructured_strategy") or "").casefold() == "auto"
+        and ((preflight or {}).get("runtime") or {}).get("status") == "deferred_native_text_clear"
+        and {str(path) for path in files} == {str(row.get("file") or "") for row in rows}
+        and all(
+            (row.get("full_native_text_coverage") or {}).get("status") == "verified"
+            and row.get("risk") != "likely"
+            and not row.get("targeted_visual_text_pages")
+            for row in rows
+        )
+    )
+
+
+def remember_native_batch_runtime(context, runtime):
+    """Remember capabilities, never one PDF's OCR selection."""
+    if (
+        isinstance(context, dict)
+        and context.get("share_native_runtime_probe") is True
+        and not context.get("unstructured_runtime_probe")
+        and isinstance(runtime, dict)
+        and isinstance(runtime.get("backend_available"), bool)
+        and isinstance(runtime.get("tesseract_available"), bool)
+    ):
+        context["unstructured_runtime_probe"] = {
+            key: value for key, value in runtime.items() if key != "ocr_required"
+        }
+
+
+def native_batch_runtime_probe(context, tesseract_factory):
+    """Restore cheap process-local OCR setup without importing the PDF backend."""
+    runtime = context.get("unstructured_runtime_probe") if isinstance(context, dict) else None
+    if not isinstance(runtime, dict) or not runtime:
+        return None
+    if context.get("share_native_runtime_probe") is not True:
+        return runtime
+    tesseract = tesseract_factory()
+    return {
+        **runtime,
+        "tesseract_available": bool(tesseract.get("available")),
+        "tesseract_executable": tesseract.get("executable") or "",
+        "tessdata_prefix": tesseract.get("tessdata_prefix") or "",
+    }
+
+
 def serializable_automatic_worker_arguments(namespace: Any) -> tuple[dict[str, Any], str]:
     """Return the exact durable worker payload and its separately held key.
 
