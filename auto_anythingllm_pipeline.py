@@ -120,8 +120,9 @@ from author_metadata.identity import (  # noqa: F401
 )
 from author_metadata.context import AuthorEvidenceContext
 from author_metadata.dispatcher import infer_author as infer_profiled_author
-from author_metadata.pdf import (
+from author_metadata.pdf import (  # noqa: F401
     recover_author_from_selected_extraction, infer_author_from_pdf_text,
+    selected_extraction_author_samples, infer_author_from_initial_pdf_pages,
 )
 from author_metadata.review import (  # noqa: F401
     is_reviewed_work_citation,
@@ -137,8 +138,7 @@ from author_metadata.legacy_fallback import (  # noqa: F401
     infer_author_from_text_samples, exclude_explicit_translators,
     _infer_author_from_text_samples, infer_author_from_strict_credit_blocks,
     opening_filename_corroborated_credit,
-    _infer_author_from_samples_or_filename, selected_extraction_author_samples,
-    infer_author_from_initial_pdf_pages,
+    _infer_author_from_samples_or_filename,
 )
 
 # Native uploads have a long, externally observable embedding portion.  Keep
@@ -21501,12 +21501,13 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     )
     title = resolved_title["title"]
     title_source = resolved_title["source"]
+    author_context = AuthorEvidenceContext.from_samples(
+        author_text_samples, path=pdf_path, title_hint=title,
+    )
     inferred_author = (
         {"author": "", "source": "error", "page": 0, "evidence": author_sample_error}
         if author_sample_error
-        else infer_profiled_author(AuthorEvidenceContext.from_samples(
-            author_text_samples, path=pdf_path, title_hint=title,
-        ))
+        else infer_profiled_author(author_context)
     )
     resolved_author = resolve_author_from_metadata_and_inference(
         pdf_meta.get("author") or "",
@@ -21542,6 +21543,11 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         "source_short_label": source_meta["source_short_label"],
         "metadata_provenance": source_meta["metadata_provenance"],
         "author_inference": inferred_author,
+        "author_document_profile": (
+            author_context.profile_evidence() if not author_sample_error
+            else {"kind": "not_assessed", "cues": [], "classification_pages": [],
+                  "sampled_pages": [], "scope_complete": False}
+        ),
         "effective_subject": pdf_meta.get("subject") or (source_meta["source_title"] if use_file_title_fallback else ""),
         "effective_subject_provenance": (
             "pdf_metadata"

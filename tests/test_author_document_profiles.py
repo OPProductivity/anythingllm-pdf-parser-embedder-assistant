@@ -5,6 +5,10 @@ import pytest
 
 import auto_anythingllm_pipeline as pipeline
 from author_metadata.profile import classify_document
+from author_metadata.pdf import (
+    infer_author_from_initial_pdf_pages, selected_extraction_author_samples,
+    recover_author_from_selected_extraction,
+)
 
 
 pytestmark = pytest.mark.offline_deterministic
@@ -79,6 +83,22 @@ def test_profile_never_claims_complete_document_scope_from_sampled_pages():
     assert not profile.scope_complete
 
 
+def test_pipeline_exports_the_canonical_pdf_author_helpers():
+    assert pipeline.infer_author_from_initial_pdf_pages is infer_author_from_initial_pdf_pages
+    assert pipeline.selected_extraction_author_samples is selected_extraction_author_samples
+
+
+def test_selected_extraction_records_the_document_profile():
+    result = recover_author_from_selected_extraction([{
+        'page': 1,
+        'text': 'Research on Social Inequality\nAlice Martin\nExample University\nAbstract\nResearch follows.',
+    }], title_hint='Research on Social Inequality')
+    assert result['document_profile']['kind'] == 'scholarly_article'
+    assert result['document_profile']['classification_pages'] == [1]
+    assert result['document_profile']['sampled_pages'] == [1]
+    assert result['document_profile']['scope_complete'] is False
+
+
 @pytest.mark.parametrize("citation_credit,citation_title,expected", [
     ("Sara Riva", "Tracing Invisibility as a Colonial Project: Indigenous Women Who Seek Asylum at the U.S.-Mexico Border", "Sara Riva"),
     ("Another Person", "Tracing Invisibility as a Colonial Project: Indigenous Women Who Seek Asylum at the U.S.-Mexico Border", ""),
@@ -99,3 +119,25 @@ def test_truncated_scholarly_pdf_title_needs_matching_publisher_citation(
     )}
     result = infer_author_from_samples([sample], Path("article.pdf"), title_hint=title)
     assert result["author"] == expected
+
+
+def test_book_stacked_authors_are_one_credit_not_conflicting_suffixes():
+    samples = [{"page": 1, "text": (
+        "Research on Social Inequality\nAlice Martin\nBruno Santos\nUniversity Press"
+    )}]
+    result = infer_author_from_samples(
+        samples, Path("book.pdf"), title_hint="Research on Social Inequality",
+    )
+    assert result["author"] == "Alice Martin, Bruno Santos"
+    assert result["source"] == "text_titlepage_publisher_byline"
+
+
+def test_book_conflicting_title_pages_still_abstain():
+    samples = [
+        {"page": 1, "text": "Research on Social Inequality\nBy\nAlice Martin\nUniversity Press"},
+        {"page": 3, "text": "Research on Social Inequality\nBy\nBruno Santos\nUniversity Press"},
+    ]
+    result = infer_author_from_samples(
+        samples, Path("book.pdf"), title_hint="Research on Social Inequality",
+    )
+    assert result["author"] == ""

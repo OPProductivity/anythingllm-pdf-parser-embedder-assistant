@@ -42,7 +42,8 @@ def recover_author_from_selected_extraction(pages, *, title_hint="", page_limit=
     if not samples:
         return {"author": "", "source": "not_assessed_no_selected_opening_text",
                 "page": 0, "evidence": "", "sample_pages": []}
-    report = dict(infer_author(AuthorEvidenceContext.from_samples(samples, title_hint=title_hint)))
+    context = AuthorEvidenceContext.from_samples(samples, title_hint=title_hint)
+    report = dict(infer_author(context))
     if not report.get("author"):
         first = samples[0]
         lines = [normalize_text(line) for line in first["text"].splitlines() if normalize_text(line)]
@@ -62,6 +63,7 @@ def recover_author_from_selected_extraction(pages, *, title_hint="", page_limit=
                           "page": first["page"],
                           "evidence": "opening title byline corroborated by running head"}
                 break
+    report["document_profile"] = context.profile_evidence()
     report["sample_pages"] = [row["page"] for row in samples]
     base_source = str(report.get("source") or "not_found")
     if report.get("author") and base_source not in POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES:

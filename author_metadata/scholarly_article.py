@@ -180,6 +180,8 @@ def infer(context):
                     credit_lines.append(line)
                     cursor += 1
                     continue
+                elif names and re.match(r"^(?:and|&)\s+\S", line, re.I):
+                    found = _names(re.sub(r"^(?:and|&)\s+", "", line, count=1, flags=re.I))
                 else:
                     found = _names(line)
                 if not found:

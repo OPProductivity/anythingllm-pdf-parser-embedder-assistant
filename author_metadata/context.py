@@ -13,6 +13,23 @@ class AuthorEvidenceContext:
     path: Path | None
     profile: DocumentProfile
 
+    def profile_evidence(self):
+        pages = []
+        for sample in self.samples:
+            try:
+                page = int(sample.get("page") or 0)
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if page > 0 and page not in pages:
+                pages.append(page)
+        return {
+            "kind": self.profile.kind,
+            "cues": list(self.profile.cues),
+            "classification_pages": list(self.profile.sampled_pages),
+            "sampled_pages": pages,
+            "scope_complete": self.profile.scope_complete,
+        }
+
     @property
     def opening_pages(self):
         def is_opening(sample):

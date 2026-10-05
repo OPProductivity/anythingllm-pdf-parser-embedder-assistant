@@ -144,7 +144,10 @@ def infer(context):
                                         "page": int(sample["page"]), "evidence": " / ".join(block + [line])}))
             if reverse_reports:
                 reports.append(max(reverse_reports, key=lambda item: item[:2])[2])
+        consumed_credit_until = 0
         for start in range(min(18, len(lines))):
+            if start < consumed_credit_until:
+                continue
             explicit = re.fullmatch(r"(?:by|written\s+by|edited\s+by)\s*:?", lines[start], re.I)
             inline = re.fullmatch(r"(?:by|written\s+by|edited\s+by)\s+(.+)", lines[start], re.I)
             if start and not (explicit or inline) and _names(lines[start - 1]):
@@ -186,6 +189,7 @@ def infer(context):
                     evidence = [*evidence, "matching copyright credit"]
                 reports.append({"author": ", ".join(names), "source": "text_strict_credit_block" if explicit or inline or not publisher_backed else "text_titlepage_publisher_byline",
                                 "page": int(sample["page"]), "evidence": " / ".join(evidence)})
+                consumed_credit_until = cursor
     # Conflicting work-level title-page credits are ambiguity, not a reason
     # to privilege whichever page happened to be sampled first.
     unique = {report["author"] for report in reports}
