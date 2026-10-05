@@ -74,6 +74,21 @@ def recover_author_from_selected_extraction(pages, *, title_hint="", page_limit=
     return report
 
 
+def corroborates_filename_surname(existing_author, existing_source, native_samples, report):
+    """Allow a scan's explicit first-page byline to expand a filename surname."""
+    surname = normalize_text(existing_author or "")
+    name = normalize_text(report.get("author") or "")
+    if (existing_source != "filename_leading_surname" or len(surname.split()) != 1
+            or any(normalize_text(row.get("text") or "") for row in native_samples or [])
+            or report.get("source") != "selected_extraction_text_byline"
+            or report.get("page") != 1 or not 2 <= len(name.split()) <= 4
+            or not looks_like_person_name(name)
+            or any(mark in name for mark in (",", ";", "&"))
+            or " and " in name.casefold()):
+        return False
+    return name.split()[-1].casefold() == surname.casefold()
+
+
 def infer_author_from_initial_pdf_pages(path: Path, title_hint="", *, page_limit=3,
                                         use_file_title_fallback=True):
     """Fast UI suggestion, with no OCR or persisted source-text sample."""

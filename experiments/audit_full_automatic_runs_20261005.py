@@ -37,6 +37,96 @@ def tokens(text):
     return re.findall(r'\w+', unicodedata.normalize('NFKC', text).casefold())
 
 
+def content_key(text):
+    # Ignore export transliteration and line-end hyphens when locating a deletion.
+    return ''.join(c for c in unicodedata.normalize('NFKD', text).casefold()
+                   if c.isalnum())
+
+
+def deletion_signals(text, reason):
+    words = tokens(text)
+    letters = re.findall(r'[^\W\d_]+', text, re.UNICODE)
+    signals = []
+    if (re.search(r'\b(?:1[5-9]\d{2}|20\d{2})\b', text)
+            and any(mark in text for mark in ';[]()') and len(letters) >= 2):
+        signals.append('citation_like_text')
+    # Initials, short title headers and letter-spaced furniture are common.
+    substantive = [word for word in letters if len(word) > 1]
+    if len(substantive) >= 8 or (len(substantive) >= 4 and text[:1].islower()):
+        signals.append('prose_like_text')
+    known_furniture = {
+        'positioned_page_number', 'repeated_running_header', 'repeated_running_footer',
+        'italic_running_author', 'repeated_vertical_copyright_notice',
+        'high_confidence_web_footer_boilerplate', 'confirmed_outer_margin_annotation',
+    }
+    if reason not in known_furniture:
+        signals.append('unrecognized_deletion_reason')
+    if reason == 'positioned_page_number' and len(words) > 1:
+        signals.append('nontrivial_page_number_deletion')
+    return signals
+
+
+def audit_layout_deletions(root, summary, rows, export, errors):
+    path = role(root, summary, 'layout-region-review.json', 'layout_region_review')
+    report = {
+        'status': 'evidence_unavailable', 'evidence_path': str(path) if path else None,
+        'scope': 'Every recorded deletion and excluded footnote in the selected layout review, not random samples.',
+        'records': [], 'warnings': [], 'selected_body_reocr_pages': [],
+        'limitations': ('Heuristic review, not proof of body-text correctness. Presence ignores case, accents, '
+                       'punctuation and spacing; another occurrence can mask loss. Page-spanning manifests '
+                       'cannot establish page-local retention. Unlogged transformations and text lost during '
+                       'OCR, reordering or export are not exhaustively checked.'),
+    }
+    if not path:
+        return report
+    review = load(path, errors, True)
+    if not isinstance(review.get('pages'), list):
+        report['status'] = 'page_evidence_unavailable'
+        return report
+    grouped = defaultdict(list)
+    for row in rows:
+        start = int(row.get('pdf_page') or 0)
+        end = int(row.get('pdf_page_end') or start)
+        if start > 0 and start == end:
+            grouped[start].append(str(row.get('text') or row.get('textContent') or ''))
+    bodies = {page: content_key('\n'.join(parts)) for page, parts in grouped.items()}
+    export_key = content_key(export)
+    for page_index, page in enumerate(review['pages']):
+        number = page.get('pdf_page')
+        if ((page.get('outer_margin_annotation') or {}).get('body_reocr') or {}).get('selected'):
+            report['selected_body_reocr_pages'].append(number)
+            report['warnings'].append({
+                'pdf_page': number, 'signals': ['body_replaced_by_ocr_requires_comparison'],
+                'evidence_pointer': f'/pages/{page_index}/outer_margin_annotation/body_reocr',
+            })
+        for field in ('removed_marginalia', 'excluded_footnotes'):
+            for index, entry in enumerate(page.get(field) or []):
+                entry = entry if isinstance(entry, dict) else {'text': str(entry)}
+                text = str(entry.get('text') or '')
+                reason = str(entry.get('reason') or field)
+                key = content_key(text)
+                presence = bool(key in bodies[number]) if key and number in bodies else None
+                signals = deletion_signals(text, reason) if field == 'removed_marginalia' else ['excluded_note_content']
+                if not key:
+                    signals.append('deleted_text_not_recorded')
+                record = {
+                    'pdf_page': number, 'text': text, 'reason': reason, 'bbox': entry.get('bbox'),
+                    'evidence_pointer': f'/pages/{page_index}/{field}/{index}',
+                    'present_in_page_local_manifest': presence,
+                    'present_in_export_anywhere': bool(key in export_key) if key and export else None,
+                    'signals': signals,
+                    'classification': ('retained_text_observed' if presence is True else
+                                       'review_possible_content_loss' if signals else 'ordinary_furniture_candidate'),
+                }
+                report['records'].append(record)
+                if signals and presence is not True:
+                    report['warnings'].append(record)
+    report['status'] = 'review_required' if report['warnings'] else 'no_heuristic_warning'
+    report['recorded_deletion_count'] = len(report['records'])
+    report['warning_count'] = len(report['warnings'])
+    return report
+
+
 def load(path, errors, required=False):
     if not path.is_file():
         if required:
@@ -185,6 +275,7 @@ def audit_document(path, samples, seed):
             'warnings': {key: summary.get(key) for key in warning_fields},
             'reference_checks': checks, 'missing_reference_count': sum(not row['exists'] for row in checks),
             'export_path': str(export_path) if export_path else None,
+            'layout_deletion_review': audit_layout_deletions(root, summary, rows, export, errors),
             'sample_comparison': sample_pages(source, summary, rows, export, samples, seed)}
 
 
@@ -255,10 +346,21 @@ def audit_run(root, samples, seed):
         except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
             errors.append(f'Document audit unavailable for {path}: {type(exc).__name__}: {exc}')
     inventory = retained_evidence_inventory(root)
+    deletion_reviews = [document['layout_deletion_review'] for document in documents]
+    content_warnings = sum(len(review['warnings']) for review in deletion_reviews)
+    unavailable_reviews = sum(review['status'] in {'evidence_unavailable', 'page_evidence_unavailable'}
+                              for review in deletion_reviews)
     return {'run_root': str(root), 'terminal_state': progress.get('state', 'missing'),
             'terminal_success': progress.get('state') == 'successful', 'completion_code': progress.get('completion_code'),
             'evidence_errors': errors, 'retained_integrity_audit': integrity,
             'retained_evidence_inventory': inventory,
+            'content_review': {
+                'status': ('review_required' if content_warnings else 'incomplete' if unavailable_reviews or errors or not documents
+                           else 'no_heuristic_warning'),
+                'warning_count': content_warnings, 'unavailable_layout_reviews': unavailable_reviews,
+                'fidelity_proven': False,
+                'scope': 'Logged selected-layout deletions only; independent of integrity and vector proof.',
+            },
             'vector_proof': {'selected_records': selected, 'confirmed_records': confirmed,
                              'per_source': per_source, 'batches': batch_proofs,
                              'unique_exact_proven_locations': len(proven_locations),
@@ -273,18 +375,22 @@ def human_summary(report):
     lines = ['Full automatic-run evidence audit', '', report['scope'], '']
     for run in report['runs']:
         proof = run['vector_proof']
-        lines.append(f"{run['run_root']}: terminal={run['terminal_state']}; vectors={proof['confirmed_records']}/{proof['selected_records']} exact_complete={proof['complete']}; audit={run['retained_integrity_audit'].get('audit_status', 'missing')}")
+        lines.append(f"{run['run_root']}: terminal={run['terminal_state']}; vectors={proof['confirmed_records']}/{proof['selected_records']} exact_complete={proof['complete']}; audit={run['retained_integrity_audit'].get('audit_status', 'missing')}; content_review={run['content_review']['status']}")
         inventory = run['retained_evidence_inventory']
         lines.append(f"  Retained artifact inventory: {len(inventory)} files; invalid/unreadable={sum(row['status'] == 'invalid_or_unreadable' for row in inventory)}")
         for doc in run['documents']:
             coverage, comparison = doc['coverage'], doc['sample_comparison']
             lines.append(f"  {Path(doc['source']).name}: physical={coverage['physical_page_count']}; selected={coverage['selected_start']}-{coverage['selected_end']}; missing={coverage['missing_selected_pages']}; missing references={doc['missing_reference_count']}; source hash={doc['source_hash_matches']}")
             lines.append(f"    Author={doc['metadata']['author']!r}; confidence={doc['metadata']['confidence']}; samples={comparison['selected_pages']} ({comparison['status']})")
+            deletion_review = doc['layout_deletion_review']
+            lines.append(f"    Content deletion review: {deletion_review['status']}; recorded deletions={deletion_review.get('recorded_deletion_count', 0)}; warnings={len(deletion_review['warnings'])}")
+            for warning in deletion_review['warnings']:
+                lines.append(f"    CONTENT REVIEW page {warning['pdf_page']}: {', '.join(warning['signals'])}; text={warning.get('text', '')!r}; bbox={warning.get('bbox')}; page-local retention={warning.get('present_in_page_local_manifest')}; evidence={deletion_review['evidence_path']}#{warning['evidence_pointer']}")
             for sample in comparison['pages']:
                 lines.append(f"    Page {sample['pdf_page']}: {sample['status']}; native recall={sample.get('native_token_recall')}; prepared precision={sample.get('prepared_token_precision')}; TXT presence={sample['sample_body_present_in_export']}")
             lines.extend('    ERROR: ' + message for message in doc['evidence_errors'])
         lines.extend('  ERROR: ' + message for message in run['evidence_errors'])
-    lines.extend(['', 'Limitations: Native-text samples are heuristic comparisons, not visual validation, metadata correctness review, or full-document equality. Missing references may be optional or deliberately pruned; inspect their recorded fields. No live vector database or API was queried.'])
+    lines.extend(['', 'Limitations: Terminal, integrity and vector success do not establish content fidelity. Deletion review covers logged selected-layout removals only; absent warnings do not prove no text loss. Native-text samples are heuristic comparisons, not visual validation, metadata correctness review, or full-document equality. Missing references may be optional or deliberately pruned; inspect their recorded fields. No live vector database or API was queried.'])
     return '\n'.join(lines) + '\n'
 
 

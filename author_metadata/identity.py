@@ -50,10 +50,10 @@ def normalize_metadata_title(value):
         return ""
     if re.fullmatch(r"OP-[A-Z]+\d+\s+\d+\.\.\d+", title):
         return ""
-    # A source-layout/office extension in Title metadata is a strong sign of
+    # A source-layout/office/raster extension in Title metadata is a strong sign of
     # an internal production filename, including short names such as
     # ``article.indd`` that would otherwise look superficially harmless.
-    if re.search(r"\.(?:pdf|indd|indb|idml|docx?|pptx?|xlsx?|txt|rtf|html?|xml)$", title, flags=re.I):
+    if re.search(r"\.(?:pdf|indd|indb|idml|docx?|pptx?|xlsx?|txt|rtf|html?|xml|png|jpe?g|jpe|jfif|tiff?|bmp|gif|webp|heic|heif)$", title, flags=re.I):
         return ""
     return title
 

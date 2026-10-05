@@ -124,6 +124,7 @@ from author_metadata.work_identity import resolve_work_identity
 from author_metadata.pdf import (  # noqa: F401
     recover_author_from_selected_extraction, infer_author_from_pdf_text,
     selected_extraction_author_samples, infer_author_from_initial_pdf_pages,
+    corroborates_filename_surname,
 )
 from author_metadata.review import (  # noqa: F401
     is_reviewed_work_citation,
@@ -23026,9 +23027,14 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     # Native metadata and its first-page sample deliberately happen before
     # backend selection. For scans, that first sample can be empty even when
     # the selected OCR text later contains a plainly visible author line.
-    # Recover only an unresolved author from the chosen OCR/unstructured
-    # candidate; never replace an operator value or existing PDF metadata.
-    if not source_meta.get("source_author") and (
+    # Also allow a filename surname to be expanded only by a matching explicit
+    # first-page byline when the native opening sample was empty.
+    surname_candidate = (
+        author_source == "filename_leading_surname"
+        and bool(source_meta.get("source_author"))
+        and not any(normalize_text(row.get("text") or "") for row in author_text_samples)
+    )
+    if (not source_meta.get("source_author") or surname_candidate) and (
         bool(ocr_evidence.get("used"))
         or str(selected.get("backend") or "").casefold() == "unstructured"
     ):
@@ -23040,7 +23046,10 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             } else None),
         )
         recovered_author = normalize_text(post_extraction_author_recovery.get("author") or "")
-        if recovered_author:
+        if recovered_author and (not surname_candidate or corroborates_filename_surname(
+            source_meta["source_author"], author_source, author_text_samples,
+            post_extraction_author_recovery,
+        )):
             recovered_source = str(post_extraction_author_recovery.get("source") or "selected_extraction_text")
             source_meta["source_author"] = recovered_author
             source_meta["metadata_provenance"] = {

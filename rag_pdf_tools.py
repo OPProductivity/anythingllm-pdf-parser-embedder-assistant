@@ -3708,7 +3708,10 @@ def unstructured_execution_evidence(pages):
     for page in pages or []:
         evidence = page.get("unstructured_execution") if isinstance(page, dict) else None
         if isinstance(evidence, dict):
-            return dict(evidence)
+            persisted = dict(evidence)
+            if persisted.pop("cache_path", None):
+                persisted["checkpoint_retention"] = "temporary_until_source_preparation_complete"
+            return persisted
     return {
         "mode": "not_recorded",
         "requested_workers": 0,
