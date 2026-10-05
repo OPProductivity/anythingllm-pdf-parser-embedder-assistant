@@ -6005,7 +6005,7 @@ def workspace_name_from_batch_labels(labels, *, date_stamp=None, has_unexamined_
     # it for the familiar date-stamped workspace convention.
     if without_date_count > with_date_count:
         return without_date
-    return with_date or without_date
+    return with_date or without_date or f"PDF-etc {date_stamp}"
 
 
 def document_workspace_name(document_label, pdf_files):
@@ -6038,7 +6038,12 @@ def document_workspace_name(document_label, pdf_files):
         return re.sub(r"\s+", " ", source_name).strip()[:WORKSPACE_NAME_SOURCE_LABEL_LIMIT]
     date_stamp = datetime.now().strftime("%Y-%m-%d")
     max_source_length = max(1, WORKSPACE_NAME_SOURCE_LABEL_LIMIT - len(date_stamp) - 1)
-    clean_name = re.sub(r"\s+", " ", source_name).strip()[:max_source_length]
+    clean_name = re.sub(r"\s+", " ", source_name).strip()
+    if len(clean_name) > max_source_length:
+        # Keep complete filename/title tokens and mark an omitted tail.
+        fitting_words = [match for match in re.finditer(r"\S+", clean_name)
+                         if match.end() <= max_source_length - len("-etc")]
+        clean_name = clean_name[:fitting_words[-1].end()] + "-etc" if fitting_words else "PDF-etc"
     return f"{clean_name} {date_stamp}"
 
 

@@ -18,6 +18,10 @@ pytestmark = pytest.mark.offline_deterministic
     ('Fran\u00e7ois L\u00e9vesque', 'Levesque'),
     ('Bj\u00f6rn M\u00fcller', 'Muller'),
     ("Jane O'Neill", "O'Neill"),
+    ('Soren S\u00f8ndergaard', 'Sondergaard'),
+    ('Anna \u0141ukaszewicz', 'Lukaszewicz'),
+    ('Jane O\u2019Neill', "O'Neill"),
+    ('Nguy\u1ec5n V\u0103n \u0110\u1ed7', 'Do'),
     ('George Packer', 'Packer'),
     ('Jane Doe, John Roe', 'Roe'),
 ])
@@ -38,6 +42,24 @@ def test_short_labels_fold_accents_without_changing_author(author, expected, nor
 ])
 def test_short_label_title_fallback(title, expected):
     assert pipeline.default_short_label(title, '') == expected
+
+
+def test_short_label_never_uses_a_fragment_of_an_unsupported_surname():
+    assert pipeline.default_short_label('Collected Essays', 'Anna \u5f35') == 'PDF'
+
+
+def test_generated_single_workspace_name_omits_whole_trailing_word():
+    label = 'Book ' + 'A' * 100 + ' Hernandez'
+    name = app.document_workspace_name(label, [])
+    assert name.startswith('Book ' + 'A' * 100 + '-etc ')
+    assert len(name) <= app.WORKSPACE_NAME_SOURCE_LABEL_LIMIT
+    assert app.document_workspace_name('A' * 130, []).startswith('PDF-etc ')
+
+
+def test_oversized_first_batch_label_keeps_batch_omission_visible():
+    assert app.workspace_name_from_batch_labels(
+        ['A' * 121, 'Hernandez'], date_stamp='2026-10-05',
+    ) == 'PDF-etc 2026-10-05'
 
 
 def test_native_identity_uses_complete_accented_surname_label():

@@ -62,6 +62,17 @@ def _latin_letter(char):
             and "LATIN" in unicodedata.name(canonical, ""))
 
 
+def ascii_label_word(value):
+    """Fold one whole label word, declining letters without a known equivalent."""
+    result = []
+    for char in unicodedata.normalize("NFC", str(value or "")):
+        replacement = _ascii_equivalent(char)
+        if char.isalpha() and not replacement:
+            return ""
+        result.append(replacement)
+    return "".join(result)
+
+
 def _simplify_private_use_accent_clusters(text):
     """Simplify only an accented cluster interrupted inside a Latin word.
 

@@ -14,7 +14,7 @@ does not prove a later one.
 """
 
 import argparse
-from text_export_hygiene import prepare_readable_pages, readable_export_text
+from text_export_hygiene import ascii_label_word, prepare_readable_pages, readable_export_text
 import csv
 import concurrent.futures
 from difflib import SequenceMatcher
@@ -806,6 +806,7 @@ POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES = {
 # included: they remain useful diagnostics but caused title phrases to be
 # published as authors in real course-library batches.
 TRUSTED_AUTHOR_INFERENCE_SOURCES = POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES | {
+    "text_dated_opening_byline",
     # Native PDF title geometry is sufficiently strong for catalog metadata,
     # but OCR can hallucinate the same adjacency. Keep it out of the stricter
     # post-OCR mutation allowlist above.
@@ -851,6 +852,7 @@ AUTHOR_ORGANIZATION_TERMS = {
     "news",
     "press",
     "publisher",
+    "repository",
     "school",
     "society",
     "systems",
@@ -1185,6 +1187,8 @@ def author_candidate_is_document_role(value):
     candidate = normalize_author_candidate(value)
     if not candidate:
         return False
+    if candidate.casefold() in {"publication date", "critical paper"}:
+        return True
     return bool(
         re.fullmatch(
             r"(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|"
@@ -1367,7 +1371,9 @@ def extract_adjacent_affiliated_name_pairs(line, title_hint=""):
         flags=re.I,
     )
     prefix = raw[: match.start()] if match else raw.split("{")[0]
-    tokens = re.findall(r"[A-Z][A-Za-z'.-]*", prefix)
+    tokens = re.findall(r"[^\W\d_](?:[^\W\d_]|['\u2019.-])*", prefix)
+    if any(not token[0].isupper() for token in tokens):
+        return []
     if len(tokens) < 4 or len(tokens) % 2:
         return []
     candidates = []
@@ -1391,12 +1397,17 @@ def extract_explicit_multi_author_byline(line, title_hint=""):
     raw = normalize_text(line or "")
     if not raw:
         return []
-    name = r"[A-Z][A-Za-z'.-]+\s+[A-Z][A-Za-z'.-]+"
+    token = r"[^\W\d_](?:[^\W\d_]|['\u2019.-])+"
+    name = rf"{token}\s+{token}"
     match = re.search(
-        rf"(?<![A-Za-z'.-])({name})\s*,\s*({name})\s+(?:and|&)\s+({name})(?![A-Za-z'.-])",
+        rf"(?<![\w'\u2019.-])({name})\s*,\s*({name})\s+(?:and|&)\s+({name})(?![\w'\u2019.-])",
         raw,
     )
     if not match:
+        return []
+    if re.search(r"(?:[,;&]|\band)\s*$", raw[:match.start()], flags=re.I) or re.match(
+        r"\s*(?:[,;&]|\band\b)", raw[match.end():], flags=re.I
+    ):
         return []
     candidates = [normalize_author_candidate(value) for value in match.groups()]
     if not all(
@@ -1628,7 +1639,7 @@ def is_high_confidence_all_caps_titlepage_author(candidate, following_line, titl
     )
 
 
-def split_author_line_candidates(line, title_hint="", *, allow_all_caps=True):
+def split_author_line_candidates(line, title_hint="", *, allow_all_caps=True, require_complete=False):
     # Reject citation furniture before removing numbers or splitting names.
     # Otherwise an anthology title and its editor can become two 'authors'.
     if re.search(r"\b(?:(?:trans|pp|vol)\.|translated\s+by\b|reproduced\s+(?:by|from)\b|edited\s+by\b)|\b(?:18|19|20)\d{2}\b", line or "", re.I):
@@ -1654,6 +1665,8 @@ def split_author_line_candidates(line, title_hint="", *, allow_all_caps=True):
     for piece in pieces:
         if looks_like_person_name(piece, title_hint=title_hint, allow_all_caps=allow_all_caps):
             candidates.append(normalize_author_candidate(piece))
+        elif require_complete:
+            return []
     return candidates if len(candidates) >= 2 else []
 
 
@@ -1827,6 +1840,46 @@ def extract_opening_title_block_byline(lines, title_hint=""):
     return []
 
 
+def extract_dated_opening_byline(lines, title_hint=""):
+    """Recognize a title followed by a complete person/dated web byline."""
+    values = [normalize_text(line) for line in (lines or []) if normalize_text(line)]
+    hint = normalize_text(title_hint).casefold()
+    if not hint:
+        return []
+    if any(re.search(r"\b(?:series|volume)\s+editors?\b|^editors?$", line, flags=re.I) for line in values[:12]):
+        return []
+    # Native object order can emit a body drop cap before the title block.
+    # Only an isolated letter may precede the independently matched title.
+    title_start = 1 if values and len(values[0]) == 1 and values[0].isalpha() else 0
+    months = {name: index for index, name in enumerate((
+        "january", "february", "march", "april", "may", "june", "july",
+        "august", "september", "october", "november", "december",
+    ), 1)}
+    for index in range(1, min(4, len(values))):
+        credit = re.fullmatch(r"([^|]{5,80})\s*\|\s*([A-Za-z]+)\s+(\d{1,2}),\s*(\d{4})", values[index])
+        if not credit or credit.group(2).casefold() not in months:
+            continue
+        try:
+            datetime(int(credit.group(4)), months[credit.group(2).casefold()], int(credit.group(3)))
+        except ValueError:
+            continue
+        # The opening lines must be the actual title, optionally followed by
+        # a site suffix in metadata; intervening role headings cannot match.
+        visible_title = normalize_text(" ".join(values[title_start:index]))
+        title_key = visible_title.casefold()
+        if len(re.findall(r"[^\W\d_]+", visible_title)) < 2:
+            continue
+        if not (title_key == hint or any(hint.startswith(title_key + separator) for separator in (" - ", " | ", " \u2013 ", " \u2014 "))):
+            continue
+        name = normalize_author_candidate(credit.group(1))
+        if (not looks_like_person_name(name, title_hint=title_hint, allow_all_caps=True)
+                or "," in credit.group(1)
+                or re.search(r"\b(?:and|editors?|publishers?|interviewees?|participants?|speakers?)\b|&", name, flags=re.I)):
+            continue
+        return [name]
+    return []
+
+
 def infer_author_from_text_samples(samples, title_hint=""):
     """Resolve visible credits without confusing endorsements or translators."""
     samples = list(samples or [])
@@ -1867,9 +1920,14 @@ def exclude_explicit_translators(report, samples):
         for name in re.findall(r"(?im)^\s*translated\s+by\s+([^\n]{3,80})", str(sample.get("text") or "")):
             translators.extend(normalize_author_candidate(n) for n in re.split(r"\s+and\s+|[;,]", name, flags=re.I))
     if report.get("author") and translators:
-        excluded = {normalize_author_candidate(n).casefold() for n in translators}
-        names = split_author_line_candidates(report["author"], allow_all_caps=True)
-        retained = [n for n in names if normalize_author_candidate(n).casefold() not in excluded]
+        def name_key(value):
+            return unicodedata.normalize("NFC", normalize_author_candidate(value)).casefold()
+
+        excluded = {name_key(n) for n in translators}
+        names = split_author_line_candidates(report["author"], allow_all_caps=True) or [
+            normalize_author_candidate(report["author"])
+        ]
+        retained = [n for n in names if name_key(n) not in excluded]
         if names and retained != names:
             report = {**report, "author": ", ".join(retained),
                       "excluded_translator_names": translators}
@@ -1877,24 +1935,32 @@ def exclude_explicit_translators(report, samples):
 
 
 def _infer_author_from_text_samples(samples, title_hint=""):
+    title_hint = unicodedata.normalize("NFC", title_hint or "")
+    # The length bound is on a complete credit line. A bounded prefix could
+    # otherwise be published as a shorter surname when the line was longer.
+    footnote_tail = r"[^\S\n]*(?:[*\u2020\u2021\u00a7\u00b6\u2217\u00b9\u00b2\u00b3\u2070-\u2079]{1,3}|[0-9]{1,2})?[^\S\n]*(?:\n|$)"
+    credit_letter = r"[^\W\d_\u00b9\u00b2\u00b3\u2070-\u2079]"
+    person_credit = rf"{credit_letter}(?:{credit_letter}|[.,'\u2019\- &]){{3,512}}(?={footnote_tail})"
+    people_credit = person_credit
     patterns = [
-        (r"(?:^|\n)\s*by\s+([A-Z][A-Za-z.,'\- ]{3,70})", "text_byline"),
-        (r"(?:^|\n)\s*written by\s+([A-Z][A-Za-z.,'\- ]{3,70})", "text_written_by"),
-        (r"(?:^|\n)\s*edited by\s+([A-Z][A-Za-z.,'\- ]{3,70})", "text_edited_by"),
-        (r"(?:^|\n)\s*review(?:ed)?\s+by\s*[:\-]?\s*([A-Z][A-Za-z.,'\- ]{3,70})", "text_review_byline"),
-        (r"(?:^|\n)\s*(?:text|article|essay)\s+by\s+([A-Z][A-Za-z.,'\- ]{3,70})", "text_byline"),
-        (r"(?:^|\n)\s*(?:column|commentary|analysis|opinion)\s+by\s+([A-Z][A-Za-z.,'\- ]{3,70})", "text_column_byline"),
-        (r"(?:^|\n)\s*author(?:\(s\))?\s*[:\-]\s*([A-Z][A-Za-z.,'\- &]{3,90})", "text_author_label"),
-        (r"(?:^|\n)\s*authors?(?:\(s\))?\s*[:\-]\s*([A-Z][A-Za-z.,'\- &]{3,90})", "text_author_label"),
-        (r"(?:^|\n)\s*writers?\s*[:\-]\s*([A-Z][A-Za-z.,'\- &]{3,90})", "text_writer_label"),
-        (r"(?:^|\n)\s*(?:book|chapter|article|document)\s+author\s*[:\-]\s*([^\n]{3,90})", "text_bibliographic_author_label"),
-        (r"(?:^|\n)\s*instructor\s*[:\-]\s*([^\n]{3,90})", "text_instructor_label"),
+        (rf"(?:^|\n)\s*by\s+({person_credit})", "text_byline"),
+        (rf"(?:^|\n)\s*written by\s+({person_credit})", "text_written_by"),
+        (rf"(?:^|\n)\s*edited by\s+({person_credit})", "text_edited_by"),
+        (rf"(?:^|\n)\s*review(?:ed)?\s+by\s*[:\-]?\s*({person_credit})", "text_review_byline"),
+        (rf"(?:^|\n)\s*(?:text|article|essay)\s+by\s+({person_credit})", "text_byline"),
+        (rf"(?:^|\n)\s*(?:column|commentary|analysis|opinion)\s+by\s+({person_credit})", "text_column_byline"),
+        (rf"(?:^|\n)\s*author(?:\(s\))?\s*[:\-]\s*({people_credit})", "text_author_label"),
+        (rf"(?:^|\n)\s*authors?(?:\(s\))?\s*[:\-]\s*({people_credit})", "text_author_label"),
+        (rf"(?:^|\n)\s*writers?\s*[:\-]\s*({people_credit})", "text_writer_label"),
+        (r"(?:^|\n)\s*(?:book|chapter|article|document)\s+author\s*[:\-]\s*([^\n]{3,512})(?=\n|$)", "text_bibliographic_author_label"),
+        (r"(?:^|\n)\s*instructor\s*[:\-]\s*([^\n]{3,512})(?=\n|$)", "text_instructor_label"),
     ]
     weak_fallback = None
     for sample in samples:
         raw_text = strip_known_extraction_structure_labels(
             str(sample.get("text") or "").replace("\r\n", "\n").replace("\r", "\n")
         )
+        raw_text = unicodedata.normalize("NFC", raw_text)
         text = normalize_text(raw_text)
         page = int(sample.get("page") or 0)
         if not text:
@@ -2056,7 +2122,17 @@ def _infer_author_from_text_samples(samples, title_hint=""):
                 # insufficient to mutate durable metadata. Labelled role and
                 # biography evidence below remains available.
                 continue
-            candidate = normalize_author_candidate(match.group(1))
+            raw_credit = match.group(1)
+            # A conjunction advertises multiple authors; normalizing the
+            # entire comma-and list as one inverted catalog name reorders it.
+            if re.search(r"\band\b|&", raw_credit, flags=re.I):
+                names = split_author_line_candidates(
+                    raw_credit, title_hint=title_hint, require_complete=True,
+                )
+                if names:
+                    return {"author": ", ".join(names[:12]), "source": source,
+                            "page": page, "evidence": match.group(0).strip()}
+            candidate = normalize_author_candidate(raw_credit)
             if looks_like_person_name(candidate, title_hint=title_hint):
                 return {
                     "author": candidate,
@@ -2963,6 +3039,11 @@ def opening_filename_corroborated_credit(samples, path: Path, title_hint=""):
 
 def infer_author_from_samples_or_filename(samples, path: Path, title_hint=""):
     """Apply the established sample rules, then the existing filename fallback."""
+    report = _infer_author_from_samples_or_filename(samples, path, title_hint=title_hint)
+    return exclude_explicit_translators(report, samples)
+
+
+def _infer_author_from_samples_or_filename(samples, path: Path, title_hint=""):
     decoded_stem = urllib.parse.unquote(re.sub(r"_([0-9A-Fa-f]{2})", r"%\1", Path(path).stem))
     catalog_parts = decoded_stem.split("--")
     if len(catalog_parts) >= 3:
@@ -2981,10 +3062,35 @@ def infer_author_from_samples_or_filename(samples, path: Path, title_hint=""):
     report = infer_author_from_text_samples(samples, title_hint=title_hint)
     if report.get("source") == "text_non_person_byline":
         return report
+    if (report.get("source") == "text_role_followup"
+            and re.match(r"^editors?\s*/", str(report.get("evidence") or ""), flags=re.I)):
+        first_page = next((sample for sample in samples if int(sample.get("page") or 0) == 1), None)
+        opening_lines = str(first_page.get("text") or "").splitlines()[:40] if first_page else []
+        issue_header = any(re.match(
+            r"^\s*(?:issue\s+\d+(?:\s*\(\d+\))?|"
+            r"volume\s+(?:\d+|one|two|three|four|five)\s*[/|]\s*"
+            r"number\s+(?:\d+|one|two|three|four|five))\b",
+            line, flags=re.I,
+        ) for line in opening_lines)
+        if issue_header:
+            return {**report, "author": "", "source": "unresolved_issue_editor_role"}
     opening_credit = opening_filename_corroborated_credit(samples, path, title_hint)
     if opening_credit and (not report.get("author") or int(report.get("page") or 0) > 1
                            or report.get("source") not in TRUSTED_AUTHOR_INFERENCE_SOURCES):
         return opening_credit
+    if not (report.get("author") and report.get("source") in TRUSTED_AUTHOR_INFERENCE_SOURCES):
+        for sample in samples:
+            if int(sample.get("page") or 0) != 1:
+                continue
+            lines = str(sample.get("text") or "").splitlines()
+            names = extract_dated_opening_byline(lines, title_hint=title_hint)
+            if names:
+                evidence = next((normalize_text(line) for line in lines
+                                 if "|" in line and normalize_author_candidate(line.partition("|")[0]) == names[0]), "")
+                return exclude_explicit_translators({
+                    "author": names[0], "source": "text_dated_opening_byline",
+                    "page": 1, "evidence": evidence,
+                }, samples)
     filename_report = infer_author_from_filename(path, title_hint=title_hint)
     if report.get("author") and report.get("source") in TRUSTED_AUTHOR_INFERENCE_SOURCES:
         return report
@@ -12390,14 +12496,14 @@ def read_workspace_model_configuration(storage_dir: Path, workspace_slug="test")
 def default_short_label(title, author):
     # Fold diacritics only for compact labels, never for source metadata/text.
     def label_words(value):
-        folded = ''.join(character for character in unicodedata.normalize("NFKD", value or "")
-                         if not unicodedata.combining(character))
-        return re.findall(r"[A-Za-z][A-Za-z'-]+", folded)
+        return re.findall(r"[^\W\d_](?:[^\W\d_]|['\u2019-])*",
+                          unicodedata.normalize("NFC", value or ""))
 
     author_words = label_words(author)
     if author_words:
-        return author_words[-1]
-    title_words = [w for w in label_words(title) if w.casefold() not in HEADING_STOPWORDS]
+        return ascii_label_word(author_words[-1]) or "PDF"
+    title_words = [folded for word in label_words(title)
+                   if (folded := ascii_label_word(word)) and folded.casefold() not in HEADING_STOPWORDS]
     return title_words[0] if title_words else "PDF"
 
 
