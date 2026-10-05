@@ -9,6 +9,7 @@ from rag_pdf_tools import normalize_text
 from .names import looks_like_review_heading
 from .book_chapter import chapter_cues
 from .corporate import corporate_cue
+from .muse_review import covers as muse_review_covers
 
 
 @dataclass(frozen=True)
@@ -91,12 +92,14 @@ def classify_document(samples, title_hint=""):
     reviewed_role_context = explicit_review_credit and bool(re.search(
         r"\b(?:review\s+of|exhibition|documentary|film|book)\b", head[:1800], flags=re.I,
     ))
-    if review_heading or reviewed_role_context or (review_essay and cited_work) or multi_work_review:
+    muse_review = bool(next(muse_review_covers(opening), None))
+    if review_heading or reviewed_role_context or (review_essay and cited_work) or multi_work_review or muse_review:
         cues = tuple(name for condition, name in (
             (review_heading, "review_heading"),
             (reviewed_role_context, "reviewed_by_role"),
             (review_essay and cited_work, "review_essay_citation"),
             (multi_work_review, "multiple_reviewed_works"),
+            (muse_review, "muse_review_cover"),
         ) if condition)
         return DocumentProfile("review", cues, pages, publication_type="review")
     report_name = bool(re.search(r"\b(?:annual|technical|research|policy|evaluation)\s+report\b|\breport\s+(?:no\.?|number)\b|\bpolicy\s+brief\b", head + "\n" + hint, flags=re.I))

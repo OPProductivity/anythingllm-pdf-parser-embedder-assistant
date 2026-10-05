@@ -6,10 +6,14 @@ from rag_pdf_tools import normalize_text
 
 from .genre_evidence import credited_names, empty_result, opening_lines, result
 from .names import has_author_affiliation_hint, looks_like_person_name, normalize_author_candidate, looks_like_review_heading
+from .muse_review import infer_cover
 
 
 def infer_review_author(context):
     """Review creators precede any people named in reviewed-work citations."""
+    name, evidence = infer_cover(context)
+    if name:
+        return result(context, [name], "text_review_byline", 1, evidence)
     for page, lines in opening_lines(context):
         names, evidence = extract_affiliated_review_credit(lines)
         if names:
