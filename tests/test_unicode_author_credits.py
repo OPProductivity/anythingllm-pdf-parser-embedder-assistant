@@ -1,3 +1,4 @@
+from author_metadata.dispatcher import infer_author_from_samples
 from pathlib import Path
 import unicodedata
 
@@ -10,7 +11,7 @@ pytestmark = pytest.mark.offline_deterministic
 
 def infer(credit, *, title="Research on Social Inequality", tail=(), page=1, filename="article.pdf"):
     samples = [{"page": page, "text": "An academic discussion follows.\n" + credit + "\nFurther discussion continues."}, *tail]
-    report = pipeline.infer_author_from_samples_or_filename(samples, Path(filename), title_hint=title)
+    report = infer_author_from_samples(samples, Path(filename), title_hint=title)
     return pipeline.resolve_author_from_metadata_and_inference("Unrelated Computer User", report), report
 
 

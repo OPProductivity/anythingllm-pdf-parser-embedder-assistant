@@ -1,3 +1,4 @@
+from author_metadata.dispatcher import infer_author_from_samples
 import json
 from pathlib import Path
 
@@ -49,7 +50,7 @@ def test_title_fragment_cannot_become_gans_author_after_placeholder_filter():
     title = pipeline.resolve_title_from_metadata_or_filename('No Job Name', path)['title']
     samples = [{'page': 1, 'text': 'STATE OF THE DISCIPLINE\nWhitening and the Changing\n'
                 'American Racial Hierarchy\nHerbert J. Gans\nDepartment of Sociology, Columbia University\nAbstract'}]
-    report = pipeline.infer_author_from_samples_or_filename(samples, path, title_hint=title)
+    report = infer_author_from_samples(samples, path, title_hint=title)
     assert report['author'] == 'Herbert J. Gans'
 
 
@@ -59,10 +60,10 @@ def test_catalog_title_does_not_include_author_or_publisher_and_author_requires_
     assert title == 'The Racial Middle'
     samples = [{'page': 4, 'text': "The Racial Middle\nLatinos and Asian Americans\n"
                 "Living beyond the Racial Divide\nEileen O'Brien\nNew York University Press"}]
-    result = pipeline.infer_author_from_samples_or_filename(samples, path, title_hint=title)
+    result = infer_author_from_samples(samples, path, title_hint=title)
     assert result['author'] == "Eileen O'Brien"
     assert pipeline.resolve_author_from_metadata_and_inference('', result)['author'] == "Eileen O'Brien"
-    uncorroborated = pipeline.infer_author_from_samples_or_filename([], path, title_hint=title)
+    uncorroborated = infer_author_from_samples([], path, title_hint=title)
     assert not pipeline.resolve_author_from_metadata_and_inference('', uncorroborated)['author']
 
 

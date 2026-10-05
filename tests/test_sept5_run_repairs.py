@@ -1,3 +1,4 @@
+from author_metadata.dispatcher import infer_author_from_samples
 from pathlib import Path
 from unittest.mock import patch
 import pytest
@@ -14,7 +15,7 @@ pytestmark = pytest.mark.offline_deterministic
 ])
 def test_opening_credit_outranks_citation(name,text,later,expected):
     p=Path(name)
-    r=a.infer_author_from_samples_or_filename([{'page':1,'text':text},{'page':2,'text':later}],p,p.stem)
+    r=infer_author_from_samples([{'page':1,'text':text},{'page':2,'text':later}],p,p.stem)
     assert r['author']==expected
 
 
@@ -26,7 +27,7 @@ def test_opening_corroboration_does_not_choose_between_two_people():
 
 
 def test_existing_explicit_multiple_author_credit_kept():
-    r=a.infer_author_from_samples_or_filename(
+    r=infer_author_from_samples(
         [{'page':1,'text':'By John Smith and Jane Doe\nArticle title\nAbstract\nA discussion.'}],Path('Smith - Article.pdf'))
     assert 'Smith' in r['author'] and 'Doe' in r['author']
 

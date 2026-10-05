@@ -1,0 +1,92 @@
+"""Conservative publication-category cues, independent of PDF producer metadata."""
+
+import re
+from dataclasses import dataclass
+
+from rag_pdf_tools import normalize_text
+
+from .names import looks_like_review_heading
+
+
+@dataclass(frozen=True)
+class DocumentProfile:
+    kind: str
+    cues: tuple[str, ...]
+    sampled_pages: tuple[int, ...]
+    scope_complete: bool = False
+
+
+def classify_document(samples, title_hint=""):
+    """Route only strongly signalled layouts; generic remains the fallback."""
+    def page_number(sample):
+        try:
+            return int(sample.get("page") or 0)
+        except (TypeError, ValueError, AttributeError):
+            return 0
+
+    opening = [sample for sample in samples or [] if 1 <= page_number(sample) <= 4]
+    pages = tuple(int(sample.get("page") or 0) for sample in opening)
+    lines = [normalize_text(line) for sample in opening for line in
+             str(sample.get("text") or "").splitlines()[:40] if normalize_text(line)]
+    head = "\n".join(lines[:100])
+    hint = normalize_text(title_hint or "")
+    review_heading = any(looks_like_review_heading(line) for line in lines[:24])
+    explicit_review_credit = any(re.match(r"^reviewed\s+by\b", line, flags=re.I) for line in lines[:40])
+    review_essay = bool(re.search(r"\breview\s+essay\b", hint, flags=re.I))
+    cited_work = bool(re.search(r",\s*by\s+[A-Z]", head))
+    review_journal = bool(re.search(r"(?m)^.{0,30}\breview\s+of\s+books\b", head[:500], flags=re.I))
+    multi_work_review = review_journal and "to cite this article" in head.casefold() and ";" in head
+    reviewed_role_context = explicit_review_credit and bool(re.search(
+        r"\b(?:review\s+of|exhibition|documentary|film|book)\b", head[:1800], flags=re.I,
+    ))
+    if review_heading or reviewed_role_context or (review_essay and cited_work) or multi_work_review:
+        cues = tuple(name for condition, name in (
+            (review_heading, "review_heading"),
+            (reviewed_role_context, "reviewed_by_role"),
+            (review_essay and cited_work, "review_essay_citation"),
+            (multi_work_review, "multiple_reviewed_works"),
+        ) if condition)
+        return DocumentProfile("review", cues, pages)
+    report_name = bool(re.search(r"\b(?:annual|technical|research|policy|evaluation)\s+report\b|\breport\s+(?:no\.?|number)\b", head + "\n" + hint, flags=re.I))
+    report_roles = bool(re.search(r"(?m)^(?:prepared\s+(?:by|for)|submitted\s+to|executive\s+summary)\b", head, flags=re.I))
+    report_release = "for release" in head.casefold() and "recommended citation" in head.casefold()
+    if (report_name and report_roles) or report_release:
+        return DocumentProfile("report", ("report_publication", "report_roles_or_citation"), pages)
+    book_identifier = bool(re.search(r"\bISBN(?:-1[03])?\b", head, flags=re.I))
+    book_frontmatter = bool(re.search(r"(?m)^(?:praise\s+for|title\s+page|copyright|contents)\b", head, flags=re.I))
+    book_navigation = bool(re.search(r"(?m)^CONTENTS\s*\nCover\s*\nEndorsements\s*\nTitle Page\b", head, flags=re.I))
+    book_praise = bool(re.search(r"(?m)^praise\s+for\s+.{4,100}$", head, flags=re.I))
+    core_title = hint.split(" -- ", 1)[0]
+    title_words = [word for word in re.findall(r"[^\W\d_]+", core_title.casefold())
+                   if word not in {"a", "an", "and", "in", "of", "the", "to"}]
+    imprint_title_page = False
+    if len(title_words) >= 2:
+        for sample in opening:
+            text = str(sample.get("text") or "")
+            if len(text.split()) > 160 or not re.search(
+                r"\b(?:university\s+press|publishers?|publishing|routledge|palgrave|macmillan|penguin)\b",
+                text, flags=re.I,
+            ):
+                continue
+            visible_words = set(re.findall(r"[^\W\d_]+", text.casefold()))
+            if sum(word in visible_words for word in title_words) >= max(2, len(title_words) - 1):
+                imprint_title_page = True
+                break
+    series_frontmatter = "titles in the series" in head.casefold() and not bool(
+        re.search(r"\b(?:doi|abstract)\b", head, flags=re.I)
+    )
+    journal_issue = bool(re.search(r"\bVol\.?\s*\d+\s*,?\s*Issue\b", head[:500], flags=re.I))
+    scholarly_cues = bool(re.search(r"\bdoi\s*:|\babstract\b", head, flags=re.I)) or journal_issue
+    if (book_identifier and book_frontmatter) or book_navigation or book_praise or series_frontmatter or (imprint_title_page and not scholarly_cues):
+        return DocumentProfile("book", ("book_frontmatter_or_titlepage",), pages)
+    dated_web_credit = bool(re.search(r"(?m)^[A-Z][^\n]{3,75}\n[A-Z][a-z]+\s+\d{1,2}(?:st|nd|rd|th)?,\s+\d{4}\n", head))
+    pipe_dated_credit = bool(re.search(r"(?m)^[A-Z][^\n|]{3,75}\s*\|\s*[A-Z][A-Z]+\s+\d{1,2},\s*\d{4}$", head))
+    web_masthead = sum(bool(re.search(rf"\b{term}\b", head, flags=re.I)) for term in
+                       ("subscribe", "renew", "view author profile", "join the conversation")) >= 2
+    web_byline = bool(re.search(r"(?m)^BY\s+[A-Z][A-Z .'-]{5,80}$", head))
+    if dated_web_credit or pipe_dated_credit or (web_masthead and web_byline):
+        return DocumentProfile("web_article", ("name_date_headline_layout" if
+                               dated_web_credit or pipe_dated_credit else "masthead_and_byline",), pages)
+    if scholarly_cues:
+        return DocumentProfile("scholarly_article", ("journal_volume_issue" if journal_issue else "doi_or_abstract",), pages)
+    return DocumentProfile("generic", (), pages)

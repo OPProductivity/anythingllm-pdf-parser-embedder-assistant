@@ -1,3 +1,4 @@
+from author_metadata.dispatcher import infer_author_from_samples
 from unittest.mock import patch
 import pytest
 import auto_anythingllm_pipeline as a
@@ -119,7 +120,7 @@ def test_encoded_catalog_credit_requires_visible_complete_name(tmp_path):
         }
     ]
     assert (
-        a.infer_author_from_samples_or_filename(sample, path, title_hint=path.stem)[
+        infer_author_from_samples(sample, path, title_hint=path.stem)[
             "author"
         ]
         == "Gloria Anzaldua"

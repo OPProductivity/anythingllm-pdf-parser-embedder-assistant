@@ -1,3 +1,4 @@
+from author_metadata.dispatcher import infer_author_from_samples
 from pathlib import Path
 from unittest.mock import patch
 import pytest
@@ -9,7 +10,7 @@ pytestmark = pytest.mark.offline_deterministic
 def test_translator_removed_even_after_title_block_fallback():
     samples=[{'page':1,'text':'The Ontology of the Photographic Image\nAndré Bazin; Hugh Gray\nFilm Quarterly, Vol. 13, No. 4.'},
              {'page':2,'text':'The Ontology of the Photographic Image\nTRANSLATED BY HUGH GRAY\nOrdinary prose.'}]
-    result=a.infer_author_from_samples_or_filename(samples,Path('The_Ontology.pdf'),title_hint='The Ontology of the Photographic Image')
+    result=infer_author_from_samples(samples,Path('The_Ontology.pdf'),title_hint='The Ontology of the Photographic Image')
     assert result['author']=='André Bazin'
 
 def test_editor_title_page_outranks_endorsement_affiliations():

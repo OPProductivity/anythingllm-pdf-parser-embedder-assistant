@@ -80,6 +80,10 @@ from embedder_capabilities import (
     provider_catalog_counts,
     provider_catalog_entries,
 )
+from author_metadata.context import AuthorEvidenceContext
+from author_metadata.dispatcher import infer_author as infer_profiled_author
+from author_metadata.pdf import infer_author_from_initial_pdf_pages
+from author_metadata.identity import resolve_author_from_metadata_and_inference
 
 from auto_anythingllm_pipeline import (
     _api_urlopen,
@@ -122,8 +126,6 @@ from auto_anythingllm_pipeline import (
     finalize_batch_inspection_context,
     find_reusable_cached_document_locations_from_snapshot,
     get_anythingllm_metadata_schema,
-    infer_author_from_initial_pdf_pages,
-    infer_author_from_samples_or_filename,
     is_local_anythingllm_url,
     is_lancedb_safe_namespace,
     LANCEDB_WORKSPACE_NAME_LIMIT,
@@ -149,7 +151,6 @@ from auto_anythingllm_pipeline import (
     remove_confirmed_workspace_queue_entries,
     restart_anythingllm_desktop,
     resolve_anythingllm_api_key,
-    resolve_author_from_metadata_and_inference,
     resolve_title_from_metadata_or_filename,
     resolve_embedder_capability,
     resolve_default_simulation_adapter,
@@ -5652,18 +5653,22 @@ def workspace_person_identity_from_pdf(pdf_file, *, native_metadata=None):
     try:
         if isinstance(native_metadata, dict):
             metadata = dict(native_metadata)
-            opening_samples = [
+            available_samples = [
                 sample for sample in (metadata.get("_author_text_samples") or [])
-                if 1 <= int(sample.get("page") or 0) <= 3
+                if 1 <= int(sample.get("page") or 0) <= 12
             ]
             resolved_title = normalize_text(
                 resolve_title_from_metadata_or_filename(metadata.get("title") or "", path)["title"]
             )
-            inference = infer_author_from_samples_or_filename(
-                opening_samples,
-                path,
-                title_hint=resolved_title,
+            context = AuthorEvidenceContext.from_samples(
+                available_samples, path=path, title_hint=resolved_title,
             )
+            selected_samples = available_samples if context.profile.kind == "book" else [
+                sample for sample in available_samples if int(sample["page"]) <= 4
+            ]
+            inference = infer_profiled_author(AuthorEvidenceContext.from_samples(
+                selected_samples, path=path, title_hint=resolved_title,
+            ))
             resolved = resolve_author_from_metadata_and_inference(
                 metadata.get("author") or "",
                 inference,
@@ -5676,7 +5681,7 @@ def workspace_person_identity_from_pdf(pdf_file, *, native_metadata=None):
             }
         else:
             metadata = None
-            author_report = infer_author_from_initial_pdf_pages(path, page_limit=3)
+            author_report = infer_author_from_initial_pdf_pages(path, page_limit=4)
         author = str(author_report.get("author") or "").strip()
     except Exception:
         return {}
@@ -26040,7 +26045,7 @@ def detected_metadata_preview(
             "filename_fallback": "filename fallback (embedded title rejected as a production filename)",
             "generated_placeholder": "not available",
         }.get(resolved_title["source"], resolved_title["source"])
-        author_inference = infer_author_from_initial_pdf_pages(pdf_path, title_hint=title, page_limit=3)
+        author_inference = infer_author_from_initial_pdf_pages(pdf_path, title_hint=title, page_limit=4)
         author = str(author_inference.get("author") or "")
         author_origin = {
             "pdf_metadata": "PDF metadata",

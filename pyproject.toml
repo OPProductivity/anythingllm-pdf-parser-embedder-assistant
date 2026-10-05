@@ -61,7 +61,7 @@ Source = "https://github.com/OPProductivity/anythingllm-pdf-parser-embedder-assi
 Issues = "https://github.com/OPProductivity/anythingllm-pdf-parser-embedder-assistant/issues"
 
 [tool.setuptools]
-packages = ["benchmarks"]
+packages = ["benchmarks", "author_metadata"]
 py-modules = [
   "browser_access",
   "desktop_service_trust",

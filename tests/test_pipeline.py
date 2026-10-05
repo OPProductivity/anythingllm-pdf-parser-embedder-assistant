@@ -1,3 +1,4 @@
+from author_metadata.dispatcher import infer_author_from_samples
 import io
 import http.server
 import json
@@ -5299,7 +5300,7 @@ class PipelineCoreTests(unittest.TestCase):
             {"page": 1, "text": "Early Silent Cinema:\nWhose Public Sphere?\nby Miriam Hansen\nIn search of a usable past"},
             {"page": 3, "text": "Gerald Mast, University of Chicago\nDiscussion of earlier work"},
         ]
-        report = pipeline.infer_author_from_samples_or_filename(
+        report = infer_author_from_samples(
             samples, Path("Miriam Hansen - Early Silent Cinema.pdf"),
             title_hint="Early Silent Cinema: Whose Public Sphere? by Miriam Hansen",
         )
@@ -5318,18 +5319,18 @@ class PipelineCoreTests(unittest.TestCase):
 
     def test_filename_leading_author_conventions_beat_weak_title_evidence(self):
         samples = [{"page": 1, "text": "Siren Songs\nHearing Resilience\nA cultural study"}]
-        person = pipeline.infer_author_from_samples_or_filename(
+        person = infer_author_from_samples(
             samples,
             Path("Robin James - Resilience and Melancholy.pdf"),
             title_hint="Resilience and Melancholy",
         )
-        surname = pipeline.infer_author_from_samples_or_filename(
+        surname = infer_author_from_samples(
             [], Path("Hughes - Why, You Reckon.pdf"), title_hint="Why, You Reckon",
         )
-        numbered = pipeline.infer_author_from_samples_or_filename(
+        numbered = infer_author_from_samples(
             [], Path("De Grazia 02-Irresistible Empire.pdf"),
         )
-        multiple = pipeline.infer_author_from_samples_or_filename(
+        multiple = infer_author_from_samples(
             [],
             Path("Mohammad Reza Aslani and Forrest Cardamenis - In Conversation.pdf"),
             title_hint="Mohammad Reza Aslani with Forrest Cardamenis - The Brooklyn Rail",
@@ -5344,7 +5345,7 @@ class PipelineCoreTests(unittest.TestCase):
 
     def test_explicit_filename_author_survives_whole_stem_title_fallback(self):
         path = Path("Francesco Casetti - The Persistence of Cinema.pdf")
-        inferred = pipeline.infer_author_from_samples_or_filename(
+        inferred = infer_author_from_samples(
             [], path, title_hint=path.stem,
         )
         self.assertEqual(
@@ -5354,7 +5355,7 @@ class PipelineCoreTests(unittest.TestCase):
 
     def test_generic_artifact_suffix_does_not_turn_title_into_filename_author(self):
         path = Path("Sound Media Ecology - complete book.pdf")
-        inferred = pipeline.infer_author_from_samples_or_filename(
+        inferred = infer_author_from_samples(
             [], path, title_hint=path.stem,
         )
         self.assertEqual(inferred["author"], "")
@@ -5373,7 +5374,7 @@ class PipelineCoreTests(unittest.TestCase):
 
     def test_visible_title_person_prefix_overrides_exporting_users_pdf_metadata(self):
         title = "Teshome Gabriel | Third Cinema as Guardian of Popular Memory"
-        inference = pipeline.infer_author_from_samples_or_filename(
+        inference = infer_author_from_samples(
             [{"page": 1, "text": f"13.07.25\n{title}\nPage 1 of 10"}],
             Path("download.pdf"),
             title_hint=title,
@@ -5415,7 +5416,7 @@ class PipelineCoreTests(unittest.TestCase):
                 "This chapter is a conceptual essay meant to introduce readers.\n"
             ),
         }]
-        inference = pipeline.infer_author_from_samples_or_filename(
+        inference = infer_author_from_samples(
             samples, Path("download.pdf"), title_hint="",
         )
         resolved = pipeline.resolve_author_from_metadata_and_inference(
@@ -5488,7 +5489,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(resolved, {"author": "", "source": "not_available"})
 
     def test_strict_credit_block_collects_complete_wrapped_article_byline(self):
-        inference = pipeline.infer_author_from_samples_or_filename(
+        inference = infer_author_from_samples(
             [{
                 "page": 1,
                 "text": (
@@ -5505,7 +5506,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(inference["source"], "text_strict_credit_block")
 
     def test_strict_credit_block_handles_numbered_chapter_and_student_cover(self):
-        chapter = pipeline.infer_author_from_samples_or_filename(
+        chapter = infer_author_from_samples(
             [{
                 "page": 1,
                 "text": (
@@ -5517,7 +5518,7 @@ class PipelineCoreTests(unittest.TestCase):
             Path("chapter.pdf"),
             title_hint="",
         )
-        student = pipeline.infer_author_from_samples_or_filename(
+        student = infer_author_from_samples(
             [{
                 "page": 1,
                 "text": "LATINA/O GV2\nNATHAN MINDERHOUD\nS5380944\nFINAL KEYWORD ESSAY\n",
@@ -5547,12 +5548,12 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(inference["source"], "text_strict_credit_block")
 
     def test_strict_credit_block_rejects_heading_and_series_editor_furniture(self):
-        heading = pipeline.infer_author_from_samples_or_filename(
+        heading = infer_author_from_samples(
             [{"page": 1, "text": "Different Views\nLATINO TERMINOLOGY\nAbstract\nText.\n"}],
             Path("article.pdf"),
             title_hint="Latino Terminology",
         )
-        series = pipeline.infer_author_from_samples_or_filename(
+        series = infer_author_from_samples(
             [{
                 "page": 1,
                 "text": "NEGOTIATING LATINIDAD\nSeries Editors\nFrances R. Aparicio\nOmar Valerio-Jiménez\n",
@@ -17318,7 +17319,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(report["source"], "filename_author_fallback")
 
     def test_author_inference_uses_title_page_name_before_copyright_byline(self):
-        report = pipeline.infer_author_from_text_samples(
+        report = infer_author_from_samples(
             [
                 {
                     "page": 3,
@@ -17341,13 +17342,11 @@ class PipelineCoreTests(unittest.TestCase):
                     ),
                 },
             ],
+            Path("Example Book.pdf"),
             title_hint="Example Book: An Example Title and Its Sample Subtitle",
         )
         self.assertEqual(report["author"], "Sample Author")
-        self.assertIn(report["source"], {
-            "text_top_block_names", "text_title_adjacent_byline",
-            "text_opening_title_block_byline",
-        })
+        self.assertEqual(report["source"], "text_titlepage_publisher_byline")
 
     def test_author_inference_recovers_all_caps_titlepage_name_above_plain_press_imprint(self):
         report = pipeline.infer_author_from_text_samples(
@@ -24796,7 +24795,7 @@ class PipelinePdfIntegrationTests(unittest.TestCase):
             doc.close()
 
             metadata = pipeline.pdf_metadata(pdf_path, include_author_samples=True)
-            report = pipeline.infer_author_from_samples_or_filename(
+            report = infer_author_from_samples(
                 metadata["_author_text_samples"],
                 pdf_path,
                 title_hint="Sample Research Paper",

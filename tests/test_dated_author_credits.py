@@ -1,3 +1,4 @@
+from author_metadata.dispatcher import infer_author_from_samples
 from pathlib import Path
 
 import pytest
@@ -10,7 +11,7 @@ TITLE = "Social Inequality and Rural Education"
 
 
 def report(text, *, title=TITLE, page=1, tail=()):
-    return pipeline.infer_author_from_samples_or_filename(
+    return infer_author_from_samples(
         [{"page": page, "text": text}, *tail], Path("article.pdf"), title_hint=title,
     )
 
@@ -75,3 +76,25 @@ def test_date_evidence_selects_credit_not_a_pipe_in_the_title():
     result = report(title + "\nAlice Martin | July 26, 2019", title=title)
     assert result["author"] == "Alice Martin"
     assert result["evidence"] == "Alice Martin | July 26, 2019"
+
+
+def test_browser_export_name_date_wrapped_title_credit():
+    headline = "Why should you be interested in a new blog on activism, influencing and change?"
+    result = report(
+        "Duncan Green\nMarch 3rd, 2025\n"
+        "Why should you be interested in a new blog on activism, influencing\n"
+        "and change?\nDiscussion follows.",
+        title=headline + " - Activism Influence and Change",
+    )
+    assert result["author"] == "Duncan Green"
+    assert result["source"] == "text_dated_opening_byline"
+    assert result["evidence"].startswith("Duncan Green / March 3rd, 2025 / Why should you")
+
+
+@pytest.mark.parametrize("date,title", [
+    ("February 30th, 2025", TITLE),
+    ("March 3rd, 2025", "A Different Headline for Another Work"),
+])
+def test_browser_date_without_valid_matching_headline_does_not_prove_author(date, title):
+    lines = ["Duncan Green", date, TITLE, "Ordinary text follows."]
+    assert pipeline.extract_dated_opening_byline(lines, title_hint=title) == []
