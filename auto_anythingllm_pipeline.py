@@ -3844,6 +3844,8 @@ def apply_region_aware_native_layout(pdf_path, pages, progress_callback=None):
             }
             if progress_callback:
                 progress_callback(page_number, page_total, "native_layout_scan")
+    from pdf_running_furniture import plan_rotated_running_furniture
+    furniture_plans = plan_rotated_running_furniture(pdf_path, page_layouts, progress_callback=progress_callback)
     top_counts = Counter()
     bottom_counts = Counter()
     copyright_counts = Counter()
@@ -3893,8 +3895,11 @@ def apply_region_aware_native_layout(pdf_path, pages, progress_callback=None):
         if not isinstance(layout, dict):
             transformed.append(page_info)
             continue
+        furniture = furniture_plans.get(page_number, {"status": "not_observed", "excluded_row_indices": [], "removed": []})
+        excluded_furniture = set(furniture["excluded_row_indices"])
+        layout = {**layout, "rows": [row for index, row in enumerate(layout["rows"]) if index not in excluded_furniture]}
         layout_height = float(layout["height"])
-        removed = []
+        removed = list(furniture["removed"])
         body_rows = []
         retained_note_candidates = []
         excluded_footnotes = []
@@ -4091,6 +4096,14 @@ def apply_region_aware_native_layout(pdf_path, pages, progress_callback=None):
             "native_ligature_space_repairs": transformed[-1]["native_ligature_space_repairs"],
             "outer_margin_annotation": annotation_plan,
             "removed_marginalia": removed,
+            "rotated_running_furniture": {
+                key: value for key, value in furniture.items()
+                if key not in {"removed", "excluded_row_indices", "number_candidates"}
+            },
+            **({"layout_integrity_status": "review" if (
+                furniture["unresolved_candidate_count"] or furniture["unresolved_page_number_count"]
+            ) else "resolved"}
+               if page_number in furniture_plans else {}),
             "note_candidates_retained": retained_note_candidates,
             "excluded_footnotes": excluded_footnotes,
             "note_separator_scan": layout["note_separator_scan"],
@@ -4142,6 +4155,11 @@ def native_layout_progress_status(completed, total, activity):
         return (
             f"Scanning positioned page layout: {completed}/{total} pages scanned",
             "native_layout_scan_progress",
+        )
+    if activity == "rotated_margin_confirmation":
+        return (
+            f"Checking repeated margin text on PDF page {completed}",
+            "rotated_margin_confirmation",
         )
     if completed >= total:
         return (

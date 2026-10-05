@@ -69,6 +69,7 @@ py-modules = [
   "cli_exports",
   "pdf_budgets",
   "pdf_layout_geometry",
+  "pdf_running_furniture",
   "authenticated_http",
   "diagnostic_runner",
   "anythingllm_compatibility",
