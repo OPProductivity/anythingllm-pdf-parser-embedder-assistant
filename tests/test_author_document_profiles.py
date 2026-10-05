@@ -111,6 +111,44 @@ def test_numbered_chapter_roles_do_not_become_book_editor_credit():
     assert not result["author"]
 
 
+@pytest.mark.parametrize("opening,expected", [
+    ("CHAPTER 2\nTRIANGULATING JAPANESE\nFILM STYLE\nBen Singer\n"
+     "It would be ludicrous to define cinema from one sequence.", "Ben Singer"),
+    ("DOI: 10.4324/9781003273141-12\n9\nLATINX LIFE WRITERS\n"
+     "OF SOUTH AMERICAN ORIGIN\nOR HERITAGE\nCynthia Martínez\n"
+     "Though writers remain underrepresented, their work matters.", "Cynthia Martínez"),
+])
+def test_book_chapter_title_continuations_are_not_authors(opening, expected):
+    result = infer_author_from_samples([{"page": 1, "text": opening}], Path("chapter.pdf"))
+    assert classify_document([{"page": 1, "text": opening}]).kind == "book_chapter"
+    assert result["author"] == expected
+
+
+def test_book_chapter_platform_credit_is_not_parent_book_editor():
+    text = ("A Handbook of Society\nJane Editor\nEditorial Board\n"
+            "Online ISBN: 9781003174288\nCHAPTER\nAbstract\n"
+            "A Study of Cultural Memory\nAlice Smith\nThis essay examines the relevant history.\n"
+            "https://academic.oup.com/edited-volume/123/chapter/456")
+    result = infer_author_from_samples([{"page": 1, "text": text}], Path("chapter.pdf"))
+    assert classify_document([{"page": 1, "text": text}]).kind == "book_chapter"
+    assert result["author"] == "Alice Smith"
+
+
+def test_numbered_scholarly_section_is_not_book_chapter():
+    text = ("Journal homepage: journal.example\nLiterature and Cultural Memory\n"
+            "Astrid Erll\nAbstract\n1. The Power of Fiction\n"
+            "Cultural memory is based on communication through media.")
+    assert classify_document([{"page": 1, "text": text}]).kind != "book_chapter"
+
+
+def test_parent_book_cover_is_not_reclassified_from_later_chapter():
+    samples = [
+        {"page": 1, "text": "Parent Book Title\nEdited by Jane Editor\nOxford University Press"},
+        {"page": 2, "text": "1 A Study of Cultural Memory\nAlice Smith\nThis chapter explains its subject."},
+    ]
+    assert classify_document(samples, "Parent Book Title").kind != "book_chapter"
+
+
 def test_pipeline_exports_the_canonical_pdf_author_helpers():
     assert pipeline.infer_author_from_initial_pdf_pages is infer_author_from_initial_pdf_pages
     assert pipeline.selected_extraction_author_samples is selected_extraction_author_samples

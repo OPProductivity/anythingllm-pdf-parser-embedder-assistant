@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from rag_pdf_tools import normalize_text
 
 from .names import looks_like_review_heading
+from .book_chapter import chapter_cues
 
 
 @dataclass(frozen=True)
@@ -83,6 +84,10 @@ def classify_document(samples, title_hint=""):
                                      "\n".join(str(s.get("text") or "")[:3000] for s in opening)))
     if chapter_roles and chapter_heading:
         return DocumentProfile("book_chapter", ("numbered_chapter_role_credit",), pages,
+                               publication_type="book_chapter", work_scope="chapter")
+    contribution_cues = chapter_cues(opening)
+    if contribution_cues:
+        return DocumentProfile("book_chapter", contribution_cues, pages,
                                publication_type="book_chapter", work_scope="chapter")
     if browser_print:
         return DocumentProfile("web_article", ("browser_print_footer",), pages,
