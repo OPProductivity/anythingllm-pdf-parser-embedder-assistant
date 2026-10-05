@@ -4,6 +4,7 @@ from pathlib import Path
 
 from .book import infer as infer_book_author
 from .book_chapter import infer as infer_book_chapter_author
+from .corporate import infer as infer_corporate_author
 from .context import AuthorEvidenceContext
 from .filename import infer_author_from_filename
 from .legacy_fallback import (
@@ -14,6 +15,7 @@ from .report import infer_report_author
 from .review import infer_review_author
 from .scholarly_article import infer as infer_scholarly_author
 from .scope import infer_issue_author, infer_legal_opinion_author
+from .thesis import infer as infer_thesis_author
 from .web_article import infer_web_article_author
 
 
@@ -26,6 +28,8 @@ _STRATEGIES = {
     "book_chapter": infer_book_chapter_author,
     "periodical_issue": infer_issue_author,
     "legal_opinion": infer_legal_opinion_author,
+    "thesis_dissertation": infer_thesis_author,
+    "corporate_publication": infer_corporate_author,
 }
 
 

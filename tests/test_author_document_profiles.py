@@ -36,6 +36,38 @@ def test_report_prepared_by_is_separate_from_prepared_for():
     assert result["source"] == "text_report_prepared_by"
 
 
+def test_degree_submission_routes_title_page_author_not_committee():
+    samples = [{"page": 1, "text": (
+        "Studies in Public Memory\nAlice Smith\nDepartment of History\n"
+        "Example University\nThesis Committee:\nBob Jones (Chair)\n"
+        "Submitted in partial fulfillment of the requirements\n"
+        "for the degree of Doctor of Philosophy."
+    )}]
+    assert classify_document(samples).kind == "thesis_dissertation"
+    result = infer_author_from_samples(samples, Path("dissertation.pdf"))
+    assert result["author"] == "Alice Smith"
+    assert result["source"] == "text_thesis_titlepage_author"
+    selected = recover_author_from_selected_extraction(samples)
+    assert selected["author"] == "Alice Smith"
+
+
+def test_thesis_mismatched_title_page_people_abstains():
+    samples = [{"page": 1, "text": (
+        "Studies in Public Memory\nAlice Smith\nDepartment of History\n"
+        "Bruno Santos\nDepartment of Sociology\n"
+        "This thesis is submitted for the degree of Doctor of Philosophy."
+    )}]
+    result = infer_author_from_samples(samples, Path("by-Alice-Smith.pdf"))
+    assert result["author"] == ""
+    assert result["source"] == "thesis_author_not_resolved"
+
+
+def test_degree_words_in_long_article_do_not_select_thesis_route():
+    text = "Abstract\n" + "A study of thesis submissions and degrees. " * 80
+    text += "\nThis thesis is submitted for the degree of Doctor of Philosophy."
+    assert classify_document([{"page": 1, "text": text}]).kind != "thesis_dissertation"
+
+
 def test_book_frontmatter_allows_later_matching_title_page():
     samples = [
         {"page": 1, "text": "The Hidden Politics of Public Memory"},

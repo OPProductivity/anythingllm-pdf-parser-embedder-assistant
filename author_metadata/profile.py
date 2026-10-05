@@ -1,12 +1,14 @@
 """Conservative publication-category cues, independent of PDF producer metadata."""
 
 import re
+import unicodedata
 from dataclasses import dataclass
 
 from rag_pdf_tools import normalize_text
 
 from .names import looks_like_review_heading
 from .book_chapter import chapter_cues
+from .corporate import corporate_cue
 
 
 @dataclass(frozen=True)
@@ -21,6 +23,29 @@ class DocumentProfile:
 
 def has_browser_print_footer(text):
     return bool(re.search(r"(?m)^https?://\S+\s*\|\s*1/\d+\s*$", text or ""))
+
+
+def thesis_title_pages(samples):
+    """Find short opening pages that explicitly identify a degree submission."""
+    for sample in samples or []:
+        try:
+            page = int(sample.get("page") or 0)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if not 1 <= page <= 4:
+            continue
+        text = unicodedata.normalize("NFKC", str(sample.get("text") or ""))
+        if len(text.split()) > 350:
+            continue
+        compact = " ".join(text.split())
+        submission = re.search(
+            r"\b(?:this\s+(?:thesis|dissertation)\s+is\s+submitted|"
+            r"submitted\s+in\s+partial\s+fulfill?ment\s+of\s+the\s+requirements)\b",
+            compact, flags=re.I,
+        )
+        degree = re.search(r"\b(?:Doctor|Master|Bachelor)\s+of\s+[A-Za-z]+\b", compact, flags=re.I)
+        if submission and degree:
+            yield page, text
 
 
 def classify_document(samples, title_hint=""):
@@ -38,6 +63,14 @@ def classify_document(samples, title_hint=""):
     head = "\n".join(lines[:100])
     first_text = str(opening[0].get("text") or "") if opening else ""
     hint = normalize_text(title_hint or "")
+    if any(thesis_title_pages(opening)):
+        return DocumentProfile("thesis_dissertation", ("degree_submission_title_page",), pages,
+                               publication_type="thesis_or_dissertation")
+    corporate = corporate_cue(opening)
+    if corporate:
+        publication_type, cue = corporate
+        return DocumentProfile("corporate_publication", (cue,), pages,
+                               publication_type=publication_type)
     browser_print = has_browser_print_footer(first_text)
     issue_masthead = bool(re.search(r"(?im)^\s*vol\.?\s*(?:[ivxlcdm]+|\d+)\.?\s*$", first_text[:1200]))
     issue_number = bool(re.search(r"(?im)^\s*no\.?\s*\d(?:[\s\d])*\.?\s*$", first_text[:1200]))

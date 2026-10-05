@@ -164,6 +164,8 @@ AUTHOR_AFFILIATION_HINTS = {
 
 
 POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES = {
+    "text_thesis_titlepage_author",
+    "text_corporate_cover_byline",
     "text_byline",
     "text_written_by",
     "text_edited_by",

@@ -22,11 +22,23 @@ Keep the visible interface and OCR selection independent of this policy.
    the durable author empty and retain the inference source and evidence for
    inspection.
 
-The implemented path is `infer_author_from_samples_or_filename`, followed by
+The implemented path classifies a publication profile, selects its own author
+strategy in `author_metadata/dispatcher.py`, and then calls
 `resolve_author_from_metadata_and_inference`. `TRUSTED_AUTHOR_INFERENCE_SOURCES`
 and `POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES` determine which inferences may
 become durable metadata. Workspace-name suggestions sample only the first
 three native pages and may differ from full preparation.
+
+Degree theses require an explicit submission statement and degree on a short
+opening page. Their author strategy accepts a supported title-page person,
+not committee members or coauthors of cited articles. Corporate routes are
+limited to strongly identified financial releases, 10-K filings, earnings
+presentations, annual reports, company overviews, and structured client cases.
+A contact, quoted executive, foreword signer, presenter, customer, or embedded
+PDF `Author` value is not a work author. An issuer belongs in separate
+organization evidence, not the personal author field; that evidence is not yet
+persisted. Ambiguous corporate reports, white papers, and thin covers retain
+their existing classification and may need manual correction.
 
 ## Known unresolved layouts
 
@@ -40,6 +52,12 @@ three native pages and may differ from full preparation.
 - Several older inference paths cap a multi-author result at 12 people. This
   limit is separate from surname capture and remains unchanged pending a
   dedicated large-collaboration policy.
+- Some corporate reports still produce false generic author guesses when the
+  corporate route abstains. The sampled Microsoft white paper has an explicit
+  but column-interleaved author page; a Deloitte survey mixes person names
+  with an organization. These require work-level layout/role evidence, not a
+  broad corporate keyword rule. A repository wrapper can also push a genuine
+  thesis title page outside the quick three-page preview.
 
 Any new role rule should be checked against its target PDF, misleading
 neighboring roles, the first-three-page native corpus comparison, and the

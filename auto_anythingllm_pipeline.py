@@ -3555,6 +3555,82 @@ def _layout_note_marker(row):
     return re.match(r"^\s*(\d{1,3}|[*†‡])(?:[.)\]](?=\s|$)|\s)", row["normalized"])
 
 
+def _layout_linked_outer_side_notes(rows, ordered, order, width, height):
+    """Move only a small outside note linked to one raised body reference."""
+    if order != "two_column_column_first":
+        return ordered, {}, set(), []
+    body = [row for row in rows if len(row["text"].split()) >= 5
+            and row["x1"] - row["x0"] >= width * .25
+            and height * .1 < row["y0"] < height * .9]
+    if len(body) < 16:
+        return ordered, {}, set(), []
+    sizes = [size for row in body for size in row["font_sizes"] if size > 0]
+    if not sizes:
+        return ordered, {}, set(), []
+    body_size = statistics.median(sizes)
+    left_edge = min(row["x0"] for row in body)
+    right_edge = max(row["x1"] for row in body)
+    outside = sorted((row for row in rows if row["font_sizes"]
+                      and max(row["font_sizes"]) <= body_size * .8
+                      and (row["x1"] < left_edge - 8 or row["x0"] > right_edge + 8)
+                      and height * .12 < row["y0"] < height * .85),
+                     key=lambda row: (row["y0"], row["x0"]))
+    moved, replacements, note_starts, details = [], {}, set(), []
+    used_rows, used_references = set(), set()
+    for first in outside:
+        if id(first) in used_rows:
+            continue
+        marker = _layout_note_marker(first)
+        if not marker:
+            continue
+        number = marker.group(1)
+        group = [first]
+        for row in outside:
+            if row is first or row["y0"] <= first["y0"]:
+                continue
+            if row["y0"] - group[-1]["y1"] > body_size * 1.3:
+                break
+            if abs(row["x0"] - first["x0"]) > 3 or _layout_note_marker(row):
+                break
+            group.append(row)
+        if len(group) < 3 or any(id(row) in used_rows for row in group):
+            continue
+        references = []
+        for row in body:
+            spans = row.get("spans") or []
+            for index, span in enumerate(spans[1:], 1):
+                previous = spans[index - 1]
+                if (span["text"].strip() == number
+                        and span["size"] <= body_size * .7
+                        and previous["size"] >= body_size * .9
+                        and -1 <= span["x0"] - previous["x1"] <= 2
+                        and span["y1"] <= previous["y1"] - 2
+                        and abs(span["y0"] - first["y0"]) <= 16):
+                    references.append((row, index))
+        if len(references) != 1 or id(references[0][0]) in used_references:
+            continue
+        reference, index = references[0]
+        replacements[id(reference)] = "".join(
+            f"[{number}]" if offset == index else span["text"]
+            for offset, span in enumerate(reference["spans"])
+        )
+        used_references.add(id(reference))
+        used_rows.update(id(row) for row in group)
+        moved.extend(group)
+        note_starts.add(id(first))
+        details.append({"marker": number, "line_count": len(group),
+                        "reference_bbox": [reference["spans"][index][key]
+                                           for key in ("x0", "y0", "x1", "y1")],
+                        "note_bbox": [min(row["x0"] for row in group),
+                                      min(row["y0"] for row in group),
+                                      max(row["x1"] for row in group),
+                                      max(row["y1"] for row in group)]})
+    if not moved:
+        return ordered, {}, set(), []
+    ordered = [row for row in ordered if id(row) not in used_rows] + moved
+    return ordered, replacements, note_starts, details
+
+
 def _layout_note_units(rows):
     """Classification-only joins of detached markers; preserve original rows."""
     used, units = set(), []
@@ -4050,7 +4126,20 @@ def apply_region_aware_native_layout(pdf_path, pages, progress_callback=None):
             ordered = sorted(body, key=lambda row: (row["y0"], row["x0"]))
             ordered += sorted(margin, key=lambda row: (row["x0"] >= right_bound, row["y0"]))
             reading_order, reading_regions = "body_then_preserved_margin_notes", None
-        semantic_text = "\n".join(row["text"].rstrip() for row in ordered).strip()
+        linked_reference_texts, linked_note_starts, linked_outer_notes = {}, set(), []
+        if not body_reocr_text and reading_regions is None:
+            ordered, linked_reference_texts, linked_note_starts, linked_outer_notes = (
+                _layout_linked_outer_side_notes(
+                    retained, ordered, reading_order, layout["width"], layout_height
+                )
+            )
+            if linked_outer_notes:
+                reading_adjustments.append("linked_outer_side_note_after_body")
+        semantic_text = "\n".join(
+            ("\n" if id(row) in linked_note_starts else "")
+            + linked_reference_texts.get(id(row), row["text"]).rstrip()
+            for row in ordered
+        ).strip()
         if body_reocr_text:
             semantic_text = body_reocr_text
             reading_order = "reocr_confirmed_annotated_body"
@@ -4107,6 +4196,7 @@ def apply_region_aware_native_layout(pdf_path, pages, progress_callback=None):
             ) else "resolved"}
                if page_number in furniture_plans else {}),
             "note_candidates_retained": retained_note_candidates,
+            **({"linked_outer_side_notes": linked_outer_notes} if linked_outer_notes else {}),
             "excluded_footnotes": excluded_footnotes,
             "note_separator_scan": layout["note_separator_scan"],
             "photographed_spread": {
