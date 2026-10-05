@@ -3044,13 +3044,33 @@ def _layout_is_number(text):
     return bool(re.fullmatch(r"(?:[-–—\s]*)(?:\d{1,4}|[ivxlcdm]{1,12})(?:[-–—\s]*)", normalize_text(text), re.I))
 
 
-def _layout_is_running_name(row):
-    words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ.'’-]*", row.get("normalized") or "")
-    italic = bool(row.get("fonts")) and all(
-        ("it" in font.casefold() or "oblique" in font.casefold())
-        for font in row["fonts"] if font
-    )
-    return italic and 2 <= len(words) <= 5 and looks_like_person_name(" ".join(words))
+def _layout_is_running_name(row, rows=()):
+    text = row.get("normalized") or ""
+    # A citation or keyword continuation can look like a name after its
+    # punctuation and dates are stripped. Font foundry names such as ITC are
+    # not evidence of an italic running head either.
+    if re.search(r"[\d;\[\]()/]", text):
+        return False
+    fonts = [font for font in row.get("fonts") or [] if font]
+    if not fonts or not all(
+        re.search(r"ital|oblique|(?:^|[-,])it(?:$|[-,])", font, re.I)
+        for font in fonts
+    ):
+        return False
+    words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ.'’-]*", text)
+    if not 2 <= len(words) <= 5 or not looks_like_person_name(" ".join(words)):
+        return False
+    # An italic caption or heading below a label belongs to page content.
+    # Only the one-off running-name fallback needs this context; repeated
+    # header detection has independent evidence above.
+    for other in rows:
+        if other is row or _layout_is_number(other["text"]):
+            continue
+        overlap = min(row["x1"], other["x1"]) - max(row["x0"], other["x0"])
+        smaller_width = min(row["x1"] - row["x0"], other["x1"] - other["x0"])
+        if other["y1"] <= row["y0"] + 1 and overlap >= 0.5 * smaller_width:
+            return False
+    return True
 
 
 def _layout_web_footer_start(rows):
@@ -4077,7 +4097,7 @@ def apply_region_aware_native_layout(pdf_path, pages, progress_callback=None):
                 reason = "repeated_running_header"
             elif bottom and bottom_counts.get(key, 0) >= repeat_threshold:
                 reason = "repeated_running_footer"
-            elif top and _layout_is_running_name(row):
+            elif top and _layout_is_running_name(row, layout_rows):
                 reason = "italic_running_author"
             if reason:
                 removed.append({"text": row["normalized"], "reason": reason, "bbox": [row["x0"], row["y0"], row["x1"], row["y1"]]})
