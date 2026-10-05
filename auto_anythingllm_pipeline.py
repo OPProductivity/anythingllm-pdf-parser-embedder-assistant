@@ -50,6 +50,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from portable_paths import application_paths, is_private_run_state_path
+from pdf_layout_geometry import verified_page_order
 from desktop_service_trust import (desktop_listener, register_managed_key, require_managed_key_origin,
                                    managed_key_storage, verify_connected_desktop_socket)
 from source_guard import locked_pdf_source
@@ -4024,9 +4025,17 @@ def apply_region_aware_native_layout(pdf_path, pages, progress_callback=None):
         )
         reading_adjustments = []
         if reading_regions is None:
-            ordered, reading_order, reading_adjustments = _layout_refine_reading_order(
+            ordered, reading_order, geometry_adjustment, column_profile = verified_page_order(
+                retained, layout["width"], layout["height"], ordered, reading_order
+            )
+            if geometry_adjustment:
+                reading_adjustments.append(geometry_adjustment)
+            ordered, reading_order, refinement_adjustments = _layout_refine_reading_order(
                 retained, ordered, reading_order, layout["width"], layout["height"]
             )
+            reading_adjustments.extend(refinement_adjustments)
+        else:
+            column_profile = "photographed_spread"
         if annotation_plan.get("reason") == "readable_margin_content_preserved":
             left_bound, right_bound = annotation_plan["body_bounds"]
             margin = [row for row in retained if row["x1"] < left_bound or row["x0"] > right_bound]
@@ -4063,6 +4072,7 @@ def apply_region_aware_native_layout(pdf_path, pages, progress_callback=None):
             "text": semantic_text if semantic_text or marginalia_only else page_info.get("text", ""),
             **({"layout_marginalia_only_page": True} if marginalia_only else {}),
             "layout_reading_order": reading_order,
+            "layout_column_profile": column_profile,
             "native_ligature_space_repairs": (
                 sum(row.get("native_ligature_space_repairs", 0) for row in retained)
                 if not body_reocr_text else 0
