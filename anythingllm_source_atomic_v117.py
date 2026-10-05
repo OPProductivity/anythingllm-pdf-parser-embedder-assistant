@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from anythingllm_cache_contract_v117 import patch_v117_cache_contract
 from anythingllm_compatibility import OBSERVED_CANDIDATE_PACKAGE_FINGERPRINTS, V117_NATIVE_CONTRACT_ID
 from anythingllm_source_atomic_server import OPENROUTER_GATE, SOURCE_ATOMIC_SERVER_BODY_TEMPLATE
 from anythingllm_source_atomic_common import (
@@ -17,7 +18,7 @@ from anythingllm_source_atomic_common import (
 )
 
 V117_SERVER_SHA256 = "a27009d6c87a476b68e619f1e65a83aa81ca257efc904b7c87c1b7deaf0b1a51"  # pragma: allowlist secret
-PATCH_ID = "anythingllm_pdf_assistant_source_atomic_server_v117_2"
+PATCH_ID = "anythingllm_pdf_assistant_source_atomic_server_v117_3"
 # Exact previously qualified generated backend; unknown edits remain refused.
 PREVIOUS_PATCH_SHA256 = "51dfb3a0f967f801788fac96f1e06e90d5b40a77da192a50d8f4ec3050395c63"  # pragma: allowlist secret
 COLLECTOR_METHOD = 'async processDocument(e="",t=null,r={})'
@@ -37,6 +38,26 @@ API_CALL = "await Tc.addDocuments(a,n)"
 NATIVE_PROVIDER_HELPER = r'''
 let __nativeTimeout=Number.parseInt(process.env.ANYTHINGLLM_FETCH_TIMEOUT||"",10),
   __sourceAtomicTimeoutMs=Number.isFinite(__nativeTimeout)&&__nativeTimeout>0?__nativeTimeout:600000;
+let __sourceAtomicSafeFailure=(error)=>{
+  let chain=[],seen=new Set,current=error;
+  for(let depth=0;current&&typeof current==="object"&&depth<4&&!seen.has(current);depth++){
+    seen.add(current);
+    let item={error_class:String(current.constructor?.name||current.name||"Error").replace(/[^A-Za-z0-9_.-]/g,"").slice(0,80)};
+    for(let field of ["code","syscall"])if(typeof current[field]==="string"&&/^[A-Za-z0-9_.-]{1,80}$/.test(current[field]))item[field]=current[field];
+    if(Number.isFinite(current.errno))item.errno=current.errno;
+    chain.push(item),current=current.cause;
+  }
+  let raw=String(error?.message||"provider request failed"),secret=String(process.env.OPENROUTER_API_KEY||"");
+  if(secret)raw=raw.split(secret).join("[redacted]");
+  let message=raw.replace(/Bearer\s+[^\s,\"']+/gi,"Bearer [redacted]").replace(/sk-[A-Za-z0-9_-]{12,}/g,"[redacted]").slice(0,500),
+    codes=chain.map(item=>item.code||""),transportClass="unknown_transport";
+  if(codes.some(code=>/ECONNRESET|EPIPE|UND_ERR_SOCKET/.test(code)))transportClass="socket_reset";
+  else if(codes.some(code=>/ENOTFOUND|EAI_AGAIN/.test(code)))transportClass="dns";
+  else if(codes.some(code=>/ETIMEDOUT|UND_ERR_.*TIMEOUT/.test(code))||chain.some(item=>/Timeout/.test(item.error_class)))transportClass="timeout";
+  else if(codes.some(code=>/CERT|TLS|SSL/.test(code)))transportClass="tls";
+  else if(chain.some(item=>/Abort/.test(item.error_class)))transportClass="aborted";
+  return{error_class:chain[0]?.error_class||"Error",message,transport_error_chain:chain,transport_error_class:transportClass};
+};
 let __sourceAtomicEmbedBatch=async(texts,context)=>{
   if(!l?.openai?.embeddings||typeof l.openai.embeddings.create!=="function")throw new Error("source-atomic OpenRouter client is unavailable");
   let started=Date.now(),attemptId=`__PATCH_ID__:${String(context?.sourceKey||"source")}:${Number(context?.batchIndex||0)}:1`,
@@ -54,10 +75,12 @@ let __sourceAtomicEmbedBatch=async(texts,context)=>{
     __sourceAtomicEmit({type:"source_staging_provider_batch_attempt_completed",...evidence,elapsed_ms:elapsedMs});
     return{vectors,attemptCount:1,retryDelayMs:0,attempts:[{attempt:1,attempt_id:attemptId,elapsed_ms:elapsedMs,request_timeout_ms:__sourceAtomicTimeoutMs,outcome:"success",attempts_scope:"adapter",retry_owner:"desktop_sdk"}]};
   }catch(error){
-    let status=Number(error?.status||error?.response?.status||0),detail={error_class:String(error?.name||error?.constructor?.name||"Error"),
-      http_status:Number.isFinite(status)&&status>0?status:0,message:String(error?.message||"provider request failed").slice(0,500)};
+    let status=Number(error?.status||error?.response?.status||0),detail={...__sourceAtomicSafeFailure(error),
+      http_status:Number.isFinite(status)&&status>0?status:0};
+    if(detail.http_status)detail.transport_error_class="http_response";
+    else if(detail.message.includes("embedding response did not match"))detail.transport_error_class="invalid_embedding_response";
     __sourceAtomicEmit({type:"source_staging_provider_batch_attempt_failed",...evidence,elapsed_ms:Date.now()-started,outcome:"failed",retryable:false,...detail});
-    throw new Error(`source-atomic provider SDK request failed${detail.http_status?` (HTTP ${detail.http_status})`:""}: ${detail.message}`);
+    throw new Error(`source-atomic provider SDK request failed${detail.http_status?` (HTTP ${detail.http_status})`:""}: ${detail.message}`,{cause:{error_class:detail.error_class,transport_error_chain:detail.transport_error_chain}});
   }finally{clearInterval(pulse)}
 };
 '''.replace("__PATCH_ID__", PATCH_ID)
@@ -120,7 +143,9 @@ def patch_v117_server_source(source: str) -> str:
     method = method.replace("let n=JSON.stringify", SIGNER_CACHE + "let n=JSON.stringify")
     method = method.replace("new Xs().xPayload", "__signer.value")
     patched = patched[:collector_start] + method + patched[collector_end:]
-    return patched.replace(API_CALL, API_CALL[:-1] + f",null,Ao(e).{REQUEST_FLAG}===true)")
+    return patch_v117_cache_contract(
+        patched.replace(API_CALL, API_CALL[:-1] + f",null,Ao(e).{REQUEST_FLAG}===true)")
+    )
 
 
 def ensure_v117_embedding_server(report: dict[str, Any]) -> dict[str, Any]:

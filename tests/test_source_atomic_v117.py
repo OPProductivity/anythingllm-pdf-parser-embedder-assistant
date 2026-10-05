@@ -1,6 +1,7 @@
 import hashlib
 import json
 import subprocess
+import tempfile
 
 import pytest
 
@@ -13,6 +14,8 @@ pytestmark = pytest.mark.offline_deterministic
 
 def fixture_source():
     return (
+        'async function of(s=null,e=!1){return e?false:{exists:false,chunks:[]}};'
+        'async function SQ(s=[],e=null){return null};'
         'const Tc={addDocuments:async function(s,e=[],t=null){legacyCalls++;return{embedded:e}},'
         'removeDocuments:async function(){}};'
         'async function api(e){let a={id:1,slug:"test"},n=["one","two","three"];'
@@ -89,7 +92,7 @@ def probe(monkeypatch, *, flag=True, engine="openrouter", scenario="fresh", dire
     patched = adapter.patch_v117_server_source(source)
     assert patched.endswith('const browserRoute="UI_NATIVE_ROUTE_UNCHANGED";')
     setup = r'''
-const scenario=SCENARIO,events=[],calls=[],committed=[],stored=[],docs=new Map;let legacyCalls=0,id=0;
+const f=name=>name==="uuid"?{v5:Object.assign(value=>value,{URL:"url"})}:require(name),scenario=SCENARIO,events=[],calls=[],committed=[],stored=[],docs=new Map;let legacyCalls=0,id=0;
 const cQ=()=>`id-${++id}`,Ao=e=>e.body;
 for(const r of [{name:"one",source:"A",text:"alpha|beta"},{name:"two",source:"A",text:"gamma"},{name:"three",source:"B",text:"delta"}])docs.set(r.name,{pageContent:r.text,docSource:r.source,title:r.name});
 if(scenario==="wide")docs.get("one").pageContent=Array.from({length:79},(_,i)=>`chunk-${i}`).join("|");
@@ -99,15 +102,21 @@ if(scenario==="cached")for(const name of ["two","three"])cached.set(name,[[{valu
 const V=()=>({fileData:async n=>docs.get(n),cachedVectorInformation:async n=>({exists:cached.has(n),chunks:cached.get(n)||[]}),storeVectorResult:async(c,n)=>{stored.push(n);cached.set(n,c)}});
 const rx=()=>({addDocumentToNamespace:async(ns,r,n)=>{if(scenario==="commit_fail"&&n==="two")return{vectorized:false,error:"commit failure"};if(!cached.has(n))throw Error("provider cache missing");committed.push(n);return{vectorized:true}}});
 const da=()=>({emitProgress:(s,e)=>events.push(e)}),N=()=>({SystemSettings:{getValueOrFallback:async()=>750}});
-const O=()=>({getEmbeddingEngineSelection:()=>({model:"fixture",openai:{embeddings:{create:async request=>{calls.push(request.input);if(scenario==="provider_fail"&&request.input.includes("alpha")){const e=new Error("invalid input");e.status=400;throw e}if((scenario==="retry"&&calls.length===1)||scenario==="retry_fail"){const e=new Error("retryable");e.status=503;throw e}const rows=request.input.map((text,i)=>({embedding:[i+1,i+2],index:i}));if(scenario==="bad_index")rows[0].index=99;if(scenario==="missing_index")delete rows[0].index;if(scenario==="bad_dimension"&&rows.length>1)rows[rows.length-1].embedding=[1];if(scenario==="reordered")rows.reverse();return{data:rows}}}}})});
+const O=()=>({getEmbeddingEngineSelection:()=>({model:"fixture",openai:{embeddings:{create:async request=>{calls.push(request.input);if(scenario==="provider_fail"&&request.input.includes("alpha")){const e=new Error("invalid input");e.status=400;throw e}if(scenario==="transport_fail"&&request.input.includes("alpha")){const cause=Object.assign(new Error("reset"),{code:"ECONNRESET",syscall:"read"});throw new Error("socket failed with Bearer secret and sk-abcdefghijklmnop",{cause})}if((scenario==="retry"&&calls.length===1)||scenario==="retry_fail"){const e=new Error("retryable");e.status=503;throw e}const rows=request.input.map((text,i)=>({embedding:[i+1,i+2],index:i}));if(scenario==="bad_index")rows[0].index=99;if(scenario==="missing_index")delete rows[0].index;if(scenario==="bad_dimension"&&rows.length>1)rows[rows.length-1].embedding=[1];if(scenario==="reordered")rows.reverse();return{data:rows}}}}})});
 class Splitter{static determineMaxChunkSize(){return 750}static buildHeaderMeta(){return ""}async splitText(s){return s.split("|")}}
 const tr=()=>({TextSplitter:Splitter}),mr={workspace_documents:{create:async()=>{}}},lQ={sendTelemetry:async()=>{}},nx={logEvent:async()=>{}},dQ=()=>"fixture";
 '''.replace("SCENARIO", json.dumps(scenario))
     call = 'Tc.addDocuments({id:1,slug:"test"},["one","two","three"])' if direct else 'api({body:FLAG})'.replace("FLAG", json.dumps({adapter.REQUEST_FLAG: flag}))
-    script = f"process.env.EMBEDDING_ENGINE={json.dumps(engine)};" + setup + patched
-    script += f"process.env.ANYTHINGLLM_FETCH_TIMEOUT={json.dumps(native_timeout)};" if native_timeout is not None else "delete process.env.ANYTHINGLLM_FETCH_TIMEOUT;"
-    script += call + '.then(result=>console.log(JSON.stringify({result,events,calls,committed,stored,legacyCalls,cached:Array.from(cached.entries())}))).catch(e=>{console.error(e);process.exitCode=1});'
-    result = subprocess.run(["node", "-"], input=script, text=True, capture_output=True, timeout=10)
+    with tempfile.TemporaryDirectory(prefix="source-atomic-v117-") as storage:
+        script = (
+            f"process.env.EMBEDDING_ENGINE={json.dumps(engine)};"
+            f"process.env.EMBEDDING_MODEL_PREF='fixture';"
+            f"process.env.STORAGE_DIR={json.dumps(storage)};"
+            "process.env.OPENROUTER_API_KEY='secret';"  # pragma: allowlist secret - synthetic fixture
+        ) + setup + patched
+        script += f"process.env.ANYTHINGLLM_FETCH_TIMEOUT={json.dumps(native_timeout)};" if native_timeout is not None else "delete process.env.ANYTHINGLLM_FETCH_TIMEOUT;"
+        script += call + '.then(result=>console.log(JSON.stringify({result,events,calls,committed,stored,legacyCalls,cached:Array.from(cached.entries())}))).catch(e=>{console.error(e);process.exitCode=1});'
+        result = subprocess.run(["node", "-"], input=script, text=True, capture_output=True, timeout=10)
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
 
@@ -131,6 +140,18 @@ def test_provider_rejection_is_source_local_and_precommit(monkeypatch):
     result = probe(monkeypatch, scenario="provider_fail")
     assert result["committed"] == ["three"] and result["stored"] == ["three"]
     assert result["result"]["failedToEmbed"] == ["one", "two"]
+
+
+def test_transport_failure_keeps_safe_socket_cause_without_credentials(monkeypatch):
+    result = probe(monkeypatch, scenario="transport_fail")
+    failure = next(
+        event for event in result["events"]
+        if event["type"] == "source_staging_provider_batch_attempt_failed"
+    )
+    assert failure["transport_error_class"] == "socket_reset"
+    assert failure["transport_error_chain"][1]["code"] == "ECONNRESET"
+    serialized = json.dumps(failure)
+    assert "secret" not in serialized and "sk-abcdefghijklmnop" not in serialized
 
 
 def test_commit_ambiguity_stops_later_sources(monkeypatch):

@@ -2,10 +2,11 @@
 
 CACHE_CONTRACT_SOURCE = r'''
 /* Assistant cache contract: retain native nested arrays and ignore other engines. */
-const __pdfCacheFs=f("fs"),__pdfCachePath=f("path"),__pdfCacheCrypto=f("crypto"),__pdfCacheUuid=f("uuid");
 const __pdfCacheContract="openrouter-v117-cache-identity-1";
 const __pdfCacheActive=()=>String(process.env.EMBEDDING_ENGINE||"").replace(/^['"]|['"]$/g,"").trim().toLowerCase()==="openrouter";
+let __pdfCacheFs=null,__pdfCachePath=null,__pdfCacheCrypto=null,__pdfCacheUuid=null;
 if(__pdfCacheActive()){
+  __pdfCacheFs=f("fs"),__pdfCachePath=f("path"),__pdfCacheCrypto=f("crypto"),__pdfCacheUuid=f("uuid");
   let marker=__pdfCachePath.resolve(process.env.STORAGE_DIR,"pdf-assistant-embedding-cache-contract.json");
   try{__pdfCacheFs.writeFileSync(marker,JSON.stringify({contract:__pdfCacheContract}),"utf8")}catch{console.warn("PDF assistant cache contract marker could not be published")}
 }
