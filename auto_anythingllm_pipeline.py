@@ -2995,7 +2995,9 @@ def _layout_repair_ligature_spans(page, blocks):
 def _layout_line_rows(page):
     """Return native lines, repairing only source-proven overlapping spaces."""
     rows = []
-    blocks = page.get_text("dict", sort=False).get("blocks", [])
+    blocks = page.get_text(
+        "dict", sort=False, flags=fitz.TEXTFLAGS_DICT & ~fitz.TEXT_PRESERVE_IMAGES
+    ).get("blocks", [])
     _layout_repair_ligature_spans(page, blocks)
     for block in blocks:
         if block.get("type") != 0:

@@ -280,3 +280,34 @@ def test_separator_rectangle_is_optional_evidence():
     assert p._layout_note_separator_rules(Page(), [row("1 Source note.", 612)])[0] == [
         (40, 610, 120)
     ]
+
+
+def test_layout_line_rows_does_not_request_image_payloads():
+    class Page:
+        def get_text(self, kind, **kwargs):
+            assert kind == "dict"
+            assert kwargs == {
+                "sort": False,
+                "flags": fitz.TEXTFLAGS_DICT & ~fitz.TEXT_PRESERVE_IMAGES,
+            }
+            return {"blocks": [{
+                "type": 0,
+                "lines": [{"bbox": (40, 50, 220, 62), "spans": [{
+                    "text": "A readable sentence.", "bbox": (40, 50, 220, 62),
+                    "font": "Times", "size": 10,
+                }]}],
+            }]}
+
+    rows = p._layout_line_rows(Page())
+    assert [item["text"] for item in rows] == ["A readable sentence."]
+
+
+def test_layout_line_rows_keeps_text_from_image_bearing_page():
+    with fitz.open() as document:
+        page = document.new_page()
+        pixmap = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 2, 2), False)
+        page.insert_image(fitz.Rect(40, 40, 80, 80), pixmap=pixmap)
+        page.insert_text((90, 100), "A readable sentence.")
+        assert any(block["type"] == 1 for block in page.get_text("dict")["blocks"])
+        rows = p._layout_line_rows(page)
+    assert [item["text"] for item in rows] == ["A readable sentence."]
