@@ -20220,6 +20220,7 @@ class PipelineCoreTests(unittest.TestCase):
                 timeout=2.0,
             )
             self.assertTrue(tracker.wait(timeout=1.0))
+            tracker.join(timeout=1.0)
             self.assertFalse(tracker.is_alive())
             outcome = tracker.outcome()
             self.assertEqual(outcome["kind"], "http_response")

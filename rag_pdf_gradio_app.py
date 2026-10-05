@@ -95,6 +95,7 @@ from auto_anythingllm_pipeline import (
     ANYTHINGLLM_SOURCE_CONTRACT,
     apply_recommended_anythingllm_settings,
     active_reconciliation_deadline,
+    owned_reconciliation_activity,
     atomic_write_text,
     anythingllm_desktop_process_running,
     anythingllm_storage_audit,
@@ -15108,7 +15109,7 @@ def _recovery_ledger_groups(run_root):
 
 
 def _is_most_recent_recovery_run(run_root):
-    root = Path(run_root)
+    root = Path(run_root).resolve()
     candidates = sorted(
         automatic_run_artifact_paths(AUTO_RUN_STATE_DIR, "**/resume-embedding-manifest.json"),
         key=lambda path: path.stat().st_mtime,
@@ -15117,11 +15118,14 @@ def _is_most_recent_recovery_run(run_root):
     if not candidates:
         return True
     latest = candidates[0]
-    # Per-document manifests live at ``<run>/<pdf>/inspection`` while the
-    # shared batch ledger/manifest lives directly at ``<run>``. Treat both as
-    # first-class recovery artifacts instead of applying the old fixed-depth
-    # assumption to the latter.
-    latest_root = latest.parents[2] if latest.parent.name == "inspection" else latest.parent
+    # Root, document and queue-group manifests share the first run directory
+    # beneath the private state root, regardless of nesting depth.
+    base = Path(AUTO_RUN_STATE_DIR).resolve()
+    try:
+        relative = latest.resolve().relative_to(base)
+    except ValueError:
+        return False
+    latest_root = base / relative.parts[0]
     return root == latest_root
 
 
@@ -15143,6 +15147,7 @@ def recover_automatic_run(
     evidence, and otherwise observes the Desktop queue without changing it.
     """
     root = Path(run_root)
+    policy = str(policy or "leave_everything_running")
     result = {
         "schema_version": 1,
         "recorded_at": datetime.now().isoformat(timespec="seconds"),
@@ -15155,6 +15160,8 @@ def recover_automatic_run(
     }
     if not root.is_dir():
         result.update(status="run_root_unavailable", message="Recovery run folder is unavailable.")
+    elif policy not in {"leave_everything_running", "restart_anythingllm_anyway", "cancel_confirmed_queues", "automatic_recover"}:
+        result.update(status="unsupported_policy", message="Unknown recovery policy; AnythingLLM was left unchanged.")
     elif automatic and not _is_most_recent_recovery_run(root):
         result.update(status="blocked_not_most_recent", message="Only the most recent interrupted run may resume automatically.")
     elif policy == "restart_anythingllm_anyway" and not explicit_restart_confirmation:
@@ -15214,7 +15221,7 @@ def recover_automatic_run(
             elif policy == "restart_anythingllm_anyway":
                 row["restart"] = restart_anythingllm_desktop(api_url, secret)
                 row.update(action="restart", status=str(row["restart"].get("status") or "unknown"))
-            elif automatic and policy == "automatic_recover":
+            elif policy == "automatic_recover":
                 # The former recovery branch could cancel an owned queue and
                 # then submit a manifest automatically.  Even strict SSE
                 # ownership does not prove that a slow queue should be
@@ -15240,41 +15247,7 @@ def recover_automatic_run(
                 )
                 row["cleanup"] = cleanup
                 row["action"] = "cancel_confirmed_queues"
-                if policy == "cancel_confirmed_queues":
-                    row["status"] = cleanup.get("status")
-                elif automatic:
-                    # A healthy slow queue is never restarted. Only a completed
-                    # removal proves a queued record was still present; a 404 or
-                    # quiet stream can also describe an active record, so neither
-                    # permits a duplicate automatic submission.
-                    if cleanup.get("status") == "complete" and int(cleanup.get("removed") or 0) > 0:
-                        sleeper(max(0.0, min(30.0, float(grace_seconds))))
-                        runtime = detect_anythingllm_api_url(api_url, api_key=secret, timeout=1.25)
-                        row["runtime_after_grace"] = runtime
-                        if runtime.get("status") not in {"reachable", "reachable_auth_required"}:
-                            row["restart"] = restart_anythingllm_desktop(api_url, secret)
-                            row["action"] = "restart_confirmed_stalled_queue"
-                            if row["restart"].get("status") != "ready":
-                                row["status"] = str(row["restart"].get("status") or "unknown")
-                                result["groups"].append(row)
-                                continue
-                        else:
-                            row["restart"] = {"status": "not_needed_runtime_healthy"}
-                        manifest_path = Path(group["ledger_path"]).with_name("resume-embedding-manifest.json")
-                        manifest = _read_automatic_run_json(manifest_path)
-                        if manifest:
-                            row["resume"] = submit_embedding_resume_manifest(
-                                manifest_path, manifest, api_url, secret, group["workspace_slug"],
-                                automatic=True, expected_run_root=root,
-                            )
-                            row["action"] = "reconcile_missing_and_resume"
-                            row["status"] = str(row["resume"].get("status") or "review_required")
-                        else:
-                            row["status"] = "resume_manifest_missing"
-                    else:
-                        row["status"] = "active_or_absent_records_not_resubmitted"
-                else:
-                    row["status"] = cleanup.get("status")
+                row["status"] = cleanup.get("status")
             result["groups"].append(row)
         if groups:
             result["status"] = "complete" if all(str(row.get("status")) in {
@@ -27399,7 +27372,7 @@ def explicit_upload_count_schema(report):
         "selected_documents": "all selected PDFs represented by this report",
         "cache_eligible_records": "selected records with reusable staged document locations; not queue completion",
         "cache_eligible_documents": "fully cache-eligible selected PDFs; not workspace-vector proof",
-        "newly_attached_records": "records this run attached to the workspace",
+        "newly_attached_records": "records this run staged in AnythingLLM document storage; not workspace-vector proof",
         "queue_requested_records": "newly attached records requested from the AnythingLLM Desktop queue",
         "queue_accepted_records": "records with a Desktop queue acceptance receipt",
         "queue_completed_records": "records with completed Desktop queue evidence",
@@ -28014,7 +27987,6 @@ def upload_prepared_automatic_batch(
         effective_deadline_seconds = deadline_seconds
         deadline_extensions = 0
         last_queue_position = 0
-        last_queue_progress_elapsed = None
         last_vector_count = 0
         last_vector_progress_elapsed = None
         last_storage_observation_position = -1
@@ -28121,6 +28093,7 @@ def upload_prepared_automatic_batch(
             return {
                 "desktop_queue_completed": completed,
                 "desktop_queue_current": current,
+                "desktop_queue_last_event_type": str(raw.get("last_event_type") or ""),
                 "desktop_queue_events_observed": max(0, int(raw.get("events_observed") or 0)),
                 "desktop_queue_last_event_age_seconds": (
                     round(max(0.0, time.monotonic() - last_event), 3)
@@ -28268,7 +28241,6 @@ def upload_prepared_automatic_batch(
             duplicate_identities = int(last_report.get("duplicate_chunk_source_count") or 0)
             if queue_position > last_queue_position:
                 last_queue_position = queue_position
-                last_queue_progress_elapsed = elapsed
             current_source_vectors = current_source_vector_progress_count(
                 last_report,
                 expected_records=len(expected_batch),
@@ -28363,24 +28335,12 @@ def upload_prepared_automatic_batch(
                     queue_event_age = float(queue_event_age)
                 except (TypeError, ValueError):
                     queue_event_age = None
-                recent_queue_progress = (
-                    last_queue_progress_elapsed is not None
-                    and elapsed - float(last_queue_progress_elapsed)
-                    <= ANYTHINGLLM_EMBEDDING_RECONCILIATION_STALL_SECONDS
-                )
                 recent_vector_progress = (
                     last_vector_progress_elapsed is not None
                     and elapsed - float(last_vector_progress_elapsed)
                     <= ANYTHINGLLM_EMBEDDING_RECONCILIATION_STALL_SECONDS
                 )
-                owned_queue_active = (
-                    queue_total > 0
-                    and queue_position < queue_total
-                    and str(queue.get("desktop_queue_observer_state") or "") == "connected"
-                    and queue_event_age is not None
-                    and queue_event_age < ANYTHINGLLM_EMBEDDING_RECONCILIATION_STALL_SECONDS
-                    and recent_queue_progress
-                )
+                owned_queue_active = owned_reconciliation_activity(queue)
                 extension_granted = False
                 if owned_queue_active or recent_vector_progress:
                     queue_remaining = queue.get("desktop_queue_estimated_remaining_seconds")

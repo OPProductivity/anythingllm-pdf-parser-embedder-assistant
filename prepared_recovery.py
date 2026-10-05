@@ -183,6 +183,9 @@ def build_prepared_recovery_plan(run_root: str | Path) -> dict[str, Any]:
         elif state == "source_rejected_without_remote_mutation":
             action = "preserve_rejection_and_continue"
             reason = "definite_pre_mutation_rejection"
+        elif state == "source_queue_rejected_without_remote_mutation":
+            action = "preserve_rejection_and_continue"
+            reason = "staged_documents_rejected_before_namespace_commit"
         elif state == "prepared":
             action = "safe_to_submit"
             reason = "no_attachment_intent_was_persisted"

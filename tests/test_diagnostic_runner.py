@@ -27,7 +27,9 @@ def _child_command(marker):
 def test_timeout_and_success_clean_up_descendants(tmp_path, wait):
     marker = tmp_path/'escaped'
     code = f"import subprocess,time; subprocess.Popen({_child_command(marker)!r}); print('child started',flush=True); " + ('time.sleep(30)' if wait else '')
-    result = run_diagnostic([sys.executable,'-c',code], tmp_path/'run', timeout_seconds=1)
+    # The timeout arm tests a one-second budget; success must not depend on
+    # the host launching two Python processes within that same short interval.
+    result = run_diagnostic([sys.executable,'-c',code], tmp_path/'run', timeout_seconds=1 if wait else 10)
     assert result['status'] == ('timed_out' if wait else 'completed')
     assert result['cleanup'] == 'job_closed'
     time.sleep(3.2)

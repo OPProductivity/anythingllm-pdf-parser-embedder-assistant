@@ -20,13 +20,18 @@ ABBREVIATIONS = {"u.s.", "u.k.", "dr.", "mr.", "mrs.", "ms.", "prof.", "ed.", "e
 
 
 def _candidate_kind(text, position):
-    before = text[:position].rstrip()
+    prefix = text[:position]
+    before = prefix.rstrip()
     after = text[position:].lstrip()
-    if before.endswith("\n\n"):
+    # Preserve paragraph separators before trimming boundary whitespace.
+    if prefix[len(before):].count("\n") >= 2:
         return "paragraph", 100
-    token = re.search(r"([A-Za-z.]+)$", before)
-    if before.endswith((".", "?", "!")) and (not token or token.group(1).casefold() not in ABBREVIATIONS):
-        return "sentence", 80
+    if before.endswith((".", "?", "!")):
+        # Abbreviation matching cannot cross whitespace. Do not rescan the
+        # whole page prefix for every whitespace boundary candidate.
+        token = re.search(r"([A-Za-z.]+)$", before.rsplit(None, 1)[-1])
+        if not token or token.group(1).casefold() not in ABBREVIATIONS:
+            return "sentence", 80
     if before.endswith((";", ":", "—", "–")):
         return "clause", 48
     if before.endswith(","):
@@ -81,7 +86,14 @@ def boundary_candidates(text, start, target, hard_limit, drift):
 
 def _last_complete_sentence_span(text):
     """Return the final complete sentence span on a page, ignoring trailing fragments."""
-    matches = list(re.finditer(r"(?s)(\S.*?[.!?][\"'”’)]?)(?=\s+|$)", text or ""))
+    text = text or ""
+    endings = list(re.finditer(r"[.!?][\"'”’)]?(?=\s+|$)", text))
+    if not endings:
+        return None
+    # A long punctuation-free tail made the matcher retry at every character.
+    # It cannot contain a complete sentence, so keep it outside that search.
+    searchable = text[:endings[-1].end()]
+    matches = list(re.finditer(r"(?s)(\S.*?[.!?][\"'”’)]?)(?=\s+|$)", searchable))
     if not matches:
         return None
     match = matches[-1]

@@ -350,10 +350,10 @@ class AnythingLLMPersistenceAdapter:
             for key, value in env_updates:
                 replacement = _environment_assignment_line(key, value)
                 pattern = re.compile(rf"^\s*{re.escape(key)}\s*=.*$", re.MULTILINE)
-                updated = pattern.sub(lambda _match: replacement, updated, count=1) if pattern.search(updated) else updated.rstrip() + "\n" + replacement + "\n"
+                updated = pattern.sub(lambda _match: replacement, updated) if pattern.search(updated) else updated.rstrip() + "\n" + replacement + "\n"
             for key in env_removals:
                 pattern = re.compile(rf"^\s*{re.escape(key)}\s*=.*(?:\r?\n|$)", re.MULTILINE)
-                updated = pattern.sub("", updated, count=1)
+                updated = pattern.sub("", updated)
             _atomic_write_text(path, updated)
             persisted = _read_env_lines(path)
             for key, value in env_updates:

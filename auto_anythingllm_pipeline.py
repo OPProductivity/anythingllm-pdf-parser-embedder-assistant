@@ -4859,31 +4859,6 @@ def detect_end_section_from_outline(outline, page_count, min_fraction=0.55):
     return None
 
 
-def outline_chapter_map(outline, start_page, end_page):
-    entries = []
-    for row in outline or []:
-        page = int(row.get("pdf_page") or 0)
-        title = row.get("title") or ""
-        if page < start_page:
-            continue
-        if end_page and page >= end_page:
-            continue
-        if is_front_matter_title(title) and not is_main_body_title(title):
-            continue
-        entries.append({"pdf_page": page, "title": title})
-    return sorted(entries, key=lambda x: x["pdf_page"])
-
-
-def outline_chapter_for_page(chapter_map, page_num, current_chapter=""):
-    selected = current_chapter
-    for entry in chapter_map:
-        if entry["pdf_page"] <= page_num:
-            selected = entry["title"]
-        else:
-            break
-    return selected
-
-
 def outline_context_for_page(outline, page_num, start_page=1, end_page=None):
     context = {"part": "", "chapter": "", "section": "", "subsection": "", "chapter_level": None}
     for row in sorted(outline or [], key=lambda item: (int(item.get("pdf_page") or 0), int(item.get("level") or 1))):
@@ -6831,76 +6806,6 @@ def split_page_with_offsets(clean, target_chars=650, min_boundary=250):
         while start < n and clean[start].isspace():
             start += 1
     return segments
-
-
-def merge_short_page_segments(page_segments, min_chars=180, max_chars=950):
-    merged = []
-    for segment in page_segments:
-        if (
-            merged
-            and len(segment["text"]) < min_chars
-            and len(merged[-1]["text"]) + len(segment["text"]) + 1 <= max_chars
-        ):
-            merged[-1]["text"] = (merged[-1]["text"] + " " + segment["text"]).strip()
-            merged[-1]["char_end_page"] = segment["char_end_page"]
-        else:
-            merged.append(segment)
-    if len(merged) >= 2 and len(merged[-1]["text"]) < min_chars:
-        previous = merged[-2]
-        last = merged[-1]
-        if len(previous["text"]) + len(last["text"]) + 1 <= max_chars:
-            previous["text"] = (previous["text"] + " " + last["text"]).strip()
-            previous["char_end_page"] = last["char_end_page"]
-            merged.pop()
-    return merged
-
-
-def split_page_under_limit_with_offsets(clean, max_chars=512):
-    if not clean:
-        return []
-    if max_chars <= 0:
-        return split_page_with_offsets(clean, target_chars=650)
-    initial = split_page_with_offsets(
-        clean,
-        target_chars=max_chars,
-        min_boundary=max(60, min(250, max_chars // 3)),
-    )
-    limited = []
-    for segment in initial:
-        text = segment.get("text") or ""
-        start = int(segment.get("char_start_page") or 0)
-        if len(text) <= max_chars:
-            limited.append(segment)
-            continue
-        cursor = 0
-        min_boundary = max(30, max_chars // 4)
-        while cursor < len(text):
-            remaining = len(text) - cursor
-            if remaining <= max_chars:
-                piece_end = len(text)
-            else:
-                window = text[cursor : cursor + max_chars]
-                candidates = [window.rfind("\n\n"), window.rfind(". "), window.rfind("? "), window.rfind("! "), window.rfind("; "), window.rfind(", "), window.rfind(" ")]
-                valid = [candidate for candidate in candidates if candidate >= min_boundary]
-                cut = max(valid) if valid else max_chars
-                adjust = 1 if cut < len(window) and window[cut:cut + 1] in {" ", "\n"} else 0
-                piece_end = min(len(text), cursor + cut + adjust)
-            raw_piece = text[cursor:piece_end]
-            piece_text = raw_piece.strip()
-            if piece_text:
-                leading_ws = len(raw_piece) - len(raw_piece.lstrip())
-                trailing_ws = len(raw_piece.rstrip())
-                limited.append(
-                    {
-                        "text": piece_text,
-                        "char_start_page": start + cursor + leading_ws,
-                        "char_end_page": start + cursor + trailing_ws,
-                    }
-                )
-            cursor = max(piece_end, cursor + 1)
-            while cursor < len(text) and text[cursor].isspace():
-                cursor += 1
-    return limited
 
 
 def shorten_heading(text, limit=44):
@@ -16360,6 +16265,38 @@ def active_reconciliation_deadline(
     }
 
 
+def owned_reconciliation_activity(queue):
+    """Recognize pending source staging and document work, never vector success."""
+    queue = dict(queue or {})
+    raw_age = queue.get("desktop_queue_last_event_age_seconds")
+    if raw_age is None:
+        return False
+    try:
+        age = float(raw_age)
+    except (TypeError, ValueError):
+        return False
+    if (not math.isfinite(age) or age < 0
+            or age >= ANYTHINGLLM_EMBEDDING_RECONCILIATION_STALL_SECONDS
+            or str(queue.get("desktop_queue_observer_state") or "") not in {"connected", "reconnecting"}):
+        return False
+    event_type = str(queue.get("desktop_queue_last_event_type") or "")
+    if event_type in {"all_complete", "source_commit_ambiguous", "doc_failed", "source_rejected_before_commit"}:
+        return False
+    total = max(0, int(queue.get("queue_records") or 0))
+    completed = max(0, int(queue.get("desktop_queue_completed") or 0))
+    current = max(0, int(queue.get("desktop_queue_current") or 0))
+    if total <= 0 or completed >= total:
+        return False
+    if event_type in {
+        "source_staging_started", "source_staging_source_plan", "source_staging_cache_resolved",
+        "source_staging_record", "source_staging_provider_batch", "source_staging_provider_batch_attempt",
+        "source_staging_provider_batch_waiting", "source_staging_provider_batch_attempt_completed",
+        "source_staging_provider_batch_retrying",
+    }:
+        return True
+    return completed < current <= total
+
+
 def storage_observation_due_for_queue(
     queue,
     expected_records,
@@ -18245,6 +18182,7 @@ def update_workspace_embeddings_desktop_queue(
         # completion counters. It explains provider time without pretending a
         # staged vector has reached the AnythingLLM namespace.
         "source_atomic_provider_batches": [],
+        "source_atomic_provider_batch_totals": {},
         "source_atomic_provider_batch_count": 0,
         "source_atomic_provider_chunk_count": 0,
         "source_atomic_provider_elapsed_ms": 0,
@@ -18304,12 +18242,18 @@ def update_workspace_embeddings_desktop_queue(
             for item in queue_state["source_atomic_provider_batches"] or []
             if isinstance(item, dict)
         }
+        totals = queue_state["source_atomic_provider_batch_totals"]
         new_items = [
             item for item in normalized
-            if (item["source_key"], item["batch_index"]) not in by_identity
+            if (item["source_key"], item["batch_index"]) not in totals
         ]
         for item in normalized:
-            by_identity[(item["source_key"], item["batch_index"])] = item
+            identity = (item["source_key"], item["batch_index"])
+            previous_chunks, previous_ms = totals.get(identity, (0, 0))
+            queue_state["source_atomic_provider_chunk_count"] += item["chunk_count"] - previous_chunks
+            queue_state["source_atomic_provider_elapsed_ms"] += item["elapsed_ms"] - previous_ms
+            totals[identity] = (item["chunk_count"], item["elapsed_ms"])
+            by_identity[identity] = item
         ordered = sorted(
             by_identity.values(),
             key=lambda item: (str(item.get("source_key") or ""), int(item.get("batch_index") or 0)),
@@ -18317,13 +18261,8 @@ def update_workspace_embeddings_desktop_queue(
         queue_state["source_atomic_provider_batches"] = ordered[
             -ANYTHINGLLM_SOURCE_ATOMIC_PROVIDER_BATCH_TAIL_LIMIT:
         ]
-        queue_state["source_atomic_provider_batch_count"] = len(ordered)
-        queue_state["source_atomic_provider_chunk_count"] = sum(
-            int(item.get("chunk_count") or 0) for item in ordered
-        )
-        queue_state["source_atomic_provider_elapsed_ms"] = sum(
-            int(item.get("elapsed_ms") or 0) for item in ordered
-        )
+        # Detail is bounded; lifetime numeric totals must not shrink with it.
+        queue_state["source_atomic_provider_batch_count"] = len(totals)
         return new_items
 
     def queue_snapshot():
@@ -26127,27 +26066,12 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             # sampled on opposite sides of a scheduler tick.
             if poll_elapsed + 0.01 < float(current_deadline or 0.0):
                 return None
-            queue_total = int(evidence.get("queue_records") or len(expected_batch))
-            queue_position = max(
-                int(evidence.get("desktop_queue_completed") or 0),
-                int(evidence.get("desktop_queue_current") or 0),
-            )
-            last_queue_progress = reconciliation_tracker["last_queue_progress_elapsed_seconds"]
             last_vector_progress = reconciliation_tracker["last_vector_progress_elapsed_seconds"]
-            recent_queue_progress = (
-                last_queue_progress is not None
-                and receipt_elapsed - float(last_queue_progress) <= ANYTHINGLLM_EMBEDDING_RECONCILIATION_STALL_SECONDS
-            )
             recent_vector_progress = (
                 last_vector_progress is not None
                 and receipt_elapsed - float(last_vector_progress) <= ANYTHINGLLM_EMBEDDING_RECONCILIATION_STALL_SECONDS
             )
-            owned_queue_active = (
-                queue_total > 0
-                and queue_position < queue_total
-                and str(evidence.get("desktop_queue_observer_state") or "") == "connected"
-                and recent_queue_progress
-            )
+            owned_queue_active = owned_reconciliation_activity(evidence)
             if not (owned_queue_active or recent_vector_progress):
                 return None
             queue_remaining_seconds = evidence.get("desktop_queue_estimated_remaining_seconds")
