@@ -8505,8 +8505,27 @@ def native_document_requires_full_ocr(candidates, pdf_page_count=0):
     )
     if not native:
         return False
-    words = int((native.get("quality") or {}).get("included_words") or 0)
-    page_count = max(1, int(pdf_page_count or 0))
+    try:
+        page_count = int(pdf_page_count or native.get("page_count") or 0)
+    except (TypeError, ValueError):
+        return False
+    pages = native.get("pages") or []
+    if page_count < 1 or not isinstance(pages, (list, tuple)) or len(pages) != page_count:
+        return False
+    # Selected-range quality cannot establish document-wide emptiness. Only
+    # complete physical-page evidence from this native candidate can do that.
+    seen = set()
+    words = 0
+    for row in pages:
+        try:
+            page = int(row.get("page") or 0)
+            text = row.get("text")
+        except (AttributeError, TypeError, ValueError):
+            return False
+        if page < 1 or page > page_count or page in seen or not isinstance(text, str):
+            return False
+        seen.add(page)
+        words += len(text.split())
     return words < max(100, page_count * 10)
 
 

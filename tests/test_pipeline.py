@@ -1641,9 +1641,49 @@ class PipelineCoreTests(unittest.TestCase):
     def test_mixed_native_document_retains_page_local_ocr(self):
         candidates = [{
             "backend": "pymupdf",
-            "pages": [{"page": page, "text": "native prose"} for page in range(1, 19)],
+            "pages": [{"page": page, "text": "native prose " * 62} for page in range(1, 19)],
             "quality": {"included_words": 2200},
         }]
+        self.assertFalse(pipeline.native_document_requires_full_ocr(candidates, 18))
+
+    def test_selected_opening_pages_cannot_promote_native_book_to_full_ocr(self):
+        candidates = [{
+            "backend": "pymupdf",
+            "page_count": 433,
+            "pages": [{"page": page, "text": "native prose " * 160}
+                      for page in range(1, 434)],
+            "start_page": 1,
+            "end_page": 4,
+            "quality": {"included_words": 256},
+        }]
+        self.assertFalse(pipeline.native_document_requires_full_ocr(candidates, 433))
+        self.assertFalse(pipeline.native_document_requires_full_ocr(candidates))
+
+    def test_full_ocr_requires_complete_unique_native_physical_page_evidence(self):
+        empty = [{"page": page, "text": ""} for page in range(1, 4)]
+        for pages in (None, 3, [], empty[:2], empty + [empty[0]],
+                      [empty[0], empty[0], empty[2]],
+                      [empty[0], empty[1], {"page": 4, "text": ""}],
+                      [empty[0], empty[1], {"page": "bad", "text": ""}],
+                      [empty[0], empty[1], {"page": 3, "text": None}],
+                      [empty[0], empty[1], None]):
+            with self.subTest(pages=pages):
+                candidate = {"backend": "pymupdf", "pages": pages,
+                             "quality": {"included_words": 0}}
+                self.assertFalse(pipeline.native_document_requires_full_ocr([candidate], 3))
+        self.assertTrue(pipeline.native_document_requires_full_ocr(
+            [{"backend": "pymupdf", "pages": empty}], 3))
+        self.assertFalse(pipeline.native_document_requires_full_ocr(
+            [{"backend": "pymupdf", "pages": empty}], "bad"))
+        self.assertFalse(pipeline.native_document_requires_full_ocr(
+            [{"backend": "pymupdf", "pages": empty}], 0))
+
+    def test_layout_ocr_peer_does_not_establish_native_coverage(self):
+        candidates = [{"backend": "pymupdf", "pages": [
+            {"page": page, "text": ""} for page in range(1, 19)]},
+            {"backend": "pymupdf4llm", "quality": {"included_words": 2200}}]
+        self.assertTrue(pipeline.native_document_requires_full_ocr(candidates, 18))
+        candidates[0]["error"] = "native extraction failed"
         self.assertFalse(pipeline.native_document_requires_full_ocr(candidates, 18))
 
     def test_full_page_ocr_retry_requires_material_recovery(self):
