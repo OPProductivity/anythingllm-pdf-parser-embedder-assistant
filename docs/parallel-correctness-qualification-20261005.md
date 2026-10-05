@@ -80,3 +80,33 @@ module. These pre-existing static issues were not silently refactored away.
 Full offline gate: 2457 passed, one skipped, 34 deselected, 25 subtests passed
 in 254.19 seconds; three existing dependency deprecation warnings. Activation
 is coordinated separately after commit; AnythingLLM Desktop remains running.
+
+## P04: Actual Same-Browser Reset Checks
+
+The independent browser agent completed six three-PDF local diagnostic runs
+without refreshing the page. All 18 serialized worker requests matched the
+entered settings and original source hashes. Checks included X-clear-Y, retry,
+saved future defaults, three different PDFs after Clear, and retry followed by
+replacement with another disjoint three-PDF selection. No stale settings or
+stale input identities were demonstrated, so no reset code was changed.
+
+A separate read-only API fixture verified display-name refresh retained the
+same confirmed workspace slug; removing that slug cleared its selection.
+Actual Confirm acknowledgement/dispatch retained the renamed workspace identity.
+The fixture then stopped at authentication preflight with zero workers; this
+does not qualify live upload/embedding. Owned browser and test ports/processes
+were closed, and fixture workspace/document/vector rows were zero.
+Evidence: `C:/Users/Ninkear/.codex/tmp/shared-p04-settings-20261005/P04-REPORT.md`.
+
+## Committed and Running
+
+Reviewed fixes committed in `6c0fd48`. After verifying the production assistant
+idle, its owned root408 was stopped through the CLI and relaunched from the
+checkout: launcher parent2808, fresh root18848, creation epoch1791195979.9564.
+Healthz returned HTTP200 on7860 and the owned-active-run list was empty.
+AnythingLLM Desktop was not stopped. The separate bridge review's native
+backend on-disk update still requires its own user-approved Desktop activation;
+this qualification does not claim that backend patch is active in memory.
+
+P01/P02/P04/P05/P06/P07 are complete in the shared pool. P03 remains explicitly
+deferred pending the recognition-policy decision. No push was made by this chat.
