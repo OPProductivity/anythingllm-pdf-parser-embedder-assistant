@@ -44,7 +44,7 @@ def recover_author_from_selected_extraction(pages, *, title_hint="", page_limit=
                 "page": 0, "evidence": "", "sample_pages": []}
     context = AuthorEvidenceContext.from_samples(samples, title_hint=title_hint)
     report = dict(infer_author(context))
-    if not report.get("author"):
+    if not report.get("author") and report.get("source") == "not_found":
         first = samples[0]
         lines = [normalize_text(line) for line in first["text"].splitlines() if normalize_text(line)]
         for index, line in enumerate(lines[:28]):

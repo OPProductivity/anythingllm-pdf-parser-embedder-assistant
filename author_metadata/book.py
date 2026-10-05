@@ -195,4 +195,7 @@ def infer(context):
     unique = {report["author"] for report in reports}
     if len(unique) == 1:
         return reports[0]
-    return not_found() if unique else _catalog_credit(context)
+    if unique:
+        return {"author": "", "source": "conflicting_work_credits", "page": 0,
+                "evidence": "; ".join(f"page {row['page']}: {row['author']}" for row in reports)}
+    return _catalog_credit(context)

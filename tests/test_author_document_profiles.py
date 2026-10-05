@@ -141,3 +141,37 @@ def test_book_conflicting_title_pages_still_abstain():
         samples, Path("book.pdf"), title_hint="Research on Social Inequality",
     )
     assert result["author"] == ""
+    assert result["source"] == "conflicting_work_credits"
+
+
+def test_book_conflict_cannot_be_overridden_by_filename_byline():
+    samples = [
+        {"page": 1, "text": "Shared Histories\nBy\nAlice Smith\nUniversity Press"},
+        {"page": 3, "text": "Shared Histories\nBy\nBob Jones\nUniversity Press"},
+    ]
+    result = infer_author_from_samples(
+        samples, Path("Shared-Histories-by-Alice-Smith.pdf"), title_hint="Shared Histories",
+    )
+    assert result["author"] == ""
+    assert result["source"] == "conflicting_work_credits"
+    assert "page 1: Alice Smith" in result["evidence"]
+    assert "page 3: Bob Jones" in result["evidence"]
+
+
+def test_book_missing_credit_still_allows_explicit_filename_byline():
+    samples = [{"page": 1, "text": "Praise for Shared Histories\nUniversity Press"}]
+    result = infer_author_from_samples(
+        samples, Path("Shared-Histories-by-Alice-Smith.pdf"), title_hint="Shared Histories",
+    )
+    assert result["author"] == "Alice Smith"
+    assert result["source"] == "filename_explicit_byline"
+
+
+def test_selected_extraction_cannot_override_conflicting_book_credits():
+    pages = [
+        {"page": 1, "text": "Shared Histories\nBy\nAlice Smith\nUniversity Press"},
+        {"page": 3, "text": "Shared Histories\nBy\nBob Jones\nUniversity Press"},
+    ]
+    result = recover_author_from_selected_extraction(pages, title_hint="Shared Histories")
+    assert result["author"] == ""
+    assert result["source"] == "selected_extraction_conflicting_work_credits"

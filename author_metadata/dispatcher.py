@@ -34,6 +34,8 @@ def infer_author(context: AuthorEvidenceContext):
     report = strategy(context)
     if report.get("author"):
         return report
+    if report.get("source") != "not_found":
+        return report
     # An explicit catalog byline is independent evidence for a work's creator,
     # but generic tail/name-shape guesses must not override a classified role.
     if context.path is not None:
