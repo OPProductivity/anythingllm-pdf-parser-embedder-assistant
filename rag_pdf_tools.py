@@ -29,7 +29,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from concurrent.futures.process import BrokenProcessPool
 from functools import lru_cache
@@ -1708,6 +1708,10 @@ def photographed_page_ocr_regions(page, runtime, *, page_number=None):
             text, image, embedded_fraction, layout_rows, tesseract, ImageOps,
             page_number=page_number,
         )
+        text, caption_evidence = relocate_bottom_caption_from_narrow_scan_prose(
+            text, layout_rows
+        )
+        recognition_layout["caption_relocation"] = caption_evidence
         if len(text) < 80 and int(page_number or 0) <= 2:
             display_decision = {}
             display_text = _ocr_photographed_crop(image, embedded_fraction, tesseract, ImageOps, psm=3,
@@ -2808,6 +2812,64 @@ def _tsv_block_text(rows):
             lines.append(" ".join(row["text"] for row in line_rows))
         paragraphs.append("\n".join(lines))
     return "\n\n".join(paragraphs).strip()
+
+
+def relocate_bottom_caption_from_narrow_scan_prose(text, layout_rows):
+    """Separate a lower side caption merged into narrow prose by OCR lines."""
+    rows = [row for row in layout_rows or [] if isinstance(row, dict)]
+    if not rows:
+        return text, {"applied": False, "reason": "word_geometry_unavailable"}
+    crop_width = rows[0].get("crop_width") or 0
+    crop_height = rows[0].get("crop_height") or 0
+    if not crop_width or not crop_height:
+        return text, {"applied": False, "reason": "crop_geometry_unavailable"}
+    groups = defaultdict(list)
+    for row in rows:
+        groups[(row["block"], row["paragraph"], row["line"])].append(row)
+    median_height = statistics.median(row["height"] for row in rows)
+    split_lines = []
+    for key, line in sorted(groups.items()):
+        line = sorted(line, key=lambda row: row["word"])
+        for index in range(1, len(line)):
+            gap = line[index]["left"] - (line[index - 1]["left"] + line[index - 1]["width"])
+            if gap > max(0.1 * crop_width, 8 * median_height):
+                left, right = line[:index], line[index:]
+                if len(left) >= 3 and len(right) >= 2:
+                    split_lines.append((key, left, right, gap))
+    if not 2 <= len(split_lines) <= 3:
+        return text, {"applied": False, "reason": "short_multiline_caption_absent"}
+    keys = [entry[0] for entry in split_lines]
+    if len({key[:2] for key in keys}) != 1 or keys[-1][2] - keys[0][2] != len(keys) - 1:
+        return text, {"applied": False, "reason": "caption_lines_not_consecutive"}
+    left_extent = max(row["left"] + row["width"] for _, left, _, _ in split_lines for row in left)
+    right_start = min(row["left"] for _, _, right, _ in split_lines for row in right)
+    first_y = min(row["top"] for _, _, right, _ in split_lines for row in right)
+    earlier = [row for row in rows if row["top"] < first_y - 2 * median_height]
+    narrow = [row for row in earlier if row["left"] + row["width"] <= 0.45 * crop_width]
+    if (first_y < 0.8 * crop_height or left_extent > 0.45 * crop_width
+            or right_start < 0.48 * crop_width or len(narrow) < 150
+            or len(narrow) / max(len(earlier), 1) < 0.9):
+        return text, {"applied": False, "reason": "sustained_narrow_prose_not_confirmed"}
+    remaining = str(text or "")
+    caption_lines = []
+    for _, left, right, _ in split_lines:
+        full = " ".join(row["text"] for row in left + right)
+        if remaining.count(full) != 1:
+            return text, {"applied": False, "reason": "unique_ocr_line_absent"}
+        remaining = remaining.replace(full, " ".join(row["text"] for row in left), 1)
+        caption_lines.append(" ".join(row["text"] for row in right))
+    caption = "\n".join(caption_lines)
+    reordered = remaining.rstrip() + "\n\n" + caption + "\n"
+    def tokens(value):
+        return re.findall(r"\w+|[^\w\s]", value)
+    if Counter(tokens(str(text or ""))) != Counter(tokens(reordered)):
+        return text, {"applied": False, "reason": "recognized_tokens_changed"}
+    return reordered, {
+        "applied": True,
+        "reason": "lower_side_caption_after_narrow_prose",
+        "line_count": len(split_lines),
+        "recognized_tokens_preserved": True,
+    }
 
 
 def _tsv_column_line_text(rows):
