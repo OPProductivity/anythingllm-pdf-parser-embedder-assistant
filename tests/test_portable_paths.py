@@ -1,4 +1,5 @@
 import pytest
+import shutil
 
 import portable_paths
 
@@ -42,3 +43,21 @@ def test_package_resource_path_rejects_missing_resource(tmp_path, monkeypatch):
 
     with pytest.raises(FileNotFoundError, match="Required package resource"):
         portable_paths.package_resource_path("missing.txt")
+
+
+def test_target_installed_annotated_model_uses_the_verified_packaged_asset(tmp_path, monkeypatch):
+    import rag_pdf_tools as tools
+
+    relative = "assets/tessdata-annotated/eng.traineddata"
+    original = portable_paths.package_resource_path(relative)
+    module = tmp_path / "target"
+    resource = module / "share/anythingllm-pdf-assistant" / relative
+    resource.parent.mkdir(parents=True)
+    shutil.copyfile(original, resource)
+    monkeypatch.setattr(portable_paths, "__file__", str(module / "portable_paths.py"))
+    monkeypatch.setattr(tools, "__file__", str(module / "rag_pdf_tools.py"))
+    monkeypatch.setattr(tools.sys, "prefix", str(tmp_path / "unrelated-interpreter"))
+    monkeypatch.setattr(portable_paths.sysconfig, "get_path", lambda _: str(tmp_path / "unrelated-data"))
+
+    assert tools.annotated_model_arguments(4, 6) == ["--tessdata-dir", str(resource.parent), "--oem", "1"]
+    assert tools.annotated_model_arguments(4, 4) == []

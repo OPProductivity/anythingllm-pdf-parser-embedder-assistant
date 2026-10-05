@@ -76,3 +76,21 @@ previously accompanied only 36 words in its physical-page rows.
 The integrated checkout repeated the mixed original-PDF Automatic run
 successfully in 59.319 seconds with production and original files preserved.
 The integrated gate passed 977 tests and 25 subtests; Ruff and Pyright passed.
+
+The final fresh live continuation used the committed `76f85e9` snapshot,
+original Ruggiero and Appalachian Reckoning PDFs, selected opening ranges,
+and a separate native AnythingLLM backend with empty storage. It completed
+in 59.866 seconds: five selected records, five physically confirmed vectors,
+clean integrity audit, and a successful manual retrieval request (HTTP 200,
+five results). Evidence is retained in `l/p01-fresh/report.json`.
+After owned backend shutdown, all test workspace/document/vector/API-key rows
+were removed, together with the test namespace, vector-cache entries and
+uploaded documents. Original sources, research storage and installed backend
+hash remained unchanged. Production assistant activation is coordinated
+separately from experimental qualification; Desktop was never restarted.
+
+Coordinator activated the stable combined checkout after the bridge review's
+source integration: ownership-verified assistant-only restart changed root PID
+8068 to 408 (launcher parent24436), healthz returned HTTP200 on7860. The Desktop
+process was not stopped. Later reviewed corrections receive a separate gate,
+commit and activation record.

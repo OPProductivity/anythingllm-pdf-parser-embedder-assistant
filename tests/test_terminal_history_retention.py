@@ -1,4 +1,7 @@
 import json
+import inspect
+from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 import rag_pdf_gradio_app as app
@@ -86,6 +89,54 @@ def test_early_terminal_is_recorded_once_but_never_calibrates(history_home, stat
 def test_unowned_preview_does_not_create_a_history_run(history_home):
     app.retain_early_terminal_history(None, "failed", "No run started", 2, 10)
     assert not app.INGESTION_HISTORY_PATH.exists()
+
+
+def test_first_preparation_worker_cancellation_retains_terminal_history(history_home, monkeypatch):
+    source = history_home / "first.pdf"
+    source.write_bytes(b"%PDF-1.4\nowned cancellation fixture\n")
+    run = history_home / "run"
+    monkeypatch.setattr(app, "AUTO_RUN_STATE_DIR", history_home / "run-state")
+    monkeypatch.setattr(app, "LIVE_AUTOMATIC_RUN_STATUS", {})
+    monkeypatch.setattr(app, "validate_pdf_inputs", lambda paths: ([str(source)], None))
+    monkeypatch.setattr(app, "automatic_batch_output_capacity_preflight",
+                        lambda *a, **kw: {"status": "pass", "message": "fixture capacity"})
+    monkeypatch.setattr(app, "can_share_native_batch_runtime", lambda *a, **kw: False)
+    monkeypatch.setenv("APPDATA", str(history_home / "empty-appdata"))
+
+    def cancel_worker(pdf, output, args, root, *callbacks):
+        assert root == run
+        assert not args.prepare_and_upload and not args.anythingllm_api_url
+        app._write_automatic_run_json(root / app.AUTOMATIC_RUN_CANCELLATION_MARKER, {})
+        return {"status": "cancelled", "recovery": app.write_automatic_cancellation_recovery(root)}
+
+    worker = Mock(side_effect=cancel_worker)
+    monkeypatch.setattr(app, "execute_automatic_preparation_in_worker", worker)
+    history = Mock(wraps=app.append_ingestion_history)
+    monkeypatch.setattr(app, "append_ingestion_history", history)
+    values = app.builtin_automatic_run_setting_values([str(source)], [])
+    values.update(mode=app.MODE_LOCAL_ONLY_LABEL, output_root_override=str(history_home / "exports"),
+                  run_root_override=str(run), api_url="", api_key="", workspace_slug="",
+                  local_check_mode=app.SIMULATION_SKIP_LABEL, inherit_anythingllm_settings=False,
+                  reviewed_timing_estimate={"expected_seconds": 10, "features": {"mode": app.MODE_LOCAL_ONLY_LABEL},
+                                            "formula": "fixture", "profile": {}},
+                  progress=lambda *a, **kw: None)
+    values = {key: value for key, value in values.items() if key in inspect.signature(app.run_automatic).parameters}
+
+    result = app.run_automatic(**values)
+
+    worker.assert_called_once()
+    history.assert_called_once()
+    assert len(result) == 7
+    assert "cancelled" in result[0]["value"].lower()
+    assert result[3] and all(Path(path).is_file() for path in result[3])
+    terminal = json.loads((run / "ingestion-terminal-record.json").read_text(encoding="utf-8"))
+    assert terminal["state"] == "cancelled" and terminal["documents"] == []
+    rows = read(app.INGESTION_HISTORY_PATH)
+    assert len(rows) == 1 and rows[0]["state"] == "cancelled"
+    assert rows[0]["run_key"] == str(run)
+    status = json.loads((run / "run-progress.json").read_text(encoding="utf-8"))
+    assert status["state"] == "cancelled"
+    assert status["batch_accepted_files"] == status["batch_vector_confirmed_files"] == 0
 
 
 def test_terminal_write_failure_is_not_reported_as_persisted(history_home, monkeypatch):

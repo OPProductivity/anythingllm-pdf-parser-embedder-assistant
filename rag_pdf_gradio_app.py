@@ -8472,7 +8472,7 @@ def latest_resume_manifest(workspace_slug):
     for path in candidates:
         try:
             manifest = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             continue
         if not isinstance(manifest, dict):
             continue
@@ -32350,6 +32350,10 @@ def run_automatic(
                 "state": "cancelled",
                 "message": "Stopped by operator. The active document worker was terminated; no further documents were started.",
             }
+            retain_early_terminal_history(
+                run_root, "cancelled", completion["message"],
+                time.perf_counter() - started_at, expected_seconds, mode=mode,
+            )
             recovery = run_root / AUTOMATIC_RUN_CANCELLATION_RECOVERY
             recovered_files = [str(recovery)] if recovery.is_file() else []
             progress(None)

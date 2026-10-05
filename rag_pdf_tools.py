@@ -2554,10 +2554,8 @@ def _verified_annotated_model(path, size, mtime):
 def annotated_model_arguments(requested_psm, resolved_psm):
     if requested_psm != 4 or resolved_psm != 6:
         return []
-    model = Path(__file__).resolve().parent / "assets" / "tessdata-annotated" / "eng.traineddata"
-    if not model.is_file():
-        model = Path(sys.prefix) / "share" / "anythingllm-pdf-assistant" / "assets" / "tessdata-annotated" / "eng.traineddata"
     try:
+        model = package_resource_path("assets/tessdata-annotated/eng.traineddata")
         stat = model.stat()
         if stat.st_size == 15400601 and _verified_annotated_model(str(model),stat.st_size,stat.st_mtime_ns):
             return ["--tessdata-dir",str(model.parent),"--oem","1"]
