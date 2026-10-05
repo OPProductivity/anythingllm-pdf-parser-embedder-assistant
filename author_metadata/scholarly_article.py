@@ -50,6 +50,20 @@ def _result(names, sample, lines, source):
             "page": int(sample["page"]), "evidence": " / ".join(lines)}
 
 
+def _truncated_cover_title_matches(visible, hint, citation_title):
+    """Accept a PDF Title cut inside its final word only with the publisher citation."""
+    observed, expected = words(visible), words(hint)
+    cited = words(citation_title)
+    return bool(
+        len(expected) >= 10
+        and len(observed) == len(expected)
+        and observed[:-1] == expected[:-1]
+        and 4 <= len(expected[-1]) < len(observed[-1]) <= len(expected[-1]) + 5
+        and observed[-1].startswith(expected[-1])
+        and cited[:len(observed)] == observed
+    )
+
+
 def _cover_credit(lines, context, sample):
     for index, line in enumerate(lines[:24]):
         labelled = re.fullmatch(r"Author\(s\):\s*(.+)", line, re.I)
@@ -67,15 +81,21 @@ def _cover_credit(lines, context, sample):
         names = _names(line)
         if not names or any(_ROLE.search(value) for value in lines[:index]):
             continue
-        title_ok = any(_matches_title(" ".join(lines[index - width:index]), context.title_hint, names)
-                       for width in range(1, min(index, 5) + 1))
-        if not title_ok:
-            continue
+        title_candidates = [" ".join(lines[index - width:index])
+                            for width in range(1, min(index, 5) + 1)]
+        title_ok = any(_matches_title(value, context.title_hint, names)
+                       for value in title_candidates)
         following = lines[index + 1:index + 5]
         if following and re.match(r"^To cite this article:\s*", following[0], re.I):
             citation_names = re.split(r"\s*\(\d{4}\)", re.sub(r"^To cite this article:\s*", "", following[0], flags=re.I), maxsplit=1)[0]
-            if _names(citation_names) == names:
+            citation_block = " ".join(following)
+            citation_title = re.sub(r"^To cite this article:\s*.+?\(\d{4}\)\s*:\s*", "", citation_block, flags=re.I)
+            if (_names(citation_names) == names and (title_ok or any(
+                    _truncated_cover_title_matches(value, context.title_hint, citation_title)
+                    for value in title_candidates))):
                 return _result(names, sample, [line, following[0]], "text_bibliographic_byline")
+        if not title_ok:
+            continue
         if (any(re.search(r"\(Article\)\s*$", value) for value in following)
                 and any(re.match(r"^Published by\s+", value) for value in following)
                 and any(re.match(r"https?://muse\.jhu\.edu/article/", value) for value in lines[index + 1:index + 8])):

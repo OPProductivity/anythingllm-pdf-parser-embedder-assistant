@@ -26851,17 +26851,27 @@ def persist_grouped_upload_outcome(summary, document_result):
         }
     )
     _write_automatic_run_json(inspection / "api-upload-report.json", api_report)
-    post_report = _read_automatic_run_json(inspection / "post-upload-verification.json")
-    post_report.update(
-        {
-            "status": summary["post_upload_verification_status"],
-            "classification": summary["post_upload_classification"],
-            "expected_payload_count": summary["post_upload_expected_payloads"],
-            "matching_vector_rows": summary["post_upload_matching_vectors"],
-            "lancedb_matching_rows": summary["post_upload_matching_vectors"],
-            "grouped_batch_result": dict(document_result),
-        }
-    )
+    prepared_post_report = _read_automatic_run_json(inspection / "post-upload-verification.json")
+    confirmed = summary["post_upload_matching_vectors"]
+    expected = summary["post_upload_expected_payloads"]
+    post_report = {
+        "status": summary["post_upload_verification_status"],
+        "classification": summary["post_upload_classification"],
+        "workspace_slug": prepared_post_report.get("workspace_slug"),
+        "verification_scope": "selected_records_in_outer_grouped_batch",
+        "workspace_found": True if confirmed else None,
+        "workspace_document_count": None,
+        "expected_payload_count": expected,
+        "matching_vector_rows": confirmed,
+        "message": (
+            f"Outer grouped upload confirmed {confirmed} of {expected} selected record vectors. "
+            "See the grouped batch ledger for exact identities."
+            if document_result.get("searchability_proven") else
+            f"Outer grouped upload confirmed {confirmed} of {expected} selected record vectors; "
+            "exact coverage is incomplete or unverified."
+        ),
+        "grouped_batch_result": dict(document_result),
+    }
     _write_automatic_run_json(inspection / "post-upload-verification.json", post_report)
     _write_grouped_upload_csv(inspection / "post-upload-verification.csv", post_report)
     runtime_report = _read_automatic_run_json(inspection / "anythingllm-runtime-validation.json")

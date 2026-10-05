@@ -77,3 +77,25 @@ def test_profile_never_claims_complete_document_scope_from_sampled_pages():
     profile = classify_document([{"page": 1, "text": "Book Review\nBook Reviewed: Example"}])
     assert profile.sampled_pages == (1,)
     assert not profile.scope_complete
+
+
+@pytest.mark.parametrize("citation_credit,citation_title,expected", [
+    ("Sara Riva", "Tracing Invisibility as a Colonial Project: Indigenous Women Who Seek Asylum at the U.S.-Mexico Border", "Sara Riva"),
+    ("Another Person", "Tracing Invisibility as a Colonial Project: Indigenous Women Who Seek Asylum at the U.S.-Mexico Border", ""),
+    ("Sara Riva", "Tracing Invisibility as a Colonial Project: Indigenous Women Who Seek Asylum at the U.S.-Mexico Borderlands", ""),
+])
+def test_truncated_scholarly_pdf_title_needs_matching_publisher_citation(
+    citation_credit, citation_title, expected,
+):
+    visible = "Tracing Invisibility as a Colonial Project: Indigenous Women Who Seek Asylum at the U.S.-Mexico Border"
+    title = visible[:-2]
+    sample = {"page": 1, "text": (
+        "Journal of Immigrant & Refugee Studies\n"
+        "Tracing Invisibility as a Colonial Project: Indigenous\n"
+        "Women Who Seek Asylum at the U.S.-Mexico\n"
+        "Border\nSara Riva\n"
+        f"To cite this article: {citation_credit} (2021): {citation_title}\n"
+        "DOI: 10.1000/example"
+    )}
+    result = infer_author_from_samples([sample], Path("article.pdf"), title_hint=title)
+    assert result["author"] == expected

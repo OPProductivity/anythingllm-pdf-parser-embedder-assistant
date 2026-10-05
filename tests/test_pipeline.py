@@ -24385,6 +24385,11 @@ class PipelineCoreTests(unittest.TestCase):
             output = Path(tmpdir) / "prepared"
             (output / "inspection").mkdir(parents=True)
             summary = {"output_root": str(output), "api_upload_status": "skipped_prepare_only"}
+            (output / "inspection" / "post-upload-verification.json").write_text(
+                json.dumps({"workspace_slug": "workspace", "workspace_found": False,
+                            "workspace_document_count": 0, "message": "No upload was attempted.",
+                            "lancedb_matching_rows": 0}), encoding="utf-8",
+            )
             result = {
                 "status": "complete",
                 "records": 2,
@@ -24392,6 +24397,7 @@ class PipelineCoreTests(unittest.TestCase):
                 "embedded": 2,
                 "post_status": "pass",
                 "post_classification": "batch_exact_vector_evidence",
+                "searchability_proven": True,
                 "runtime_status": "deferred_after_exact_vector_proof",
                 "queue_requested": 2,
                 "queue_accepted": 2,
@@ -24406,6 +24412,11 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(run_summary["api_upload_status"], "complete")
         self.assertEqual(api_report["status"], "complete")
         self.assertEqual(post_report["status"], "pass")
+        self.assertEqual(post_report["workspace_found"], True)
+        self.assertIsNone(post_report["workspace_document_count"])
+        self.assertNotIn("lancedb_matching_rows", post_report)
+        self.assertNotIn("No upload", post_report["message"])
+        self.assertEqual(post_report["verification_scope"], "selected_records_in_outer_grouped_batch")
 
     def test_grouped_upload_attributes_attachment_error_to_its_pdf(self):
         import rag_pdf_gradio_app as app
