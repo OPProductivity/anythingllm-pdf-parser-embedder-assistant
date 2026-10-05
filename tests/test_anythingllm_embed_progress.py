@@ -1,5 +1,7 @@
+import hashlib
 import json
 import sqlite3
+import struct
 import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -20,6 +22,58 @@ from auto_anythingllm_pipeline import (
 
 
 pytestmark = pytest.mark.offline_deterministic
+
+
+def write_certified_cache(storage, location, *, metadata=None, vector=None, model="fixture-model"):
+    from embedding_cache import CACHE_CONTRACT, CACHE_MARKER
+
+    storage.mkdir(parents=True, exist_ok=True)
+    (storage / CACHE_MARKER).write_text(
+        json.dumps({"contract": CACHE_CONTRACT}), encoding="utf-8"
+    )
+    (storage / ".env").write_text(
+        "EMBEDDING_ENGINE=openrouter\n"
+        f"EMBEDDING_MODEL_PREF={model}\n"
+        "EMBEDDING_MODEL_MAX_CHUNK_LENGTH=8191\n",
+        encoding="utf-8",
+    )
+    with sqlite3.connect(storage / "anythingllm.db") as connection:
+        connection.execute(
+            "create table if not exists system_settings (label text primary key, value text)"
+        )
+        connection.executemany(
+            "insert or replace into system_settings(label,value) values (?,?)",
+            [("text_splitter_chunk_size", "1000"), ("text_splitter_chunk_overlap", "20")],
+        )
+    configuration = {
+        "engine": "openrouter", "model": model, "chunk_size": "1000",
+        "chunk_overlap": "20", "chunk_limit": "8191",
+    }
+    metadata = dict(metadata or {
+        "text": "cached text", "docSource": "local-pdf://fixture",
+        "chunkSource": "page-parent://fixture-p0001",
+    })
+    vector = list(vector or [0.25, -0.5, 0.75])
+    text = "\0".join(
+        str(metadata.get(name) or "") for name in ("text", "docSource", "chunkSource")
+    )
+    proof = {
+        "contract": CACHE_CONTRACT,
+        "configuration": configuration,
+        "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "vector_sha256": hashlib.sha256(
+            struct.pack("<" + "d" * len(vector), *vector)
+        ).hexdigest(),
+    }
+    cache_dir = storage / "vector-cache"
+    cache_dir.mkdir(exist_ok=True)
+    path = cache_dir / f"{uuid.uuid5(uuid.NAMESPACE_URL, location)}.json"
+    path.write_text(
+        json.dumps([[{"values": vector, "metadata": metadata,
+                      "pdfAssistantCacheIdentity": proof}]]),
+        encoding="utf-8",
+    )
+    return path
 
 
 def test_shadow_identity_hint_counts_distinct_sources_without_claiming_cache(tmp_path):
@@ -75,10 +129,13 @@ def test_renders_a_cache_reuse_status_only_for_explicit_cache_evidence(tmp_path)
     location = "custom-documents/page-parent-p001.txt"
     cache_dir = tmp_path / "vector-cache"
     cache_dir.mkdir()
-    (cache_dir / f"{uuid.uuid5(uuid.NAMESPACE_URL, location)}.json").write_text(
+    legacy = cache_dir / f"{uuid.uuid5(uuid.NAMESPACE_URL, location)}.json"
+    legacy.write_text(
         "[]", encoding="utf-8"
     )
 
+    assert not _anythingllm_vector_cache_hit(tmp_path, location)
+    write_certified_cache(tmp_path, location)
     assert _anythingllm_vector_cache_hit(tmp_path, location)
     assert not _anythingllm_vector_cache_hit(tmp_path, "custom-documents/other.txt")
     message = anythingllm_embed_progress_message(
@@ -107,10 +164,12 @@ def test_reuses_only_an_exact_cached_page_parent_document(tmp_path):
     document_path = tmp_path / "documents" / location
     document_path.parent.mkdir(parents=True)
     document_path.write_text(json.dumps(document), encoding="utf-8")
-    cache_dir = tmp_path / "vector-cache"
-    cache_dir.mkdir()
-    (cache_dir / f"{uuid.uuid5(uuid.NAMESPACE_URL, location)}.json").write_text(
-        "[]", encoding="utf-8"
+    write_certified_cache(
+        tmp_path, location,
+        metadata={
+            "text": document["pageContent"], "docSource": document["docSource"],
+            "chunkSource": document["chunkSource"],
+        },
     )
     payload = {
         "textContent": document["pageContent"],
@@ -143,10 +202,12 @@ def test_cached_reuse_respects_requested_document_folder_layout(tmp_path):
     document_path = tmp_path / "documents" / location
     document_path.parent.mkdir(parents=True)
     document_path.write_text(json.dumps(document), encoding="utf-8")
-    cache_dir = tmp_path / "vector-cache"
-    cache_dir.mkdir()
-    (cache_dir / f"{uuid.uuid5(uuid.NAMESPACE_URL, location)}.json").write_text(
-        "[]", encoding="utf-8"
+    write_certified_cache(
+        tmp_path, location,
+        metadata={
+            "text": document["pageContent"], "docSource": document["docSource"],
+            "chunkSource": document["chunkSource"],
+        },
     )
     payload = {
         "textContent": document["pageContent"],
@@ -180,11 +241,13 @@ def test_cached_reuse_uses_desktop_index_and_ignores_unattached_orphan(tmp_path)
         path = documents_root / candidate_location
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(document), encoding="utf-8")
-    cache_dir = tmp_path / "vector-cache"
-    cache_dir.mkdir()
     for candidate_location in (location, orphan_location):
-        (cache_dir / f"{uuid.uuid5(uuid.NAMESPACE_URL, candidate_location)}.json").write_text(
-            "[]", encoding="utf-8"
+        write_certified_cache(
+            tmp_path, candidate_location,
+            metadata={
+                "text": document["pageContent"], "docSource": document["docSource"],
+                "chunkSource": document["chunkSource"],
+            },
         )
     con = sqlite3.connect(tmp_path / "anythingllm.db")
     try:
@@ -222,10 +285,12 @@ def test_readonly_cache_snapshot_reuses_exact_indexed_payload_without_rescanning
     document_path = tmp_path / "documents" / location
     document_path.parent.mkdir(parents=True)
     document_path.write_text(json.dumps(document), encoding="utf-8")
-    cache_dir = tmp_path / "vector-cache"
-    cache_dir.mkdir()
-    (cache_dir / f"{uuid.uuid5(uuid.NAMESPACE_URL, location)}.json").write_text(
-        "[]", encoding="utf-8"
+    write_certified_cache(
+        tmp_path, location,
+        metadata={
+            "text": document["pageContent"], "docSource": document["docSource"],
+            "chunkSource": document["chunkSource"],
+        },
     )
     con = sqlite3.connect(tmp_path / "anythingllm.db")
     try:

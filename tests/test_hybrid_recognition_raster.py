@@ -98,5 +98,7 @@ def test_revised_ocr_cannot_receive_cache_credit_for_old_page_text(tmp_path):
         return {'status':'ready','documents_root':str(documents),'custom_documents':str(custom),
                 'cache_entry_names':{str(uuid.uuid5(uuid.NAMESPACE_URL,location))},
                 'locations_by_chunk_source':{metadata['chunkSource']:[location]}}
-    assert pipeline.find_reusable_cached_document_locations_from_snapshot(snapshot(),[original])==[location]
-    assert pipeline.find_reusable_cached_document_locations_from_snapshot(snapshot(),[corrected])==['']
+    with patch('embedding_cache.cache_configuration',return_value={'engine':'openrouter'}), \
+            patch('embedding_cache.cache_entry_usable',return_value=True):
+        assert pipeline.find_reusable_cached_document_locations_from_snapshot(snapshot(),[original])==[location]
+        assert pipeline.find_reusable_cached_document_locations_from_snapshot(snapshot(),[corrected])==['']

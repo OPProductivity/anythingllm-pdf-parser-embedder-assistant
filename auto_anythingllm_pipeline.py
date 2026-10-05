@@ -12693,30 +12693,12 @@ def _normalized_anythingllm_document_location(value):
     return str(value or "").replace("\\", "/").lstrip("./").casefold()
 
 
-def _anythingllm_vector_cache_hit(storage_dir, location):
-    """Return whether Desktop will reuse the exact queued document's vectors.
+def _anythingllm_vector_cache_hit(storage_dir, location, *, configuration=None):
+    """Observe usable cache content, never infer a hit from filename existence."""
+    from embedding_cache import cache_configuration, cache_entry_usable
 
-    AnythingLLM stores each cache entry under UUID-v5(URL, queued-path).json.
-    This mirrors its read-only existence check; it does not infer cache reuse
-    from elapsed time, inspect vector content, or treat a cache entry as
-    completion evidence. The subsequent Desktop queue event and exact vector
-    confirmation still establish that the page-parent record was written.
-    """
-    if not storage_dir or not str(location or "").strip():
-        return False
-    try:
-        cache_dir = Path(storage_dir) / "vector-cache"
-        if not cache_dir.is_dir():
-            return False
-        original = str(location)
-        normalized_separators = original.replace("\\", "/")
-        candidates = list(dict.fromkeys((original, normalized_separators)))
-        return any(
-            (cache_dir / f"{uuid.uuid5(uuid.NAMESPACE_URL, candidate)}.json").is_file()
-            for candidate in candidates
-        )
-    except (OSError, TypeError, ValueError):
-        return False
+    policy = cache_configuration(storage_dir) if configuration is None else configuration
+    return cache_entry_usable(storage_dir, location, configuration=policy)
 
 
 def _page_parent_payload_reuse_key(payload):
@@ -12889,7 +12871,10 @@ def find_reusable_cached_document_locations(
             for folder in raw_folders
         ]
     try:
+        from embedding_cache import cache_configuration, cache_entry_usable
+
         storage = Path(storage_dir)
+        cache_policy = cache_configuration(storage)
         documents_root = (storage / "documents").resolve()
         custom_documents = (documents_root / "custom-documents").resolve()
         if not custom_documents.is_dir() or not custom_documents.is_relative_to(documents_root):
@@ -12952,6 +12937,8 @@ def find_reusable_cached_document_locations(
                 if allowed_folders is not None and relative_folder not in allowed_folders:
                     continue
                 if str(uuid.uuid5(uuid.NAMESPACE_URL, relative)) not in cache_entry_names:
+                    continue
+                if not cache_entry_usable(storage, relative, configuration=cache_policy):
                     continue
                 raw_bytes = resolved_candidate.read_bytes()
                 # ``chunkSource`` is part of the final hash below.  Checking
@@ -13119,6 +13106,10 @@ def find_reusable_cached_document_locations_from_snapshot(
         custom_documents = Path(str(snapshot.get("custom_documents") or "")).resolve()
         if not custom_documents.is_dir() or not custom_documents.is_relative_to(documents_root):
             return reusable
+        from embedding_cache import cache_configuration, cache_entry_usable
+
+        cache_storage = documents_root.parent
+        cache_policy = cache_configuration(cache_storage)
         cache_entry_names = set(snapshot.get("cache_entry_names") or ())
         locations_by_chunk_source = snapshot.get("locations_by_chunk_source") or {}
         claimed_locations = snapshot.setdefault("claimed_locations", set())
@@ -13137,6 +13128,10 @@ def find_reusable_cached_document_locations_from_snapshot(
                     continue
                 try:
                     if str(uuid.uuid5(uuid.NAMESPACE_URL, location)) not in cache_entry_names:
+                        continue
+                    if not cache_entry_usable(
+                        cache_storage, location, configuration=cache_policy
+                    ):
                         continue
                     candidate = documents_root / Path(location)
                     if candidate.is_symlink():
@@ -14599,6 +14594,32 @@ def create_temporary_desktop_api_key(api_url):
         }
 
 
+def observe_temporary_desktop_key_absence(api_url, key_id, api_key=None):
+    """Verify one key ID in only the OS-bound local Desktop store."""
+    try:
+        storage = managed_key_storage(api_key) if api_key else None
+        storage = Path(storage) if storage else default_anythingllm_storage_dir()
+        if not desktop_listener(api_url, storage):
+            return {
+                "status": "unavailable",
+                "reason": "desktop_storage_identity_not_verified",
+            }
+        from contextlib import closing
+
+        with closing(
+            sqlite_readonly_connection(storage / "anythingllm.db", timeout=0.1)
+        ) as connection:
+            found = connection.execute(
+                "select 1 from api_keys where id=?", (int(key_id),)
+            ).fetchone()
+        return {"status": "present" if found else "absent"}
+    except (OSError, ValueError, TypeError, sqlite3.Error):
+        return {
+            "status": "unavailable",
+            "reason": "key_absence_observation_unavailable",
+        }
+
+
 def delete_temporary_desktop_api_key(api_url, key_id, api_key=None):
     if not key_id:
         return {"status": "not_applicable", "error": ""}
@@ -14606,10 +14627,18 @@ def delete_temporary_desktop_api_key(api_url, key_id, api_key=None):
     try:
         management_key, _ = resolve_anythingllm_api_key(api_url, api_key)
         status, _ = delete_json(endpoint, api_key=management_key or None)
+        absence = observe_temporary_desktop_key_absence(
+            api_url, key_id, management_key or api_key
+        )
+        verified = 200 <= status < 300 and absence["status"] == "absent"
         return {
-            "status": "deleted" if 200 <= status < 300 else "delete_failed",
+            "status": "deleted" if verified else "delete_failed",
             "http_status": status,
-            "error": "",
+            "absence_verification": absence,
+            "error": (
+                "" if verified
+                else "Temporary API-key deletion was not independently confirmed."
+            ),
         }
     except Exception as exc:
         return {"status": "delete_failed", "error": str(exc)}
@@ -18122,10 +18151,15 @@ def update_workspace_embeddings_desktop_queue(
     # Take this read-only snapshot before the request is submitted.  Checking
     # from a later ``doc_complete`` callback can observe a cache file written
     # by the current run and incorrectly claim that it was reused.
+    from embedding_cache import cache_configuration
+
+    cache_policy = cache_configuration(storage_dir)
     preexisting_cached_locations = {
         _normalized_anythingllm_document_location(location)
         for location in unique_locations
-        if _anythingllm_vector_cache_hit(storage_dir, location)
+        if _anythingllm_vector_cache_hit(
+            storage_dir, location, configuration=cache_policy
+        )
     }
     # Preserve cache/fresh *runs* in queued order, rather than only the two
     # totals.  A mixed Desktop group can process (for example) a short cached
@@ -22533,8 +22567,19 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
             }
             # The initial live snapshot stays cheap. Only a complete mapping
             # candidate or an explicit recovery/deep read opens physical IDs.
+            expected_provenance = {
+                str(location or "").replace("\\", "/").lstrip("/"):
+                dict(payload.get("metadata") or {})
+                for location, payload in zip(upload_locations or [], expected_payloads)
+                if isinstance(payload, dict)
+            } if len(upload_locations or []) == len(expected_payloads) else {}
             physical = (
-                observe_submission_vector_ids(storage_dir, workspace_slug, location_vector_ids)
+                observe_submission_vector_ids(
+                    storage_dir,
+                    workspace_slug,
+                    location_vector_ids,
+                    expected_provenance=expected_provenance,
+                )
                 if current_raw_documents_complete or attachment_only_observation
                 or normalized_observation_mode not in {"fast"}
                 else {"status": "deferred", "complete": False, "locations_with_vectors": []}
@@ -22547,6 +22592,16 @@ def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha
                 current_raw_documents_complete and physical["complete"]
                 and len(physical["locations_with_vectors"]) == expected_count
             )
+            if physical.get("provenance_mismatched_vector_count"):
+                result.update(
+                    status="vector_provenance_mismatch",
+                    classification="current_submission_vector_provenance_mismatch",
+                    message=(
+                        "Mapped vectors exist but their stored source/page identities "
+                        "do not match this submission."
+                    ),
+                )
+                return result
         matching_docs = []
         for doc in docs:
             haystack = " ".join(str(doc.get(key) or "") for key in ["filename", "docpath", "metadata"])

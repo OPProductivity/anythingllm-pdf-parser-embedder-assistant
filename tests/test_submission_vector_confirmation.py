@@ -32,7 +32,12 @@ def storage_fixture(tmp_path, *, physical=True, namespace='target', expanded=Fal
     connection.close()
     if physical:
         lancedb.connect(str(tmp_path / 'lancedb')).create_table(namespace, data=[
-            {'id': identity, 'vector': [1.0, 2.0, 3.0]} for identity in ids
+            {
+                'id': identity, 'vector': [1.0, 2.0, 3.0],
+                'docSource': 'local-pdf://fixture',
+                'chunkSource': 'segment://owned',
+            }
+            for identity in ids
         ])
     return location, ids
 
@@ -80,6 +85,28 @@ def test_one_missing_internal_vector_keeps_record_unconfirmed(tmp_path):
     assert result['locations_with_vectors'] == []
 
 
+def test_existing_vector_id_with_wrong_source_identity_is_not_confirmation(tmp_path):
+    location, _ = storage_fixture(tmp_path)
+    table = lancedb.connect(str(tmp_path / 'lancedb')).open_table('target')
+    table.update(
+        where="id = 'owned-1'",
+        values={'docSource': 'local-pdf://wrong', 'chunkSource': 'segment://wrong'},
+    )
+    result = observe_submission_vector_ids(
+        tmp_path,
+        'target',
+        {location: {'owned-1'}},
+        expected_provenance={location: {
+            'docSource': 'local-pdf://fixture',
+            'chunkSource': 'segment://owned',
+        }},
+    )
+    assert result['status'] == 'provenance_mismatch'
+    assert result['matched_vector_count'] == 1
+    assert result['provenance_mismatched_vector_count'] == 1
+    assert not result['complete'] and result['locations_with_vectors'] == []
+
+
 @pytest.mark.parametrize('mode,should_read', [('fast', False), ('current_upload', True)])
 def test_partial_fast_snapshot_defers_physical_read_but_explicit_recovery_checks(tmp_path, mode, should_read):
     location, _ = storage_fixture(tmp_path)
@@ -90,7 +117,7 @@ def test_partial_fast_snapshot_defers_physical_read_but_explicit_recovery_checks
                               wraps=observe_submission_vector_ids) as physical:
         report = pipeline.verify_anythingllm_post_upload(
             tmp_path, 'target', '', [
-                {'metadata': {'chunkSource': 'segment://one'}},
+                {'metadata': {'chunkSource': 'segment://owned'}},
                 {'metadata': {'chunkSource': 'segment://two'}},
             ], upload_locations=[location, 'custom-documents/not-yet-mapped.json'],
             observation_mode=mode,

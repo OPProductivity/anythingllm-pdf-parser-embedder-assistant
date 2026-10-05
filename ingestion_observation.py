@@ -29,11 +29,21 @@ async def bounded_stream_lines(response):
         yield bytes(pending).rstrip(b"\r").decode("utf-8", errors="replace")
 
 
-def observe_submission_vector_ids(storage_dir, workspace_slug, location_vector_ids):
-    """Prove mapped IDs in only the selected namespace, without loading text."""
+def observe_submission_vector_ids(
+    storage_dir,
+    workspace_slug,
+    location_vector_ids,
+    *,
+    expected_provenance=None,
+):
+    """Prove mapped IDs and supplied source identities in the selected namespace."""
     expected = {str(value) for values in location_vector_ids.values() for value in values}
-    result = {'status': 'pending', 'expected_vector_count': len(expected),
-              'matched_vector_count': 0, 'locations_with_vectors': [], 'complete': False}
+    result = {
+        'status': 'pending', 'expected_vector_count': len(expected),
+        'matched_vector_count': 0, 'locations_with_vectors': [], 'complete': False,
+        'provenance_checked': False, 'provenance_mismatched_vector_count': 0,
+        'provenance_mismatches': [],
+    }
     vector_store = Path(storage_dir) / 'lancedb'
     if not expected or not workspace_slug or not vector_store.is_dir():
         return result
@@ -42,20 +52,59 @@ def observe_submission_vector_ids(storage_dir, workspace_slug, location_vector_i
 
         table = lancedb.connect(str(vector_store)).open_table(workspace_slug)
         present = set()
+        accepted = set()
+        provenance_by_id = {}
+        for location, values in location_vector_ids.items():
+            identity = (expected_provenance or {}).get(location) or {}
+            wanted = {
+                name: str(identity.get(name) or '').strip()
+                for name in ('docSource', 'chunkSource')
+                if str(identity.get(name) or '').strip()
+            }
+            for value in values:
+                provenance_by_id.setdefault(str(value), []).append(wanted)
+        fields = sorted({
+            name
+            for identities in provenance_by_id.values()
+            for identity in identities
+            for name in identity
+        })
+        columns = set(table.schema.names)
+        selected = ['id'] + [name for name in fields if name in columns]
+        result['provenance_checked'] = bool(fields)
+        mismatched = set()
         ids = sorted(expected)
         for start in range(0, len(ids), 256):
             batch = ids[start:start + 256]
             quoted = ','.join("'" + value.replace("'", "''") + "'" for value in batch)
             rows = (table.search().where(f'id IN ({quoted})', prefilter=True)
-                    .select(['id']).limit(len(batch)).to_arrow().to_pylist())
-            present.update(str(row['id']) for row in rows)
+                    .select(selected).limit(len(batch)).to_arrow().to_pylist())
+            for row in rows:
+                identity = str(row['id'])
+                present.add(identity)
+                wrong = sorted({
+                    name
+                    for wanted in provenance_by_id.get(identity, [])
+                    for name, value in wanted.items()
+                    if str(row.get(name) or '').strip() != value
+                })
+                if wrong:
+                    mismatched.add(identity)
+                    if len(result['provenance_mismatches']) < 25:
+                        result['provenance_mismatches'].append(
+                            {'id': identity, 'fields': wrong}
+                        )
+                else:
+                    accepted.add(identity)
         result.update({
-            'status': 'complete', 'matched_vector_count': len(expected & present),
+            'status': 'provenance_mismatch' if mismatched else 'complete',
+            'matched_vector_count': len(expected & present),
+            'provenance_mismatched_vector_count': len(mismatched),
             'locations_with_vectors': sorted(
                 location for location, values in location_vector_ids.items()
-                if values and set(values).issubset(present)
+                if values and set(values).issubset(accepted)
             ),
-            'complete': expected.issubset(present),
+            'complete': expected.issubset(accepted),
         })
     except Exception as exc:
         # Missing/busy physical storage is uncertainty, never retry authority.

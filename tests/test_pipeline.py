@@ -20043,6 +20043,7 @@ class PipelineCoreTests(unittest.TestCase):
         original_post = pipeline.post_json
         original_tracker = pipeline.start_json_post_response_tracker
         original_listener = pipeline.start_anythingllm_embed_progress_listener
+        original_cache_hit = pipeline._anythingllm_vector_cache_hit
         statuses = []
         reports = []
         location = "custom-documents/page-parent-cache-test.txt"
@@ -20080,6 +20081,7 @@ class PipelineCoreTests(unittest.TestCase):
                     }
 
                 pipeline.start_anythingllm_embed_progress_listener = fake_listener
+                pipeline._anythingllm_vector_cache_hit = lambda *_args, **_kwargs: True
                 pipeline.post_json = lambda *_args, **_kwargs: (200, json.dumps({"success": True}))
                 pipeline.start_json_post_response_tracker = fake_json_post_tracker(
                     lambda _body, _abandoned: {"kind": "http_response", "status": 200, "response_text": "{}"}
@@ -20100,6 +20102,7 @@ class PipelineCoreTests(unittest.TestCase):
                 pipeline.post_json = original_post
                 pipeline.start_json_post_response_tracker = original_tracker
                 pipeline.start_anythingllm_embed_progress_listener = original_listener
+                pipeline._anythingllm_vector_cache_hit = original_cache_hit
 
         assert any("reusing cached embeddings" in message for message in statuses)
         assert any(report.get("desktop_queue_vector_cache_hit") is True for report in reports)
