@@ -25,14 +25,51 @@ def test_off_centre_gutter_places_complete_left_column_first():
     assert Counter(map(id, ordered)) == Counter(map(id, rows))
 
 
-def test_three_prose_tracks_are_not_forced_through_two_column_rule():
+def test_three_prose_tracks_follow_each_column_without_losing_rows():
     rows = [row(f"Column {column} has a complete and useful prose sentence {index}.", x, x + 152,
                 310 + index * 15)
             for column, x in enumerate((81, 249, 417), start=1) for index in range(25)]
     baseline = sorted(rows, key=lambda item: (item["y0"], item["x0"]))
     ordered, kind, reason, profile = verified_page_order(rows, 629, 811, baseline, "two_column_column_first")
-    assert ordered == baseline
-    assert (kind, reason, profile) == ("two_column_column_first", "three_column_layout_needs_review", "three_column")
+    assert [item["text"].split()[1] for item in ordered] == [str(number) for number in (1, 2, 3) for _ in range(25)]
+    assert Counter(map(id, ordered)) == Counter(map(id, rows))
+    assert (kind, reason, profile) == ("three_column_column_first", "verified_three_column_tracks", "three_column")
+
+
+def test_three_column_title_precedes_body_and_wide_caption_follows_it():
+    rows = [row(f"Column {column} has a complete and useful prose sentence {index}.", x, x + 152,
+                310 + index * 15)
+            for column, x in enumerate((81, 249, 417), start=1) for index in range(25)]
+    title = {**row("A large title across these three columns.", 81, 548, 100), "font_sizes": [25]}
+    caption = {**row("Figure caption spanning two columns of the page.", 249, 565, 250), "font_sizes": [7]}
+    rows.extend((title, caption))
+    baseline = sorted(rows, key=lambda item: (item["y0"], item["x0"]))
+    ordered, kind, reason, profile = verified_page_order(rows, 629, 811, baseline, "two_column_column_first")
+    assert ordered[0] is title
+    assert ordered[-1] is caption
+    assert [item["text"].split()[1] for item in ordered[1:-1]] == [str(number) for number in (1, 2, 3) for _ in range(25)]
+    assert Counter(map(id, ordered)) == Counter(map(id, rows))
+    assert (kind, reason, profile) == ("three_column_column_first", "verified_three_column_tracks", "three_column")
+
+
+def test_three_column_sustained_large_callout_does_not_split_a_body_sentence():
+    rows = [row(f"Column {column} has a complete and useful prose sentence {index}.", x, x + 152,
+                310 + index * 15)
+            for column, x in enumerate((81, 249, 417), start=1) for index in range(25)]
+    callout = [
+        {**row(f"Large display quotation line {index}.", 249, 400, 385 + index * 17),
+         "font_sizes": [16]}
+        for index in range(4)
+    ]
+    rows.extend(callout)
+    baseline = sorted(rows, key=lambda item: (item["y0"], item["x0"]))
+    ordered, kind, _, _ = verified_page_order(rows, 629, 811, baseline, "two_column_column_first")
+    assert kind == "three_column_column_first"
+    assert [item["text"].split()[1] for item in ordered[:-4]] == [
+        str(number) for number in (1, 2, 3) for _ in range(25)
+    ]
+    assert ordered[-4:] == callout
+    assert Counter(map(id, ordered)) == Counter(map(id, rows))
 
 
 def test_sustained_single_column_rejoins_inline_fragments_without_losing_characters():

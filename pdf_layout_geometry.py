@@ -42,6 +42,66 @@ def _three_prose_tracks(rows, width, height):
     return shared >= height * .18
 
 
+def _three_column_order(rows, width, height):
+    prose = sorted(_body_prose(rows, width, height), key=lambda row: row["x0"])
+    bands = []
+    for row in prose:
+        if not bands or row["x0"] - bands[-1][-1]["x0"] > width * .095:
+            bands.append([row])
+        else:
+            bands[-1].append(row)
+    bands = [band for band in bands if len(band) >= 8 and _coverage(band) >= height * .20]
+    if len(bands) != 3:
+        return None
+    starts = [statistics.median(row["x0"] for row in band) for band in bands]
+    boundaries = [(starts[0] + starts[1]) / 2, (starts[1] + starts[2]) / 2]
+    column_width = statistics.median(right - left for left, right in zip(starts, starts[1:])) * .91
+    body_sizes = [size for row in prose for size in row.get("font_sizes", []) if size > 0]
+    body_size = statistics.median(body_sizes) if body_sizes else 10
+    large_rows = sorted(
+        (row for row in rows
+         if row["y0"] >= height * .24
+         and row["x1"] - row["x0"] <= column_width * 1.48
+         and statistics.median(row.get("font_sizes") or [body_size]) >= body_size * 1.45),
+        key=lambda row: (row["x0"], row["y0"]),
+    )
+    large_groups = []
+    for row in large_rows:
+        if (not large_groups
+                or abs(row["x0"] - large_groups[-1][-1]["x0"]) > 4
+                or row["y0"] - large_groups[-1][-1]["y1"] > body_size * 1.5):
+            large_groups.append([row])
+        else:
+            large_groups[-1].append(row)
+    callout_ids = {
+        id(row) for group in large_groups
+        if len(group) >= 3 and _coverage(group) >= height * .06
+        for row in group
+    }
+    preamble, columns, spanning = [], [[], [], []], []
+    for row in rows:
+        extent = row["x1"] - row["x0"]
+        row_size = statistics.median(row.get("font_sizes") or [body_size])
+        if id(row) in callout_ids:
+            spanning.append(row)
+        elif (extent > column_width * 1.25 and row["y0"] < height * .24
+                and row_size >= body_size * 1.45):
+            preamble.append(row)
+        elif extent > column_width * 1.48:
+            spanning.append(row)
+        else:
+            x = row["x0"]
+            column = 0 if x < boundaries[0] else 1 if x < boundaries[1] else 2
+            columns[column].append(row)
+    if min(len(column) for column in columns) < 8:
+        return None
+    def visual(row):
+        return row["y0"], row["x0"]
+    return (sorted(preamble, key=visual)
+            + [row for column in columns for row in sorted(column, key=visual)]
+            + sorted(spanning, key=visual))
+
+
 def _measured_gutter(rows, width, height):
     prose = _body_prose(rows, width, height)
     full = [row for row in prose if row["x1"] - row["x0"] >= width * .55]
@@ -145,6 +205,9 @@ def _join_inline(rows, width):
 def verified_page_order(rows, width, height, baseline, baseline_kind):
     """Change order only for measured columns or sustained single-column prose."""
     if _three_prose_tracks(rows, width, height):
+        ordered = _three_column_order(rows, width, height)
+        if ordered is not None:
+            return ordered, "three_column_column_first", "verified_three_column_tracks", "three_column"
         return baseline, baseline_kind, "three_column_layout_needs_review", "three_column"
     split = _measured_gutter(rows, width, height)
     if split is not None and baseline_kind == "two_column_column_first":

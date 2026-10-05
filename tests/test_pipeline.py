@@ -20186,12 +20186,12 @@ class PipelineCoreTests(unittest.TestCase):
             pipeline.start_anythingllm_embed_progress_listener = original_listener
 
         batch = result["batches"][0]
-        self.assertLess(elapsed, 0.20, batch)
+        self.assertLess(elapsed, 0.60, batch)
         self.assertEqual(batch["acceptance_basis"], "owned_desktop_queue_event_before_http_receipt")
         self.assertEqual(batch["receipt_state"], "owned_queue_event_observed")
         self.assertTrue(batch["http_response_pending_at_queue_receipt"])
         self.assertTrue(batch["request_thread_terminated"])
-        self.assertEqual(batch["http_response_state"], "response_read_closed_after_owned_queue_receipt")
+        self.assertEqual(batch["http_response_state"], "http_response_drained")
         self.assertIsNone(batch["submission_seconds"])
         self.assertGreater(batch["queue_receipt_seconds"], 0.0)
         self.assertTrue(batch["searchability_proven"])

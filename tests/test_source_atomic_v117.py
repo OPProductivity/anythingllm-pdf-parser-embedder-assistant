@@ -212,6 +212,15 @@ def test_production_post_marks_only_local_cross_record_sources(monkeypatch, url,
         def wait(self, timeout=None):
             return True
 
+        def is_alive(self):
+            return False
+
+        def join(self, timeout=None):
+            return None
+
+        def close_response_read(self):
+            return None
+
         def outcome(self):
             return {"kind": "http_response", "status": 200, "response_text": "{}"}
 

@@ -10161,8 +10161,8 @@ class _JsonPostResponseTracker:
 
     Desktop begins its durable queue work before its synchronous route handler
     returns.  Once a path-correlated queue event proves that the request body
-    crossed that boundary, the client should not occupy a response socket just
-    to learn a late status.  ``urllib`` does not expose the underlying socket
+    crossed that boundary, vector reconciliation can run while the bounded
+    response reader drains the late status.  ``urllib`` does not expose the underlying socket
     while it is blocked in ``urlopen``, so this narrow transport keeps the
     connection handle under explicit ownership.  It never retries: retry
     policy remains with the caller, which can distinguish an explicit refusal
@@ -10212,11 +10212,10 @@ class _JsonPostResponseTracker:
         self.thread.join(timeout=timeout)
 
     def close_response_read(self):
-        """Release a blocked response read after a durable queue receipt.
+        """Release a blocked response read at its owner's terminal boundary.
 
-        This must only be called once Desktop has emitted the path-correlated
-        event for this POST.  Closing earlier would make the mutation boundary
-        ambiguous; closing here cannot turn that known mutation into a retry.
+        Closure never authorizes replay. If ownership was not observed, the
+        mutation remains ambiguous and must retain normal reconciliation rules.
         """
         self.response_read_abandoned.set()
         with self._socket_lock:
@@ -14512,7 +14511,148 @@ def _write_embedding_batch_ledger(ledger_path, workspace_slug, result):
         write_json(resume_path, payload, compact=True)
 
 
-def _update_workspace_embeddings_batched_serial(
+class _OwnedHttpResponseDrain:
+    """Keep one bounded response reader owned through vector reconciliation."""
+
+    def __init__(self, cancel_callback=None):
+        self.reader: _JsonPostResponseTracker | None = None
+        self.report: dict[str, Any] | None = None
+        self.result: dict[str, Any] | None = None
+        self.owned = False
+        self.cancel_callback = cancel_callback
+        self.unsubscribe: Any = None
+        self.activity_count = 0
+        self.last_activity: dict[str, Any] = {}
+        self.last_progress: tuple[Any, ...] | None = None
+        self.attempt_elapsed: dict[str, float] = {}
+
+    def register(self, reader, report, receipt_observer=None):
+        self.reader, self.report, self.owned = reader, report, False
+        self.activity_count, self.last_activity, self.last_progress = 0, {}, None
+        self.attempt_elapsed = {}
+        subscribe = getattr(receipt_observer, "subscribe_response_activity", None)
+        if callable(subscribe):
+            self.unsubscribe = subscribe(self.observe_progress)
+
+    def observe_progress(self, event, snapshot):
+        if not self.owned or self.reader is None or not self.reader.is_alive():
+            return
+        kind = str(event.get("type") or "")
+        if kind not in {"doc_starting", "doc_complete", "chunk_progress", "all_complete",
+                        "source_staging_provider_batch", "source_staging_finished",
+                        "source_staging_provider_batch_waiting"}:
+            return
+        progress = (
+            snapshot.get("desktop_queue_completed", 0),
+            snapshot.get("desktop_queue_current", 0),
+            snapshot.get("source_atomic_provider_batch_count", 0),
+            snapshot.get("source_atomic_provider_chunk_count", 0),
+            event.get("chunkIndex", -1), kind == "all_complete",
+        )
+        if kind == "source_staging_provider_batch_waiting":
+            attempt = str(event.get("attempt_id") or "").strip()
+            try:
+                elapsed = float(event.get("elapsed_ms") or 0)
+            except (TypeError, ValueError):
+                return
+            if not attempt or not math.isfinite(elapsed) or elapsed <= self.attempt_elapsed.get(attempt, 0):
+                return
+            self.attempt_elapsed[attempt] = elapsed
+        else:
+            if progress == self.last_progress:
+                return
+            self.last_progress = progress
+        lease = getattr(self.reader, "grant_response_activity_lease", None)
+        if callable(lease):
+            grant = cast(dict[str, Any], lease(
+                idle_seconds=ANYTHINGLLM_SOURCE_ATOMIC_RECEIPT_ACTIVITY_LEASE_SECONDS,
+                max_total_seconds=ANYTHINGLLM_SOURCE_ATOMIC_RECEIPT_MAX_SECONDS,
+            ))
+            if grant.get("granted"):
+                self.activity_count += 1
+                self.last_activity = {"event_type": kind, **grant}
+
+    def finish(self, reason):
+        reader, report = self.reader, self.report
+        if reader is None or report is None:
+            return False
+        if callable(self.unsubscribe):
+            self.unsubscribe()
+            self.unsubscribe = None
+        report["response_reconciliation_activity_count"] = self.activity_count
+        report["response_reconciliation_last_activity"] = self.last_activity
+        # Exact vector proof permits this short, event-driven transport cleanup.
+        # Event.wait returns immediately when the reader has a complete outcome.
+        if (reason == "batch_terminal" and self.owned
+                and report.get("searchability_proven") and reader.is_alive()):
+            started = time.monotonic()
+            deadline = started + 2.0
+            exit_reason = "response_completed"
+            while reader.is_alive():
+                if callable(self.cancel_callback) and self.cancel_callback():
+                    exit_reason = "cancelled"
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    exit_reason = "cleanup_budget_exhausted"
+                    break
+                # Legacy cancellation is a callback; only that check is polled.
+                # Response completion wakes the existing Event immediately.
+                interval = min(0.05, remaining) if callable(self.cancel_callback) else remaining
+                if reader.wait(timeout=interval):
+                    exit_reason = "response_completed"
+                    break
+            report["response_cleanup_wait_seconds"] = round(time.monotonic() - started, 4)
+            report["response_cleanup_wait_result"] = exit_reason
+        if reader.is_alive():
+            reader.close_response_read()
+        reader.join(timeout=0.75)
+        terminated = not reader.is_alive()
+        if self.owned:
+            outcome = reader.outcome()
+            diagnostic = {
+                key: (str(value)[:500] if isinstance(value, BaseException) or key == "response_text" else value)
+                for key, value in outcome.items()
+            }
+            state = ("http_response_drained" if outcome.get("kind") == "http_response"
+                     else "response_read_closed_at_terminal")
+            if not terminated:
+                state = "response_reader_release_incomplete"
+            report.update({
+                "late_http_outcome": diagnostic,
+                "http_response_state": state,
+                "request_thread_terminated": terminated,
+                "response_reader_cleanup_reason": reason,
+            })
+            if outcome.get("status") is not None:
+                report["late_http_status"] = outcome["status"]
+            if self.result is not None:
+                self.result["runtime_events"].append({
+                    "event": ("owned_queue_response_reader_finalized" if terminated
+                              else "owned_queue_response_reader_release_incomplete"),
+                    "batch": report["batch"],
+                    "http_response_state": state,
+                    "request_thread_terminated": terminated,
+                    "cleanup_reason": reason,
+                    "late_http_outcome": diagnostic,
+                    "retry_authorized": False,
+                })
+                if not terminated and not report.get("response_reader_release_failure_recorded"):
+                    report["response_reader_release_failure_recorded"] = True
+                    self.result["errors"].append({
+                        "endpoint": "response-reader-cleanup",
+                        "batch": report["batch"],
+                        "error": "HTTP response reader did not terminate; later submissions stopped.",
+                    })
+                inflight = self.result.get("inflight_batch")
+                if inflight and inflight.get("batch") == report["batch"]:
+                    self.result["inflight_batch"] = dict(report)
+        if terminated:
+            self.reader = self.report = None
+        return self.owned
+
+
+def _update_workspace_embeddings_batched_serial_impl(
     api_url,
     api_key,
     workspace_slug,
@@ -14531,6 +14671,8 @@ def _update_workspace_embeddings_batched_serial(
     submission_timeout_override=None,
     location_sources=None,
     receipt_observer=None,
+    *,
+    _response_drain: _OwnedHttpResponseDrain,
 ):
     """Submit a bounded sequence of embedding updates and retain partial progress.
 
@@ -14575,6 +14717,9 @@ def _update_workspace_embeddings_batched_serial(
         request thread remains read-only after its body was sent; later source
         windows remain gated by exact vector proof for this source.
         """
+        _response_drain.finish("before_next_submission")
+        if _response_drain.reader is not None:
+            raise RuntimeError("Previous HTTP response reader did not terminate; no new POST was sent.")
         submission_started_monotonic = time.monotonic()
         receipt_context = {
             "batch": batch_number,
@@ -14616,6 +14761,7 @@ def _update_workspace_embeddings_batched_serial(
             api_key=api_key,
             timeout=max(1, int(math.ceil(timeout_seconds))),
         )
+        _response_drain.register(request_tracker, batch_report, receipt_observer)
         source_atomic_activity_leases = []
         # The direct HTTP response remains the preferred receipt.  Poll the
         # existing observer only while it is still pending; this adds no new
@@ -14662,25 +14808,21 @@ def _update_workspace_embeddings_batched_serial(
                     **grant,
                 })
                 continue
-            # The request body has already crossed the known mutation
-            # boundary. Stop consuming the late synchronous response instead
-            # of retaining a daemon socket for the old 20-second deadline.
-            # The exact-vector reconciler remains the completion authority.
-            # Snapshot this *before* closing the response read.  It answers
-            # the useful diagnostic question ("was HTTP still pending when
-            # Desktop ownership was proven?"); ``request_thread_terminated``
-            # below separately records whether the deliberate release worked.
+            # Ownership permits vector reconciliation while this bounded reader
+            # drains the same response. A later status cannot authorize replay.
             http_pending_at_queue_receipt = request_tracker.is_alive()
-            request_tracker.close_response_read()
-            request_tracker.join(timeout=0.75)
-            late_outcome = request_tracker.outcome()
+            _response_drain.owned = True
+            late_outcome = {
+                key: str(value)[:500] if isinstance(value, BaseException) else value
+                for key, value in request_tracker.outcome().items()
+            }
             return {
                 "kind": "owned_queue_evidence",
                 "evidence": dict(evidence),
                 "receipt_wait_seconds": round(observed_after_seconds, 4),
                 "http_response_state": (
-                    "response_read_closed_after_owned_queue_receipt"
-                    if not late_outcome or late_outcome.get("kind") == "response_read_abandoned"
+                    "response_read_draining_during_reconciliation"
+                    if request_tracker.is_alive()
                     else "http_response_observed_after_owned_queue_receipt"
                 ),
                 "late_http_outcome": late_outcome,
@@ -14756,6 +14898,7 @@ def _update_workspace_embeddings_batched_serial(
             if source_by_location.get(location)
         ],
     }
+    _response_drain.result = result
     _write_embedding_batch_ledger(ledger_path, workspace_slug, result)
     endpoint = api_url.rstrip("/") + f"/api/v1/workspace/{workspace_slug}/update-embeddings"
     batch_plan = []
@@ -14940,14 +15083,13 @@ def _update_workspace_embeddings_batched_serial(
                             "receipt_state": "owned_queue_event_observed",
                             "receipt_evidence": receipt_evidence,
                             "queue_receipt_seconds": batch_report["receipt_wait_seconds"],
-                            # No HTTP-response duration exists when we have closed
-                            # the response read. Do not pollute ETA history with a
+                            # HTTP may still be pending. Do not pollute ETA history with a
                             # queue-event latency disguised as submission time.
                             "submission_seconds": None,
                             "http_response_seconds": None,
                             "http_response_state": str(
                                 receipt_outcome.get("http_response_state")
-                                or "response_read_closed_after_owned_queue_receipt"
+                                or "response_read_draining_during_reconciliation"
                             ),
                             "http_response_pending_at_queue_receipt": bool(
                                 receipt_outcome.get("http_request_pending")
@@ -14985,20 +15127,6 @@ def _update_workspace_embeddings_batched_serial(
                             if batch_report.get("late_http_status") is not None:
                                 receipt_event["late_http_status"] = batch_report["late_http_status"]
                         result["runtime_events"].append(receipt_event)
-                        if not batch_report["request_thread_terminated"]:
-                            # This is not a retry trigger: the owned queue
-                            # receipt still makes replay unsafe. Record the
-                            # rare release failure explicitly so a later run
-                            # audit can distinguish it from Desktop slowness
-                            # or a normal completed response reader.
-                            result["runtime_events"].append({
-                                "event": "owned_queue_response_reader_release_incomplete",
-                                "batch": batch_number,
-                                "message": (
-                                    "The client response reader was still alive after its bounded release; "
-                                    "no retry was attempted because Desktop queue ownership was already proven."
-                                ),
-                            })
                         # This durable write is intentionally before vector
                         # observation: a process death must retain the fact that
                         # replay is unsafe, even though success is unproven.
@@ -15551,6 +15679,7 @@ def _update_workspace_embeddings_batched_serial(
         )
         batch_report["batch_elapsed_seconds"] = round(time.perf_counter() - batch_started, 4)
         batch_report["timing_event"] = "batch_completed"
+        _response_drain.finish("batch_terminal")
         result["batches"].append(batch_report)
         result.pop("inflight_batch", None)
         _write_embedding_batch_ledger(ledger_path, workspace_slug, result)
@@ -15616,6 +15745,62 @@ def _update_workspace_embeddings_batched_serial(
         if result["errors"]:
             break
     return result
+
+
+def _update_workspace_embeddings_batched_serial(
+    api_url,
+    api_key,
+    workspace_slug,
+    locations,
+    batch_size=ANYTHINGLLM_EMBEDDING_UPDATE_BATCH_SIZE,
+    warmup_batch_size=ANYTHINGLLM_EMBEDDING_WARMUP_BATCH_SIZE,
+    warmup_batch_count=ANYTHINGLLM_EMBEDDING_WARMUP_BATCH_COUNT,
+    ledger_path=None,
+    status_callback=None,
+    batch_verifier=None,
+    batch_inspector=None,
+    cancel_callback=None,
+    verification_mode="checkpoint",
+    verification_interval=ANYTHINGLLM_EMBEDDING_VERIFICATION_CHECKPOINT_INTERVAL,
+    adaptive_single_record_threshold_seconds=60.0,
+    submission_timeout_override=None,
+    location_sources=None,
+    receipt_observer=None,
+):
+    """Submit serially and release owned HTTP readers on every exit path."""
+    drain = _OwnedHttpResponseDrain(cancel_callback=cancel_callback)
+    unwinding = True
+    try:
+        result = _update_workspace_embeddings_batched_serial_impl(
+            api_url=api_url,
+            api_key=api_key,
+            workspace_slug=workspace_slug,
+            locations=locations,
+            batch_size=batch_size,
+            warmup_batch_size=warmup_batch_size,
+            warmup_batch_count=warmup_batch_count,
+            ledger_path=ledger_path,
+            status_callback=status_callback,
+            batch_verifier=batch_verifier,
+            batch_inspector=batch_inspector,
+            cancel_callback=cancel_callback,
+            verification_mode=verification_mode,
+            verification_interval=verification_interval,
+            adaptive_single_record_threshold_seconds=adaptive_single_record_threshold_seconds,
+            submission_timeout_override=submission_timeout_override,
+            location_sources=location_sources,
+            receipt_observer=receipt_observer,
+            _response_drain=drain,
+        )
+        unwinding = False
+        return result
+    finally:
+        if drain.finish("submission_exit") and drain.result is not None:
+            try:
+                _write_embedding_batch_ledger(ledger_path, workspace_slug, drain.result)
+            except Exception:
+                if not unwinding:
+                    raise
 
 
 def update_workspace_embeddings_batched(
@@ -16196,6 +16381,24 @@ def update_workspace_embeddings_desktop_queue(
             return "Desktop queue observer is connected; waiting for the next queue event"
         return f"0/{requested} {normalized_record_label} completed"
 
+    response_activity_lock = threading.Lock()
+    response_activity_callbacks = []
+
+    def subscribe_response_activity(callback):
+        with response_activity_lock:
+            response_activity_callbacks.append(callback)
+        def unsubscribe():
+            with response_activity_lock:
+                if callback in response_activity_callbacks:
+                    response_activity_callbacks.remove(callback)
+        return unsubscribe
+
+    def publish_response_activity(event, snapshot):
+        # Callbacks observe only events already accepted by the owned SSE listener.
+        with response_activity_lock:
+            for callback in response_activity_callbacks:
+                callback(event, snapshot)
+
     def publish_desktop_queue_event(event):
         """Relay a matching Desktop queue update through the worker event file.
 
@@ -16309,6 +16512,7 @@ def update_workspace_embeddings_desktop_queue(
                         "error": str(event.get("error") or ""),
                     }
             snapshot = queue_snapshot()
+            publish_response_activity(event, snapshot)
             # A busy SSE relay may omit an individual provider-batch event.
             # The source terminal event carries the complete bounded list and
             # already repairs the aggregate snapshot above. Mirror only the
@@ -16483,6 +16687,7 @@ def update_workspace_embeddings_desktop_queue(
                     position,
                 )
         snapshot = queue_snapshot()
+        publish_response_activity(event, snapshot)
         if not callable(status_callback):
             return
         if event_type == "doc_complete":
@@ -16646,6 +16851,8 @@ def update_workspace_embeddings_desktop_queue(
             "events_observed": event_count,
             "observed_after_submission_seconds": observed_after_seconds,
         }
+
+    owned_desktop_queue_receipt.subscribe_response_activity = subscribe_response_activity
 
     def desktop_queue_status(message, report):
         if not callable(status_callback):
