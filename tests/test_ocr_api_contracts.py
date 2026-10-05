@@ -21,7 +21,8 @@ def test_explicit_connectivity_preserves_previous_component_results(seed):
     for before, after in zip(previous[1:], current[1:]):
         np.testing.assert_array_equal(before, after)
     # Explicit NumPy indexing must not allocate another page-sized label map.
-    assert np.asarray(current[1], dtype=np.int32) is current[1]
+    labels = np.asarray(current[1], dtype=np.int32)
+    assert np.shares_memory(labels, current[1])
 
 
 def test_eight_way_connectivity_preserves_diagonal_ink():
