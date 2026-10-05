@@ -1,0 +1,396 @@
+{
+  "schema": "work-identity-manual-v1",
+  "scope": "27 distinct public PDFs; labels concern publication identity and visible opening/reviewed credits, not full-text fidelity",
+  "items": [
+    {
+      "file": "news-blog/guardian-fossil.pdf",
+      "category": "news_article",
+      "work_title": "Scientists discover oldest ever giant tadpole fossil in Argentina",
+      "container": "The Guardian",
+      "creator": "Associated Press",
+      "role": "wire_agency",
+      "credit_basis": "visible_page_1",
+      "exclude": [
+        "photographer",
+        "quoted researcher"
+      ],
+      "sha256": "865b6e00263f3acebbaca6a986f187b7b84d412d5d9b4fd2b0512767ba27ac7a",
+      "pages": 3
+    },
+    {
+      "file": "news-blog/propublica-surprises.pdf",
+      "category": "investigative_news",
+      "work_title": "Some Surprises in the No Surprises Act",
+      "container": "ProPublica",
+      "creator": "T. Christian Miller",
+      "role": "author",
+      "credit_basis": "visible_page_1",
+      "exclude": [
+        "photo credit Brian Finke"
+      ],
+      "sha256": "aace1aa1762b9fe5a24d9ec791fa193e415eed8f9681fbbd914c67606bd58b37",
+      "pages": 5
+    },
+    {
+      "file": "news-blog/bbc-kermit.pdf",
+      "category": "broadcast_news_article",
+      "work_title": "Kermit the Frog honoured in new fossil find",
+      "container": "BBC News",
+      "creator": "Maddie Molloy",
+      "role": "author",
+      "credit_basis": "visible_page_1",
+      "exclude": [
+        "photo credits James D. Tiller and James Di Loreto"
+      ],
+      "sha256": "294fcaccf9740f95bb8d2169b312b1f4aa99ccec99af97d12581505dde0147e1",
+      "pages": 4
+    },
+    {
+      "file": "news-blog/examiner-northern-lights.pdf",
+      "category": "news_article",
+      "work_title": "Stargazers 'might be lucky enough' to glimpse Northern Lights in Ireland",
+      "container": "Irish Examiner",
+      "creator": "Sally Gorman",
+      "role": "author",
+      "credit_basis": "visible_page_1",
+      "exclude": [
+        "subscription overlay"
+      ],
+      "sha256": "d008c524de21b39d7dec3c2c109f534cb9f27bfe041a99b836ee1069de15122d",
+      "pages": 6
+    },
+    {
+      "file": "news-blog/guardian-creation-lake.pdf",
+      "category": "book_review_in_newspaper",
+      "work_title": "Creation Lake by Rachel Kushner review - double dealing in deepest France",
+      "container": "The Observer / The Guardian",
+      "creator": "Anthony Cummins",
+      "role": "reviewer",
+      "credit_basis": "visible_page_1",
+      "exclude": [
+        "reviewed book author Rachel Kushner"
+      ],
+      "sha256": "b85b2339b9951a058604e06c99aac95c330b7b9ae250c04213833cab2d58d949",
+      "pages": 4
+    },
+    {
+      "file": "news-blog/sciencenews-tadpole.pdf",
+      "category": "science_news",
+      "work_title": "The oldest known fossil tadpole was a big baby",
+      "container": "Science News",
+      "creator": "Jake Buehler",
+      "role": "author",
+      "credit_basis": "visible_page_1",
+      "exclude": [
+        "illustration credit Gabriel Lío",
+        "cited research authors"
+      ],
+      "sha256": "19002b0acbb7064bbe250699e378d8f3bc21510f7d6d74f4f419d634ea29edf1",
+      "pages": 4
+    },
+    {
+      "file": "news-blog/simon-training.pdf",
+      "category": "personal_blog",
+      "work_title": "Training is not the same as chatting: ChatGPT and other LLMs don't remember everything you say",
+      "container": "Simon Willison's Weblog",
+      "creator": null,
+      "role": "author_not_explicit_in_opening",
+      "credit_basis": "masthead_only",
+      "exclude": [
+        "quoted people"
+      ],
+      "sha256": "e3e0e6ef7eafce1c16be98c8faaa50cc1aa5f18a510e487a2459437c7bbf39da",
+      "pages": 5
+    },
+    {
+      "file": "news-blog/julia-inside-git.pdf",
+      "category": "technical_tutorial_blog",
+      "work_title": "Inside .git",
+      "container": "Julia Evans's blog",
+      "creator": null,
+      "role": "author_not_explicit_in_opening",
+      "credit_basis": "site_context_only",
+      "exclude": [
+        "Git log example author Julia Evans"
+      ],
+      "sha256": "097ca423217f9b5b1df45d9dd20b4b52414d35356f8d0a2aa38bd500b18b4d12",
+      "pages": 6
+    },
+    {
+      "file": "news-blog/schneier-democracy.pdf",
+      "category": "expert_opinion_blog",
+      "work_title": "Rethinking Democracy for the Age of AI",
+      "container": "Schneier on Security",
+      "creator": null,
+      "role": "author_not_explicit_in_opening",
+      "credit_basis": "masthead_only",
+      "exclude": [
+        "commenter names on later pages"
+      ],
+      "sha256": "4139e882375de7e3236f5d0d704885ab88dea667263ff0c5e7399b7faf2dcc0d",
+      "pages": 32
+    },
+    {
+      "file": "news-blog/mozilla-firefox.pdf",
+      "category": "corporate_blog",
+      "work_title": "Here's what we're working on in Firefox",
+      "container": "Mozilla blog",
+      "creator": "Mozilla",
+      "role": "corporate_author",
+      "credit_basis": "visible_page_1",
+      "exclude": [
+        "people mentioned in article"
+      ],
+      "sha256": "63f530ff50fbad463f059ed77db90713b2acd7ac909466f7e319a468bb674758",
+      "pages": 8
+    },
+    {
+      "file": "news-blog/lse-climate-review.pdf",
+      "category": "academic_book_review_blog",
+      "work_title": "Book Review | One Planet, Many Worlds: The Climate Parallax",
+      "container": "LSE United States Politics and Policy",
+      "creator": "Elisabeth Wennerström",
+      "role": "reviewer",
+      "credit_basis": "visible_page_1",
+      "exclude": [
+        "reviewed book author Dipesh Chakrabarty"
+      ],
+      "sha256": "d343b71c4197522eb10bcbd126fee00317e1dd7ebb69422f75d0ad4c13f3ba62",
+      "pages": 11
+    },
+    {
+      "file": "news-blog/oregon-weekly-1900-06-11-issue.pdf",
+      "category": "historical_newspaper_issue",
+      "work_title": "The Oregon Weekly, June 11, 1900",
+      "container": "The Oregon Weekly",
+      "creator": null,
+      "role": "issue_no_single_author",
+      "credit_basis": "visible_masthead",
+      "exclude": [
+        "OCR-derived personal-name guesses"
+      ],
+      "sha256": "cae7acfc27bffd81c60c82e86b6d6cb69db05df174fdbaaabbc26f9497284451",
+      "pages": 4
+    },
+    {
+      "file": "reviews-reports/frontiers-book-review.pdf",
+      "category": "scholarly_book_review",
+      "work_title": "Book Review: Research ethics in the life sciences",
+      "container": "Advances in Drug and Alcohol Research",
+      "creator": "Stephanie J. Bird",
+      "role": "reviewer",
+      "credit_basis": "visible_page_1",
+      "exclude": [
+        "reviewed book author Michael J. Kuhar",
+        "handling editor"
+      ],
+      "sha256": "ae25c292dd83baed2cc8ab34db921a74b42c132904a249eceb30b1720f3e626e",
+      "pages": 3
+    },
+    {
+      "file": "reviews-reports/jstage-japanese-book-review.pdf",
+      "category": "non_english_book_review",
+      "work_title": null,
+      "container": "The Journal of Information Science and Technology Association",
+      "creator": "佐藤翔",
+      "role": "reviewer",
+      "credit_basis": "signed_at_end_page_1",
+      "exclude": [
+        "reviewed book author 西川開",
+        "unjustified romanization"
+      ],
+      "sha256": "6a1a8ff8c0a55afa0fe326946a7d628bc2f1bfd636fc08b072fac2637ecbf4b3",
+      "pages": 1
+    },
+    {
+      "file": "reviews-reports/frontiers-review-article.pdf",
+      "category": "scholarly_review_article",
+      "work_title": "Adolescent alcohol drinking interaction with the gut microbiome: implications for adult alcohol use disorder",
+      "container": "Advances in Drug and Alcohol Research",
+      "creator": "Bruk Getachew; Sheketha R. Hauser; Samia Bennani; Nacer El Kouhen; Youssef Sari; Yousef Tizabi",
+      "role": "authors",
+      "credit_basis": "visible_page_1",
+      "exclude": [
+        "affiliation Pharmaceutical Sciences",
+        "handling editor",
+        "peer reviewers"
+      ],
+      "sha256": "214799cb2eade45b47ff102c945b6c68e971dfdef388bbc20fe58258321c7f3a",
+      "pages": 14
+    },
+    {
+      "file": "reviews-reports/frontiers-editorial.pdf",
+      "category": "journal_editorial",
+      "work_title": "Editorial: Technologies in smallholder poultry development: characterization, utilization, conservation, improvement, waste management, and disease control volume II",
+      "container": "Frontiers in Genetics",
+      "creator": "Abdulmojeed Yakubu; Oladeji Bamidele; Aranganoor Kannan Thiruvenkadan; Moses Okpeku; Senol Çelik",
+      "role": "editorial_authors",
+      "credit_basis": "visible_page_1",
+      "exclude": [
+        "handling editor",
+        "peer reviewers"
+      ],
+      "sha256": "a957de901513f78a38756216aceb9ff2d4459026916680a94e34922f95e3e7b6",
+      "pages": 3
+    },
+    {
+      "file": "reviews-reports/frontiers-opinion.pdf",
+      "category": "journal_opinion",
+      "work_title": "Awake brain surgery: toward optimal cognitive explorations",
+      "container": "Frontiers in Human Neuroscience",
+      "creator": "Elena Salillas; Serena De Pellegrin; Carlo Semenza",
+      "role": "opinion_authors",
+      "credit_basis": "visible_page_1",
+      "exclude": [
+        "handling editor",
+        "peer reviewer"
+      ],
+      "sha256": "e288d8e3a4b29ec87b7bdf76afd0e1ff1f414efb6be4e363e31288d0473c9d89",
+      "pages": 4
+    },
+    {
+      "file": "reviews-reports/acl-conference-paper.pdf",
+      "category": "conference_paper",
+      "work_title": "Enhancing Ethical Explanations of Large Language Models through Iterative Symbolic Refinement",
+      "container": "Proceedings of the 18th Conference of the European Chapter of the Association for Computational Linguistics",
+      "creator": "Xin Quan; Marco Valentino; Louise A. Dennis; André Freitas",
+      "role": "authors",
+      "credit_basis": "visible_page_1",
+      "exclude": [
+        "proceedings editors"
+      ],
+      "sha256": "63e985e2cd6850fae17f57e1a6700faedab2b1318e38f5b977474a94ec08811b",
+      "pages": 22
+    },
+    {
+      "file": "reviews-reports/nber-working-paper.pdf",
+      "category": "working_paper",
+      "work_title": "Meritocracy across Countries",
+      "container": "NBER Working Paper Series",
+      "creator": "Oriana Bandiera; Ananya Kotia; Ilse Lindenlaub; Christian Moser; Andrea Prat",
+      "role": "authors",
+      "credit_basis": "visible_page_1",
+      "exclude": [
+        "acknowledged discussant"
+      ],
+      "sha256": "61a6d910d121a7529b3c817011f69d2720779d09d146d7b17741058029d92aaa",
+      "pages": 83
+    },
+    {
+      "file": "reviews-reports/gao-institutional-report.pdf",
+      "category": "government_report",
+      "work_title": "Bureau of the Fiscal Service's FY 2024 Schedules of the General Fund",
+      "container": "U.S. Government Accountability Office",
+      "creator": "U.S. Government Accountability Office",
+      "role": "institutional_author",
+      "credit_basis": "visible_page_1",
+      "exclude": [
+        "title fragment General Fund",
+        "report recipient"
+      ],
+      "sha256": "1c321530e8a4547a19bdfd5a2119c8a9ed9877c58a6ed525b175452dfaef7242",
+      "pages": 59
+    },
+    {
+      "file": "reviews-reports/pew-collaborative-report.pdf",
+      "category": "research_institute_report",
+      "work_title": "In Tied Presidential Race, Harris and Trump Have Contrasting Strengths, Weaknesses",
+      "container": "Pew Research Center",
+      "creator": "Pew Research Center",
+      "role": "institutional_author",
+      "credit_basis": "recommended_citation_page_1",
+      "exclude": [
+        "media contacts"
+      ],
+      "sha256": "61b4c2272dfa23734fa2fb1446d91b9688b309ee101c4ec5f47e5f1f19334948",
+      "pages": 88
+    },
+    {
+      "file": "reviews-reports/pew-social-report.pdf",
+      "category": "research_institute_report",
+      "work_title": "The Experiences of U.S. Adults Who Don't Have Children",
+      "container": "Pew Research Center",
+      "creator": "Rachel Minkin; Juliana Horowitz; Carolina Aragão",
+      "role": "authors",
+      "credit_basis": "explicit_BY_page_1",
+      "exclude": [
+        "other media contacts"
+      ],
+      "sha256": "307a6fdc0a2876a68dc49dc1d1afda0c1187fad0c8681fdf3523cd676ae54eeb",
+      "pages": 52
+    },
+    {
+      "file": "reviews-reports/unicef-policy-brief.pdf",
+      "category": "policy_brief",
+      "work_title": "Protecting children from violence and exploitation in relation to the digital environment",
+      "container": "UNICEF",
+      "creator": "United Nations Children's Fund (UNICEF)",
+      "role": "institutional_author",
+      "credit_basis": "publisher_citation_page_2",
+      "exclude": [
+        "address United Nations Plaza, New York",
+        "photo credit"
+      ],
+      "sha256": "f50c201e903a7fcf2a2035c183e9009a42267cc98a18f43f830dc25f6f4c9fdc",
+      "pages": 16
+    },
+    {
+      "file": "reviews-reports/ucsd-dissertation.pdf",
+      "category": "dissertation",
+      "work_title": "The Many Faces of Quantum Matter and Quantum Phase Transitions",
+      "container": "UC San Diego Electronic Theses and Dissertations",
+      "creator": "Dachuan Lu",
+      "role": "author",
+      "credit_basis": "repository_cover_page_1",
+      "exclude": [
+        "committee members",
+        "repository publisher"
+      ],
+      "sha256": "34a1bd771f24869fa594d777fcce81fc1d93382610f058b7a8a9dfbfda390fc5",
+      "pages": 310
+    },
+    {
+      "file": "reviews-reports/supreme-court-opinion.pdf",
+      "category": "court_opinion",
+      "work_title": null,
+      "container": "Official Reports of the Supreme Court",
+      "creator": "Justice Sotomayor",
+      "role": "opinion_author",
+      "credit_basis": "visible_opinion_page_4",
+      "exclude": [
+        "reporter of decisions Rebecca A. Womeldorf",
+        "lawyers"
+      ],
+      "sha256": "eed3e88da7134ce8672ad23000a9da9533250bba44546bdb9e0c9e6b81c16ec7",
+      "pages": 20
+    },
+    {
+      "file": "reviews-reports/obp-edited-book-chapter.pdf",
+      "category": "edited_book_chapter",
+      "work_title": "Introduction",
+      "container": "Ethics of Socially Disruptive Technologies",
+      "creator": "Ibo van de Poel; Jeroen Hopster; Guido Löhr; Elena Ziliotti; Stefan Buijsman; Philip Brey",
+      "role": "lead_and_contributing_authors",
+      "credit_basis": "chapter_heading_after_book_frontmatter",
+      "exclude": [
+        "book cover editors without chapter-role check"
+      ],
+      "sha256": "959e533fac2d9c6539a7257a66d7b7008841e4f6ce8adb72f0d0b1dd55a3ee0e",
+      "pages": 24
+    },
+    {
+      "file": "reviews-reports/obp-coordinated-book-chapter.pdf",
+      "category": "coordinated_book_chapter",
+      "work_title": "Preparing for the field",
+      "container": "A Field Guide to Cross-Cultural Research on Childhood Learning",
+      "creator": "Adam Boyette; Dorsa Amir; Alejandrina Cristia; Alyssa Crittenden; Ardain Dzabatou; Michael Gurven; Vidrige Kandza; Patricia Kanngiesser; Nokwanda Ndlovu; Sarah Pope-Caldwell; Marie Schäfer; Andrea Taverna",
+      "role": "coordinator_and_contributors",
+      "credit_basis": "chapter_heading_after_book_frontmatter",
+      "exclude": [
+        "book cover editors without chapter-role check"
+      ],
+      "sha256": "237ed77e6eeb80af9f16ac3e49067461cae5eef57f319aadec91dca97c5510ff",
+      "pages": 38
+    }
+  ]
+}

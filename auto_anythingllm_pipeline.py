@@ -98,7 +98,6 @@ from rag_pdf_tools import (
     unstructured_execution_evidence,
     unstructured_runtime_status,
 )
-from author_metadata.profile import classify_document
 from author_metadata.constants import (  # noqa: F401
     HEADING_STOPWORDS, AUTHOR_ROLE_HINTS, AUTHOR_STOP_TERMS,
     AUTHOR_BLOCK_STOP_HINTS, AUTHOR_NAME_PARTICLES, AUTHOR_AFFILIATION_HINTS,
@@ -120,6 +119,7 @@ from author_metadata.identity import (  # noqa: F401
 )
 from author_metadata.context import AuthorEvidenceContext
 from author_metadata.dispatcher import infer_author as infer_profiled_author
+from author_metadata.work_identity import resolve_work_identity
 from author_metadata.pdf import (  # noqa: F401
     recover_author_from_selected_extraction, infer_author_from_pdf_text,
     selected_extraction_author_samples, infer_author_from_initial_pdf_pages,
@@ -873,12 +873,10 @@ def pdf_metadata(path: Path, include_page_geometry=False, include_author_samples
                     text = doc.load_page(page_number - 1).get_text("text")
                     if text:
                         author_text_samples.append({"page": page_number, "text": text})
-                sample_title = resolve_title_from_metadata_or_filename(
-                    metadata.get("title") or "", path,
-                )["title"]
-                book_frontmatter = classify_document(
-                    author_text_samples, title_hint=sample_title,
-                ).kind == "book"
+                opening_identity = resolve_work_identity(
+                    metadata.get("title") or "", path, author_text_samples,
+                )
+                book_frontmatter = opening_identity.profile.kind == "book"
                 page_numbers = list(opening_numbers)
                 if book_frontmatter:
                     page_numbers.extend(range(5, min(12, len(doc)) + 1))
@@ -21493,16 +21491,18 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     author_text_samples = pdf_meta.pop("_author_text_samples", [])
     author_sample_error = str(pdf_meta.pop("_author_sample_error", "") or "")
     use_file_title_fallback = getattr(args, "use_file_title_fallback", True)
-    resolved_title = resolve_title_from_metadata_or_filename(
+    work_identity = resolve_work_identity(
         pdf_meta.get("title") or "",
         pdf_path,
+        author_text_samples,
         title_override=args.document_label,
         use_file_title_fallback=use_file_title_fallback,
     )
-    title = resolved_title["title"]
-    title_source = resolved_title["source"]
+    title = work_identity.title
+    title_source = work_identity.title_source
     author_context = AuthorEvidenceContext.from_samples(
         author_text_samples, path=pdf_path, title_hint=title,
+        profile=work_identity.profile,
     )
     inferred_author = (
         {"author": "", "source": "error", "page": 0, "evidence": author_sample_error}
@@ -21548,6 +21548,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             else {"kind": "not_assessed", "cues": [], "classification_pages": [],
                   "sampled_pages": [], "scope_complete": False}
         ),
+        "work_identity": work_identity.as_evidence(),
         "effective_subject": pdf_meta.get("subject") or (source_meta["source_title"] if use_file_title_fallback else ""),
         "effective_subject_provenance": (
             "pdf_metadata"
@@ -22720,6 +22721,9 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         post_extraction_author_recovery = recover_author_from_selected_extraction(
             selected.get("pages") or [],
             title_hint=source_meta.get("source_title") or "",
+            profile=(author_context.profile if author_context.profile.kind in {
+                "periodical_issue", "book_chapter", "legal_opinion",
+            } else None),
         )
         recovered_author = normalize_text(post_extraction_author_recovery.get("author") or "")
         if recovered_author:

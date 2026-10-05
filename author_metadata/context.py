@@ -28,6 +28,8 @@ class AuthorEvidenceContext:
             "classification_pages": list(self.profile.sampled_pages),
             "sampled_pages": pages,
             "scope_complete": self.profile.scope_complete,
+            "publication_type": self.profile.publication_type,
+            "work_scope": self.profile.work_scope,
         }
 
     @property
@@ -40,11 +42,11 @@ class AuthorEvidenceContext:
         return tuple(sample for sample in self.samples if is_opening(sample))
 
     @classmethod
-    def from_samples(cls, samples, *, title_hint="", path=None):
+    def from_samples(cls, samples, *, title_hint="", path=None, profile=None):
         selected = tuple(dict(sample) for sample in samples or [] if isinstance(sample, dict))
         return cls(
             samples=selected,
             title_hint=str(title_hint or ""),
             path=Path(path) if path is not None else None,
-            profile=classify_document(selected, title_hint=title_hint),
+            profile=profile or classify_document(selected, title_hint=title_hint),
         )

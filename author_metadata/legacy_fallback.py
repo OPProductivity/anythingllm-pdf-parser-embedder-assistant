@@ -6,11 +6,9 @@ import unicodedata
 import urllib.parse
 from pathlib import Path
 
-import fitz
 from rag_pdf_tools import normalize_text
 from .constants import (
     AUTHOR_ROLE_HINTS, AUTHOR_BLOCK_STOP_HINTS,
-    POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES,
     TRUSTED_AUTHOR_INFERENCE_SOURCES,
 )
 from .names import (
@@ -20,7 +18,6 @@ from .names import (
     extract_adjacent_person_names, strip_known_extraction_structure_labels,
 )
 from .filename import infer_author_from_filename, structured_filename_surname_evidence
-from .identity import resolve_title_from_metadata_or_filename, resolve_author_from_metadata_and_inference
 from .profile import classify_document
 from .legacy_book_layout import extract_publisher_backed_name, title_page_matches_book
 from .review import is_reviewed_work_citation, looks_like_review_heading, extract_affiliated_review_credit
@@ -1521,138 +1518,3 @@ def _infer_author_from_samples_or_filename(samples, path: Path, title_hint=""):
                 "evidence": f"{report.get('evidence') or ''} / {Path(path).name}".strip(" /"),
             }
     return exclude_explicit_translators(report if report.get("author") else filename_report, samples)
-
-
-def selected_extraction_author_samples(pages, *, page_limit=4):
-    """Return a small, transient opening-page sample from selected text.
-
-    This is deliberately post-selection: a scan has no usable native text at
-    metadata preflight, but the selected OCR candidate can later contain an
-    explicit title-page byline. Only the first non-empty physical pages are
-    considered, no raw text is persisted by this helper, and malformed page
-    records are skipped rather than changing an otherwise successful run.
-    """
-    limit = max(1, min(6, int(page_limit or 4)))
-    selected = []
-    seen_pages = set()
-    for row in pages or []:
-        if not isinstance(row, dict):
-            continue
-        try:
-            page = int(row.get("page") or 0)
-        except (TypeError, ValueError):
-            continue
-        text = str(row.get("text") or "")
-        if page <= 0 or page in seen_pages or not normalize_text(text):
-            continue
-        seen_pages.add(page)
-        selected.append({"page": page, "text": text})
-        if len(selected) >= limit:
-            break
-    return selected
-
-
-def recover_author_from_selected_extraction(pages, *, title_hint="", page_limit=4):
-    """Use the established author heuristics on the selected OCR text.
-
-    The result is evidence only. Callers must apply it solely when the earlier
-    metadata/native-text stage has no resolved author, preserving explicit
-    user entries and PDF metadata precedence.
-    """
-    samples = selected_extraction_author_samples(pages, page_limit=page_limit)
-    if not samples:
-        return {
-            "author": "",
-            "source": "not_assessed_no_selected_opening_text",
-            "page": 0,
-            "evidence": "",
-            "sample_pages": [],
-        }
-    report = dict(infer_author_from_text_samples(samples, title_hint=title_hint))
-    if not report.get("author") and samples:
-        # OCR-only recovery: a standalone opening byline below an uppercase
-        # title must be independently repeated as a running head on another
-        # physical page. Do not use isolated person-shaped OCR guesses.
-        first = samples[0]
-        lines = [normalize_text(x) for x in first["text"].splitlines() if normalize_text(x)]
-        for i, line in enumerate(lines[:28]):
-            if not re.fullmatch(r"[A-ZÀ-ÖØ-Þ][A-ZÀ-ÖØ-Þ '’-]{4,70}", line):
-                continue
-            name = normalize_author_candidate(line)
-            heading = " ".join(lines[max(0, i-3):i])
-            if (not looks_like_person_name(name, allow_all_caps=True)
-                    or not 2 <= len(name.split()) <= 4
-                    or len(heading.split()) < 5 or not heading.isupper()):
-                continue
-            repeated = any(re.search(rf"(?im)^\s*\d*\s*{re.escape(line)}\s*$", s["text"])
-                           for s in samples[1:] if s["page"] != first["page"])
-            if repeated:
-                report = {"author": name, "source": "text_compact_caps_byline",
-                          "page": first["page"], "evidence": "opening title byline corroborated by running head"}
-                break
-    report["sample_pages"] = [row["page"] for row in samples]
-    base_source = str(report.get("source") or "not_found")
-    if report.get("author") and base_source not in POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES:
-        # Bare title-block names are useful interactive suggestions when a
-        # person can review them, but insufficient to mutate durable metadata
-        # after OCR. Keep the abstention auditable without retaining text.
-        report.update({
-            "author": "",
-            "source": f"selected_extraction_rejected_weak_{base_source}",
-            "evidence": "",
-        })
-        return report
-    report["source"] = f"selected_extraction_{base_source}"
-    return report
-
-
-def infer_author_from_initial_pdf_pages(path: Path, title_hint="", *, page_limit=3):
-    """Resolve author evidence from PDF metadata plus a small opening-page sample.
-
-    Workspace naming must stay responsive, so it shares the full pipeline's
-    normalization, confidence rules, and precedence while inspecting only the
-    requested opening text pages. It never invokes OCR and keeps extracted
-    source text transient.
-    """
-    pdf_path = Path(path)
-    try:
-        with fitz.open(pdf_path) as doc:
-            metadata = dict(doc.metadata or {})
-            resolved_title = normalize_text(
-                title_hint
-                or resolve_title_from_metadata_or_filename(metadata.get("title") or "", pdf_path)["title"]
-            )
-            limit = max(1, int(page_limit or 3))
-            samples = []
-            for page_index in range(min(limit, len(doc))):
-                text = doc.load_page(page_index).get_text("text")
-                if text:
-                    samples.append({"page": page_index + 1, "text": text})
-    except Exception as exc:
-        return {"author": "", "source": "error", "page": 0, "evidence": "", "error": type(exc).__name__}
-    inference = infer_author_from_samples_or_filename(samples, pdf_path, title_hint=resolved_title)
-    resolved = resolve_author_from_metadata_and_inference(metadata.get("author") or "", inference)
-    return {
-        "author": resolved["author"],
-        "source": resolved["source"],
-        "page": int(inference.get("page") or 0),
-        "evidence": str(inference.get("evidence") or ""),
-    }
-
-
-def infer_author_from_pdf_text(path: Path, title_hint=""):
-    try:
-        with fitz.open(path) as doc:
-            page_count = len(doc)
-            page_numbers = []
-            for number in [1, 2, 3, 4, max(1, page_count - 1), page_count]:
-                if 1 <= number <= page_count and number not in page_numbers:
-                    page_numbers.append(number)
-            samples = []
-            for page_number in page_numbers:
-                text = doc.load_page(page_number - 1).get_text("text")
-                if text:
-                    samples.append({"page": page_number, "text": text})
-            return infer_author_from_samples_or_filename(samples, path, title_hint=title_hint)
-    except Exception as exc:
-        return {"author": "", "source": "error", "page": 0, "evidence": str(exc)}

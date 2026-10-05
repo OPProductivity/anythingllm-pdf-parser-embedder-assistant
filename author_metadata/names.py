@@ -20,6 +20,12 @@ def looks_like_review_heading(value):
             flags=re.I,
         )
         or re.fullmatch(
+            r"(?:book|film|documentary(?:\s+film)?|exhibition|performance|article|media|work)\s+"
+            r"reviews?\s*\|\s*.+",
+            heading,
+            flags=re.I,
+        )
+        or re.fullmatch(
             r"(?:a\s+)?review\s+essays?(?:\s+(?:on|of)\s+.+|\s*[:\-–—]\s*.+)?",
             heading,
             flags=re.I,

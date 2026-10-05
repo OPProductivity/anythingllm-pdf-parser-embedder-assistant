@@ -83,6 +83,34 @@ def test_profile_never_claims_complete_document_scope_from_sampled_pages():
     assert not profile.scope_complete
 
 
+def test_browser_print_is_not_scholarly_from_body_abstract_or_reference_doi():
+    samples = [{"page": 1, "text": (
+        "Here is what we are working on\nMozilla\nAbstract images are available.\n"
+        "https://example.org/article | 1/3"
+    )}, {"page": 3, "text": "References\nDOI: 10.1000/example"}]
+    profile = classify_document(samples, "Here is what we are working on")
+    assert profile.kind == "web_article"
+    assert profile.publication_type == "browser_print_article"
+
+
+def test_whole_issue_suppresses_title_adjacent_person_guess():
+    samples = [{"page": 1, "text": (
+        "THE EXAMPLE WEEKLY\nVOL. I.\nMONDAY, JUNE 11, 1900.\nNo. 1 7.\n"
+        "A Person's Name Appears in a Story\nAlice Jones"
+    )}]
+    result = infer_author_from_samples(samples, Path("example-weekly.pdf"))
+    assert result["source"] == "whole_issue_no_single_author"
+    assert not result["author"]
+
+
+def test_numbered_chapter_roles_do_not_become_book_editor_credit():
+    samples = [{"page": 1, "text": "An Edited Book\nEdited by Example Editor"},
+               {"page": 3, "text": "5. Preparing for the field\nCoordinated by Adam Boyette\nContributors: Dorsa Amir"}]
+    result = infer_author_from_samples(samples, Path("chapter.pdf"))
+    assert result["source"] == "chapter_roles_not_resolved"
+    assert not result["author"]
+
+
 def test_pipeline_exports_the_canonical_pdf_author_helpers():
     assert pipeline.infer_author_from_initial_pdf_pages is infer_author_from_initial_pdf_pages
     assert pipeline.selected_extraction_author_samples is selected_extraction_author_samples

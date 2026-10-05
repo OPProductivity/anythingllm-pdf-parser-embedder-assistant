@@ -12,6 +12,7 @@ from .legacy_fallback import (
 from .report import infer_report_author
 from .review import infer_review_author
 from .scholarly_article import infer as infer_scholarly_author
+from .scope import infer_chapter_author, infer_issue_author, infer_legal_opinion_author
 from .web_article import infer_web_article_author
 
 
@@ -21,6 +22,9 @@ _STRATEGIES = {
     "review": infer_review_author,
     "scholarly_article": infer_scholarly_author,
     "web_article": infer_web_article_author,
+    "book_chapter": infer_chapter_author,
+    "periodical_issue": infer_issue_author,
+    "legal_opinion": infer_legal_opinion_author,
 }
 
 

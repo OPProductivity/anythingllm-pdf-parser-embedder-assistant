@@ -14087,7 +14087,7 @@ class PipelineCoreTests(unittest.TestCase):
                     "needs_password": False,
                     "is_encrypted": False,
                 }
-                app.infer_author_from_initial_pdf_pages = lambda path, title_hint="", page_limit=3: {
+                app.infer_author_from_initial_pdf_pages = lambda path, title_hint="", page_limit=3, use_file_title_fallback=True: {
                     "author": "Sample Author",
                     "source": "page_scan",
                     "page": 1,
