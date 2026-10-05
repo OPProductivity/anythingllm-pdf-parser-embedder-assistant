@@ -31475,9 +31475,9 @@ def run_automatic(
             run_root,
             state="running",
             phase=(
-                "Document finished — preparing the next PDF"
+                "PDF prepared; preparing the next PDF"
                 if completed_files < total_files
-                else "All PDF processing finished — completing the batch"
+                else "All PDFs prepared; checking and indexing records"
             ),
             expected_seconds=expected_seconds,
             details="",
@@ -31705,7 +31705,7 @@ def run_automatic(
             nonlocal active_source_atomic_provider_batch_size
             nonlocal execution_plan_priced_batch_size
             report = report or {}
-            stage_text = str(stage or "Submitting the selected PDF batch to AnythingLLM")
+            stage_text = str(stage or "Checking prepared PDFs for AnythingLLM")
             runtime_batch_reprice_context = None
             # The grouped Desktop route owns the live queue observer.  Feed
             # each of its evidence-bearing callbacks through the established
@@ -32183,7 +32183,11 @@ def run_automatic(
             update_live_automatic_run_status(
                 run_root,
                 state="running",
-                phase="Submitting the selected PDF batch to AnythingLLM",
+                phase={
+                    "queue_receipt": "Checking and submitting prepared PDFs to AnythingLLM",
+                    "desktop_queue": "AnythingLLM is indexing page records",
+                    "identity_set": "Confirming searchable page records",
+                }[upload_progress_phase],
                 expected_seconds=expected_seconds,
                 details=display_stage_text,
                 confirmed_fraction=grouped_confirmed_fraction,

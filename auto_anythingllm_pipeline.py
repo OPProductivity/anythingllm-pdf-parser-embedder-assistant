@@ -11077,36 +11077,29 @@ def anythingllm_embed_progress_message(event):
     if event_type == "source_staging_provider_batch":
         batch_index = event_int("batchIndex") + 1
         chunks = event_int("chunkCount")
-        elapsed_ms = event_int("elapsed_ms")
         attempts = max(1, event_int("attempt_count", 1))
-        retry_delay_ms = max(0, event_int("retry_delay_ms"))
         retry_note = (
-            f" after {attempts} attempts and {retry_delay_ms / 1000.0:.1f}s controlled retry delay"
+            f" after {attempts} attempts"
             if attempts > 1 else ""
         )
         return (
-            f"AnythingLLM provider batch {batch_index} embedded {chunks} chunk(s) "
-            f"in {elapsed_ms / 1000.0:.2f}s{retry_note}"
+            f"Embedding batch {batch_index} completed: {chunks} chunk(s){retry_note}"
         )
     if event_type == "source_staging_provider_batch_attempt":
         batch_index = event_int("batchIndex") + 1
         attempt = event_int("attempt", 1)
         chunks = event_int("chunkCount")
-        timeout_ms = max(0, event_int("request_timeout_ms"))
         retry_suffix = " (attempt 2)" if attempt > 1 else ""
         return (
-            f"AnythingLLM provider batch {batch_index} started for {chunks} chunk(s)"
-            f"{retry_suffix} (request boundary {timeout_ms / 1000.0:.0f}s)"
+            f"Embedding batch {batch_index} started: {chunks} chunk(s){retry_suffix}"
         )
     if event_type == "source_staging_provider_batch_attempt_completed":
         batch_index = event_int("batchIndex") + 1
         attempt = event_int("attempt", 1)
         chunks = event_int("chunkCount")
-        elapsed_ms = max(0, event_int("elapsed_ms"))
         retry_suffix = " (attempt 2)" if attempt > 1 else ""
         return (
-            f"AnythingLLM provider batch {batch_index} completed {chunks} chunk(s) "
-            f"in {elapsed_ms / 1000.0:.2f}s{retry_suffix}"
+            f"Embedding batch {batch_index} completed: {chunks} chunk(s){retry_suffix}"
         )
     if event_type == "source_staging_provider_batch_waiting":
         batch_index = event_int("batchIndex") + 1
@@ -16169,17 +16162,11 @@ def update_workspace_embeddings_desktop_queue(
             max(0, int(snapshot.get("desktop_queue_cached_records") or 0)),
         )
         if completed:
-            rate = snapshot.get("desktop_queue_records_per_minute")
-            remaining = snapshot.get("desktop_queue_estimated_remaining_seconds")
-            forecast = (
-                f" (~{float(rate):.1f}/min; ~{int(round(float(remaining)))}s queue remaining)"
-                if rate and remaining is not None else ""
-            )
             cache_detail = (
                 f"; cached embeddings reused for {cached_records}/{requested}"
                 if cached_records else ""
             )
-            return f"Desktop completed {completed}/{requested} {normalized_record_label}{cache_detail}{forecast}"
+            return f"Desktop completed {completed}/{requested} {normalized_record_label}{cache_detail}"
         if current:
             if bool(snapshot.get("desktop_queue_current_is_cache_eligible")):
                 return (

@@ -3651,7 +3651,8 @@ class PipelineCoreTests(unittest.TestCase):
             }
         )
 
-        self.assertIn("completed 36 chunk(s)", completed)
+        self.assertEqual(completed, "Embedding batch 3 completed: 36 chunk(s)")
+        self.assertNotIn("0.91s", completed)
         self.assertNotIn("unrecognized", completed)
         self.assertIn("native cache for 3/4", planned)
         self.assertIn("1 record(s), 12 chunk(s) require provider staging", planned)
@@ -3679,8 +3680,9 @@ class PipelineCoreTests(unittest.TestCase):
             {"type": "source_staging_record"}
         )
 
-        self.assertIn("provider batch 1 started", first)
+        self.assertEqual(first, "Embedding batch 1 started: 36 chunk(s)")
         self.assertNotIn("attempt", first)
+        self.assertNotIn("request boundary", first)
         self.assertIn("(attempt 2)", retry)
         self.assertNotIn("unrecognized", record)
 
@@ -6144,7 +6146,7 @@ class PipelineCoreTests(unittest.TestCase):
                 app.update_live_automatic_run_status(
                     temp_dir,
                     state="running",
-                    phase="All PDF processing finished — completing the batch",
+                    phase="All PDFs prepared; checking and indexing records",
                     batch_completed_files=8,
                     batch_total_files=8,
                 )
@@ -20035,6 +20037,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertTrue(any("embedding record 3" in message for message in statuses))
         self.assertTrue(any("3/5 page-parent files completed" in message for message in statuses))
         self.assertTrue(any("Desktop completed 3/5 page-parent files" in message for message in statuses))
+        self.assertFalse(any("queue remaining" in message for message in statuses))
         self.assertFalse(any("Desktop event stream observed" in message for message in statuses))
         self.assertFalse(any("Confirming searchable vectors next" in message for message in statuses))
 
