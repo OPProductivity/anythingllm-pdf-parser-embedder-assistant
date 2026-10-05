@@ -17,6 +17,7 @@ def fixture_source():
         'removeDocuments:async function(){}};'
         'async function api(e){let a={id:1,slug:"test"},n=["one","two","three"];'
         'return await Tc.addDocuments(a,n)};'
+        'class Collector{async processDocument(e="",t=null,r={}){let n=JSON.stringify(r);return new Xs().xPayload}async processLink(){}};'
         'const browserRoute="UI_NATIVE_ROUTE_UNCHANGED";'
     )
 

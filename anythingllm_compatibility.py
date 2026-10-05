@@ -280,12 +280,53 @@ def _desktop_package_identity(
     return result, evidence, []
 
 
+def _native_product_version(executable: Path) -> str:
+    """Read fresh Windows resource data without launching a shell or caching it."""
+    import ctypes
+    from ctypes import wintypes
+
+    library = ctypes.WinDLL("version", use_last_error=True)
+    library.GetFileVersionInfoSizeW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(wintypes.DWORD)]
+    library.GetFileVersionInfoSizeW.restype = wintypes.DWORD
+    library.GetFileVersionInfoW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID]
+    library.GetFileVersionInfoW.restype = wintypes.BOOL
+    library.VerQueryValueW.argtypes = [wintypes.LPCVOID, wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.UINT)]
+    library.VerQueryValueW.restype = wintypes.BOOL
+    ignored = wintypes.DWORD()
+    size = library.GetFileVersionInfoSizeW(str(executable), ctypes.byref(ignored))
+    if not size:
+        raise ctypes.WinError(ctypes.get_last_error())
+    buffer = ctypes.create_string_buffer(size)
+    if not library.GetFileVersionInfoW(str(executable), 0, size, buffer):
+        raise ctypes.WinError(ctypes.get_last_error())
+    pointer, length = ctypes.c_void_p(), wintypes.UINT()
+    if (not library.VerQueryValueW(buffer, "\\VarFileInfo\\Translation", ctypes.byref(pointer), ctypes.byref(length))
+            or not pointer.value or not length.value or length.value % 4):
+        raise ValueError("Missing or malformed version translations")
+    words = ctypes.cast(pointer, ctypes.POINTER(wintypes.WORD))
+    translations = [(words[i], words[i + 1]) for i in range(0, length.value // 2, 2)]
+    for language, codepage in translations:
+        query = f"\\StringFileInfo\\{language:04x}{codepage:04x}\\ProductVersion"
+        if library.VerQueryValueW(buffer, query, ctypes.byref(pointer), ctypes.byref(length)) and pointer.value and length.value:
+            value = ctypes.wstring_at(pointer, length.value).rstrip("\0").strip()
+            if value:
+                return value
+    raise ValueError("Missing ProductVersion")
+
+
 def _desktop_version(executable: Path | None) -> tuple[str, list[Evidence], list[str]]:
     """Read the installed Desktop version on Windows without starting Desktop."""
     if executable is None:
         return "", [], ["desktop_executable_missing"]
     if platform.system() != "Windows":
         return "", [], ["desktop_version_probe_unsupported_platform"]
+    try:
+        version = _native_product_version(executable)
+        if version:
+            return version, [_evidence("filesystem", str(executable), version)], []
+    except (OSError, ValueError, AttributeError):
+        # Preserve the established fallback for unusual resource layouts.
+        pass
     try:
         completed = subprocess.run(
             [

@@ -17,7 +17,17 @@ from anythingllm_source_atomic_common import (
 )
 
 V117_SERVER_SHA256 = "a27009d6c87a476b68e619f1e65a83aa81ca257efc904b7c87c1b7deaf0b1a51"  # pragma: allowlist secret
-PATCH_ID = "anythingllm_pdf_assistant_source_atomic_server_v117_1"
+PATCH_ID = "anythingllm_pdf_assistant_source_atomic_server_v117_2"
+# Exact previously qualified generated backend; unknown edits remain refused.
+PREVIOUS_PATCH_SHA256 = "51dfb3a0f967f801788fac96f1e06e90d5b40a77da192a50d8f4ec3050395c63"  # pragma: allowlist secret
+COLLECTOR_METHOD = 'async processDocument(e="",t=null,r={})'
+SIGNER_CACHE = (
+    'let __signer=this.constructor.__pdfAssistantSigner;'
+    'if(!__signer||__signer.key!==process.env.SIG_KEY||__signer.salt!==process.env.SIG_SALT){'
+    'let __fresh=new Xs;'
+    '__signer={key:process.env.SIG_KEY,salt:process.env.SIG_SALT,value:__fresh.xPayload};'
+    'this.constructor.__pdfAssistantSigner=__signer;}'
+)
 REQUEST_FLAG = "pdfAssistantSourceAtomic"
 FUNCTION_PREFIX = "addDocuments:async function(s,e=[],t=null){"
 FUNCTION_FOLLOWER = "},removeDocuments:async function"
@@ -100,6 +110,16 @@ def patch_v117_server_source(source: str) -> str:
         + provider_staging_body() + "}" + legacy + "}"
     )
     patched = source[:start] + replacement + source[end:]
+    if patched.count(COLLECTOR_METHOD) != 1:
+        raise ValueError("Expected exact v1.17.0 collector method.")
+    collector_start = patched.index(COLLECTOR_METHOD)
+    collector_end = patched.index("async processLink", collector_start)
+    method = patched[collector_start:collector_end]
+    if method.count("let n=JSON.stringify") != 1 or method.count("new Xs().xPayload") != 1:
+        raise ValueError("Expected exact v1.17.0 collector signer anchors.")
+    method = method.replace("let n=JSON.stringify", SIGNER_CACHE + "let n=JSON.stringify")
+    method = method.replace("new Xs().xPayload", "__signer.value")
+    patched = patched[:collector_start] + method + patched[collector_end:]
     return patched.replace(API_CALL, API_CALL[:-1] + f",null,Ao(e).{REQUEST_FLAG}===true)")
 
 
@@ -147,7 +167,7 @@ def ensure_v117_embedding_server(report: dict[str, Any]) -> dict[str, Any]:
         result.update(status="already_enabled" if active else "restart_required", enabled=active,
                       installed=True, reason=reason, restart_required=restart)
         return result
-    if current_hash != V117_SERVER_SHA256:
+    if current_hash not in {V117_SERVER_SHA256, PREVIOUS_PATCH_SHA256}:
         result["reason"] = "source_atomic_server_hash_mismatch"
         return result
     if not backup.exists():

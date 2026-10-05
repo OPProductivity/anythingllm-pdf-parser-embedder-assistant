@@ -51,12 +51,27 @@ def read_bounded_response(response, limit=MAX_JSON_RESPONSE_BYTES, *, deadline_s
             raise ResponseBudgetExceeded("HTTP response exceeds the configured byte budget.")
 
 
+class DeferredHTTPSHandler(urllib.request.HTTPSHandler):
+    """Load the platform trust store only when this opener actually uses TLS."""
+
+    def __init__(self):
+        urllib.request.AbstractHTTPHandler.__init__(self)
+        self._tls_initialized = False
+
+    def https_open(self, request):
+        # Keep urllib's TLS defaults, including certificate and hostname checks.
+        if not self._tls_initialized:
+            super().__init__()
+            self._tls_initialized = True
+        return super().https_open(request)
+
+
 def authenticated_opener(request):
     validate_authenticated_url(request.full_url)
     # Never entrust credentials to implicit environment-controlled proxies.
     authorization = request.get_header("Authorization", "")
     storage = managed_key_storage(authorization[7:]) if authorization.startswith("Bearer ") else None
-    handlers = [urllib.request.ProxyHandler({}), RejectAuthenticatedRedirects()]
+    handlers = [urllib.request.ProxyHandler({}), RejectAuthenticatedRedirects(), DeferredHTTPSHandler()]
     if storage:
         class DesktopConnection(http.client.HTTPConnection):
             def connect(self):
