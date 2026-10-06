@@ -5172,23 +5172,24 @@ class PipelineCoreTests(unittest.TestCase):
         )
         self.assertIn("An edited document title", title_update["placeholder"])
 
-    def test_workspace_filename_never_turns_a_title_fragment_into_an_author_label(self):
+    def test_workspace_recognizes_new_credit_sources_and_middle_initial(self):
         import rag_pdf_gradio_app as app
 
-        # A filename is useful for display and manual editing, but it cannot
-        # establish person or institution provenance by itself.
-        for filename in (
-            "About That Disappearing Middle Class - WSJ.pdf",
-            "From the Archive - Magazine.pdf",
-            "Because We Can - Article.pdf",
-            "By the River - Journal.pdf",
-            "Nuclear Power in the Netherlands.pdf",
-            "WHO and Africa CDC welcome vaccines.pdf",
-            "Shockley Poems.pdf",
-            "Vaswani-2017-attention-is-all-you-need.pdf",
-            "Berlant - Intimate Public Sphere.pdf",
-        ):
-            self.assertEqual(app.workspace_title_fallback_label(filename), "", filename)
+        with tempfile.TemporaryDirectory() as directory:
+            pdf = Path(directory) / "source.pdf"
+            pdf.write_bytes(b"%PDF-1.4\n")
+            cases = (
+                ("Christopher A. Loperena", "text_strict_credit_block", "Loperena"),
+                ("Eileen O’Brien", "filename_structured_corroborated_text_names", "O’Brien"),
+                ("About That Disappearing", "text_opening_title_block", ""),
+            )
+            for author, source, expected in cases:
+                with self.subTest(source=source), mock.patch.object(
+                    app, "infer_author_from_initial_pdf_pages",
+                    return_value={"author": author, "source": source},
+                ):
+                    identity = app.workspace_person_identity_from_pdf(pdf)
+                    self.assertEqual(identity.get("label", ""), expected)
 
     def test_workspace_institutional_labels_require_document_evidence(self):
         import rag_pdf_gradio_app as app
@@ -24953,6 +24954,10 @@ class PipelinePdfIntegrationTests(unittest.TestCase):
             self.assertTrue(Path(summary["variant_summary"]).exists())
             self.assertTrue(Path(summary["diagnostics_report"]).exists())
             profile = json.loads((output_dir / "source-profile.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                profile["source_short_label"],
+                f"PDF-{profile['source_sha256'][:8]}",
+            )
             provenance_manifest = json.loads(
                 Path(summary["provenance_review_manifest"]).read_text(encoding="utf-8")
             )

@@ -4757,7 +4757,9 @@ def detect_chapter_number(*values):
 
 
 def native_identity_stem(row, include_segment=True, page_parent=False):
-    short_label = compact_label_token(row.get("source_short_label") or row.get("source_title") or "PDF")
+    short_label = compact_label_token(row.get("source_short_label") or default_short_label(
+        row.get("source_title"), row.get("source_author"), row.get("source_sha256"),
+    ))
     page_start = int(row["pdf_page"])
     page_end = int(row.get("pdf_page_end") or page_start)
     page_part = f"p{page_start}" if page_end == page_start else f"p{page_start}-{page_end}"
@@ -4806,7 +4808,9 @@ def native_page_parent_title(row, include_heading=True):
 
 def compact_marker(row, marker_style="short"):
     chapter = shorten_heading(row.get("chapter") or row.get("section") or "", 44)
-    short_label = row.get("source_short_label") or row["source_title"]
+    short_label = row.get("source_short_label") or default_short_label(
+        row.get("source_title"), row.get("source_author"), row.get("source_sha256"),
+    )
     segment_no = f"s{int(row['segment_index']):05d}"
     page_start = int(row["pdf_page"])
     page_end = int(row.get("pdf_page_end") or page_start)
@@ -4982,7 +4986,9 @@ def make_segments(
                     "source_id": source_id,
                     "source_title": source_meta["source_title"],
                     "source_author": source_meta["source_author"],
-                    "source_short_label": source_meta.get("source_short_label") or source_meta["source_title"],
+                    "source_short_label": source_meta.get("source_short_label") or default_short_label(
+                        source_meta.get("source_title"), source_meta.get("source_author"), source_meta.get("source_sha256"),
+                    ),
                     "source_file": pdf_path.name,
                     "source_sha256": source_meta["source_sha256"],
                     "source_published_epoch_ms": source_meta.get("source_published_epoch_ms"),
@@ -7733,7 +7739,9 @@ def build_page_parent_rows(segments):
                 "source_id": row["source_id"],
                 "source_title": row["source_title"],
                 "source_author": row.get("source_author") or "",
-                "source_short_label": row.get("source_short_label") or row["source_title"],
+                "source_short_label": row.get("source_short_label") or default_short_label(
+                    row.get("source_title"), row.get("source_author"), row.get("source_sha256"),
+                ),
                 "source_file": row["source_file"],
                 "source_sha256": row["source_sha256"],
                 "backend": row["backend"],
@@ -10252,18 +10260,19 @@ def read_workspace_model_configuration(storage_dir: Path, workspace_slug="test")
     return result
 
 
-def default_short_label(title, author):
+def default_short_label(title, author, source_sha256=""):
+    """Use the first recognized author; never present a title word as an author label."""
     # Fold diacritics only for compact labels, never for source metadata/text.
     def label_words(value):
         return re.findall(r"[^\W\d_](?:[^\W\d_]|['\u2019-])*",
                           unicodedata.normalize("NFC", value or ""))
 
-    author_words = label_words(author)
-    if author_words:
-        return ascii_label_word(author_words[-1]) or "PDF"
-    title_words = [folded for word in label_words(title)
-                   if (folded := ascii_label_word(word)) and folded.casefold() not in HEADING_STOPWORDS]
-    return title_words[0] if title_words else "PDF"
+    first_author = re.split(r"\s*(?:,|;|\band\b|&)\s*", author or "", maxsplit=1, flags=re.I)[0]
+    author_words = label_words(first_author)
+    if author_words and (surname := ascii_label_word(author_words[-1])):
+        return surname
+    digest = str(source_sha256 or "").lower()
+    return f"PDF-{digest[:8]}" if re.fullmatch(r"[0-9a-f]{64}", digest) else "PDF"
 
 
 def _api_urlopen(request, timeout):
@@ -21865,7 +21874,9 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         "author_inference": inferred_author,
     }
     source_meta["source_short_label"] = normalize_text(
-        args.document_short_label or default_short_label(source_meta["source_title"], source_meta["source_author"])
+        args.document_short_label or default_short_label(
+            source_meta["source_title"], source_meta["source_author"], source_sha,
+        )
     )
     profile = {
         "source_file": str(pdf_path),
@@ -23079,7 +23090,9 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             source_meta["author_inference"] = dict(post_extraction_author_recovery)
             source_meta["source_short_label"] = normalize_text(
                 args.document_short_label
-                or default_short_label(source_meta["source_title"], source_meta["source_author"])
+                or default_short_label(
+                    source_meta["source_title"], source_meta["source_author"], source_sha,
+                )
             )
             profile["detected_author"] = recovered_author
             profile["source_short_label"] = source_meta["source_short_label"]

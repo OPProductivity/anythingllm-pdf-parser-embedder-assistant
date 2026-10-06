@@ -81,6 +81,7 @@ from embedder_capabilities import (
     provider_catalog_entries,
 )
 from author_metadata.context import AuthorEvidenceContext
+from author_metadata.constants import TRUSTED_AUTHOR_INFERENCE_SOURCES
 from author_metadata.dispatcher import infer_author as infer_profiled_author
 from author_metadata.pdf import infer_author_from_initial_pdf_pages
 from author_metadata.work_identity import resolve_work_identity
@@ -5453,44 +5454,8 @@ WORKSPACE_SOURCE_IDENTITY_INFLIGHT = {}
 _WORKSPACE_AUTHOR_STOP_WORDS = {
     "a", "an", "and", "by", "for", "from", "in", "of", "on", "the", "to", "with",
 }
-# A workspace name is a compact, user-facing mnemonic, so it must be more
-# precision-oriented than the pipeline's broader metadata record.  The full
-# pipeline may retain a weak opening-page name for review, but a title-shaped
-# line must never silently become a surname in a workspace suggestion.
-_WORKSPACE_PERSON_EVIDENCE_SOURCES = frozenset({
-    "text_byline",
-    "text_written_by",
-    "text_edited_by",
-    "text_review_byline",
-    "text_column_byline",
-    "text_author_label",
-    "text_writer_label",
-    "text_bibliographic_author_label",
-    "text_instructor_label",
-    "text_affiliated_byline",
-    "text_adjacent_affiliated_byline",
-    "text_stacked_affiliated_byline",
-    "text_bibliographic_byline",
-    "text_compact_caps_byline",
-    "text_title_adjacent_byline",
-    "text_title_window_adjacent_byline",
-    "text_titlepage_publisher_byline",
-    "text_first_lines_stacked_byline",
-    "text_role_followup",
-    "text_visible_title_person_prefix",
-    "text_opening_title_block_byline",
-    "filename_explicit_byline",
-    "filename_leading_name",
-    "filename_leading_names",
-    "filename_leading_surname",
-    "filename_leading_name_before_section",
-    "filename_corroborated_text_name",
-    "filename_leading_surnames",
-    "filename_compact_name_before_year",
-    "filename_name_before_section_label",
-    "filename_surname_before_year",
-    "filename_surname_before_section_number",
-})
+# The canonical author resolver owns the evidence allowlist. Workspace names
+# apply person-shape checks below, but must not maintain a stale second copy.
 WORKSPACE_UNKNOWN_SOURCE_LABEL = "Unknown"
 _WORKSPACE_INSTITUTIONAL_SUFFIXES = (
     "Association", "Organization", "Agency", "Centre", "Center", "Institute",
@@ -5698,7 +5663,7 @@ def workspace_person_identity_from_pdf(pdf_file, *, native_metadata=None):
     # or a structurally constrained title-page form before deriving a compact
     # surname. This is evidence-based rather
     # than a blacklist of incidental words such as "Bold" or "Edition".
-    if source not in _WORKSPACE_PERSON_EVIDENCE_SOURCES:
+    if source not in TRUSTED_AUTHOR_INFERENCE_SOURCES or source == "text_corporate_cover_byline":
         return {}
     # The shared inference result can contain multiple authors. A workspace
     # needs one compact label per selected PDF, so retain the first resolved
@@ -5723,7 +5688,7 @@ def workspace_person_identity_from_pdf(pdf_file, *, native_metadata=None):
     words = re.findall(r"[^\W\d_][\w'’-]*", person_author, flags=re.UNICODE)
     if (
         (len(words) < 2 and not (single_catalog_surname and len(words) == 1))
-        or ({word.casefold() for word in words} & _WORKSPACE_AUTHOR_STOP_WORDS)
+        or ({word.casefold() for word in words if len(word) > 1} & _WORKSPACE_AUTHOR_STOP_WORDS)
     ):
         return {}
     result = words[-1]
@@ -5753,16 +5718,6 @@ def workspace_name_surname_from_filename(pdf_file):
     here; this remains a responsive, no-OCR, suggestion-only operation.
     """
     return str(workspace_person_identity_from_pdf(pdf_file).get("label") or "")
-
-
-def workspace_title_fallback_label(pdf_file):
-    """Deprecated compatibility seam; filename title fragments are not labels.
-
-    A filename can support a human edit, but it is not enough evidence to call
-    its first word a person or organization.  Keep the helper for integrations
-    that import it, while making the no-guessing policy explicit.
-    """
-    return ""
 
 
 def workspace_source_identity_from_pdf(pdf_file):
@@ -34485,8 +34440,9 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             )
             workspace_slug.input(
-                fn=update_new_workspace_name_without_pdf_inspection,
-                inputs=[workspace_slug, auto_label, new_workspace_name, new_workspace_name_auto_state],
+                fn=update_new_workspace_name_control,
+                inputs=[workspace_slug, auto_label, auto_pdfs, auto_folder_pdfs,
+                        new_workspace_name, new_workspace_name_auto_state],
                 outputs=[new_workspace_name, new_workspace_name_auto_state],
                 show_progress="hidden",
                 queue=False,

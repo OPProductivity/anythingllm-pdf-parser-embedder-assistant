@@ -23,7 +23,7 @@ pytestmark = pytest.mark.offline_deterministic
     ('Jane O\u2019Neill', "O'Neill"),
     ('Nguy\u1ec5n V\u0103n \u0110\u1ed7', 'Do'),
     ('George Packer', 'Packer'),
-    ('Jane Doe, John Roe', 'Roe'),
+    ('Jane Doe, John Roe', 'Doe'),
 ])
 @pytest.mark.parametrize('normalization', ['NFC', 'NFD'])
 def test_short_labels_fold_accents_without_changing_author(author, expected, normalization):
@@ -33,15 +33,12 @@ def test_short_labels_fold_accents_without_changing_author(author, expected, nor
     assert pipeline.compact_label_token(expected) == expected.casefold().replace("'", '-')
 
 
-@pytest.mark.parametrize(('title', 'expected'), [
-    ('\u00c9tudes culturelles', 'Etudes'),
-    ('The \u00c9migr\u00e9 Experience', 'Emigre'),
-    ('Collected Essays', 'Collected'),
-    ('123', 'PDF'),
-    ('', 'PDF'),
+@pytest.mark.parametrize('title', [
+    '\u00c9tudes culturelles', 'The \u00c9migr\u00e9 Experience', 'Collected Essays', '123', '',
 ])
-def test_short_label_title_fallback(title, expected):
-    assert pipeline.default_short_label(title, '') == expected
+def test_short_label_unknown_author_never_uses_a_title_fragment(title):
+    assert pipeline.default_short_label(title, '') == 'PDF'
+    assert pipeline.default_short_label(title, '', 'a' * 64) == 'PDF-aaaaaaaa'
 
 
 def test_short_label_never_uses_a_fragment_of_an_unsupported_surname():
