@@ -12834,10 +12834,13 @@ def create_validation_workspace(
     if not requested_workspace_name:
         visible_prefix = next_validation_workspace_prefix(storage_dir, name_prefix)
         requested_workspace_name = f"{visible_prefix} {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    requested_workspace_name = unicode_workspace_display_name(requested_workspace_name)
     workspace_name, collision_suffix = unique_lancedb_workspace_name(
         requested_workspace_name,
         storage_dir=storage_dir,
     )
+    suffix = f" {collision_suffix}" if collision_suffix else ""
+    display_name = requested_workspace_name[:LANCEDB_WORKSPACE_NAME_LIMIT - len(suffix)] + suffix
     cleanup = {"status": "not_applicable", "error": ""}
     try:
         status, response_text = post_json(
@@ -12882,6 +12885,46 @@ def create_validation_workspace(
                     + (f" Cleanup error: {cleanup_error}" if cleanup_error else "")
                 ),
             }
+        if 200 <= status < 300 and workspace_slug and display_name != workspace_name:
+            try:
+                rename_status, rename_text = post_json(
+                    api_url.rstrip("/") + f"/api/v1/workspace/{workspace_slug}/update",
+                    {"name": display_name},
+                    api_key=runtime_key,
+                )
+                renamed = json.loads(rename_text) if rename_text else {}
+                renamed_workspace = renamed.get("workspace") or {}
+                if (
+                    not 200 <= rename_status < 300
+                    or renamed_workspace.get("name") != display_name
+                    or renamed_workspace.get("slug") != workspace_slug
+                ):
+                    raise RuntimeError("AnythingLLM did not confirm the requested visible workspace name.")
+                workspace = renamed_workspace
+            except Exception as rename_exc:
+                cleanup_error = ""
+                try:
+                    delete_status, delete_response = delete_json(
+                        api_url.rstrip("/") + f"/api/v1/workspace/{workspace_slug}",
+                        api_key=runtime_key,
+                        timeout=60,
+                    )
+                    if not 200 <= delete_status < 300:
+                        cleanup_error = delete_response[:500]
+                except Exception as cleanup_exc:
+                    cleanup_error = str(cleanup_exc)
+                return {
+                    "status": "workspace_display_name_update_failed",
+                    "workspace_slug": workspace_slug if cleanup_error else "",
+                    "workspace_name": display_name,
+                    "requested_workspace_name": requested_workspace_name,
+                    "workspace_name_sanitized": workspace_name,
+                    "workspace_name_collision_suffix": collision_suffix,
+                    "authentication_mode": authentication_mode,
+                    "temporary_key_cleanup": cleanup,
+                    "error": f"Could not set the visible workspace name: {rename_exc}"
+                    + (f" Empty-workspace cleanup also failed: {cleanup_error}" if cleanup_error else ""),
+                }
         return {
             "status": "created" if 200 <= status < 300 and workspace_slug else "error",
             "workspace_slug": workspace_slug,
@@ -14381,7 +14424,7 @@ LANCEDB_WORKSPACE_NAME_LIMIT = 120
 
 
 def lancedb_safe_workspace_name(value, fallback="PDF workspace"):
-    """Return a human-readable name whose server-derived slug is LanceDB-safe."""
+    """Return an ASCII creation name whose server-derived slug is LanceDB-safe."""
     normalized = unicodedata.normalize("NFKD", str(value or ""))
     ascii_value = normalized.encode("ascii", "ignore").decode("ascii")
     # Remove possessive punctuation rather than joining two words with a
@@ -14389,6 +14432,18 @@ def lancedb_safe_workspace_name(value, fallback="PDF workspace"):
     # whitespace before collapsing so generated slugs remain readable.
     ascii_value = ascii_value.replace("'", "")
     safe = re.sub(r"[^A-Za-z0-9._ -]+", " ", ascii_value)
+    safe = re.sub(r"\s+", " ", safe).strip(" .-")
+    return safe[:LANCEDB_WORKSPACE_NAME_LIMIT] or fallback
+
+
+def unicode_workspace_display_name(value, fallback="PDF workspace"):
+    """Keep printable Unicode letters in a workspace's visible name."""
+    normalized = unicodedata.normalize("NFC", str(value or ""))
+    safe = "".join(
+        char if unicodedata.category(char)[:1] in {"L", "N", "M"}
+        or char in " ._-'\u2019" else " "
+        for char in normalized
+    )
     safe = re.sub(r"\s+", " ", safe).strip(" .-")
     return safe[:LANCEDB_WORKSPACE_NAME_LIMIT] or fallback
 

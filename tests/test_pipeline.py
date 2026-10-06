@@ -4481,15 +4481,26 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertTrue(pipeline.is_lancedb_safe_namespace("pdf-example-book-example-authors-views-2026"))
         self.assertFalse(pipeline.is_lancedb_safe_namespace("pdf-example-author's-views"))
 
+    def test_unicode_workspace_display_name_preserves_accents_without_using_them_in_slug(self):
+        import rag_pdf_gradio_app as app
+
+        requested = "Herñañdézëzáàço"
+        self.assertEqual(app.canonical_new_workspace_name(requested), requested)
+        self.assertEqual(pipeline.lancedb_safe_workspace_name(requested), "Hernandezezaaco")
+        self.assertEqual(
+            pipeline.unicode_workspace_display_name("García-Louis / Chávez-Moreno"),
+            "García-Louis Chávez-Moreno",
+        )
+
     def test_manual_workspace_name_uses_the_same_120_character_creation_contract(self):
         import rag_pdf_gradio_app as app
 
         requested = "Author's unsafe workspace / " + ("x" * 160)
         canonical = app.canonical_new_workspace_name(requested)
 
-        self.assertEqual(canonical, pipeline.lancedb_safe_workspace_name(requested))
+        self.assertEqual(canonical, pipeline.unicode_workspace_display_name(requested))
         self.assertEqual(len(canonical), pipeline.LANCEDB_WORKSPACE_NAME_LIMIT)
-        self.assertNotIn("'", canonical)
+        self.assertIn("'", canonical)
         self.assertNotIn("/", canonical)
 
     def test_confirm_canonicalizes_an_edited_workspace_name_before_the_run_is_reserved(self):
@@ -4518,7 +4529,7 @@ class PipelineCoreTests(unittest.TestCase):
 
         self.assertIsNone(report)
         self.assertTrue(allowed)
-        self.assertEqual(settings["new_workspace_name"], pipeline.lancedb_safe_workspace_name(requested))
+        self.assertEqual(settings["new_workspace_name"], pipeline.unicode_workspace_display_name(requested))
         self.assertEqual(len(settings["new_workspace_name"]), pipeline.LANCEDB_WORKSPACE_NAME_LIMIT)
         event_states = [event["state"] for event in status_events]
         self.assertIn("request_validation_started", event_states)
@@ -5089,7 +5100,7 @@ class PipelineCoreTests(unittest.TestCase):
             "",
         )
         self.assertTrue(generated["visible"])
-        self.assertTrue(generated["placeholder"].startswith("Default: Sample Authors Boundary Study "))
+        self.assertTrue(generated["placeholder"].startswith("Default: Sample Author's Boundary Study "))
         preserved, _marker = app.update_new_workspace_name_control(
             app.NEW_DOCUMENT_WORKSPACE_VALUE,
             "Changed detected title",

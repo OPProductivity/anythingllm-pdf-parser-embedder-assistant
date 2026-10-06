@@ -131,7 +131,7 @@ from auto_anythingllm_pipeline import (
     is_local_anythingllm_url,
     is_lancedb_safe_namespace,
     LANCEDB_WORKSPACE_NAME_LIMIT,
-    lancedb_safe_workspace_name,
+    unicode_workspace_display_name,
     load_upload_plan_rows,
     managed_anythingllm_upload_folder_name,
     maybe_upload_to_anythingllm,
@@ -5439,7 +5439,7 @@ def refresh_workspaces_with_readiness(api_url, api_key, workspace_slug):
     return workspace_update, workspace_status, readiness
 
 
-# This matches the visible-name guard in ``lancedb_safe_workspace_name``.
+# This matches the visible-name limit in ``unicode_workspace_display_name``.
 # Keep suggestion assembly within that boundary rather than building a longer
 # string and relying on the final safety helper to cut an author in half.
 WORKSPACE_NAME_SOURCE_LABEL_LIMIT = LANCEDB_WORKSPACE_NAME_LIMIT
@@ -6012,13 +6012,13 @@ def document_workspace_name(document_label, pdf_files):
 
 
 def suggested_document_workspace_name(document_label, pdf_files):
-    return lancedb_safe_workspace_name(document_workspace_name(document_label, pdf_files))
+    return unicode_workspace_display_name(document_workspace_name(document_label, pdf_files))
 
 
 def canonical_new_workspace_name(value):
     """Apply the creation-boundary workspace-name contract without inventing a name."""
     value = str(value or "").strip()
-    return lancedb_safe_workspace_name(value) if value else ""
+    return unicode_workspace_display_name(value) if value else ""
 
 
 def workspace_name_auto_state(value=None):
@@ -23951,7 +23951,7 @@ def automatic_confirmation_html(settings):
         summary = '<div class="automatic-confirmation-summary">' + html.escape(" - ".join(str(value) for value in values)) + "</div>"
         return summary + automatic_ocr_preflight_html(settings.get("ocr_preflight_manifest"))
     workspace_label = (
-        f"New workspace for this document: {lancedb_safe_workspace_name(settings.get('new_workspace_name') or document_workspace_name(settings.get('document_label'), settings.get('files') or settings.get('pdf_files')))}"
+        f"New workspace for this document: {unicode_workspace_display_name(settings.get('new_workspace_name') or document_workspace_name(settings.get('document_label'), settings.get('files') or settings.get('pdf_files')))}"
         if is_new_document_workspace_choice(settings["workspace_slug"])
         else settings["workspace_slug"] or "Not selected"
     )

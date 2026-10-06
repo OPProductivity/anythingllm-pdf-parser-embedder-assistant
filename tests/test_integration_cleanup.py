@@ -83,6 +83,64 @@ def test_validation_workspace_keeps_explicit_api_settings_without_template_reads
     assert not hasattr(pipeline, "read_validation_workspace_template")
 
 
+def test_unicode_workspace_name_keeps_visible_accents_with_safe_creation_slug(monkeypatch):
+    calls = []
+    monkeypatch.setattr(pipeline, "resolve_anythingllm_api_key", lambda *_: ("fixture", "provided"))
+
+    def post(url, body, **_kwargs):
+        calls.append((url, body))
+        if url.endswith("/workspace/new"):
+            return 200, json.dumps({"workspace": {"slug": "hernandezezaaco", "name": body["name"]}})
+        return 200, json.dumps({"workspace": {"slug": "hernandezezaaco", "name": body["name"]}})
+
+    monkeypatch.setattr(pipeline, "post_json", post)
+    result = pipeline.create_validation_workspace(
+        "http://127.0.0.1:3001", workspace_name="Herñañdézëzáàço",
+    )
+    assert result["status"] == "created"
+    assert result["workspace_name"] == "Herñañdézëzáàço"
+    assert result["workspace_slug"] == "hernandezezaaco"
+    assert calls[0][1]["name"] == "Hernandezezaaco"
+    assert calls[1][0].endswith("/workspace/hernandezezaaco/update")
+    assert calls[1][1] == {"name": "Herñañdézëzáàço"}
+
+
+def test_unicode_workspace_name_failed_update_removes_empty_workspace(monkeypatch):
+    calls = []
+    monkeypatch.setattr(pipeline, "resolve_anythingllm_api_key", lambda *_: ("fixture", "provided"))
+
+    def post(url, body, **_kwargs):
+        if url.endswith("/workspace/new"):
+            return 200, json.dumps({"workspace": {"slug": "garcia", "name": body["name"]}})
+        return 200, json.dumps({"workspace": {"slug": "garcia", "name": "Garcia"}})
+
+    monkeypatch.setattr(pipeline, "post_json", post)
+    monkeypatch.setattr(pipeline, "delete_json", lambda url, **_kwargs: calls.append(url) or (200, ""))
+    result = pipeline.create_validation_workspace(
+        "http://127.0.0.1:3001", workspace_name="García",
+    )
+    assert result["status"] == "workspace_display_name_update_failed"
+    assert result["workspace_slug"] == ""
+    assert calls == ["http://127.0.0.1:3001/api/v1/workspace/garcia"]
+
+
+def test_unicode_workspace_collision_suffix_is_visible(monkeypatch):
+    calls = []
+    monkeypatch.setattr(pipeline, "resolve_anythingllm_api_key", lambda *_: ("fixture", "provided"))
+    monkeypatch.setattr(pipeline, "unique_lancedb_workspace_name", lambda *_args, **_kwargs: ("Garcia 2", 2))
+
+    def post(url, body, **_kwargs):
+        calls.append(body["name"])
+        return 200, json.dumps({"workspace": {"slug": "garcia-2", "name": body["name"]}})
+
+    monkeypatch.setattr(pipeline, "post_json", post)
+    result = pipeline.create_validation_workspace(
+        "http://127.0.0.1:3001", workspace_name="García",
+    )
+    assert result["workspace_name"] == "García 2"
+    assert calls == ["Garcia 2", "García 2"]
+
+
 @pytest.mark.parametrize("with_source", [True, False])
 def test_retrieval_sampling_keeps_equal_page_numbers_from_different_pdfs(with_source):
     candidates = [payload("first"), payload("second")]
