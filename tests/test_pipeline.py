@@ -4527,6 +4527,28 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn("estimate_complete", event_states)
         self.assertIn("confirmation_validation_complete", event_states)
 
+    def test_confirm_does_not_promote_an_automatic_workspace_suggestion_to_override(self):
+        import rag_pdf_gradio_app as app
+
+        defaults = app.fresh_automatic_run_setting_values(["C:/tmp/example.pdf"], [])
+        defaults["mode"] = app.MODE_LOCAL_ONLY_LABEL
+        core = [defaults[field] for field in app.AUTOMATIC_RUN_FIELDS]
+        with mock.patch.object(app, "validate_pdf_inputs", return_value=(["C:/tmp/example.pdf"], None)), \
+             mock.patch.object(app, "estimate_automatic_run", return_value={"expected_seconds": 12, "source": "test"}):
+            automatic, report, _warnings, allowed = app.validated_automatic_run_settings(
+                [*core, "PDF workspace", False, {"suggestion": "Orchard-Mora", "user_edited": False}]
+            )
+            manual, manual_report, _manual_warnings, manual_allowed = app.validated_automatic_run_settings(
+                [*core, "My selected name", False, {"suggestion": "Orchard-Mora", "user_edited": False}]
+            )
+
+        self.assertIsNone(report)
+        self.assertTrue(allowed)
+        self.assertEqual(automatic["new_workspace_name"], "")
+        self.assertIsNone(manual_report)
+        self.assertTrue(manual_allowed)
+        self.assertEqual(manual["new_workspace_name"], "My selected name")
+
     def test_cache_plan_progress_text_never_reuses_a_prior_sources_counts(self):
         import rag_pdf_gradio_app as app
 
@@ -5067,7 +5089,7 @@ class PipelineCoreTests(unittest.TestCase):
             "",
         )
         self.assertTrue(generated["visible"])
-        self.assertTrue(generated["value"].startswith("Sample Authors Boundary Study "))
+        self.assertTrue(generated["placeholder"].startswith("Default: Sample Authors Boundary Study "))
         preserved, _marker = app.update_new_workspace_name_control(
             app.NEW_DOCUMENT_WORKSPACE_VALUE,
             "Changed detected title",
@@ -5075,7 +5097,7 @@ class PipelineCoreTests(unittest.TestCase):
             "My Sample Author comparison",
             marker,
         )
-        self.assertEqual(preserved["value"], "My Sample Author comparison")
+        self.assertNotIn("value", preserved)
 
     def test_workspace_name_replaces_a_prior_automatic_suggestion_after_selection_changes(self):
         import rag_pdf_gradio_app as app
@@ -5098,7 +5120,7 @@ class PipelineCoreTests(unittest.TestCase):
                 "Second label",
                 ["second.pdf"],
                 [],
-                first["value"],
+                "",
                 state,
             )
             edited_state = app.mark_new_workspace_name_manual_edit("My own workspace", state)
@@ -5111,9 +5133,44 @@ class PipelineCoreTests(unittest.TestCase):
                 edited_state,
             )
 
-        self.assertEqual(first["value"], "First automatic name")
-        self.assertEqual(second["value"], "Second automatic name")
-        self.assertEqual(preserved["value"], "My own workspace")
+        self.assertEqual(first["placeholder"], "Default: First automatic name")
+        self.assertEqual(second["placeholder"], "Default: Second automatic name")
+        self.assertNotIn("value", preserved)
+
+    def test_workspace_switch_restores_file_suggestion_without_generic_name(self):
+        import rag_pdf_gradio_app as app
+
+        with mock.patch.object(app, "suggested_document_workspace_name", return_value="Sanchez-Pita 2026-10-06"):
+            generated, state = app.update_new_workspace_name_control(
+                app.NEW_DOCUMENT_WORKSPACE_VALUE, "", ["first.pdf", "second.pdf"], [], "", {}
+            )
+        with mock.patch.object(app, "suggested_document_workspace_name", return_value="Sanchez-Pita 2026-10-06"):
+            hidden, state = app.update_new_workspace_name_control(
+                "existing-workspace", "", ["first.pdf", "second.pdf"], [], "", state
+            )
+            restored, state = app.update_new_workspace_name_control(
+                app.NEW_DOCUMENT_WORKSPACE_VALUE, "", ["first.pdf", "second.pdf"], [], "", state
+            )
+        self.assertFalse(hidden["visible"])
+        self.assertEqual(restored["placeholder"], "Default: Sanchez-Pita 2026-10-06")
+        self.assertFalse(state["user_edited"])
+
+        blank, blank_state = app.update_new_workspace_name_without_pdf_inspection(
+            app.NEW_DOCUMENT_WORKSPACE_VALUE, "", "PDF workspace", {}
+        )
+        self.assertNotIn("value", blank)
+        self.assertEqual(blank_state["suggestion"], "")
+
+        manual_state = app.mark_new_workspace_name_manual_edit("My own workspace", state)
+        manual, _ = app.update_new_workspace_name_without_pdf_inspection(
+            app.NEW_DOCUMENT_WORKSPACE_VALUE, "", "My own workspace", manual_state
+        )
+        self.assertNotIn("value", manual)
+
+        title_update, _ = app.update_new_workspace_name_without_pdf_inspection(
+            app.NEW_DOCUMENT_WORKSPACE_VALUE, "An edited document title", "", {}
+        )
+        self.assertIn("An edited document title", title_update["placeholder"])
 
     def test_workspace_filename_never_turns_a_title_fragment_into_an_author_label(self):
         import rag_pdf_gradio_app as app

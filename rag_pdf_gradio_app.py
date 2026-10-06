@@ -6109,7 +6109,7 @@ def mark_new_workspace_name_manual_edit(current_name, last_suggestion=None):
     """Record a user edit without confusing a prior automatic value for one."""
     state = workspace_name_auto_state(last_suggestion)
     current = str(current_name or "").strip()
-    state["user_edited"] = bool(current and current != state["suggestion"])
+    state["user_edited"] = bool(current)
     return state
 
 
@@ -6126,7 +6126,6 @@ def update_new_workspace_name_control(
     # Keep the callable backward-compatible for non-UI integrations that
     # supplied the former five positional arguments before folder batches had
     # their own workspace-label input.
-    legacy_call = last_suggestion is None
     if last_suggestion is None:
         last_suggestion = current_name
         current_name = folder_pdf_files
@@ -6137,25 +6136,17 @@ def update_new_workspace_name_control(
         normalize_file_list(pdf_files) + normalize_file_list(folder_pdf_files)
     ))
     suggestion = suggested_document_workspace_name(document_label, selected_files)
-    current = str(current_name or "").strip()
     state = workspace_name_auto_state(last_suggestion)
-    if legacy_call and current and current != state["suggestion"]:
-        # Direct callers of the former signature have no browser ``input``
-        # event. Preserve its established behavior by treating a different
-        # supplied value as an intentional edit.
-        state["user_edited"] = True
-    # A selection-driven refresh and its derived metadata callbacks can arrive
-    # in different orders. Previously a newer marker could make the old
-    # automatic value look user-authored, leaving the wrong source mnemonic in
-    # the field. Only a browser-originated text edit sets ``user_edited``;
-    # otherwise this control always follows the latest settled selection.
-    value = current if state["user_edited"] and current else suggestion
+    # The textbox is an override, never storage for an automatic suggestion.
+    # Do not write its value from an asynchronous selection callback: an older
+    # response could otherwise erase a custom name typed moments later.
     next_state = {
         "suggestion": suggestion,
         "selection_signature": workspace_name_selection_signature(pdf_files, folder_pdf_files),
-        "user_edited": bool(state["user_edited"] and value == current),
+        "user_edited": bool(state["user_edited"]),
     }
-    return gr.update(value=value, visible=True, interactive=True), next_state
+    placeholder = f"Default: {suggestion}" if suggestion else "Optional: type a name, or leave blank to derive one after Confirm"
+    return gr.update(placeholder=placeholder, visible=True, interactive=True), next_state
 
 
 def update_new_workspace_name_without_pdf_inspection(
@@ -6164,19 +6155,17 @@ def update_new_workspace_name_without_pdf_inspection(
     current_name="",
     last_suggestion=None,
 ):
-    """Update the editable workspace field without opening selected PDFs.
-
-    A typed document label can still become an immediate suggestion. A blank
-    label remains blank so confirmation can derive the source-aware name.
-    """
-    return update_new_workspace_name_control(
-        workspace_slug,
-        document_label,
-        [],
-        [],
-        current_name,
-        last_suggestion,
-    )
+    """Update a typed title's suggestion without reopening selected PDFs."""
+    state = workspace_name_auto_state(last_suggestion)
+    if not is_new_document_workspace_choice(workspace_slug):
+        return gr.update(visible=False), state
+    if str(document_label or "").strip():
+        suggestion = suggested_document_workspace_name(document_label, [])
+    else:
+        suggestion = state["suggestion"] if state["selection_signature"] else ""
+    state["suggestion"] = suggestion
+    placeholder = f"Default: {suggestion}" if suggestion else "Optional: type a name, or leave blank to derive one after Confirm"
+    return gr.update(placeholder=placeholder, visible=True, interactive=True), state
 
 
 def create_new_document_workspace(api_url, api_key, document_label, pdf_files, workspace_name_override=""):
@@ -24274,6 +24263,16 @@ def validated_automatic_run_settings(values, *, preflight_progress_callback=None
         if len(values) > len(AUTOMATIC_RUN_FIELDS)
         else ""
     )
+    # Current UI keeps automatic suggestions in the placeholder, not this
+    # override value. Recognize an auto-filled value from an older browser tab
+    # without mistaking an actual edit for a default.
+    if len(values) > len(AUTOMATIC_RUN_FIELDS) + 2:
+        name_state = workspace_name_auto_state(values[len(AUTOMATIC_RUN_FIELDS) + 2])
+        if (
+            not name_state["user_edited"]
+            and requested_workspace_name in {name_state["suggestion"], "PDF workspace"}
+        ):
+            requested_workspace_name = ""
     settings["new_workspace_name"] = canonical_new_workspace_name(requested_workspace_name)
     folder_inspection = inspect_uploaded_pdf_candidates(settings["folder_pdf_files"])
     files, validation_report = validate_pdf_inputs(
@@ -34439,6 +34438,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 existing_workspace_duplicate_policy,
                 new_workspace_name,
                 retain_detailed_evidence,
+                new_workspace_name_auto_state,
             ]
             automatic_timer_inputs = [
                 auto_pdfs,
