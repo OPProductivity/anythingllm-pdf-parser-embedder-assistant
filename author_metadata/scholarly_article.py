@@ -24,10 +24,12 @@ _DATE = re.compile(r"^\d{1,2}\s+[A-Za-z]+\s+\d{4}$")
 def _names(line, title=""):
     if _ROLE.search(line) or has_author_affiliation_hint(line):
         return []
-    # A comma is an author-list delimiter only with a visible conjunction;
-    # this keeps `Aalborg, Denmark` out of inverted-name normalization.
+    # A bare comma can separate two complete names on a publisher cover.
+    # Require two validated names so a location such as Aalborg, Denmark
+    # remains outside the author grammar.
     if "," in line and not re.search(r"\band\b|&", line, re.I):
-        return []
+        names = split_author_line_candidates(line, title_hint=title, require_complete=True)
+        return names if len(names) >= 2 else []
     line = re.sub(r"(?<=[^\W\d_])[\d*\u2020\u2021]+(?=\s*(?:,|&|\band\b|$))", "", line)
     names = split_author_line_candidates(line, title_hint=title, require_complete=True)
     if names:
@@ -41,6 +43,11 @@ def _matches_title(visible, hint, names):
         return True
     parts = re.split(r"\s+(?:--|[-\u2013\u2014])\s+", hint)
     if len(parts) > 1 and sorted(words(parts[0])) == sorted(words(" ".join(names))):
+        return matches(visible, " ".join(parts[1:]), names, allow_long_prefix=True)
+    if len(parts) > 1 and any(
+        words(parts[0]) == words(name)[-len(words(parts[0])):]
+        for name in names if words(parts[0])
+    ):
         return matches(visible, " ".join(parts[1:]), names, allow_long_prefix=True)
     return False
 
@@ -89,7 +96,7 @@ def _cover_credit(lines, context, sample):
         if following and re.match(r"^To cite this article:\s*", following[0], re.I):
             citation_names = re.split(r"\s*\(\d{4}\)", re.sub(r"^To cite this article:\s*", "", following[0], flags=re.I), maxsplit=1)[0]
             citation_block = " ".join(following)
-            citation_title = re.sub(r"^To cite this article:\s*.+?\(\d{4}\)\s*:\s*", "", citation_block, flags=re.I)
+            citation_title = re.sub(r"^To cite this article:\s*.+?\(\d{4}\)\s*:?\s*", "", citation_block, flags=re.I)
             if (_names(citation_names) == names and (title_ok or any(
                     _truncated_cover_title_matches(value, context.title_hint, citation_title)
                     for value in title_candidates))):
@@ -191,16 +198,20 @@ def infer(context):
                 cursor += 1
             if not names or cursor >= len(lines):
                 continue
-            boundary = bool(_BOUNDARY.match(lines[cursor]))
+            boundary = bool(_BOUNDARY.match(lines[cursor]) or (
+                affiliation and re.search(r"\(\d{4}\).+\bdoi\s*:", lines[cursor], re.I)
+            ))
             unlabelled = affiliation and len(" ".join(lines[cursor:cursor + 2]).split()) >= 18
             if not (boundary or unlabelled):
                 continue
             title_end = start
             if title_end and _DOI.fullmatch(lines[title_end - 1]):
                 title_end -= 1
-            for width in range(1, min(5, title_end) + 1):
+            for width in range(1, min(12, title_end) + 1):
                 visible_title = " ".join(lines[title_end - width:title_end])
-                if not _matches_title(visible_title, context.title_hint, names):
+                title_matches = _matches_title(visible_title, context.title_hint, names)
+                machine_title = bool(re.fullmatch(r"[A-Za-z]{2,}\d{3,}.*", context.title_hint))
+                if not title_matches and not (machine_title and width >= 2 and affiliation):
                     continue
                 if not all(looks_like_person_name(name, title_hint=visible_title) for name in names):
                     continue

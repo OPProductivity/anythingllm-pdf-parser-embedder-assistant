@@ -38,6 +38,9 @@ def infer(context):
                 continue
             if line.casefold() == "by" and following:
                 names = credited_names(following)
+                if not names and re.search(r"\b[A-Z]\s+[a-z]{2,}\b", following):
+                    repaired = re.sub(r"\b([A-Z])\s+([a-z]{2,})\b", r"\1\2", following)
+                    names = credited_names(repaired)
                 if len(names) == 1:
                     candidates.append((page, names[0], f"By / {following}"))
                 continue

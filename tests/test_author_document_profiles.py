@@ -273,3 +273,47 @@ def test_selected_extraction_cannot_override_conflicting_book_credits():
     result = recover_author_from_selected_extraction(pages, title_hint="Shared Histories")
     assert result["author"] == ""
     assert result["source"] == "selected_extraction_conflicting_work_credits"
+
+
+def test_selected_ocr_titlepage_inline_byline():
+    pages = [
+        {"page": 1, "text": "RAPHAEL DALLEO AND ELENA MACHADO SAEZ"},
+        {"page": 4, "text": "THE LATINO/A CANON AND THE EMERGENCE OF POST-SIXTIES LITERATURE By Raphael Dalleo and Elena Machado Sáez"},
+    ]
+    result = recover_author_from_selected_extraction(pages, title_hint="The Latino a Canon")
+    assert result["author"] == "Raphael Dalleo, Elena Machado Sáez"
+    assert result["source"] == "selected_extraction_text_byline"
+
+
+def test_selected_ocr_catalog_card_requires_matching_name_twice():
+    card = ("Library of Congress Cataloging-in-Publication Data García, Cindy, 1968-"
+            "Salsa crossings : dancing latinidad in Los Angeles / Cindy García.")
+    pages = [{"page": index, "text": "front matter"} for index in range(1, 5)]
+    pages.append({"page": 5, "text": card})
+    result = recover_author_from_selected_extraction(pages, title_hint="SALSAC~1")
+    assert result["author"] == "Cindy García"
+    assert result["sample_pages"] == [1, 2, 3, 4, 5]
+    pages[-1]["text"] = card.replace("/ Cindy García", "/ Another Person")
+    assert recover_author_from_selected_extraction(pages, title_hint="SALSAC~1")["author"] == ""
+
+
+def test_dos_short_filename_book_uses_explicit_editor_titlepage():
+    samples = [{"page": 3, "text": (
+        "Precarity and Belonging\nLabor, Migration, and Noncitizenship\n"
+        "EDITED BY CATHERINE S. RAMÍREZ, SYLVANNA M. FALCÓN,\n"
+        "JUAN POBLETE, STEVEN C. MCKAY, AND\nFELICITY AMAYA SCHAEFFER\n"
+        "Rutgers University Press") }]
+    result = infer_author_from_samples(samples, Path("PRECAR~1.PDF"), title_hint="PRECAR~1")
+    assert result["author"] == ("CATHERINE S. RAMÍREZ, SYLVANNA M. FALCÓN, "
+                                "JUAN POBLETE, STEVEN C. MCKAY, FELICITY AMAYA SCHAEFFER")
+
+
+def test_microfilm_thesis_ocr_letter_spacing_in_author():
+    sample = {"page": 3, "text": (
+        "PO L IT IC S O F A Z T L A N\nby\nIgnacio M olina G arcia\n"
+        "A Dissertation Submitted to the Faculty o f the\n"
+        "In Partial Fulfillm ent o f the Requirem ents\n"
+        "F or the D egree o f\nD O C T O R O F P H IL O S O P H Y")}
+    result = infer_author_from_samples([sample], Path("dissertation.pdf"), title_hint="Politics of Aztlan")
+    assert result["author"] == "Ignacio Molina Garcia"
+    assert result["source"] == "text_thesis_titlepage_author"

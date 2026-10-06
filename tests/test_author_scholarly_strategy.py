@@ -104,3 +104,27 @@ def test_translated_article_credits_original_author():
 ])
 def test_translator_or_subject_is_not_author(body):
     assert parse(f'Journal of Society\nVol. 2, Issue No. 1, 2023\n{body}\nDOI: 10.1000/example') == ''
+
+
+def test_publisher_cover_comma_separated_authors():
+    text = (f'{TITLE}\nLourdes Gutiérrez Nájera, Korinta Maldonado\n'
+            'Journal Quarterly, Volume 69, Number 4, pp.\n809-821 (Article)\n'
+            'Published by Johns Hopkins University Press\nDOI: 10.1353/aq.2017.0067\n'
+            'https://muse.jhu.edu/article/680486')
+    assert parse(text) == 'Lourdes Gutiérrez Nájera, Korinta Maldonado'
+
+
+def test_wrapped_title_and_affiliated_credit():
+    title = '“New White Ethnics” or “New Latinos”? Hispanic/Latino Pan-ethnicity and Ancestry Reporting among South American Immigrants to the United States'
+    text = ('Original Research Article\n“New White Ethnics”\nor “New Latinos”?\n'
+            'Hispanic/Latino\nPan-ethnicity and\nAncestry Reporting\n'
+            'among South\nAmerican Immigrants\nto the United States\n'
+            'Rebecca A. Schut\nPopulation Studies Center, University of Pennsylvania\nAbstract')
+    assert parse(text, title=title) == 'Rebecca A. Schut'
+
+
+def test_machine_pdf_title_with_affiliated_abstract_byline():
+    text = ('Progress report\nGeographies of race and\nethnicity II: Environmental\n'
+            'racism, racial capitalism and\nstate-sanctioned violence\n'
+            'Laura Pulido\nUniversity of Southern California, USA\nAbstract')
+    assert parse(text, title='PHG646495 524..533') == 'Laura Pulido'

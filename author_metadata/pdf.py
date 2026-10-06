@@ -10,7 +10,8 @@ from .constants import POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES
 from .context import AuthorEvidenceContext
 from .dispatcher import infer_author
 from .identity import resolve_author_from_metadata_and_inference
-from .names import looks_like_person_name, normalize_author_candidate
+from .names import (looks_like_person_name, normalize_author_candidate,
+                    split_author_line_candidates)
 from .work_identity import resolve_work_identity
 
 
@@ -44,6 +45,41 @@ def recover_author_from_selected_extraction(pages, *, title_hint="", page_limit=
                 "page": 0, "evidence": "", "sample_pages": []}
     context = AuthorEvidenceContext.from_samples(samples, title_hint=title_hint, profile=profile)
     report = dict(infer_author(context))
+    if report.get("source") not in POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES and report.get("source") != "conflicting_work_credits":
+        extra_catalog_page = selected_extraction_author_samples(pages, page_limit=5)[4:5]
+        for sample in [*samples, *extra_catalog_page]:
+            if sample["page"] > 5:
+                continue
+            compact = " ".join(str(sample["text"]).split())
+            # OCR sometimes emits the complete title and its explicit By
+            # credit on one line instead of preserving the title-page break.
+            titlepage = re.match(r"^(.{20,180}?)\s+[Bb]y\s+(.{5,140})$", compact)
+            if sample["page"] <= 4 and titlepage and len(titlepage.group(1).split()) >= 5:
+                names = split_author_line_candidates(
+                    titlepage.group(2), allow_all_caps=True, require_complete=True,
+                )
+                if names:
+                    report = {"author": ", ".join(names), "source": "text_byline",
+                              "page": sample["page"], "evidence": compact[:250]}
+                    break
+            # A catalog card names the writer twice: surname-first in the
+            # heading and given-name-first after the work title's slash.
+            catalog = re.search(
+                r"Library of Congress Cataloging-in-Publication Data\s+"
+                r"([^,.;]{2,45}),\s*([^,.;]{2,45}),\s*\d{4}[^/]{10,220}/\s*"
+                r"([^.;]{5,90})\.", compact, re.I,
+            )
+            if catalog:
+                heading = normalize_author_candidate(
+                    f"{catalog.group(2)} {catalog.group(1)}")
+                printed = normalize_author_candidate(catalog.group(3))
+                if (heading.casefold() == printed.casefold()
+                        and looks_like_person_name(printed)):
+                    report = {"author": printed, "source": "text_strict_credit_block",
+                              "page": sample["page"], "evidence": catalog.group(0)[:250]}
+                    if sample in extra_catalog_page:
+                        samples = [*samples, sample]
+                    break
     if not report.get("author") and report.get("source") == "not_found":
         first = samples[0]
         lines = [normalize_text(line) for line in first["text"].splitlines() if normalize_text(line)]

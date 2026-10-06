@@ -45,6 +45,12 @@ def thesis_title_pages(samples):
             compact, flags=re.I,
         )
         degree = re.search(r"\b(?:Doctor|Master|Bachelor)\s+of\s+[A-Za-z]+\b", compact, flags=re.I)
+        if not (submission and degree):
+            # Microfilm OCR often separates letters in the degree heading.
+            # Keep the damaged-text route tied to a short title page that
+            # still states its dissertation submission explicitly.
+            submission = re.search(r"\bDissertation\s+Submitted\s+to\s+the\s+Faculty\b", compact, re.I)
+            degree = re.search(r"\bD\s+O\s+C\s+T\s+O\s+R\s+O\s+F\s+P\s+H", compact, re.I)
         if submission and degree:
             yield page, text
 

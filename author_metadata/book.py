@@ -26,6 +26,10 @@ def _names(line):
 def _title_matches(visible, hint, names):
     if re.search(r"\b(?:edited\s+by|written\s+by|foreword|copyright|contributors?|series\s+editors?)\b", visible, re.I):
         return False
+    # DOS 8.3 filenames carry no usable work title. An explicit title-page
+    # role can instead use the complete printed title immediately above it.
+    if re.fullmatch(r"[A-Za-z]{2,6}~\d+", hint) and len(words(visible)) >= 3:
+        return True
     if matches(visible, hint, names) or (len(words(hint)) >= 2 and words(visible) == words(hint)):
         return True
     parts = re.split(r"\s+--\s+", hint)
