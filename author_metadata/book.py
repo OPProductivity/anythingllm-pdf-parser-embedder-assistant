@@ -33,6 +33,9 @@ def _title_matches(visible, hint, names):
     if matches(visible, hint, names) or (len(words(hint)) >= 2 and words(visible) == words(hint)):
         return True
     parts = re.split(r"\s+--\s+", hint)
+    if (len(parts) >= 3 and any(_IMPRINT.search(part) for part in parts[2:])
+            and matches(visible, parts[0], names)):
+        return True
     if len(parts) >= 2 and words(parts[1]) == words(" ".join(names)):
         if any(not (_IMPRINT.search(part) or re.fullmatch(r"\d{4}", part)) for part in parts[2:]):
             return False

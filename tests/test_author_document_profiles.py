@@ -317,3 +317,45 @@ def test_microfilm_thesis_ocr_letter_spacing_in_author():
     result = infer_author_from_samples([sample], Path("dissertation.pdf"), title_hint="Politics of Aztlan")
     assert result["author"] == "Ignacio Molina Garcia"
     assert result["source"] == "text_thesis_titlepage_author"
+
+
+def test_ebsco_catalog_wrapper_does_not_override_book_editor_titlepage():
+    samples = [
+        {"page": 1, "text": (
+            "1996. National Academies Press.\n"
+            "EBSCO Publishing: eBook Collection (EBSCOhost) printed on 2/16/2026\n"
+            "123655; Lott, Juanita Tamayo, Edmonston, Barry, Goldstein, Joshua, "
+            "National Research Council (U.S.); Spotlight on Heterogeneity")},
+        {"page": 2, "text": (
+            "Spotlight on\nHeterogeneity\nThe Federal Standards for Racial and Ethnic\n"
+            "Classification\nSummary of a Workshop\n"
+            "Barry Edmonston, Joshua Goldstein, Juanita Tamayo Lott, Editors\n"
+            "National Academies Press")},
+    ]
+    result = infer_author_from_samples(samples, Path("LottJuanitaTamayoEdm_1996_SpotlightonHeterogeneity.pdf"))
+    assert result["author"] == "Barry Edmonston, Joshua Goldstein, Juanita Tamayo Lott"
+
+
+def test_university_of_texas_press_titlepage_is_book_author_evidence():
+    samples = [
+        {"page": 2, "text": "Mexican Americans and the Question of Race"},
+        {"page": 4, "text": (
+            "Mexican Americans and\nthe Question of Race\nJulie A. Dowling\n"
+            "University of Texas Press   Austin")},
+    ]
+    title = "Mexican Americans and the Question of Race -- Julie A Dowling, (1975- ) -- University of Texas Press"
+    result = infer_author_from_samples(samples, Path("catalog.pdf"), title_hint=title)
+    assert result["author"] == "Julie A. Dowling"
+    assert result["page"] == 4
+
+
+def test_single_page_proquest_excerpt_citation_requires_matching_work_title():
+    sample = {"page": 1, "text": (
+        "Part III\nSeven Years After\n"
+        "Galeano, Eduardo. Open Veins of Latin America : Five Centuries of the Pillage of a Continent, "
+        "Monthly Review Press, 1997. ProQuest Ebook Central,\n"
+        "Copyright © 1997. Monthly Review Press. All rights reserved.\n"
+        "Ebook pages 284-284 | Printed page 1 of 1")}
+    path = Path("Open_Veins_of_Latin_America_Five_Centuries_of_the_...pdf")
+    assert infer_author_from_samples([sample], path, title_hint=path.stem)["author"] == "Eduardo Galeano"
+    assert infer_author_from_samples([sample], path, title_hint="Another Work Entirely")["author"] == ""

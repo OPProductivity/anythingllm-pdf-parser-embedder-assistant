@@ -507,6 +507,13 @@ def infer_author_from_text_samples(samples, title_hint=""):
     filtered = []
     for sample in samples:
         text = str(sample.get("text") or "")
+        # EBSCO print wrappers prepend an inverted catalog list and an
+        # organization before the actual book title page. Those comma pairs
+        # are not adjacent person/affiliation credits.
+        if (str(sample.get("page") or "") == "1"
+                and "EBSCO Publishing: eBook Collection" in text
+                and "EBSCOhost" in text):
+            continue
         # Multiple dash-attributed endorsements are not an author title block.
         # Leave ordinary name/affiliation pages and a single quoted passage alone.
         endorsements = re.findall(r"(?m)^\s*[—–]\s*[^\n,]{3,80},", text)
@@ -1403,6 +1410,25 @@ def infer_author_from_samples_or_filename(samples, path: Path, title_hint=""):
 
 
 def _infer_author_from_samples_or_filename(samples, path: Path, title_hint=""):
+    # A one-page ProQuest excerpt can carry the book's catalog citation
+    # rather than a title page. Match that citation to the selected file's
+    # title before accepting its inverted author name.
+    if len(samples) == 1 and str(samples[0].get("page") or "") == "1":
+        text = str(samples[0].get("text") or "")
+        if ("ProQuest Ebook Central" in text
+                and re.search(r"Ebook pages\s+\d+-\d+\s*\|\s*Printed page 1 of 1", text, re.I)):
+            citation = re.search(
+                r"(?m)^([A-Z][^\n,.]{1,50}),\s*([A-Z][^\n,.]{1,50})\.\s+"
+                r"([^\n]{15,180}?),\s*[^\n]*ProQuest Ebook Central",
+                text,
+            )
+            expected = re.findall(r"[^\W\d_]+", title_hint.casefold())[:5]
+            observed = re.findall(r"[^\W\d_]+", citation.group(3).casefold()) if citation else []
+            if (len(expected) >= 4 and observed[:len(expected)] == expected):
+                name = normalize_author_candidate(f"{citation.group(1)}, {citation.group(2)}")
+                if looks_like_person_name(name):
+                    return {"author": name, "source": "text_bibliographic_author_label",
+                            "page": 1, "evidence": citation.group(0)[:220]}
     decoded_stem = urllib.parse.unquote(re.sub(r"_([0-9A-Fa-f]{2})", r"%\1", Path(path).stem))
     catalog_parts = decoded_stem.split("--")
     if len(catalog_parts) >= 3:

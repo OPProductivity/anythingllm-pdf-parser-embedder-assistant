@@ -23104,11 +23104,12 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     selected["ocr_assistance_evidence"] = str(ocr_evidence.get("evidence") or "not_observed")
     post_extraction_author_recovery = {
         "author": "",
-        "source": "not_needed_author_already_resolved",
+        "source": ("not_needed_author_already_resolved" if source_meta.get("source_author")
+                   else "not_attempted_no_selected_ocr_text"),
         "page": 0,
         "evidence": "",
         "sample_pages": [],
-        "status": "not_needed",
+        "status": "not_needed" if source_meta.get("source_author") else "not_attempted",
     }
     # Native metadata and its first-page sample deliberately happen before
     # backend selection. For scans, that first sample can be empty even when

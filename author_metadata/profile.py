@@ -151,7 +151,7 @@ def classify_document(samples, title_hint=""):
         for sample in opening:
             text = str(sample.get("text") or "")
             if len(text.split()) > 160 or not re.search(
-                r"\b(?:university\s+press|publishers?|publishing|routledge|palgrave|macmillan|penguin)\b",
+                r"\b(?:university(?:\s+of\s+\w+){0,3}\s+press|publishers?|publishing|routledge|palgrave|macmillan|penguin)\b",
                 text, flags=re.I,
             ):
                 continue
