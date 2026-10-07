@@ -51,6 +51,11 @@ def thesis_title_pages(samples):
             # still states its dissertation submission explicitly.
             submission = re.search(r"\bDissertation\s+Submitted\s+to\s+the\s+Faculty\b", compact, re.I)
             degree = re.search(r"\bD\s+O\s+C\s+T\s+O\s+R\s+O\s+F\s+P\s+H", compact, re.I)
+        if not (submission and degree):
+            submission = (re.search(r"\bA\s+Dissertation\b", compact, re.I)
+                          and re.search(r"\bSubmitted\s+to\b", compact, re.I)
+                          and re.search(r"\bpartial\s+fulfill?ment\b", compact, re.I))
+            degree = re.search(r"\bDoctor\s+of\s+Philosophy\b", compact, re.I)
         if submission and degree:
             yield page, text
 

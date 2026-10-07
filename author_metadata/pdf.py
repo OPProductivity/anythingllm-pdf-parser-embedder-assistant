@@ -12,6 +12,7 @@ from .dispatcher import infer_author
 from .identity import resolve_author_from_metadata_and_inference
 from .names import (looks_like_person_name, normalize_author_candidate,
                     split_author_line_candidates)
+from .scholarly_article import has_editorial_opening
 from .work_identity import resolve_work_identity
 
 
@@ -148,6 +149,13 @@ def infer_author_from_initial_pdf_pages(path: Path, title_hint="", *, page_limit
                     value = doc.load_page(index).get_text("text")
                     if value:
                         samples.append({"page": index + 1, "text": value})
+            elif identity.profile.kind == "scholarly_article" and has_editorial_opening(samples):
+                for number in dict.fromkeys((max(1, len(doc) - 1), len(doc))):
+                    if number <= limit:
+                        continue
+                    value = doc.load_page(number - 1).get_text("text")
+                    if value:
+                        samples.append({"page": number, "text": value})
     except Exception as exc:
         return {"author": "", "source": "error", "page": 0, "evidence": "",
                 "error": type(exc).__name__}

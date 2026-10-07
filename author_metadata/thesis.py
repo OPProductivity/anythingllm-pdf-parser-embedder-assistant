@@ -44,7 +44,14 @@ def infer(context):
                 if len(names) == 1:
                     candidates.append((page, names[0], f"By / {following}"))
                 continue
-            if _ORGANIZATION.match(line) or not _AFFILIATION.match(following):
+            if re.fullmatch(r"A\s+Dissertation", following, re.I):
+                names = credited_names(line)
+                if len(names) == 1:
+                    candidates.append((page, names[0], f"{line} / {following}"))
+                continue
+            if (_ORGANIZATION.match(line)
+                    or re.search(r"\b(?:Committee|Dean|Advisor|Supervisor|Examiner)\b", line, re.I)
+                    or not _AFFILIATION.match(following)):
                 continue
             name = normalize_author_candidate(line)
             if looks_like_person_name(name, title_hint="", allow_all_caps=True):

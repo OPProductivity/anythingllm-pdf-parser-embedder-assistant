@@ -22,9 +22,23 @@ _PUBLICATION = re.compile(r"^(?:received:|revised:|accepted:|published online:|\
 _DATE = re.compile(r"^\d{1,2}\s+[A-Za-z]+\s+\d{4}$")
 
 
+def has_editorial_opening(samples):
+    first = next((sample for sample in samples or ()
+                  if int(sample.get("page") or 0) == 1), None)
+    if first is None:
+        return False
+    lines = [" ".join(line.split()) for line in str(first.get("text") or "").splitlines()
+             if line.strip()]
+    return any(re.fullmatch(r"Editorial", line, re.I) for line in lines[:8])
+
+
 def _names(line, title=""):
     if _ROLE.search(line) or has_author_affiliation_hint(line):
         return []
+    suffix = re.fullmatch(r"(.+?),\s*(Jr\.?|Sr\.?|III|IV)", line, re.I)
+    if suffix:
+        candidate = normalize_author_candidate(line)
+        return [candidate] if looks_like_person_name(candidate, title_hint=title) else []
     # A bare comma can separate two complete names on a publisher cover.
     # Require two validated names so a location such as Aalborg, Denmark
     # remains outside the author grammar.
@@ -51,6 +65,21 @@ def _matches_title(visible, hint, names):
     ):
         return matches(visible, " ".join(parts[1:]), names, allow_long_prefix=True)
     return False
+
+
+def _matches_truncated_filename_title(visible, context):
+    """Allow a clipped filename to corroborate a longer visible article title."""
+    if context.path is None or words(context.path.stem) != words(context.title_hint):
+        return False
+    expected, observed = words(context.title_hint), words(visible)
+    return bool(
+        len(expected) >= 5
+        and len(expected[-1]) >= 5
+        and len(observed) >= len(expected) + 2
+        and observed[:len(expected) - 1] == expected[:-1]
+        and observed[len(expected) - 1].startswith(expected[-1])
+        and observed[len(expected) - 1] != expected[-1]
+    )
 
 
 def _result(names, sample, lines, source):
@@ -221,9 +250,131 @@ def _abstract_adjacent_credit(lines, context, sample):
     return not_found()
 
 
+def _medical_multicolumn_credit(lines, sample):
+    """Recover a credentialled byline emitted after the first body column."""
+    if int(sample["page"]) != 1:
+        return not_found()
+    abstract = next((i for i, line in enumerate(lines[:12])
+                     if re.match(r"^abstract\b", line, re.I)), -1)
+    contact = next((i for i, line in enumerate(lines[:100])
+                    if re.fullmatch(r"Corresponding Author\s*:?", line, re.I)), -1)
+    if abstract < 2 or len(words(" ".join(lines[:abstract]))) < 6 or contact < 0:
+        return not_found()
+    credential = re.compile(
+        r"(.+?),\s*((?:(?:MD|DO|PhD|MPH|DNP|RN|MS|MAS|FAAFP)[,\s]*)+)(?:\d{1,2})?",
+        re.I,
+    )
+    for start in range(abstract + 3, min(contact, len(lines))):
+        names = []
+        cursor = start
+        while cursor < min(contact, len(lines)):
+            match = credential.fullmatch(lines[cursor])
+            parsed = _names(match.group(1)) if match else []
+            if len(parsed) != 1:
+                break
+            names.append(parsed[0])
+            cursor += 1
+        if len(names) < 3 or cursor >= len(lines):
+            continue
+        if not re.match(r"^\d{1,2}(?:Department|University|School|College|Institute)\b",
+                        lines[cursor], re.I):
+            continue
+        contact_names = _names(lines[contact + 1]) if contact + 1 < len(lines) else []
+        if contact_names != names[:1]:
+            continue
+        return _result(names, sample, lines[start:cursor], "text_medical_multicolumn_byline")
+    return not_found()
+
+
+def _repository_cover_credit(context):
+    """Cross-check a repository cover credit against the work's own byline."""
+    pages = {int(sample["page"]): sample for sample in context.opening_pages}
+    if 1 not in pages or 2 not in pages:
+        return not_found()
+    cover = [" ".join(line.split()) for line in pages[1]["text"].splitlines() if line.strip()]
+    content = [" ".join(line.split()) for line in pages[2]["text"].splitlines() if line.strip()]
+    if not any("researchgate.net/publication/" in line.casefold() for line in cover[:5]):
+        return not_found()
+    for index, line in enumerate(cover[:25]):
+        if not re.fullmatch(r"1 author\s*:", line, re.I) or index + 1 >= len(cover):
+            continue
+        cover_names = _names(cover[index + 1])
+        if len(cover_names) != 1:
+            continue
+        for credit_index, visible in enumerate(content[1:12], start=1):
+            if _names(visible) != cover_names:
+                continue
+            for width in range(1, min(5, credit_index) + 1):
+                title = " ".join(content[credit_index - width:credit_index])
+                def key(value):
+                    return tuple(word for word in words(value)
+                                 if word not in {"and", "the", "of"})
+                if (key(title) == key(context.title_hint)
+                        and any(key(value) == key(title) for value in cover[:5])):
+                    return _result(cover_names, pages[2],
+                                   [title, visible, cover[index + 1]],
+                                   "text_repository_cover_correlated_byline")
+    return not_found()
+
+
+def _openedition_cover_credit(lines, context, sample):
+    """Use a visible OpenEdition credit repeated in its electronic citation."""
+    if not any("journals.openedition.org/" in line for line in lines[:35]):
+        return not_found()
+    reference = next((i for i, line in enumerate(lines[:45])
+                      if re.fullmatch(r"Electronic reference", line, re.I)), -1)
+    if reference < 0:
+        return not_found()
+    for index, line in enumerate(lines[:reference]):
+        names = _names(line)
+        if len(names) != 1 or index + 1 >= len(lines):
+            continue
+        if not re.fullmatch(r"Electronic version", lines[index + 1], re.I):
+            continue
+        if not any(_matches_title(" ".join(lines[index - width:index]),
+                                  context.title_hint, names)
+                   for width in range(1, min(5, index) + 1)):
+            continue
+        if any(lines[cite].casefold().startswith(names[0].casefold() + ",")
+               for cite in range(reference + 1, min(reference + 4, len(lines)))):
+            return _result(names, sample, [line, lines[reference]],
+                           "text_bibliographic_byline")
+    return not_found()
+
+
+def _editorial_end_signature(context):
+    """Use an editorial's own signed closing block, not journal masthead."""
+    if not has_editorial_opening(context.opening_pages):
+        return not_found()
+    first = next(sample for sample in context.opening_pages
+                 if int(sample["page"]) == 1)
+    opening = [" ".join(line.split()) for line in first["text"].splitlines() if line.strip()]
+    if any(re.match(r"^Abstract\b", line, re.I) for line in opening[:25]):
+        return not_found()
+    for sample in sorted(context.samples, key=lambda row: int(row.get("page") or 0), reverse=True):
+        if int(sample.get("page") or 0) <= 4:
+            continue
+        lines = [" ".join(line.split()) for line in sample["text"].splitlines() if line.strip()]
+        for index, line in enumerate(lines[-45:]):
+            actual = len(lines) - min(45, len(lines)) + index
+            if not re.fullmatch(r"(?:Founding|Managing|Chief)?\s*Editor(?:-in-Chief)?", line, re.I):
+                continue
+            if actual < 1 or actual + 1 >= len(lines):
+                continue
+            names = _names(lines[actual - 1])
+            following = " ".join(lines[actual + 1:actual + 4])
+            if len(names) == 1 and has_author_affiliation_hint(following):
+                return _result(names, sample, lines[actual - 1:actual + 2],
+                               "text_editorial_end_signature")
+    return not_found()
+
+
 def infer(context):
     if context.profile.kind != "scholarly_article":
         return not_found()
+    repository = _repository_cover_credit(context)
+    if repository["author"]:
+        return repository
     for sample in context.opening_pages:
         if int(sample["page"]) > 3:
             continue
@@ -231,6 +382,9 @@ def infer(context):
         cover = _cover_credit(lines, context, sample)
         if cover["author"]:
             return cover
+        openedition = _openedition_cover_credit(lines, context, sample)
+        if openedition["author"]:
+            return openedition
         translated = _translated_credit(lines, context, sample)
         if translated["author"]:
             return translated
@@ -243,6 +397,20 @@ def infer(context):
                         return _result(names, sample, [line], "text_byline")
         for start in range(min(80, len(lines))):
             if any(_ROLE.search(line) for line in lines[:start + 1]):
+                continue
+            if (
+                start + 1 < len(lines)
+                and _names(lines[start])
+                and _names(lines[start + 1])
+                and any(
+                    _matches_truncated_filename_title(
+                        " ".join(lines[start - width:start + 1]), context
+                    )
+                    for width in range(1, min(3, start) + 1)
+                )
+            ):
+                # A wrapped title can end in two capitalized words that look
+                # like a person. Its actual byline starts on the next line.
                 continue
             names, credit_lines = [], []
             cursor = start
@@ -271,7 +439,7 @@ def infer(context):
                     credit_lines.append(line)
                     cursor += 1
                     continue
-                elif _LOCATION.fullmatch(line):
+                elif _LOCATION.fullmatch(line) and not _names(line):
                     # One location after an established name may precede the
                     # abstract. It is never itself parsed as a person.
                     if not names or cursor + 1 >= len(lines) or not _BOUNDARY.match(lines[cursor + 1]):
@@ -301,8 +469,11 @@ def infer(context):
                 title_end -= 1
             for width in range(1, min(12, title_end) + 1):
                 visible_title = " ".join(lines[title_end - width:title_end])
-                title_matches = _matches_title(visible_title, context.title_hint, names)
-                machine_title = bool(re.fullmatch(r"[A-Za-z]{2,}\d{3,}.*", context.title_hint))
+                title_matches = (
+                    _matches_title(visible_title, context.title_hint, names)
+                    or _matches_truncated_filename_title(visible_title, context)
+                )
+                machine_title = bool(re.fullmatch(r"[A-Za-z]{2,}[_-]?\d{3,}.*", context.title_hint))
                 if not title_matches and not (machine_title and width >= 2 and affiliation):
                     continue
                 if not all(looks_like_person_name(name, title_hint=visible_title) for name in names):
@@ -318,4 +489,10 @@ def infer(context):
         adjacent = _abstract_adjacent_credit(lines, context, sample)
         if adjacent["author"]:
             return adjacent
+        medical = _medical_multicolumn_credit(lines, sample)
+        if medical["author"]:
+            return medical
+    editorial = _editorial_end_signature(context)
+    if editorial["author"]:
+        return editorial
     return not_found()

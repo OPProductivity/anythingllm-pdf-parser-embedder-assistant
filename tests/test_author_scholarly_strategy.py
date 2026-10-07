@@ -1,5 +1,7 @@
 from author_metadata.context import AuthorEvidenceContext
 from author_metadata.scholarly_article import infer
+from author_metadata.identity import resolve_author_from_metadata_and_inference
+from pathlib import Path
 import pytest
 
 pytestmark = pytest.mark.offline_deterministic
@@ -167,3 +169,73 @@ def test_affiliation_suffix_requires_corresponding_name_and_marker():
             f'{TITLE}\nMaria Abascala\nAbstract\nArticle prose.\nDOI: 10.1000/example')
     assert parse(text) == 'Maria Abascal'
     assert parse(text.replace('aColumbia University\n', '')) == 'Maria Abascala'
+
+
+def test_machine_title_with_separator_uses_affiliated_visible_byline():
+    text = ('KEYNOTE ADDRESS\nDonald Trump’s contribution to the study of politics\n'
+            'and the life sciences\nJohn R. Hibbing\nExample University\n'
+            'Email: john@example.edu\nAbstract\nArticle prose.')
+    assert parse(text, title='PLS_2300010 169..178') == 'John R. Hibbing'
+
+
+def test_clipped_filename_title_with_two_affiliated_authors_on_second_page():
+    path = Path('Critical_Latinx_Indigeneities_Unpacking_Indigeneit.pdf')
+    samples = [dict(page=1, text='Journal cover\nISSN: 1234-5678'),
+               dict(page=2, text=(
+                   'Critical Latinx Indigeneities: Unpacking Indigeneity from Within and Outside of\n'
+                   'Latinized Entanglements\nLuis Urrieta, Jr.\nExample University\n'
+                   'Dolores Calderón\nWestern Washington University\nAbstract\nArticle prose.'))]
+    context = AuthorEvidenceContext.from_samples(samples, title_hint=path.stem, path=path)
+    assert infer(context)['author'] == 'Luis Urrieta, Jr., Dolores Calderón'
+    wrong = AuthorEvidenceContext.from_samples(samples, title_hint='Different_Article_Unpacking_Indigeneit', path=path)
+    assert infer(wrong)['author'] == ''
+
+
+def test_multicolumn_medical_credit_requires_matching_contact():
+    text = ('REFLECTIONS\nA Study of Community Health and Identity\nAbstract\n'
+            'This article discusses communities.\n' * 4 +
+            'Diana N. Carvajal, MD, MPH1\nIvonne McLean, MD2\n'
+            'Miranda Aragón, MD3\n1Department of Medicine\n'
+            'CORRESPONDING AUTHOR\nDiana N. Carvajal\nExample University')
+    assert parse(text, title='0220254') == 'Diana N. Carvajal, Ivonne McLean, Miranda Aragón'
+    report = infer(AuthorEvidenceContext.from_samples([dict(page=1, text=text)], title_hint='0220254'))
+    assert resolve_author_from_metadata_and_inference('', report)['author'] == report['author']
+    assert parse(text.replace('CORRESPONDING AUTHOR\nDiana N. Carvajal',
+                              'CORRESPONDING AUTHOR\nAnother Person'), title='0220254') == ''
+
+
+def test_repository_cover_requires_same_author_and_title_on_content_page():
+    path = Path('Cultural Homogenization Ethnic Cleansing Genocide.pdf')
+    cover = ('See publication at https://www.researchgate.net/publication/123\n'
+             'Cultural Homogenization, Ethnic Cleansing, and Genocide\n'
+             'Chapter · January 2010\nDOI: 10.1000/example\n1 author:\nDaniele Conversi')
+    content = ('Cultural Homogenization, Ethnic\nCleansing, and Genocide\n'
+               'Daniele Conversi\nExample University\nIntroduction\nProse.')
+    samples = [dict(page=1, text=cover), dict(page=2, text=content)]
+    context = AuthorEvidenceContext.from_samples(samples, path=path, title_hint=path.stem)
+    report = infer(context)
+    assert report['author'] == 'Daniele Conversi'
+    assert resolve_author_from_metadata_and_inference('', report)['author'] == 'Daniele Conversi'
+    samples[1]['text'] = content.replace('Daniele Conversi', 'Another Person')
+    assert infer(AuthorEvidenceContext.from_samples(samples, path=path, title_hint=path.stem))['author'] == ''
+
+
+def test_openedition_citation_repeats_cover_author():
+    text = ('Revue LISA\nReactive Ethnic Formations and Panethnic Identities\n'
+            'Ramón A. Gutiérrez\nElectronic version\n'
+            'URL: https://journals.openedition.org/lisa/5279\n'
+            'DOI: 10.4000/lisa.5279\nElectronic reference\n'
+            'Ramón A. Gutiérrez, “Reactive Ethnic Formations and Panethnic Identities”')
+    assert parse(text, title='Reactive Ethnic Formations and Panethnic Identities') == 'Ramón A. Gutiérrez'
+
+
+def test_editorial_closing_signature_requires_editor_role():
+    samples = [dict(page=1, text='Editorial\nReflections on a scholarly field\nDOI: 10.1000/example'),
+               dict(page=9, text='References\nSuzanne Oboler\nFounding Editor\n'
+                    'John Jay College of Criminal Justice\nE-mail: editor@example.edu')]
+    context = AuthorEvidenceContext.from_samples(samples, title_hint='lst.2012.29')
+    report = infer(context)
+    assert report['author'] == 'Suzanne Oboler'
+    assert resolve_author_from_metadata_and_inference('', report)['author'] == 'Suzanne Oboler'
+    samples[1]['text'] = samples[1]['text'].replace('Founding Editor', 'Book Editor')
+    assert infer(AuthorEvidenceContext.from_samples(samples, title_hint='lst.2012.29'))['author'] == ''

@@ -84,6 +84,7 @@ from author_metadata.context import AuthorEvidenceContext
 from author_metadata.constants import TRUSTED_AUTHOR_INFERENCE_SOURCES
 from author_metadata.dispatcher import infer_author as infer_profiled_author
 from author_metadata.pdf import infer_author_from_initial_pdf_pages
+from author_metadata.scholarly_article import has_editorial_opening
 from author_metadata.work_identity import resolve_work_identity
 from author_metadata.identity import resolve_author_from_metadata_and_inference
 
@@ -5621,7 +5622,7 @@ def workspace_person_identity_from_pdf(pdf_file, *, native_metadata=None):
             metadata = dict(native_metadata)
             available_samples = [
                 sample for sample in (metadata.get("_author_text_samples") or [])
-                if 1 <= int(sample.get("page") or 0) <= 12
+                if int(sample.get("page") or 0) >= 1
             ]
             identity = resolve_work_identity(
                 metadata.get("title") or "", path, available_samples,
@@ -5631,9 +5632,15 @@ def workspace_person_identity_from_pdf(pdf_file, *, native_metadata=None):
                 available_samples, path=path, title_hint=resolved_title,
                 profile=identity.profile,
             )
-            selected_samples = available_samples if context.profile.kind == "book" else [
-                sample for sample in available_samples if int(sample["page"]) <= 4
-            ]
+            if context.profile.kind == "book":
+                selected_samples = [sample for sample in available_samples
+                                    if int(sample["page"]) <= 12]
+            elif (context.profile.kind == "scholarly_article"
+                  and has_editorial_opening(available_samples)):
+                selected_samples = available_samples
+            else:
+                selected_samples = [sample for sample in available_samples
+                                    if int(sample["page"]) <= 4]
             inference = infer_profiled_author(AuthorEvidenceContext.from_samples(
                 selected_samples, path=path, title_hint=resolved_title,
                 profile=identity.profile,

@@ -1,7 +1,9 @@
 from author_metadata.dispatcher import infer_author_from_samples
 from pathlib import Path
+import tempfile
 
 import pytest
+import fitz
 
 import auto_anythingllm_pipeline as pipeline
 from author_metadata.profile import classify_document
@@ -49,6 +51,45 @@ def test_degree_submission_routes_title_page_author_not_committee():
     assert result["source"] == "text_thesis_titlepage_author"
     selected = recover_author_from_selected_extraction(samples)
     assert selected["author"] == "Alice Smith"
+
+
+def test_dissertation_title_page_without_byline_credits_name_before_degree_label():
+    text = ("The Experiences of Students at a University\nMary Ann Begley\n"
+            "A Dissertation\nSubmitted to the Graduate College in partial fulfillment "
+            "of the requirements for the degree of DOCTOR OF PHILOSOPHY\n"
+            "Committee:\nDr. Ellen Broido, Advisor")
+    samples = [{"page": 1, "text": text}]
+    assert classify_document(samples).kind == "thesis_dissertation"
+    assert infer_author_from_samples(samples, Path("dissertation.pdf"))["author"] == "Mary Ann Begley"
+
+
+def test_dissertation_byline_excludes_committee_and_dean():
+    text = ("A Dissertation\nentitled\nA Study of Degree Awards\nby\n"
+            "Rosalinda C. Dunlap\nSubmitted to the Graduate Faculty as partial "
+            "fulfillment of the requirements for the Doctor of Philosophy Degree\n"
+            "Dr. Penny Gosetti, Committee Chair\nDr. Patricia Komuniecki, Dean\n"
+            "College of Graduate Studies")
+    samples = [{"page": 1, "text": text}]
+    assert classify_document(samples).kind == "thesis_dissertation"
+    assert infer_author_from_samples(samples, Path("dissertation.pdf"))["author"] == "Rosalinda C. Dunlap"
+
+
+def test_editorial_ui_preview_samples_signed_last_page_only_for_editorials():
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "editorial.pdf"
+        doc = fitz.open()
+        for index in range(9):
+            page = doc.new_page()
+            text = ("Editorial\nReflections on a scholarly field\nDOI: 10.1000/example"
+                    if index == 0 else
+                    "Suzanne Oboler\nFounding Editor\nJohn Jay College of Criminal Justice"
+                    if index == 8 else "Editorial prose continues.")
+            page.insert_text((72, 72), text)
+        doc.save(path)
+        doc.close()
+        report = infer_author_from_initial_pdf_pages(path, page_limit=4)
+    assert report["author"] == "Suzanne Oboler"
+    assert report["page"] == 9
 
 
 def test_thesis_mismatched_title_page_people_abstains():

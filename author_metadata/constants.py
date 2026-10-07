@@ -189,6 +189,9 @@ POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES = {
 
 
 TRUSTED_AUTHOR_INFERENCE_SOURCES = POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES | {
+    "text_medical_multicolumn_byline",
+    "text_repository_cover_correlated_byline",
+    "text_editorial_end_signature",
     "text_review_affiliated_byline",
     "text_dated_opening_byline",
     "text_report_prepared_by",
