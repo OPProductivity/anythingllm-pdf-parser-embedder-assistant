@@ -22291,6 +22291,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             and automatic_targeted_ocr_pages
             and str(requested_unstructured_strategy or "auto").casefold() == "auto"
             and active_unstructured.get("runtime", {}).get("tesseract_available")
+            and active_unstructured["resolved"] != "ocr_only"
         ):
             active_unstructured = {
                 **active_unstructured,
@@ -22397,6 +22398,20 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 if backend == "unstructured" and automatic_targeted_ocr_pages
                 else None
             )
+            if (
+                unstructured_page_numbers
+                and unstructured_effective_strategy == "ocr_only"
+                and any(
+                    candidate.get("backend") == "pymupdf"
+                    and document_has_image_backed_split_words(candidate.get("quality"))
+                    for candidate in candidates
+                    if not candidate.get("error")
+                )
+            ):
+                # The page-local visual gap remains in the audit, but a
+                # pervasive broken image-backed layer needs a whole-document
+                # independent OCR comparison.
+                unstructured_page_numbers = None
             if unstructured_page_numbers:
                 if native_document_requires_full_ocr(
                     candidates, profile.get("pdf_page_count")
@@ -23158,6 +23173,17 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         recovered_candidates = []
         for candidate in viable:
             if str(candidate.get("backend") or "").casefold() != "unstructured":
+                continue
+            if (
+                str(candidate.get("unstructured_strategy") or "") == "ocr_only"
+                and any(
+                    native.get("backend") == "pymupdf"
+                    and document_has_image_backed_split_words(native.get("quality"))
+                    for native in viable
+                )
+            ):
+                # A full OCR comparison must pass its separate quality gate;
+                # one recovered sparse page cannot select the entire document.
                 continue
             page_text_by_number = {
                 candidate_page_number(row): str(row.get("text") or "").strip()

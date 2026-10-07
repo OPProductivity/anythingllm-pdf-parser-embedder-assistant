@@ -58,6 +58,29 @@ def _result(names, sample, lines, source):
             "page": int(sample["page"]), "evidence": " / ".join(lines)}
 
 
+def _corroborate_affiliation_suffix(names, lines):
+    """Remove a merged lowercase affiliation mark when a credit confirms it."""
+    if len(names) != 1:
+        return names
+    candidate = names[0]
+    marker = candidate[-1:]
+    if not marker.islower():
+        return names
+    for index, line in enumerate(lines[:100]):
+        if not re.fullmatch(r"Corresponding Author\s*:?", line, re.I):
+            continue
+        if index + 1 >= len(lines):
+            continue
+        corroborated = _names(lines[index + 1].split(",", 1)[0])
+        if not any(candidate[:-1].casefold() == name.casefold() for name in corroborated):
+            continue
+        if any(re.match(rf"^{re.escape(marker)}[A-Z].*"
+                        r"(?:University|College|Department|Institute|School)",
+                        value) for value in lines[:100]):
+            return [name for name in corroborated if candidate[:-1].casefold() == name.casefold()]
+    return names
+
+
 def _truncated_cover_title_matches(visible, hint, citation_title):
     """Accept a PDF Title cut inside its final word only with the publisher citation."""
     observed, expected = words(visible), words(hint)
@@ -168,7 +191,8 @@ def _abstract_adjacent_credit(lines, context, sample):
             candidate = normalize_author_candidate(raw)
             if looks_like_person_name(candidate, title_hint="", allow_all_caps=True):
                 names = [candidate]
-        return [name.title() if name.isupper() else name for name in names]
+        names = [name.title() if name.isupper() else name for name in names]
+        return _corroborate_affiliation_suffix(names, lines)
 
     for abstract_index, line in enumerate(lines[:64]):
         if not re.match(r"^abstract\b", line, flags=re.I):
@@ -283,6 +307,7 @@ def infer(context):
                     continue
                 if not all(looks_like_person_name(name, title_hint=visible_title) for name in names):
                     continue
+                names = _corroborate_affiliation_suffix(names, lines)
                 return {"author": ", ".join(names), "source": "text_affiliated_byline" if affiliation else "text_strict_credit_block",
                         "page": int(sample["page"]), "evidence": " / ".join(credit_lines + [lines[cursor]])}
     for sample in context.opening_pages:

@@ -159,3 +159,11 @@ def test_wrapped_title_tail_does_not_become_abstract_author():
     text = ('“New White Ethnics” or “New Latinos”? Hispanic/Latino Pan-ethnicity and\n'
             'Ancestry Reporting\nAbstract\nArticle prose.\nDOI: 10.1000/example')
     assert parse(text, title='“New White Ethnics” or “New Latinos”? Hispanic/Latino Pan-ethnicity and Ancestry Reporting') == ''
+
+
+def test_affiliation_suffix_requires_corresponding_name_and_marker():
+    text = ('Journal of Society\naColumbia University\nCorresponding Author:\n'
+            'Maria Abascal, Columbia University\n'
+            f'{TITLE}\nMaria Abascala\nAbstract\nArticle prose.\nDOI: 10.1000/example')
+    assert parse(text) == 'Maria Abascal'
+    assert parse(text.replace('aColumbia University\n', '')) == 'Maria Abascala'
