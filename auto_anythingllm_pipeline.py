@@ -5289,6 +5289,8 @@ FRAGMENT_PAGE_MIN_CLUSTER_RATIO = 0.08
 FRAGMENT_DOCUMENT_MIN_PAGE_RATIO = 0.60
 FRAGMENT_DOCUMENT_MIN_CLUSTER_RATIO = 0.06
 FRAGMENT_DOCUMENT_MIN_CLUSTER_LINES_PER_PAGE = 2
+FRAGMENT_IMAGE_PAGE_MIN_SINGLE_LETTER_RATIO = 0.12
+FRAGMENT_IMAGE_DOCUMENT_MIN_PAGE_RATIO = 0.60
 OUTLINE_FALLBACK_MIN_AGREEING_BACKENDS = 2
 
 
@@ -5391,6 +5393,54 @@ def document_has_sustained_fragmentation(quality):
             pages * FRAGMENT_DOCUMENT_MIN_CLUSTER_LINES_PER_PAGE,
         )
     )
+
+
+def document_has_image_backed_split_words(quality):
+    """Request OCR comparison for a pervasive broken text layer over scans.
+
+    Some embedded OCR splits *parts* of words (``M exican``, ``num ber``)
+    without producing long runs of isolated glyphs. Require both page-local
+    repetition and raster evidence so short abbreviations or a spaced heading
+    cannot send an otherwise clean text PDF through document-wide OCR.
+    """
+    quality = quality or {}
+    pages = int(quality.get("included_pages") or 0)
+    required = max(3, math.ceil(pages * FRAGMENT_IMAGE_DOCUMENT_MIN_PAGE_RATIO))
+    return (
+        pages >= 3
+        and int(quality.get("image_backed_split_word_pages") or 0) >= required
+        and float(quality.get("fragmented_single_letter_token_ratio") or 0.0)
+        >= FRAGMENT_IMAGE_PAGE_MIN_SINGLE_LETTER_RATIO
+    )
+
+
+def cleaner_ocr_candidate_for_split_words(candidates):
+    """Use OCR only when it visibly repairs a complete broken native layer."""
+    native = next((row for row in candidates
+                   if row.get("backend") == "pymupdf"
+                   and document_has_image_backed_split_words(row.get("quality"))), None)
+    if native is None:
+        return None
+    native_quality = native.get("quality") or {}
+    native_ratio = float(native_quality.get("fragmented_single_letter_token_ratio") or 0)
+    native_words = int(native_quality.get("included_words") or 0)
+    candidates_ocr = [
+        row for row in candidates
+        if row.get("backend") == "unstructured"
+        and row.get("unstructured_strategy") == "ocr_only"
+        and not row.get("error")
+        and row.get("segments")
+        and int((row.get("quality") or {}).get("included_pages") or 0)
+        >= int(native_quality.get("included_pages") or 0)
+        and int((row.get("quality") or {}).get("included_words") or 0)
+        >= max(200, int(native_words * 0.60))
+        and float((row.get("quality") or {}).get("fragmented_single_letter_token_ratio", 1))
+        <= native_ratio * 0.25
+        and str((row.get("quality") or {}).get("text_integrity_status") or "") != "review"
+        and float((row.get("quality") or {}).get("ocr_layout_artifact_ratio") or 0) < 0.005
+        and str((row.get("native_chunk_eval") or {}).get("status") or "") == "pass"
+    ]
+    return max(candidates_ocr, key=lambda row: row.get("score", -999), default=None)
 
 
 def has_corroborated_outline_disagreement(candidates):
@@ -5910,6 +5960,16 @@ def extraction_quality(pages, stats, start_page, end_page):
             text_integrity_metrics(page.get("text") or "")
         )
     )
+    image_backed_pages = {
+        int(stat.pdf_page) for stat in included if stat.image_count > 0
+    }
+    image_backed_split_word_pages = sum(
+        1 for page in pages
+        if int(page.get("page") or 0) in image_backed_pages
+        and text_integrity_metrics(page.get("text") or "")[
+            "fragmented_single_letter_token_ratio"
+        ] >= FRAGMENT_IMAGE_PAGE_MIN_SINGLE_LETTER_RATIO
+    )
     chars = sum(s.chars for s in included)
     words = sum(s.words for s in included)
     replacement = sum(s.replacement_chars for s in included)
@@ -5951,6 +6011,13 @@ def extraction_quality(pages, stats, start_page, end_page):
         "fragmented_cluster_token_ratio": integrity["fragmented_cluster_token_ratio"],
         "fragmented_cluster_line_count": integrity["fragmented_cluster_line_count"],
     })
+    image_backed_split_words = document_has_image_backed_split_words({
+        "included_pages": len(included),
+        "image_backed_split_word_pages": image_backed_split_word_pages,
+        "fragmented_single_letter_token_ratio": integrity[
+            "fragmented_single_letter_token_ratio"
+        ],
+    })
     return {
         "included_pages": len(included),
         "included_chars": chars,
@@ -5975,11 +6042,17 @@ def extraction_quality(pages, stats, start_page, end_page):
         "fragmented_cluster_token_ratio": integrity["fragmented_cluster_token_ratio"],
         "fragmented_cluster_line_count": integrity["fragmented_cluster_line_count"],
         "fragmented_page_count": fragmented_page_count,
+        "image_backed_split_word_pages": image_backed_split_word_pages,
         # This is a review signal, not a proof that OCR will be better. Verse,
         # art catalogues, and low-quality embedded OCR can benefit from a
         # comparison while still having a more useful native result.
-        "text_integrity_status": "review" if fragmented_text else "not_flagged",
-        "text_integrity_interpretation": integrity["text_integrity_interpretation"],
+        "text_integrity_status": (
+            "review" if fragmented_text or image_backed_split_words else "not_flagged"
+        ),
+        "text_integrity_interpretation": (
+            "image_backed_split_word_pattern" if image_backed_split_words
+            else integrity["text_integrity_interpretation"]
+        ),
         "scanned_likelihood": scanned_likelihood,
     }
 
@@ -6445,6 +6518,12 @@ def resolve_unstructured_strategy(
         ocr_preflight_hint, pdf_page_count)
     targeted_ocr_needed = bool(targeted_visual_text.get("page_numbers"))
     backend_failed = any(bool(candidate.get("error")) for candidate in prior_candidates)
+    fragmented_native_text = any(
+        str((candidate.get("quality") or {}).get("text_integrity_status") or "").casefold()
+        == "review"
+        for candidate in prior_candidates
+        if str(candidate.get("backend") or "").casefold() == "pymupdf"
+    )
     coverage_disagreement = False
     word_counts = [
         int((candidate.get("quality") or {}).get("included_words") or 0)
@@ -6469,8 +6548,26 @@ def resolve_unstructured_strategy(
             "reason": "explicit_strategy",
         }
 
+    image_backed_split_words = any(
+        str(candidate.get("backend") or "").casefold() == "pymupdf"
+        and document_has_image_backed_split_words(candidate.get("quality"))
+        for candidate in prior_candidates
+        if not candidate.get("error")
+    )
+    if runtime_probe.get("tesseract_available") and image_backed_split_words:
+        # hi_res can continue reading the broken embedded OCR layer. This
+        # stronger visual-plus-text signal needs a genuinely independent OCR
+        # candidate before page-local reconciliation chooses a transcript.
+        return {
+            "requested": requested,
+            "resolved": "ocr_only",
+            "runtime": {**runtime_probe, "ocr_required": True},
+            "reason": "ocr_only_for_image_backed_split_words",
+        }
+
     if runtime_probe.get("tesseract_available") and (
-        scanned_like or targeted_ocr_needed or backend_failed or coverage_disagreement
+        scanned_like or targeted_ocr_needed or backend_failed
+        or coverage_disagreement or fragmented_native_text
     ):
         return {
             "requested": requested,
@@ -6478,7 +6575,10 @@ def resolve_unstructured_strategy(
             "runtime": {**runtime_probe, "ocr_required": True},
             "reason": (
                 "ocr_enabled_for_targeted_visual_text_pages"
-                if targeted_ocr_needed and not (scanned_like or backend_failed or coverage_disagreement)
+                if targeted_ocr_needed and not (
+                    scanned_like or backend_failed or coverage_disagreement
+                    or fragmented_native_text
+                )
                 else "ocr_enabled_for_difficult_pdf"
             ),
         }
@@ -7187,12 +7287,16 @@ def build_run_diagnostics(
         else:
             add("PDF_OCR_REQUIRED", "error", "extraction", "Most included pages have little text and appear image-heavy.", "Run page-aware OCR, then prepare the OCRed PDF.")
     if quality.get("text_integrity_status") == "review":
+        split_word_pages = int(quality.get("image_backed_split_word_pages") or 0)
         add(
             "PDF_TEXT_LAYER_FRAGMENTED",
             "warning",
             "extraction",
             (
-                "The nominal text layer contains "
+                "The nominal text layer has repeated split-word evidence "
+                f"on {split_word_pages} image-backed page(s)."
+                if document_has_image_backed_split_words(quality)
+                else "The nominal text layer contains "
                 f"{quality.get('fragmented_cluster_token_count', 0)} clustered isolated-letter tokens "
                 f"across {quality.get('fragmented_page_count', 0)} page(s)."
             ),
@@ -23091,6 +23195,17 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             automatic_targeted_ocr_selection["reason"] = (
                 "targeted_ocr_did_not_recover_nonempty_text"
             )
+    automatic_split_word_ocr_selection = {
+        "applied": False, "reason": "not_applicable",
+    }
+    if backend_mode == "automatic" and not automatic_targeted_ocr_selection["applied"]:
+        clearer_ocr = cleaner_ocr_candidate_for_split_words(viable)
+        if clearer_ocr is not None:
+            selected = clearer_ocr
+            automatic_split_word_ocr_selection = {
+                "applied": True,
+                "reason": "complete_ocr_candidate_repairs_image_backed_split_words",
+            }
     (
         ocr_processing_seconds,
         selected_output_ocr_processing_seconds,
@@ -25686,6 +25801,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         "page_local_ocr_plan": dict(automatic_page_local_plan),
         "targeted_page_numbers": list(automatic_targeted_ocr_pages),
         "targeted_selection": dict(automatic_targeted_ocr_selection),
+        "split_word_ocr_selection": dict(automatic_split_word_ocr_selection),
         "threshold_policy": {
             "coverage_disagreement_ratio": BACKEND_COVERAGE_DISAGREEMENT_RATIO,
             "document_wide_ocr_page_ratio": DOCUMENT_WIDE_OCR_PAGE_RATIO,
@@ -25697,6 +25813,8 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             "fragment_page_min_cluster_ratio": FRAGMENT_PAGE_MIN_CLUSTER_RATIO,
             "fragment_document_min_page_ratio": FRAGMENT_DOCUMENT_MIN_PAGE_RATIO,
             "fragment_document_min_cluster_ratio": FRAGMENT_DOCUMENT_MIN_CLUSTER_RATIO,
+            "fragment_image_page_min_single_letter_ratio": FRAGMENT_IMAGE_PAGE_MIN_SINGLE_LETTER_RATIO,
+            "fragment_image_document_min_page_ratio": FRAGMENT_IMAGE_DOCUMENT_MIN_PAGE_RATIO,
             "outline_fallback_min_agreeing_backends": OUTLINE_FALLBACK_MIN_AGREEING_BACKENDS,
         },
         "user_requested": bool(args.deep_extraction),
@@ -25956,8 +26074,13 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             "attempts": extraction_attempt_decisions,
             "candidates": [extraction_candidate_decision_metrics(c) for c in candidates],
             "selected_backend": selected["backend"],
-            "selection_basis": "targeted_ocr_recovery_override" if automatic_targeted_ocr_selection["applied"] else "highest_score_stable_backend_order",
+            "selection_basis": (
+                "targeted_ocr_recovery_override" if automatic_targeted_ocr_selection["applied"]
+                else "image_backed_split_word_ocr_recovery" if automatic_split_word_ocr_selection["applied"]
+                else "highest_score_stable_backend_order"
+            ),
             "targeted_ocr_selection": automatic_targeted_ocr_selection,
+            "split_word_ocr_selection": automatic_split_word_ocr_selection,
             "unstructured_suppressed_reasons": auto_unstructured_suppressed_reasons,
         },
         "layout_removed_marginalia_count": (selected.get("layout_evidence") or {}).get("removed_marginalia_count", 0),

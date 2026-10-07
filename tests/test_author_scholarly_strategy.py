@@ -128,3 +128,34 @@ def test_machine_pdf_title_with_affiliated_abstract_byline():
             'racism, racial capitalism and\nstate-sanctioned violence\n'
             'Laura Pulido\nUniversity of Southern California, USA\nAbstract')
     assert parse(text, title='PHG646495 524..533') == 'Laura Pulido'
+
+
+def test_author_before_selected_title_and_abstract():
+    text = ('Special section: On ethnic names\nLinda Martín Alcoff\n'
+            'Latino vs. Hispanic\nThe politics of ethnic names\nAbstract\n'
+            'The article begins here.\nDOI: 10.1000/example')
+    assert parse(text, title='Latino vs. Hispanic') == 'Linda Martín Alcoff'
+
+
+def test_displaced_title_block_before_abstract():
+    text = ('Sociology of Race and Ethnicity\nArticle body printed before title block.\n'
+            'Corresponding Author:\nEvelyn Nakano Glenn, Example University\n'
+            'Settler Colonialism as\nStructure: A Framework for\n'
+            'Comparative Studies of U.S.\nRace and Gender Formation\n'
+            'Evelyn Nakano Glenn1\nAbstract\nUnderstanding the framework.\n'
+            'DOI: 10.1000/example')
+    assert parse(text, title='Glenn Settler Colonialism as Structure (2015)') == 'Evelyn Nakano Glenn'
+
+
+def test_credentialled_multi_author_credit_before_abstract():
+    text = ('Different Views\nLatino Terminology: Conceptual Bases for Standardized Terminology\n'
+            'DAVID E. HAYES-BAUTISTA, PHD, AND JORGE CHAPA\n'
+            'Abstract: Conceptually, this article examines naming.\n'
+            'DOI: 10.1000/example')
+    assert parse(text, title='hayes-bautista-chapa-2011-latino-terminology-conceptual-bases-for-standardized-terminology') == 'David E. Hayes-Bautista, Jorge Chapa'
+
+
+def test_wrapped_title_tail_does_not_become_abstract_author():
+    text = ('“New White Ethnics” or “New Latinos”? Hispanic/Latino Pan-ethnicity and\n'
+            'Ancestry Reporting\nAbstract\nArticle prose.\nDOI: 10.1000/example')
+    assert parse(text, title='“New White Ethnics” or “New Latinos”? Hispanic/Latino Pan-ethnicity and Ancestry Reporting') == ''

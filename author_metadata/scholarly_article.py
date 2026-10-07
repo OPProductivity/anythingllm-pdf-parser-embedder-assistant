@@ -8,6 +8,7 @@ import re
 import unicodedata
 
 from .names import (normalize_author_candidate, looks_like_person_name,
+                    author_phrase_is_title_fragment,
                     split_author_line_candidates, has_author_affiliation_hint)
 from .title_evidence import matches, not_found, words
 
@@ -129,6 +130,73 @@ def _translated_credit(lines, context, sample):
     return not_found()
 
 
+def _abstract_adjacent_credit(lines, context, sample):
+    """Read a first-page byline next to a verified title and Abstract heading.
+
+    Journal PDFs can emit the title block after a body column, or print a
+    credential inside a multi-person byline. The title and abstract are both
+    required; no names are harvested from the article body or correspondence.
+    """
+    if int(sample["page"]) != 1:
+        return not_found()
+    expected = words(context.title_hint)
+    if len(expected) < 3:
+        return not_found()
+
+    def title_matches(value):
+        observed = words(value)
+        if len(observed) < 3:
+            return False
+        if observed == expected:
+            return True
+        minimum = min(4, len(expected))
+        return any(
+            observed[:minimum] == expected[index:index + minimum]
+            for index in range(len(expected) - minimum + 1)
+        )
+
+    def credit_names(value):
+        if (author_phrase_is_title_fragment(value, context.title_hint)
+                or _LOCATION.fullmatch(value)
+                or "(" in value or ")" in value):
+            return []
+        raw = re.sub(r"(?<=[^\W\d_])\d{1,2}$", "", value)
+        raw = re.sub(r",?\s*(?:Ph\.?D\.?|M\.?D\.?)\.?", "", raw, flags=re.I)
+        raw = re.sub(r",\s*(?=and\b)", " ", raw, flags=re.I)
+        names = split_author_line_candidates(raw, require_complete=True)
+        if not names:
+            candidate = normalize_author_candidate(raw)
+            if looks_like_person_name(candidate, title_hint="", allow_all_caps=True):
+                names = [candidate]
+        return [name.title() if name.isupper() else name for name in names]
+
+    for abstract_index, line in enumerate(lines[:64]):
+        if not re.match(r"^abstract\b", line, flags=re.I):
+            continue
+        if abstract_index < 2:
+            continue
+        # Standard title -> byline -> Abstract, including titles wrapped over
+        # several lines. The last line before Abstract must be a complete name.
+        names = credit_names(lines[abstract_index - 1])
+        if names:
+            for start in range(max(0, abstract_index - 9), abstract_index - 1):
+                if (not any(_ROLE.search(value) for value in lines[start:abstract_index])
+                        and title_matches(" ".join(lines[start:abstract_index - 1]))):
+                    return _result(names, sample, lines[abstract_index - 1:abstract_index + 1],
+                                   "text_strict_credit_block")
+        # Some journal covers print the author above the title instead. Keep
+        # the complete selected title directly between author and Abstract.
+        for name_index in range(max(0, abstract_index - 7), abstract_index - 1):
+            names = credit_names(lines[name_index])
+            if len(names) != 1:
+                continue
+            if (not any(_ROLE.search(value) for value in lines[name_index:abstract_index])
+                    and title_matches(" ".join(lines[name_index + 1:abstract_index]))):
+                return _result(names, sample, lines[name_index:abstract_index + 1],
+                               "text_strict_credit_block")
+    return not_found()
+
+
 def infer(context):
     if context.profile.kind != "scholarly_article":
         return not_found()
@@ -217,4 +285,12 @@ def infer(context):
                     continue
                 return {"author": ", ".join(names), "source": "text_affiliated_byline" if affiliation else "text_strict_credit_block",
                         "page": int(sample["page"]), "evidence": " / ".join(credit_lines + [lines[cursor]])}
+    for sample in context.opening_pages:
+        if int(sample["page"]) != 1:
+            continue
+        lines = [" ".join(unicodedata.normalize("NFKC", line).split())
+                 for line in sample["text"].splitlines() if line.strip()][:100]
+        adjacent = _abstract_adjacent_credit(lines, context, sample)
+        if adjacent["author"]:
+            return adjacent
     return not_found()
