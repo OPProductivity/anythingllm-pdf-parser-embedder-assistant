@@ -12,7 +12,7 @@ from .profile import thesis_title_pages
 _ROLE_START = re.compile(r"^(?:thesis\s+committee|committee|supervisors?|advisors?|examiners?)\s*:?$", re.I)
 _AFFILIATION = re.compile(
     r"^(?:department|school|faculty|college|university|institute|division)\s+of\b|"
-    r"^university\b|^[A-Z]{2,8}(?:-[A-Z]{1,8})?-\d{2,4}-\d{2,6}$",
+    r"^university\b|\bHonors College\s*$|^[A-Z]{2,8}(?:-[A-Z]{1,8})?-\d{2,4}-\d{2,6}$",
     re.I,
 )
 _ORGANIZATION = re.compile(
@@ -24,8 +24,35 @@ _ORGANIZATION = re.compile(
 
 def infer(context):
     candidates = []
+    for sample in context.opening_pages:
+        text = str(sample.get("text") or "")
+        if (re.search(r"\bA Thesis\b", text, re.I)
+                and re.search(r"\bHonors College\b", text, re.I)
+                and re.search(r"\b(?:Submitted|Presented)\s+to\b", text, re.I)):
+            credit = re.search(r"(?im)^\s*by\s*\n\s*([^\n]{5,90})", text)
+            if credit:
+                name = normalize_author_candidate(credit.group(1))
+                if looks_like_person_name(name):
+                    return result(context, [name], "text_thesis_titlepage_author",
+                                  int(sample["page"]), credit.group(0))
+        if not re.search(r"\bHonors Research Projects\b", text, re.I):
+            continue
+        lines = [normalize_text(line) for line in text.splitlines() if normalize_text(line)]
+        for index, line in enumerate(lines[:35]):
+            if index + 1 >= len(lines) or "@" not in lines[index + 1]:
+                continue
+            if looks_like_person_name(line):
+                return result(context, [line], "text_thesis_titlepage_author",
+                              int(sample["page"]), line + " / " + lines[index + 1])
     for page, text in thesis_title_pages(context.opening_pages):
         lines = [normalize_text(line) for line in text.splitlines() if normalize_text(line)]
+        for index, line in enumerate(lines[:45]):
+            if not re.fullmatch(r"Dissertation Prepared for the Degree of", line, re.I) or index == 0:
+                continue
+            name = re.sub(r"(?:,?\s*(?:B\.?A\.?|M\.?A\.?|M\.?S\.?|Ph\.?D\.?))*\s*$", "", lines[index - 1], flags=re.I).strip(" ,")
+            if looks_like_person_name(name):
+                return result(context, [name], "text_thesis_titlepage_author", page,
+                              lines[index - 1] + " / " + line)
         for index, line in enumerate(lines[:32]):
             if _ROLE_START.match(line):
                 break

@@ -1,4 +1,5 @@
 from author_metadata.context import AuthorEvidenceContext
+from author_metadata.dispatcher import infer_author
 from author_metadata.scholarly_article import infer
 from author_metadata.identity import resolve_author_from_metadata_and_inference
 from pathlib import Path
@@ -213,11 +214,12 @@ def test_repository_cover_requires_same_author_and_title_on_content_page():
                'Daniele Conversi\nExample University\nIntroduction\nProse.')
     samples = [dict(page=1, text=cover), dict(page=2, text=content)]
     context = AuthorEvidenceContext.from_samples(samples, path=path, title_hint=path.stem)
-    report = infer(context)
+    assert context.profile.kind == 'book_chapter'
+    report = infer_author(context)
     assert report['author'] == 'Daniele Conversi'
     assert resolve_author_from_metadata_and_inference('', report)['author'] == 'Daniele Conversi'
     samples[1]['text'] = content.replace('Daniele Conversi', 'Another Person')
-    assert infer(AuthorEvidenceContext.from_samples(samples, path=path, title_hint=path.stem))['author'] == ''
+    assert infer_author(AuthorEvidenceContext.from_samples(samples, path=path, title_hint=path.stem))['author'] == ''
 
 
 def test_openedition_citation_repeats_cover_author():

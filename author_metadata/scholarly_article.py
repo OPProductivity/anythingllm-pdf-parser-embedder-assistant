@@ -369,6 +369,84 @@ def _editorial_end_signature(context):
     return not_found()
 
 
+def _journal_opening_credit(context):
+    """Use a title-adjacent credit when a journal cue has already been verified.
+
+    Older journal layouts often lack an Abstract heading. Their opening title,
+    author and affiliation stack is still a stronger credit than PDF properties.
+    """
+    if "journal_publication_record" not in context.profile.cues:
+        return not_found()
+    for sample in context.opening_pages:
+        if int(sample.get("page") or 0) != 1:
+            continue
+        raw = str(sample.get("text") or "")
+        if re.search(r"(?im)^\s*To cite this article:\s*", raw):
+            continue
+        if (re.search(r"(?im)^\s*Source:\s*", raw)
+                and not re.search(r"\b(?:Stable URL|Vol\.|Volume|ISSN|pp\.)\b", raw, re.I)):
+            continue
+        lines = [" ".join(unicodedata.normalize("NFKC", line).split())
+                 for line in str(sample.get("text") or "").splitlines() if line.strip()]
+        if len(lines) >= 3 and all(re.fullmatch(r"[A-ZÀ-ÖØ-Þ]{3,30}", value)
+                                   for value in lines[:2]):
+            stacked = " ".join(lines[:2])
+            title_words = words(lines[2])
+            hint_words = words(context.title_hint)
+            if (looks_like_person_name(stacked, allow_all_caps=True)
+                    and len(title_words) >= 2
+                    and any(hint_words[start:start + len(title_words)] == title_words
+                            for start in range(len(hint_words) - len(title_words) + 1))):
+                return _result([stacked], sample, lines[:3], "text_journal_title_byline")
+        def title_matches(value):
+            observed = words(re.sub(r"(?<=[^\W\d_])\d{1,2}$", "", value))
+            expected = words(context.title_hint)
+            segments = [words(part) for part in re.split(r"\s+(?:--|[-\u2013\u2014])\s+", context.title_hint)]
+            return len(observed) >= 4 and (observed == expected or any(
+                observed == segment for segment in segments if len(segment) >= 4))
+        for end in range(1, min(18, len(lines) - 1)):
+            if not any(title_matches(" ".join(lines[start:end]))
+                       for start in range(max(0, end - 7), end)):
+                continue
+            names = []
+            for line in lines[end:min(end + 12, len(lines))]:
+                if _BOUNDARY.match(line) or _ROLE.search(line):
+                    break
+                inline = re.fullmatch(r"([^,]{3,80}),\s*(.+)", line)
+                if inline and has_author_affiliation_hint(inline.group(2)):
+                    found = _names(inline.group(1))
+                elif has_author_affiliation_hint(line):
+                    continue
+                else:
+                    found = _names(line)
+                if not found:
+                    break
+                names.extend(name for name in found if name not in names)
+            names = [re.sub(r"[\ue000-\uf8ff]", "", name).strip() for name in names]
+            if names and all(looks_like_person_name(name) for name in names):
+                return _result(names, sample, lines[end:end + len(names)], "text_journal_title_byline")
+    return not_found()
+
+
+def _spaced_abstract_credit(context):
+    """Read an Elsevier analysis byline with lettered affiliation suffixes."""
+    for sample in context.opening_pages:
+        if int(sample.get("page") or 0) != 1:
+            continue
+        lines = [" ".join(line.split()) for line in str(sample.get("text") or "").splitlines()
+                 if line.strip()]
+        if (len(lines) < 8 or lines[0].casefold() != "analysis"
+                or words(lines[1]) != words(context.title_hint)
+                or not any(re.fullmatch(r"a\s+b\s+s\s+t\s+r\s+a\s+c\s+t", line, re.I)
+                           for line in lines[:16])):
+            continue
+        cleaned = re.sub(r"\s+[a-d](?:,[a-d])+(?:,[⁎*])?", "", lines[2], flags=re.I)
+        names = split_author_line_candidates(cleaned, require_complete=True)
+        if len(names) >= 2 and all(looks_like_person_name(name) for name in names):
+            return _result(names, sample, lines[1:3], "text_strict_credit_block")
+    return not_found()
+
+
 def infer(context):
     if context.profile.kind != "scholarly_article":
         return not_found()
@@ -495,4 +573,10 @@ def infer(context):
     editorial = _editorial_end_signature(context)
     if editorial["author"]:
         return editorial
+    opening_credit = _journal_opening_credit(context)
+    if opening_credit["author"]:
+        return opening_credit
+    spaced = _spaced_abstract_credit(context)
+    if spaced["author"]:
+        return spaced
     return not_found()

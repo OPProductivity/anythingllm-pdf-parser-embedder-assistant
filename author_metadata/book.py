@@ -18,6 +18,8 @@ def _names(line):
         return []
     found = split_author_line_candidates(line, require_complete=True)
     if found:
+        if (re.search(r"\band\b", line, re.I) or "&" in line) and len(found) < 2:
+            return []
         return found
     candidate = normalize_author_candidate(line)
     return [candidate] if looks_like_person_name(candidate) else []
@@ -171,6 +173,8 @@ def infer(context):
             names, credit = [], []
             while cursor < min(len(lines), start + 7):
                 raw = inline.group(1) if inline and cursor == start else lines[cursor]
+                if names:
+                    raw = re.sub(r"^(?:and|&)\s+", "", raw, count=1, flags=re.I)
                 found = _names(raw)
                 if not found:
                     break

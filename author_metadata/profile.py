@@ -56,6 +56,13 @@ def thesis_title_pages(samples):
                           and re.search(r"\bSubmitted\s+to\b", compact, re.I)
                           and re.search(r"\bpartial\s+fulfill?ment\b", compact, re.I))
             degree = re.search(r"\bDoctor\s+of\s+Philosophy\b", compact, re.I)
+        if not (submission and degree):
+            submission = bool(re.search(r"\b(?:A\s+Thesis|A\s+Dissertation|Dissertation\s+Prepared\s+for\s+the\s+Degree)\b", compact, re.I))
+            degree = bool(re.search(r"\b(?:Degree\s+of\s+Doctor\s+of\s+Philosophy|Doctor\s+of\s+Philosophy|Master\s+of\s+[A-Za-z]+)\b", compact, re.I))
+            submission = submission and bool(re.search(r"\b(?:presented\s+to|submitted\s+to|prepared\s+for|partial\s+fulfill?ment)\b", compact, re.I))
+        if not (submission and degree):
+            submission = bool(re.search(r"\b(?:Honors\s+Theses|Honors\s+Research\s+Projects)\b", compact, re.I))
+            degree = submission and bool(re.search(r"\b(?:Honors\s+College|University\s+of|The\s+University)\b", compact, re.I))
         if submission and degree:
             yield page, text
 
@@ -78,18 +85,72 @@ def classify_document(samples, title_hint=""):
     if any(thesis_title_pages(opening)):
         return DocumentProfile("thesis_dissertation", ("degree_submission_title_page",), pages,
                                publication_type="thesis_or_dissertation")
+    # Export covers identify the selected contribution before a publisher's
+    # ISBN, imprint or abstract can be mistaken for a whole book or article.
+    first_head = first_text[:3500]
+    chapter_cover = bool(re.search(r"(?im)^\s*Chapter Title:\s*\S", first_head)
+                         and re.search(r"(?im)^\s*Book Title:\s*\S", first_head))
+    loan_chapter = bool(re.search(r"(?im)^\s*TYPE:\s*Book Chapter\s*$", first_head))
+    researchgate_chapter = bool(re.search(r"(?im)^\s*Chapter\s*[·•]\s*(?:January|February|March|April|May|June|July|August|September|October|November|December)", first_head))
+    platform_chapter = bool(re.search(r"(?im)^\s*CHAPTER\s*$", first_head)
+                            and re.search(r"\b(?:Online ISBN|Print ISBN|/chapter/|/edited-volume/)\b", first_head, re.I))
+    handbook_entry = bool(re.search(r"(?im)^\s*(?:The SAGE Handbook|Sage Reference)\b", first_head)
+                          and re.search(r"(?im)^\s*Author:\s*\S", first_head))
+    anthology_excerpt = bool(re.search(r"(?im)^\s*[^\n]{3,90}:\s*An Anthology\b[^\n]*Edited by", first_head))
+    chapter_heading = bool(re.search(r"(?im)^\s*(?:chapter\s+(?:one|two|three|four|five|six|\d+)|\d{1,2}\.\s+[^\n]{8,100})\b", first_head))
+    excerpt_citation = bool(re.search(r"\b(?:Ebook pages|Printed page|ProQuest Ebook Central|EBSCO Publishing\s*:\s*eBook Collection)\b", first_head, re.I)
+                            and re.search(r"\b(?:chapter|part\s+[ivx]+|introduction)\b", first_head[:900], re.I))
+    chapter_with_book_citation = chapter_heading and bool(re.search(r"\b(?:ebook collection|proquest ebook central|book title:)\b", first_head, re.I))
+    anthology_header = bool(re.search(r"(?im)^\s*Literary Theory:\s*An Anthology\b", first_head))
+    chapter_hinted_excerpt = bool(re.search(r"\bchapter\b", hint, re.I) and any(
+        re.search(r"(?m)^\s*\d{2,4}\s+[A-ZÀ-ÖØ-Þ][^\n]{5,90}$", str(s.get("text") or "")[:180])
+        for s in opening[1:]
+    ))
+    reprinted_excerpt = bool(re.search(r"(?im)^\s*From\s+[A-Z][^\n]{8,140}", first_head)
+                             and re.search(r"\bReprinted\s+by\s+permission\b", first_head, re.I))
+    ebook_interior = bool(re.search(r"(?m)^\s*\d{2,4}\s*\n", first_head[:80])
+                          and re.search(r"\beBook Collection\b|\bEBSCOhost\b", first_text, re.I))
+    anthology_reprint = bool(re.search(r"(?im)^\s*\d{2,4}\s*[•·]\s*[A-Z\s()/-]{8,100}$", first_head[:200])
+                               and re.search(r"\bFirst (?:presented|published|distributed)\b", first_head[:1000], re.I))
+    opening_chapter = bool(re.search(r"\A\s*(?:\d{1,3}\s*\n)?\s*(?:chapter\s+(?:one|two|three|four|five|six|\d+)\s*(?:[—:-]|\n)|\d{1,2}\.\s+[^\n]{8,100})", first_head[:250], re.I))
+    named_introduction = bool(re.search(r"(?im)^\s*i\s*n\s*t\s*r\s*o\s*d\s*u\s*c\s*t\s*i\s*o\s*n\s*$", first_head[:120])
+                              and not re.search(r"\b(?:journal|abstract|doi|issn)\b", first_head[:1000], re.I))
+    if (chapter_cover or loan_chapter or researchgate_chapter or platform_chapter or
+            handbook_entry or anthology_excerpt or chapter_with_book_citation or excerpt_citation or anthology_header
+            or opening_chapter or named_introduction or chapter_hinted_excerpt
+            or reprinted_excerpt or ebook_interior or anthology_reprint):
+        cue = next(name for value, name in ((chapter_cover, "chapter_and_book_title_cover"),
+                   (loan_chapter, "interlibrary_loan_book_chapter"),
+                   (researchgate_chapter, "repository_chapter_label"),
+                   (platform_chapter, "platform_chapter_record"),
+                   (handbook_entry, "handbook_entry_record"),
+                   (anthology_excerpt or anthology_header, "edited_anthology_excerpt"),
+                   (chapter_with_book_citation or excerpt_citation, "ebook_chapter_excerpt"),
+                   (opening_chapter or named_introduction, "opening_chapter_heading"),
+                   (chapter_hinted_excerpt, "chapter_hinted_running_head"),
+                   (reprinted_excerpt or ebook_interior or anthology_reprint,
+                    "printed_book_excerpt")) if value)
+        return DocumentProfile("book_chapter", (cue,), pages,
+                               publication_type="book_chapter", work_scope="chapter")
     corporate = corporate_cue(opening)
     if corporate:
         publication_type, cue = corporate
         return DocumentProfile("corporate_publication", (cue,), pages,
                                publication_type=publication_type)
     browser_print = has_browser_print_footer(first_text)
+    browser_print = browser_print or bool(re.search(r"(?m)^Page 1 of \d+\s*$", first_text[:700])
+                                    and re.search(r"(?m)^https?://\S+", first_text[:1000]))
     issue_masthead = bool(re.search(r"(?im)^\s*vol\.?\s*(?:[ivxlcdm]+|\d+)\.?\s*$", first_text[:1200]))
     issue_number = bool(re.search(r"(?im)^\s*no\.?\s*\d(?:[\s\d])*\.?\s*$", first_text[:1200]))
     issue_date = bool(re.search(r"\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}\b", first_text[:1200], flags=re.I))
     if issue_masthead and issue_number and issue_date:
         return DocumentProfile("periodical_issue", ("masthead_volume_number_date",), pages,
                                publication_type="newspaper_or_periodical_issue", work_scope="whole_issue")
+    if (re.search(r"(?im)^Vol\s+\d+,\s*No\s+\d+,\s*(?:Spring|Summer|Autumn|Fall|Winter)\s+\d{4}\s*\|\|", first_text[:500])
+            and any(re.search(r"\bjournal\s+of\b", str(s.get("text") or "")[:400], re.I)
+                    for s in opening[1:2])):
+        return DocumentProfile("periodical_issue", ("journal_issue_cover_and_masthead",), pages,
+                               publication_type="journal_issue", work_scope="whole_issue")
     if re.search(r"\bOFFICIAL REPORTS\s+OF\s+THE\s+[A-Z ]{3,45}COURT\b",
                  first_text[:1600], flags=re.I):
         return DocumentProfile("legal_opinion", ("official_court_report",), pages,
@@ -125,6 +186,14 @@ def classify_document(samples, title_hint=""):
         return DocumentProfile("report", ("institutional_report" if institutional_report else
                                           "policy_brief" if policy_brief else "report_publication",), pages,
                                publication_type="policy_brief" if policy_brief else "report")
+    if (re.search(r"\bHarvard\s+Latino\s+Law\s+Review\b",
+                  "\n".join(str(s.get("text") or "")[:700] for s in opening[:3]), re.I)
+            or re.search(r"\b\d+\s+Harv\.\s+Latino\s+L\.\s+Rev\.\s+\d+\b",
+                  "\n".join(str(s.get("text") or "")[:1600] for s in opening), re.I)
+            or (re.search(r"(?im)^\s*ARTICLE\s*$", first_text[:300])
+                and re.search(r"\b10\.1177/\S+", first_text[:200]))):
+        return DocumentProfile("scholarly_article", ("journal_article_identifier",), pages,
+                               publication_type="scholarly_article")
     chapter_roles = bool(re.search(r"(?im)^\s*(?:lead author|coordinated by|contributors)\s*:",
                                    "\n".join(str(s.get("text") or "")[:3000] for s in opening)))
     chapter_heading = bool(re.search(r"(?m)^\s*\d{1,2}\.\s+[^\n]{4,100}$",
@@ -136,6 +205,33 @@ def classify_document(samples, title_hint=""):
     if contribution_cues:
         return DocumentProfile("book_chapter", contribution_cues, pages,
                                publication_type="book_chapter", work_scope="chapter")
+    journal_cover = bool(re.search(r"(?im)^\s*Source:\s*[^\n]*(?:Journal|Review|Discourse|History|Studies)\b", first_head)
+                         and re.search(r"(?im)^\s*Author\(s\):\s*\S", first_head))
+    journal_citation = bool(re.search(r"(?im)^\s*To cite this article:\s*\S", first_head)
+                            and re.search(r"\b(?:journal|review|studies|history|critique)\b", first_head, re.I))
+    journal_header = bool(re.search(r"(?im)^\s*(?:Journal of [^\n]{4,90}|Geoforum\s+\d+|new left review\s+\d+|Feminist Media Histories,?\s+Vol\.|Social Forces\s+\d+)", first_head)
+                          and re.search(r"\b(?:pp\.?\s*\d+|\d+\s*[-–]\s*\d+|Vol\.?\s*\d+|\d{4}\)\s*\d+|doi)\b", first_head, re.I))
+    journal_footer = bool(re.search(r"(?im)^\s*(?:AJS\s+Volume\s+\d+|RADICAL HISTORY REVIEW\s+\d+|Constellations\s+Volume\s+\d+|d\s*iff\s*erences\s*:\s*A Journal of Feminist Cultural Studies)", first_text)
+                          or (re.search(r"(?im)^\s*Journal of Political Ecology\s+Vol\.", str(opening[1].get("text") or "")) if len(opening)>1 else False))
+    journal_article_label = bool(re.search(r"(?im)^\s*ARTICLE\s*$", first_head[:300])
+                                 and re.search(r"\b(?:journal|research|review|studies|politics)\b", first_head[:500], re.I))
+    law_review = bool(re.search(r"\b\d+\s+Harv\.\s+Latino\s+L\.\s+Rev\.\s+\d+\b", "\n".join(str(s.get("text") or "")[:1600] for s in opening), re.I))
+    journal_article_label = journal_article_label or bool(
+        re.search(r"(?im)^\s*ARTICLE\s*$", first_head[:300])
+        and re.search(r"\b10\.1177/\S+", first_head[:200])
+    )
+    journal_citation_line = bool(re.search(r"(?im)^\s*[A-Z][^\n]{4,70}\s*,\s*Vol\.\s*\d+", first_head[:1200])
+                                 and re.search(r"\b(?:pp\.|stable url|ISSN)\b", first_head[:1500], re.I))
+    scholarly_footer = bool(re.search(r"(?im)^\s*(?:J Eng Educ\.|[A-Za-z ]+\s+\d{4};\d{1,3}:\d+[-–]\d+)", first_text))
+    scholarly_footer = scholarly_footer or bool(re.search(r"\bA Journal of Feminist Cultural Studies\b", first_text, re.I))
+    scholarly_footer = scholarly_footer or bool(re.search(r"(?im)^\s*new left review\s+\d+\s+(?:may|jan|mar|jul|sep|nov)", first_head[:250]))
+    scholarly_footer = scholarly_footer or bool(re.search(r"(?im)^\s*(?:SPRING|SUMMER|FALL|WINTER)\s+\d{4}\s+contexts\b", "\n".join(str(s.get("text") or "")[:300] for s in opening), re.I))
+    article_info = bool(re.search(r"(?im)^\s*a\s*r\s*t\s*i\s*c\s*l\s*e\s*i\s*n\s*f\s*o\s*$", first_head)
+                        and re.search(r"(?im)^\s*a\s*b\s*s\s*t\s*r\s*a\s*c\s*t\s*$", first_head))
+    if (journal_cover or journal_citation or journal_header or article_info or
+            journal_footer or journal_article_label or journal_citation_line or scholarly_footer or law_review):
+        return DocumentProfile("scholarly_article", ("journal_publication_record",), pages,
+                               publication_type="scholarly_article")
     if browser_print:
         return DocumentProfile("web_article", ("browser_print_footer",), pages,
                                publication_type="browser_print_article")
@@ -167,10 +263,54 @@ def classify_document(samples, title_hint=""):
     series_frontmatter = "titles in the series" in head.casefold() and not bool(
         re.search(r"\b(?:doi|abstract)\b", head, flags=re.I)
     )
+    def short_imprint_page(sample):
+        text = str(sample.get("text") or "")
+        letters = re.sub(r"[^a-z]", "", text.casefold())
+        return (4 <= len(text.split()) <= 65
+                and (re.search(r"\b(?:University\s+Press|Strelka\s+Press|Zero\s+Books|Routledge|Palgrave\s+Macmillan)\b", text, re.I)
+                     or "universitypress" in letters)
+                and not re.search(r"\b(?:Source:|Chapter Title:|Journal of|Vol\.|ISBN|DOI|Abstract)\b", text, re.I))
+    compact_titlepage = any(short_imprint_page(sample) for sample in opening[:4])
     journal_issue = bool(re.search(r"\bVol\.?\s*\d+\s*,?\s*Issue\b", head[:500], flags=re.I))
     scholarly_cues = bool(re.search(r"\bdoi\s*:|\babstract\b", head, flags=re.I)) or journal_issue
-    if (book_identifier and book_frontmatter) or book_navigation or book_praise or series_frontmatter or (imprint_title_page and not scholarly_cues):
-        return DocumentProfile("book", ("book_frontmatter_or_titlepage",), pages,
+    all_opening = "\n".join(str(s.get("text") or "")[:2200] for s in opening)
+    book_imprint = bool(re.search(r"\b(?:University\s+Press|National\s+Academies\s+Press|Routledge|Palgrave\s+Macmillan|Zero\s+Books)\b", all_opening, re.I))
+    book_copyright = bool(re.search(r"\b(?:Copyright|©|Library of Congress|ISBN)\b", all_opening, re.I))
+    book_titlepage = book_imprint and book_copyright and not scholarly_cues
+    editor_titlepage = any(
+        3 <= len(str(sample.get("text") or "").split()) <= 90
+        and re.search(r"(?im)^\s*Edited\s+by\s*$", str(sample.get("text") or ""))
+        and not re.search(r"\b(?:journal|article|abstract|doi|review)\b", str(sample.get("text") or ""), re.I)
+        for sample in opening[:4]
+    )
+    noisy_editor_titlepage = bool(re.search(r"\bHandbook\s+of\b", first_head[:300], re.I)
+                                  and re.search(r"(?im)^\s*EDIT\s*ED\s*By\s*$", first_head[:700])
+                                  and len(first_text.split()) < 100)
+    translator_titlepage = any(
+        len(str(sample.get("text") or "").split()) <= 80
+        and re.search(r"(?im)^\s*Translated\s+by\s+", str(sample.get("text") or ""))
+        and re.search(r"(?im)^\s*With\s+an\s+introduction\s+by\s+", str(sample.get("text") or ""))
+        for sample in opening[:4]
+    )
+    full_book_blurb = bool(re.search(r"\bIn this (?:engaging|important|new) book\b", all_opening, re.I))
+    by_titlepage = any(
+        3 <= len(str(sample.get("text") or "").split()) <= 70
+        and re.search(r"(?im)^\s*By\s+[A-Z][^\n]{5,130}", str(sample.get("text") or ""))
+        and len(re.split(r"(?im)^\s*By\s+", str(sample.get("text") or ""), maxsplit=1)[0].split()) >= 5
+        and any(3 <= len(str(prior.get("text") or "").split()) <= 15
+                and not re.search(r"(?im)^\s*By\s+", str(prior.get("text") or ""))
+                for prior in opening[:index])
+        for index, sample in enumerate(opening[:4])
+    )
+    foreword_cover = bool(re.search(r"(?im)^\s*FOREWORD\s+BY\s+[A-Z]", first_head[:250])
+                          and len(first_text.split()) < 50)
+    if ((book_identifier and book_frontmatter) or book_navigation or book_praise
+            or series_frontmatter or compact_titlepage or book_titlepage or editor_titlepage
+            or noisy_editor_titlepage
+            or translator_titlepage or full_book_blurb or by_titlepage or foreword_cover
+            or (imprint_title_page and not scholarly_cues)):
+        return DocumentProfile("book", ("book_frontmatter_or_titlepage",) +
+                               (("foreword_cover",) if foreword_cover else ()), pages,
                                publication_type="book")
     dated_web_credit = bool(re.search(r"(?m)^[A-Z][^\n]{3,75}\n[A-Z][a-z]+\s+\d{1,2}(?:st|nd|rd|th)?,\s+\d{4}\n", head))
     pipe_dated_credit = bool(re.search(r"(?m)^[A-Z][^\n|]{3,75}\s*\|\s*[A-Z][A-Z]+\s+\d{1,2},\s*\d{4}$", head))

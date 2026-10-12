@@ -1,6 +1,7 @@
 """Select one publication-specific author strategy from visible PDF evidence."""
 
 from pathlib import Path
+import re
 
 from .book import infer as infer_book_author
 from .book_chapter import infer as infer_book_chapter_author
@@ -16,6 +17,7 @@ from .review import infer_review_author
 from .scholarly_article import infer as infer_scholarly_author
 from .scope import infer_issue_author, infer_legal_opinion_author
 from .thesis import infer as infer_thesis_author
+from .title_evidence import words
 from .web_article import infer_web_article_author
 
 
@@ -45,6 +47,54 @@ def infer_author(context: AuthorEvidenceContext):
         return report
     if report.get("source") != "not_found":
         return report
+    if context.profile.kind == "book" and context.path is not None:
+        opening = infer_generic_author(context.opening_pages, context.path,
+                                       title_hint=context.title_hint)
+        if opening.get("author") and opening.get("source") in {
+            "text_edited_by",
+            "text_titlepage_publisher_byline",
+            "filename_structured_corroborated_text_names",
+        }:
+            return opening
+        if (opening.get("author") and opening.get("source") == "text_opening_title_block_byline"
+                and "editors" in str(opening.get("evidence") or "").casefold()):
+            return opening
+        if (opening.get("author") and opening.get("source") == "text_title_adjacent_byline"
+                and "foreword_cover" in context.profile.cues):
+            return opening
+    if context.profile.kind == "scholarly_article" and not any(
+        "to cite this article:" in str(s.get("text") or "").casefold()
+        for s in context.opening_pages
+    ):
+        expected = words(context.title_hint)
+        visible = words(" ".join(str(s.get("text") or "")[:1800]
+                                 for s in context.opening_pages if int(s.get("page") or 0) == 1))
+        title_corroborated = len(expected) >= 5 and any(
+            visible[pos:pos + 5] == expected[start:start + 5]
+            for start in range(len(expected) - 4)
+            for pos in range(max(0, len(visible) - 4))
+        )
+        first_text = next((str(s.get("text") or "") for s in context.opening_pages
+                           if int(s.get("page") or 0) == 1), "")
+        journal_volume = bool(re.search(r"\bVol\.?\s*\d+\s*,?\s*No\.?\s*\d+|\b[A-Z][A-Za-z ]{4,60}\s+\d{1,3}\(\d+\)",
+                                        first_text[:1600], re.I))
+        if title_corroborated or journal_volume:
+            opening = infer_generic_text_author(context.opening_pages, title_hint=context.title_hint)
+            if opening.get("author") and opening.get("source") in {
+                "text_opening_title_block_byline", "text_title_window_adjacent_byline",
+                "text_title_adjacent_byline", "text_affiliated_byline",
+                "text_strict_credit_block",
+            } and (title_corroborated or (
+                journal_volume and opening.get("source") in {
+                    "text_affiliated_byline", "text_opening_title_block_byline",
+                } and ("," in opening["author"] or ";" in opening["author"])
+            )):
+                return opening
+    if context.profile.kind == "web_article" and context.path is not None:
+        opening = infer_generic_author(context.opening_pages, context.path,
+                                       title_hint=context.title_hint)
+        if opening.get("author") and opening.get("source") == "text_visible_title_person_prefix":
+            return opening
     # An explicit catalog byline is independent evidence for a work's creator,
     # but generic tail/name-shape guesses must not override a classified role.
     if context.path is not None:

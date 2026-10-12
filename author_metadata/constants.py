@@ -181,6 +181,7 @@ POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES = {
     "text_title_window_adjacent_byline",
     "text_visible_title_person_prefix",
     "text_opening_title_block_byline",
+    "text_journal_title_byline",
     "text_strict_credit_block",
     "text_stacked_affiliated_byline",
     "text_bibliographic_byline",

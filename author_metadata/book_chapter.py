@@ -3,7 +3,7 @@
 import re
 import unicodedata
 
-from .names import looks_like_person_name, split_author_line_candidates
+from .names import looks_like_person_name, normalize_author_candidate, split_author_line_candidates
 from .title_evidence import not_found, words
 
 _NUMBER = r'(?:\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)'
@@ -105,6 +105,74 @@ def chapter_cues(samples):
 def infer(context):
     if context.profile.kind != 'book_chapter':
         return not_found()
+    if 'chapter_hinted_running_head' in context.profile.cues:
+        def name_key(value):
+            return ''.join(char for char in unicodedata.normalize('NFKD', value).casefold()
+                           if char.isalnum() and not unicodedata.combining(char))
+        hint = name_key(context.title_hint)
+        for sample in context.opening_pages:
+            if int(sample.get('page') or 0) <= 1:
+                continue
+            for line in str(sample.get('text') or '').splitlines()[:5]:
+                match = re.fullmatch(r'\s*\d{2,4}\s+(.{5,90})\s*', line)
+                name = normalize_author_candidate(match.group(1)) if match else ''
+                surname = name_key(name.split()[-1]) if name else ''
+                if surname and surname in hint and looks_like_person_name(name):
+                    return {'author': name, 'source': 'text_strict_credit_block',
+                            'page': int(sample['page']), 'evidence': line.strip()}
+    if 'repository_chapter_label' in context.profile.cues:
+        from .scholarly_article import _repository_cover_credit
+        repository = _repository_cover_credit(context)
+        if repository.get('author'):
+            return repository
+    if 'printed_book_excerpt' in context.profile.cues:
+        for sample in context.opening_pages:
+            if int(sample.get('page') or 0) != 1:
+                continue
+            text = str(sample.get('text') or '')
+            if re.search(r'\bFirst (?:presented|published|distributed)\b', text, re.I):
+                lines = _lines(text)
+                for index, line in enumerate(lines[:15]):
+                    if not line.startswith('[') or index < 2:
+                        continue
+                    names = _names(lines[index - 1])
+                    if len(names) == 1:
+                        return {'author': names[0], 'source': 'text_strict_credit_block',
+                                'page': 1, 'evidence': lines[index - 1] + ' / ' + line[:100]}
+            if 'eBook Collection' in text or 'EBSCOhost' in text:
+                catalog = re.search(r'(?im)^\s*AN:\s*\d+\s*;\s*([^;\n]{5,90})\s*;\s*[^;\n]{5,100}', text)
+                if catalog:
+                    name = normalize_author_candidate(catalog.group(1).strip(' .'))
+                    if looks_like_person_name(name):
+                        return {'author': name, 'source': 'text_bibliographic_author_label',
+                                'page': 1, 'evidence': catalog.group(0).strip()}
+    for sample in context.opening_pages:
+        if int(sample.get('page') or 0) != 1:
+            continue
+        text = str(sample.get('text') or '')
+        if re.search(r'(?im)^\s*Chapter Title:\s*\S', text) and re.search(r'(?im)^\s*Book Title:\s*\S', text):
+            credit = re.search(r'(?im)^\s*Book Author(?:\(s\))?:\s*([^\n]+)', text)
+        elif re.search(r'(?im)^\s*TYPE:\s*Book Chapter\s*$', text):
+            credit = re.search(r'(?im)^\s*(?:CHAPTER AUTHOR|BOOK AUTHOR):\s*([^\n]+)', text)
+        elif re.search(r'(?im)^\s*(?:Sage Reference|The SAGE Handbook)\b', text):
+            credit = re.search(r'(?im)^\s*Author:\s*([^\n]+)', text)
+        else:
+            credit = None
+        if credit:
+            name = normalize_author_candidate(credit.group(1))
+            if looks_like_person_name(name, allow_all_caps=True):
+                return {'author': name, 'source': 'text_author_label',
+                        'page': 1, 'evidence': credit.group(0).strip()}
+    if context.path is not None and any(
+        'ProQuest Ebook Central' in str(sample.get('text') or '')
+        for sample in context.opening_pages
+    ):
+        from .legacy_fallback import infer_author_from_samples_or_filename
+        cited = infer_author_from_samples_or_filename(
+            context.opening_pages, context.path, title_hint=context.title_hint,
+        )
+        if cited.get('source') == 'text_bibliographic_author_label':
+            return cited
     for sample, lines in _opening(context.samples):
         # Book-platform chapter covers can extract their title after the
         # abstract keyword furniture and parent-volume editorial board.
@@ -126,5 +194,23 @@ def infer(context):
                 continue
             return {'author': ', '.join(names), 'source': 'text_strict_credit_block',
                     'page': int(sample['page']), 'evidence': title + ' / ' + lines[index]}
+    if context.path is not None:
+        from .legacy_fallback import infer_author_from_samples_or_filename
+        corroborated = infer_author_from_samples_or_filename(
+            context.opening_pages, context.path, title_hint=context.title_hint,
+        )
+        if corroborated.get('author') and corroborated.get('source') == 'filename_corroborated_text_name':
+            return corroborated
+        if corroborated.get('author') and corroborated.get('source') == 'filename_leading_name':
+            parts = re.split(r'\s+[-–—]\s+', context.title_hint, maxsplit=1)
+            if len(parts) == 2 and words(parts[0]) == words(corroborated['author']):
+                title = words(parts[1])
+                if len(title) >= 3 and any(
+                    any(opening[start:start + len(title)] == title
+                        for start in range(len(opening) - len(title) + 1))
+                    for opening in [words(' '.join(str(sample.get('text') or '').splitlines()[:4]))]
+                    for sample in context.opening_pages if int(sample.get('page') or 0) == 1
+                ):
+                    return corroborated
     return {'author': '', 'source': 'chapter_roles_not_resolved', 'page': 0,
             'evidence': 'No complete local chapter title/byline; parent-book credits are not chapter authors.'}
