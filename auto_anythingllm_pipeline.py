@@ -117,8 +117,11 @@ from author_metadata.filename import infer_author_from_filename, structured_file
 from author_metadata.identity import (  # noqa: F401
     normalize_metadata_author, normalize_metadata_title,
     resolve_title_from_metadata_or_filename, resolve_author_from_metadata_and_inference,
+    author_confidence,
 )
 from author_metadata.context import AuthorEvidenceContext
+from author_metadata.grobid import analyze as analyze_grobid, reconcile as reconcile_grobid
+from author_metadata.field_map import compact_field_review, review_author_field_map
 from author_metadata.dispatcher import infer_author as infer_profiled_author
 from author_metadata.work_identity import resolve_work_identity
 from author_metadata.pdf import (  # noqa: F401
@@ -22012,17 +22015,27 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         if author_sample_error
         else infer_profiled_author(author_context)
     )
+    grobid_analysis = analyze_grobid(pdf_path, author_context, fulltext=True)
+    inferred_author, grobid_decision = reconcile_grobid(
+        author_context, inferred_author, grobid_analysis,
+    )
     resolved_author = resolve_author_from_metadata_and_inference(
         pdf_meta.get("author") or "",
         inferred_author,
         author_override=args.document_author,
     )
+    resolved_author["grobid_agrees"] = (
+        grobid_decision == "agrees"
+        and resolved_author.get("author") == inferred_author.get("author")
+    )
     author = resolved_author["author"]
     author_source = resolved_author["source"]
+    author_confidence_record = author_confidence(resolved_author)
     source_meta = {
         "source_id": f"pdf_{source_sha[:16]}",
         "source_title": normalize_text(title),
         "source_author": normalize_text(author),
+        "author_confidence": author_confidence_record,
         "source_sha256": source_sha,
         "source_published_epoch_ms": pdf_date_to_epoch_ms(pdf_meta.get("creationDate")),
         "metadata_provenance": {
@@ -22045,9 +22058,12 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         **pdf_meta,
         "detected_title": source_meta["source_title"],
         "detected_author": source_meta["source_author"],
+        "author_confidence": author_confidence_record,
         "source_short_label": source_meta["source_short_label"],
         "metadata_provenance": source_meta["metadata_provenance"],
         "author_inference": inferred_author,
+        "grobid_analysis": grobid_analysis,
+        "grobid_author_decision": grobid_decision,
         "author_document_profile": (
             author_context.profile_evidence() if not author_sample_error
             else {"kind": "not_assessed", "cues": [], "classification_pages": [],
@@ -23280,6 +23296,9 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         )):
             recovered_source = str(post_extraction_author_recovery.get("source") or "selected_extraction_text")
             source_meta["source_author"] = recovered_author
+            recovered_confidence = author_confidence({"author": recovered_author,
+                                                      "source": recovered_source})
+            source_meta["author_confidence"] = recovered_confidence
             source_meta["metadata_provenance"] = {
                 **dict(source_meta.get("metadata_provenance") or {}),
                 "source_author": recovered_source,
@@ -23292,6 +23311,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 )
             )
             profile["detected_author"] = recovered_author
+            profile["author_confidence"] = recovered_confidence
             profile["source_short_label"] = source_meta["source_short_label"]
             profile["metadata_provenance"] = dict(source_meta["metadata_provenance"])
             profile["author_inference"] = dict(post_extraction_author_recovery)
@@ -23301,6 +23321,53 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             post_extraction_author_recovery["status"] = "not_recovered"
     selected["post_extraction_author_recovery"] = dict(post_extraction_author_recovery)
     profile["post_extraction_author_recovery"] = dict(post_extraction_author_recovery)
+    # A reversible, shadow-only field map reviews the *final* author against
+    # existing OCR and bounded alternative OCR crops. Failed OCR compositions
+    # remain in its ledger and never suppress a later retry or alter labels.
+    field_review_started = time.perf_counter()
+    try:
+        ocr_peer = next((candidate for candidate in viable
+                         if candidate.get("backend") == "unstructured"
+                         and candidate.get("unstructured_strategy") in {"ocr_only", "hi_res"}
+                         and candidate.get("pages") and not candidate.get("error")), None)
+        tesseract_path = str((unstructured_runtime_probe or {}).get("tesseract_executable") or "")
+        if not tesseract_path:
+            # Some callers supply only a boolean capability probe. Ask the
+            # canonical local resolver for the executable before declaring
+            # the independent final OCR check unavailable.
+            tesseract_path = str(ensure_tesseract_runtime().get("executable") or "")
+        field_review = review_author_field_map(
+            pdf_path,
+            title_hint=source_meta.get("source_title") or "",
+            author=source_meta.get("source_author") or "",
+            author_source=(source_meta.get("metadata_provenance") or {}).get("source_author") or "",
+            ocr_peer_pages=(ocr_peer or {}).get("pages") or (),
+            grobid_analysis=grobid_analysis,
+            tesseract=tesseract_path,
+        )
+        field_review_path = Path(selected["candidate_dir"]) / "author-field-review.json"
+        write_json(field_review_path, compact_field_review(field_review))
+        field_review_summary = {
+            "status": field_review.get("status"),
+            "mode": field_review.get("mode"),
+            "final_review": field_review.get("final_review"),
+            "mapped_pages": [page["page"] for page in field_review.get("pages") or []],
+            "ocr_checks": [{"source": row.get("source"), "page": row.get("page"),
+                            "composition": row.get("composition"), "status": row.get("status"),
+                            "reason": row.get("reason")}
+                           for row in field_review.get("checks") or []],
+            "review_file": str(field_review_path),
+            "changes_final_metadata": False,
+        }
+    except (OSError, ValueError, RuntimeError, fitz.FileDataError) as exc:
+        field_review_summary = {"status": "error", "error_type": type(exc).__name__,
+                                "changes_final_metadata": False}
+    profile["author_field_review"] = field_review_summary
+    selected["author_field_review"] = field_review_summary
+    emit_pipeline_timing_event(args, "author_field_review",
+                               elapsed_seconds=time.perf_counter() - field_review_started,
+                               source_bytes=profile["file_size"],
+                               pdf_pages=profile["pdf_page_count"])
     selection_stage = f"Selected {selected['backend']} and writing output variants"
     if len(viable) > 1:
         selection_stage += f" — compared {len(viable)} extractors; selected by quality policy"

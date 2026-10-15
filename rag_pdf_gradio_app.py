@@ -81,12 +81,13 @@ from embedder_capabilities import (
     provider_catalog_entries,
 )
 from author_metadata.context import AuthorEvidenceContext
+from author_metadata.grobid import analyze as analyze_grobid, reconcile as reconcile_grobid
 from author_metadata.constants import TRUSTED_AUTHOR_INFERENCE_SOURCES
 from author_metadata.dispatcher import infer_author as infer_profiled_author
 from author_metadata.pdf import infer_author_from_initial_pdf_pages
 from author_metadata.scholarly_article import has_editorial_opening
 from author_metadata.work_identity import resolve_work_identity
-from author_metadata.identity import resolve_author_from_metadata_and_inference
+from author_metadata.identity import author_confidence, resolve_author_from_metadata_and_inference
 
 from auto_anythingllm_pipeline import (
     _api_urlopen,
@@ -5641,19 +5642,26 @@ def workspace_person_identity_from_pdf(pdf_file, *, native_metadata=None):
             else:
                 selected_samples = [sample for sample in available_samples
                                     if int(sample["page"]) <= 4]
-            inference = infer_profiled_author(AuthorEvidenceContext.from_samples(
+            selected_context = AuthorEvidenceContext.from_samples(
                 selected_samples, path=path, title_hint=resolved_title,
                 profile=identity.profile,
-            ))
+            )
+            inference = infer_profiled_author(selected_context)
+            grobid_analysis = analyze_grobid(path, selected_context)
+            inference, grobid_decision = reconcile_grobid(
+                selected_context, inference, grobid_analysis,
+            )
             resolved = resolve_author_from_metadata_and_inference(
                 metadata.get("author") or "",
                 inference,
             )
+            resolved["grobid_agrees"] = grobid_decision == "agrees"
             author_report = {
                 "author": resolved["author"],
                 "source": resolved["source"],
                 "page": int(inference.get("page") or 0),
                 "evidence": str(inference.get("evidence") or ""),
+                "author_confidence": author_confidence(resolved),
             }
         else:
             metadata = None
@@ -5702,18 +5710,22 @@ def workspace_person_identity_from_pdf(pdf_file, *, native_metadata=None):
     if result.isupper():
         result = result.capitalize()
     label = result[:1].upper() + result[1:]
-    if source.startswith("filename_"):
+    if source in {"filename_pdf_credit_match", "filename_pdf_standalone_match"}:
+        provenance = "opening-page author evidence corroborated by filename"
+    elif source.startswith("filename_"):
         provenance = "explicit leading filename author convention"
     elif source == "not_available":
         return {}
     else:
         provenance = "opening-page person/byline evidence"
+    confidence = author_report.get("author_confidence") or author_confidence(author_report)
     return {
         "label": label,
         "kind": "person",
         "provenance": provenance,
         "evidence": first_author,
-        "confidence": "moderate",
+        "confidence": confidence["level"],
+        "confidence_score": confidence["score"],
     }
 
 
@@ -5744,7 +5756,7 @@ def workspace_source_identity_from_pdf(pdf_file):
         return fallback
     try:
         inspection_key = pdf_picker_native_inspection_key(path)
-        cache_key = ("workspace-source-identity-v4", *inspection_key)
+        cache_key = ("workspace-source-identity-v5", *inspection_key)
     except OSError:
         cache_key = None
     if cache_key is not None:
@@ -26067,6 +26079,8 @@ def detected_metadata_preview(
             ("Title used", title or "Not available", title_origin),
             ("Embedded title", embedded_title or "Not set", "PDF metadata"),
             ("Author", author or "Not set", author_origin),
+            ("Author confidence", f"{author_inference.get('author_confidence', {}).get('score', 0)}/100 — "
+             f"{author_inference.get('author_confidence', {}).get('basis', 'unresolved')}", "evidence grade"),
             ("Author evidence", author_inference.get("evidence") or "None", "PDF text scan"),
             ("Text-layer check", text_layer_status, "PyMuPDF sample"),
             ("OCR / scanned risk", text_layer_detail, "PyMuPDF page profile"),
@@ -26089,6 +26103,15 @@ def detected_metadata_preview(
                 "PDF structure",
             ),
         ]
+        grobid_preview = author_inference.get("grobid") or {}
+        if grobid_preview.get("status") not in {None, "skipped_genre"}:
+            metadata_rows[5:5] = [
+                ("GROBID", grobid_preview.get("status", "unknown"), "local scholarly parser"),
+                ("GROBID authors", ", ".join(grobid_preview.get("authors") or []) or "None",
+                 "scholarly header"),
+                ("GROBID decision", grobid_preview.get("decision", "not assessed"),
+                 "author evidence comparison"),
+            ]
         row_html = "".join(
             '<div class="metadata-key">{}</div><div class="metadata-value">{}</div>'.format(
                 html.escape(str(key)),

@@ -190,6 +190,9 @@ POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES = {
 
 
 TRUSTED_AUTHOR_INFERENCE_SOURCES = POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES | {
+    "grobid_header_author",
+    "filename_pdf_credit_match",
+    "filename_pdf_standalone_match",
     "text_medical_multicolumn_byline",
     "text_repository_cover_correlated_byline",
     "text_editorial_end_signature",

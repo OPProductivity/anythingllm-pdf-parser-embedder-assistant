@@ -24965,6 +24965,9 @@ class PipelinePdfIntegrationTests(unittest.TestCase):
             self.assertTrue(Path(summary["variant_summary"]).exists())
             self.assertTrue(Path(summary["diagnostics_report"]).exists())
             profile = json.loads((output_dir / "source-profile.json").read_text(encoding="utf-8"))
+            self.assertEqual(profile["author_confidence"], {
+                "score": 0, "level": "unresolved", "basis": "unresolved",
+            })
             self.assertEqual(
                 profile["source_short_label"],
                 f"PDF-{profile['source_sha256'][:8]}",

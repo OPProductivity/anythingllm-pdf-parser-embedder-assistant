@@ -116,7 +116,10 @@ def author_candidate_is_document_role(value):
     candidate = normalize_author_candidate(value)
     if not candidate:
         return False
-    if candidate.casefold() in {"publication date", "critical paper"}:
+    if candidate.casefold() == "publication date":
+        return True
+    if re.fullmatch(r"(?:working|research|discussion|conference|position|critical)\s+papers?",
+                    candidate, flags=re.I):
         return True
     if looks_like_review_heading(candidate):
         return True

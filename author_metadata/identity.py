@@ -3,7 +3,8 @@ import re
 from pathlib import Path
 from rag_pdf_tools import normalize_text
 from .constants import TRUSTED_AUTHOR_INFERENCE_SOURCES
-from .names import normalize_author_candidate, author_candidate_is_font_metadata, looks_like_person_name
+from .names import (normalize_author_candidate, author_candidate_is_document_role,
+                    author_candidate_is_font_metadata, looks_like_person_name)
 
 
 def normalize_metadata_author(value):
@@ -98,6 +99,50 @@ def resolve_author_from_metadata_and_inference(metadata_author, inference, *, au
     report = dict(inference or {})
     inferred_value = normalize_text(report.get("author") or "")
     inferred_source = str(report.get("source") or "")
-    if inferred_value and inferred_source in TRUSTED_AUTHOR_INFERENCE_SOURCES:
+    surname_only_sources = {
+        "filename_leading_surname", "filename_leading_surnames",
+        "filename_surname_before_year", "filename_surname_before_section_number",
+    }
+    single_person_credit = (
+        inferred_source != "text_corporate_cover_byline"
+        and inferred_source not in surname_only_sources
+        and not re.search(r",|;|\s+and\s+|&", inferred_value, re.I)
+    )
+    if (inferred_value and inferred_source in TRUSTED_AUTHOR_INFERENCE_SOURCES
+            and not author_candidate_is_document_role(inferred_value)
+            and (not single_person_credit or looks_like_person_name(inferred_value))):
         return {"author": inferred_value, "source": inferred_source or "text_inference"}
     return {"author": "", "source": "not_available"}
+
+
+def author_confidence(resolved_author):
+    """Return a reusable evidence grade, not a calibrated probability.
+
+    Consumers can compare grades without parsing source names. Zero means
+    unresolved; higher values reflect the *kind* of accepted evidence.
+    """
+    author = normalize_text((resolved_author or {}).get("author") or "")
+    source = str((resolved_author or {}).get("source") or "")
+    if not author or source == "not_available":
+        score, basis = 0, "unresolved"
+    elif source == "user_override":
+        score, basis = 100, "user_override"
+    elif source == "filename_pdf_credit_match":
+        score, basis = 90, "filename_and_visible_author_field"
+    elif source == "filename_pdf_standalone_match":
+        score, basis = 82, "filename_and_opening_byline"
+    elif source == "grobid_header_author":
+        score, basis = 85, "grobid_header_and_visible_byline"
+    elif source in {"text_author_label", "text_bibliographic_author_label",
+                    "text_thesis_titlepage_author", "text_byline", "text_written_by"}:
+        score, basis = 90, "explicit_visible_credit"
+    elif source.startswith("text_") or source.startswith("selected_extraction_text_"):
+        score, basis = 80, "visible_text_inference"
+    elif source.startswith("filename_"):
+        score, basis = 70, "structured_filename"
+    else:
+        score, basis = 0, "unresolved"
+    if 0 < score < 100 and (resolved_author or {}).get("grobid_agrees"):
+        score, basis = max(score, 92), "visible_credit_and_grobid_header_agreement"
+    level = "high" if score >= 90 else "moderate" if score >= 70 else "unresolved"
+    return {"score": score, "level": level, "basis": basis}

@@ -9,7 +9,8 @@ from rag_pdf_tools import normalize_text
 from .constants import POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES
 from .context import AuthorEvidenceContext
 from .dispatcher import infer_author
-from .identity import resolve_author_from_metadata_and_inference
+from .grobid import analyze as analyze_grobid, reconcile as reconcile_grobid
+from .identity import author_confidence, resolve_author_from_metadata_and_inference
 from .names import (looks_like_person_name, normalize_author_candidate,
                     split_author_line_candidates)
 from .scholarly_article import has_editorial_opening
@@ -158,7 +159,7 @@ def infer_author_from_initial_pdf_pages(path: Path, title_hint="", *, page_limit
                         samples.append({"page": number, "text": value})
     except Exception as exc:
         return {"author": "", "source": "error", "page": 0, "evidence": "",
-                "error": type(exc).__name__}
+                "error": type(exc).__name__, "author_confidence": author_confidence({})}
     identity = resolve_work_identity(
         metadata.get("title") or "", pdf_path, samples,
         title_override=title_hint,
@@ -167,10 +168,21 @@ def infer_author_from_initial_pdf_pages(path: Path, title_hint="", *, page_limit
     report = infer_author(AuthorEvidenceContext.from_samples(
         samples, path=pdf_path, title_hint=identity.title, profile=identity.profile,
     ))
+    context = AuthorEvidenceContext.from_samples(
+        samples, path=pdf_path, title_hint=identity.title, profile=identity.profile,
+    )
+    grobid_analysis = analyze_grobid(pdf_path, context)
+    report, grobid_decision = reconcile_grobid(context, report, grobid_analysis)
     resolved = resolve_author_from_metadata_and_inference(metadata.get("author") or "", report)
+    resolved["grobid_agrees"] = grobid_decision == "agrees"
     return {"author": resolved["author"], "source": resolved["source"],
             "page": int(report.get("page") or 0), "evidence": str(report.get("evidence") or ""),
-            "work_identity": identity.as_evidence()}
+            "work_identity": identity.as_evidence(), "author_confidence": author_confidence(resolved),
+            "grobid": {"status": grobid_analysis.get("status"),
+                       "decision": grobid_decision,
+                       "title": grobid_analysis.get("title", ""),
+                       "authors": [item["name"] for item in grobid_analysis.get("authors", [])]},
+            }
 
 
 def infer_author_from_pdf_text(path: Path, title_hint=""):

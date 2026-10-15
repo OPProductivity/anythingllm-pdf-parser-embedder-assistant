@@ -63,6 +63,11 @@ def test_opening_ocr_scope_preserves_recovered_cover_and_user_boundary(
     result = pipeline.prepare_pdf(pdf, tmp_path / "output", args)
     assert result["start_page"] == expected_start
     profile = json.loads((tmp_path / "output" / "source-profile.json").read_text())
+    field_review = profile["author_field_review"]
+    assert field_review["status"] == "reviewed"
+    assert field_review["changes_final_metadata"] is False
+    assert (tmp_path / "output" / "candidates" / result["selected_backend"] /
+            "author-field-review.json").is_file()
     assert {row["start_page"] for row in profile["backends"] if not row.get("error")} == {expected_start}
     if expected_start == 1:
         assert result["selected_backend"] == "unstructured"

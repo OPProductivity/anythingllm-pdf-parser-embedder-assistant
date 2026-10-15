@@ -6,7 +6,9 @@ from dataclasses import dataclass
 
 from rag_pdf_tools import normalize_text
 
-from .names import looks_like_review_heading
+from .names import (has_author_affiliation_hint, looks_like_person_name,
+                    looks_like_review_heading, normalize_author_candidate,
+                    split_author_line_candidates)
 from .book_chapter import chapter_cues
 from .corporate import corporate_cue
 from .muse_review import covers as muse_review_covers
@@ -24,6 +26,48 @@ class DocumentProfile:
 
 def has_browser_print_footer(text):
     return bool(re.search(r"(?m)^https?://\S+\s*\|\s*1/\d+\s*$", text or ""))
+
+
+def compact_scholarly_opening(text, title_hint):
+    """Recognize a title/byline followed by article prose and scholarly evidence.
+
+    This is deliberately a last-resort article cue. It never replaces an
+    explicit book, chapter, review, issue, report, or web classification.
+    """
+    if len(text or "") < 1000:
+        return False
+    lines = [normalize_text(line) for line in text.splitlines() if normalize_text(line)]
+    hint_words = {word for word in re.findall(r"[^\W\d_]+", title_hint.casefold(), re.UNICODE)
+                  if len(word) > 2 and word not in {"and", "for", "the", "with"}}
+    if len(hint_words) < 2:
+        return False
+    for index in range(1, min(5, len(lines))):
+        line = lines[index]
+        credit, separator, affiliation = line.partition(" / ")
+        names = split_author_line_candidates(credit, title_hint="", allow_all_caps=False)
+        if not names and separator:
+            name = normalize_author_candidate(credit)
+            if looks_like_person_name(name):
+                names = [name]
+        if not names:
+            continue
+        title = " ".join(lines[:index])
+        title_words = re.findall(r"[^\W\d_]+", title.casefold(), re.UNICODE)
+        if not 4 <= len(title_words) <= 28:
+            continue
+        if len(set(title_words) & hint_words) < 2:
+            continue
+        if len(" ".join(lines[index + 1:]).split()) < 120:
+            continue
+        affiliation_credit = bool(separator and has_author_affiliation_hint(affiliation))
+        author_year_citation = bool(re.search(
+            r"\([A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÿ'’-]+(?:\s+et al\.)?"
+            r"(?:\s+and\s+[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÿ'’-]+)?\s+(?:19|20)\d{2}\)",
+            text[:2200],
+        ))
+        if affiliation_credit or author_year_citation:
+            return True
+    return False
 
 
 def thesis_title_pages(samples):
@@ -323,5 +367,8 @@ def classify_document(samples, title_hint=""):
                                publication_type="web_article")
     if scholarly_cues:
         return DocumentProfile("scholarly_article", ("journal_volume_issue" if journal_issue else "doi_or_abstract",), pages,
+                               publication_type="scholarly_article")
+    if first_text and compact_scholarly_opening(first_text, hint):
+        return DocumentProfile("scholarly_article", ("compact_title_byline_and_scholarly_body",), pages,
                                publication_type="scholarly_article")
     return DocumentProfile("generic", (), pages)
