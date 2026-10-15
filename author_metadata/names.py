@@ -108,14 +108,22 @@ def author_phrase_is_title_fragment(candidate, title_hint=""):
 def author_candidate_is_document_role(value):
     """Reject compact document furniture that merely has a name-like shape.
 
-    These are grammatical roles, not a global blacklist of individual words.
+    These are grammatical roles and page furniture, not a global blacklist of individual words.
     A real surname may be ``Edition`` or an organisation may contain an
     acronym; only the complete, strongly structured field/edition expressions
-    below are rejected.
+    below are rejected. A leading list bullet or question punctuation is not
+    part of a standalone person name.
     """
     candidate = normalize_author_candidate(value)
     if not candidate:
         return False
+    if re.match(r"^[•○▪◦]", candidate) or re.search(r"[?!]", candidate):
+        return True
+    # Browser-printed navigation can begin with a decorative bullet and an
+    # "About Company" menu entry. It is a page section, not a person credit.
+    section = re.sub(r"^[^\w]+", "", candidate, flags=re.UNICODE).strip()
+    if re.fullmatch(r"About\s+[^\W\d_][\w&.' -]{1,65}", section, flags=re.I | re.UNICODE):
+        return True
     if candidate.casefold() == "publication date":
         return True
     if re.fullmatch(r"(?:working|research|discussion|conference|position|critical)\s+papers?",

@@ -83,6 +83,14 @@ def test_working_paper_heading_is_not_a_person_but_paper_can_be_a_surname():
     assert looks_like_person_name("Jane Paper")
 
 
+def test_browser_menu_about_company_is_not_a_person_credit():
+    assert not looks_like_person_name("○ About PepsiCo")
+    assert not looks_like_person_name("• Recast Segment Information")
+    assert not looks_like_person_name("What is HubSpot?")
+    assert not looks_like_person_name("About Example University")
+    assert looks_like_person_name("Anne About")
+
+
 def test_fast_pdf_preview_exposes_same_author_confidence(tmp_path):
     path = tmp_path / "article - Congdon.pdf"
     with fitz.open() as document:

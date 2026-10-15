@@ -43,7 +43,43 @@ def infer_web_article_author(context):
                 evidence = next((' / '.join(lines[index:index + 3]) for index, line in enumerate(lines)
                                  if normalize_author_candidate(line) == names[0]), '')
             return result(context, names, 'text_dated_opening_byline', page, evidence)
+        names = extract_date_then_byline(lines)
+        if names:
+            evidence = next((' / '.join(lines[index:index + 4]) for index, line in enumerate(lines)
+                             if line == names[0]), names[0])
+            return result(context, names, 'text_dated_opening_byline', page, evidence)
     return empty_result()
+
+
+def extract_date_then_byline(lines):
+    """Read a printed news byline after its publication date and UI controls.
+
+    The publication date supplies the boundary: a name in an image caption or
+    quoted article body before it cannot become the article author. Accept
+    only a compact person line immediately after the date or two known browser
+    controls, and require a browser-print footer on the same page.
+    """
+    values = [normalize_text(line) for line in lines if normalize_text(line)]
+    if not any(re.fullmatch(r"https?://\S+\s*\|\s*1/\d+", line) for line in values):
+        return []
+    month = (r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+             r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)")
+    date_patterns = (
+        rf"\d{{1,2}}\s+{month}\s+20\d{{2}}",
+        rf"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\s+\d{{1,2}}\s+{month},?\s+20\d{{2}}(?:\s*[-–]\s*\d{{1,2}}:\d{{2}})?",
+    )
+    for index, line in enumerate(values[:30]):
+        if not any(re.fullmatch(pattern, line, flags=re.I) for pattern in date_patterns):
+            continue
+        for candidate_index in range(index + 1, min(index + 4, len(values))):
+            intervening = values[index + 1:candidate_index]
+            if any(value.casefold() not in {"save", "add as preferred on google"}
+                   for value in intervening):
+                continue
+            name = normalize_author_candidate(values[candidate_index])
+            if looks_like_person_name(name, allow_all_caps=False):
+                return [name]
+    return []
 
 
 def extract_dated_opening_byline(

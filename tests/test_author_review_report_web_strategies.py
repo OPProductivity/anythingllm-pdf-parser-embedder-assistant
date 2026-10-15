@@ -1,10 +1,25 @@
 from types import SimpleNamespace
 
-from author_metadata.report import infer_report_author
-from author_metadata.review import infer_review_author
-from author_metadata.web_article import infer_web_article_author
 import pytest
 
+from author_metadata.report import infer_report_author
+from author_metadata.review import infer_review_author
+from author_metadata.web_article import extract_date_then_byline, infer_web_article_author
+
+
+def test_browser_print_date_then_person_credit_skips_caption_before_date():
+    lines = ["Kermit the Frog honoured in new fossil find", "James D. Tiller, Smithsonian",
+             "21 March 2024", "Save", "Add as preferred on Google", "Maddie Molloy",
+             "BBC News Climate & Science", "https://www.bbc.com/news/example | 1/4"]
+    assert extract_date_then_byline(lines) == ["Maddie Molloy"]
+    assert extract_date_then_byline(lines[:-1]) == []
+
+
+def test_browser_print_dated_byline_abstains_when_a_menu_intervenes():
+    lines = ["Mon, 25 Mar, 2024 - 18:01", "Sally Gorman", "HOMEPAGE / NEWS",
+             "https://www.irishexaminer.com/news/example | 1/6"]
+    assert extract_date_then_byline(lines) == ["Sally Gorman"]
+    assert extract_date_then_byline([lines[0], "HOMEPAGE / NEWS", lines[1], lines[-1]]) == []
 pytestmark = pytest.mark.offline_deterministic
 
 
