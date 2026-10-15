@@ -82,6 +82,44 @@ def _numbered_credits(lines):
                 yield names, title, index - 1
 
 
+def _local_heading_credit(context):
+    """A chapter's own title followed immediately by its complete byline."""
+    hint_words = words(context.title_hint)
+    if len(hint_words) < 5:
+        return not_found()
+    for sample in context.opening_pages:
+        if int(sample.get('page') or 0) != 1:
+            continue
+        lines = _lines(str(sample.get('text') or ''))[:18]
+        for start in range(min(10, len(lines))):
+            for width in range(1, min(4, len(lines) - start)):
+                title = ' '.join(lines[start:start + width])
+                title_words = words(title)
+                if len(title_words) < 4 or not any(
+                    title_words[pos:pos + 4] == hint_words[offset:offset + 4]
+                    for pos in range(len(title_words) - 3)
+                    for offset in range(len(hint_words) - 3)
+                ):
+                    continue
+                for credit_width in range(1, min(4, len(lines) - start - width) + 1):
+                    credit_lines = lines[start + width:start + width + credit_width]
+                    if any(_FURNITURE.match(line) or _ROLE.search(line) for line in credit_lines):
+                        break
+                    raw = ' '.join(credit_lines)
+                    if re.search(r'\((?:ed\.?|editor|editors)\)', raw, re.I):
+                        continue
+                    if credit_lines[-1].rstrip().endswith((',', '&', 'and')):
+                        continue
+                    names = split_author_line_candidates(raw, require_complete=True)
+                    if not names:
+                        name = normalize_author_candidate(raw)
+                        names = [name] if looks_like_person_name(name, title_hint=title) else []
+                    if names and all(looks_like_person_name(name, title_hint=title) for name in names):
+                        return {'author': ', '.join(names), 'source': 'text_strict_credit_block',
+                                'page': 1, 'evidence': title + ' / ' + raw}
+    return not_found()
+
+
 def chapter_cues(samples):
     for sample, lines in _opening(samples):
         text = '\n'.join(lines)
@@ -105,6 +143,9 @@ def chapter_cues(samples):
 def infer(context):
     if context.profile.kind != 'book_chapter':
         return not_found()
+    local = _local_heading_credit(context)
+    if local.get('author'):
+        return local
     if 'chapter_hinted_running_head' in context.profile.cues:
         def name_key(value):
             return ''.join(char for char in unicodedata.normalize('NFKD', value).casefold()

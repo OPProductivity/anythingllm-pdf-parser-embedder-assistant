@@ -44,6 +44,7 @@ def normalize_author_candidate(value):
         candidate,
         flags=re.I,
     )
+    candidate = re.sub(r"^(?:(?:Dr|Prof)\.)\s+(?=[^\W\d_])", "", candidate, flags=re.I)
     # OCR title pages sometimes join a single-letter middle initial to an
     # all-caps surname (``WARREN I.SUSMAN``). This is a spacing repair, not a
     # name guess: keep the original letters and only restore the separator.
@@ -125,6 +126,10 @@ def author_candidate_is_document_role(value):
     if re.fullmatch(r"About\s+[^\W\d_][\w&.' -]{1,65}", section, flags=re.I | re.UNICODE):
         return True
     if candidate.casefold() == "publication date":
+        return True
+    if re.fullmatch(r"(?:student|instructor|author)\s+(?:name|number|id)", candidate, flags=re.I):
+        return True
+    if candidate.isupper() and re.fullmatch(r"[A-ZÀ-ÖØ-Þ ]+\s+STUDIES", candidate):
         return True
     if re.fullmatch(r"(?:working|research|discussion|conference|position|critical)\s+papers?",
                     candidate, flags=re.I):

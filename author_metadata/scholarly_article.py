@@ -6,6 +6,7 @@ This strategy does not infer journal authors from PDF properties or filenames.
 
 import re
 import unicodedata
+import fitz
 
 from .names import (normalize_author_candidate, looks_like_person_name,
                     author_phrase_is_title_fragment,
@@ -450,6 +451,26 @@ def _spaced_abstract_credit(context):
 def infer(context):
     if context.profile.kind != "scholarly_article":
         return not_found()
+    # Magazine-style scholarly exports sometimes print a lowercase title and
+    # lowercase `by` credit. The exact title phrase must occur in the selected
+    # filename and the complete credit must be its immediate next line.
+    first = next((sample for sample in context.opening_pages
+                  if int(sample.get('page') or 0) == 1), None)
+    if first is not None:
+        leading = [" ".join(line.split()) for line in first['text'].splitlines() if line.strip()][:8]
+        hint_words = words(context.title_hint)
+        for index in range(min(5, len(leading) - 1)):
+            title_words = words(leading[index])
+            credit = re.fullmatch(r'by\s+(.+)', leading[index + 1], re.I)
+            if not credit or len(title_words) < 5 or not any(
+                hint_words[start:start + len(title_words)] == title_words
+                for start in range(len(hint_words) - len(title_words) + 1)
+            ):
+                continue
+            raw_names = re.split(r'\s+(?:and|&)\s+|\s*,\s*', credit.group(1), flags=re.I)
+            names = [normalize_author_candidate(name.title()) for name in raw_names]
+            if names and all(looks_like_person_name(name, title_hint=leading[index]) for name in names):
+                return _result(names, first, leading[index:index + 2], 'text_byline')
     repository = _repository_cover_credit(context)
     if repository["author"]:
         return repository
@@ -579,4 +600,73 @@ def infer(context):
     spaced = _spaced_abstract_credit(context)
     if spaced["author"]:
         return spaced
+    # PyMuPDF drawing order can put a two-column article's visible title and
+    # byline after its body text. Try a positioned reading order only when
+    # the existing scholarly rules abstain, and keep the same adjacent-title
+    # requirement used for the native first-line credit above.
+    if context.path is not None and first is not None:
+        try:
+            with fitz.open(context.path) as doc:
+                sorted_lines = [" ".join(line.split()) for line in doc[0].get_text(sort=True).splitlines()
+                                if line.strip()][:20]
+                positioned_blocks = doc[0].get_text('blocks')
+                page_height = float(doc[0].rect.height)
+        except Exception:
+            sorted_lines = []
+            positioned_blocks = []
+            page_height = 0
+        hint_words = words(context.title_hint)
+        for index in range(min(12, len(sorted_lines) - 1)):
+            title_words = words(sorted_lines[index])
+            credit = re.fullmatch(r'by\s+(.+)', sorted_lines[index + 1], re.I)
+            if not credit or len(title_words) < 5 or not any(
+                hint_words[start:start + len(title_words)] == title_words
+                for start in range(len(hint_words) - len(title_words) + 1)
+            ):
+                continue
+            names = [normalize_author_candidate(name.title()) for name in
+                     re.split(r'\s+(?:and|&)\s+|\s*,\s*', credit.group(1), flags=re.I)]
+            if names and all(looks_like_person_name(name, title_hint=sorted_lines[index]) for name in names):
+                return _result(names, first, sorted_lines[index:index + 2], 'text_byline')
+        # An excerpt may continue in one column while a new work begins in
+        # another. Require a complete local title (or the work-title segment
+        # after a separator), an aligned byline, and body text in that column.
+        # PDF drawing order is not necessarily column order.
+        title_parts = [words(part) for part in re.split(
+            r'\s+(?:--|[-\u2013\u2014])\s+|:\s+', context.title_hint)]
+        title_parts = [part for part in title_parts if part]
+        target_title = title_parts[-1] if title_parts else []
+        blocks = [(bounds, ' '.join(str(bounds[4]).split())) for bounds in positioned_blocks
+                  if len(bounds) >= 5 and str(bounds[4]).strip()]
+        for box, heading in blocks:
+            heading_words = words(heading)
+            title_match = heading_words == target_title or (
+                len(target_title) == 1 and len(target_title[0]) >= 5
+                and heading_words[:1] == target_title and len(heading_words) <= 2
+                and '/' in heading
+            )
+            if not (page_height and box[1] < page_height * .28
+                    and heading_words and title_match):
+                continue
+            aligned = [(other, line) for other, line in blocks
+                       if abs(float(other[0]) - float(box[0])) <= 18
+                       and float(other[1]) > float(box[3])]
+            if not aligned:
+                continue
+            # Sort by vertical position, not by text or by PDF drawing order.
+            aligned.sort(key=lambda item: float(item[0][1]))
+            next_box, line = aligned[0]
+            if not 0 < float(next_box[1]) - float(box[3]) < 30:
+                continue
+            candidate = normalize_author_candidate(line)
+            if not looks_like_person_name(candidate, title_hint=heading):
+                continue
+            body_nearby = any(
+                15 < float(body_box[1]) - float(next_box[3]) < 110
+                and abs(float(body_box[0]) - float(box[0])) <= 18
+                and len(words(body)) >= 8
+                for body_box, body in aligned[1:]
+            )
+            if body_nearby:
+                return _result([candidate], first, [heading, line], 'text_strict_credit_block')
     return not_found()

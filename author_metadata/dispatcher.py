@@ -5,12 +5,14 @@ import re
 
 from .book import infer as infer_book_author
 from .book_chapter import infer as infer_book_chapter_author
+from .bibliographic import infer_repeated_platform_credit
 from .corporate import infer as infer_corporate_author
 from .context import AuthorEvidenceContext
 from .constants import TRUSTED_AUTHOR_INFERENCE_SOURCES
 from .credit_match import (match_filename_to_pdf_author_credit,
                            match_filename_to_scholarly_byline)
 from .filename import infer_author_from_filename
+from .frontmatter import infer_generic_frontmatter
 from .legacy_fallback import (
     infer_author_from_samples_or_filename as infer_generic_author,
     infer_author_from_text_samples as infer_generic_text_author,
@@ -44,15 +46,26 @@ def infer_author(context: AuthorEvidenceContext):
     if strategy is None:
         if context.path is None:
             return infer_generic_text_author(context.samples, title_hint=context.title_hint)
+        platform = infer_repeated_platform_credit(context)
+        if platform.get('author'):
+            return platform
         report = infer_generic_author(context.samples, context.path, title_hint=context.title_hint)
         matched = match_filename_to_pdf_author_credit(context)
         if matched and (report.get("source") not in TRUSTED_AUTHOR_INFERENCE_SOURCES
                         or str(report.get("author") or "").casefold() == matched["author"].casefold()):
             return matched
+        if not report.get('author') or report.get('source') not in TRUSTED_AUTHOR_INFERENCE_SOURCES:
+            frontmatter = infer_generic_frontmatter(context)
+            if frontmatter.get('author'):
+                return frontmatter
         return report
     report = strategy(context)
     if report.get("author"):
         return report
+    if context.profile.kind == 'book_chapter':
+        platform = infer_repeated_platform_credit(context)
+        if platform.get('author'):
+            return platform
     matched = match_filename_to_pdf_author_credit(context)
     if matched:
         return matched

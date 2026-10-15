@@ -120,11 +120,178 @@ def _catalog_credit(context):
             "page": 0, "evidence": context.path.name}
 
 
+def _explicit_titlepage_credit(context, samples):
+    """Read complete by/editor lists attached to this book's printed title.
+
+    PDF title pages often put the role and two names on the same line, then
+    continue the list on following lines. The older parser only accepted a
+    standalone `edited by` line and stopped at the first inline name.
+    """
+    hint = re.split(r"\s+--\s+", context.title_hint)[0]
+    hint_words = words(hint)
+    if len(hint_words) < 3:
+        return not_found()
+    reports = []
+    role = re.compile(r"^(?:(?:edited|written)\s+by|by)\s*:?[\s\u00ad]*(.*)$", re.I)
+    for sample in samples:
+        lines = [" ".join(line.replace("\u00ad", "").split())
+                 for line in sample["text"].splitlines() if line.strip()]
+        # Publisher series catalogs enumerate many neighboring books with
+        # their creators. None is a title-page credit for this PDF.
+        if sum(bool(role.fullmatch(value)) for value in lines[:32]) >= 3:
+            continue
+        for index, line in enumerate(lines[:22]):
+            match = role.fullmatch(line)
+            if not match or any(_PRAISE.match(v) for v in lines[:index]):
+                continue
+            preceding = words(" ".join(lines[max(0, index - 5):index]))
+            # Require the document's own title directly above the credit.
+            # Catalog filenames can truncate a title; their opening words
+            # still have to agree with the printed work.
+            overlap = min(len(hint_words), 4)
+            # A damaged cover may leave only the printed subtitle legible.
+            # Require a four-word contiguous phrase from the selected title;
+            # this is still tied to the work, not any nearby person name.
+            if not any(preceding[pos:pos + overlap] == hint_words[start:start + overlap]
+                       for start in range(max(0, len(hint_words) - overlap + 1))
+                       for pos in range(max(0, len(preceding) - overlap + 1))):
+                continue
+            credit = [match.group(1)] if match.group(1).strip() else []
+            for next_line in lines[index + 1:index + 6]:
+                if _IMPRINT.search(next_line) or _OTHER_ROLE.search(next_line):
+                    break
+                credit.append(next_line)
+                joined = " ".join(credit).strip(" ,")
+                if not joined or credit[-1].rstrip().endswith((",", "and", "AND", "&")):
+                    continue
+                names = split_author_line_candidates(joined, require_complete=True)
+                if not names:
+                    single = normalize_author_candidate(joined)
+                    names = [single] if looks_like_person_name(single, title_hint=hint) else []
+                if names and all(looks_like_person_name(name, title_hint=hint) for name in names):
+                    reports.append({"author": ", ".join(names), "source": "text_strict_credit_block",
+                                    "page": int(sample["page"]), "evidence": line + " / " + joined})
+                    # A complete inline list ends here. Subsequent text can
+                    # be a series subtitle or the opening chapter heading.
+                    break
+            # An inline credit may be complete without a following name line.
+            if match.group(1).strip():
+                names = split_author_line_candidates(match.group(1), require_complete=True)
+                if not names:
+                    name = normalize_author_candidate(match.group(1))
+                    names = [name] if looks_like_person_name(name, title_hint=hint) else []
+                if names:
+                    reports.append({"author": ", ".join(names), "source": "text_strict_credit_block",
+                                    "page": int(sample["page"]), "evidence": line})
+    if not reports:
+        return not_found()
+    # The longest complete credit list is preferred; a shorter inline prefix
+    # on the same page is just a partial rendering of that list.
+    reports.sort(key=lambda row: len(row["author"].split(", ")), reverse=True)
+    return reports[0]
+
+
+def _frontmatter_credit(context, samples):
+    """Use explicit author-rights or work-level library catalog records."""
+    hint = re.split(r"\s+--\s+", context.title_hint)[0]
+    expected = words(hint)
+    reports = []
+    printed_titlepages = []
+    for row in samples:
+        opening_lines = [" ".join(line.split()) for line in row["text"].splitlines() if line.strip()][:14]
+        opening_words = words(" ".join(opening_lines))
+        if len(expected) >= 3 and any(opening_words[pos:pos + 3] == expected[:3]
+                                      for pos in range(max(0, len(opening_words) - 2))):
+            printed_titlepages.append((int(row["page"]), opening_words))
+    for sample in samples:
+        lines = [" ".join(line.split()) for line in sample["text"].splitlines() if line.strip()]
+        text = " ".join(lines[:35])
+        if re.search(r"\b(?:Library of Congress Cataloging|British Library Cataloguing)", text, re.I):
+            # Work-level CIP: title / author or editors. It is only accepted
+            # when the title itself matches the selected work's opening words.
+            catalog = re.search(r"(?:^|\s)(.{10,160}?)\s*/\s*(?:(?:edited|written)\s+by\s+)?"
+                                r"(.{5,150}?)\.\s*(?:p\.\s*cm\.|pages\s+cm|Includes\b)",
+                                text, re.I)
+            if catalog and len(expected) >= 3:
+                title_words = words(catalog.group(1))
+                if any(title_words[pos:pos + 3] == expected[:3]
+                       for pos in range(max(0, len(title_words) - 2))):
+                    raw = re.sub(r",?\s+editors?\.?$", "", catalog.group(2), flags=re.I)
+                    names = split_author_line_candidates(raw, require_complete=True)
+                    if not names:
+                        name = normalize_author_candidate(raw)
+                        names = [name] if looks_like_person_name(name, title_hint=hint) else []
+                    if names and all(looks_like_person_name(name, title_hint=hint) for name in names):
+                        reports.append({"author": ", ".join(name.rstrip("." ) for name in names),
+                                        "source": "text_bibliographic_author_label",
+                                        "page": int(sample["page"]), "evidence": catalog.group(0)[:250]})
+        # Copyright owner alone is insufficient. This exact rights clause
+        # asserts authorship of the work, even when the title page is a scan.
+        rights = re.search(r"\bThe rights? of (.{5,80}?) (?:as|to be identified as) (?:the )?author\b", text, re.I)
+        if rights:
+            name = normalize_author_candidate(rights.group(1))
+            if looks_like_person_name(name):
+                reports.append({"author": name, "source": "text_bibliographic_author_label",
+                                "page": int(sample["page"]), "evidence": rights.group(0)})
+        for copyright_line in lines[:25]:
+            copyrighted = re.fullmatch(r"(?:Text copyright\s*:\s*|(?:Copyright\s*)?©\s*)"
+                                      r"(?:18|19|20)\d{2}\s+(.{5,80}?)\.?", copyright_line, re.I)
+            if not copyrighted:
+                continue
+            name = normalize_author_candidate(copyrighted.group(1))
+            name_words = words(name)
+            if not looks_like_person_name(name) or not name_words:
+                continue
+            if any(abs(int(sample["page"]) - page) <= 2 and any(
+                page_words[pos:pos + len(name_words)] == name_words
+                for pos in range(max(0, len(page_words) - len(name_words) + 1)))
+                   for page, page_words in printed_titlepages):
+                reports.append({"author": name, "source": "text_bibliographic_author_label",
+                                "page": int(sample["page"]), "evidence": copyright_line})
+    authors = {report["author"].casefold() for report in reports}
+    return reports[0] if len(authors) == 1 else not_found()
+
+
+def _embedded_chapter_credit(context, samples):
+    """A chapter excerpt whose PDF begins with the edited parent frontmatter."""
+    hint = words(re.split(r"\s+--\s+", context.title_hint)[0])
+    if len(hint) < 4:
+        return not_found()
+    by_page = {int(sample["page"]): sample["text"] for sample in samples}
+    if any(any(words(line)[:4] == hint[:4] for line in by_page.get(page, "").splitlines()[:8])
+           for page in (1, 2)):
+        return not_found()
+    for page in range(3, 12):
+        if page not in by_page or page + 1 not in by_page:
+            continue
+        lines = [" ".join(line.split()) for line in by_page[page].splitlines() if line.strip()][:12]
+        next_lines = [" ".join(line.split()) for line in by_page[page + 1].splitlines() if line.strip()][:5]
+        for index in range(len(lines) - 1):
+            for width in (1, 2):
+                if index + width >= len(lines):
+                    continue
+                title = " ".join(lines[index:index + width])
+                if words(title)[:4] != hint[:4]:
+                    continue
+                name = normalize_author_candidate(lines[index + width])
+                if not looks_like_person_name(name, title_hint=title):
+                    continue
+                if any(words(line) == words(name) for line in next_lines):
+                    return {"author": name, "source": "text_strict_credit_block",
+                            "page": page, "evidence": title + " / " + name + " / next-page running head"}
+    return not_found()
+
+
 def infer(context):
     if context.profile.kind != "book":
         return not_found()
     reports = []
     samples = tuple(sample for sample in context.samples if 1 <= int(sample["page"]) <= 12)
+    embedded = _embedded_chapter_credit(context, samples)
+    if embedded.get("author"):
+        return embedded
+    explicit_credit = _explicit_titlepage_credit(context, samples)
+    frontmatter_credit = _frontmatter_credit(context, samples)
     for sample in samples:
         lines = [" ".join(line.split()) for line in sample["text"].splitlines() if line.strip()][:32]
         if any(_PRAISE.match(line) for line in lines[:6]):
@@ -205,8 +372,15 @@ def infer(context):
     # to privilege whichever page happened to be sampled first.
     unique = {report["author"] for report in reports}
     if len(unique) == 1:
-        return reports[0]
+        if (not explicit_credit.get("author") or
+                len(reports[0]["author"].split(", ")) >= len(explicit_credit["author"].split(", "))):
+            return reports[0]
+        return explicit_credit
     if unique:
         return {"author": "", "source": "conflicting_work_credits", "page": 0,
                 "evidence": "; ".join(f"page {row['page']}: {row['author']}" for row in reports)}
+    if explicit_credit.get("author"):
+        return explicit_credit
+    if frontmatter_credit.get("author"):
+        return frontmatter_credit
     return _catalog_credit(context)
