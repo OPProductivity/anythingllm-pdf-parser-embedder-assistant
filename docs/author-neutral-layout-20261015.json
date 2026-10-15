@@ -1,0 +1,234 @@
+{
+  "baseline_commit": "99591bf",
+  "grobid": "not used; default remains disabled",
+  "scoring": "Unchanged complete reviewed-name comparison; punctuation, accents, case and author order normalized. No surname-only credit in headlines.",
+  "fixed_ground_truth": "Previous 196 course labels and original two gate populations, unchanged. All sources uses workbook Suggested file author / editor column.",
+  "course_before": {
+    "selected": 216,
+    "scored": 196,
+    "complete_correct": 164,
+    "percent": 83.673,
+    "unverified_deferred": 20,
+    "named_gold_total": 195,
+    "named_correct": 163,
+    "scored_unique_hashes": 193,
+    "correct_unique_hashes": 162
+  },
+  "course_after": {
+    "selected": 216,
+    "scored": 196,
+    "complete_correct": 174,
+    "percent": 88.776,
+    "unverified_deferred": 20,
+    "named_gold_total": 195,
+    "named_correct": 173,
+    "scored_unique_hashes": 193,
+    "correct_unique_hashes": 172
+  },
+  "neutral_before": {
+    "selected": 216,
+    "scored": 196,
+    "complete_correct": 122,
+    "percent": 62.245,
+    "unverified_deferred": 20,
+    "named_gold_total": 195,
+    "named_correct": 121,
+    "scored_unique_hashes": 193,
+    "correct_unique_hashes": 121
+  },
+  "neutral_after": {
+    "selected": 216,
+    "scored": 196,
+    "complete_correct": 134,
+    "percent": 68.367,
+    "unverified_deferred": 20,
+    "named_gold_total": 195,
+    "named_correct": 133,
+    "scored_unique_hashes": 193,
+    "correct_unique_hashes": 133
+  },
+  "course_gain_percentage_points": 5.103,
+  "neutral_gain_percentage_points": 6.122,
+  "original_gate_results": {
+    "all_sources": {
+      "before": 39,
+      "after": 39,
+      "total": 41
+    },
+    "manual172": {
+      "before": 166,
+      "after": 166,
+      "total": 172
+    }
+  },
+  "tests": {
+    "focused_final": "187 passed",
+    "broad_first_revision": "1180 passed; 2 known baseline failures deselected; 28 subtests passed",
+    "broad_final": "1188 passed; 2 known baseline failures deselected; 28 subtests passed",
+    "broad_final_log": "broad-final-tests.log"
+  },
+  "limits": [
+    "Metadata preflight covers all selected original and neutral PDF records; full preparation coverage is separately enumerated.",
+    "20 course PDFs remain without verified author ground truth and receive no correctness credit.",
+    "22 scored normal-filename course records still fail complete-name matching.",
+    "Normal and neutral scores each include one correct expected-blank whole-issue control; the 172 population includes three expected-blank controls.",
+    "All PDFs are development/regression evidence; this pass does not establish performance on untouched PDFs.",
+    "File counts include near-duplicate works: the ten new normal-file matches come from seven source works.",
+    "No upload, embedding, retrieval or running GUI verification."
+  ],
+  "rejected_candidate_01": {
+    "manual172": 164,
+    "required": 166,
+    "course_complete": 171,
+    "used": false,
+    "reason": "lost prior OCR credits and introduced subtitle/header false assignments"
+  },
+  "paired_lost_correct_count": 0,
+  "new_wrong_nonempty_count": 0,
+  "timing": {
+    "elapsed_seconds": 256.685,
+    "unique_paths": 557,
+    "median_seconds": 0.0968,
+    "p95_seconds": 4.9929,
+    "max_seconds": 6.4507,
+    "note": "sampled metadata, with duplicate-path reuse; not a controlled performance comparison"
+  },
+  "source_files": [
+    "author_metadata/portable_layout.py",
+    "author_metadata/dispatcher.py",
+    "author_metadata/bounded_ocr.py"
+  ],
+  "inference_hashes": "Full hashes preserved with local qualification artifacts.",
+  "full_preparation": [
+    {
+      "id": "F02-024",
+      "population": "stage2",
+      "pages": 10,
+      "author": "MAUREEN TURIM",
+      "grobid": {
+        "status": "disabled"
+      },
+      "source_hash_preserved": true,
+      "exit_code": 0
+    },
+    {
+      "id": "F03-005",
+      "population": "stage2",
+      "pages": 16,
+      "author": "JANE GAINES",
+      "grobid": {
+        "status": "disabled"
+      },
+      "source_hash_preserved": true,
+      "exit_code": 0
+    },
+    {
+      "id": "F02-024",
+      "population": "neutral_stage2",
+      "pages": 10,
+      "author": "MAUREEN TURIM",
+      "grobid": {
+        "status": "disabled"
+      },
+      "source_hash_preserved": true,
+      "exit_code": 0
+    },
+    {
+      "id": "F03-005",
+      "population": "neutral_stage2",
+      "pages": 16,
+      "author": "JANE GAINES",
+      "grobid": {
+        "status": "disabled"
+      },
+      "source_hash_preserved": true,
+      "exit_code": 0
+    }
+  ],
+  "focused_ablation_no_new_layout": {
+    "manual172": {
+      "correct": 4,
+      "total": 4,
+      "complete_correct": 4,
+      "unknown": 0,
+      "wrong_nonempty": 0,
+      "errors": 0,
+      "seconds": 5.924
+    },
+    "neutral_stage2": {
+      "correct": 1,
+      "total": 9,
+      "complete_correct": 1,
+      "unknown": 8,
+      "wrong_nonempty": 0,
+      "errors": 0,
+      "seconds": 16.938
+    },
+    "neutral_stage3": {
+      "correct": 0,
+      "total": 3,
+      "complete_correct": 0,
+      "unknown": 3,
+      "wrong_nonempty": 0,
+      "errors": 0,
+      "seconds": 0.615
+    },
+    "stage2": {
+      "correct": 2,
+      "total": 9,
+      "complete_correct": 0,
+      "unknown": 7,
+      "wrong_nonempty": 0,
+      "errors": 0,
+      "seconds": 17.285
+    },
+    "stage3": {
+      "correct": 1,
+      "total": 3,
+      "complete_correct": 0,
+      "unknown": 2,
+      "wrong_nonempty": 0,
+      "errors": 0,
+      "seconds": 0.697
+    }
+  },
+  "derived_challenges": {
+    "misleading-properties": {
+      "correct": 3,
+      "total": 5,
+      "complete_correct": 3,
+      "unknown": 2,
+      "wrong_nonempty": 0,
+      "errors": 0,
+      "seconds": 0.963
+    },
+    "neutral": {
+      "correct": 2,
+      "total": 5,
+      "complete_correct": 2,
+      "unknown": 1,
+      "wrong_nonempty": 2,
+      "errors": 0,
+      "seconds": 0.828
+    },
+    "raster-opening": {
+      "correct": 1,
+      "total": 5,
+      "complete_correct": 1,
+      "unknown": 4,
+      "wrong_nonempty": 0,
+      "errors": 0,
+      "seconds": 23.046
+    },
+    "repository-cover": {
+      "correct": 2,
+      "total": 5,
+      "complete_correct": 2,
+      "unknown": 1,
+      "wrong_nonempty": 2,
+      "errors": 0,
+      "seconds": 0.538
+    }
+  },
+  "state": "Qualified source. Local integration and running-service state are reported separately."
+}

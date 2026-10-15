@@ -58,7 +58,9 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--population", default="all")
     parser.add_argument(
-        "--ablation", choices=["none", "no_ocr", "no_new_credit_rules"], default="none"
+        "--ablation",
+        choices=["none", "no_ocr", "no_new_credit_rules", "no_portable_layout"],
+        default="none",
     )
     args = parser.parse_args()
     sys.path.insert(0, args.repo)
@@ -73,6 +75,9 @@ def main():
     import author_metadata.dispatcher as dispatcher
 
     if args.ablation == "no_ocr":
+        portable = sys.modules.get("author_metadata.portable_layout")
+        if portable is not None:
+            portable._collapsed_byline = lambda page, line: []
         dispatcher.infer_bounded_ocr = lambda context: {
             "author": "",
             "source": "not_found",
@@ -102,6 +107,16 @@ def main():
                 },
             )
         dispatcher.remove_translator_role = lambda report, context: report
+    if args.ablation in {"no_new_credit_rules", "no_portable_layout"}:
+
+        def empty(*args, **kwargs):
+            return {"author": "", "source": "not_found", "page": 0, "evidence": ""}
+
+        dispatcher.infer_portable_layout = empty
+        bounded = sys.modules.get("author_metadata.bounded_ocr")
+        if bounded is not None:
+            bounded.layout_credit = empty
+            bounded.publisher_credit = empty
     manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
     rows = []
     cache = {}

@@ -9,6 +9,7 @@ import time
 
 from .structured_credit import _names, _title_supported, _words
 from .title_evidence import not_found
+from .portable_layout import read_tsv, layout_credit, publisher_credit
 
 _CACHE = {}
 
@@ -171,13 +172,37 @@ def infer(context):
                         matrix=fitz.Matrix(scale, scale), clip=clip
                     ).tobytes("png")
                     completed = subprocess.run(
-                        [executable, "stdin", "stdout", "-l", "eng", "--psm", "3"],
+                        [
+                            executable,
+                            "stdin",
+                            "stdout",
+                            "-l",
+                            "eng",
+                            "--psm",
+                            "3",
+                            "tsv",
+                        ],
                         input=png,
                         capture_output=True,
                         timeout=min(3, remaining),
                     )
-                    text = completed.stdout.decode("utf-8", errors="replace")
-                    result = _credit(text, context, index + 1)
+                    text, lines = read_tsv(completed.stdout)
+                    result = publisher_credit(lines, page=index + 1)
+                    if not result.get("author"):
+                        result = layout_credit(
+                            lines,
+                            region.width * scale,
+                            region.height * scale,
+                            page=index + 1,
+                        )
+                    if not result.get("author"):
+                        result = _credit(text, context, index + 1)
+                    if (
+                        result.get("author")
+                        and result.get("source") == "text_structured_opening_credit"
+                    ):
+                        result["source"] = "text_ocr_author_credit"
+                        result["geometry_coordinate_space"] = "ocr_pixels"
                     if result.get("author"):
                         # OCR sometimes merges a punctuation mark into a middle
                         # initial. Verify that narrow ambiguity at another scale;
