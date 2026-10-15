@@ -1,0 +1,255 @@
+{
+  "baseline_commit": "d134683",
+  "experimental_commit": "3c1eb53",
+  "candidate_status": "experimental, not integrated: raised 193/196 course gate is unmet",
+  "grobid": "not used",
+  "scoring": "Unchanged complete reviewed-name comparison; no surname-only credit. All sources labels still come from the workbook Suggested file author / editor column.",
+  "course_original": {
+    "before": {
+      "correct": 174,
+      "total": 196,
+      "named_correct": 173,
+      "named_total": 195,
+      "percent": 88.776
+    },
+    "after": {
+      "correct": 174,
+      "total": 196,
+      "named_correct": 173,
+      "named_total": 195,
+      "percent": 88.776
+    },
+    "required": 193
+  },
+  "course_neutral": {
+    "before": {
+      "correct": 134,
+      "total": 196,
+      "named_correct": 133,
+      "named_total": 195,
+      "percent": 68.367
+    },
+    "after": {
+      "correct": 148,
+      "total": 196,
+      "named_correct": 147,
+      "named_total": 195,
+      "percent": 75.51
+    }
+  },
+  "combined_neutral": {
+    "before": {
+      "correct": 181,
+      "total": 257,
+      "named_correct": 178,
+      "named_total": 254,
+      "percent": 70.428
+    },
+    "after": {
+      "correct": 195,
+      "total": 257,
+      "named_correct": 192,
+      "named_total": 254,
+      "percent": 75.875
+    },
+    "gain_percentage_points": 5.447
+  },
+  "original_gates": {
+    "all_sources": {
+      "before": {
+        "correct": 39,
+        "total": 41,
+        "named_correct": 39,
+        "named_total": 41,
+        "percent": 95.122
+      },
+      "after": {
+        "correct": 39,
+        "total": 41,
+        "named_correct": 39,
+        "named_total": 41,
+        "percent": 95.122
+      }
+    },
+    "manual172": {
+      "before": {
+        "correct": 166,
+        "total": 172,
+        "named_correct": 163,
+        "named_total": 169,
+        "percent": 96.512
+      },
+      "after": {
+        "correct": 166,
+        "total": 172,
+        "named_correct": 163,
+        "named_total": 169,
+        "percent": 96.512
+      }
+    },
+    "adjacent_controls": {
+      "before": {
+        "correct": 23,
+        "total": 41,
+        "named_correct": 10,
+        "named_total": 26,
+        "percent": 56.098
+      },
+      "after": {
+        "correct": 24,
+        "total": 41,
+        "named_correct": 11,
+        "named_total": 26,
+        "percent": 58.537
+      }
+    }
+  },
+  "manual172_neutral": {
+    "correct": 133,
+    "total": 172,
+    "coverage": "Per-member scoring of evaluated, shared neutral hash views; 172 rows represent 165 hashes."
+  },
+  "fresh_development": {
+    "count": 23,
+    "initial_production": {
+      "fresh_neutral": {
+        "correct": 7,
+        "total": 23,
+        "complete_correct": 7,
+        "unknown": 12,
+        "wrong_nonempty": 4,
+        "errors": 0,
+        "seconds": 5.785
+      },
+      "fresh_original": {
+        "correct": 5,
+        "total": 23,
+        "complete_correct": 5,
+        "unknown": 14,
+        "wrong_nonempty": 4,
+        "errors": 0,
+        "seconds": 6.486
+      }
+    },
+    "retuned_candidate": {
+      "fresh_neutral": {
+        "correct": 23,
+        "total": 23,
+        "complete_correct": 23,
+        "unknown": 0,
+        "wrong_nonempty": 0,
+        "errors": 0,
+        "seconds": 1.867
+      },
+      "fresh_original": {
+        "correct": 23,
+        "total": 23,
+        "complete_correct": 23,
+        "unknown": 0,
+        "wrong_nonempty": 0,
+        "errors": 0,
+        "seconds": 1.933
+      }
+    },
+    "interpretation": "Initial fresh test exposed layout failures; after tuning, these 23 are development data, not unseen validation."
+  },
+  "fresh_holdout": {
+    "count": 20,
+    "baseline": {
+      "fresh_neutral": {
+        "correct": 4,
+        "total": 20,
+        "complete_correct": 4,
+        "unknown": 9,
+        "wrong_nonempty": 7,
+        "errors": 0,
+        "seconds": 8.869
+      },
+      "fresh_original": {
+        "correct": 9,
+        "total": 20,
+        "complete_correct": 9,
+        "unknown": 4,
+        "wrong_nonempty": 7,
+        "errors": 0,
+        "seconds": 9.393
+      }
+    },
+    "candidate": {
+      "fresh_neutral": {
+        "correct": 17,
+        "total": 20,
+        "complete_correct": 17,
+        "unknown": 3,
+        "wrong_nonempty": 0,
+        "errors": 0,
+        "seconds": 4.42
+      },
+      "fresh_original": {
+        "correct": 17,
+        "total": 20,
+        "complete_correct": 17,
+        "unknown": 3,
+        "wrong_nonempty": 0,
+        "errors": 0,
+        "seconds": 4.587
+      }
+    },
+    "interpretation": "20 additional documents, labels frozen and code frozen before first inference. New PDFs within the same four journal families, not unseen publisher templates. Three abstentions; no incorrect nonempty credits."
+  },
+  "tests": {
+    "focused": "75 passed",
+    "broad": "1210 passed, 1 failed, 2 previously known failures deselected; 28 subtests passed",
+    "unresolved_failure": "test_confirm_stream_acknowledges_before_the_long_pipeline_returns: state failed rather than preparing. Isolated reruns passed on both candidate and baseline; the unchanged baseline pipeline-only suite passed 923 tests. This is not established as a pre-existing broad-suite failure, and is not called a passing qualification.",
+    "known_deselections": [
+      "test_ocr_near_miss_is_recognition_uncertainty_not_different_author",
+      "test_author_inference_reads_instructor_label"
+    ],
+    "hooks": "Ruff, production type checks, secret scanning and Git hooks passed for the experimental commit"
+  },
+  "ocr_recheck": {
+    "full_evaluation": "U112 regressed to abstention; retained in the 195/257 score",
+    "isolated_recheck": {
+      "combined_neutral": {
+        "correct": 1,
+        "total": 1,
+        "complete_correct": 1,
+        "unknown": 0,
+        "wrong_nonempty": 0,
+        "errors": 0,
+        "seconds": 1.764
+      }
+    },
+    "decision": "Do not replace the full-run score with the successful repeat. Timing-sensitive OCR remains a qualification issue."
+  },
+  "additional_abstaining_preparation": "A nine-author JOSS holdout paper also produced an empty author during full preparation, consistent with its original holdout metadata result; not a new pipeline mismatch. Its preparation output is preserved.",
+  "final_native_preparation": {
+    "distinct_pdfs": 2,
+    "views": 4,
+    "total_pages_across_views": 42,
+    "all_complete_author_matches": true,
+    "source_hashes_preserved": true,
+    "original_and_neutral_parsed_text_hashes_identical": true,
+    "grobid": "disabled in every profile",
+    "coverage": "Actual native CLI preparation of a seven-author PLOS paper and a six-author JOSS holdout paper, original and neutral copies. No embedding or UI test."
+  },
+  "decision": {
+    "adopt_recognition_changes": false,
+    "reasons": [
+      "Raised original-course gate requires 193/196; observed 174/196.",
+      "One previously correct OCR-dependent neutral result abstained in the full evaluation, though an isolated repeat passed.",
+      "One broad-suite UI stream-state test failed; isolated candidate/baseline reruns passed."
+    ],
+    "no_exceptional_pdf_overfitting": true,
+    "ground_truth": "Original labels/scorer unchanged; five independently visually verified deferred labels added to the union. Fifteen deferred course files remain unscored.",
+    "scope": "257 distinct labelled PDF hashes in the combined neutral union, plus 23 fresh development documents and a separate 20-document holdout. Course source inventory remains 216 files, 213 hashes.",
+    "corpus_overlap": "106 unique hashes overlap the original manual and selected course inventories; do not add the denominators as independent documents.",
+    "file_count_vs_authors": "Course 174/196 includes one correct abstention; combined 195/257 includes three. Named-only values are included in the summary."
+  },
+  "reproduce": {
+    "download": "python -B benchmarks/fetch_author_oa_qualification.py --output-dir OUTPUT --split all",
+    "evaluate": "python -B benchmarks/author_portability_eval.py --repo . --manifest OUTPUT/manifest.json --output OUTPUT/results.json",
+    "metric": "Read complete_correct. The legacy correct column can allow weaker matches for older private manifests. The 43 public cases use complete_names.",
+    "scope": "Metadata inference only. Full native preparation is separately sampled; no embedding or running GUI proof. The public original download names preserve publisher naming plus organizing prefixes, not author-enriched filenames."
+  }
+}
