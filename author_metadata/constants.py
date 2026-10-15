@@ -164,6 +164,9 @@ AUTHOR_AFFILIATION_HINTS = {
 
 
 POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES = {
+    "text_ocr_author_credit",
+    "text_credential_author_roster",
+    "text_structured_opening_credit",
     "text_thesis_titlepage_author",
     "text_corporate_cover_byline",
     "text_byline",
@@ -190,6 +193,8 @@ POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES = {
 
 
 TRUSTED_AUTHOR_INFERENCE_SOURCES = POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES | {
+    "text_work_rights_credit",
+    "text_positioned_publisher_credit",
     "grobid_header_author",
     "filename_pdf_credit_match",
     "filename_pdf_standalone_match",

@@ -884,14 +884,22 @@ def pdf_metadata(path: Path, include_page_geometry=False, include_author_samples
                 book_frontmatter = opening_identity.profile.kind == "book"
                 sparse_frontmatter = (not book_frontmatter and len(doc) > 8
                                       and 0 < sum(len(row["text"].strip()) for row in author_text_samples) < 300)
+                contents_frontmatter = (not book_frontmatter and any(
+                    re.search(r'\b(?:table of contents|contents)\b',row['text'][:800],re.I)
+                    for row in author_text_samples))
                 page_numbers = list(opening_numbers)
                 if book_frontmatter:
                     page_numbers.extend(range(5, min(12, len(doc)) + 1))
-                elif sparse_frontmatter:
+                elif sparse_frontmatter or contents_frontmatter or (len(doc) > 8 and not any(
+                    int(row['page']) <= 2 and row['text'].strip() for row in author_text_samples
+                )):
                     # A small amount of cover/artwork text can hide a book's
                     # first readable title page after the fourth PDF page.
                     page_numbers.extend(range(5, min(8, len(doc)) + 1))
                 page_numbers.extend((max(1, len(doc) - 1), len(doc)))
+                if contents_frontmatter and any(re.search(r'\babout the author\b',row['text'],re.I)
+                                               for row in author_text_samples):
+                    page_numbers.extend(range(max(1,len(doc)-7),len(doc)+1))
                 page_numbers = list(dict.fromkeys(number for number in page_numbers
                                                   if 1 <= number <= len(doc)))
                 for position, page_number in enumerate(page_numbers):

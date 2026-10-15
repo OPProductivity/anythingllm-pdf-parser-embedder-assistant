@@ -246,6 +246,8 @@ def _post_pdf(path: Path, *, fulltext: bool, timeout: float):
 
 def analyze(path, context, *, fulltext=False):
     """Return diagnostics on failure; never block another genre on GROBID."""
+    if os.environ.get('PDF_GROBID_ENABLED', '0') != '1':
+        return {'status': 'disabled'}
     if context.profile.kind != "scholarly_article" or context.profile.work_scope != "single_work":
         return {"status": "skipped_genre"}
     pdf = Path(path)

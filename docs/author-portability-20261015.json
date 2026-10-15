@@ -1,0 +1,456 @@
+{
+  "source_baseline": "b0e87d4",
+  "grobid": "excluded from all evaluation; default disabled; actual full-preparation profiles confirm disabled",
+  "scoring": "Both original populations pass complete-name comparison after punctuation, accent and case normalization. Course headline requires all complete reviewed names, ignoring order. Legacy/surname scores retained separately. Manual172 includes 3 expected-blank controls; course stage2 includes one whole-issue blank-author control.",
+  "joint_gate": {
+    "all_sources": {
+      "baseline": 34,
+      "final": 39,
+      "total": 41,
+      "gain_percentage_points": 12.195,
+      "required": 37,
+      "pass": true
+    },
+    "manual172": {
+      "baseline": 157,
+      "final": 166,
+      "total": 172,
+      "gain_percentage_points": 5.233,
+      "required": 166,
+      "pass": true
+    }
+  },
+  "baseline": {
+    "adjacent_controls": {
+      "correct": 24,
+      "total": 41,
+      "unknown": 29,
+      "wrong_nonempty": 2,
+      "errors": 0,
+      "seconds": 6.285,
+      "complete_correct": 23,
+      "named_gold_total": 26,
+      "named_complete_correct": 10
+    },
+    "all_sources": {
+      "correct": 34,
+      "total": 41,
+      "unknown": 7,
+      "wrong_nonempty": 0,
+      "errors": 0,
+      "seconds": 4.881,
+      "complete_correct": 34,
+      "named_gold_total": 41,
+      "named_complete_correct": 34
+    },
+    "manual172": {
+      "correct": 157,
+      "total": 172,
+      "unknown": 15,
+      "wrong_nonempty": 3,
+      "errors": 0,
+      "seconds": 17.719,
+      "complete_correct": 157,
+      "named_gold_total": 169,
+      "named_complete_correct": 154
+    },
+    "stage1": {
+      "correct": 59,
+      "total": 64,
+      "unknown": 4,
+      "wrong_nonempty": 1,
+      "errors": 0,
+      "seconds": 4.957,
+      "complete_correct": 59,
+      "named_gold_total": 64,
+      "named_complete_correct": 59
+    },
+    "stage2": {
+      "correct": 29,
+      "total": 49,
+      "unknown": 18,
+      "wrong_nonempty": 3,
+      "errors": 0,
+      "seconds": 5.089,
+      "complete_correct": 24,
+      "named_gold_total": 48,
+      "named_complete_correct": 23
+    },
+    "stage3": {
+      "correct": 45,
+      "total": 59,
+      "unknown": 11,
+      "wrong_nonempty": 3,
+      "errors": 0,
+      "seconds": 6.427,
+      "complete_correct": 44,
+      "named_gold_total": 59,
+      "named_complete_correct": 44
+    },
+    "stage4": {
+      "correct": 11,
+      "total": 15,
+      "unknown": 4,
+      "wrong_nonempty": 0,
+      "errors": 0,
+      "seconds": 3.026,
+      "complete_correct": 11,
+      "named_gold_total": 15,
+      "named_complete_correct": 11
+    },
+    "stage5": {
+      "correct": 1,
+      "total": 9,
+      "unknown": 6,
+      "wrong_nonempty": 2,
+      "errors": 0,
+      "seconds": 1.143,
+      "complete_correct": 1,
+      "named_gold_total": 9,
+      "named_complete_correct": 1
+    }
+  },
+  "final": {
+    "adjacent_controls": {
+      "correct": 24,
+      "total": 41,
+      "complete_correct": 23,
+      "unknown": 29,
+      "wrong_nonempty": 2,
+      "errors": 0,
+      "seconds": 6.129,
+      "named_gold_total": 26,
+      "named_complete_correct": 10
+    },
+    "all_sources": {
+      "correct": 39,
+      "total": 41,
+      "complete_correct": 39,
+      "unknown": 2,
+      "wrong_nonempty": 0,
+      "errors": 0,
+      "seconds": 5.121,
+      "named_gold_total": 41,
+      "named_complete_correct": 39
+    },
+    "manual172": {
+      "correct": 166,
+      "total": 172,
+      "complete_correct": 166,
+      "unknown": 8,
+      "wrong_nonempty": 1,
+      "errors": 0,
+      "seconds": 48.54,
+      "named_gold_total": 169,
+      "named_complete_correct": 163
+    },
+    "stage1": {
+      "correct": 61,
+      "total": 64,
+      "complete_correct": 61,
+      "unknown": 3,
+      "wrong_nonempty": 0,
+      "errors": 0,
+      "seconds": 13.696,
+      "named_gold_total": 64,
+      "named_complete_correct": 61
+    },
+    "stage2": {
+      "correct": 40,
+      "total": 49,
+      "complete_correct": 35,
+      "unknown": 10,
+      "wrong_nonempty": 0,
+      "errors": 0,
+      "seconds": 35.695,
+      "named_gold_total": 48,
+      "named_complete_correct": 34
+    },
+    "stage3": {
+      "correct": 53,
+      "total": 59,
+      "complete_correct": 52,
+      "unknown": 5,
+      "wrong_nonempty": 1,
+      "errors": 0,
+      "seconds": 21.818,
+      "named_gold_total": 59,
+      "named_complete_correct": 52
+    },
+    "stage4": {
+      "correct": 13,
+      "total": 15,
+      "complete_correct": 13,
+      "unknown": 2,
+      "wrong_nonempty": 0,
+      "errors": 0,
+      "seconds": 3.175,
+      "named_gold_total": 15,
+      "named_complete_correct": 13
+    },
+    "stage5": {
+      "correct": 3,
+      "total": 9,
+      "complete_correct": 3,
+      "unknown": 6,
+      "wrong_nonempty": 0,
+      "errors": 0,
+      "seconds": 24.759,
+      "named_gold_total": 9,
+      "named_complete_correct": 3
+    }
+  },
+  "course": {
+    "selected_files": 216,
+    "unique_hashes": 213,
+    "scored": 196,
+    "unverified_deferred": 20,
+    "complete_correct": 164,
+    "baseline_complete_correct": 139,
+    "named_gold_total": 195,
+    "named_complete_correct": 163,
+    "previously_labelled_or_seen_hashes": 106,
+    "near_100_percent_achieved": false
+  },
+  "neutral_filename_probe": {
+    "baseline": {
+      "all_sources": {
+        "correct": 28,
+        "total": 41,
+        "unknown": 12,
+        "wrong_nonempty": 1,
+        "errors": 0,
+        "seconds": 7.941,
+        "complete_correct": 28,
+        "named_gold_total": 41,
+        "named_complete_correct": 28
+      },
+      "stage1": {
+        "correct": 42,
+        "total": 64,
+        "unknown": 16,
+        "wrong_nonempty": 6,
+        "errors": 0,
+        "seconds": 15.975,
+        "complete_correct": 42,
+        "named_gold_total": 64,
+        "named_complete_correct": 42
+      }
+    },
+    "candidate": {
+      "all_sources": {
+        "correct": 34,
+        "total": 41,
+        "complete_correct": 34,
+        "unknown": 6,
+        "wrong_nonempty": 1,
+        "errors": 0,
+        "seconds": 8.57,
+        "named_gold_total": 41,
+        "named_complete_correct": 34
+      },
+      "stage1": {
+        "correct": 45,
+        "total": 64,
+        "complete_correct": 45,
+        "unknown": 13,
+        "wrong_nonempty": 6,
+        "errors": 0,
+        "seconds": 22.228,
+        "named_gold_total": 64,
+        "named_complete_correct": 45
+      }
+    }
+  },
+  "derived_challenges": {
+    "baseline": {
+      "misleading-properties": {
+        "correct": 0,
+        "total": 5,
+        "complete_correct": 0,
+        "unknown": 5,
+        "wrong_nonempty": 0,
+        "errors": 0,
+        "seconds": 1.641,
+        "named_gold_total": 5,
+        "named_complete_correct": 0
+      },
+      "neutral": {
+        "correct": 0,
+        "total": 5,
+        "complete_correct": 0,
+        "unknown": 3,
+        "wrong_nonempty": 2,
+        "errors": 0,
+        "seconds": 1.258,
+        "named_gold_total": 5,
+        "named_complete_correct": 0
+      },
+      "raster-opening": {
+        "correct": 0,
+        "total": 5,
+        "complete_correct": 0,
+        "unknown": 5,
+        "wrong_nonempty": 0,
+        "errors": 0,
+        "seconds": 0.04,
+        "named_gold_total": 5,
+        "named_complete_correct": 0
+      },
+      "repository-cover": {
+        "correct": 0,
+        "total": 5,
+        "complete_correct": 0,
+        "unknown": 3,
+        "wrong_nonempty": 2,
+        "errors": 0,
+        "seconds": 0.882,
+        "named_gold_total": 5,
+        "named_complete_correct": 0
+      }
+    },
+    "candidate": {
+      "misleading-properties": {
+        "correct": 3,
+        "total": 5,
+        "complete_correct": 3,
+        "unknown": 2,
+        "wrong_nonempty": 0,
+        "errors": 0,
+        "seconds": 2.388,
+        "named_gold_total": 5,
+        "named_complete_correct": 3
+      },
+      "neutral": {
+        "correct": 2,
+        "total": 5,
+        "complete_correct": 2,
+        "unknown": 1,
+        "wrong_nonempty": 2,
+        "errors": 0,
+        "seconds": 2.006,
+        "named_gold_total": 5,
+        "named_complete_correct": 2
+      },
+      "raster-opening": {
+        "correct": 0,
+        "total": 5,
+        "complete_correct": 0,
+        "unknown": 5,
+        "wrong_nonempty": 0,
+        "errors": 0,
+        "seconds": 26.621,
+        "named_gold_total": 5,
+        "named_complete_correct": 0
+      },
+      "repository-cover": {
+        "correct": 2,
+        "total": 5,
+        "complete_correct": 2,
+        "unknown": 1,
+        "wrong_nonempty": 2,
+        "errors": 0,
+        "seconds": 1.282,
+        "named_gold_total": 5,
+        "named_complete_correct": 2
+      }
+    }
+  },
+  "frozen_stage5": {
+    "candidate": "candidate-09",
+    "code_record": "frozen-09-code.json",
+    "baseline": 1,
+    "candidate_correct": 1,
+    "total": 9,
+    "interpretation": "failed portability check; after inspection, these files became development data. Final 3/9 is not an untouched holdout result."
+  },
+  "timing": {
+    "elapsed_seconds": 163.014,
+    "unique_paths_processed": 344,
+    "median_metadata_seconds": 0.1368,
+    "p95_metadata_seconds": 2.5803,
+    "max_metadata_seconds": 6.9449,
+    "note": "metadata sampling only; overlapping rows reused results; wall-clock timings are not controlled head-to-head benchmarks"
+  },
+  "limitations": [
+    "Near-100% recognition was not achieved.",
+    "No remaining untouched holdout supports the final candidate.",
+    "Repeated files and related works are not independent observations.",
+    "Scanned excerpts without a visible byline remain difficult.",
+    "Filename and title dependence remain; the derived raster probes fail.",
+    "20 course PDFs lack independently verified author gold and receive no correctness credit.",
+    "Whole-book author/editor correctness does not establish chapter-level attribution.",
+    "No guarantee of unchanged end-to-end PDF outputs is made."
+  ],
+  "paired_complete_regression_count": 0,
+  "tests": {
+    "broad": "1152 passed, 28 subtests, 2 known baseline failures deselected",
+    "final_focused": "163 passed",
+    "lint": "ruff checks and git diff --check passed",
+    "baseline_failures_reproduced_at": "b0e87d4"
+  },
+  "scope": "Sampled metadata over 216 selected course PDF records; three full offline preparations; no uploads, embeddings, retrieval, GUI reload or untouched-final-candidate holdout.",
+  "full_preparations": [
+    {
+      "id": "S05",
+      "exit_code": 0,
+      "documents": [
+        {
+          "detected_author": "Stefan Borg",
+          "total_pipeline_seconds": 37.0,
+          "grobid": {
+            "grobid_analysis": {
+              "status": "disabled"
+            },
+            "grobid_author_decision": "not_found"
+          },
+          "pages": 250
+        }
+      ]
+    },
+    {
+      "id": "S19",
+      "exit_code": 0,
+      "documents": [
+        {
+          "detected_author": "Milena Feldmann, Markus Rieger-Ladich",
+          "total_pipeline_seconds": 17.51,
+          "grobid": {
+            "grobid_analysis": {
+              "status": "disabled"
+            },
+            "grobid_author_decision": "not_found"
+          },
+          "pages": 24
+        }
+      ]
+    },
+    {
+      "id": "F04-021",
+      "exit_code": 0,
+      "documents": [
+        {
+          "detected_author": "Sabrina Qiong Yu, Guy Austin",
+          "total_pipeline_seconds": 36.52,
+          "grobid": {
+            "grobid_analysis": {
+              "status": "disabled"
+            },
+            "grobid_author_decision": "not_found"
+          },
+          "pages": 306
+        }
+      ]
+    }
+  ],
+  "state": "Local source qualification. Integration and service reload must be reported separately.",
+  "code_files": [
+    "auto_anythingllm_pipeline.py",
+    "author_metadata/constants.py",
+    "author_metadata/dispatcher.py",
+    "author_metadata/grobid.py",
+    "author_metadata/structured_credit.py",
+    "author_metadata/bounded_ocr.py"
+  ],
+  "fingerprint_location": "Full source hashes and fingerprint are preserved with the local qualification artifacts."
+}

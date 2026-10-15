@@ -19,6 +19,11 @@ from author_metadata.profile import DocumentProfile, classify_document
 pytestmark = pytest.mark.offline_deterministic
 
 
+@pytest.fixture(autouse=True)
+def explicitly_enable_optional_service(monkeypatch):
+    monkeypatch.setenv('PDF_GROBID_ENABLED', '1')
+
+
 TEI = b'''<TEI xmlns="http://www.tei-c.org/ns/1.0">
 <teiHeader><fileDesc><sourceDesc><biblStruct><analytic>
 <title>The Politics of Rural Memory</title>
