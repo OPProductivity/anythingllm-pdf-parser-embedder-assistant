@@ -40,6 +40,8 @@ from .structured_credit import (
 )
 from .bounded_ocr import infer as infer_bounded_ocr
 from .portable_layout import infer as infer_portable_layout
+from .portable_book import infer as infer_portable_book
+from .native_article import infer as infer_native_article
 
 
 _STRATEGIES = {
@@ -234,7 +236,17 @@ def infer_author(context: AuthorEvidenceContext):
     labelled = document_record(context)
     if labelled.get("author"):
         return labelled
+    article = infer_native_article(context)
+    if article.get("author"):
+        return article
     report = _infer_author(context)
+    book = infer_portable_book(context)
+    if book.get("author") and (
+        not report.get("author")
+        or str(report.get("source", "")).startswith("filename_")
+        or set(words(report["author"])) < set(words(book["author"]))
+    ):
+        report = book
     layout = infer_portable_layout(context)
     if layout.get("author"):
         old = set(words(report.get("author", "")))

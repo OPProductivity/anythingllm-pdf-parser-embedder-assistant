@@ -33,7 +33,14 @@ def untrack(value):
 def _person(line):
     if re.search(r"\bet\.?\s+al\.?\b", line["text"], re.I):
         return []
-    return _names(untrack(line["text"])) if not _ROLE.search(line["text"]) else []
+    value = re.sub(
+        r",\s*(?:Ph\.?D\.?|M\.?D\.?|M\.?A\.?|M\.?Sc\.?)(?=\s*[,;]|\s+and\b|$)",
+        "",
+        untrack(line["text"]),
+        flags=re.I,
+    )
+    value = re.sub(r",\s*(?:and|&)\s+", " and ", value, flags=re.I)
+    return _names(value) if not _ROLE.search(value) else []
 
 
 def _report(names, heading, credit, page, basis):
@@ -47,7 +54,7 @@ def _report(names, heading, credit, page, basis):
     }
 
 
-def _heading(lines, end, credit_size):
+def _heading(lines, end, credit_size, *, allow_quotes=False):
     selected = []
     for line in reversed(lines[:end]):
         if not line["text"].strip():
@@ -64,7 +71,8 @@ def _heading(lines, end, credit_size):
             r"^(?:fig(?:ure)?\.?\s*\d+|table\s*\d+|plate\s*\d+)\b", heading, re.I
         )
         or _ROLE.search(heading)
-        or re.search(r'[“”"«»]|\b(?:references|bibliography|contents)\b', heading, re.I)
+        or re.search(r"\b(?:references|bibliography|contents)\b", heading, re.I)
+        or (not allow_quotes and re.search(r'[“”"«»]', heading))
     ):
         return "", []
     return heading, selected
@@ -81,7 +89,18 @@ def layout_credit(lines, width, height, *, page=1, repeated_headers=()):
             or credit.get("confidence", 100) < 70
         ):
             continue
-        heading, cluster = _heading(lines, index, credit["size"])
+        following = [
+            v
+            for v in lines[index + 1 :]
+            if v["box"][1] >= credit["box"][3] - 2
+            and v["box"][1] - credit["box"][3] < 135
+        ]
+        abstract = any(
+            re.match(r"^\s*Abstract\b", v["text"], re.I)
+            for v in lines[index + 1 :]
+            if 0 <= v["box"][1] - credit["box"][3] < 180
+        )
+        heading, cluster = _heading(lines, index, credit["size"], allow_quotes=abstract)
         if heading and 0 <= credit["box"][1] - cluster[-1]["box"][3] <= 80:
             left = min(v["box"][0] for v in cluster)
             right = max(v["box"][2] for v in cluster)
@@ -100,7 +119,7 @@ def layout_credit(lines, width, height, *, page=1, repeated_headers=()):
                 body_left = min(v["box"][0] for v in body)
                 body_right = max(v["box"][2] for v in body)
                 if (
-                    abs(body_left - left) <= 40
+                    (abs(body_left - left) <= 40 or body_left <= left <= body_right)
                     and credit["box"][0] >= min(left, body_left) - 20
                     and credit["box"][2] <= max(right, body_right) + 25
                 ):
@@ -134,6 +153,50 @@ def layout_credit(lines, width, height, *, page=1, repeated_headers=()):
                     credit,
                     page,
                     "repeated_header_above_large_work_heading",
+                )
+        # Explicit chapter markers or an abstract bound an opening work credit
+        # even when its author is above the title and the title is not larger.
+        chapter = any(
+            re.fullmatch(r"chapter\d+", "".join(v["text"].split()), re.I)
+            for v in lines[:index]
+        )
+        if page == 1 and credit["box"][1] < height * 0.3 and (chapter or abstract):
+            cluster = []
+            for v in following:
+                if v["size"] < credit["size"] * 0.85 or re.match(
+                    r"^abstract\b", v["text"], re.I
+                ):
+                    break
+                if len(v["text"].split()) > 15 or v["box"][1] - credit["box"][3] > 110:
+                    break
+                cluster.append(v)
+            heading = " ".join(v["text"] for v in cluster)
+            body = [
+                v
+                for v in lines[index + 1 :]
+                if cluster
+                and v["box"][1] >= cluster[-1]["box"][3]
+                and v["box"][1] - cluster[-1]["box"][3] < 140
+                and len(v["text"].split()) >= 7
+                and v["size"] < credit["size"] * 0.95
+            ]
+            if (
+                3 <= len(_words(heading)) <= 30
+                and not _ROLE.search(heading)
+                and body
+                and sum(len(v["text"].split()) for v in body) >= 20
+                and all(
+                    credit["box"][0] >= v["box"][0] - 30
+                    and credit["box"][2] <= v["box"][2] + 30
+                    for v in cluster
+                )
+            ):
+                return _report(
+                    names,
+                    heading,
+                    credit,
+                    page,
+                    "chapter_or_abstract_author_above_heading",
                 )
     return not_found()
 
