@@ -11017,6 +11017,22 @@ class PipelineCoreTests(unittest.TestCase):
             {"value": "workspace"},
             {"visible": False},
         )
+        worker_entered = threading.Event()
+        release_worker = threading.Event()
+
+        def long_worker(*_args, **_kwargs):
+            worker_entered.set()
+            if not release_worker.wait(10):
+                raise TimeoutError("test did not release the confirmed worker")
+            # Match the real pipeline: publish a terminal lifecycle before
+            # returning its terminal UI result.
+            app.update_live_automatic_run_status(
+                state="completed", phase="Processing complete",
+                confirmation_in_flight=False, cancel_available=False,
+            )
+            return terminal
+
+        stream = None
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = {
                 "expected_seconds": 194,
@@ -11030,15 +11046,21 @@ class PipelineCoreTests(unittest.TestCase):
             }
             try:
                 app.validated_automatic_run_settings = lambda values, **_kwargs: (settings, None, [], True)
-                app.run_automatic_from_confirmation = lambda *args, **kwargs: terminal
+                app.run_automatic_from_confirmation = long_worker
                 stream = app.run_automatic_from_confirmation_stream(*([None] * len(app.AUTOMATIC_RUN_FIELDS)))
                 preprocessing = next(stream)
                 started = next(stream)
+                self.assertTrue(worker_entered.wait(10))
                 observed_state = dict(app.LIVE_AUTOMATIC_RUN_STATUS)
+                release_worker.set()
                 completed = next(stream)
                 with self.assertRaises(StopIteration):
                     next(stream)
             finally:
+                release_worker.set()
+                if stream is not None:
+                    # Drain the worker before restoring shared callbacks.
+                    list(stream)
                 app.validated_automatic_run_settings = original_validate
                 app.run_automatic_from_confirmation = original_run
                 # The stream intentionally publishes a live preparing state.
@@ -13866,6 +13888,9 @@ class PipelineCoreTests(unittest.TestCase):
                     end_section_names=pipeline.DEFAULT_END_SECTION_HEADINGS,
                     validation_phrases=[],
                     unstructured_strategy="auto",
+                    # This backend-selection test stubs extraction; its OCR
+                    # capability must also be independent of the host PATH.
+                    unstructured_runtime_probe={"backend_available": True, "tesseract_available": True},
                     marker_style="short",
                     disable_inline_markers=False,
                     run_vector_eval=False,
@@ -17327,7 +17352,8 @@ class PipelineCoreTests(unittest.TestCase):
             ],
             title_hint="Annotated Bibliography Assignment",
         )
-        self.assertEqual(report["author"], "Dr. Example Instructor")
+        # Honorifics are removed from canonical person names across genres.
+        self.assertEqual(report["author"], "Example Instructor")
         self.assertEqual(report["source"], "text_instructor_label")
 
     def test_author_inference_reads_author_s_label(self):
