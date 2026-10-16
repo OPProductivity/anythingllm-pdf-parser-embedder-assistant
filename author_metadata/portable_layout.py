@@ -54,7 +54,9 @@ def _report(names, heading, credit, page, basis):
     }
 
 
-def _heading(lines, end, credit_size, *, allow_quotes=False):
+def _heading(
+    lines, end, credit_size, *, allow_quotes=False, allow_embedded_quotes=False
+):
     selected = []
     for line in reversed(lines[:end]):
         if not line["text"].strip():
@@ -72,7 +74,11 @@ def _heading(lines, end, credit_size, *, allow_quotes=False):
         )
         or _ROLE.search(heading)
         or re.search(r"\b(?:references|bibliography|contents)\b", heading, re.I)
-        or (not allow_quotes and re.search(r'[“”"«»]', heading))
+        or (
+            not allow_quotes
+            and re.search(r'[“”"«»]', heading)
+            and (not allow_embedded_quotes or re.match(r'^[“"«]', heading))
+        )
     ):
         return "", []
     return heading, selected
@@ -83,6 +89,30 @@ def layout_credit(lines, width, height, *, page=1, repeated_headers=()):
     lines = sorted(lines, key=lambda v: (v["box"][1], v["box"][0]))
     for index, credit in enumerate(lines):
         names = _person(credit)
+        # Lowercase display bylines can be personal names. Only consider
+        # case restoration in the separate opening-header grammar below.
+        if not names and page == 1 and credit["text"].islower():
+            header_names = _names(credit["text"].title())
+            after = [v for v in lines[index + 1 :] if v["box"][1] >= credit["box"][3]]
+            if header_names and after and credit["box"][3] < height * 0.20:
+                heading_line = after[0]
+                body_lines = [v for v in after[1:] if len(v["text"].split()) >= 7]
+                body_size = sorted(v["size"] for v in body_lines)
+                if (
+                    2 <= len(_words(heading_line["text"])) <= 24
+                    and heading_line["size"] >= credit["size"] * 1.1
+                    and body_size
+                    and credit["size"] >= body_size[len(body_size) // 2] * 1.25
+                    and sum(len(v["text"].split()) for v in body_lines) >= 100
+                    and not _ROLE.search(heading_line["text"])
+                ):
+                    return _report(
+                        header_names,
+                        heading_line["text"],
+                        credit,
+                        page,
+                        "prominent_lowercase_byline_above_heading_and_body",
+                    )
         if (
             not names
             or credit["box"][1] > height * 0.86
@@ -100,7 +130,20 @@ def layout_credit(lines, width, height, *, page=1, repeated_headers=()):
             for v in lines[index + 1 :]
             if 0 <= v["box"][1] - credit["box"][3] < 180
         )
-        heading, cluster = _heading(lines, index, credit["size"], allow_quotes=abstract)
+        body_sizes = sorted(v["size"] for v in following if len(v["text"].split()) >= 7)
+        strong_opening = (
+            page == 1
+            and credit["box"][1] < height * 0.35
+            and body_sizes
+            and credit["size"] >= body_sizes[len(body_sizes) // 2] * 1.2
+        )
+        heading, cluster = _heading(
+            lines,
+            index,
+            credit["size"],
+            allow_quotes=abstract,
+            allow_embedded_quotes=bool(strong_opening),
+        )
         if heading and 0 <= credit["box"][1] - cluster[-1]["box"][3] <= 80:
             left = min(v["box"][0] for v in cluster)
             right = max(v["box"][2] for v in cluster)
@@ -307,7 +350,31 @@ def _native_page(page):
                         "size": max(s["size"] for s in spans),
                     }
                 )
-    return lines
+    # Uppercase display names are sometimes split into adjacent PDF lines
+    # on one baseline. Rejoin only close, same-size capital fragments.
+    joined = []
+    for line in sorted(lines, key=lambda v: (v["box"][1], v["box"][0])):
+        previous = joined[-1] if joined else None
+        if (
+            previous
+            and line["text"].strip().isupper()
+            and previous["text"].strip().isupper()
+            and len(line["text"].split()) <= 3
+            and len(previous["text"].split()) <= 3
+            and abs(line["box"][1] - previous["box"][1]) < 1
+            and abs(line["size"] - previous["size"]) < 0.3
+            and 0 <= line["box"][0] - previous["box"][2] <= line["size"] * 1.2
+        ):
+            previous["text"] += " " + line["text"]
+            previous["box"] = [
+                min(previous["box"][0], line["box"][0]),
+                min(previous["box"][1], line["box"][1]),
+                max(previous["box"][2], line["box"][2]),
+                max(previous["box"][3], line["box"][3]),
+            ]
+        else:
+            joined.append(dict(line))
+    return joined
 
 
 def _collapsed_byline(page, line):

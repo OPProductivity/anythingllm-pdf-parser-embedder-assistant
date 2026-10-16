@@ -1,0 +1,96 @@
+{
+  "state": "experimental_not_merged",
+  "gates": {
+    "course_original": {
+      "before": 174,
+      "after": 175,
+      "total": 196,
+      "minimum": 193,
+      "pass": false,
+      "change_percentage_points": 0.51
+    },
+    "course_neutral": {
+      "before": 148,
+      "after": 154,
+      "total": 196,
+      "minimum": 158,
+      "pass": false,
+      "change_percentage_points": 3.061
+    },
+    "combined_neutral": {
+      "before": 195,
+      "after": 202,
+      "total": 257,
+      "minimum": 208,
+      "pass": false,
+      "change_percentage_points": 2.724
+    },
+    "all_sources": {
+      "before": 39,
+      "after": 39,
+      "total": 41,
+      "minimum": 39,
+      "pass": true,
+      "change_percentage_points": 0
+    },
+    "manual172": {
+      "before": 166,
+      "after": 166,
+      "total": 172,
+      "minimum": 166,
+      "pass": true,
+      "change_percentage_points": 0
+    },
+    "adjacent_controls": {
+      "before": 24,
+      "after": 24,
+      "total": 41,
+      "minimum": 24,
+      "pass": true,
+      "change_percentage_points": 0
+    }
+  },
+  "all_gates_pass": false,
+  "evaluated_views": 944,
+  "unique_combined_labeled_hashes": 257,
+  "scoring": "unchanged_complete_matches_against_frozen_labels_including_required_abstentions",
+  "grobid_used": false,
+  "candidate_seconds": 322.231,
+  "prior_seconds": 316.552,
+  "tests": {
+    "candidate": {
+      "passed": 1224,
+      "failed": 0,
+      "excluded": 0,
+      "subtests": 28
+    },
+    "main_repairs": {
+      "passed": 1190,
+      "failed": 0,
+      "excluded": 0,
+      "subtests": 28
+    }
+  },
+  "coverage": "sampled native metadata inference plus four complete CLI preparations for two PDFs; no whole-corpus parsing, embedding, GUI restart or GUI runtime verification",
+  "open_access_regression": {
+    "development_documents": 23,
+    "development_complete_each_mode": 23,
+    "previous_holdout_documents": 20,
+    "previous_holdout_complete_each_mode": 17,
+    "new_blind_test_this_round": false
+  },
+  "limitations": [
+    "Weights and specialist confidences are heuristic, not calibrated probabilities.",
+    "Package improvements do not isolate the numeric weighting contribution.",
+    "Previous holdout documents are regression inputs this round.",
+    "No title/person/hash-to-expected-author lookup or label changes were used.",
+    "Exceptional unlabeled PDFs remain deferred; old 196 denominator stays fixed."
+  ],
+  "repair_commit": "f37fe49",
+  "recognition_pushed": false,
+  "candidate_base": "3c1eb53",
+  "baseline_timing_sensitivity": {
+    "id": "U112",
+    "note": "The seven combined-neutral score gains include one recovery of a previously OCR-timing-sensitive case without a new recognition rule; six are structural credit recoveries."
+  }
+}

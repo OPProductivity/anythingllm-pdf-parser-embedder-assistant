@@ -106,7 +106,7 @@ def _infer_author(context: AuthorEvidenceContext):
     report = strategy(context)
     if report.get("author"):
         return report
-    if context.profile.kind == "book_chapter":
+    if context.profile.kind in {"book_chapter", "scholarly_article"}:
         platform = infer_repeated_platform_credit(context)
         if platform.get("author"):
             return platform
@@ -232,7 +232,7 @@ def _infer_author(context: AuthorEvidenceContext):
     return report
 
 
-def infer_author(context: AuthorEvidenceContext):
+def _select_author(context: AuthorEvidenceContext):
     labelled = document_record(context)
     if labelled.get("author"):
         return labelled
@@ -308,3 +308,39 @@ def infer_author_from_samples(samples, path: Path, title_hint=""):
     return infer_author(
         AuthorEvidenceContext.from_samples(samples, path=path, title_hint=title_hint)
     )
+
+
+def infer_author(context: AuthorEvidenceContext):
+    from .context_priority import infer as infer_context_priority
+
+    report = _select_author(context)
+    if not report.get("author") or str(report.get("source", "")).startswith(
+        "filename_"
+    ):
+        from dataclasses import replace
+        from .physical_work import opening_title
+
+        first = next(
+            (
+                str(s.get("text") or "")
+                for s in context.samples
+                if int(s.get("page") or 0) == 1
+            ),
+            "",
+        )
+        title = opening_title(first.splitlines())
+        if title and words(title) != words(context.title_hint):
+            retry = _select_author(replace(context, title_hint=title))
+            if retry.get("author") and not str(retry.get("source", "")).startswith(
+                "filename_"
+            ):
+                report = {
+                    **retry,
+                    "reconsideration": {
+                        "reason": "opening_title_credit_structure",
+                        "title": title,
+                        "previous_source": report.get("source"),
+                        "attempts": 1,
+                    },
+                }
+    return infer_context_priority(context, report)

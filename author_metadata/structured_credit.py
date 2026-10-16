@@ -585,6 +585,16 @@ def whole_book_editors(context):
         if len(lines) > 24:
             continue
         for index, line in enumerate(lines):
+            suffix = re.fullmatch(r"(.{10,160}),\s*editors?\.?", line, re.I)
+            suffix_names = _names(suffix.group(1)) if suffix else []
+            if len(suffix_names) >= 2 and len(_words(" ".join(lines[:index]))) >= 3:
+                return {
+                    "author": ", ".join(suffix_names),
+                    "source": "text_structured_opening_credit",
+                    "page": int(sample["page"]),
+                    "role": "editors",
+                    "evidence": "whole-book title-page editor credit: " + line,
+                }
             if (
                 not re.fullmatch(r"edited by", line, re.I)
                 or len(_words(" ".join(lines[:index]))) < 3

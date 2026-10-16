@@ -173,6 +173,62 @@ def credit(lines, width, height):
     return not_found()
 
 
+def alternating_credit(lines, width, height):
+    """A title, complete author/affiliation pairs, then an abstract.
+
+    Equal font sizes do not erase these textual role boundaries. A name-like
+    subtitle is not a person credit unless it has its own affiliation.
+    """
+    lines = _column_lines(lines, 0, width)
+    stop = next(
+        (
+            i
+            for i, line in enumerate(lines[:24])
+            if re.fullmatch(r"(?i)abstract", line["text"].strip())
+        ),
+        None,
+    )
+    if stop is None:
+        return not_found()
+    pairs = []
+    for i in range(stop - 1):
+        raw = lines[i]["text"]
+        # A comma before a generational suffix is part of one person credit.
+        protected = re.sub(r",\s*(Jr\.|Sr\.)(?=\s*$)", r" \1", raw, flags=re.I)
+        names = _names(protected)
+        if protected != raw:
+            names = [
+                re.sub(r"\s+(Jr\.|Sr\.)$", r", \1", name, flags=re.I) for name in names
+            ]
+        if names and _INSTITUTION.search(lines[i + 1]["text"]):
+            pairs.append((i, names))
+    if not pairs or len(pairs) > 6:
+        return not_found()
+    first = pairs[0][0]
+    heading = [
+        line
+        for line in lines[:first]
+        if len(_words(line["text"])) >= 3 and not _ROLE.search(line["text"])
+    ]
+    title = " ".join(line["text"] for line in heading)
+    if not 4 <= len(_words(title)) <= 45 or _INSTITUTION.search(title):
+        return not_found()
+    # Every line between the first credit and the abstract must have a role;
+    # do not quietly drop unparsed coauthors, editors or a department's staff.
+    covered = {i for index, _names_at_index in pairs for i in (index, index + 1)}
+    if any(i not in covered for i in range(first, stop)):
+        return not_found()
+    names = [name for _, people in pairs for name in people]
+    return {
+        "author": ", ".join(names),
+        "source": "text_structured_opening_credit",
+        "page": 1,
+        "evidence": title + " / " + " / ".join(lines[i]["text"] for i, _ in pairs),
+        "mechanism": "title_author_affiliation_pairs_before_abstract",
+        "geometry": {"byline": [lines[i]["box"] for i, _ in pairs]},
+    }
+
+
 def infer(context):
     if (
         context.path is None
@@ -188,9 +244,21 @@ def infer(context):
         if key in _CACHE:
             return dict(_CACHE[key])
         with fitz.open(context.path) as doc:
-            result = credit(
-                positioned_lines(doc[0]), doc[0].rect.width, doc[0].rect.height
-            )
+            result = not_found()
+            for page_index in range(min(2, len(doc))):
+                page = doc[page_index]
+                lines = positioned_lines(page)
+                result = credit(lines, page.rect.width, page.rect.height)
+                if not result.get("author"):
+                    result = alternating_credit(
+                        lines, page.rect.width, page.rect.height
+                    )
+                if result.get("author"):
+                    result["page"] = page_index + 1
+                    break
+                # Only a sparse wrapper warrants a second opening page.
+                if sum(len(line["text"].split()) for line in lines) >= 30:
+                    break
         if len(_CACHE) > 256:
             _CACHE.clear()
         if result.get("author"):
