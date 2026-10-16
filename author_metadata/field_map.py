@@ -613,7 +613,7 @@ def _check_ocr(author, text, ocr_map=None, title_hint="", native_map=None):
                 localized_matches.add(native_key)
                 continue
             if native_key in expected_keys and local_text:
-                possible = normalize_author_candidate(local_text)
+                possible = normalize_author_candidate(local_text.rstrip("!.,;:*†‡"))
                 if looks_like_person_name(possible) and _author_key(possible) != expected:
                     localized.append(possible)
         if expected_keys and localized_matches == expected_keys:
