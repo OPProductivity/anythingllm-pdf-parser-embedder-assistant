@@ -55,7 +55,13 @@ def _report(names, heading, credit, page, basis):
 
 
 def _heading(
-    lines, end, credit_size, *, allow_quotes=False, allow_embedded_quotes=False
+    lines,
+    end,
+    credit_size,
+    *,
+    allow_quotes=False,
+    allow_embedded_quotes=False,
+    allow_short=False,
 ):
     selected = []
     for line in reversed(lines[:end]):
@@ -68,7 +74,7 @@ def _heading(
         selected.insert(0, line)
     heading = " ".join(untrack(v["text"]) for v in selected)
     if (
-        len(_words(heading)) < 3
+        not (1 if allow_short else 3) <= len(_words(heading)) <= 45
         or re.match(
             r"^(?:fig(?:ure)?\.?\s*\d+|table\s*\d+|plate\s*\d+)\b", heading, re.I
         )
@@ -84,29 +90,27 @@ def _heading(
     return heading, selected
 
 
-def layout_credit(lines, width, height, *, page=1, repeated_headers=()):
+def layout_credit_reports(lines, width, height, *, page=1, repeated_headers=()):
     """A heading, separately sized byline and following body share a column."""
     lines = sorted(lines, key=lambda v: (v["box"][1], v["box"][0]))
     for index, credit in enumerate(lines):
         names = _person(credit)
-        # Lowercase display bylines can be personal names. Only consider
-        # case restoration in the separate opening-header grammar below.
         if not names and page == 1 and credit["text"].islower():
             header_names = _names(credit["text"].title())
             after = [v for v in lines[index + 1 :] if v["box"][1] >= credit["box"][3]]
-            if header_names and after and credit["box"][3] < height * 0.20:
+            if header_names and after and (credit["box"][3] < height * 0.2):
                 heading_line = after[0]
                 body_lines = [v for v in after[1:] if len(v["text"].split()) >= 7]
-                body_size = sorted(v["size"] for v in body_lines)
+                body_size = sorted((v["size"] for v in body_lines))
                 if (
                     2 <= len(_words(heading_line["text"])) <= 24
                     and heading_line["size"] >= credit["size"] * 1.1
                     and body_size
-                    and credit["size"] >= body_size[len(body_size) // 2] * 1.25
-                    and sum(len(v["text"].split()) for v in body_lines) >= 100
-                    and not _ROLE.search(heading_line["text"])
+                    and (credit["size"] >= body_size[len(body_size) // 2] * 1.25)
+                    and (sum((len(v["text"].split()) for v in body_lines)) >= 100)
+                    and (not _ROLE.search(heading_line["text"]))
                 ):
-                    return _report(
+                    yield _report(
                         header_names,
                         heading_line["text"],
                         credit,
@@ -126,16 +130,28 @@ def layout_credit(lines, width, height, *, page=1, repeated_headers=()):
             and v["box"][1] - credit["box"][3] < 135
         ]
         abstract = any(
-            re.match(r"^\s*Abstract\b", v["text"], re.I)
-            for v in lines[index + 1 :]
-            if 0 <= v["box"][1] - credit["box"][3] < 180
+            (
+                re.match("^\\s*Abstract\\b", v["text"], re.I)
+                for v in lines[index + 1 :]
+                if 0 <= v["box"][1] - credit["box"][3] < 180
+            )
         )
-        body_sizes = sorted(v["size"] for v in following if len(v["text"].split()) >= 7)
+        body_sizes = sorted(
+            (v["size"] for v in following if len(v["text"].split()) >= 7)
+        )
         strong_opening = (
             page == 1
             and credit["box"][1] < height * 0.35
             and body_sizes
-            and credit["size"] >= body_sizes[len(body_sizes) // 2] * 1.2
+            and (credit["size"] >= body_sizes[len(body_sizes) // 2] * 1.2)
+        )
+        local_numbered_work = any(
+            0 <= credit["box"][1] - v["box"][3] <= 150
+            and re.match(
+                r"^(?:chapter\s*)?\d{1,3}(?:[.:]?\s+|$)", v["text"].strip(), re.I
+            )
+            and len(v["text"].split()) <= 7
+            for v in lines[max(0, index - 6) : index]
         )
         heading, cluster = _heading(
             lines,
@@ -143,10 +159,11 @@ def layout_credit(lines, width, height, *, page=1, repeated_headers=()):
             credit["size"],
             allow_quotes=abstract,
             allow_embedded_quotes=bool(strong_opening),
+            allow_short=local_numbered_work,
         )
         if heading and 0 <= credit["box"][1] - cluster[-1]["box"][3] <= 80:
-            left = min(v["box"][0] for v in cluster)
-            right = max(v["box"][2] for v in cluster)
+            left = min((v["box"][0] for v in cluster))
+            right = max((v["box"][2] for v in cluster))
             following = [
                 v
                 for v in lines[index + 1 :]
@@ -158,18 +175,59 @@ def layout_credit(lines, width, height, *, page=1, repeated_headers=()):
                 for v in following
                 if len(v["text"].split()) >= 5 and v["size"] <= credit["size"] * 1.6
             ]
-            if body and sum(len(v["text"].split()) for v in body) >= 20:
-                body_left = min(v["box"][0] for v in body)
-                body_right = max(v["box"][2] for v in body)
+            if body and sum((len(v["text"].split()) for v in body)) >= 20:
+                body_left = min((v["box"][0] for v in body))
+                body_right = max((v["box"][2] for v in body))
                 if (
-                    (abs(body_left - left) <= 40 or body_left <= left <= body_right)
+                    (
+                        abs(body_left - left) <= 40
+                        or body_left <= left <= body_right
+                        or (abstract and left <= body_left <= right)
+                    )
                     and credit["box"][0] >= min(left, body_left) - 20
-                    and credit["box"][2] <= max(right, body_right) + 25
+                    and (credit["box"][2] <= max(right, body_right) + 25)
                 ):
-                    return _report(
+                    yield _report(
                         names, heading, credit, page, "physical_heading_byline_body"
                     )
-        # Some journals put their byline in a running header above a large title.
+        if (
+            page == 1
+            and credit["text"].isupper()
+            and (credit["box"][1] < height * 0.45)
+        ):
+            cluster = []
+            for line in reversed(lines[:index]):
+                if (
+                    not line["text"].isupper()
+                    or line["size"] < credit["size"] * 0.95
+                    or line["size"] > credit["size"] * 1.8
+                    or (cluster and cluster[0]["box"][1] - line["box"][3] > 25)
+                ):
+                    break
+                cluster.insert(0, line)
+            heading = " ".join((v["text"] for v in cluster))
+            body = [
+                v
+                for v in lines[index + 1 :]
+                if len(v["text"].split()) >= 7 and v["size"] <= credit["size"] * 0.85
+            ]
+            center = (credit["box"][0] + credit["box"][2]) / 2
+            if (
+                cluster
+                and 5 <= len(_words(heading)) <= 30
+                and (not _ROLE.search(heading))
+                and (5 <= credit["box"][1] - cluster[-1]["box"][3] <= 70)
+                and all(
+                    (
+                        abs((v["box"][0] + v["box"][2]) / 2 - center) <= width * 0.1
+                        for v in cluster
+                    )
+                )
+                and (sum((len(v["text"].split()) for v in body)) >= 80)
+            ):
+                yield _report(
+                    names, heading, credit, page, "centered_display_title_and_byline"
+                )
         if (
             credit["box"][3] < height * 0.16
             and tuple(_words(", ".join(names))) in repeated_headers
@@ -184,75 +242,86 @@ def layout_credit(lines, width, height, *, page=1, repeated_headers=()):
                 if line["size"] < credit["size"] * 1.6:
                     break
                 cluster.append(line)
-            heading = " ".join(v["text"] for v in cluster)
+            heading = " ".join((v["text"] for v in cluster))
             if (
                 5 <= len(_words(heading)) <= 30
-                and not _ROLE.search(heading)
-                and not re.search(r"\breviews?\b", heading, re.I)
+                and (not _ROLE.search(heading))
+                and (not re.search("\\breviews?\\b", heading, re.I))
             ):
-                return _report(
+                yield _report(
                     names,
                     heading,
                     credit,
                     page,
                     "repeated_header_above_large_work_heading",
                 )
-        # Explicit chapter markers or an abstract bound an opening work credit
-        # even when its author is above the title and the title is not larger.
         chapter = any(
-            re.fullmatch(r"chapter\d+", "".join(v["text"].split()), re.I)
-            for v in lines[:index]
+            (
+                re.fullmatch("chapter\\d+", "".join(v["text"].split()), re.I)
+                for v in lines[:index]
+            )
         )
         if page == 1 and credit["box"][1] < height * 0.3 and (chapter or abstract):
             cluster = []
             for v in following:
                 if v["size"] < credit["size"] * 0.85 or re.match(
-                    r"^abstract\b", v["text"], re.I
+                    "^abstract\\b", v["text"], re.I
                 ):
                     break
                 if len(v["text"].split()) > 15 or v["box"][1] - credit["box"][3] > 110:
                     break
                 cluster.append(v)
-            heading = " ".join(v["text"] for v in cluster)
+            heading = " ".join((v["text"] for v in cluster))
             body = [
                 v
                 for v in lines[index + 1 :]
                 if cluster
                 and v["box"][1] >= cluster[-1]["box"][3]
-                and v["box"][1] - cluster[-1]["box"][3] < 140
-                and len(v["text"].split()) >= 7
-                and v["size"] < credit["size"] * 0.95
+                and (v["box"][1] - cluster[-1]["box"][3] < 140)
+                and (len(v["text"].split()) >= 7)
+                and (v["size"] < credit["size"] * 0.95)
             ]
             if (
                 3 <= len(_words(heading)) <= 30
-                and not _ROLE.search(heading)
+                and (not _ROLE.search(heading))
                 and body
-                and sum(len(v["text"].split()) for v in body) >= 20
+                and (sum((len(v["text"].split()) for v in body)) >= 20)
                 and all(
-                    credit["box"][0] >= v["box"][0] - 30
-                    and credit["box"][2] <= v["box"][2] + 30
-                    for v in cluster
+                    (
+                        credit["box"][0] >= v["box"][0] - 30
+                        and credit["box"][2] <= v["box"][2] + 30
+                        for v in cluster
+                    )
                 )
             ):
-                return _report(
+                yield _report(
                     names,
                     heading,
                     credit,
                     page,
                     "chapter_or_abstract_author_above_heading",
                 )
-    return not_found()
+    return
 
 
-def publisher_credit(lines, *, page=1):
+def layout_credit(lines, width, height, *, page=1, repeated_headers=()):
+    reports = list(
+        layout_credit_reports(
+            lines, width, height, page=page, repeated_headers=repeated_headers
+        )
+    )
+    return reports[0] if reports else not_found()
+
+
+def publisher_credit_reports(lines, *, page=1):
     """Small OCR title page; keep original creators ahead of later role credits."""
     lines = sorted(lines, key=lambda v: (v["box"][1], v["box"][0]))
-    if sum(len(v["text"].split()) for v in lines) > 100:
-        return not_found()
+    if sum((len(v["text"].split()) for v in lines)) > 100:
+        return
     for publisher, line in enumerate(lines):
         publisher_key = "".join(_words(line["text"]))
         if not re.search(
-            r"(?:university[a-z]{0,40}press|institutionpress|publishers)", publisher_key
+            "(?:university[a-z]{0,40}press|institutionpress|publishers)", publisher_key
         ):
             continue
         boundary = next(
@@ -263,9 +332,9 @@ def publisher_credit(lines, *, page=1):
             credit = lines[index]
             names = _person(credit)
             first = index
-            if index and re.search(r"\s+and\s*$", lines[index - 1]["text"], re.I):
+            if index and re.search("\\s+and\\s*$", lines[index - 1]["text"], re.I):
                 leading = _names(
-                    re.sub(r"\s+and\s*$", "", lines[index - 1]["text"], flags=re.I)
+                    re.sub("\\s+and\\s*$", "", lines[index - 1]["text"], flags=re.I)
                 )
                 if leading and names:
                     names = leading + names
@@ -273,11 +342,8 @@ def publisher_credit(lines, *, page=1):
             if not names or credit.get("confidence", 100) < 70:
                 continue
             if boundary < publisher and re.search(
-                r"\bedited by\b", lines[boundary]["text"], re.I
+                "\\bedited by\\b", lines[boundary]["text"], re.I
             ):
-                # A subtitle is not a creator credit on an edited volume.
-                # Only a separate, wrapped original-author group precedes
-                # this role boundary with sufficient independent typography.
                 if (
                     first == index
                     or first == 0
@@ -285,21 +351,28 @@ def publisher_credit(lines, *, page=1):
                     < credit["size"] * 2
                 ):
                     continue
-            title = " ".join(v["text"] for v in lines[:first])
+            title = " ".join((v["text"] for v in lines[:first]))
             if len(_words(title)) < 3 or _ROLE.search(title):
                 continue
             title_size = max((v["size"] for v in lines[:first]), default=0)
             if (
                 credit["size"] >= line["size"] * 1.1
                 and title_size >= credit["size"] * 1.2
-                or len(names) >= 2
-                and boundary < publisher
-                and title_size >= credit["size"] * 0.8
+                or (
+                    len(names) >= 2
+                    and boundary < publisher
+                    and (title_size >= credit["size"] * 0.8)
+                )
             ):
-                return _report(
+                yield _report(
                     names, title, credit, page, "compact_publisher_titlepage_role_order"
                 )
-    return not_found()
+    return
+
+
+def publisher_credit(lines, *, page=1):
+    reports = list(publisher_credit_reports(lines, page=page))
+    return reports[0] if reports else not_found()
 
 
 def read_tsv(payload):
@@ -416,13 +489,36 @@ def infer(context):
         or context.profile.work_scope == "whole_issue"
     ):
         return not_found()
+    if context.evidence_bundle is not None:
+        pages = [
+            p
+            for p in context.evidence_bundle.get("native", [])
+            if p["page"] <= 5
+            and "horizontal_lines" in p
+            and "width" in p
+            and "height" in p
+        ]
+        headers = {
+            _words(", ".join(_person(line)))
+            for p in pages
+            if p["page"] > 1
+            for line in p.get("horizontal_lines", [])
+            if line["box"][3] < p["height"] * 0.16 and _person(line)
+        }
+        reports = [
+            layout_credit(
+                p.get("horizontal_lines", []),
+                p["width"],
+                p["height"],
+                page=p["page"],
+                repeated_headers=headers,
+            )
+            for p in pages
+        ]
+        return next((r for r in reports if r.get("author")), not_found())
     import fitz
 
     try:
-        stat = context.path.stat()
-        key = (str(context.path), stat.st_size, stat.st_mtime_ns)
-        if key in _CACHE:
-            return dict(_CACHE[key])
         with fitz.open(context.path) as doc:
             report = not_found()
             crop_attempted = False
@@ -457,10 +553,8 @@ def infer(context):
                     if crop_attempted:
                         continue
                     crop_attempted = True
-                    crop_key = key + (i, tuple(line["box"]))
-                    names = _CROP_CACHE.get(crop_key) or _collapsed_byline(doc[i], line)
+                    names = _collapsed_byline(doc[i], line)
                     if names:
-                        _CROP_CACHE[crop_key] = names
                         report = _report(
                             names,
                             "explicit positioned By credit",
@@ -471,11 +565,6 @@ def infer(context):
                         break
                 if report.get("author"):
                     break
-        if len(_CACHE) > 256:
-            _CACHE.clear()
-            _CROP_CACHE.clear()
-        if report.get("author"):
-            _CACHE[key] = dict(report)
         return report
     except OSError, ValueError, RuntimeError:
         return not_found()

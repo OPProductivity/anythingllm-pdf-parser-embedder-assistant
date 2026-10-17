@@ -1,10 +1,15 @@
 """Resolve accepted document identity from metadata and author evidence."""
+
 import re
 from pathlib import Path
 from rag_pdf_tools import normalize_text
 from .constants import TRUSTED_AUTHOR_INFERENCE_SOURCES
-from .names import (normalize_author_candidate, author_candidate_is_document_role,
-                    author_candidate_is_font_metadata, looks_like_person_name)
+from .names import (
+    normalize_author_candidate,
+    author_candidate_is_document_role,
+    author_candidate_is_font_metadata,
+    looks_like_person_name,
+)
 
 
 def normalize_metadata_author(value):
@@ -40,7 +45,11 @@ def normalize_metadata_title(value):
     preferred whenever it is plausibly intended for people.
     """
     title = normalize_text(value or "")
-    if len(title) < 3 or len(title) > 300 or any(ord(character) < 32 for character in title):
+    if (
+        len(title) < 3
+        or len(title) > 300
+        or any(ord(character) < 32 for character in title)
+    ):
         return ""
     lowered = title.casefold().strip()
     if re.fullmatch(
@@ -54,7 +63,11 @@ def normalize_metadata_title(value):
     # A source-layout/office/raster extension in Title metadata is a strong sign of
     # an internal production filename, including short names such as
     # ``article.indd`` that would otherwise look superficially harmless.
-    if re.search(r"\.(?:pdf|indd|indb|idml|docx?|pptx?|xlsx?|txt|rtf|html?|xml|png|jpe?g|jpe|jfif|tiff?|bmp|gif|webp|heic|heif)$", title, flags=re.I):
+    if re.search(
+        r"\.(?:pdf|indd|indb|idml|docx?|pptx?|xlsx?|txt|rtf|html?|xml|png|jpe?g|jpe|jfif|tiff?|bmp|gif|webp|heic|heif)$",
+        title,
+        flags=re.I,
+    ):
         return ""
     return title
 
@@ -76,7 +89,9 @@ def resolve_title_from_metadata_or_filename(
     filename_value = normalize_text(Path(path).stem)
     catalog_parts = filename_value.split("--")
     if len(catalog_parts) >= 3 and looks_like_person_name(
-        catalog_parts[1].strip(), title_hint=catalog_parts[0], allow_all_caps=True,
+        catalog_parts[1].strip(),
+        title_hint=catalog_parts[0],
+        allow_all_caps=True,
     ):
         filename_value = normalize_text(catalog_parts[0])
     if use_file_title_fallback and filename_value:
@@ -84,7 +99,9 @@ def resolve_title_from_metadata_or_filename(
     return {"title": "Untitled PDF", "source": "generated_placeholder"}
 
 
-def resolve_author_from_metadata_and_inference(metadata_author, inference, *, author_override=""):
+def resolve_author_from_metadata_and_inference(
+    metadata_author, inference, *, author_override=""
+):
     """Resolve one document author without trusting embedded PDF Author data.
 
     ``metadata_author`` remains in this compatibility signature because old
@@ -100,17 +117,23 @@ def resolve_author_from_metadata_and_inference(metadata_author, inference, *, au
     inferred_value = normalize_text(report.get("author") or "")
     inferred_source = str(report.get("source") or "")
     surname_only_sources = {
-        "filename_leading_surname", "filename_leading_surnames",
-        "filename_surname_before_year", "filename_surname_before_section_number",
+        "filename_leading_surname",
+        "filename_leading_surnames",
+        "filename_surname_before_year",
+        "filename_surname_before_section_number",
     }
     single_person_credit = (
-        inferred_source != "text_corporate_cover_byline"
+        inferred_source
+        not in {"text_corporate_cover_byline", "text_role_scoped_creator"}
         and inferred_source not in surname_only_sources
         and not re.search(r",|;|\s+and\s+|&", inferred_value, re.I)
     )
-    if (inferred_value and inferred_source in TRUSTED_AUTHOR_INFERENCE_SOURCES
-            and not author_candidate_is_document_role(inferred_value)
-            and (not single_person_credit or looks_like_person_name(inferred_value))):
+    if (
+        inferred_value
+        and inferred_source in TRUSTED_AUTHOR_INFERENCE_SOURCES
+        and not author_candidate_is_document_role(inferred_value)
+        and (not single_person_credit or looks_like_person_name(inferred_value))
+    ):
         return {"author": inferred_value, "source": inferred_source or "text_inference"}
     return {"author": "", "source": "not_available"}
 
@@ -133,8 +156,13 @@ def author_confidence(resolved_author):
         score, basis = 82, "filename_and_opening_byline"
     elif source == "grobid_header_author":
         score, basis = 85, "grobid_header_and_visible_byline"
-    elif source in {"text_author_label", "text_bibliographic_author_label",
-                    "text_thesis_titlepage_author", "text_byline", "text_written_by"}:
+    elif source in {
+        "text_author_label",
+        "text_bibliographic_author_label",
+        "text_thesis_titlepage_author",
+        "text_byline",
+        "text_written_by",
+    }:
         score, basis = 90, "explicit_visible_credit"
     elif source.startswith("text_") or source.startswith("selected_extraction_text_"):
         score, basis = 80, "visible_text_inference"

@@ -1,20 +1,17 @@
 """Small, bounded OCR recovery for absent or corrupt native opening evidence."""
 
-import math
-from pathlib import Path
 import re
-import shutil
-import subprocess
-import time
+import shutil as shutil  # Historical patch points; acquisition uses the same modules.
+import subprocess as subprocess
 
 from .structured_credit import _names, _title_supported, _words
 from .title_evidence import not_found
-from .portable_layout import read_tsv, layout_credit, publisher_credit
+from .portable_layout import layout_credit_reports, publisher_credit_reports
 
 _CACHE = {}
 
 
-def _credit(text, context, page):
+def _credit_reports(text, context, page):
     lines = [" ".join(v.split()) for v in text.splitlines() if v.strip()]
     opening = " ".join(lines[:35])
     if len(opening.split()) < 100 and re.search(
@@ -40,7 +37,7 @@ def _credit(text, context, page):
                     names = preceding + names
             filename_words = set(_words(context.path.stem))
             if all(_words(name)[-1] in filename_words for name in names):
-                return {
+                yield {
                     "author": ", ".join(names),
                     "source": "text_ocr_author_credit",
                     "page": page,
@@ -56,7 +53,7 @@ def _credit(text, context, page):
             if len(names) == 1 and set(_words(names[0])).issubset(
                 set(_words(context.path.stem))
             ):
-                return {
+                yield {
                     "author": names[0],
                     "source": "text_ocr_author_credit",
                     "page": page,
@@ -78,7 +75,7 @@ def _credit(text, context, page):
             )
             names = _names(raw)
             if names:
-                return {
+                yield {
                     "author": ", ".join(names),
                     "source": "text_ocr_author_credit",
                     "page": page,
@@ -108,203 +105,102 @@ def _credit(text, context, page):
             if explicit and 1 <= len(core) <= 3 and seen == core:
                 title_ok = True
             if title_ok and len(" ".join(lines[index + 1 : index + 4]).split()) >= 12:
-                return {
+                yield {
                     "author": ", ".join(names),
                     "source": "text_ocr_author_credit",
                     "page": page,
                     "evidence": visible + " / " + line,
                 }
-    return not_found()
+    return
+
+
+def _credit(text, context, page):
+    """Compatibility API; all occurrences are evaluated before choosing one."""
+    reports = list(_credit_reports(text, context, page))
+    return reports[0] if reports else not_found()
 
 
 def bundle_reports(context):
-    """Every acquired OCR region is interpreted; a credit never ends the scan."""
-    from .native_article import credit, alternating_credit
+    """Interpret every region and every acquired reading, including alternatives."""
+    from .native_article import credit_reports, alternating_credit_reports
+
     reports = []
-    for region in (context.evidence_bundle or {}).get('ocr', []):
-        lines = [{**line, 'baseline': line.get('baseline', line['box'][3])} for line in region['lines']]
-        alternatives = [publisher_credit(lines, page=region['page']),
-                        layout_credit(lines, region['width'], region['height'], page=region['page']),
-                        credit(lines, region['width'], region['height']),
-                        alternating_credit(lines, region['width'], region['height']),
-                        _credit(region['text'], context, region['page'])]
-        for report in alternatives:
-            if report.get('author') and region.get('alternate'):
-                alternate = _credit(region['alternate']['text'], context, region['page'])
-                a, b = report['author'].split(), alternate.get('author', '').split()
-                if len(a) == len(b) and all(x == y or (re.fullmatch(r'[A-Z]{1,3}\.', x) and re.fullmatch(r'[A-Z]{1,3}\.', y) and x[0] == y[0]) for x, y in zip(a, b)):
-                    report['author'] = ' '.join(min((x, y), key=len) for x, y in zip(a, b))
-                    report['ocr_initial_recheck'] = [a, b]
-            if report.get('author'):
-                reports.append({**report, 'source': 'text_ocr_author_credit',
-                                'page': region['page'], 'extraction': 'tesseract',
-                                'crop': region['clip'], 'geometry_coordinate_space': 'crop_pixels'})
+    for primary in (context.evidence_bundle or {}).get("ocr", []):
+        variants = [primary] + (
+            [primary["alternate"]] if primary.get("alternate") else []
+        )
+        for index, region in enumerate(variants):
+            lines = [
+                {**line, "baseline": line.get("baseline", line["box"][3])}
+                for line in region["lines"]
+            ]
+            alternatives = [
+                *publisher_credit_reports(lines, page=region["page"]),
+                *layout_credit_reports(
+                    lines, region["width"], region["height"], page=region["page"]
+                ),
+                *credit_reports(lines, region["width"], region["height"]),
+                *alternating_credit_reports(lines, region["width"], region["height"]),
+                *_credit_reports(region["text"], context, region["page"]),
+            ]
+            if region.get("reason") == "collapsed_explicit_byline":
+                value = " ".join(region["text"].split())
+                names = _names(value) if re.match(r"^BY\s+", value, re.I) else []
+                if (
+                    names
+                    and "".join(_words(", ".join(names)))
+                    == str(region.get("native_letters", "")).casefold()
+                ):
+                    alternatives.append(
+                        {
+                            "author": ", ".join(names),
+                            "page": region["page"],
+                            "evidence": value,
+                            "mechanism": "ocr_space_restoration_native_letters_verified",
+                        }
+                    )
+            for report in alternatives:
+                if report.get("author") and region.get("alternate"):
+                    alternate = _credit(
+                        region["alternate"]["text"], context, region["page"]
+                    )
+                    a, b = report["author"].split(), alternate.get("author", "").split()
+                    if len(a) == len(b) and all(
+                        x == y
+                        or (
+                            re.fullmatch(r"[A-Z]{1,3}\.", x)
+                            and re.fullmatch(r"[A-Z]{1,3}\.", y)
+                            and x[0] == y[0]
+                        )
+                        for x, y in zip(a, b)
+                    ):
+                        report["author"] = " ".join(
+                            min((x, y), key=len) for x, y in zip(a, b)
+                        )
+                        report["ocr_initial_recheck"] = [a, b]
+                if report.get("author"):
+                    reports.append(
+                        {
+                            **report,
+                            "source": "text_ocr_author_credit",
+                            "page": region["page"],
+                            "extraction": "tesseract",
+                            "crop": region["clip"],
+                            "reading_variant": index,
+                            "geometry_coordinate_space": "crop_pixels",
+                        }
+                    )
     return reports
 
 
 def infer(context):
-    if context.evidence_bundle is not None:
-        reports = bundle_reports(context)
-        return reports[0] if reports else not_found()
-    if context.path is None or context.profile.kind in {
-        "periodical_issue",
-        "legal_opinion",
-        "corporate_publication",
-        "review",
-    }:
-        return not_found()
-    native = "".join(s.get("text", "") for s in context.opening_pages)
-    corrupt = (
-        sum(ord(c) < 32 and c not in "\r\n\t" for c in native) > len(native) * 0.04
-    )
-    if len(native.strip()) >= 80 and not corrupt:
-        return not_found()
-    path = Path(context.path)
-    if not path.is_file():
-        return not_found()
-    executable = (
-        shutil.which("tesseract") or r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-    )
-    if not Path(executable).is_file():
-        return not_found()
-    stat = path.stat()
-    key = (str(path), stat.st_size, stat.st_mtime_ns, context.title_hint)
-    if key in _CACHE:
-        return dict(_CACHE[key])
-    import fitz
+    """Compatibility result from the same completed acquisition as arbitration.
 
-    started = time.monotonic()
-    result = not_found()
-    try:
-        with fitz.open(path) as doc:
-            for index in range(min(4, len(doc))):
-                page = doc[index]
-                rect = page.rect
-                clips = (
-                    [None]
-                    if rect.width < rect.height * 1.15
-                    else [
-                        fitz.Rect(rect.width * 0.54, 0, rect.width, rect.height),
-                        fitz.Rect(0, 0, rect.width * 0.46, rect.height),
-                    ]
-                )
-                for clip in clips:
-                    remaining = 6 - (time.monotonic() - started)
-                    if remaining < 0.5:
-                        break
-                    region = clip or rect
-                    scale = min(
-                        2.5, math.sqrt(4_000_000 / max(1, region.width * region.height))
-                    )
-                    png = page.get_pixmap(
-                        matrix=fitz.Matrix(scale, scale), clip=clip
-                    ).tobytes("png")
-                    completed = subprocess.run(
-                        [
-                            executable,
-                            "stdin",
-                            "stdout",
-                            "-l",
-                            "eng",
-                            "--psm",
-                            "3",
-                            "tsv",
-                        ],
-                        input=png,
-                        capture_output=True,
-                        timeout=min(3, remaining),
-                    )
-                    text, lines = read_tsv(completed.stdout)
-                    result = publisher_credit(lines, page=index + 1)
-                    if not result.get("author"):
-                        # Reuse the acquired OCR lines with the same relational
-                        # author/affiliation/abstract expert used on native text.
-                        from .native_article import alternating_credit
-                        positioned = [{**line, "baseline": line["box"][3]} for line in lines]
-                        result = alternating_credit(positioned, region.width * scale, region.height * scale)
-                        if result.get("author"):
-                            result["page"] = index + 1
-                    if not result.get("author"):
-                        result = layout_credit(
-                            lines,
-                            region.width * scale,
-                            region.height * scale,
-                            page=index + 1,
-                        )
-                    if not result.get("author"):
-                        result = _credit(text, context, index + 1)
-                    if (
-                        result.get("author")
-                        and result.get("source") == "text_structured_opening_credit"
-                    ):
-                        result["source"] = "text_ocr_author_credit"
-                        result["geometry_coordinate_space"] = "ocr_pixels"
-                    if result.get("author"):
-                        # OCR sometimes merges a punctuation mark into a middle
-                        # initial. Verify that narrow ambiguity at another scale;
-                        # use an initial only when both readings support it.
-                        if re.search(r"\b[A-Z]{2,3}\.\s+\S+$", result["author"]):
-                            scale2 = min(
-                                2,
-                                math.sqrt(
-                                    4_000_000 / max(1, region.width * region.height)
-                                ),
-                            )
-                            png2 = page.get_pixmap(
-                                matrix=fitz.Matrix(scale2, scale2), clip=clip
-                            ).tobytes("png")
-                            second = subprocess.run(
-                                [
-                                    executable,
-                                    "stdin",
-                                    "stdout",
-                                    "-l",
-                                    "eng",
-                                    "--psm",
-                                    "3",
-                                ],
-                                input=png2,
-                                capture_output=True,
-                                timeout=min(
-                                    2, max(0.5, 6 - (time.monotonic() - started))
-                                ),
-                            )
-                            alternate = _credit(
-                                second.stdout.decode("utf-8", errors="replace"),
-                                context,
-                                index + 1,
-                            )
-                            a, b = (
-                                result["author"].split(),
-                                alternate.get("author", "").split(),
-                            )
-                            if len(a) == len(b) and all(
-                                x == y
-                                or (
-                                    re.fullmatch(r"[A-Z]{1,3}\.", x)
-                                    and re.fullmatch(r"[A-Z]{1,3}\.", y)
-                                    and x[0] == y[0]
-                                )
-                                for x, y in zip(a, b)
-                            ):
-                                result["author"] = " ".join(
-                                    min((x, y), key=len) for x, y in zip(a, b)
-                                )
-                                result["ocr_initial_recheck"] = [a, b]
-                        result.update(
-                            {
-                                "extraction": "tesseract",
-                                "crop": list(clip) if clip else "whole_page",
-                                "seconds": round(time.monotonic() - started, 3),
-                            }
-                        )
-                        break
-                if result.get("author") or time.monotonic() - started >= 5.5:
-                    break
-    except OSError, ValueError, RuntimeError, subprocess.TimeoutExpired:
-        result = not_found()
-    if len(_CACHE) > 128:
-        _CACHE.clear()
-    if result.get("author"):
-        _CACHE[key] = dict(result)
-    return result
+    The collector inspects every scheduled region regardless of an early name.
+    All reports remain available through bundle_reports; this entry point keeps
+    the historical one-result API without a second OCR plan or cross-call cache.
+    """
+    from .evidence_collection import collect
+
+    reports = bundle_reports(collect(context))
+    return reports[0] if reports else not_found()

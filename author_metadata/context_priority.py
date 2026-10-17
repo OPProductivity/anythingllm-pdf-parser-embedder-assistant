@@ -121,6 +121,10 @@ def rank_candidates(current, proposals, *, role_evidence=(), whole_book=False):
         ],
     }
     if selected != current or any(row["contributions"] for row in ranked):
+        if current.get("author") and _key(selected.get("author", "")) == current_key:
+            # Corroborating expertise does not rewrite an accepted credit's
+            # provenance merely because the same roster has a higher score.
+            selected = current
         selected = {**selected, "context_priority": ledger}
     return selected
 
@@ -129,22 +133,18 @@ def infer(context, current):
     """One bounded native-field pass. No network, OCR call or corpus lookup."""
     if context.path is None or context.profile.work_scope == "whole_issue":
         return current
-    opening_text = "\n".join(str(s.get("text") or "") for s in context.opening_pages)
-    if (
-        current.get("author")
-        and not str(current.get("source", "")).startswith("filename_")
-        and not re.search(
-            r"(?i)translated by|edited by|foreword by|department chair", opening_text
-        )
-    ):
-        return current
     import fitz
     from .field_map import map_page
 
     proposals, roles = [], []
     try:
         with fitz.open(context.path) as document:
-            for index in range(min(4, len(document))):
+            planned = {int(p["page"]) for p in context.planned_opening_pages}
+            for index in (
+                [n - 1 for n in sorted(planned)]
+                if planned
+                else range(min(5, len(document)))
+            ):
                 page = map_page(document[index], index + 1, context.title_hint)
                 fields = page["field_candidates"]
                 groups = {g["id"]: g for g in page["groups"]}

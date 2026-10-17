@@ -1,6 +1,5 @@
 """Vocabulary and trust policy shared by author metadata inference."""
 
-
 HEADING_STOPWORDS = {
     "chapter",
     "part",
@@ -193,6 +192,8 @@ POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES = {
 
 
 TRUSTED_AUTHOR_INFERENCE_SOURCES = POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES | {
+    "text_scoped_responsibility_span",
+    "text_role_scoped_creator",
     "text_work_rights_credit",
     "text_positioned_publisher_credit",
     "grobid_header_author",

@@ -6,6 +6,8 @@ from .constants import TRUSTED_AUTHOR_INFERENCE_SOURCES
 from .evidence_collection import collect, evidence_views
 from .publishing_relations import claims, select, running_chapter_claims
 from .structured_credit import _words
+from .text_responsibility import claims as text_span_claims
+from .contextual_roles import claims as role_claims
 
 
 def _key(report):
@@ -19,8 +21,16 @@ def infer(context):
     from .physical_work import opening_title
     from .profile import classify_document
     from .publishing_acts import embedded_chapter
+    from . import structured_credit
+    from .portable_book import credit_reports as book_credit_reports
+    from .book_chapter import infer_reports as chapter_credit_reports
 
     context = collect(context)
+    opening_plan = (context.evidence_bundle or {}).get("trace", {}).get("opening_plan")
+    if (context.evidence_bundle or {}).get("trace", {}).get(
+        "mode"
+    ) == "supplied_samples_only":
+        opening_plan = None
     views = evidence_views(context)
     proposals, attempts, assertions, regions = [], [], [], []
     # The historical selector is one expert, not the final verdict. Its internal
@@ -47,11 +57,60 @@ def infer(context):
         experts.append(("profile_strategy", strategy))
     for index, view in enumerate(views):
         found, labels = claims(
-            view.samples, kind=view.profile.kind, work_scope=view.profile.work_scope
+            view.samples,
+            kind=view.profile.kind,
+            work_scope=view.profile.work_scope,
+            opening_pages=opening_plan,
         )
         assertions.extend(found)
+        assertions.extend(
+            text_span_claims(
+                view.samples,
+                kind=view.profile.kind,
+                work_scope=view.profile.work_scope,
+                title_hint=view.title_hint,
+                opening_pages=opening_plan,
+            )
+        )
+        assertions.extend(
+            role_claims(
+                view.samples,
+                kind=view.profile.kind,
+                work_scope=view.profile.work_scope,
+                opening_pages=opening_plan,
+            )
+        )
         regions.extend(labels)
         for name, expert in experts:
+            structured_names = {
+                "structured_credit": "infer",
+                "biography": "biographic_titlepage",
+                "work_rights": "work_rights_credit",
+            }
+            enumerator = getattr(
+                structured_credit, structured_names.get(name, name) + "_reports", None
+            )
+            if name == "portable_book":
+                enumerator = book_credit_reports
+            if name == "profile_strategy" and view.profile.kind == "book_chapter":
+                enumerator = chapter_credit_reports
+            if enumerator is not None:
+                reports = list(enumerator(view))
+                attempts.append(
+                    {
+                        "expert": name,
+                        "view": index,
+                        "status": "assessed",
+                        "enumeration": "all_occurrences",
+                        "proposals": len(reports),
+                    }
+                )
+                proposals.extend(
+                    {"expert": name, "view": index, **report}
+                    for report in reports
+                    if report.get("author")
+                )
+                continue
             report = expert(view)
             attempts.append(
                 {
@@ -64,6 +123,43 @@ def infer(context):
             )
             if report.get("author"):
                 proposals.append({"expert": name, "view": index, **report})
+            # Compatibility experts return one result. Enumerate their local
+            # page interpretations too, so a result on an earlier page cannot
+            # suppress a later rights/title/signature proposal. Actual page
+            # numbers and work scope are preserved, with no fake first page.
+            if name in {
+                "document_record",
+                "credential_roster",
+                "structured_credit",
+                "publisher_titlepage",
+                "work_rights",
+                "whole_book_editors",
+                "continued_byline",
+                "biography",
+                "profile_strategy",
+            }:
+                for sample in view.samples:
+                    local = expert(replace(view, samples=(sample,)))
+                    attempts.append(
+                        {
+                            "expert": name,
+                            "view": index,
+                            "projection": "page_local",
+                            "page": sample.get("page", 0),
+                            "status": "assessed",
+                            "author": local.get("author", ""),
+                            "source": local.get("source", ""),
+                        }
+                    )
+                    if local.get("author"):
+                        proposals.append(
+                            {
+                                "expert": name,
+                                "view": index,
+                                "projection": "page_local",
+                                **local,
+                            }
+                        )
         # A different genre is a testable interpretation of acquired structure,
         # never inferred just because a parser happened to produce a name.
         profile = classify_document(view.samples, title_hint=view.title_hint)
@@ -112,7 +208,13 @@ def infer(context):
                 )
     # Read horizontal text separately from rotated export margins, and retain
     # complete page-level geometric proposals even after an earlier success.
-    from .native_article import credit, alternating_credit, deck_credit
+    from .native_article import (
+        credit_reports,
+        alternating_credit_reports,
+        deck_credit_reports,
+        email_roster_reports,
+    )
+    from .portable_layout import layout_credit_reports
 
     for page in context.evidence_bundle.get("native", []):
         lines = page.get("horizontal_lines")
@@ -144,32 +246,79 @@ def infer(context):
             [horizontal],
             kind=context.profile.kind,
             work_scope=context.profile.work_scope,
+            opening_pages=opening_plan,
         )
         assertions.extend(found)
         regions.extend(labels)
+        if (
+            page["page"] <= 5
+            and context.profile.kind in {"generic", "scholarly_article", "book_chapter"}
+            and context.profile.work_scope != "whole_issue"
+        ):
+            # Marker-cleaned baselines serve journal rosters; raw PDF spans
+            # preserve display lettering and its original font hierarchy.
+            # Both readings remain available to the layout specialist.
+            for representation, geometry in (
+                ("marker_cleaned", lines),
+                ("native_spans", page.get("layout_lines", [])),
+            ):
+                reports = list(
+                    layout_credit_reports(
+                        geometry, page["width"], page["height"], page=page["page"]
+                    )
+                )
+                attempts.append(
+                    {
+                        "expert": "portable_layout_all_occurrences",
+                        "page": page["page"],
+                        "representation": representation,
+                        "status": "assessed",
+                        "proposals": len(reports),
+                    }
+                )
+                proposals.extend(
+                    {
+                        "expert": "portable_layout",
+                        "representation": representation,
+                        **report,
+                    }
+                    for report in reports
+                )
         if (
             page["page"] <= 5
             and context.profile.kind in {"generic", "scholarly_article"}
             and context.profile.work_scope != "whole_issue"
         ):
             for name, expert in [
-                ("physical_byline", credit),
-                ("physical_affiliations", alternating_credit),
-                ("physical_feature_deck", deck_credit),
+                ("physical_byline", credit_reports),
+                ("physical_affiliations", alternating_credit_reports),
+                ("physical_feature_deck", deck_credit_reports),
+                ("physical_email_roster", email_roster_reports),
             ]:
-                report = expert(lines, page["width"], page["height"])
+                reports = list(expert(lines, page["width"], page["height"]))
                 attempts.append(
                     {
                         "expert": name,
                         "page": page["page"],
                         "status": "assessed",
-                        "author": report.get("author", ""),
+                        "proposals": len(reports),
                     }
                 )
-                if report.get("author"):
+                for report in reports:
                     proposals.append(
                         {"expert": "native_article", **report, "page": page["page"]}
                     )
+                    if report.get("mechanism") == "complete_title_bound_email_roster":
+                        assertions.append(
+                            {
+                                **report,
+                                "page": page["page"],
+                                "role": "author",
+                                "work": "selected work",
+                                "family": "physical_complete_email_roster",
+                                "priority": 109,
+                            }
+                        )
     ocr = bundle_reports(context)
     attempts.append(
         {
@@ -185,12 +334,67 @@ def infer(context):
     if chapter:
         proposals.append({"expert": "local_chapter_boundary", **chapter})
         current = chapter
+    # A complete catalog credit remains evidence for a chapter even when the
+    # genre expert has no local byline. A bare surname is never expanded here.
+    if context.path is not None and context.profile.work_scope != "whole_issue":
+        from .filename import infer_author_from_filename
+        from .names import split_author_line_candidates, looks_like_person_name
+
+        filename = infer_author_from_filename(context.path, context.title_hint)
+        complete_sources = {
+            "filename_leading_name",
+            "filename_leading_names",
+            "filename_compact_name_before_year",
+            "filename_name_before_section_label",
+        }
+        if filename.get("source") in complete_sources and (
+            looks_like_person_name(filename.get("author", ""))
+            or split_author_line_candidates(
+                filename.get("author", ""), require_complete=True
+            )
+        ):
+            proposals.append({"expert": "filename_catalog", **filename})
+            # A complete credit in an explicit Name - Title filename can
+            # identify an excerpt whose local byline is absent. For a generic
+            # genre, also require its actual title to occur on opening pages.
+            # This does not expand a bare surname or affect neutral names.
+            catalog_title = re.split(r"\s+[-–—]{1,2}\s+", context.path.stem, maxsplit=1)
+            title_words = _words(catalog_title[1]) if len(catalog_title) == 2 else ()
+            visible_words = _words(
+                " ".join(
+                    str(s.get("text") or "")
+                    for s in context.samples
+                    if int(s.get("page") or 0) <= 5
+                )
+            )
+            length = min(4, len(title_words))
+            title_visible = length >= 3 and any(
+                visible_words[n : n + length] == title_words[:length]
+                for n in range(max(0, len(visible_words) - length + 1))
+            )
+            if not current.get("author") and (
+                context.profile.kind in {"book", "book_chapter"}
+                or context.profile.kind == "generic"
+                and title_visible
+            ):
+                current = filename
+
     # Existing trust rules still apply. A new guess only fills unresolved or
     # filename-only evidence; stronger scoped responsibility below can revise
     # even an accepted native author. Agreement need not be independent.
     weak = not current.get("author") or str(current.get("source", "")).startswith(
         "filename_"
     )
+    for proposal in proposals:
+        if re.match(
+            r"^\s*(?:coordinated\s+by|contributing\s+authors?\s*:)",
+            str(proposal.get("author") or ""),
+            re.I,
+        ):
+            proposal["eligible_for_selection"] = False
+            proposal["eligibility_reason"] = (
+                "A role clause is not itself a personal name"
+            )
     if weak and context.profile.work_scope != "whole_issue":
         order = {
             "document_record": 100,
@@ -214,6 +418,7 @@ def infer(context):
             p
             for p in proposals
             if p.get("source") in TRUSTED_AUTHOR_INFERENCE_SOURCES
+            and p.get("eligible_for_selection", True)
             and not str(p.get("source", "")).startswith("filename_")
         ]
         if trusted:
@@ -238,6 +443,16 @@ def infer(context):
             kind=context.profile.kind,
             work_scope=context.profile.work_scope,
         )
+    )
+    # A repository's broad Author(s) field may include a translator. Only
+    # revise that roster when an explicit local byline supplies the remaining
+    # people and a separately read translation credit explains the difference.
+    # A translator can also be an author; the role label alone is no veto.
+    from .publishing_relations import local_credit_role_claims, title_copyright_claims
+
+    assertions.extend(local_credit_role_claims(proposals, assertions))
+    assertions.extend(
+        title_copyright_claims(proposals, context.samples, opening_pages=opening_plan)
     )
     before = {"author": current.get("author", ""), "source": current.get("source", "")}
     current, decision = select(

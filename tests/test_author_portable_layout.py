@@ -39,6 +39,58 @@ def body(y):
     ]
 
 
+def test_indented_abstract_remains_inside_title_column():
+    lines = [
+        line("Collective Memory and Public Life", 100, 20),
+        line("Amelia Hart", 145, 12, right=180),
+        line(
+            "Abstract: This study investigates collective memory and public life.",
+            180,
+            11,
+            x=125,
+            right=450,
+        ),
+        line(
+            "Our findings describe how different communities preserve and interpret their shared historical records.",
+            196,
+            11,
+            x=125,
+            right=450,
+        ),
+    ]
+    assert layout_credit(lines, 600, 850)["author"] == "Amelia Hart"
+
+
+def test_centered_capital_title_does_not_need_twenty_percent_font_difference():
+    lines = [
+        line("COLLECTIVE MEMORY:", 100, 15, x=140, right=360),
+        line("PUBLIC LIFE AND HISTORICAL CHANGE", 118, 15, x=70, right=430),
+        line("AMELIA HART", 150, 14, x=190, right=310),
+    ]
+    lines += [
+        line(
+            "The study investigates how communities preserve shared historical records.",
+            190 + i * 15,
+            11,
+        )
+        for i in range(10)
+    ]
+    assert layout_credit(lines, 500, 850)["author"] == "AMELIA HART"
+
+
+def test_flowing_prose_cannot_be_a_work_title_for_a_section_heading():
+    lines = [
+        line(
+            "Ordinary paragraph text describes historical change in public memory and collective life.",
+            100 + i * 14,
+            12,
+        )
+        for i in range(6)
+    ]
+    lines += [line("PUBLIC MEMORY AS A METHOD", 205, 9), *body(235)]
+    assert not layout_credit(lines, 600, 850)["author"]
+
+
 def test_right_aligned_credit_can_follow_a_mid_page_work_heading():
     lines = [
         line("The previous chapter ends here.", 50),

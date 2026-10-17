@@ -4,23 +4,29 @@ from dataclasses import replace
 import re
 
 from .book import infer as infer_book
-from .portable_layout import _native_page, publisher_credit
+from .portable_layout import _native_page, publisher_credit_reports
 from .structured_credit import _words
 from .title_evidence import not_found
 
 
-def infer(context):
-    if context.path is None or context.profile.kind != "book":
-        return not_found()
+def credit_reports(context):
+    if (
+        context.path is None
+        or context.profile.kind != "book"
+        or context.profile.work_scope == "chapter"
+    ):
+        return
     import fitz
 
     try:
         with fitz.open(context.path) as doc:
-            # Parent-volume covers attached to short chapter excerpts are not
-            # whole-book authorship. Keep their existing scope parser in charge.
-            if len(doc) < 80:
-                return not_found()
-            for index in range(min(4, len(doc))):
+            # Length does not establish work boundaries. Inspect every
+            # acquired opening title interpretation, with local chapter
+            # responsibility still available to the final adjudicator.
+            planned = {int(p["page"]) for p in context.planned_opening_pages}
+            for index in (
+                [n - 1 for n in sorted(planned)] if planned else range(min(5, len(doc)))
+            ):
                 lines = sorted(
                     _native_page(doc[index]), key=lambda v: (v["box"][1], v["box"][0])
                 )
@@ -57,14 +63,17 @@ def infer(context):
                 if report.get("author") and not str(
                     report.get("source", "")
                 ).startswith("filename_"):
-                    return {
+                    yield {
                         **report,
                         "physical_title": title,
                         "title_evidence_page": index + 1,
                     }
-                report = publisher_credit(lines, page=index + 1)
-                if report.get("author"):
-                    return report
+                yield from publisher_credit_reports(lines, page=index + 1)
     except OSError, ValueError, RuntimeError:
         pass
-    return not_found()
+    return
+
+
+def infer(context):
+    reports = list(credit_reports(context))
+    return reports[0] if reports else not_found()

@@ -246,7 +246,8 @@ def test_empty_ocr_attempt_is_not_cached_as_a_permanent_failure(tmp_path, monkey
     monkeypatch.setattr(bounded_ocr.shutil, "which", lambda _: sys.executable)
     source = tmp_path / "scan.pdf"
     doc = fitz.open()
-    doc.new_page()
+    page = doc.new_page()
+    page.draw_rect(fitz.Rect(30, 30, 100, 60), fill=(0, 0, 0))
     doc.save(source)
     doc.close()
     sample = context("", kind="generic", path=source)
@@ -256,7 +257,9 @@ def test_empty_ocr_attempt_is_not_cached_as_a_permanent_failure(tmp_path, monkey
     ) as run:
         ocr_infer(sample)
         ocr_infer(sample)
-    assert run.call_count == 2
+    # Each request independently reads the nonblank image, then performs its
+    # empty-reading quality retry. Neither an empty result nor success is cached.
+    assert run.call_count == 4
     assert not any(key[0] == str(source) for key in bounded_ocr._CACHE)
 
 
@@ -315,7 +318,7 @@ def test_tail_translator_with_joined_initials_is_not_a_coauthor():
     )
 
 
-def test_whole_book_editor_credit_requires_whole_book_size(tmp_path):
+def test_whole_book_editor_credit_depends_on_scope_and_title_not_page_count(tmp_path):
     source = tmp_path / "misleading-chapter.pdf"
     doc = fitz.open()
     for _ in range(80):
@@ -333,9 +336,20 @@ def test_whole_book_editor_credit_requires_whole_book_size(tmp_path):
     doc.new_page()
     doc.save(short)
     doc.close()
-    assert not whole_book_editors(
-        context(sample.samples[0]["text"], kind="generic", path=short)
-    )["author"]
+    assert (
+        whole_book_editors(
+            context(sample.samples[0]["text"], kind="generic", path=short)
+        )["author"]
+        == "Amina Rao, Gabriel Santos"
+    )
+    from dataclasses import replace
+
+    chapter = replace(
+        sample,
+        path=short,
+        profile=DocumentProfile("book_chapter", (), (1,), work_scope="chapter"),
+    )
+    assert not whole_book_editors(chapter)["author"]
 
 
 @pytest.mark.parametrize(

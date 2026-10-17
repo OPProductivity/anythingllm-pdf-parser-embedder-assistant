@@ -13,6 +13,45 @@ from author_metadata.publishing_relations import claims, select
 pytestmark = pytest.mark.offline_deterministic
 
 
+def test_ocr_frontmatter_extends_plan_even_after_native_author(tmp_path, monkeypatch):
+    import fitz
+    from author_metadata import evidence_collection as collection
+    from author_metadata.context import AuthorEvidenceContext
+
+    path = tmp_path / "document.pdf"
+    with fitz.open() as document:
+        for index in range(14):
+            page = document.new_page()
+            page.insert_text((50, 80), "By Amelia Hart" if index == 0 else "Continued")
+            page.draw_rect(fitz.Rect(40, 150, 200, 180), fill=(0, 0, 0))
+        document.save(path)
+
+    def read(document, task, executable):
+        return [
+            {
+                **task,
+                "text": "Table of contents" if task["page"] == 1 else "Read image",
+                "lines": [],
+            }
+        ], [{"kind": "ocr", **task, "status": "read"}]
+
+    monkeypatch.setattr(collection, "_read_region", read)
+    result = collection.collect(
+        AuthorEvidenceContext.from_samples(
+            [{"page": 1, "text": "By Amelia Hart"}], path=path
+        )
+    )
+    trace = result.evidence_bundle["trace"]
+    assert trace["native_plan"] == list(range(1, 15))
+    assert any(
+        e["reason"] == "ocr_revealed_publishing_sequence" for e in trace["extensions"]
+    )
+    assert {a["page"] for a in trace["attempts"] if a["kind"] == "ocr"} == set(
+        range(1, 15)
+    )
+    assert trace["complete"]
+
+
 def ctx(samples=(), **kw):
     return AuthorEvidenceContext.from_samples(
         samples, profile=DocumentProfile("book", (), ()), **kw
@@ -111,6 +150,8 @@ def test_all_scheduled_ocr_attempted_after_success_and_failure(tmp_path, monkeyp
             page = doc.new_page()
             if i >= 3:
                 page.insert_text((50, 60), "Amina Rao is credited here. " * 8)
+            else:
+                page.draw_rect(fitz.Rect(50, 50, 100, 70), fill=(0, 0, 0))
         doc.save(path)
     _CACHE.clear()
     monkeypatch.setattr(
@@ -127,19 +168,22 @@ def test_all_scheduled_ocr_attempted_after_success_and_failure(tmp_path, monkeyp
     monkeypatch.setattr(acquisition.subprocess, "run", ocr)
     result = collect(ctx(path=path))
     trace = result.evidence_bundle["trace"]
-    assert len(called) == len(trace["ocr_plan"]) == 3
+    assert len(called) == 4 and len(trace["ocr_plan"]) == 3
     assert [a["status"] for a in trace["attempts"] if a["kind"] == "ocr"] == [
         "read",
         "failed",
         "read",
+        "read",
     ]
     assert trace["native_plan"] == [1, 2, 3, 4, 5]
-    assert trace["complete"] is False
+    assert trace["complete"] is True
+    assert any(a.get("reason") == "transient_read_retry" for a in trace["attempts"])
     _CACHE.clear()
 
 
 def test_later_specialist_still_called_after_an_accepted_author(monkeypatch):
     from author_metadata import dispatcher
+    from author_metadata import structured_credit
     from author_metadata.adjudication import infer
 
     called = []
@@ -149,7 +193,9 @@ def test_later_specialist_still_called_after_an_accepted_author(monkeypatch):
         lambda _: {"author": "Gabriel Santos", "source": "text_byline"},
     )
     monkeypatch.setattr(
-        dispatcher, "biographic_titlepage", lambda _: called.append("bio") or {}
+        structured_credit,
+        "biographic_titlepage_reports",
+        lambda _: called.append("bio") or [],
     )
     context = ctx(
         [

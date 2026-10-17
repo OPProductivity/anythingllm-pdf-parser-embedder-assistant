@@ -138,8 +138,15 @@ def test_physical_title_recovers_complete_inline_editor_list_without_ocr(tmp_pat
     ocr.assert_not_called()
 
 
-def test_parent_volume_frontmatter_cannot_define_short_chapter_authorship(tmp_path):
-    assert not infer_book(make_book(tmp_path, pages=15))["author"]
+def test_parent_volume_frontmatter_cannot_override_explicit_chapter_scope(tmp_path):
+    from dataclasses import replace
+
+    short = make_book(tmp_path, pages=15)
+    assert infer_book(short)["author"] == "Nadia Okafor, Gabriel Santos, Elena Chen"
+    chapter = replace(
+        short, profile=DocumentProfile("book_chapter", (), (1, 2), work_scope="chapter")
+    )
+    assert not infer_book(chapter)["author"]
 
 
 def test_praise_pages_do_not_provide_a_substitute_work_title(tmp_path):

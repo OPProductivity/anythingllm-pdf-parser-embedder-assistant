@@ -289,7 +289,10 @@
         "report recipient"
       ],
       "sha256": "1c321530e8a4547a19bdfd5a2119c8a9ed9877c58a6ed525b175452dfaef7242",
-      "pages": 59
+      "pages": 59,
+      "accepted_visible_forms": [
+        "United States Government Accountability Office"
+      ]
     },
     {
       "file": "reviews-reports/pew-collaborative-report.pdf",
@@ -325,6 +328,10 @@
       "work_title": "Protecting children from violence and exploitation in relation to the digital environment",
       "container": "UNICEF",
       "creator": "United Nations Children's Fund (UNICEF)",
+      "accepted_visible_forms": [
+        "United Nations Children’s Fund",
+        "United Nations Children's Fund"
+      ],
       "role": "institutional_author",
       "credit_basis": "publisher_citation_page_2",
       "exclude": [
@@ -362,7 +369,10 @@
         "lawyers"
       ],
       "sha256": "eed3e88da7134ce8672ad23000a9da9533250bba44546bdb9e0c9e6b81c16ec7",
-      "pages": 20
+      "pages": 20,
+      "accepted_visible_forms": [
+        "Sotomayor"
+      ]
     },
     {
       "file": "reviews-reports/obp-edited-book-chapter.pdf",

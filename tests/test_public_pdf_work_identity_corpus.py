@@ -17,11 +17,17 @@ from author_metadata.title_evidence import words
 from author_metadata.work_identity import resolve_work_identity
 
 
-LABELS = json.loads((Path(__file__).parent / "fixtures" / "public_pdf_work_identity_labels.json").read_text(encoding="utf-8"))
-ROOT = Path(os.environ.get(
-    "ANYTHINGLLM_PUBLIC_PDF_CORPUS",
-    Path.home() / "Downloads" / "_anythingllm-public-metadata-corpus-20261005",
-))
+LABELS = json.loads(
+    (
+        Path(__file__).parent / "fixtures" / "public_pdf_work_identity_labels.json"
+    ).read_text(encoding="utf-8")
+)
+ROOT = Path(
+    os.environ.get(
+        "ANYTHINGLLM_PUBLIC_PDF_CORPUS",
+        Path.home() / "Downloads" / "_anythingllm-public-metadata-corpus-20261005",
+    )
+)
 
 pytestmark = pytest.mark.offline_deterministic
 
@@ -40,14 +46,22 @@ def test_real_pdf_work_scope_and_no_false_credit(item):
     samples = metadata.pop("_author_text_samples")
     identity = resolve_work_identity(metadata.get("title"), path, samples)
     context = AuthorEvidenceContext.from_samples(
-        samples, path=path, title_hint=identity.title, profile=identity.profile,
+        samples,
+        path=path,
+        title_hint=identity.title,
+        profile=identity.profile,
     )
     inference = infer_author(context)
-    author = resolve_author_from_metadata_and_inference(metadata.get("author"), inference)["author"]
+    author = resolve_author_from_metadata_and_inference(
+        metadata.get("author"), inference
+    )["author"]
 
     # Correctly unresolved is preferable to a role-confused nonempty credit.
     expected = ", ".join((item.get("creator") or "").split("; "))
-    assert not author or author == expected
+    # Visible forms were checked on the pages; a surname-only opinion credit
+    # is explicitly partial and must never be reported as an expanded name.
+    visible_forms = {expected, *item.get("accepted_visible_forms", [])}
+    assert not author or author in visible_forms
 
     if item["category"] == "historical_newspaper_issue":
         assert identity.profile.kind == "periodical_issue"
@@ -61,15 +75,25 @@ def test_real_pdf_work_scope_and_no_false_credit(item):
             assert author == expected
     elif item["category"] == "court_opinion":
         assert identity.profile.kind == "legal_opinion"
-        assert not author
+        assert author == "Sotomayor"
+        assert inference["creator_type"] == "person_surname"
     elif item["category"] in {"government_report", "policy_brief"}:
         assert identity.profile.kind == "report"
-        assert not author
+        if item["category"] == "government_report":
+            assert author == "United States Government Accountability Office"
+            assert inference["creator_type"] == "organization"
     elif item["category"] in {"academic_book_review_blog", "book_review_in_newspaper"}:
         assert identity.profile.kind == "review"
-    elif item["category"] in {"news_article", "broadcast_news_article", "science_news",
-                               "personal_blog", "technical_tutorial_blog", "expert_opinion_blog",
-                               "corporate_blog", "investigative_news"}:
+    elif item["category"] in {
+        "news_article",
+        "broadcast_news_article",
+        "science_news",
+        "personal_blog",
+        "technical_tutorial_blog",
+        "expert_opinion_blog",
+        "corporate_blog",
+        "investigative_news",
+    }:
         assert identity.profile.kind == "web_article"
 
     if identity.container_title and item.get("work_title"):
@@ -84,6 +108,9 @@ def test_real_pdf_work_scope_and_no_false_credit(item):
             folded = unicodedata.normalize("NFKD", value).casefold()
             return "".join(char for char in folded if char.isalnum())
 
-        assert preview["grobid"]["decision"] in {"filled_unknown", "expanded_filename_surname"}
-        assert credit_key(preview["author"]) == credit_key(expected)
+        assert preview["grobid"]["decision"] in {
+            "filled_unknown",
+            "expanded_filename_surname",
+        }
+        assert credit_key(preview["author"]) in {credit_key(v) for v in visible_forms}
     assert preview["work_identity"]["category"] == identity.profile.kind

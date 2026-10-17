@@ -19,7 +19,7 @@ class AuthorEvidenceContext:
         for sample in self.samples:
             try:
                 page = int(sample.get("page") or 0)
-            except (TypeError, ValueError, AttributeError):
+            except TypeError, ValueError, AttributeError:
                 continue
             if page > 0 and page not in pages:
                 pages.append(page)
@@ -38,13 +38,29 @@ class AuthorEvidenceContext:
         def is_opening(sample):
             try:
                 return 1 <= int(sample.get("page") or 0) <= 5
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 return False
+
         return tuple(sample for sample in self.samples if is_opening(sample))
+
+    @property
+    def planned_opening_pages(self):
+        """Opening apparatus acquired for this request, excluding closing pages."""
+        plan = (self.evidence_bundle or {}).get("trace", {}).get("opening_plan")
+        if (
+            plan is None
+            or (self.evidence_bundle or {}).get("trace", {}).get("mode")
+            == "supplied_samples_only"
+        ):
+            return self.opening_pages
+        pages = set(plan)
+        return tuple(s for s in self.samples if int(s.get("page") or 0) in pages)
 
     @classmethod
     def from_samples(cls, samples, *, title_hint="", path=None, profile=None):
-        selected = tuple(dict(sample) for sample in samples or [] if isinstance(sample, dict))
+        selected = tuple(
+            dict(sample) for sample in samples or [] if isinstance(sample, dict)
+        )
         return cls(
             samples=selected,
             title_hint=str(title_hint or ""),

@@ -24,7 +24,15 @@ _RIGHTS_FAMILIES = (
     ),
     (
         "moral_rights_as_author",
-        r"\bmoral\s+rights?\s+of\s+(.{5,180}?)\s+as\s+(?:the\s+)?authors?\s+(?:has|have)\s+been\s+asserted",
+        r"\bmoral\s+rights?\s+of\s+(.{5,180}?)\s+as\s+(?:the\s+)?authors?\s+(?:(?:has|have)\s+been|are|is)\s+asserted",
+    ),
+    (
+        "attribution_as_author_right",
+        r"\b(?:the\s+)?rights?\s+of\s+(.{5,180}?)\s+to\s+be\s+(?:identified|named|credited)\s+as\s+(?:the\s+)?authors?\b",
+    ),
+    (
+        "authorship_attributed_to",
+        r"\bauthorship\s+of\s+(?:this|the\s+present)\s+(?:work|book|volume|edition)\s+is\s+attributed\s+to\s+(.{5,160}?)(?=\s+(?:ISBN|Copyright|All rights reserved)\b|[;©]|$)",
     ),
 )
 _SECTION_FAMILIES = {
@@ -73,7 +81,7 @@ def _clean_names(value):
     return _names(value)
 
 
-def claims(samples, *, kind, work_scope):
+def claims(samples, *, kind, work_scope, opening_pages=None):
     result, regions = [], []
     for sample in samples:
         text = str(sample.get("text") or "")
@@ -99,6 +107,35 @@ def claims(samples, *, kind, work_scope):
                         "evidence": line,
                     }
                 )
+            # The actor, author-role and rights act can occur in either order.
+            # These short apparatus clauses do not rely on a particular legal
+            # boilerplate sentence or on an ownership symbol being present.
+            if (
+                int(sample["page"]) in opening_pages
+                if opening_pages is not None
+                else 0 <= int(sample["page"]) <= 12
+            ) and len(line) <= 320:
+                predicates = (
+                    r"^(.{5,150}?)\s+(?:has\s+|have\s+)?(?:asserted|asserts|claims)\s+(?:(?:his|her|their|the)\s+)?(?:moral\s+)?rights?\s+(?:to\s+(?:be\s+named|identification|attribution)\s+as\s+authors?|as\s+authors?)\b",
+                    r"^(.{5,150}?)\s+(?:asserts|claims)\s+authorship\s+of\s+(?:this|the\s+present)\s+(?:work|book|volume|edition)\b",
+                    r"^(.{5,150}?)\s+is\s+identified\s+as\s+(?:the\s+)?author\s+of\s+this\s+(?:work|book|volume|edition)\b",
+                    r"^The\s+authors?\s*,\s*(.{5,150}?)\s*,\s*retains?\s+attribution\s+rights?\b",
+                )
+                for pattern in predicates:
+                    assertion = re.search(pattern, line, re.I)
+                    people = _clean_names(assertion[1]) if assertion else []
+                    if people:
+                        result.append(
+                            _claim(
+                                ", ".join(people),
+                                "author",
+                                sample,
+                                line,
+                                "author_role_and_attribution_right",
+                                110,
+                                work="current book or parent work",
+                            )
+                        )
             for role, pattern in _ROLE_PATTERNS:
                 match = re.fullmatch(pattern, line, re.I)
                 people = _clean_names(match[1]) if match else []
@@ -151,26 +188,44 @@ def claims(samples, *, kind, work_scope):
         # An em-dash can attach a professional affiliation to a personal
         # byline. Record both roles; do not treat the institution as a person.
         # The role predicate is essential: a dash alone may join two authors.
-        if kind in {"generic", "scholarly_article", "web_article"} and int(sample["page"]) <= 2:
+        if (
+            kind in {"generic", "scholarly_article", "web_article"}
+            and int(sample["page"]) <= 2
+        ):
             for index, line in enumerate(lines[:12]):
                 professional = re.fullmatch(
-                    r"(.{5,90}?)\s*[—–]\s*(.{3,100}?)\s+(Research Associate|Research Fellow|Professor|Lecturer|Researcher)\s*", line, re.I
+                    r"(.{5,90}?)\s*[—–]\s*(.{3,100}?)\s+(Research Associate|Research Fellow|Professor|Lecturer|Researcher)\s*",
+                    line,
+                    re.I,
                 )
                 if not professional or index == 0:
                     continue
                 people = _names(professional[1])
-                preceding = " ".join(lines[max(0, index - 4):index])
+                preceding = " ".join(lines[max(0, index - 4) : index])
                 if len(people) == 1 and len(_words(preceding)) >= 4:
-                    result.append(_claim(
-                        people[0], "author", sample, line,
-                        "title_adjacent_professional_role", 105,
-                        work="selected article",
-                    ))
-                    regions.append({"role": "affiliation", "page": int(sample["page"]), "line": index,
-                                    "evidence": professional[2] + " " + professional[3]})
+                    result.append(
+                        _claim(
+                            people[0],
+                            "author",
+                            sample,
+                            line,
+                            "title_adjacent_professional_role",
+                            105,
+                            work="selected article",
+                        )
+                    )
+                    regions.append(
+                        {
+                            "role": "affiliation",
+                            "page": int(sample["page"]),
+                            "line": index,
+                            "evidence": professional[2] + " " + professional[3],
+                        }
+                    )
 
         if re.search(
-            r"(?i)\b(?:ISBN|copyright|all rights reserved|copyright act)\b|©", compact
+            r"(?i)\b(?:ISBN|copyright|all rights reserved|copyright act|moral rights?|authorship|attribution rights?)\b|©",
+            compact,
         ):
             for family, pattern in _RIGHTS_FAMILIES:
                 for match in re.finditer(pattern, compact, re.I):
@@ -198,6 +253,27 @@ def claims(samples, *, kind, work_scope):
         # A labelled local contributor block precedes a numbered chapter's
         # prose. Read continuation until its paragraph boundary; never accept
         # a prefix whose final person is split across lines.
+        if work_scope != "whole_issue" and re.search(r"(?m)^\s*\d{1,3}[.]\s+\S", text):
+            roster = re.search(
+                r"(?im)^\s*Lead authors?\s*:\s*([^\n]+)\n"
+                r"\s*Contributing authors?\s*:\s*([^\n]+(?:\n(?!\s*\n)[^\n]+){0,7})",
+                text,
+            )
+            if roster:
+                leads = _clean_names(" ".join(roster[1].split()))
+                contributors = _clean_names(" ".join(roster[2].split()))
+                if leads and contributors:
+                    result.append(
+                        _claim(
+                            ", ".join(dict.fromkeys(leads + contributors)),
+                            "author",
+                            sample,
+                            roster[0],
+                            "local_chapter_contributors",
+                            115,
+                            work="selected chapter",
+                        )
+                    )
         if re.search(r"(?m)^\s*\d{1,3}[.]\s+\S", text):
             match = re.search(
                 r"(?im)^\s*Contributors?\s*:\s*([^\n]+(?:\n(?!\s*\n)[^\n]+){0,7})", text
@@ -376,38 +452,160 @@ def claims(samples, *, kind, work_scope):
     # Ownership does not equal authorship. A complete personal owner roster
     # can corroborate the SAME complete opening byline above an abstract on
     # a separate page, including working papers with long address apparatus.
-    if kind in {"generic", "scholarly_article", "report"} and work_scope not in {"chapter", "whole_issue"}:
+    if kind in {"generic", "scholarly_article", "report"} and work_scope not in {
+        "chapter",
+        "whole_issue",
+    }:
         for sample in samples:
             for line in str(sample.get("text") or "").splitlines():
                 owner = re.fullmatch(
-                    r"\s*(?:copyright\s*©?\s*|©\s*)(?:18|19|20)\d{2}\s*(?:by\s+)?(.{5,400}?)\s*[.]?\s*", line, re.I
+                    r"\s*(?:copyright\s*©?\s*|©\s*)(?:18|19|20)\d{2}\s*(?:by\s+)?(.{5,400}?)\s*[.]?\s*",
+                    line,
+                    re.I,
                 )
-                if not owner or re.search(r"(?i)\b(?:press|publishers?|books|ltd|inc|group)\b", owner[1]):
+                if not owner or re.search(
+                    r"(?i)\b(?:press|publishers?|books|ltd|inc|group)\b", owner[1]
+                ):
                     continue
-                people = _names(owner[1].rstrip('. '))
+                people = _names(owner[1].rstrip(". "))
                 if not people:
                     continue
                 for other in samples:
                     if other["page"] == sample["page"] or int(other["page"]) > 3:
                         continue
-                    opening = [" ".join(v.split()) for v in str(other.get("text") or "").splitlines() if v.strip()]
+                    opening = [
+                        " ".join(v.split())
+                        for v in str(other.get("text") or "").splitlines()
+                        if v.strip()
+                    ]
                     for index, credit in enumerate(opening[1:12], 1):
                         same = _names(credit)
-                        if not same or _words(", ".join(same)) != _words(", ".join(people)):
+                        if not same or _words(", ".join(same)) != _words(
+                            ", ".join(people)
+                        ):
                             continue
                         preceding = " ".join(opening[:index])
-                        following = " ".join(opening[index+1:index+9])
-                        if (3 <= len(_words(preceding)) <= 50
-                                and re.search(r"(?i)\babstract\b", following)
-                                and not re.search(r"(?i)\b(?:praise|foreword|translated|contents|references|bibliography)\b", preceding)):
-                            result.append(_claim(
-                                ", ".join(same), "author", other,
-                                line.strip() + " / separate opening credit: " + credit,
-                                "copyright_plus_opening_article_roster", 106,
-                                work="selected article",
-                            ))
+                        following = " ".join(opening[index + 1 : index + 9])
+                        if (
+                            3 <= len(_words(preceding)) <= 50
+                            and re.search(r"(?i)\babstract\b", following)
+                            and not re.search(
+                                r"(?i)\b(?:praise|foreword|translated|contents|references|bibliography)\b",
+                                preceding,
+                            )
+                        ):
+                            result.append(
+                                _claim(
+                                    ", ".join(same),
+                                    "author",
+                                    other,
+                                    line.strip()
+                                    + " / separate opening credit: "
+                                    + credit,
+                                    "copyright_plus_opening_article_roster",
+                                    106,
+                                    work="selected article",
+                                )
+                            )
 
     return result, regions
+
+
+def title_copyright_claims(proposals, samples, *, opening_pages=None):
+    """A title-bound roster and matching ownership are stronger together."""
+    result = []
+    for proposal in proposals:
+        if proposal.get("expert") not in {
+            "structured_credit",
+            "publisher_titlepage",
+            "portable_book",
+        }:
+            continue
+        names = _names(proposal.get("author", ""))
+        page = int(proposal.get("page") or 0)
+        if not names or (
+            page not in opening_pages
+            if opening_pages is not None
+            else not 1 <= page <= 12
+        ):
+            continue
+        for sample in samples:
+            if int(sample.get("page") or 0) != page:
+                continue
+            for match in re.finditer(
+                r"(?im)^\s*(?:Copyright\s*©?|©)\s*(?:\d{4}\s*)?(?:by\s+)?([^\n]+)",
+                sample["text"],
+            ):
+                owner = _clean_names(match[1].strip().rstrip("."))
+                if sorted(_words(n) for n in owner) != sorted(_words(n) for n in names):
+                    continue
+                result.append(
+                    _claim(
+                        ", ".join(names),
+                        "author",
+                        sample,
+                        proposal.get("evidence", "") + " / " + match[0].strip(),
+                        "title_credit_and_matching_personal_copyright",
+                        108,
+                        work="selected work",
+                    )
+                )
+    return result
+
+
+def local_credit_role_claims(proposals, assertions):
+    """Explain a wrapper roster using a narrower physical credit and roles."""
+    translators = {
+        "".join(_words(name))
+        for claim in assertions
+        if claim.get("role") in {"translator", "translated", "translation"}
+        for name in _names(claim.get("author", ""))
+    }
+    if not translators:
+        return []
+    result = []
+    wrappers = [
+        c
+        for c in assertions
+        if c.get("family") == "labelled_responsibility_field"
+        and c.get("role") == "author"
+        and c.get("work") == "selected work"
+    ]
+    for wrapper in wrappers:
+        roster = _names(wrapper["author"])
+        kept = [n for n in roster if "".join(_words(n)) not in translators]
+        if not kept or len(kept) == len(roster):
+            continue
+        local_proposals = list(proposals) + [
+            {**c, "expert": "local_explicit_byline"}
+            for c in assertions
+            if c.get("family") == "local_explicit_byline"
+        ]
+        for proposal in local_proposals:
+            evidence = proposal.get("evidence", "")
+            if (
+                proposal.get("expert")
+                not in {"structured_credit", "local_explicit_byline"}
+                or not re.search(r"(?:^|/|\n)\s*by\s+", evidence, re.I)
+                or int(proposal.get("page") or 0) > 5
+                or sorted(
+                    "".join(_words(n)) for n in _names(proposal.get("author", ""))
+                )
+                != sorted("".join(_words(n)) for n in kept)
+            ):
+                continue
+            result.append(
+                _claim(
+                    ", ".join(kept),
+                    "author",
+                    {"page": proposal["page"]},
+                    evidence + " / wrapper roster: " + wrapper["author"],
+                    "local_byline_with_separate_translation_credit",
+                    112,
+                    work="selected work",
+                )
+            )
+    return result
 
 
 def select(current, assertions, *, kind, work_scope):
@@ -419,6 +617,24 @@ def select(current, assertions, *, kind, work_scope):
         )
     eligible = []
     for claim in assertions:
+        if claim.get("source") == "text_role_scoped_creator":
+            if claim.get("work") == "selected work":
+                eligible.append(claim)
+            continue
+        span_family = claim["family"] in {
+            "labelled_responsibility_field",
+            "explicit_publishing_act_span",
+        }
+        if span_family:
+            if claim.get("work") != "selected work" or claim.get("priority", 0) <= 0:
+                continue
+            if claim["role"] == "author" or (
+                claim["role"] == "editor"
+                and kind in {"book", "generic"}
+                and work_scope not in {"chapter", "whole_issue"}
+            ):
+                eligible.append(claim)
+            continue
         if claim["role"] != "author":
             continue
         if (
@@ -444,6 +660,10 @@ def select(current, assertions, *, kind, work_scope):
             "corporate_citation_and_responsibility",
             "interviewer_title_and_question_turn",
             "local_chapter_with_two_later_author_heads",
+            "local_byline_with_separate_translation_credit",
+            "local_explicit_byline",
+            "title_credit_and_matching_personal_copyright",
+            "physical_complete_email_roster",
         }:
             eligible.append(claim)
         elif kind in {"book", "generic"} and work_scope not in {
@@ -463,11 +683,25 @@ def select(current, assertions, *, kind, work_scope):
         # Explicit conflicting responsibility is unresolved, never first-wins.
         return {
             "author": "",
-            "source": "not_found",
+            "source": "conflicting_work_credits",
+            "page": 0,
+            "evidence": " / ".join(
+                dict.fromkeys(
+                    f"page {claim.get('page', 0)}: {claim['author']}" for claim in best
+                )
+            ),
         }, "defer conflicting same-work responsibility assertions"
     chosen = best[0]
+    if current.get("author") and _words(current["author"]) == _words(chosen["author"]):
+        return (
+            current,
+            "scoped responsibility corroborates incumbent; retain provenance",
+        )
     return {k: chosen[k] for k in ("author", "source", "page", "evidence")} | {
-        "mechanism": chosen["family"]
+        "mechanism": chosen["family"],
+        **(
+            {"creator_type": chosen["creator_type"]} if "creator_type" in chosen else {}
+        ),
     }, "select highest-priority scoped responsibility after collection"
 
 
