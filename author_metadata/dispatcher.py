@@ -310,7 +310,7 @@ def infer_author_from_samples(samples, path: Path, title_hint=""):
     )
 
 
-def infer_author(context: AuthorEvidenceContext):
+def _infer_before_collection(context: AuthorEvidenceContext):
     from .context_priority import infer as infer_context_priority
 
     report = _select_author(context)
@@ -343,4 +343,11 @@ def infer_author(context: AuthorEvidenceContext):
                         "attempts": 1,
                     },
                 }
-    return infer_context_priority(context, report)
+    from .publishing_acts import reconcile
+
+    return reconcile(context, infer_context_priority(context, report))
+
+
+def infer_author(context: AuthorEvidenceContext):
+    from .adjudication import infer
+    return infer(context)

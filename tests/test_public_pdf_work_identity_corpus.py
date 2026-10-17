@@ -56,7 +56,9 @@ def test_real_pdf_work_scope_and_no_false_credit(item):
     elif item["category"] in {"edited_book_chapter", "coordinated_book_chapter"}:
         assert identity.profile.kind == "book_chapter"
         assert identity.profile.work_scope == "chapter"
-        assert not author
+        if item["category"] == "coordinated_book_chapter":
+            # The complete printed contributor roster is now recoverable.
+            assert author == expected
     elif item["category"] == "court_opinion":
         assert identity.profile.kind == "legal_opinion"
         assert not author

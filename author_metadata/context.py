@@ -12,6 +12,7 @@ class AuthorEvidenceContext:
     title_hint: str
     path: Path | None
     profile: DocumentProfile
+    evidence_bundle: dict | None = None
 
     def profile_evidence(self):
         pages = []
@@ -36,7 +37,7 @@ class AuthorEvidenceContext:
     def opening_pages(self):
         def is_opening(sample):
             try:
-                return 1 <= int(sample.get("page") or 0) <= 4
+                return 1 <= int(sample.get("page") or 0) <= 5
             except (TypeError, ValueError):
                 return False
         return tuple(sample for sample in self.samples if is_opening(sample))

@@ -117,7 +117,35 @@ def _credit(text, context, page):
     return not_found()
 
 
+def bundle_reports(context):
+    """Every acquired OCR region is interpreted; a credit never ends the scan."""
+    from .native_article import credit, alternating_credit
+    reports = []
+    for region in (context.evidence_bundle or {}).get('ocr', []):
+        lines = [{**line, 'baseline': line.get('baseline', line['box'][3])} for line in region['lines']]
+        alternatives = [publisher_credit(lines, page=region['page']),
+                        layout_credit(lines, region['width'], region['height'], page=region['page']),
+                        credit(lines, region['width'], region['height']),
+                        alternating_credit(lines, region['width'], region['height']),
+                        _credit(region['text'], context, region['page'])]
+        for report in alternatives:
+            if report.get('author') and region.get('alternate'):
+                alternate = _credit(region['alternate']['text'], context, region['page'])
+                a, b = report['author'].split(), alternate.get('author', '').split()
+                if len(a) == len(b) and all(x == y or (re.fullmatch(r'[A-Z]{1,3}\.', x) and re.fullmatch(r'[A-Z]{1,3}\.', y) and x[0] == y[0]) for x, y in zip(a, b)):
+                    report['author'] = ' '.join(min((x, y), key=len) for x, y in zip(a, b))
+                    report['ocr_initial_recheck'] = [a, b]
+            if report.get('author'):
+                reports.append({**report, 'source': 'text_ocr_author_credit',
+                                'page': region['page'], 'extraction': 'tesseract',
+                                'crop': region['clip'], 'geometry_coordinate_space': 'crop_pixels'})
+    return reports
+
+
 def infer(context):
+    if context.evidence_bundle is not None:
+        reports = bundle_reports(context)
+        return reports[0] if reports else not_found()
     if context.path is None or context.profile.kind in {
         "periodical_issue",
         "legal_opinion",
@@ -188,6 +216,14 @@ def infer(context):
                     )
                     text, lines = read_tsv(completed.stdout)
                     result = publisher_credit(lines, page=index + 1)
+                    if not result.get("author"):
+                        # Reuse the acquired OCR lines with the same relational
+                        # author/affiliation/abstract expert used on native text.
+                        from .native_article import alternating_credit
+                        positioned = [{**line, "baseline": line["box"][3]} for line in lines]
+                        result = alternating_credit(positioned, region.width * scale, region.height * scale)
+                        if result.get("author"):
+                            result["page"] = index + 1
                     if not result.get("author"):
                         result = layout_credit(
                             lines,

@@ -193,13 +193,7 @@ def alternating_credit(lines, width, height):
     pairs = []
     for i in range(stop - 1):
         raw = lines[i]["text"]
-        # A comma before a generational suffix is part of one person credit.
-        protected = re.sub(r",\s*(Jr\.|Sr\.)(?=\s*$)", r" \1", raw, flags=re.I)
-        names = _names(protected)
-        if protected != raw:
-            names = [
-                re.sub(r"\s+(Jr\.|Sr\.)$", r", \1", name, flags=re.I) for name in names
-            ]
+        names = _names(raw)
         if names and _INSTITUTION.search(lines[i + 1]["text"]):
             pairs.append((i, names))
     if not pairs or len(pairs) > 6:
@@ -207,7 +201,7 @@ def alternating_credit(lines, width, height):
     first = pairs[0][0]
     heading = [
         line
-        for line in lines[:first]
+        for line in lines[max(0, first - 4):first]
         if len(_words(line["text"])) >= 3 and not _ROLE.search(line["text"])
     ]
     title = " ".join(line["text"] for line in heading)
@@ -227,6 +221,47 @@ def alternating_credit(lines, width, height):
         "mechanism": "title_author_affiliation_pairs_before_abstract",
         "geometry": {"byline": [lines[i]["box"] for i, _ in pairs]},
     }
+
+
+
+def deck_credit(lines, width, height):
+    """A feature/commentary byline may follow a summary deck, above body prose."""
+    if not any(re.fullmatch(r"FEATURE ARTICLE|INSIGHT", line["text"], re.I)
+               for line in lines[:8]):
+        return not_found()
+    eligible = [line for line in lines if line["box"][1] < height * .45
+                and 2 <= len(_words(line["text"])) <= 25
+                and not line["text"].isupper() and not _ROLE.search(line["text"])]
+    if not eligible:
+        return not_found()
+    largest = max(line["size"] for line in eligible)
+    heading = [line for line in eligible if line["size"] >= largest * .9]
+    bottom = max(line["box"][3] for line in heading)
+    for index, line in enumerate(lines):
+        if line["box"][1] <= bottom or line["box"][1] > height * .65:
+            continue
+        if not line["text"].isupper() or _ROLE.search(line["text"]):
+            continue
+        deck = ' '.join(v['text'] for v in lines[:index] if v['box'][1] >= bottom)
+        if len(deck.split()) < 12:
+            continue
+        band = [line]
+        for following in lines[index+1:index+4]:
+            if (not following['text'].isupper() or _ROLE.search(following['text'])
+                    or abs(following['size']-line['size']) > line['size']*.15
+                    or following['box'][1]-band[-1]['box'][3] > line['size']*1.5):
+                break
+            band.append(following)
+        joined = ' '.join(v['text'] for v in band)
+        names = _names(joined)
+        tail = ' '.join(v['text'] for v in lines[index+len(band):index+len(band)+5])
+        if not names or len(tail.split()) < 12 or not any(c.islower() for c in tail):
+            continue
+        return {'author': ', '.join(names), 'source': 'text_structured_opening_credit',
+                'page':1, 'evidence': ' / '.join(v['text'] for v in heading)+' / '+joined,
+                'mechanism':'feature_deck_then_author_byline',
+                'geometry':{'byline':[v['box'] for v in band]}}
+    return not_found()
 
 
 def infer(context):
@@ -253,6 +288,8 @@ def infer(context):
                     result = alternating_credit(
                         lines, page.rect.width, page.rect.height
                     )
+                if not result.get("author"):
+                    result = deck_credit(lines, page.rect.width, page.rect.height)
                 if result.get("author"):
                     result["page"] = page_index + 1
                     break

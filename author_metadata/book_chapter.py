@@ -33,6 +33,10 @@ def _opening(samples):
 
 
 def _names(line):
+    # A trailing hyphen is an unfinished token. Internal surname hyphens
+    # remain valid; only a complete joined credit may become a person.
+    if re.search(r'\w[-–]\s*$', line):
+        return []
     if _ROLE.search(line) or _FURNITURE.match(line) or any(mark in line for mark in (':', '?', '!', '(', ')')):
         return []
     raw = line.lstrip("'\u2018\u2019").strip()

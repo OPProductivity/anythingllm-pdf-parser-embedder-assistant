@@ -451,6 +451,11 @@ def _spaced_abstract_credit(context):
 def infer(context):
     if context.profile.kind != "scholarly_article":
         return not_found()
+    # A signed current editorial has its own responsibility statement. It
+    # outranks name-shaped journal furniture encountered earlier in the prose.
+    editorial = _editorial_end_signature(context)
+    if editorial["author"]:
+        return editorial
     # Magazine-style scholarly exports sometimes print a lowercase title and
     # lowercase `by` credit. The exact title phrase must occur in the selected
     # filename and the complete credit must be its immediate next line.
@@ -591,9 +596,6 @@ def infer(context):
         medical = _medical_multicolumn_credit(lines, sample)
         if medical["author"]:
             return medical
-    editorial = _editorial_end_signature(context)
-    if editorial["author"]:
-        return editorial
     opening_credit = _journal_opening_credit(context)
     if opening_credit["author"]:
         return opening_credit

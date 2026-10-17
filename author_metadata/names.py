@@ -220,7 +220,9 @@ def looks_like_person_name(value, title_hint="", *, allow_all_caps=True):
         return False
     if any(word.casefold().rstrip(".") in AUTHOR_ORGANIZATION_TERMS for word in words):
         return False
-    if any(word.casefold() in HEADING_STOPWORDS for word in words):
+    if any(word.casefold() in HEADING_STOPWORDS
+           and not (len(word) == 1 and word.isupper() and 0 < index < len(words) - 1)
+           for index, word in enumerate(words)):
         return False
     # A strong, explicit byline can legitimately use all caps (for example,
     # ``BY IAN WARD``). A generic title-block fallback cannot safely make the

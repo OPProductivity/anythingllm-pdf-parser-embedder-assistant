@@ -1,0 +1,201 @@
+{
+  "date": "2026-10-17",
+  "production_baseline": "f37fe49",
+  "reviewed_experimental_baseline": "6a893b8",
+  "coverage": "770 hash-verified copied paths representing 383 byte-distinct contents; actual sampled metadata inference with planned native/OCR acquisition; no full PDF preparation, upload, embedding, UI or installed-app runtime. Manually reviewed development labels, not a blind holdout.",
+  "summary": {
+    "paths": 770,
+    "distinct_contents": 383,
+    "baseline_correct": 592,
+    "production_baseline_correct": 512,
+    "correct": 607,
+    "gains": 15,
+    "regressions": 0,
+    "new_nonempty_wrong_decisions": 0,
+    "errors": 0,
+    "unknown": 153,
+    "correct_no_single_author_decisions": 6,
+    "incomplete_evidence_cases": 2,
+    "sample_before": 27,
+    "sample_after": 36,
+    "sample_total": 40,
+    "warning_threshold": "25 percent relative decline; warning only",
+    "warnings": [],
+    "long_term_target": 760
+  },
+  "normalization": "Complete person roster comparison; punctuation, order and diacritics normalized, explicitly recorded accepted variants allowed.",
+  "subgroup_note": "Historical membership diagnostics use unique indexed paths and current reviewed labels; they are not the superseded historical gates.",
+  "subgroups": [
+    {
+      "name": "all_sources",
+      "total": 41,
+      "before": 39,
+      "after": 40,
+      "before_accuracy": 0.9512195121951219,
+      "after_accuracy": 0.975609756097561,
+      "relative_decline": -0.02564102564102555,
+      "warning": false
+    },
+    {
+      "name": "manual172",
+      "total": 165,
+      "before": 158,
+      "after": 159,
+      "before_accuracy": 0.9575757575757575,
+      "after_accuracy": 0.9636363636363636,
+      "relative_decline": -0.006329113924050667,
+      "warning": false
+    },
+    {
+      "name": "adjacent_controls",
+      "total": 41,
+      "before": 12,
+      "after": 14,
+      "before_accuracy": 0.2926829268292683,
+      "after_accuracy": 0.34146341463414637,
+      "relative_decline": -0.16666666666666674,
+      "warning": false
+    },
+    {
+      "name": "stage1",
+      "total": 64,
+      "before": 61,
+      "after": 62,
+      "before_accuracy": 0.953125,
+      "after_accuracy": 0.96875,
+      "relative_decline": -0.016393442622950838,
+      "warning": false
+    },
+    {
+      "name": "stage2",
+      "total": 49,
+      "before": 44,
+      "after": 44,
+      "before_accuracy": 0.8979591836734694,
+      "after_accuracy": 0.8979591836734694,
+      "relative_decline": 0,
+      "warning": false
+    },
+    {
+      "name": "stage3",
+      "total": 59,
+      "before": 54,
+      "after": 54,
+      "before_accuracy": 0.9152542372881356,
+      "after_accuracy": 0.9152542372881356,
+      "relative_decline": 0,
+      "warning": false
+    },
+    {
+      "name": "stage4",
+      "total": 15,
+      "before": 13,
+      "after": 13,
+      "before_accuracy": 0.8666666666666667,
+      "after_accuracy": 0.8666666666666667,
+      "relative_decline": 0,
+      "warning": false
+    },
+    {
+      "name": "stage5",
+      "total": 9,
+      "before": 3,
+      "after": 3,
+      "before_accuracy": 0.3333333333333333,
+      "after_accuracy": 0.3333333333333333,
+      "relative_decline": 0,
+      "warning": false
+    },
+    {
+      "name": "neutral_stage1",
+      "total": 61,
+      "before": 54,
+      "after": 58,
+      "before_accuracy": 0.8852459016393442,
+      "after_accuracy": 0.9508196721311475,
+      "relative_decline": -0.07407407407407418,
+      "warning": false
+    },
+    {
+      "name": "neutral_stage2",
+      "total": 49,
+      "before": 38,
+      "after": 38,
+      "before_accuracy": 0.7755102040816326,
+      "after_accuracy": 0.7755102040816326,
+      "relative_decline": 0,
+      "warning": false
+    },
+    {
+      "name": "neutral_stage3",
+      "total": 59,
+      "before": 45,
+      "after": 46,
+      "before_accuracy": 0.7627118644067796,
+      "after_accuracy": 0.7796610169491526,
+      "relative_decline": -0.022222222222222143,
+      "warning": false
+    },
+    {
+      "name": "neutral_stage4",
+      "total": 15,
+      "before": 12,
+      "after": 12,
+      "before_accuracy": 0.8,
+      "after_accuracy": 0.8,
+      "relative_decline": 0,
+      "warning": false
+    },
+    {
+      "name": "neutral_stage5",
+      "total": 9,
+      "before": 3,
+      "after": 3,
+      "before_accuracy": 0.3333333333333333,
+      "after_accuracy": 0.3333333333333333,
+      "relative_decline": 0,
+      "warning": false
+    },
+    {
+      "name": "combined_neutral",
+      "total": 257,
+      "before": 200,
+      "after": 205,
+      "before_accuracy": 0.7782101167315175,
+      "after_accuracy": 0.7976653696498055,
+      "relative_decline": -0.02499999999999991,
+      "warning": false
+    },
+    {
+      "name": "filename_neutral",
+      "total": 383,
+      "before": 275,
+      "after": 284,
+      "before_accuracy": 0.7180156657963447,
+      "after_accuracy": 0.741514360313316,
+      "relative_decline": -0.032727272727272716,
+      "warning": false
+    },
+    {
+      "name": "filename_original",
+      "total": 387,
+      "before": 317,
+      "after": 323,
+      "before_accuracy": 0.8191214470284238,
+      "after_accuracy": 0.834625322997416,
+      "relative_decline": -0.018927444794952786,
+      "warning": false
+    }
+  ],
+  "validation": {
+    "offline_tests_passed": 3031,
+    "skipped": 1,
+    "deselected": 34,
+    "subtests_passed": 28,
+    "ruff": "passed",
+    "core_pyright": "passed",
+    "grobid": "disabled",
+    "runtime": "No Desktop installation or live ingestion qualification",
+    "repository_content_check": "passed"
+  }
+}

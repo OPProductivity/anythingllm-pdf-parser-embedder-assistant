@@ -383,14 +383,15 @@
       "category": "coordinated_book_chapter",
       "work_title": "Preparing for the field",
       "container": "A Field Guide to Cross-Cultural Research on Childhood Learning",
-      "creator": "Adam Boyette; Dorsa Amir; Alejandrina Cristia; Alyssa Crittenden; Ardain Dzabatou; Michael Gurven; Vidrige Kandza; Patricia Kanngiesser; Nokwanda Ndlovu; Sarah Pope-Caldwell; Marie Schäfer; Andrea Taverna",
+      "creator": "Dorsa Amir; Adam Boyette; Alejandrina Cristia; Alyssa Crittenden; Ardain Dzabatou; Michael Gurven; Vidrige Kandza; Patricia Kanngiesser; Nokwanda Ndlovu; Sarah Pope-Caldwell; Marie Schäfer; Andrea Taverna",
       "role": "coordinator_and_contributors",
-      "credit_basis": "chapter_heading_after_book_frontmatter",
+      "credit_basis": "Manually rechecked PDF p3: complete printed Contributors roster; Coordinated by is a separate role",
       "exclude": [
         "book cover editors without chapter-role check"
       ],
       "sha256": "237ed77e6eeb80af9f16ac3e49067461cae5eef57f319aadec91dca97c5510ff",
-      "pages": 38
+      "pages": 38,
+      "coordinator": "Adam Boyette"
     }
   ]
 }

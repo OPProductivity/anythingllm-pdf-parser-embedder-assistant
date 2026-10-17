@@ -47,8 +47,20 @@ def _names(value):
             value = left.strip()
     if re.search(r"\b(?:university|college|institute|department|tech)\b", value, re.I):
         return []
+    # A terminal comma is punctuation, while a comma before Jr./Sr. belongs
+    # to one person. Neither should erase the complete roster.
+    terminal_separator = bool(re.search(r"[,;]\s*$", value))
+    value = value.strip().rstrip(",; ")
+    value = re.sub(r",\s*(Jr\.|Sr\.)(?=\s*(?:[,;]|and\b|&|$))", r" \1", value, flags=re.I)
+    value = re.sub(r',\s*(?:and|&)\s+', ', ', value, flags=re.I)
     parts = re.split(r"\s+(?:and|&)\s+|\s*;\s*|\s*,\s*", value, flags=re.I)
+    if terminal_separator and len(parts) > 1:
+        # A multi-person line ending in a separator may continue on the next
+        # line. Its prefix is not a complete roster. A single byline followed
+        # by affiliation can still carry terminal punctuation.
+        return []
     names = [normalize_author_candidate(p) for p in parts]
+    names = [re.sub(r"\s+(Jr\.|Sr\.)$", r", \1", name, flags=re.I) for name in names]
     return (
         names
         if names and all(looks_like_person_name(p, allow_all_caps=True) for p in names)
