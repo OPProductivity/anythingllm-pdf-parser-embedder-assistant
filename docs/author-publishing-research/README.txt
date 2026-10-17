@@ -6,10 +6,10 @@ These priorities are not calibrated probabilities. No GROBID or reusable
 cross-request PDF/OCR evidence cache is used.
 
 proposed-variants.json contains 500 research hypotheses in 25 categories;
-sources.json records 39 publishing, metadata, accessibility and OCR sources.
+sources.json records 40 publishing, metadata, accessibility and OCR sources.
 The source register identifies provenance and verification limits. Catalogue
 entries are not 500 observed quotations or automatically qualified rules.
-The local workbook has 100 separate recorded publishing observations, all 500
+The local workbook has 104 separate recorded publishing observations, all 500
 individual trial outcomes, and uniform first-five-page visual/code comparisons
 for the historical content population. Synthetic semantic controls and actual
 PDF/OCR controls are labelled separately and failed trials are preserved.

@@ -1,5 +1,6 @@
 """Shared author name normalization and structural validation."""
 import re
+import unicodedata
 from rag_pdf_tools import normalize_text
 from .constants import (
     AUTHOR_STOP_TERMS, AUTHOR_NAME_PARTICLES, AUTHOR_AFFILIATION_HINTS,
@@ -36,6 +37,11 @@ def looks_like_review_heading(value):
 def normalize_author_candidate(value):
     # Directional formatting from PDF exports is not part of a person's name.
     candidate = normalize_text(re.sub(r"[\u202a-\u202e\u2066-\u2069]", "", value or ""))
+    # TeX exports can use a dotless base plus a detached accent glyph to
+    # draw an ordinary accented i/j. Preserve genuine unaccented dotless names.
+    accents = {"´": "\u0301", "`": "\u0300", "¨": "\u0308", "ˆ": "\u0302", "˜": "\u0303", "ˇ": "\u030c", "˘": "\u0306", "˚": "\u030a", "˙": "\u0307"}
+    candidate = re.sub(r"([ıȷ])\s*([´`¨ˆ˜ˇ˘˚˙])", lambda m: unicodedata.normalize("NFC", {"ı":"i","ȷ":"j"}[m[1]] + accents[m[2]]), candidate)
+    candidate = re.sub(r"([´`¨ˆ˜ˇ˘˚˙])\s*([ıȷ])", lambda m: unicodedata.normalize("NFC", {"ı":"i","ȷ":"j"}[m[2]] + accents[m[1]]), candidate)
     candidate = candidate.lstrip("> ")
     candidate = re.sub(r"[*†‡§¶∗]+", " ", candidate)
     candidate = re.sub(

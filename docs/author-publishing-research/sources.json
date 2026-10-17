@@ -411,5 +411,15 @@
     "location": "Description, example steps 3–4, tests steps 1.1–1.4",
     "accessed": "2026-10-17",
     "verification": "Read current W3C technique, updated July 2025, via web open; finding paraphrased."
+  },
+  {
+    "id": "S40",
+    "title": "PLOS publisher JATS for a mixed personal and consortium byline",
+    "type": "Publisher article XML and rendered PDF",
+    "url": "https://journals.plos.org/plosone/article/file?id=10.1371/journal.pone.0300011&type=manuscript",
+    "finding": "A represented consortium is encoded as an author/collab alongside seven personal authors; the handling editor is a distinct editor/name contributor. Membership in acknowledgments must not be expanded into uncredited personal authors.",
+    "location": "article-meta/contrib-group; rendered PDF page1 byline and membership footnote",
+    "accessed": "2026-10-17",
+    "verification": "Rendered PDF first five pages and publisher XML inspected; no recognition output used as ground truth."
   }
 ]

@@ -21,7 +21,29 @@ def positioned_lines(page):
     """Keep name letters at their own baseline; discard smaller footnote markers."""
     import fitz
 
+    from urllib.parse import urlsplit
+
+    orcid_boxes = []
+    try:
+        for link in page.get_links():
+            if urlsplit(link.get("uri", "")).hostname in {
+                "orcid.org",
+                "www.orcid.org",
+            } and link.get("from"):
+                orcid_boxes.append(fitz.Rect(link["from"]))
+    except AttributeError, OSError, ValueError, RuntimeError:
+        pass
+
+    def identifier_icon(span, dominant_size):
+        if span["text"].strip() not in {"ID", "iD", "ORCID"} or "bbox" not in span:
+            return False
+        box = fitz.Rect(span["bbox"])
+        return any(
+            (box & target).get_area() >= box.get_area() * 0.5 for target in orcid_boxes
+        )
+
     fragments = []
+    detached_identifiers = []
     for block in page.get_text(
         "dict", flags=fitz.TEXTFLAGS_DICT & ~fitz.TEXT_PRESERVE_IMAGES
     )["blocks"]:
@@ -36,6 +58,14 @@ def positioned_lines(page):
             ]
             if not letters and not separators:
                 continue
+            dominant = max((s["size"] for s in letters), default=0)
+            identifier_markers = [
+                s for s in line["spans"] if identifier_icon(s, dominant)
+            ]
+            letters = [s for s in letters if s not in identifier_markers]
+            if not letters and not separators:
+                detached_identifiers.extend(identifier_markers)
+                continue
             visible_letters = [s for s in letters if s.get("alpha", 255) > 0]
             core = visible_letters or letters or separators
             size = max(s["size"] for s in core)
@@ -44,6 +74,7 @@ def positioned_lines(page):
                 s
                 for s in line["spans"]
                 if s["size"] >= size * 0.75
+                and s not in identifier_markers
                 and (not (s["flags"] & 1) or not s["text"].strip())
                 and (not visible_letters or s.get("alpha", 255) > 0)
             ]
@@ -52,7 +83,9 @@ def positioned_lines(page):
             skipped_marker = False
             for span in line["spans"]:
                 if span not in spans:
-                    skipped_marker |= bool(re.search(r"[\d*†‡∗]", span["text"]))
+                    skipped_marker |= span in identifier_markers or bool(
+                        re.search(r"[\d*†‡∗]", span["text"])
+                    )
                     continue
                 gap = (
                     span["bbox"][0] - previous["bbox"][2]
@@ -62,6 +95,16 @@ def positioned_lines(page):
                 boundary = skipped_marker and re.match(
                     r"^(?:and\b|&|[A-Z][a-z])", span["text"].lstrip()
                 )
+                separate_people = (
+                    previous is not None
+                    and gap > size * (0.8 if skipped_marker else 1.5)
+                    and _names(text.rstrip(",; "))
+                    and _names(span["text"].strip())
+                    and not re.search(r"[,;&-]$", text.strip())
+                    and not re.match(r"[,;&]|(?:and|&)\b", span["text"].strip(), re.I)
+                )
+                if separate_people:
+                    text += ", "
                 if (
                     text
                     and not text[-1].isspace()
@@ -82,6 +125,16 @@ def positioned_lines(page):
                         "text": text,
                         "size": size,
                         "baseline": baseline,
+                        "trailing_marker": skipped_marker,
+                        "marker_exclusions": [
+                            {
+                                "text": s["text"],
+                                "box": s.get("bbox"),
+                                "role": "ORCID identifier icon",
+                                "basis": "smaller identifier glyph inside its ORCID hyperlink rectangle",
+                            }
+                            for s in identifier_markers
+                        ],
                         "visible": bool(
                             visible_letters
                             or (
@@ -92,6 +145,19 @@ def positioned_lines(page):
                         "box": list(line["bbox"]),
                     }
                 )
+    for marker in detached_identifiers:
+        if fragments:
+            nearest = min(
+                fragments, key=lambda v: abs(v["baseline"] - marker["origin"][1])
+            )
+            nearest.setdefault("marker_exclusions", []).append(
+                {
+                    "text": marker["text"],
+                    "box": marker.get("bbox"),
+                    "role": "ORCID identifier icon",
+                    "basis": "linked identifier icon stored separately by the PDF, not a name suffix",
+                }
+            )
     return sorted(fragments, key=lambda v: (v["baseline"], v["box"][0]))
 
 
@@ -110,13 +176,18 @@ def _column_lines(fragments, left, right):
             # separate people. Adjacent pieces of one name still join with a
             # space, and explicit punctuation keeps its own delimiter.
             separate_people = (
-                line["box"][0] - previous["box"][2] > line["size"] * 1.5
+                line["box"][0] - previous["box"][2]
+                > line["size"] * (0.8 if previous.get("trailing_marker") else 1.5)
                 and len(_names(previous["text"])) >= 1
                 and len(_names(line["text"])) == 1
                 and not re.search(r"[,;&]$", previous["text"].strip())
                 and not re.match(r"[,;&]", line["text"].strip())
             )
             previous["text"] += (", " if separate_people else " ") + line["text"]
+            previous["trailing_marker"] = line.get("trailing_marker", False)
+            previous["marker_exclusions"] = previous.get(
+                "marker_exclusions", []
+            ) + line.get("marker_exclusions", [])
             previous["box"] = [
                 min(previous["box"][0], line["box"][0]),
                 min(previous["box"][1], line["box"][1]),
@@ -142,6 +213,62 @@ def _is_date_field(text):
         r"\s*(?:\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{4})\s*", text
     )
     return bool(named_date or numeric_date)
+
+
+def _credit_roster(value):
+    people = _names(value)
+    if people:
+        return people, []
+    represented = re.fullmatch(
+        r"(.+?)[,;]?\s+(on\s+behalf\s+of|representing|for)\s+(?:the\s+)?(.+)",
+        value.strip(),
+        re.I,
+    )
+    if not represented:
+        return [], []
+    people = _names(represented[1].rstrip(",; "))
+    group = represented[3].strip(" ,;.")
+    if (
+        not people
+        or not 2 <= len(group.split()) <= 14
+        or not re.search(
+            r"\b(?:consortium|collaboration|collaborative|network|team|investigators|study group|working group)\b",
+            group,
+            re.I,
+        )
+    ):
+        return [], []
+    return [*people, group], [
+        {
+            "name": group,
+            "role": "represented author group",
+            "relation": represented[2],
+            "work": "selected article byline",
+        }
+    ]
+
+
+def _roster_is_partial(names, complete):
+    if not names or len(names) > len(complete):
+        return False
+    used = set()
+    changed = len(names) < len(complete)
+    for name in names:
+        matching = next(
+            (
+                i
+                for i, full in enumerate(complete)
+                if i not in used
+                and len(name) <= len(full)
+                and full[-len(name) :] == name
+            ),
+            None,
+        )
+        if matching is None:
+            return False
+        used.add(matching)
+        changed |= name != complete[matching]
+    return changed
 
 
 def _candidate_credit_reports(lines, width, height):
@@ -219,7 +346,18 @@ def _candidate_credit_reports(lines, width, height):
         0,
         width * 0.98,
     )
-    for index, first in enumerate(following):
+    boundary = next(
+        (
+            i
+            for i, v in enumerate(following)
+            if re.fullmatch(
+                r"abstract|summary|(?:1[. ]+)?introduction", v["text"].strip(), re.I
+            )
+            or re.match(r"^(?:abstract|summary)[:.]\s", v["text"], re.I)
+        ),
+        len(following),
+    )
+    for index, first in enumerate(following[:boundary]):
         if any(
             _names(following[i]["text"])
             and _INSTITUTION.search(following[i + 1]["text"])
@@ -284,7 +422,7 @@ def _candidate_credit_reports(lines, width, height):
             )
             joined = (joined + separator + text).strip()
         joined = re.sub(",\\s*(?:and|&)\\s+", " and ", joined, flags=re.I)
-        names = _names(joined)
+        names, represented_groups = _credit_roster(joined)
         if not names:
             continue
         tail = following[index + len(band) :]
@@ -355,10 +493,25 @@ def _candidate_credit_reports(lines, width, height):
             "source": "text_structured_opening_credit",
             "page": 1,
             "evidence": title + " / " + joined,
+            "represented_groups": represented_groups,
             "mechanism": "complete_native_author_band",
             "geometry": {
                 "title": [v["box"] for v in cluster],
                 "byline": [v["box"] for v in band],
+                "marker_exclusions": [
+                    m
+                    for v in lines
+                    if any(
+                        v["box"] == b["box"]
+                        or (
+                            v["baseline"] == b["baseline"]
+                            and v["box"][0] >= b["box"][0]
+                            and v["box"][2] <= b["box"][2]
+                        )
+                        for b in band
+                    )
+                    for m in v.get("marker_exclusions", [])
+                ],
             },
         }
     return
@@ -368,13 +521,13 @@ def credit_reports(lines, width, height):
     """Retain every interpretation, marking geometric roster suffixes partial."""
     reports = list(_candidate_credit_reports(lines, width, height))
     for report in reports:
-        names = {tuple(_words(n)) for n in _names(report["author"])}
+        names = [tuple(_words(n)) for n in _credit_roster(report["author"])[0]]
         boxes = report.get("geometry", {}).get("byline", [])
         for other in reports:
-            complete = {tuple(_words(n)) for n in _names(other["author"])}
+            complete = [tuple(_words(n)) for n in _credit_roster(other["author"])[0]]
             other_boxes = other.get("geometry", {}).get("byline", [])
             if (
-                names < complete
+                _roster_is_partial(names, complete)
                 and boxes
                 and report.get("geometry", {}).get("title")
                 == other.get("geometry", {}).get("title")

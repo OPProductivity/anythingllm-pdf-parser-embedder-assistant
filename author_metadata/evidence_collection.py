@@ -148,7 +148,8 @@ def _plan(document, extra_text="", *, ocr_pages=None):
             apparatus_at = number
             apparatus_kind = labelled[0].casefold() if labelled else "legal_or_imprint"
         body = re.search(
-            r"(?im)^(?:abstract[.:]?|(?:\d{1,2}[. ]+)?(?:general )?introduction|"
+            r"(?im)^(?:(?:abstract|summary)\b(?=[:.]|\s*$|[ \t]{2,})|"
+            r"(?:\d{1,2}[. ]+)?(?:general )?introduction\s*[.:]?\s*$|"
             r"chapter\s+\d+\b|part\s+(?:[ivxlcdm]+|\d+|one|two|three)\b)",
             heading,
         )
@@ -164,7 +165,9 @@ def _plan(document, extra_text="", *, ocr_pages=None):
     # The word copyright inside a citation or a closing legal page does not
     # imply that the opening is still front matter. A later body boundary can
     # close that sequence, regardless of whether an author has been found.
-    frontmatter = apparatus_at > 0 and body_at < apparatus_at
+    # Acknowledgments or rights after the body are back matter, not a reason
+    # to reopen an opening acquisition sequence.
+    frontmatter = apparatus_at > 0 and body_at == 0
     if frontmatter:
         later = list(range(6, min(12, len(document)) + 1))
         pages.update(later)
