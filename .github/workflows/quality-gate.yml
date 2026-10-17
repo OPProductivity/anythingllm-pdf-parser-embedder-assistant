@@ -11,7 +11,7 @@ permissions:
 jobs:
   deterministic-checks:
     name: Offline regression gate
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -30,6 +30,7 @@ jobs:
       - name: Offline deterministic tests
         run: python -m pytest -m offline_deterministic -q
       - name: Tracked-file secret scan
+        shell: bash
         run: git ls-files -z | xargs -0 detect-secrets-hook --baseline .secrets.baseline
 
 # Live AnythingLLM/Desktop, browser, and paid-provider acceptance are intentionally

@@ -238,10 +238,12 @@ def test_all_titlepage_authors_need_individual_biographic_support():
     assert not biographic_titlepage(incomplete)["author"]
 
 
-def test_empty_ocr_attempt_is_not_cached_as_a_permanent_failure(tmp_path):
+def test_empty_ocr_attempt_is_not_cached_as_a_permanent_failure(tmp_path, monkeypatch):
     import subprocess
+    import sys
     from author_metadata import bounded_ocr
 
+    monkeypatch.setattr(bounded_ocr.shutil, "which", lambda _: sys.executable)
     source = tmp_path / "scan.pdf"
     doc = fitz.open()
     doc.new_page()
