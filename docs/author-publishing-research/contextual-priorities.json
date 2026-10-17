@@ -1,0 +1,142 @@
+[
+  {
+    "case": "R01",
+    "situation": "Author name in footer plus title-linked byline",
+    "decision": "Retain author",
+    "why": "Footer position describes location; the byline supplies same-work responsibility.",
+    "shared_cues": "Allowed. Contextual expertise and relation specificity determine contribution; no blanket independence veto."
+  },
+  {
+    "case": "R02",
+    "situation": "Name only inside a cited-work footnote",
+    "decision": "Do not promote that occurrence",
+    "why": "Citation marker, title and bibliographic syntax link the name to another work.",
+    "shared_cues": "Allowed. Contextual expertise and relation specificity determine contribution; no blanket independence veto."
+  },
+  {
+    "case": "R03",
+    "situation": "Corresponding-author first footnote",
+    "decision": "Support a known byline member",
+    "why": "Correspondence has an author-specific role, but does not enumerate every coauthor.",
+    "shared_cues": "Allowed. Contextual expertise and relation specificity determine contribution; no blanket independence veto."
+  },
+  {
+    "case": "R04",
+    "situation": "First-note affiliation linked by superscript",
+    "decision": "Support and delimit credit",
+    "why": "Marker linkage joins person and affiliation without turning affiliation into a person.",
+    "shared_cues": "Allowed. Contextual expertise and relation specificity determine contribution; no blanket independence veto."
+  },
+  {
+    "case": "R05",
+    "situation": "Footnote says editor of special section",
+    "decision": "Keep parent editor separate",
+    "why": "Its object is the section, not the article; a local byline remains primary.",
+    "shared_cues": "Allowed. Contextual expertise and relation specificity determine contribution; no blanket independence veto."
+  },
+  {
+    "case": "R06",
+    "situation": "Generic note region label versus corroborated author",
+    "decision": "Author responsibility wins",
+    "why": "A region hypothesis alone has no competing role relation.",
+    "shared_cues": "Allowed. Contextual expertise and relation specificity determine contribution; no blanket independence veto."
+  },
+  {
+    "case": "R07",
+    "situation": "Copyright holder is institutional publisher",
+    "decision": "Keep owner and creator separate",
+    "why": "Ownership is a different predicate; it cannot override a personal byline by itself.",
+    "shared_cues": "Allowed. Contextual expertise and relation specificity determine contribution; no blanket independence veto."
+  },
+  {
+    "case": "R08",
+    "situation": "Explicit author-rights assertion inside copyright page",
+    "decision": "Strong authorship support",
+    "why": "The assertion names author role and work target, despite copyright-page location.",
+    "shared_cues": "Allowed. Contextual expertise and relation specificity determine contribution; no blanket independence veto."
+  },
+  {
+    "case": "R09",
+    "situation": "Translator attribution rights",
+    "decision": "Record translator role",
+    "why": "The asserted right belongs to a translation contribution, not automatically original text authorship.",
+    "shared_cues": "Allowed. Contextual expertise and relation specificity determine contribution; no blanket independence veto."
+  },
+  {
+    "case": "R10",
+    "situation": "Complete personal ownership roster repeats as opening credit",
+    "decision": "Corroborate same-work byline",
+    "why": "The contribution is an explicit linked roster relation; evidence may be correlated and still useful.",
+    "shared_cues": "Allowed. Contextual expertise and relation specificity determine contribution; no blanket independence veto."
+  },
+  {
+    "case": "R11",
+    "situation": "Foreword ends in prominent signature",
+    "decision": "Assign local foreword credit",
+    "why": "If PDF selects whole book, do not transfer it; if it selects the foreword, reconsider work scope.",
+    "shared_cues": "Allowed. Contextual expertise and relation specificity determine contribution; no blanket independence veto."
+  },
+  {
+    "case": "R12",
+    "situation": "Biography describes current author",
+    "decision": "Corroborate subject",
+    "why": "Link biography heading and subject to selected-work credit; profession alone is insufficient.",
+    "shared_cues": "Allowed. Contextual expertise and relation specificity determine contribution; no blanket independence veto."
+  },
+  {
+    "case": "R13",
+    "situation": "Biography says author of a different book",
+    "decision": "Keep other-work relation",
+    "why": "Being an author is not being author of every nearby work.",
+    "shared_cues": "Allowed. Contextual expertise and relation specificity determine contribution; no blanket independence veto."
+  },
+  {
+    "case": "R14",
+    "situation": "Praise names book author and endorser",
+    "decision": "Separate praised subject and speaker",
+    "why": "Possessed book relation can support candidate surname; quote signature identifies evaluator.",
+    "shared_cues": "Allowed. Contextual expertise and relation specificity determine contribution; no blanket independence veto."
+  },
+  {
+    "case": "R15",
+    "situation": "Review heading credits reviewed-book writer",
+    "decision": "Assign nested-work creator",
+    "why": "Review byline or signature identifies current text writer.",
+    "shared_cues": "Allowed. Contextual expertise and relation specificity determine contribution; no blanket independence veto."
+  },
+  {
+    "case": "R16",
+    "situation": "Whole issue masthead and article byline",
+    "decision": "Respect contribution boundaries",
+    "why": "Editor-in-chief manages issue; article byline owns local text responsibility.",
+    "shared_cues": "Allowed. Contextual expertise and relation specificity determine contribution; no blanket independence veto."
+  },
+  {
+    "case": "R17",
+    "situation": "Individual credited in two roles",
+    "decision": "Retain both occurrence roles",
+    "why": "A person may author the text and design its cover; one production role is no global veto.",
+    "shared_cues": "Allowed. Contextual expertise and relation specificity determine contribution; no blanket independence veto."
+  },
+  {
+    "case": "R18",
+    "situation": "Full repeated running head disagrees with OCR byline spelling",
+    "decision": "Revisit transcription with scope guard",
+    "why": "Repeated acquired full credits can resolve text error; never manufacture a missing given name.",
+    "shared_cues": "Allowed. Contextual expertise and relation specificity determine contribution; no blanket independence veto."
+  },
+  {
+    "case": "R19",
+    "situation": "New genre cues appear on later page",
+    "decision": "Reconsider model with recorded reason",
+    "why": "Switch strategies because of content/work structure, not because one happened to return a name.",
+    "shared_cues": "Allowed. Contextual expertise and relation specificity determine contribution; no blanket independence veto."
+  },
+  {
+    "case": "R20",
+    "situation": "OCR or native evidence missing after a strong guess",
+    "decision": "Complete planned acquisition",
+    "why": "Confidence never cancels scheduled evidence; missing reads remain explicit uncertainties.",
+    "shared_cues": "Allowed. Contextual expertise and relation specificity determine contribution; no blanket independence veto."
+  }
+]

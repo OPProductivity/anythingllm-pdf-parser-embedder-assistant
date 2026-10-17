@@ -147,6 +147,28 @@ def claims(samples, *, kind, work_scope):
                             work="dedication",
                         )
                     )
+
+        # An em-dash can attach a professional affiliation to a personal
+        # byline. Record both roles; do not treat the institution as a person.
+        # The role predicate is essential: a dash alone may join two authors.
+        if kind in {"generic", "scholarly_article", "web_article"} and int(sample["page"]) <= 2:
+            for index, line in enumerate(lines[:12]):
+                professional = re.fullmatch(
+                    r"(.{5,90}?)\s*[—–]\s*(.{3,100}?)\s+(Research Associate|Research Fellow|Professor|Lecturer|Researcher)\s*", line, re.I
+                )
+                if not professional or index == 0:
+                    continue
+                people = _names(professional[1])
+                preceding = " ".join(lines[max(0, index - 4):index])
+                if len(people) == 1 and len(_words(preceding)) >= 4:
+                    result.append(_claim(
+                        people[0], "author", sample, line,
+                        "title_adjacent_professional_role", 105,
+                        work="selected article",
+                    ))
+                    regions.append({"role": "affiliation", "page": int(sample["page"]), "line": index,
+                                    "evidence": professional[2] + " " + professional[3]})
+
         if re.search(
             r"(?i)\b(?:ISBN|copyright|all rights reserved|copyright act)\b|©", compact
         ):
@@ -350,6 +372,41 @@ def claims(samples, *, kind, work_scope):
                             )
                         )
                         break
+
+    # Ownership does not equal authorship. A complete personal owner roster
+    # can corroborate the SAME complete opening byline above an abstract on
+    # a separate page, including working papers with long address apparatus.
+    if kind in {"generic", "scholarly_article", "report"} and work_scope not in {"chapter", "whole_issue"}:
+        for sample in samples:
+            for line in str(sample.get("text") or "").splitlines():
+                owner = re.fullmatch(
+                    r"\s*(?:copyright\s*©?\s*|©\s*)(?:18|19|20)\d{2}\s*(?:by\s+)?(.{5,400}?)\s*[.]?\s*", line, re.I
+                )
+                if not owner or re.search(r"(?i)\b(?:press|publishers?|books|ltd|inc|group)\b", owner[1]):
+                    continue
+                people = _names(owner[1].rstrip('. '))
+                if not people:
+                    continue
+                for other in samples:
+                    if other["page"] == sample["page"] or int(other["page"]) > 3:
+                        continue
+                    opening = [" ".join(v.split()) for v in str(other.get("text") or "").splitlines() if v.strip()]
+                    for index, credit in enumerate(opening[1:12], 1):
+                        same = _names(credit)
+                        if not same or _words(", ".join(same)) != _words(", ".join(people)):
+                            continue
+                        preceding = " ".join(opening[:index])
+                        following = " ".join(opening[index+1:index+9])
+                        if (3 <= len(_words(preceding)) <= 50
+                                and re.search(r"(?i)\babstract\b", following)
+                                and not re.search(r"(?i)\b(?:praise|foreword|translated|contents|references|bibliography)\b", preceding)):
+                            result.append(_claim(
+                                ", ".join(same), "author", other,
+                                line.strip() + " / separate opening credit: " + credit,
+                                "copyright_plus_opening_article_roster", 106,
+                                work="selected article",
+                            ))
+
     return result, regions
 
 
@@ -380,6 +437,8 @@ def select(current, assertions, *, kind, work_scope):
             # citation while explicitly crediting personal report authors.
             continue
         if claim["family"] in {
+            "title_adjacent_professional_role",
+            "copyright_plus_opening_article_roster",
             "local_chapter_contributors",
             "closing_affiliated_roster",
             "corporate_citation_and_responsibility",

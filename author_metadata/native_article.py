@@ -42,7 +42,8 @@ def positioned_lines(page):
             spans = [
                 s
                 for s in line["spans"]
-                if s["size"] >= size * 0.75 and not (s["flags"] & 1)
+                if s["size"] >= size * 0.75
+                and (not (s["flags"] & 1) or not s["text"].strip())
             ]
             text = "".join(s["text"] for s in spans)
             text = "".join(
@@ -153,7 +154,43 @@ def credit(lines, width, height):
         nearby = " ".join(
             v["text"] for v in tail if v["box"][1] - band[-1]["box"][3] < height * 0.65
         )
-        if not re.search(r"\b(?:abstract|summary)\b", nearby, re.I):
+        labelled_summary = bool(re.search(r"\b(?:abstract|summary)\b", nearby, re.I))
+        # An affiliation immediately after the complete band is an explicit
+        # role boundary even when the abstract is unlabelled or omitted.
+        # Keep column, title and roster tests above; a sidebar name is not
+        # promoted merely because prose exists elsewhere on the page.
+        body_start = next(
+            (i for i, v in enumerate(tail)
+             if len(v["text"].split()) >= 9
+             and any(c.islower() for c in v["text"])
+             and not _INSTITUTION.search(v["text"])
+             and not _ROLE.search(v["text"])),
+            len(tail),
+        )
+        # An affiliation ends one person's credit, not necessarily the whole
+        # roster. Further same-size person/affiliation pairs before prose
+        # belong to an alternating roster expert, not this contiguous band.
+        further_credit_pair = any(
+            _names(v["text"])
+            and abs(v["size"] - first["size"]) <= first["size"] * 0.12
+            and _INSTITUTION.search(tail[i + 1]["text"])
+            for i, v in enumerate(tail[:max(0, body_start - 1)])
+        )
+        if further_credit_pair:
+            return not_found()
+        affiliated_body = bool(
+            tail
+            and _INSTITUTION.search(tail[0]["text"])
+            and tail[0]["box"][1] - band[-1]["box"][3] < first["size"] * 4
+            and any(
+                len(v["text"].split()) >= 9
+                and any(c.islower() for c in v["text"])
+                and not _INSTITUTION.search(v["text"])
+                and not _ROLE.search(v["text"])
+                for v in tail[1:18]
+            )
+        )
+        if not (labelled_summary or affiliated_body):
             continue
         if not (
             _INSTITUTION.search(nearby) or re.match(r"^\s*Abstract\b", nearby, re.I)
