@@ -155,6 +155,123 @@ def _claim(author, sample, evidence, family, creator_type, priority=109):
     }
 
 
+def _institutional_deck_claims(opening, all_text, opening_text):
+    """A company's own investor/profile act, not a logo or ownership alone."""
+    result = []
+    cover = opening_text[:1800]
+    if re.search(r"\bcompany overview\b", cover, re.I):
+        for sample in opening:
+            text = str(sample.get("text") or "")
+            if not re.search(r"\bheadquarters\s*:|\bheadcount\s*:", text, re.I):
+                continue
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            for name in lines[:4]:
+                if not re.fullmatch(r"[A-Z][A-Za-z&.'’ -]{1,60}", name):
+                    continue
+                if re.search(re.escape(name) + r"[’']s\b", text) and re.search(
+                    r"\bour\s+(?:platform|products?|company|business)\b", text, re.I
+                ):
+                    result.append(
+                        _claim(
+                            name,
+                            sample,
+                            name
+                            + " / company overview / headquarters or headcount / own-company narrative",
+                            "corporate_profile_self_presentation",
+                            "organization",
+                            priority=104,
+                        )
+                    )
+    if not re.search(
+        r"\b(?:annual report|financial results|earnings (?:deck|presentation))\b",
+        cover,
+        re.I,
+    ):
+        return result
+    owners = {}
+    for sample in opening:
+        text = str(sample.get("text") or "")
+        for marker in re.finditer(
+            r"(?:©|copyright(?:\s+©)?)\s*(?:\d{4}\s*)?([A-Z][A-Za-z&.'’ -]{1,90}?)\.?\s+All rights reserved",
+            text,
+            re.I,
+        ):
+            name = marker[1].strip().rstrip(".")
+            if len(name.split()) > 1 and not _ORGANIZATION.search(name):
+                continue
+            if re.search(r"\b(?:press|publishers?|author|authors)\b", name, re.I):
+                continue
+            key = name.casefold()
+            owners.setdefault(
+                key,
+                {"name": name, "pages": set(), "sample": sample, "evidence": marker[0]},
+            )["pages"].add(sample.get("page", 0))
+    for owner in owners.values():
+        name = owner["name"]
+        responsibility = re.search(
+            re.escape(name)
+            + r"[’']s\s+(?:quarterly|annual|revenue|earnings|financial|business|results|cash|dividend)\b",
+            all_text,
+            re.I,
+        )
+        if len(owner["pages"]) >= 2 and responsibility:
+            result.append(
+                _claim(
+                    name,
+                    owner["sample"],
+                    owner["evidence"]
+                    + " / recurring investor apparatus / "
+                    + responsibility[0],
+                    "financial_deck_owner_and_reporting_subject",
+                    "organization",
+                    priority=104,
+                )
+            )
+    return result
+
+
+def _personal_post_claim(opening_text, all_text):
+    """Record a site-owner hypothesis without inventing a post byline."""
+    match = re.search(
+        r"(?im)^\s*(.{5,85}?)[’']s\s+(?:weblog|blog|notebook|diary)\b",
+        opening_text[:500],
+    )
+    names = _names(match[1]) if match else []
+    dated = re.search(
+        r"\b(?:\d{1,2}(?:st|nd|rd|th)?\s+"
+        + _MONTH
+        + r"\s+\d{4}|"
+        + _MONTH
+        + r"\s+\d{1,2},?\s+\d{4})\b",
+        opening_text[:2200],
+        re.I,
+    )
+    voice = re.search(
+        r"(?im)^\s*I(?:[’']m|[’']ve|[’']d| am| think| suspect| began| have)\b",
+        opening_text[:3500],
+    )
+    guest = re.search(
+        r"(?im)^\s*(?:guest post|guest author|guest contribution)(?:\s*[:—-]|\s+by\b)",
+        all_text,
+    )
+    if len(names) != 1 or not dated or not voice or guest:
+        return None
+    claim = _claim(
+        names[0],
+        {"page": 1},
+        match[0] + " / " + dated[0] + " / " + voice[0],
+        "personal_blog_masthead_current_post",
+        "person",
+        priority=0,
+    )
+    claim.update(
+        role="site_owner_hypothesis",
+        work="hosting site",
+        limitation="A masthead, date and first-person voice do not identify the writer of this particular post.",
+    )
+    return claim
+
+
 def claims(samples, *, kind, work_scope, opening_pages=None):
     result = []
     if work_scope == "whole_issue":
@@ -177,6 +294,10 @@ def claims(samples, *, kind, work_scope, opening_pages=None):
         ),
         "",
     )
+    result.extend(_institutional_deck_claims(opening, all_text, opening_text))
+    personal_post = _personal_post_claim(opening_text, all_text)
+    if personal_post:
+        result.append(personal_post)
     for sample in opening:
         text = str(sample.get("text") or "")
         page = int(sample.get("page") or 0)
@@ -274,12 +395,21 @@ def claims(samples, *, kind, work_scope, opening_pages=None):
                                 "organization",
                             )
                         )
-        if kind in {"corporate_publication", "report", "generic"}:
+        report_apparatus = bool(
+            re.search(
+                r"\b(?:this|our)\s+(?:report|study|survey)\b|our\s+[\"“][^\"”]{3,150}[\"”]\s+report\b",
+                all_text[:12000],
+                re.I,
+            )
+        )
+        if kind in {"corporate_publication", "report", "generic"} or (
+            kind == "book_chapter" and report_apparatus
+        ):
             # A personal title-page By credit remains the complete work credit;
             # the broader issuing institution does not erase it.
             personal_cover = any(
                 _names(m[1])
-                for m in re.finditer(r"(?im)^\s*by\s+([^\n]+)", text[:2500])
+                for m in re.finditer(r"(?im)^\s*by\s+([^\n]+)", all_text[:12000])
             )
             if not personal_cover and re.search(
                 r"\b(?:revenue|financial results|earnings)\b", text, re.I

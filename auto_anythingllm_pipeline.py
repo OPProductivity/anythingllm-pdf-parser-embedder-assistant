@@ -871,13 +871,20 @@ def pdf_metadata(path: Path, include_page_geometry=False, include_author_samples
                     progress_callback("page_geometry", page_number, len(doc))
         author_text_samples = []
         author_sample_error = ""
+        author_sample_errors = []
         if include_author_samples:
-            try:
-                opening_numbers = range(1, min(4, len(doc)) + 1)
-                for page_number in opening_numbers:
+            def read_author_sample(page_number):
+                try:
                     text = doc.load_page(page_number - 1).get_text("text")
                     if text:
                         author_text_samples.append({"page": page_number, "text": text})
+                except Exception as exc:
+                    author_sample_errors.append(f"page {page_number}: {exc}")
+
+            try:
+                opening_numbers = range(1, min(5, len(doc)) + 1)
+                for page_number in opening_numbers:
+                    read_author_sample(page_number)
                 opening_identity = resolve_work_identity(
                     metadata.get("title") or "", path, author_text_samples,
                 )
@@ -907,17 +914,12 @@ def pdf_metadata(path: Path, include_page_geometry=False, include_author_samples
                         if callable(progress_callback):
                             progress_callback("author_sample", position + 1, len(page_numbers))
                         continue
-                    text = doc.load_page(page_number - 1).get_text("text")
-                    if text:
-                        author_text_samples.append({"page": page_number, "text": text})
+                    read_author_sample(page_number)
                     if callable(progress_callback):
                         progress_callback("author_sample", position + 1, len(page_numbers))
             except Exception as exc:
-                # Preserve the legacy failure meaning: a broken sampled-page
-                # read means author inference abstains instead of using a
-                # partial sample that could change metadata provenance.
-                author_text_samples = []
-                author_sample_error = str(exc)
+                author_sample_errors.append(f"sampling plan: {exc}")
+            author_sample_error = "; ".join(author_sample_errors)
         result = {
             "pdf_page_count": len(doc),
             "title": normalize_text(metadata.get("title") or ""),
@@ -22024,10 +22026,8 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         author_text_samples, path=pdf_path, title_hint=title,
         profile=work_identity.profile,
     )
-    inferred_author = (
-        {"author": "", "source": "error", "page": 0, "evidence": author_sample_error}
-        if author_sample_error
-        else infer_profiled_author(author_context)
+    inferred_author = infer_profiled_author(
+        author_context, sampling_error=author_sample_error,
     )
     grobid_analysis = analyze_grobid(pdf_path, author_context, fulltext=True)
     inferred_author, grobid_decision = reconcile_grobid(
@@ -22079,9 +22079,9 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         "grobid_analysis": grobid_analysis,
         "grobid_author_decision": grobid_decision,
         "author_document_profile": (
-            author_context.profile_evidence() if not author_sample_error
-            else {"kind": "not_assessed", "cues": [], "classification_pages": [],
-                  "sampled_pages": [], "scope_complete": False}
+            author_context.profile_evidence()
+            | ({"sampling_warning": author_sample_error, "scope_complete": False}
+               if author_sample_error else {})
         ),
         "work_identity": work_identity.as_evidence(),
         "effective_subject": pdf_meta.get("subject") or (source_meta["source_title"] if use_file_title_fallback else ""),

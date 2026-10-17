@@ -19,7 +19,7 @@ _FIELD = re.compile(
 _NEXT = re.compile(
     r"\b(?:Publication Date|Copyright Information|Permalink|Journal|Source|"
     r"Published by|Book Title|Book Subtitle|Chapter Title|Stable URL|DOI|ISBN|"
-    r"ISSN|Pub[.] Date|Product|Access Date|Publishing Company|Publisher|Online ISBN|City|"
+    r"ISSN|Pub[.] Date|Product|Access Date|Publishing Company|Publisher|Online ISBN|City|Description|Identifiers|Subjects|Classification|"
     r"To cite this article|To link to this article|Follow this|"
     r"Abstract|Keywords?|Received|Revised|Accepted|Published online)\s*:?(?=\s|$)",
     re.I,
@@ -88,17 +88,24 @@ def _credit(value):
             if best
             and _people(line)
             and not re.match(r"^(?:and|&)\b", line, re.I)
-            and not re.search(r"\band\s*$|&\s*$", joined, re.I)
+            and not re.search(r"[,;]\s*$|\band\s*$|&\s*$", joined, re.I)
             else " "
         )
         candidate = joined + (separator if joined else "") + line
         names = _people(candidate)
         if not names and best:
+            if re.search(r"[,;]\s*$|\band\s*$|&\s*$", candidate, re.I):
+                # A trailing separator promises more roster text. Failure to
+                # parse the unfinished line is not a publishing boundary.
+                joined = candidate
+                continue
             break
         joined = candidate
         if names:
             best = names
-    return [] if re.search(r"\b(?:and)\s*$|&\s*$", joined, re.I) else best
+    if re.search(r"\band\s*$|&\s*$", joined, re.I):
+        return []
+    return _people(joined) if re.search(r"[,;]\s*$", joined) else best
 
 
 def _claim(
@@ -148,7 +155,11 @@ def claims(samples, *, kind, work_scope, title_hint="", opening_pages=None):
         if wrapper:
             fields = list(_FIELD.finditer(compact[:2400]))
             for index, marker in enumerate(fields):
-                stop = fields[index + 1].start() if index + 1 < len(fields) else 2400
+                stop = (
+                    fields[index + 1].start()
+                    if index + 1 < len(fields)
+                    else len(compact)
+                )
                 raw = compact[marker.end() : stop]
                 names = _credit(raw)
                 if not names:
@@ -182,19 +193,41 @@ def claims(samples, *, kind, work_scope, title_hint="", opening_pages=None):
                 )
         if not opening or work_scope == "whole_issue":
             continue
-        if 1 <= page <= 5:
+        if 1 <= page <= 5 or (opening_pages is not None and page in opening_pages):
             # Explicit local By lines remain interpretable even when the
             # selected filename and Info title are both neutral. The opening
             # heading and following discourse supply the work boundary.
-            for byline in re.finditer(r"(?im)^\s*by\s+([^\n]+)", text[:1200]):
+            for byline in re.finditer(r"(?im)^\s*by\s+([^\n]+)", text):
                 names = _people(byline[1])
                 heading = text[: byline.start()]
                 after = text[byline.end() :]
+                # A list of separately credited publications is not one local
+                # title/byline unit. Only a matching immediately preceding
+                # title can bind an entry to the selected work.
+                acts = list(
+                    re.finditer(r"(?im)^\s*(?:by|edited by|written by)\s+", text)
+                )
+                listing = len(acts) > 1 or bool(
+                    re.search(
+                        r"\b(?:a series edited by|also (?:available|by)|other books)\b",
+                        heading,
+                        re.I,
+                    )
+                )
+                local_heading = re.split(r"\n\s*\n", heading.rstrip())[-1]
+                expected_words = _words(title_hint)
+                local_words = _words(local_heading)
+                overlap = min(3, len(expected_words))
+                listed_title_bound = overlap >= 2 and any(
+                    local_words[n : n + overlap] == expected_words[:overlap]
+                    for n in range(max(0, len(local_words) - overlap + 1))
+                )
                 chapter_bound = work_scope != "chapter" or bool(
                     re.search(r"(?im)^\s*(?:chapter\s*)?\d{1,3}[.:]?\s+", heading)
                 )
                 if (
                     names
+                    and (not listing or listed_title_bound)
                     and chapter_bound
                     and 1 <= len(_words(heading)) <= 45
                     and not re.search(
@@ -212,6 +245,23 @@ def claims(samples, *, kind, work_scope, title_hint="", opening_pages=None):
                         )
                     )
                 ):
+                    rereads = [
+                        r
+                        for r in sample.get("direct_byline_rereads", [])
+                        if _words(r["text"]) == _words(byline[0])
+                        and (r.get("confidence") or 0) >= 80
+                    ]
+                    visible = [
+                        _words(v) for v in sample.get("visible_byline_texts", [])
+                    ]
+                    native_visible = _words(byline[0]) in visible
+                    byline_priority = (
+                        108
+                        if native_visible or (rereads and not visible)
+                        else 104
+                        if rereads and visible
+                        else 106
+                    )
                     result.append(
                         _claim(
                             names,
@@ -219,13 +269,20 @@ def claims(samples, *, kind, work_scope, title_hint="", opening_pages=None):
                             byline,
                             "author",
                             "local_explicit_byline",
-                            106,
+                            byline_priority,
                             original=True,
                         )
                     )
+                    if native_visible:
+                        result[-1]["native_visible_byline_support"] = True
+                    if rereads:
+                        result[-1].update(
+                            reread_basis="Direct visible byline reread challenges an invisible OCR transcription",
+                            reread_confidence=min(r["confidence"] for r in rereads),
+                        )
         # Explicit prose responsibility is admitted in the opening apparatus,
         # before article prose. Quotes/reviews of other books remain separate.
-        zone = text[:1800]
+        zone = text
         cutoff = re.search(r"\b(?:Abstract|Introduction|Keywords?)\s*:", zone, re.I)
         if cutoff:
             zone = zone[: cutoff.start()]

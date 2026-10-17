@@ -6,6 +6,7 @@ an explicit completeness ledger. Each new call acquires its own evidence.
 
 from dataclasses import replace
 import math
+import os
 import io
 from pathlib import Path
 import re
@@ -30,16 +31,36 @@ def text_quality(text):
     return "usable_native"
 
 
-def _image_regions(page):
+def _invisible_native_overlay(page):
+    spans = page.get_texttrace()
+    total = sum(len(span.get("chars", ())) for span in spans)
+    hidden = sum(len(span.get("chars", ())) for span in spans if span.get("type") == 3)
+    return total > 0 and hidden / total >= 0.5
+
+
+def _image_regions(page, *, invisible_overlay=None):
     """Image areas without a usable native text layer need their own reading."""
     import fitz
 
     words = page.get_text("words")
+    invisible_overlay = (
+        _invisible_native_overlay(page)
+        if invisible_overlay is None
+        else invisible_overlay
+    )
     regions = []
     area = max(1, page.rect.get_area())
     for info in page.get_image_info():
         rect = fitz.Rect(info["bbox"]) & page.rect
-        if rect.is_empty or rect.get_area() / area < 0.04:
+        narrow_text_shape = (
+            rect.width >= 60
+            and 8 <= rect.height <= 60
+            and rect.width >= rect.height * 2
+        )
+        if rect.is_empty or (
+            rect.get_area() / area < 0.04
+            and not (narrow_text_shape and rect.get_area() / area >= 0.001)
+        ):
             continue
         overlay = " ".join(
             str(w[4]) for w in words if fitz.Rect(w[:4]).intersects(rect)
@@ -53,7 +74,11 @@ def _image_regions(page):
         partial_overlay = (
             rect.get_area() / area >= 0.35 and native_area < rect.get_area() * 0.025
         )
-        if text_quality(overlay) != "usable_native" or partial_overlay:
+        if (
+            text_quality(overlay) != "usable_native"
+            or partial_overlay
+            or (invisible_overlay and rect.get_area() / area >= 0.65)
+        ):
             if not any(
                 (rect & old).get_area() >= rect.get_area() * 0.9 for old in regions
             ):
@@ -61,26 +86,85 @@ def _image_regions(page):
     return regions
 
 
-def _plan(document, extra_text=""):
+def _plan(document, extra_text="", *, ocr_pages=None):
     """Opening and closing apparatus, extended by publishing structure."""
     pages = set(range(1, min(5, len(document)) + 1))
-    opening = "\n".join(
-        document[n - 1].get_text("text", sort=True) for n in sorted(pages)
-    )
+    page_text = {}
+    for number in sorted(pages):
+        try:
+            page_text[number] = document[number - 1].get_text("text", sort=True)
+        except OSError, ValueError, RuntimeError:
+            # The scheduled native attempt records this failure later and
+            # still schedules a rendered-image reading of the page.
+            page_text[number] = ""
+    opening = "\n".join(page_text.values())
     opening += "\n" + extra_text
     extensions = []
     # This describes a publishing sequence, not whether an author was found.
-    frontmatter = bool(
-        re.search(
-            r"(?im)\b(?:contents(?:\s+at a glance)?|table of contents|"
-            r"praise(?:\s+for)?|endorsements|acclaim|foreword|preface|"
-            r"title page|copyright|catalog(?:u)?ing.in.publication|ISBN|"
-            r"a series edited by|university press|publishers?|publishing|"
+    if ocr_pages is not None:
+        for region in ocr_pages:
+            number = region["page"]
+            if number in page_text:
+                page_text[number] += "\n" + region.get("text", "")
+    elif extra_text and pages:
+        # Compatibility callers without page coordinates retain their supplied
+        # structure. Actual collection passes per-page OCR, excluding closings.
+        page_text[max(pages)] += "\n" + extra_text
+    apparatus_at, body_at = 0, 0
+    apparatus_kind = ""
+    for number, text in page_text.items():
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        heading = "\n".join(lines[:10])
+        labelled = re.search(
+            r"(?im)^(?:table of contents|contents(?: at a glance)?|detailed contents|"
+            r"list of (?:figures|tables|illustrations)|praise(?: for.*)?|endorsements|acclaim|"
+            r"foreword(?: by.*)?|preface(?: to.*)?|acknowledg\w*|dedication|"
+            r"about (?:the )?(?:authors?|editors?)|title page|"
             r"inhaltsverzeichnis|sommaire|sum[aá]rio|inhoudsopgave|"
-            r"pr[eé]face|pr[oó]logo|pref[aá]cio|d[eé]dicace|dedication)\b",
-            opening,
+            r"pr[eé]face|pr[oó]logo|pref[aá]cio|d[eé]dicace)\s*$",
+            heading,
         )
-    )
+        legal = (
+            sum(
+                bool(re.search(pattern, text, re.I))
+                for pattern in (
+                    r"©|\bcopyright\b",
+                    r"all rights reserved|rights? .* identified",
+                    r"\bISBN\b",
+                    r"catalog(?:u)?ing.in.publication",
+                    r"first published|published by",
+                )
+            )
+            >= 3
+        )
+        sparse_imprint = len(text.split()) < 160 and bool(
+            re.search(
+                r"\b(?:university press|a series edited by|catalog(?:u)?ing.in.publication)\b",
+                text,
+                re.I,
+            )
+        )
+        if labelled or legal or sparse_imprint:
+            apparatus_at = number
+            apparatus_kind = labelled[0].casefold() if labelled else "legal_or_imprint"
+        body = re.search(
+            r"(?im)^(?:abstract[.:]?|(?:\d{1,2}[. ]+)?(?:general )?introduction|"
+            r"chapter\s+\d+\b|part\s+(?:[ivxlcdm]+|\d+|one|two|three)\b)",
+            heading,
+        )
+        dense_prose = (
+            len(text.split()) >= 180 and len(re.findall(r"[.!?]\s+[A-Z]", text)) >= 6
+        )
+        if (body and not labelled) or (
+            dense_prose
+            and number > apparatus_at
+            and apparatus_kind == "legal_or_imprint"
+        ):
+            body_at = number
+    # The word copyright inside a citation or a closing legal page does not
+    # imply that the opening is still front matter. A later body boundary can
+    # close that sequence, regardless of whether an author has been found.
+    frontmatter = apparatus_at > 0 and body_at < apparatus_at
     if frontmatter:
         later = list(range(6, min(12, len(document)) + 1))
         pages.update(later)
@@ -157,7 +241,7 @@ def _read_region(document, task, executable):
 
     page = document[task["page"] - 1]
     region = fitz.Rect(task["clip"])
-    line_task = task.get("reason") == "collapsed_explicit_byline"
+    line_task = task.get("reason") in {"collapsed_explicit_byline", "narrow_text_image"}
     scale = min(
         4.0 if line_task else 2.5,
         math.sqrt((1_000_000 if line_task else 4_000_000) / max(1, region.get_area())),
@@ -204,6 +288,7 @@ def _read_region(document, task, executable):
                 [executable, "stdin", "stdout", "-l", "eng", "--psm", str(psm), "tsv"],
                 input=payload.getvalue(),
                 capture_output=True,
+                env={**os.environ, "OMP_THREAD_LIMIT": "1"},
                 timeout=10,
                 check=True,
             )
@@ -327,6 +412,12 @@ def collect(context):
                     trace["attempts"].append(
                         {"kind": "native", "page": number, "status": "read"}
                     )
+                    native[-1]["visible_byline_texts"] = [
+                        line["text"]
+                        for line in native[-1]["horizontal_lines"]
+                        if line.get("visible")
+                        and re.match(r"^(?:by|written by)\s+", line["text"], re.I)
+                    ]
                     for line in native[-1]["horizontal_lines"]:
                         if re.fullmatch(r"BY[A-Z]{7,60}", line["text"].strip()):
                             preceding = [
@@ -347,23 +438,57 @@ def collect(context):
                                     }
                                 )
                     reason = text_quality(text)
-                    regions = (
-                        [page.rect]
-                        if reason != "usable_native"
-                        else _image_regions(page)
+                    invisible_overlay = _invisible_native_overlay(page)
+                    clean_sparse_native = (
+                        reason == "sparse_native"
+                        and bool(text.strip())
+                        and not page.get_image_info()
+                        and not page.get_drawings()
                     )
+                    regions = (
+                        []
+                        if clean_sparse_native
+                        else [page.rect]
+                        if reason != "usable_native"
+                        else _image_regions(page, invisible_overlay=invisible_overlay)
+                    )
+                    if clean_sparse_native:
+                        trace["attempts"].append(
+                            {
+                                "kind": "image_assessment",
+                                "page": number,
+                                "status": "clean_native_text_only",
+                                "reason": "No embedded image or vector artwork remains unread; sparse native text alone does not require OCR",
+                            }
+                        )
                     if reason == "usable_native":
                         reason = "image_without_native_overlay"
                     for region in regions:
+                        region_reason = (
+                            "invisible_native_text_overlay"
+                            if invisible_overlay
+                            and region.get_area() >= page.rect.get_area() * 0.65
+                            else reason
+                        )
                         leaves = [region]
-                        if region.width > region.height * 1.15:
+                        if (
+                            region.width > region.height * 1.15
+                            and region.height >= page.rect.height * 0.7
+                            and region.get_area() >= page.rect.get_area() * 0.75
+                        ):
                             middle = (region.x0 + region.x1) / 2
                             leaves = [
                                 fitz.Rect(region.x0, region.y0, middle, region.y1),
                                 fitz.Rect(middle, region.y0, region.x1, region.y1),
                             ]
                         tasks.extend(
-                            {"page": number, "clip": list(leaf), "reason": reason}
+                            {
+                                "page": number,
+                                "clip": list(leaf),
+                                "reason": "narrow_text_image"
+                                if leaf.width >= leaf.height * 2 and leaf.height <= 60
+                                else region_reason,
+                            }
                             for leaf in leaves
                         )
                 except (OSError, ValueError, RuntimeError) as error:
@@ -376,6 +501,26 @@ def collect(context):
                             "error": str(error),
                         }
                     )
+
+                    try:
+                        failed_page = document[number - 1]
+                        tasks.append(
+                            {
+                                "page": number,
+                                "clip": list(failed_page.rect),
+                                "reason": "native_read_failed",
+                            }
+                        )
+                    except (OSError, ValueError, RuntimeError) as image_error:
+                        trace["attempts"].append(
+                            {
+                                "kind": "ocr",
+                                "page": number,
+                                "status": "failed",
+                                "reason": "native_read_failed",
+                                "error": str(image_error),
+                            }
+                        )
 
             for number in pages:
                 read_native(number)
@@ -408,7 +553,7 @@ def collect(context):
                         )
                 if stage == 0:
                     extra = "\n".join(r["text"] for r in ocr)
-                    expanded, _ = _plan(document, extra)
+                    expanded, _ = _plan(document, extra, ocr_pages=ocr)
                     additional = sorted(set(expanded) - set(trace["native_plan"]))
                     if additional:
                         trace["native_plan"] = sorted(set(expanded))
@@ -482,6 +627,10 @@ def evidence_views(context):
                 text = (
                     "\n".join(parts)
                     if text_quality(previous) != "usable_native"
+                    or any(
+                        s.get("reason") == "invisible_native_text_overlay"
+                        for s in chosen
+                    )
                     else previous + "\n" + "\n".join(parts)
                 )
                 merged[number] = {
@@ -490,6 +639,18 @@ def evidence_views(context):
                     "extraction": "native_and_ocr_alternate"
                     if alternate
                     else "native_and_ocr",
+                    "visible_byline_texts": native.get(number, {}).get(
+                        "visible_byline_texts", []
+                    ),
+                    "direct_byline_rereads": [
+                        line
+                        for region in chosen
+                        if region.get("reason") == "invisible_native_text_overlay"
+                        for line in region.get("lines", [])
+                        if re.match(
+                            r"^(?:by|written by)\s+", line.get("text", ""), re.I
+                        )
+                    ],
                 }
             if not alternate or changed:
                 views.append(

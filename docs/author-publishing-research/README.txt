@@ -1,32 +1,38 @@
-Publishing research catalogue and transfer trials
+Publishing responsibility research and qualification
 
-proposed-variants.json contains 500 proposed semantic wording/layout templates,
-20 in each of 25 categories. They are research hypotheses, not 500 quotations,
-observed counts, production regexes or trained probabilities. sources.json
-records 24 consulted publishing, style, metadata and university sources.
-contextual-priorities.json records 20 situations in which role and work scope
-change an expert's contribution. Experts may share visual, native and OCR cues.
+The framework describes responsibility for a selected work, completed planned
+acquisition, shared native/visual/OCR expertise and contextual heuristic priority.
+These priorities are not calibrated probabilities. No GROBID or reusable
+cross-request PDF/OCR evidence cache is used.
 
-The complete manually verified ground-truth workbook, source renderings, PDF
-research downloads, literal code comparisons and per-case traces are preserved
-in the local project output publishing-evidence-completion-20261017. Private
-PDFs and the workbook are not included in this repository.
+proposed-variants.json contains 500 research hypotheses in 25 categories;
+sources.json records 39 publishing, metadata, accessibility and OCR sources.
+The source register identifies provenance and verification limits. Catalogue
+entries are not 500 observed quotations or automatically qualified rules.
+The local workbook has 100 separate recorded publishing observations, all 500
+individual trial outcomes, and uniform first-five-page visual/code comparisons
+for the historical content population. Synthetic semantic controls and actual
+PDF/OCR controls are labelled separately and failed trials are preserved.
 
-The implementation in this revision enables only selected bounded relations
-that were manually compared with pages first: title-linked professional role,
-affiliated byline without an Abstract label, and personal ownership roster
-corroborated by a separate opening article credit. Native whitespace around
-superscript markers remains significant. The contiguous-band expert must defer
-when further author-affiliation pairs continue before prose.
+The historical denominator remains 770 filename cases for 383 byte-distinct
+content records: 382 PDFs and one HTML payload disguised as PDF. Original,
+neutral-with-metadata and pure-neutral conditions are reported separately.
+Pure-neutral v1 scores were invalidated after active metadata was found in
+96 copies. The replacement v2 copies are reopened and checked for empty active
+Info/XMP, identical page counts and unchanged first-five text/raster pixels.
+One explicitly excluded assignment remains visible in historical totals and
+has a separate requested-scope adjusted result.
 
-Qualification results are recorded in the accompanying benchmark note after
-the corrected candidate completes. The initial wider candidate returned
-608/770 (8 gains, 7 regressions from 607); it was not adopted. Its failures
-were coauthor truncation across three ordinary layouts, not exceptional PDFs.
-The corrected boundary passed a focused 17/17 original/neutral filename replay.
+Private source PDFs, workbook, file paths, source renderings and detailed
+per-case traces remain in local project output publishing-uniform-review-20261017.
+Public Git contains generic mechanisms, invented counterexamples and sanitized
+aggregate qualification. Downloaded fresh works are reported separately and
+are not silently added to the historical denominator. A fresh set becomes
+development evidence after it informs a refinement; subsequent frozen revisions
+receive a separate unseen-work set.
 
-Limits: this is development-reviewed metadata inference, not a blind holdout,
-full PDF preparation, upload/embedding or installed Desktop runtime check.
-770 filename cases represent 383 byte-distinct contents and fewer independent
-works. Research PDFs are not silently added to the denominator. The long-term
-target remains near 760/770. No GROBID or source-name exceptions are used.
+Qualification is in progress for the latest frozen candidate. The final
+sanitized benchmark note records the actual accepted or rejected score, test
+coverage and timing. A checkpoint commit is not a completed qualification,
+installed-app deployment or observed Desktop runtime result. The long-term
+near-760/770 objective has not been declared achieved.

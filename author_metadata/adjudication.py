@@ -18,7 +18,7 @@ def infer(context):
     from . import dispatcher as strategies
     from .bounded_ocr import bundle_reports
     from .scholarly_article import _editorial_end_signature
-    from .physical_work import opening_title
+    from .physical_work import opening_title, opening_title_hypotheses
     from .profile import classify_document
     from .publishing_acts import embedded_chapter
     from . import structured_credit
@@ -33,6 +33,27 @@ def infer(context):
         opening_plan = None
     views = evidence_views(context)
     proposals, attempts, assertions, regions = [], [], [], []
+    title_hypotheses = opening_title_hypotheses(
+        context.evidence_bundle,
+        context.title_hint,
+        work_scope=context.profile.work_scope,
+    )
+    original_views = list(views)
+    for hypothesis in title_hypotheses:
+        for view in original_views:
+            if _words(hypothesis["title"]) == _words(view.title_hint):
+                continue
+            profile = classify_document(view.samples, title_hint=hypothesis["title"])
+            if context.profile.work_scope == "chapter":
+                profile = replace(profile, kind="book_chapter", work_scope="chapter")
+            views.append(replace(view, title_hint=hypothesis["title"], profile=profile))
+        attempts.append(
+            {
+                "expert": "opening_work_title_hypothesis",
+                "status": "assessed",
+                **hypothesis,
+            }
+        )
     # The historical selector is one expert, not the final verdict. Its internal
     # fallback order cannot prevent the following independent expert calls.
     current = strategies._infer_before_collection(context)
@@ -213,6 +234,7 @@ def infer(context):
         alternating_credit_reports,
         deck_credit_reports,
         email_roster_reports,
+        mixed_image_line_views,
     )
     from .portable_layout import layout_credit_reports
 
@@ -251,8 +273,13 @@ def infer(context):
         assertions.extend(found)
         regions.extend(labels)
         if (
-            page["page"] <= 5
-            and context.profile.kind in {"generic", "scholarly_article", "book_chapter"}
+            (
+                page["page"] in opening_plan
+                if opening_plan is not None
+                else page["page"] <= 5
+            )
+            and context.profile.kind
+            in {"generic", "scholarly_article", "book_chapter", "web_article"}
             and context.profile.work_scope != "whole_issue"
         ):
             # Marker-cleaned baselines serve journal rosters; raw PDF spans
@@ -285,8 +312,13 @@ def infer(context):
                     for report in reports
                 )
         if (
-            page["page"] <= 5
-            and context.profile.kind in {"generic", "scholarly_article"}
+            (
+                page["page"] in opening_plan
+                if opening_plan is not None
+                else page["page"] <= 5
+            )
+            and context.profile.kind
+            in {"generic", "scholarly_article", "book_chapter", "web_article"}
             and context.profile.work_scope != "whole_issue"
         ):
             for name, expert in [
@@ -308,6 +340,35 @@ def infer(context):
                     proposals.append(
                         {"expert": "native_article", **report, "page": page["page"]}
                     )
+                    if report.get("mechanism") in {
+                        "complete_native_author_band",
+                        "title_author_affiliation_pairs_before_abstract",
+                        "title_author_affiliation_pairs_before_body",
+                    }:
+                        boxes = report.get("geometry", {}).get("byline", [])
+                        band_lines = [
+                            line
+                            for line in lines
+                            if any(
+                                min(line["box"][2], b[2]) > max(line["box"][0], b[0])
+                                and min(line["box"][3], b[3])
+                                > max(line["box"][1], b[1])
+                                for b in boxes
+                            )
+                        ]
+                        if band_lines and all(
+                            line.get("visible", True) for line in band_lines
+                        ):
+                            assertions.append(
+                                {
+                                    **report,
+                                    "page": page["page"],
+                                    "role": "author",
+                                    "work": "selected work",
+                                    "family": "physical_complete_native_roster",
+                                    "priority": 109,
+                                }
+                            )
                     if report.get("mechanism") == "complete_title_bound_email_roster":
                         assertions.append(
                             {
@@ -319,6 +380,59 @@ def infer(context):
                                 "priority": 109,
                             }
                         )
+        if (
+            (
+                page["page"] in opening_plan
+                if opening_plan is not None
+                else page["page"] <= 5
+            )
+            and context.profile.kind
+            in {"generic", "scholarly_article", "book_chapter", "web_article"}
+            and context.profile.work_scope != "whole_issue"
+        ):
+            for mixed in mixed_image_line_views(
+                page, context.evidence_bundle.get("ocr", [])
+            ):
+                reports = list(
+                    credit_reports(mixed["lines"], page["width"], page["height"])
+                )
+                attempts.append(
+                    {
+                        "expert": "mixed_native_ocr_physical_byline",
+                        "page": page["page"],
+                        "alternate": mixed["alternate"],
+                        "status": "assessed",
+                        "proposals": len(reports),
+                    }
+                )
+                for report in reports:
+                    byline = report.get("geometry", {}).get("byline", [])
+                    uses_image = any(
+                        min(a[2], b[2]) > max(a[0], b[0])
+                        and min(a[3], b[3]) > max(a[1], b[1])
+                        for a in byline
+                        for b in mixed["added_boxes"]
+                    )
+                    if not uses_image:
+                        continue
+                    report = {
+                        **report,
+                        "page": page["page"],
+                        "source": "text_ocr_author_credit",
+                        "mechanism": "mixed_native_ocr_complete_author_band",
+                        "coordinate_space": "pdf_points",
+                        "extraction_views": ["native baselines", "OCR image text"],
+                    }
+                    proposals.append({"expert": "mixed_native_ocr", **report})
+                    assertions.append(
+                        {
+                            **report,
+                            "role": "author",
+                            "work": "selected work",
+                            "family": "physical_complete_mixed_roster",
+                            "priority": 107,
+                        }
+                    )
     ocr = bundle_reports(context)
     attempts.append(
         {
@@ -355,15 +469,16 @@ def infer(context):
         ):
             proposals.append({"expert": "filename_catalog", **filename})
             # A complete credit in an explicit Name - Title filename can
-            # identify an excerpt whose local byline is absent. For a generic
-            # genre, also require its actual title to occur on opening pages.
+            # identify an excerpt whose local byline is absent. For any other
+            # genre, require its actual title to occur on opening pages.
             # This does not expand a bare surname or affect neutral names.
             catalog_title = re.split(r"\s+[-–—]{1,2}\s+", context.path.stem, maxsplit=1)
             title_words = _words(catalog_title[1]) if len(catalog_title) == 2 else ()
             visible_words = _words(
                 " ".join(
                     str(s.get("text") or "")
-                    for s in context.samples
+                    for view in views
+                    for s in view.samples
                     if int(s.get("page") or 0) <= 5
                 )
             )
@@ -372,10 +487,18 @@ def infer(context):
                 visible_words[n : n + length] == title_words[:length]
                 for n in range(max(0, len(visible_words) - length + 1))
             )
-            if not current.get("author") and (
-                context.profile.kind in {"book", "book_chapter"}
-                or context.profile.kind == "generic"
-                and title_visible
+            if len(title_words) == 2:
+                title_visible |= any(
+                    _words(line) == title_words
+                    for view in views
+                    for sample in view.samples
+                    if int(sample.get("page") or 0) <= 5
+                    for line in str(sample.get("text") or "").splitlines()
+                )
+            if (
+                not current.get("author")
+                and current.get("source") != "unresolved_issue_editor_role"
+                and (context.profile.kind in {"book", "book_chapter"} or title_visible)
             ):
                 current = filename
 
@@ -464,6 +587,7 @@ def infer(context):
     keys = {_key(p) for p in proposals if p.get("author")}
     trace = {
         "version": 1,
+        "work_title_hypotheses": title_hypotheses,
         "score_kind": "contextual_priority_not_probability",
         "shared_inputs_allowed": True,
         "collection": context.evidence_bundle["trace"],

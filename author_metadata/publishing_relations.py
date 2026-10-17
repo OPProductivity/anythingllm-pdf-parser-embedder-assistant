@@ -618,7 +618,30 @@ def select(current, assertions, *, kind, work_scope):
     eligible = []
     for claim in assertions:
         if claim.get("source") == "text_role_scoped_creator":
+            if claim.get(
+                "family"
+            ) == "personal_blog_masthead_current_post" and current.get("author"):
+                # Site ownership and first-person voice are contextual support,
+                # not authority to erase an already accepted post creator.
+                continue
             if claim.get("work") == "selected work":
+                explicit_personal = current.get("source") in {
+                    "text_byline",
+                    "text_written_by",
+                    "text_author_label",
+                    "text_report_prepared_by",
+                } or current.get("mechanism") in {
+                    "complete_native_author_band",
+                    "title_author_affiliation_pairs_before_abstract",
+                    "title_author_affiliation_pairs_before_body",
+                    "complete_title_bound_email_roster",
+                    "feature_deck_then_author_byline",
+                }
+                if claim.get("creator_type") == "organization" and explicit_personal:
+                    # Issuing/research responsibility can coexist with named
+                    # personal writers. Its corporate role does not erase an
+                    # explicit title-bound complete personal byline.
+                    continue
                 eligible.append(claim)
             continue
         span_family = claim["family"] in {
@@ -664,6 +687,8 @@ def select(current, assertions, *, kind, work_scope):
             "local_explicit_byline",
             "title_credit_and_matching_personal_copyright",
             "physical_complete_email_roster",
+            "physical_complete_mixed_roster",
+            "physical_complete_native_roster",
         }:
             eligible.append(claim)
         elif kind in {"book", "generic"} and work_scope not in {

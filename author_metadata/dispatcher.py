@@ -348,6 +348,10 @@ def _infer_before_collection(context: AuthorEvidenceContext):
     return reconcile(context, infer_context_priority(context, report))
 
 
-def infer_author(context: AuthorEvidenceContext):
+def infer_author(context: AuthorEvidenceContext, *, sampling_error=""):
     from .adjudication import infer
-    return infer(context)
+
+    result = infer(context)
+    if sampling_error:
+        result = {**result, "initial_sampling_warning": str(sampling_error)}
+    return result

@@ -260,6 +260,156 @@
     "finding": "A textbook distinguishes senior contributing authors, other contributors, institutional licensing and reviewers.",
     "location": "Opening front matter",
     "accessed": "2026-10-17",
-    "verification": "Download and manual front-matter review pending"
+    "verification": "Downloaded current PDF; native text and complete rendered PDF pp.1–5 inspected. Whole-book contributor roster is not yet adjudicated."
+  },
+  {
+    "id": "S25",
+    "title": "AP byline roles and syndication",
+    "url": "https://api.ap.org/media/v/docs/About_Bylines.htm",
+    "type": "News agency API guidance",
+    "finding": "Byline roles vary by medium; an agency can be the credited actor and third-party bylines may omit By.",
+    "location": "Relevant source sections",
+    "accessed": "2026-10-17",
+    "verification": "Read primary page via web open/search; findings are paraphrases; no new PDF observation implied"
+  },
+  {
+    "id": "S26",
+    "title": "Chicago: multiple forewords and closing signatures",
+    "url": "https://www.chicagomanualofstyle.org/qanda/data/faq/topics/ManuscriptPreparation/faq0088.html",
+    "type": "Publisher editorial guidance",
+    "finding": "A book can contain several forewords or differently labelled opening pieces; non-author contributors can have opening bylines or closing signatures.",
+    "location": "Relevant source sections",
+    "accessed": "2026-10-17",
+    "verification": "Read primary page via web open/search; findings are paraphrases; no new PDF observation implied"
+  },
+  {
+    "id": "S27",
+    "title": "Tesseract image quality and segmentation",
+    "url": "https://tesseract-ocr.github.io/tessdoc/ImproveQuality.html",
+    "type": "OCR engine documentation",
+    "finding": "Image polarity, resolution, skew, borders and segmentation affect OCR; these acquisition-quality concerns differ from author-role confidence.",
+    "location": "Relevant source sections",
+    "accessed": "2026-10-17",
+    "verification": "Read primary page via web open/search; findings are paraphrases; no new PDF observation implied"
+  },
+  {
+    "id": "S28",
+    "title": "Chicago: copyright page at book end",
+    "url": "https://www.chicagomanualofstyle.org/qanda/data/faq/topics/ManuscriptPreparation/faq0188.html",
+    "type": "Publisher editorial guidance",
+    "finding": "A copyright page can occur at the end of a book; opening-only acquisition is insufficient for that layout.",
+    "location": "Relevant source sections",
+    "accessed": "2026-10-17",
+    "verification": "Read primary page via web open/search; findings are paraphrases; no new PDF observation implied"
+  },
+  {
+    "id": "S29",
+    "title": "DWP research report guidance",
+    "url": "https://www.gov.uk/government/publications/dwp-research-reports-style-guide/dwp-research-reports-guidance",
+    "type": "Government publishing guidance",
+    "finding": "Author information, report summaries, citation formats and footnotes have distinct publishing functions.",
+    "location": "Relevant source sections",
+    "accessed": "2026-10-17",
+    "verification": "Read primary page via web open/search; findings are paraphrases; no new PDF observation implied"
+  },
+  {
+    "id": "S30",
+    "title": "Crossref contributor markup",
+    "url": "https://www.crossref.org/documentation/schema-library/markup-guide-metadata-segments/contributors/",
+    "type": "Metadata authority guidance",
+    "finding": "People and organizations can contribute; multiple roles can coexist. A genuine single personal name is supported, and given name, surname and suffix are separate fields.",
+    "location": "Contributors, contributor roles, contributor names",
+    "accessed": "2026-10-17",
+    "verification": "Primary source read through web open/search; paraphrased research guidance, not a new observed PDF case or automatically enabled recognition rule"
+  },
+  {
+    "id": "S31",
+    "title": "Library of Congress personal-name authority fields",
+    "url": "https://www.loc.gov/marc/authority/concise/ad100.html",
+    "type": "Cataloging authority guidance",
+    "finding": "Personal names may contain initials or a fuller form recorded separately. Relationship to a work and uncertain or pseudonymous attribution have distinct fields.",
+    "location": "Fields a, e, j, q and t",
+    "accessed": "2026-10-17",
+    "verification": "Primary source read through web open/search; paraphrased research guidance, not a new observed PDF case or automatically enabled recognition rule"
+  },
+  {
+    "id": "S32",
+    "title": "Elsevier inclusive author name changes",
+    "url": "https://www.elsevier.com/about/policies-and-standards/inclusive-author-name-changes",
+    "type": "Publisher policy",
+    "finding": "An author name may change on the article and indexing metadata without a visible correction notice. Version-specific printed credit and current authoritative metadata can differ legitimately.",
+    "location": "Policy paragraphs",
+    "accessed": "2026-10-17",
+    "verification": "Primary source read through web open/search; paraphrased research guidance, not a new observed PDF case or automatically enabled recognition rule"
+  },
+  {
+    "id": "S33",
+    "title": "W3C PDF reading order",
+    "url": "https://www.w3.org/WAI/WCAG22/Techniques/pdf/PDF3.html",
+    "type": "Accessibility standard technique",
+    "finding": "Visual columns, sidebars and footnotes can have incorrect machine reading order. Tag order and geometric order require validation rather than automatic trust.",
+    "location": "Description",
+    "accessed": "2026-10-17",
+    "verification": "Primary source read through web open/search; paraphrased research guidance, not a new observed PDF case or automatically enabled recognition rule"
+  },
+  {
+    "id": "S34",
+    "title": "JVS-Vascular Insights author instructions",
+    "url": "https://legacyfileshare.elsevier.com/promis_misc/JVSVI_IFA_v4.pdf",
+    "type": "Publisher author instructions PDF",
+    "finding": "Group and individual author responsibility must be separated from collaborator membership; a collaborator list may appear at the end of a manuscript.",
+    "location": "PDF p. 3 collaborator groups; PDF p. 10 author names and non-Latin forms",
+    "accessed": "2026-10-17",
+    "verification": "Primary source read through web open/search; paraphrased research guidance, not a new observed PDF case or automatically enabled recognition rule"
+  },
+  {
+    "id": "S35",
+    "title": "Open Book Publishers PDF submission",
+    "url": "https://wiki.openbookpublishers.com/public/pdf-submission",
+    "type": "Publisher production guidance",
+    "finding": "Two front title pages and blank leaves may precede responsibility evidence; back matter and running book/chapter titles carry distinct roles.",
+    "location": "Front matter and running heads",
+    "accessed": "2026-10-17",
+    "verification": "Primary source read through web open/search; paraphrased research guidance, not a new observed PDF case or automatically enabled recognition rule"
+  },
+  {
+    "id": "S36",
+    "title": "Reuters attribution guidelines",
+    "url": "https://reutersagency.com/brand-attribution-guidelines/",
+    "type": "News agency attribution guidance",
+    "finding": "News text attribution and visual-content attribution concern their respective contributions; source credits must retain work and role boundaries.",
+    "location": "Attribution guidance",
+    "accessed": "2026-10-17",
+    "verification": "Primary source read through web open/search; paraphrased research guidance, not a new observed PDF case or automatically enabled recognition rule"
+  },
+  {
+    "id": "S37",
+    "title": "Tesseract benchmarks and FAQ: OCR threading",
+    "url": "https://tesseract-ocr.github.io/tessdoc/Benchmarks.html",
+    "type": "OCR engine primary documentation",
+    "finding": "OpenMP can waste CPU time; official documentation recommends OMP_THREAD_LIMIT=1 for relevant builds. This is a measured performance hypothesis, not an accuracy shortcut or evidence cache.",
+    "location": "501openmp and linked FAQ speed discussion",
+    "accessed": "2026-10-17",
+    "verification": "Read primary benchmarks and official FAQ through web search/open; local cold qualification still required"
+  },
+  {
+    "id": "S38",
+    "title": "Adobe Acrobat: Fix text recognition errors in scanned PDFs",
+    "url": "https://helpx.adobe.com/acrobat/desktop/create-documents/scan-documents-to-pdfs/fix-scanned-text.html",
+    "type": "PDF producer primary documentation",
+    "finding": "A scanned image may remain visible while an uncertain recognized word sits in searchable text behind it; the text layer requires comparison with the image.",
+    "location": "Opening explanation and Review recognized text procedure",
+    "accessed": "2026-10-17",
+    "verification": "Read primary Adobe documentation through web search and open; finding paraphrased."
+  },
+  {
+    "id": "S39",
+    "title": "W3C PDF7: Performing OCR on scanned PDFs",
+    "url": "https://www.w3.org/WAI/WCAG22/Techniques/pdf/PDF7.html",
+    "type": "Accessibility primary guidance",
+    "finding": "OCR can leave suspect text. The resulting text should be checked for completeness, correctness and reading order rather than assumed correct because it is searchable.",
+    "location": "Description, example steps 3–4, tests steps 1.1–1.4",
+    "accessed": "2026-10-17",
+    "verification": "Read current W3C technique, updated July 2025, via web open; finding paraphrased."
   }
 ]

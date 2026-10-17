@@ -36,7 +36,8 @@ def positioned_lines(page):
             ]
             if not letters and not separators:
                 continue
-            core = letters or separators
+            visible_letters = [s for s in letters if s.get("alpha", 255) > 0]
+            core = visible_letters or letters or separators
             size = max(s["size"] for s in core)
             baseline = max(core, key=lambda s: len(s["text"]))["origin"][1]
             spans = [
@@ -44,8 +45,33 @@ def positioned_lines(page):
                 for s in line["spans"]
                 if s["size"] >= size * 0.75
                 and (not (s["flags"] & 1) or not s["text"].strip())
+                and (not visible_letters or s.get("alpha", 255) > 0)
             ]
-            text = "".join(s["text"] for s in spans)
+            text = ""
+            previous = None
+            skipped_marker = False
+            for span in line["spans"]:
+                if span not in spans:
+                    skipped_marker |= bool(re.search(r"[\d*†‡∗]", span["text"]))
+                    continue
+                gap = (
+                    span["bbox"][0] - previous["bbox"][2]
+                    if previous and "bbox" in span and "bbox" in previous
+                    else 0
+                )
+                boundary = skipped_marker and re.match(
+                    r"^(?:and\b|&|[A-Z][a-z])", span["text"].lstrip()
+                )
+                if (
+                    text
+                    and not text[-1].isspace()
+                    and not span["text"].startswith(" ")
+                    and (boundary or gap > size * 0.18)
+                ):
+                    text += " "
+                text += span["text"]
+                previous = span
+                skipped_marker = False
             text = "".join(
                 c for c in text if unicodedata.category(c) != "Cf" and c not in "*†‡§¶∗"
             )
@@ -56,6 +82,13 @@ def positioned_lines(page):
                         "text": text,
                         "size": size,
                         "baseline": baseline,
+                        "visible": bool(
+                            visible_letters
+                            or (
+                                not letters
+                                and any(s.get("alpha", 255) > 0 for s in separators)
+                            )
+                        ),
                         "box": list(line["bbox"]),
                     }
                 )
@@ -78,7 +111,7 @@ def _column_lines(fragments, left, right):
             # space, and explicit punctuation keeps its own delimiter.
             separate_people = (
                 line["box"][0] - previous["box"][2] > line["size"] * 1.5
-                and len(_names(previous["text"])) == 1
+                and len(_names(previous["text"])) >= 1
                 and len(_names(line["text"])) == 1
                 and not re.search(r"[,;&]$", previous["text"].strip())
                 and not re.match(r"[,;&]", line["text"].strip())
@@ -95,7 +128,23 @@ def _column_lines(fragments, left, right):
     return groups
 
 
-def credit_reports(lines, width, height):
+_DATE_WORD = re.compile(
+    r"\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?|Spring|Summer|Autumn|Fall|Winter)\b",
+    re.I,
+)
+
+
+def _is_date_field(text):
+    if len(text) > 120:
+        return False
+    named_date = _DATE_WORD.search(text) and re.search(r"\b\d{4}\b", text)
+    numeric_date = re.fullmatch(
+        r"\s*(?:\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{4})\s*", text
+    )
+    return bool(named_date or numeric_date)
+
+
+def _candidate_credit_reports(lines, width, height):
     eligible = [
         v
         for v in lines
@@ -110,6 +159,9 @@ def credit_reports(lines, width, height):
     start = headings[0]
     cluster = []
     for v in lines[lines.index(start) :]:
+        if v["box"][2] < start["box"][0] or v["box"][0] > start["box"][2]:
+            # Another column cannot terminate this title block.
+            continue
         if (
             cluster
             and _names(v["text"])
@@ -126,19 +178,66 @@ def credit_reports(lines, width, height):
         "\\b(?:figure|table|plate|praise|reviewed|edited|translated)\\b", title, re.I
     ):
         return
-    left = min((v["box"][0] for v in cluster))
+    title_left = min(v["box"][0] for v in cluster)
+    title_right = max(v["box"][2] for v in cluster)
+    side_roles = [
+        v
+        for v in lines
+        if _ROLE.search(v["text"])
+        and v["size"] < largest * 0.85
+        and (v["box"][2] < title_left or v["box"][0] > title_right)
+    ]
+
+    def in_responsibility_column(v):
+        if v["box"][2] >= title_left and v["box"][0] <= title_right:
+            return True
+        return not any(
+            v["box"][1] >= role["box"][1]
+            and (
+                (role["box"][2] < title_left and v["box"][2] < title_left)
+                or (role["box"][0] > title_right and v["box"][0] > title_right)
+            )
+            for role in side_roles
+        )
+
     following = _column_lines(
-        [v for v in lines if v["box"][1] >= cluster[-1]["box"][3] - 2],
-        left,
+        [
+            v
+            for v in lines
+            if v["box"][1] >= cluster[-1]["box"][3] - 2
+            and in_responsibility_column(v)
+            and not re.fullmatch(r"(?:[^\s<>]+@[^\s<>]+[\s,;]*)+", v["text"])
+            and not (
+                _ROLE.search(v["text"])
+                and v["size"] < largest * 0.85
+                and (
+                    v["box"][2] < min(t["box"][0] for t in cluster)
+                    or v["box"][0] > max(t["box"][2] for t in cluster)
+                )
+            )
+        ],
+        0,
         width * 0.98,
     )
     for index, first in enumerate(following):
+        if any(
+            _names(following[i]["text"])
+            and _INSTITUTION.search(following[i + 1]["text"])
+            for i in range(max(0, index - 1))
+        ):
+            # A preceding author/affiliation pair belongs to the same title.
+            # Its later pair is not an independent complete author roster.
+            continue
         if index:
             previous = following[index - 1]
             if (
                 abs(previous["size"] - first["size"]) <= first["size"] * 0.12
                 and first["box"][1] - previous["box"][3] <= first["size"] * 1.5
-                and _names(previous["text"].rstrip(",; "))
+                and _names(
+                    re.sub(r"(?:\band|&)\s*$", "", previous["text"], flags=re.I).rstrip(
+                        ",; "
+                    )
+                )
                 and not _ROLE.search(previous["text"])
                 and not _INSTITUTION.search(previous["text"])
             ):
@@ -160,6 +259,8 @@ def credit_reports(lines, width, height):
                 or _INSTITUTION.search(v["text"])
                 or _ROLE.search(v["text"])
                 or v["text"].casefold().startswith(("abstract", "summary"))
+                or _is_date_field(v["text"].strip())
+                or re.match(r"^\d{1,3}(?=\s|[^\W\d_])", v["text"])
             ):
                 break
             if band and v["box"][1] - band[-1]["box"][3] > first["size"] * 1.5:
@@ -234,14 +335,19 @@ def credit_reports(lines, width, height):
             continue
         numbered_affiliation = bool(
             tail
-            and re.match(r"^\d+\s+[^\W\d_]", tail[0]["text"])
-            and tail[0]["size"] < first["size"] * 0.9
+            and re.match(r"^\d{1,3}\s*[^\W\d_]", tail[0]["text"])
             and labelled_summary
         )
         if not (
             _INSTITUTION.search(nearby)
             or re.match("^\\s*Abstract\\b", nearby, re.I)
             or numbered_affiliation
+            or (
+                tail
+                and _is_date_field(tail[0]["text"])
+                and len(tail) > 1
+                and re.fullmatch(r"abstract|summary", tail[1]["text"].strip(), re.I)
+            )
         ):
             continue
         yield {
@@ -258,8 +364,39 @@ def credit_reports(lines, width, height):
     return
 
 
+def credit_reports(lines, width, height):
+    """Retain every interpretation, marking geometric roster suffixes partial."""
+    reports = list(_candidate_credit_reports(lines, width, height))
+    for report in reports:
+        names = {tuple(_words(n)) for n in _names(report["author"])}
+        boxes = report.get("geometry", {}).get("byline", [])
+        for other in reports:
+            complete = {tuple(_words(n)) for n in _names(other["author"])}
+            other_boxes = other.get("geometry", {}).get("byline", [])
+            if (
+                names < complete
+                and boxes
+                and report.get("geometry", {}).get("title")
+                == other.get("geometry", {}).get("title")
+                and all(b in other_boxes for b in boxes)
+            ):
+                report = {
+                    **report,
+                    "mechanism": "partial_native_author_band",
+                    "eligible_for_selection": False,
+                    "eligibility_reason": "This is a geometric suffix/subset of the same title-bound complete roster.",
+                    "complete_roster": other["author"],
+                }
+                break
+        yield report
+
+
 def credit(lines, width, height):
-    reports = list(credit_reports(lines, width, height))
+    reports = [
+        r
+        for r in credit_reports(lines, width, height)
+        if r.get("eligible_for_selection", True)
+    ]
     return reports[0] if reports else not_found()
 
 
@@ -278,6 +415,30 @@ def alternating_credit_reports(lines, width, height):
         ),
         None,
     )
+    labelled_abstract = stop is not None
+    if stop is None:
+        first_pair = next(
+            (
+                i
+                for i in range(len(lines) - 1)
+                if _names(lines[i]["text"])
+                and _INSTITUTION.search(lines[i + 1]["text"])
+            ),
+            None,
+        )
+        if first_pair is None:
+            return
+        stop = next(
+            (
+                i
+                for i in range(first_pair + 2, len(lines))
+                if len(_words(lines[i]["text"])) >= 9
+                and any(c.islower() for c in lines[i]["text"])
+                and not _INSTITUTION.search(lines[i]["text"])
+                and not _ROLE.search(lines[i]["text"])
+            ),
+            None,
+        )
     if stop is None:
         return
     pairs = []
@@ -306,7 +467,9 @@ def alternating_credit_reports(lines, width, height):
         "source": "text_structured_opening_credit",
         "page": 1,
         "evidence": title + " / " + " / ".join((lines[i]["text"] for i, _ in pairs)),
-        "mechanism": "title_author_affiliation_pairs_before_abstract",
+        "mechanism": "title_author_affiliation_pairs_before_abstract"
+        if labelled_abstract
+        else "title_author_affiliation_pairs_before_body",
         "geometry": {"byline": [lines[i]["box"] for i, _ in pairs]},
     }
 
@@ -316,6 +479,40 @@ def alternating_credit(lines, width, height):
     return reports[0] if reports else not_found()
 
 
+def _pair_email_columns(lines):
+    """Join a name and its same-baseline contact despite a different font size."""
+    email = re.compile(r"(?:[^\s<>]+@[^\s<>]+[\s,;]*)+")
+    pairs = {}
+    used = set()
+    for index, line in enumerate(lines):
+        if not _names(line["text"]) or _ROLE.search(line["text"]):
+            continue
+        contacts = [
+            (j, v)
+            for j, v in enumerate(lines)
+            if j != index
+            and j not in used
+            and email.fullmatch(v["text"])
+            and abs(v["baseline"] - line["baseline"]) < 2
+            and v["box"][0] >= line["box"][2] - 2
+        ]
+        if contacts:
+            used.update(j for j, _ in contacts)
+            boxes = [line["box"], *(v["box"] for _, v in contacts)]
+            pairs[index] = {
+                **line,
+                "text": line["text"] + " " + " ".join(v["text"] for _, v in contacts),
+                "box": [
+                    min(b[0] for b in boxes),
+                    min(b[1] for b in boxes),
+                    max(b[2] for b in boxes),
+                    max(b[3] for b in boxes),
+                ],
+                "contact_pair_basis": "same baseline, name to left of email; typography may differ",
+            }
+    return [pairs.get(i, line) for i, line in enumerate(lines) if i not in used]
+
+
 def email_roster_reports(lines, width, height):
     """Read every name/email block before the article's body boundary.
 
@@ -323,7 +520,7 @@ def email_roster_reports(lines, width, height):
     Email is a role cue only in a title-bound opening roster, never a general
     licence to treat contacts or names in prose as authors.
     """
-    lines = _column_lines(lines, 0, width)
+    lines = _column_lines(_pair_email_columns(lines), 0, width)
     stop = next(
         (
             i
@@ -432,10 +629,11 @@ def deck_credit_reports(lines, width, height):
         if len(deck.split()) < 12:
             continue
         band = [line]
-        for following in lines[index + 1 : index + 4]:
+        for following in lines[index + 1 :]:
             if (
                 not following["text"].isupper()
                 or _ROLE.search(following["text"])
+                or _INSTITUTION.search(following["text"])
                 or abs(following["size"] - line["size"]) > line["size"] * 0.15
                 or (following["box"][1] - band[-1]["box"][3] > line["size"] * 1.5)
             ):
@@ -471,7 +669,8 @@ def deck_credit(lines, width, height):
 def infer(context):
     if (
         context.path is None
-        or context.profile.kind not in {"generic", "scholarly_article"}
+        or context.profile.kind
+        not in {"generic", "scholarly_article", "book_chapter", "web_article"}
         or context.profile.work_scope == "whole_issue"
     ):
         return not_found()
@@ -479,9 +678,14 @@ def infer(context):
         # Acquisition has already read these pages. Assess each available
         # opening page and specialist even after an earlier proposal succeeds.
         reports = []
+        planned = {int(s["page"]) for s in context.planned_opening_pages}
         for page in context.evidence_bundle.get("native", []):
             if (
-                page.get("page", 0) > 5
+                (
+                    page.get("page", 0) not in planned
+                    if planned
+                    else page.get("page", 0) > 5
+                )
                 or "horizontal_lines" not in page
                 or "width" not in page
                 or "height" not in page
@@ -516,3 +720,70 @@ def infer(context):
         return result
     except OSError, ValueError, RuntimeError:
         return not_found()
+
+
+def mixed_image_line_views(page, regions):
+    """Place small OCR image text beside native text in the same PDF space.
+
+    The native-only and crop-only interpretations remain available. OCR is
+    added here only where a small image has no overlapping readable native
+    line; it cannot overwrite an already readable native byline.
+    """
+    native = page.get("horizontal_lines", [])
+    relevant = [
+        r
+        for r in regions
+        if r.get("page") == page["page"]
+        and r.get("clip")
+        and (r["clip"][2] - r["clip"][0]) * (r["clip"][3] - r["clip"][1])
+        < page["width"] * page["height"] * 0.5
+    ]
+    result = []
+    for alternate in (False, True):
+        if alternate and not any(r.get("alternate") for r in relevant):
+            continue
+        added = []
+        for original in relevant:
+            region = original.get("alternate", original) if alternate else original
+            factor = region.get("scale", 1)
+            x, y = original["clip"][:2]
+            for line in region.get("lines", []):
+                box = [
+                    line["box"][0] / factor + x,
+                    line["box"][1] / factor + y,
+                    line["box"][2] / factor + x,
+                    line["box"][3] / factor + y,
+                ]
+                area = max(1, (box[2] - box[0]) * (box[3] - box[1]))
+
+                def overlap(b):
+                    return max(0, min(box[2], b[2]) - max(box[0], b[0])) * max(
+                        0, min(box[3], b[3]) - max(box[1], b[1])
+                    )
+
+                if any(overlap(n["box"]) / area > 0.4 for n in native):
+                    continue
+                text = re.sub(r"(?<=\w)[\d*†‡]+(?=\s|[,;&]|$)", "", line["text"])
+                if not text.strip():
+                    continue
+                added.append(
+                    {
+                        "text": text,
+                        "box": box,
+                        "size": max(1, (box[3] - box[1]) * 1.35),
+                        "baseline": box[3],
+                        "extraction": "ocr_image_in_native_page",
+                        "ocr_confidence": line.get("confidence"),
+                    }
+                )
+        if added:
+            result.append(
+                {
+                    "lines": sorted(
+                        [*native, *added], key=lambda r: (r["box"][1], r["box"][0])
+                    ),
+                    "added_boxes": [r["box"] for r in added],
+                    "alternate": alternate,
+                }
+            )
+    return result
