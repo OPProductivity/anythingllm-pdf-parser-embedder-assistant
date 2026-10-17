@@ -57,7 +57,7 @@ def _names(value):
         r",\s*(Jr\.|Sr\.)(?=\s*(?:[,;]|and\b|&|$))", r" \1", value, flags=re.I
     )
     value = re.sub(r",\s*(?:and|&)\s+", ", ", value, flags=re.I)
-    parts = re.split(r"\s+(?:and|&)\s+|\s*;\s*|\s*,\s*", value, flags=re.I)
+    parts = re.split(r"\s+(?:and|&)\s+|\s*[;·•]\s*|\s*,\s*", value, flags=re.I)
     if terminal_separator and len(parts) > 1:
         # A multi-person line ending in a separator may continue on the next
         # line. Its prefix is not a complete roster. A single byline followed

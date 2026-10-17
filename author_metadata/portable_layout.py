@@ -159,7 +159,11 @@ def layout_credit_reports(lines, width, height, *, page=1, repeated_headers=()):
             credit["size"],
             allow_quotes=abstract,
             allow_embedded_quotes=bool(strong_opening),
-            allow_short=local_numbered_work,
+            allow_short=local_numbered_work
+            or bool(
+                strong_opening
+                and re.match(r"^\s*(?:by|written by)\s+", credit["text"], re.I)
+            ),
         )
         if heading and 0 <= credit["box"][1] - cluster[-1]["box"][3] <= 80:
             left = min((v["box"][0] for v in cluster))
@@ -364,9 +368,16 @@ def publisher_credit_reports(lines, *, page=1):
                     and (title_size >= credit["size"] * 0.8)
                 )
             ):
-                yield _report(
+                report = _report(
                     names, title, credit, page, "compact_publisher_titlepage_role_order"
                 )
+                if boundary < publisher:
+                    report["secondary_role_boundary"] = {
+                        "text": lines[boundary]["text"],
+                        "box": lines[boundary]["box"],
+                        "relation": "after separately credited primary creators",
+                    }
+                yield report
     return
 
 

@@ -96,7 +96,14 @@ def embedded_chapter(context, current):
     Examine physical leaves separately, so a preceding bibliography on the left
     cannot be joined to a right-leaf chapter byline.
     """
-    if context.path is None or current.get("source") != "text_edited_by":
+    parent_editor = current.get("source") == "text_edited_by" or bool(
+        re.search(r"\bedited\s+by\b", current.get("evidence", ""), re.I)
+    )
+    if (
+        context.path is None
+        or not parent_editor
+        or context.profile.work_scope == "whole_issue"
+    ):
         return None
     import fitz
 

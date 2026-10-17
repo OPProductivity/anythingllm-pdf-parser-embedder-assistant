@@ -421,5 +421,25 @@
     "location": "article-meta/contrib-group; rendered PDF page1 byline and membership footnote",
     "accessed": "2026-10-17",
     "verification": "Rendered PDF first five pages and publisher XML inspected; no recognition output used as ground truth."
+  },
+  {
+    "id": "S41",
+    "title": "Active Feature-Value Acquisition for Classifier Induction",
+    "type": "Author-hosted primary research paper",
+    "url": "https://www.cs.utexas.edu/~ml/papers/afa-tr-04.pdf",
+    "finding": "Research acquisition can target missing feature values on informative labelled instances. Correct labels remain distinct from acquired features; acquisition for improving a recognizer differs from economical inference on a new input.",
+    "location": "Abstract and sections1–2; source motivates workflow rather than proving this PDF system works.",
+    "accessed": "2026-10-17",
+    "verification": "Primary full-text paper read; adapted experimentally to manual publishing logic and heuristics, not claimed as a fitted AFA model."
+  },
+  {
+    "id": "S42",
+    "title": "PyMuPDF multiprocessing guidance",
+    "type": "Official implementation documentation",
+    "url": "https://pymupdf.readthedocs.io/en/latest/recipes-multiprocessing.html",
+    "finding": "PyMuPDF does not support concurrent multithreaded PDF access. The proposed OCR execution keeps PDF rendering on the calling thread and sends only image bytes and numbers to bounded external-recognition workers.",
+    "location": "Multiprocessing introduction and page-oriented example",
+    "accessed": "2026-10-17",
+    "verification": "Official documentation inspected before designing parallel OCR; runtime gain and output equivalence still require local qualification."
   }
 ]

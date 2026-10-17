@@ -4,7 +4,7 @@ Collection is independent of author confidence and genre. Failed reads stay in
 an explicit completeness ledger. Each new call acquires its own evidence.
 """
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import math
 import os
 import io
@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 import time
+from typing import Callable
 
 # Compatibility handle for old diagnostics; cross-call evidence is not retained.
 _CACHE = {}
@@ -237,43 +238,56 @@ def _apparatus_continuation(document, opening_plan, native, ocr):
     return list(range(last + 1, min(last + 3, 32, len(document)) + 1)), False
 
 
-def _read_region(document, task, executable):
-    """Acquire a region with a quality-driven retry, never an author-driven stop."""
+@dataclass(frozen=True)
+class _RasterRegion:
+    width: float
+    height: float
+    frames: dict
+    request_frame: Callable[[float], dict] | None = None
+
+
+def _region_scale(task):
+    width = max(0, task["clip"][2] - task["clip"][0])
+    height = max(0, task["clip"][3] - task["clip"][1])
+    line_task = task.get("reason") in {
+        "collapsed_explicit_byline",
+        "narrow_text_image",
+        "invisible_explicit_byline",
+    }
+    return min(
+        4.0 if line_task else 2.5,
+        math.sqrt((1_000_000 if line_task else 4_000_000) / max(1, width * height)),
+    )
+
+
+def _prepare_region(document, task, *, factors=None):
+    """Render on the caller thread; workers receive only PNG bytes and numbers."""
     import fitz
-    from .portable_layout import read_tsv
+    from PIL import Image, ImageOps
 
     page = document[task["page"] - 1]
     region = fitz.Rect(task["clip"])
-    line_task = task.get("reason") in {"collapsed_explicit_byline", "narrow_text_image"}
-    scale = min(
-        4.0 if line_task else 2.5,
-        math.sqrt((1_000_000 if line_task else 4_000_000) / max(1, region.get_area())),
-    )
-    attempts, readings = [], []
-    schedule = [(7 if line_task else 3, scale, task["reason"])]
-    for psm, factor, reason in schedule:
-        attempt = {"kind": "ocr", **task, "reason": reason, "psm": psm, "scale": factor}
+    scale = _region_scale(task)
+    line_task = task.get("reason") in {
+        "collapsed_explicit_byline",
+        "narrow_text_image",
+        "invisible_explicit_byline",
+    }
+    frames = {}
+    for factor in dict.fromkeys(
+        factors if factors is not None else (scale, min(2.0, scale), 2.0)
+    ):
         try:
-            if not Path(executable).is_file():
-                raise OSError("Tesseract unavailable")
             pix = page.get_pixmap(
                 matrix=fitz.Matrix(factor, factor), clip=region, alpha=False
             )
-            # Pure white pixels contain no visual lettering to OCR. This is an
-            # explicit image inspection, not an inference from an accepted name.
             if pix.samples and pix.samples.count(b"\xff") == len(pix.samples):
-                attempt.update(status="blank_region", characters=0)
-                attempts.append(attempt)
-                return [], attempts
-            from PIL import Image, ImageOps
-
+                frames[factor] = {"blank": True}
+                continue
             pixels = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
             histogram = pixels.convert("L").histogram()
             total = max(1, pix.width * pix.height)
             preprocessing = []
-            # White lettering on a dark cover needs the same contrast
-            # convention as ordinary printed text. A solid black rectangle
-            # has no light glyphs and is not silently declared a blank page.
             if (
                 sum(histogram[:90]) / total > 0.70
                 and sum(histogram[180:]) / total > 0.003
@@ -285,20 +299,68 @@ def _read_region(document, task, executable):
                 pixels = ImageOps.expand(pixels, border=border, fill="white")
                 preprocessing.append("tight_line_white_border")
             payload = io.BytesIO()
-            pixels.save(payload, format="PNG")
-            attempt["preprocessing"] = preprocessing
+            pixels.save(payload, format="PNG", compress_level=1)
+            frames[factor] = {
+                "payload": payload.getvalue(),
+                "border": border,
+                "preprocessing": preprocessing,
+            }
+        except (OSError, ValueError, RuntimeError) as error:
+            frames[factor] = {"error": str(error)}
+    return _RasterRegion(region.width, region.height, frames)
+
+
+def _read_region(document, task, executable):
+    """Read every scheduled retry without accessing PyMuPDF from OCR workers."""
+    from .portable_layout import read_tsv
+
+    prepared = (
+        document
+        if isinstance(document, _RasterRegion)
+        else _prepare_region(document, task, factors=(_region_scale(task),))
+    )
+    line_task = task.get("reason") in {
+        "collapsed_explicit_byline",
+        "narrow_text_image",
+        "invisible_explicit_byline",
+    }
+    scale = _region_scale(task)
+    attempts, readings = [], []
+    schedule = [(7 if line_task else 3, scale, task["reason"])]
+    for psm, factor, reason in schedule:
+        attempt = {"kind": "ocr", **task, "reason": reason, "psm": psm, "scale": factor}
+        try:
+            if not Path(executable).is_file():
+                raise OSError("Tesseract unavailable")
+            if factor not in prepared.frames:
+                if prepared.request_frame is not None:
+                    prepared.frames[factor] = prepared.request_frame(factor)
+                elif not isinstance(document, _RasterRegion):
+                    prepared.frames.update(
+                        _prepare_region(document, task, factors=(factor,)).frames
+                    )
+                else:
+                    raise RuntimeError("Requested OCR raster is unavailable")
+            frame = prepared.frames[factor]
+            if frame.get("error"):
+                raise RuntimeError(frame["error"])
+            if frame.get("blank"):
+                attempt.update(status="blank_region", characters=0)
+                attempts.append(attempt)
+                return [], attempts
+            attempt["preprocessing"] = frame["preprocessing"]
             result = subprocess.run(
                 [executable, "stdin", "stdout", "-l", "eng", "--psm", str(psm), "tsv"],
-                input=payload.getvalue(),
+                input=frame["payload"],
                 capture_output=True,
                 env={**os.environ, "OMP_THREAD_LIMIT": "1"},
                 timeout=10,
                 check=True,
             )
             text, lines = read_tsv(result.stdout)
-            if border:
+            if frame["border"]:
                 for line in lines:
-                    line["box"] = [value - border for value in line["box"]]
+                    line["box"] = [value - frame["border"] for value in line["box"]]
             confidences = [line["confidence"] for line in lines if "confidence" in line]
             confidence = sum(confidences) / len(confidences) if confidences else None
             block = {
@@ -306,14 +368,14 @@ def _read_region(document, task, executable):
                 "text": text,
                 "lines": lines,
                 "scale": factor,
-                "width": region.width * factor,
-                "height": region.height * factor,
+                "width": prepared.width * factor,
+                "height": prepared.height * factor,
                 "extraction": "tesseract",
                 "coordinate_space": "crop_pixels",
                 "psm": psm,
                 "ocr_word_confidence_mean": confidence,
+                "preprocessing": frame["preprocessing"],
             }
-            block["preprocessing"] = preprocessing
             readings.append(block)
             attempt.update(
                 status="read", characters=len(text), ocr_word_confidence_mean=confidence
@@ -334,23 +396,203 @@ def _read_region(document, task, executable):
         return [], attempts
     chosen = max(
         readings,
-        key=lambda reading: (
-            bool(reading["text"].strip()),
-            reading.get("ocr_word_confidence_mean") or 0,
-        ),
+        key=lambda r: (bool(r["text"].strip()), r.get("ocr_word_confidence_mean") or 0),
     )
-    alternate = next((reading for reading in readings if reading is not chosen), None)
+    alternate = next((r for r in readings if r is not chosen), None)
     if alternate is not None:
         chosen["alternate"] = alternate
     return [chosen], attempts
+
+
+def _read_regions(document, tasks, executable, *, workers):
+    """Bound both in-flight image memory and external OCR; retain plan order."""
+    from concurrent.futures import ThreadPoolExecutor
+    from queue import Empty, Queue
+    from threading import Event
+
+    workers = max(1, min(4, int(workers)))
+    with ThreadPoolExecutor(
+        max_workers=workers, thread_name_prefix="author-ocr"
+    ) as pool:
+        for offset in range(0, len(tasks), workers):
+            requests = Queue()
+            cancelled = Event()
+            pending = []
+            for task in tasks[offset : offset + workers]:
+                try:
+                    if workers == 1:
+                        readings, attempts = _read_region(document, task, executable)
+                        pending.append((task, (readings, attempts)))
+                    else:
+                        prepared = _prepare_region(
+                            document, task, factors=(_region_scale(task),)
+                        )
+
+                        def request_frame(factor, task=task):
+                            ready, response = Event(), []
+                            requests.put((task, factor, ready, response))
+                            while not ready.wait(0.05):
+                                if cancelled.is_set():
+                                    raise RuntimeError("OCR raster request cancelled")
+                            return response[0]
+
+                        prepared = replace(prepared, request_frame=request_frame)
+                        pending.append((task, prepared))
+                except (OSError, ValueError, RuntimeError) as error:
+                    pending.append(
+                        (
+                            task,
+                            (
+                                [],
+                                [
+                                    {
+                                        "kind": "ocr",
+                                        **task,
+                                        "status": "failed",
+                                        "error": str(error),
+                                    }
+                                ],
+                            ),
+                        )
+                    )
+            # Finish this bounded render batch before starting recognition.
+            # PNG encoding must not starve worker pipe draining or deadlines.
+            pending = [
+                (task, pool.submit(_read_region, result, task, executable))
+                if isinstance(result, _RasterRegion)
+                else (task, result)
+                for task, result in pending
+            ]
+            # Only a retry actually requested by recognition needs another
+            # raster. The owner services requests; workers never touch the PDF.
+            # This removes unused image encoding, not acquisition opportunities.
+            try:
+                while any(
+                    not result.done()
+                    for _, result in pending
+                    if not isinstance(result, tuple)
+                ):
+                    try:
+                        task, factor, ready, response = requests.get(timeout=0.02)
+                    except Empty:
+                        continue
+                    try:
+                        frame = _prepare_region(
+                            document, task, factors=(factor,)
+                        ).frames[factor]
+                    except (OSError, ValueError, RuntimeError) as error:
+                        frame = {"error": str(error)}
+                    response.append(frame)
+                    ready.set()
+            finally:
+                cancelled.set()
+            for task, result in pending:
+                try:
+                    readings, attempts = (
+                        result if isinstance(result, tuple) else result.result()
+                    )
+                except (OSError, ValueError, RuntimeError) as error:
+                    readings, attempts = (
+                        [],
+                        [
+                            {
+                                "kind": "ocr",
+                                **task,
+                                "status": "failed",
+                                "error": str(error),
+                            }
+                        ],
+                    )
+                yield task, readings, attempts
+
+
+def _hidden_explicit_byline_lines(page, *, require_person=True):
+    """Recover physical credit runs before mixed image-alt text sets line size."""
+    import fitz
+    from .structured_credit import _names
+
+    found = []
+    for block in page.get_text(
+        "dict", flags=fitz.TEXTFLAGS_DICT & ~fitz.TEXT_PRESERVE_IMAGES
+    )["blocks"]:
+        for line in block.get("lines", []):
+            if abs(line.get("dir", (1, 0))[0]) < 0.9:
+                continue
+            spans = line.get("spans", [])
+            for index, start in enumerate(spans):
+                if not re.match(r"^\s*(?:by|written by)(?:\s+|$)", start["text"], re.I):
+                    continue
+                selected = []
+                for span in spans[index:]:
+                    if (
+                        not 0.65 <= span["size"] / max(1, start["size"]) <= 1.5
+                        or abs(span["origin"][1] - start["origin"][1])
+                        > start["size"] * 0.4
+                        or (
+                            selected
+                            and span["bbox"][0] - selected[-1]["bbox"][2]
+                            > start["size"] * 2
+                        )
+                    ):
+                        break
+                    selected.append(span)
+                text = ""
+                for n, span in enumerate(selected):
+                    if (
+                        n
+                        and text
+                        and not text[-1].isspace()
+                        and not span["text"].startswith(" ")
+                        and (
+                            re.fullmatch(r"\s*(?:by|written by)\s*", text, re.I)
+                            or span["bbox"][0] - selected[n - 1]["bbox"][2]
+                            > start["size"] * 0.15
+                        )
+                    ):
+                        text += " "
+                    text += span["text"]
+                text = " ".join(text.split())
+                letters = sum(len(s["text"]) for s in selected)
+                hidden = sum(
+                    len(s["text"]) for s in selected if s.get("alpha", 255) == 0
+                )
+                if not 5 <= len(text) <= 120 or not letters or hidden / letters < 0.5:
+                    continue
+                if require_person and not _names(text):
+                    # Ordinary "by the window" prose does not justify this
+                    # extra production crop. Full-page OCR remains scheduled;
+                    # the laboratory can explore these additional spans too.
+                    continue
+                found.append(
+                    {
+                        "text": text,
+                        "box": [
+                            min(s["bbox"][0] for s in selected),
+                            min(s["bbox"][1] for s in selected),
+                            max(s["bbox"][2] for s in selected),
+                            max(s["bbox"][3] for s in selected),
+                        ],
+                    }
+                )
+    return found
 
 
 def collect(context):
     """Finish every planned native and image-region inspection before deciding."""
     if context.evidence_bundle is not None:
         return context
+    if context.acquisition_mode not in {"production", "lab"}:
+        raise ValueError("Unknown author acquisition mode")
+    workers = max(1, min(4, int(context.ocr_workers)))
     trace = {
-        "version": 2,
+        "version": 3,
+        "acquisition_mode": context.acquisition_mode,
+        "ocr_execution": {
+            "workers": workers,
+            "rendering": "caller_thread",
+            "recognition": "bounded_external_processes",
+            "output_order": "plan_order",
+        },
         "cross_call_cache": False,
         "native_plan": [],
         "opening_plan": [],
@@ -386,6 +628,19 @@ def collect(context):
         with fitz.open(context.path) as document:
             trace["document_page_count"] = len(document)
             pages, trace["extensions"] = _plan(document)
+            lab_pages = (
+                list(
+                    range(1, min(max(5, context.lab_page_limit), 32, len(document)) + 1)
+                )
+                if context.acquisition_mode == "lab"
+                else []
+            )
+            if lab_pages:
+                pages = sorted(set(pages) | set(lab_pages))
+                trace["lab_audit"] = {
+                    "pages": lab_pages,
+                    "basis": "Exploratory full-page OCR irrespective of native text or an author guess; extra pages are not automatically front matter",
+                }
             trace["native_plan"] = pages
             trace["opening_plan"] = sorted(
                 set(range(1, min(5, len(document)) + 1))
@@ -442,6 +697,19 @@ def collect(context):
                                 )
                     reason = text_quality(text)
                     invisible_overlay = _invisible_native_overlay(page)
+                    if invisible_overlay and number in trace["opening_plan"]:
+                        for line in _hidden_explicit_byline_lines(
+                            page, require_person=context.acquisition_mode != "lab"
+                        ):
+                            crop = (fitz.Rect(line["box"]) + (-5, -5, 5, 5)) & page.rect
+                            tasks.append(
+                                {
+                                    "page": number,
+                                    "clip": list(crop),
+                                    "reason": "invisible_explicit_byline",
+                                    "native_byline_text": line["text"],
+                                }
+                            )
                     clean_sparse_native = (
                         reason == "sparse_native"
                         and bool(text.strip())
@@ -455,6 +723,10 @@ def collect(context):
                         if reason != "usable_native"
                         else _image_regions(page, invisible_overlay=invisible_overlay)
                     )
+                    if number in lab_pages:
+                        regions = [page.rect]
+                        reason = "lab_full_page_audit"
+                        clean_sparse_native = False
                     if clean_sparse_native:
                         trace["attempts"].append(
                             {
@@ -535,9 +807,10 @@ def collect(context):
                 pending = tasks[consumed:]
                 consumed = len(tasks)
                 trace["ocr_plan"] = tasks
-                for task in pending:
+                for task, readings, attempts in _read_regions(
+                    document, pending, executable, workers=workers
+                ):
                     try:
-                        readings, attempts = _read_region(document, task, executable)
                         ocr.extend(readings)
                         trace["attempts"].extend(attempts)
                         if not readings and not any(
@@ -578,6 +851,9 @@ def collect(context):
                     trace["planning_limit_reached"] = (
                         "Continuing front matter at the 32-page opening window"
                     )
+                opening_progress = bool(
+                    set(additional_opening) - set(trace["opening_plan"])
+                )
                 additional = sorted(set(additional_opening) - set(trace["native_plan"]))
                 if additional_opening:
                     trace["opening_plan"] = sorted(
@@ -593,7 +869,7 @@ def collect(context):
                     for number in additional:
                         read_native(number)
                 stage += 1
-                if consumed == len(tasks) and not additional:
+                if consumed == len(tasks) and not additional and not opening_progress:
                     break
     except (OSError, ValueError, RuntimeError) as error:
         trace.update(complete=False, error=str(error))
@@ -606,6 +882,68 @@ def collect(context):
         samples=tuple(samples[n] for n in sorted(samples)),
         evidence_bundle={"trace": trace, "native": native, "ocr": ocr},
     )
+
+
+def _visible_byline_projections(native, regions):
+    """Bind a directly read image credit to its hidden transcription's line.
+
+    This is a labelled interpretation, never a replacement of the native record
+    or full-page OCR. No expected author is supplied to recognition.
+    """
+    from .structured_credit import _words
+
+    lines = str(native.get("text") or "").splitlines()
+    projections = []
+    for primary in regions:
+        if primary.get("reason") != "invisible_explicit_byline":
+            continue
+        for region in [primary] + (
+            [primary["alternate"]] if primary.get("alternate") else []
+        ):
+            candidates = [
+                line
+                for line in region.get("lines", [])
+                if re.match(r"^(?:by|written by)\s+", line.get("text", ""), re.I)
+                and (line.get("confidence") or 0) >= 80
+            ]
+            if len(candidates) != 1:
+                continue
+            reread = candidates[0]
+            if any(
+                re.search(r"[,;]\s*$|\b(?:and)\s*$|&\s*$", value, re.I)
+                for value in (
+                    region.get("native_byline_text", ""),
+                    reread["text"],
+                )
+            ):
+                # A crop of a promised roster continuation is not a complete
+                # credit. Keep it as acquired evidence without promoting it.
+                continue
+            target = _words(region.get("native_byline_text", ""))
+            matches = [
+                n for n, line in enumerate(lines) if target and _words(line) == target
+            ]
+            if len(matches) != 1:
+                continue
+            index = matches[0]
+            projected = list(lines)
+            projected[index] = reread["text"]
+            projections.append(
+                {
+                    **native,
+                    "text": "\n".join(projected),
+                    "extraction": "native_with_ocr_byline_projection",
+                    "direct_byline_rereads": [reread],
+                    "byline_projection": [
+                        {
+                            "native": lines[index],
+                            "visible_read": reread["text"],
+                            "clip": region["clip"],
+                        }
+                    ],
+                }
+            )
+    return projections
 
 
 def evidence_views(context):
@@ -648,7 +986,11 @@ def evidence_views(context):
                     "direct_byline_rereads": [
                         line
                         for region in chosen
-                        if region.get("reason") == "invisible_native_text_overlay"
+                        if region.get("reason")
+                        in {
+                            "invisible_native_text_overlay",
+                            "invisible_explicit_byline",
+                        }
                         for line in region.get("lines", [])
                         if re.match(
                             r"^(?:by|written by)\s+", line.get("text", ""), re.I
@@ -658,5 +1000,16 @@ def evidence_views(context):
             if not alternate or changed:
                 views.append(
                     replace(context, samples=tuple(merged[n] for n in sorted(merged)))
+                )
+        for number, sample in native.items():
+            for projection in _visible_byline_projections(
+                sample, [r for r in bundle["ocr"] if r["page"] == number]
+            ):
+                projected = dict(native)
+                projected[number] = projection
+                views.append(
+                    replace(
+                        context, samples=tuple(projected[n] for n in sorted(projected))
+                    )
                 )
     return views

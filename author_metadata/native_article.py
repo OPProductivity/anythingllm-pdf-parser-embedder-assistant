@@ -357,12 +357,22 @@ def _candidate_credit_reports(lines, width, height):
         ),
         len(following),
     )
+    # Prefix facts depend on the evidence, not the candidate or an accepted name.
+    # Compute them once instead of re-parsing every previous body line for
+    # every candidate. The previous author/affiliation-pair rule is unchanged.
+    prior_pairs, prior_roles = [], []
+    seen_pair = seen_role = False
+    for index, line in enumerate(following):
+        if index >= 2:
+            seen_pair = seen_pair or bool(
+                _INSTITUTION.search(following[index - 1]["text"])
+                and _names(following[index - 2]["text"])
+            )
+        prior_pairs.append(seen_pair)
+        prior_roles.append(seen_role)
+        seen_role = seen_role or bool(_ROLE.search(line["text"]))
     for index, first in enumerate(following[:boundary]):
-        if any(
-            _names(following[i]["text"])
-            and _INSTITUTION.search(following[i + 1]["text"])
-            for i in range(max(0, index - 1))
-        ):
+        if prior_pairs[index]:
             # A preceding author/affiliation pair belongs to the same title.
             # Its later pair is not an independent complete author roster.
             continue
@@ -382,7 +392,7 @@ def _candidate_credit_reports(lines, width, height):
                 # This is a continuation inside one physical roster, not a
                 # second independent proposal for its suffix alone.
                 continue
-        if any((_ROLE.search(v["text"]) for v in following[:index])):
+        if prior_roles[index]:
             continue
         if first["box"][1] - cluster[-1]["box"][3] > 140 or _ROLE.search(first["text"]):
             continue
@@ -413,8 +423,8 @@ def _candidate_credit_reports(lines, width, height):
                 ", "
                 if (
                     joined
-                    and _names(joined)
                     and _names(text)
+                    and _names(joined)
                     and not re.search(r"[,;&-]$", joined)
                     and not re.match(r"^(?:and|&)\b", text, re.I)
                 )
@@ -447,9 +457,9 @@ def _candidate_credit_reports(lines, width, height):
         )
         further_credit_pair = any(
             (
-                _names(v["text"])
-                and abs(v["size"] - first["size"]) <= first["size"] * 0.12
+                abs(v["size"] - first["size"]) <= first["size"] * 0.12
                 and _INSTITUTION.search(tail[i + 1]["text"])
+                and _names(v["text"])
                 for i, v in enumerate(tail[: max(0, body_start - 1)])
             )
         )

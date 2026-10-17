@@ -6,10 +6,10 @@ These priorities are not calibrated probabilities. No GROBID or reusable
 cross-request PDF/OCR evidence cache is used.
 
 proposed-variants.json contains 500 research hypotheses in 25 categories;
-sources.json records 40 publishing, metadata, accessibility and OCR sources.
+sources.json records 42 publishing, metadata, accessibility and OCR sources.
 The source register identifies provenance and verification limits. Catalogue
 entries are not 500 observed quotations or automatically qualified rules.
-The local workbook has 104 separate recorded publishing observations, all 500
+The local workbook has 122 separate recorded publishing observations, all 500
 individual trial outcomes, and uniform first-five-page visual/code comparisons
 for the historical content population. Synthetic semantic controls and actual
 PDF/OCR controls are labelled separately and failed trials are preserved.
@@ -36,3 +36,17 @@ sanitized benchmark note records the actual accepted or rejected score, test
 coverage and timing. A checkpoint commit is not a completed qualification,
 installed-app deployment or observed Desktop runtime result. The long-term
 near-760/770 objective has not been declared achieved.
+
+Lab acquisition is explicitly separate from the production default. Both use
+the same responsibility experts. Lab audits full-page images even when native
+text is healthy and can explore beyond the initial opening; those extra pages
+do not automatically become front matter. Paired results use the same manual
+ground truth and report acquisition, proposal, scoped-claim and final-verdict
+failures separately. Saved diagnostic evidence never substitutes for new-input
+production qualification.
+
+Production OCR execution renders on the caller thread, then uses at most four
+external recognition jobs. Plan order, quality retries and failure records are
+preserved. A linear prefix-fact pass replaces repeated body-name scans without
+removing candidate evidence. These mechanisms require their own qualified
+accuracy, output-equivalence and isolated latency results before integration.

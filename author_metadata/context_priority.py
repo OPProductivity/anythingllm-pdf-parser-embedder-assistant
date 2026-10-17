@@ -194,17 +194,21 @@ def infer(context, current):
                         )
                 # Role specialists share these exact native lines. Keep their
                 # text and page in the decision trace rather than a hard veto.
+                # The candidate roster does not change inside this page's
+                # region loop. Parse it once, while still assessing every line.
+                role_targets = [
+                    (report, " ".join(_words(report.get("author", ""))))
+                    for report in [current] + [item[1] for item in proposals]
+                    if _words(report.get("author", ""))
+                    and len(_names(report["author"])) == 1
+                ]
                 for group in page["groups"]:
                     if group["kind"] != "extractor_line":
                         continue
                     text = group["text"]
-                    for report in [current] + [item[1] for item in proposals]:
-                        candidate_words = _words(report.get("author", ""))
-                        if (
-                            candidate_words
-                            and len(_names(report["author"])) == 1
-                            and " ".join(candidate_words) in " ".join(_words(text))
-                        ):
+                    text_words = " ".join(_words(text)) if role_targets else ""
+                    for report, candidate_phrase in role_targets:
+                        if candidate_phrase in text_words:
                             for role, confidence in region_scores(group, page):
                                 roles.append(
                                     {
@@ -219,7 +223,8 @@ def infer(context, current):
                         r"(?i)\s*(translated by|edited by|foreword by|series editor:?|department chair:?)\s+(.{5,90})",
                         text,
                     )
-                    if match and _names(match[2]):
+                    role_names = _names(match[2]) if match else []
+                    if match and role_names:
                         role = {
                             "translated by": "translator",
                             "edited by": "editor",
@@ -227,7 +232,7 @@ def infer(context, current):
                         }.get(match[1].casefold(), "institutional_staff")
                         roles.append(
                             {
-                                "author": ", ".join(_names(match[2])),
+                                "author": ", ".join(role_names),
                                 "role": role,
                                 "confidence": 0.98,
                                 "page": index + 1,

@@ -13,6 +13,9 @@ class AuthorEvidenceContext:
     path: Path | None
     profile: DocumentProfile
     evidence_bundle: dict | None = None
+    acquisition_mode: str = "production"
+    ocr_workers: int = 4
+    lab_page_limit: int = 12
 
     def profile_evidence(self):
         pages = []
@@ -57,7 +60,17 @@ class AuthorEvidenceContext:
         return tuple(s for s in self.samples if int(s.get("page") or 0) in pages)
 
     @classmethod
-    def from_samples(cls, samples, *, title_hint="", path=None, profile=None):
+    def from_samples(
+        cls,
+        samples,
+        *,
+        title_hint="",
+        path=None,
+        profile=None,
+        acquisition_mode="production",
+        ocr_workers=4,
+        lab_page_limit=12,
+    ):
         selected = tuple(
             dict(sample) for sample in samples or [] if isinstance(sample, dict)
         )
@@ -66,4 +79,7 @@ class AuthorEvidenceContext:
             title_hint=str(title_hint or ""),
             path=Path(path) if path is not None else None,
             profile=profile or classify_document(selected, title_hint=title_hint),
+            acquisition_mode=acquisition_mode,
+            ocr_workers=ocr_workers,
+            lab_page_limit=lab_page_limit,
         )

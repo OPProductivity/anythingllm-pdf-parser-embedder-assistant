@@ -608,6 +608,106 @@ def local_credit_role_claims(proposals, assertions):
     return result
 
 
+def primary_creator_role_claims(proposals, *, kind, work_scope):
+    """Use a specialist's explicit primary/secondary title-page relation."""
+    if kind not in {"book", "generic"} or work_scope in {"chapter", "whole_issue"}:
+        return []
+    result = []
+    for proposal in proposals:
+        boundary = proposal.get("secondary_role_boundary", {})
+        if (
+            proposal.get("mechanism") != "compact_publisher_titlepage_role_order"
+            or not re.search(
+                r"\b(?:edited by|translated by)\b", boundary.get("text", ""), re.I
+            )
+            or not _names(proposal.get("author", ""))
+        ):
+            continue
+        result.append(
+            {
+                **proposal,
+                "role": "author",
+                "work": "selected work",
+                "family": "primary_creators_before_edition_role",
+                "priority": 108,
+                "basis": "The physical title-page expert separates the primary creator block from a later edition-editor or translation credit",
+            }
+        )
+    return result
+
+
+def visible_credit_truncation_claims(assertions, bundle):
+    """Visible complete role credits can explain an OCR-truncated roster.
+
+    Keep both readings. This contextual priority requires the same page, role,
+    full preceding people and an otherwise identical final surname prefix.
+    Native text has no blanket priority over OCR or a genuine different roster.
+    """
+    pages = {p["page"]: p for p in (bundle or {}).get("native", [])}
+    result = []
+    for claim in assertions:
+        if (
+            claim.get("family") != "explicit_publishing_act_span"
+            or claim.get("role") not in {"author", "editor"}
+            or "ocr" in claim.get("extraction", "")
+            or claim.get("work") != "selected work"
+        ):
+            continue
+        names = _names(claim.get("author", ""))
+        if len(names) < 2:
+            continue
+        visible = [
+            line["text"]
+            for line in pages.get(claim.get("page"), {}).get("horizontal_lines", [])
+            if line.get("visible")
+        ]
+        if not any(
+            re.search(r"\b(?:edited by|editors?|written by|authors?|by)\b", line, re.I)
+            for line in visible
+        ):
+            continue
+        words = _words(" ".join(visible))
+        roster = [_words(name) for name in names]
+        if not all(
+            any(
+                words[i : i + len(name)] == name
+                for i in range(len(words) - len(name) + 1)
+            )
+            for name in roster
+        ):
+            continue
+        for other in assertions:
+            if (
+                "ocr" not in other.get("extraction", "")
+                or other.get("page") != claim.get("page")
+                or other.get("role") != claim.get("role")
+                or other.get("work") != claim.get("work")
+            ):
+                continue
+            partial = [_words(name) for name in _names(other.get("author", ""))]
+            if len(partial) != len(roster) or partial[:-1] != roster[:-1]:
+                continue
+            short, full = partial[-1], roster[-1]
+            if (
+                len(short) != len(full)
+                or short[:-1] != full[:-1]
+                or not 3 <= len(short[-1]) <= len(full[-1]) - 2
+                or not full[-1].startswith(short[-1])
+            ):
+                continue
+            result.append(
+                {
+                    **claim,
+                    "family": "visible_complete_credit_ocr_truncation",
+                    "priority": 107,
+                    "basis": "Visible role and every complete name explain a same-page OCR truncation; a different complete surname would remain a conflict",
+                    "truncated_reading": other["author"],
+                }
+            )
+            break
+    return result
+
+
 def select(current, assertions, *, kind, work_scope):
     """Specific responsibility can overturn an incumbent; region alone cannot."""
     if work_scope == "whole_issue":
@@ -647,6 +747,7 @@ def select(current, assertions, *, kind, work_scope):
         span_family = claim["family"] in {
             "labelled_responsibility_field",
             "explicit_publishing_act_span",
+            "visible_complete_credit_ocr_truncation",
         }
         if span_family:
             if claim.get("work") != "selected work" or claim.get("priority", 0) <= 0:
@@ -689,6 +790,10 @@ def select(current, assertions, *, kind, work_scope):
             "physical_complete_email_roster",
             "physical_complete_mixed_roster",
             "physical_complete_native_roster",
+            "physical_opening_byline_before_body",
+            "primary_creators_before_edition_role",
+            "local_chapter_credit_with_repeated_running_author",
+            "visible_complete_credit_ocr_truncation",
         }:
             eligible.append(claim)
         elif kind in {"book", "generic"} and work_scope not in {
@@ -806,3 +911,50 @@ def running_chapter_claims(bundle, *, kind, work_scope):
             )
             found.append(claim)
     return found
+
+
+def opening_byline_claims(proposals, bundle, *, kind, work_scope):
+    """Bind a geometric opening credit to the abstract of the selected article."""
+    if kind != "scholarly_article" or work_scope == "whole_issue":
+        return []
+    page = next(
+        (p for p in (bundle or {}).get("native", []) if p.get("page") == 1), None
+    )
+    if page is None:
+        return []
+    result = []
+    for proposal in proposals:
+        if (
+            proposal.get("page") != 1
+            or proposal.get("mechanism") != "physical_heading_byline_body"
+        ):
+            continue
+        box = proposal.get("geometry", {}).get("byline")
+        if (
+            not isinstance(box, (list, tuple))
+            or len(box) != 4
+            or not all(isinstance(v, (int, float)) for v in box)
+        ):
+            continue
+        body = [
+            line
+            for line in page.get("horizontal_lines", [])
+            if line["box"][1] >= box[3]
+            and re.match(r"^\s*(?:abstract|summary)\b[:.]?", line["text"], re.I)
+        ]
+        if not body or not _names(proposal.get("author", "")):
+            continue
+        result.append(
+            {
+                "author": proposal["author"],
+                "role": "author",
+                "work": "selected work",
+                "page": 1,
+                "evidence": proposal["evidence"],
+                "family": "physical_opening_byline_before_body",
+                "priority": 107,
+                "source": "text_scoped_responsibility_span",
+                "basis": "Complete physical title/byline/body proposal precedes this article's abstract; later section headings cannot silently outrank it",
+            }
+        )
+    return result

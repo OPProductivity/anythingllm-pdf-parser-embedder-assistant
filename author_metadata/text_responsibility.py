@@ -54,6 +54,13 @@ def _people(value):
         return []
     value = re.sub(r"(?<=\w)[*†‡\d]+(?=\s|$)", "", value)
     value = re.sub(r"\s+(?:editors?|authors?)\.?$", "", value, flags=re.I)
+    # Spaced display dashes can separate complete people in an explicit role
+    # field. An internal surname hyphen remains part of the person's name.
+    displayed = re.split(r"\s+[–—-]\s+", value)
+    if len(displayed) > 1:
+        rosters = [_names(part) for part in displayed]
+        if all(rosters):
+            return [person for roster in rosters for person in roster]
     names = _names(value)
     if names:
         return names
@@ -71,15 +78,36 @@ def _credit(value):
     """An explicit following field bounds a complete roster, not a name prefix."""
     value = _NEXT.split(value, maxsplit=1)[0]
     value = _BOUNDARY.split(value, maxsplit=1)[0]
-    value = re.split(r"\s+[—–]\s+", value, maxsplit=1)[0]
+    # CIP physical-description shorthand follows the responsibility statement;
+    # it is not an extension of the final contributor's surname.
+    value = re.split(r"\bp[.]\s*cm[.](?=\s|$)", value, maxsplit=1, flags=re.I)[0]
+    display_parts = re.split(r"\s+[—–]\s+", value)
+    if len(display_parts) > 1 and not all(_names(part) for part in display_parts):
+        value = display_parts[0]
     # Preserve a wrapped roster within its paragraph. A blank line ends the
     # credit block, while "and Name" on the next line continues it.
+    # Display spacing does not terminate a roster after an explicit separator.
+    value = re.sub(r"([,;])(?:[ \t]*\n){2,}(?=[ \t]*[^\W\d_])", r"\1\n", value)
     value = re.sub(r"\n\s*\n(?=\s*(?:and\b|&))", "\n", value, flags=re.I)
     value = re.sub(r"(?im)(\band|&)\s*\n\s*\n", r"\1\n", value)
     value = re.split(r"\n\s*\n", value.strip(), maxsplit=1)[0]
     parts = [line.strip() for line in value.splitlines() if line.strip()]
     best, joined = [], ""
-    for line in parts:
+    from .book import _IMPRINT
+
+    for index, line in enumerate(parts):
+        if (
+            best
+            and _IMPRINT.search(line)
+            and re.search(
+                r"\b(?:group|publishing|publishers?|ltd|incorporated)\b",
+                " ".join(parts[index + 1 : index + 3]),
+                re.I,
+            )
+        ):
+            # A recognizable imprint plus adjacent corporate apparatus supplies
+            # the role boundary even when OCR merges its logo into name text.
+            break
         if re.fullmatch(r"and|&", line, re.I):
             joined += " " + line
             continue
@@ -135,6 +163,7 @@ def _claim(
         "family": family,
         "priority": priority,
         "source": "text_scoped_responsibility_span",
+        "extraction": sample.get("extraction", "native_or_supplied_text"),
     }
 
 

@@ -166,7 +166,7 @@ def test_all_scheduled_ocr_attempted_after_success_and_failure(tmp_path, monkeyp
         return SimpleNamespace(stdout=b"Amina Rao")
 
     monkeypatch.setattr(acquisition.subprocess, "run", ocr)
-    result = collect(ctx(path=path))
+    result = collect(ctx(path=path, ocr_workers=1))
     trace = result.evidence_bundle["trace"]
     assert len(called) == 4 and len(trace["ocr_plan"]) == 3
     assert [a["status"] for a in trace["attempts"] if a["kind"] == "ocr"] == [

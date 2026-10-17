@@ -79,6 +79,7 @@ def test_native_failure_gets_ocr_attempt_and_can_revise_an_early_author(
         [],
         path=path,
         title_hint="Collective Memory and Public Life",
+        ocr_workers=1,  # This control injects a synchronous PDF-reading adapter.
         profile=DocumentProfile("book", (), (), work_scope="single_work"),
     )
     result = infer_author(

@@ -444,7 +444,13 @@ def infer(context):
     )
     proposals.extend({"expert": "ocr", **report} for report in ocr)
     # Explicit local chapter evidence may challenge a parent editorial credit.
-    chapter = embedded_chapter(context, current)
+    chapter = (
+        current
+        if current.get("mechanism")
+        == "local_chapter_credit_with_repeated_running_author"
+        and len(set(current.get("corroboration_pages", []))) >= 2
+        else embedded_chapter(context, current)
+    )
     if chapter:
         proposals.append({"expert": "local_chapter_boundary", **chapter})
         current = chapter
@@ -577,12 +583,55 @@ def infer(context):
     assertions.extend(
         title_copyright_claims(proposals, context.samples, opening_pages=opening_plan)
     )
+    from .publishing_relations import (
+        opening_byline_claims,
+        primary_creator_role_claims,
+        visible_credit_truncation_claims,
+    )
+
+    assertions.extend(
+        opening_byline_claims(
+            proposals,
+            context.evidence_bundle,
+            kind=context.profile.kind,
+            work_scope=context.profile.work_scope,
+        )
+    )
+    kind, work_scope = context.profile.kind, context.profile.work_scope
+    if chapter:
+        kind, work_scope = "book_chapter", "chapter"
+        assertions = [
+            {
+                **claim,
+                "work": "parent book",
+                "priority": 0,
+                "scope_basis": "A local chapter credit and two subsequent author heads establish the selected contribution",
+            }
+            if claim.get("role") == "editor" and claim.get("work") == "selected work"
+            else claim
+            for claim in assertions
+        ]
+        assertions.append(
+            {
+                **chapter,
+                "role": "author",
+                "work": "selected chapter",
+                "family": chapter["mechanism"],
+                "priority": 116,
+            }
+        )
+    assertions.extend(
+        primary_creator_role_claims(proposals, kind=kind, work_scope=work_scope)
+    )
+    assertions.extend(
+        visible_credit_truncation_claims(assertions, context.evidence_bundle)
+    )
     before = {"author": current.get("author", ""), "source": current.get("source", "")}
     current, decision = select(
         current,
         assertions,
-        kind=context.profile.kind,
-        work_scope=context.profile.work_scope,
+        kind=kind,
+        work_scope=work_scope,
     )
     keys = {_key(p) for p in proposals if p.get("author")}
     trace = {
@@ -600,13 +649,13 @@ def infer(context):
         "decision": decision,
         "all_scheduled_experts_assessed": True,
     }
-    if current.get("mechanism") in {
+    if chapter or current.get("mechanism") in {
         "local_chapter_contributors",
         "local_chapter_with_two_later_author_heads",
     }:
         trace["scope_reconsideration"] = {
             "before": context.profile.work_scope,
             "after": "chapter",
-            "reason": current["mechanism"],
+            "reason": chapter["mechanism"] if chapter else current["mechanism"],
         }
     return {**current, "evidence_review": trace}

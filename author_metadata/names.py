@@ -187,9 +187,28 @@ def looks_like_person_name(value, title_hint="", *, allow_all_caps=True):
     candidate = normalize_author_candidate(value)
     if not candidate:
         return False
+    if candidate.count("(") != candidate.count(")"):
+        # An unfinished parenthetical span is incomplete evidence, often a
+        # continued subtitle. Do not silently certify its remaining words.
+        return False
     if len(candidate) < 5 or len(candidate) > 80:
         return False
     lowered = candidate.casefold()
+    # These unchanged, cheap grammar predicates reject ordinary prose before
+    # the more expensive role recognizers normalize the same span again.
+    if re.search(r"\d", candidate) or candidate.count(" ") > 5:
+        return False
+    words = re.findall(r"[^\W\d_][\w'.-]*", candidate, flags=re.UNICODE)
+    if len(words) < 2 or len(words) > 5:
+        return False
+    if not allow_all_caps and all(word.isupper() for word in words):
+        return False
+    capitalized = sum(
+        1 for word in words
+        if word[0].isupper() or word.casefold() in AUTHOR_NAME_PARTICLES
+    )
+    if capitalized < max(2, len(words) - 1):
+        return False
     if author_candidate_is_document_role(candidate):
         return False
     if any(term in lowered for term in AUTHOR_STOP_TERMS):
@@ -214,16 +233,9 @@ def looks_like_person_name(value, title_hint="", *, allow_all_caps=True):
     # surname.  Require a standalone protocol/identifier marker instead.
     if re.search(r"(?:https?://|\bwww\.|@|\b(?:doi|issn|url)\b)", lowered):
         return False
-    if re.search(r"\d", candidate):
-        return False
-    if candidate.count(" ") > 5:
-        return False
     # ``\w`` in Unicode mode includes letters such as Ł, É, and Ø. Exclude
     # digits/underscores explicitly so author validation remains strict while
     # not silently dropping legitimate non-ASCII personal names.
-    words = re.findall(r"[^\W\d_][\w'.-]*", candidate, flags=re.UNICODE)
-    if len(words) < 2 or len(words) > 5:
-        return False
     if any(word.casefold().rstrip(".") in AUTHOR_ORGANIZATION_TERMS for word in words):
         return False
     if any(word.casefold() in HEADING_STOPWORDS
@@ -234,15 +246,6 @@ def looks_like_person_name(value, title_hint="", *, allow_all_caps=True):
     # ``BY IAN WARD``). A generic title-block fallback cannot safely make the
     # same assumption: outlet/topic banners such as ``CATHOLIC NEWS`` were
     # otherwise appended to a real author in production metadata.
-    if not allow_all_caps and all(word.isupper() for word in words):
-        return False
-    capitalized = sum(
-        1
-        for word in words
-        if word[0].isupper() or word.casefold() in AUTHOR_NAME_PARTICLES
-    )
-    if capitalized < max(2, len(words) - 1):
-        return False
     return True
 
 
