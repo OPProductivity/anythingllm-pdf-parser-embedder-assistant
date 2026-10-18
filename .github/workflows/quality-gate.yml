@@ -27,6 +27,24 @@ jobs:
         run: python -m ruff check --force-exclude .
       - name: Core type checks
         run: python -m pyright --pythonplatform Windows
+      - name: Install pinned OCR test dependency
+        shell: pwsh
+        run: |
+          choco install tesseract --version=5.5.0.20241111 --yes --no-progress --limit-output
+          if ($LASTEXITCODE -notin @(0, 3010)) { throw 'Tesseract installation failed' }
+          $taskOcr = Join-Path $env:ProgramFiles 'Tesseract-OCR/tesseract.exe'
+          if (-not (Test-Path -LiteralPath $taskOcr)) { throw 'Tesseract executable missing' }
+          $taskVersion = & $taskOcr --version
+          if ($LASTEXITCODE -ne 0 -or $taskVersion[0] -ne 'tesseract v5.5.0.20241111') {
+            throw 'Unexpected OCR engine version'
+          }
+          $taskVersion | Write-Output
+          $taskLanguages = & $taskOcr --list-langs
+          if ($LASTEXITCODE -ne 0 -or $taskLanguages -notcontains 'eng') {
+            throw 'English OCR language data missing'
+          }
+          $taskLanguages | Write-Output
+          Split-Path -Parent $taskOcr | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - name: Offline deterministic tests
         run: python -m pytest -m offline_deterministic -q
       - name: Tracked-file secret scan
