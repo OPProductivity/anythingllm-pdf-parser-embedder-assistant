@@ -107,7 +107,8 @@
     "location": "Contributor Roles",
     "accessed": "2026-10-17",
     "verification": "Read through web search/open; PDF sources additionally downloaded and inspected when listed in external-pdf-manifest.json",
-    "quote_policy": "Finding is a short paraphrase. Proposed templates are authored hypotheses, not quotations or observed counts."
+    "quote_policy": "Finding is a short paraphrase. Proposed templates are authored hypotheses, not quotations or observed counts.",
+    "revisited": "2026-10-18: role description and authorship are not equivalent; multiple roles may belong to one contributor, and a role may have several contributors. Do not turn CRediT into a universal author-selection rule."
   },
   {
     "id": "S11",
@@ -441,5 +442,135 @@
     "location": "Multiprocessing introduction and page-oriented example",
     "accessed": "2026-10-17",
     "verification": "Official documentation inspected before designing parallel OCR; runtime gain and output equivalence still require local qualification."
+  },
+  {
+    "id": "S43",
+    "title": "NISO JATS 1.4: Contributor and contributor naming/role structures",
+    "type": "Primary publishing metadata specification",
+    "url": "https://jats.nlm.nih.gov/publishing/tag-library/1.4/element/contrib.html",
+    "finding": "Contributor records can describe authors, editors and other roles. Personal names, collective names, affiliations and on-behalf-of relationships are different structures. Names may have language or spelling alternatives; a group credit is not a list of individual people.",
+    "location": "Usage/Remarks; Related Elements; examples for collective names, on-behalf-of and name-alternatives",
+    "accessed": "2026-10-18",
+    "verification": "Official specification read directly. Used as publishing-structure evidence and manual-review guidance, not a requirement that every PDF follows JATS."
+  },
+  {
+    "id": "S44",
+    "title": "ICMJE: Defining the Role of Authors and Contributors",
+    "type": "Primary medical-journal publishing recommendations",
+    "url": "https://www.icmje.org/recommendations/browse/roles-and-responsibilities/defining-the-role-of-authors-and-contributors.html",
+    "finding": "Group bylines may include or omit personal names. Byline-linked notes distinguish author members from other collaborators. Correspondence and acknowledgement are separate functions. These medical-journal recommendations inform recognition of printed roles; their ethical criteria are not a universal parser veto.",
+    "location": "Who Is an Author; group bylines and linked member lists; Non-Author Contributors",
+    "accessed": "2026-10-18",
+    "verification": "Official guidance read directly. No author-label change or recognition-code change made from this post-freeze research."
+  },
+  {
+    "id": "S45",
+    "title": "TEI P5: Default Text Structure, front/back matter and title pages",
+    "type": "Primary text-encoding and descriptive bibliography guidance",
+    "url": "https://tei-c.org/release/doc/tei-p5-doc/en/html/DS.html",
+    "finding": "A textual unit may contain nested independent contributions; title, creator, epigraph, edition and imprint are separate functions. A byline may appear at a work’s beginning or end. Front and back placement vary, and typographic segmentation matters for title-page analysis.",
+    "location": "4.3 Grouped and Floating Texts; 4.5 Front Matter; 4.6 Title Pages; 4.7 Back Matter",
+    "accessed": "2026-10-18",
+    "verification": "Official guidance sections read directly. Post-freeze theoretical comparison, not a newly executed recognition rule."
+  },
+  {
+    "id": "S46",
+    "title": "Schema.org: author property",
+    "type": "Primary web structured-data vocabulary",
+    "url": "https://schema.org/author",
+    "finding": "The author relation accepts either a Person or an Organization and attaches to the content being credited. A person-shaped validator alone cannot represent the vocabulary’s valid collective-creator possibility.",
+    "location": "Definition; expected value types; nested BookSeries example",
+    "accessed": "2026-10-18",
+    "verification": "Official property page read directly. Structural possibility, not evidence that a visible logo alone establishes corporate authorship."
+  },
+  {
+    "id": "S47",
+    "title": "Crossref: Required, recommended, and optional metadata",
+    "type": "Primary publishing metadata registration guidance",
+    "url": "https://www.crossref.org/documentation/schema-library/required-recommended-elements/",
+    "finding": "Contributor given names are recommended rather than always supplied. Metadata needs vary by record type; series, reports and components have distinct contributor contexts. A surname-only supplied record must not be counted as recovered full given names.",
+    "location": "Contributor metadata; Book; Report / Working paper; Peer Review",
+    "accessed": "2026-10-18",
+    "verification": "Official guidance read directly. Input metadata completeness is a measurement limitation, not a reason to expand names without supporting evidence."
+  },
+  {
+    "id": "S48",
+    "title": "Corwin Author’s Guide: Front Matter",
+    "type": "Primary publisher author guidance",
+    "url": "https://resources.corwin.com/author-guide/editorial/preparing-your-manuscript/drafting-your-manuscript/front-matter",
+    "finding": "This house places forewords after contents and requests an end signature with title and affiliation. Prefaces, acknowledgments and author biographies have different functions; a short acknowledgment can be embedded in a preface. Introduction placement can vary. These conventions contrast with other house styles and cannot establish universal page-order or affiliation vetoes.",
+    "location": "Foreword; Preface; Acknowledgments; About the Author(s); Introduction",
+    "accessed": "2026-10-18",
+    "verification": "Official HTML guidance read directly during frozen14 timing; no PDF inference run. Two linked foreword samples returned404 and are not claimed inspected."
+  },
+  {
+    "id": "S49",
+    "title": "Springer Publishing Company: Guidelines for Authors",
+    "type": "Primary publisher manuscript guidance; distinct from Springer Nature",
+    "url": "https://media.springerpub.com/media/resources/Springer-Publishing_Author_and_Editor_Guidelines.pdf",
+    "finding": "Keywords may precede titles; chapter summaries may be introductions. Epigraph and table/figure source notes identify embedded works. Pedagogic boxes and production instructions require roles distinct from the main byline.",
+    "location": "PDF pp.1-2title/keywords/Introduction; p.3epigraphs; pp.4-5table/figure source notes and boxes; p.6special features",
+    "accessed": "2026-10-18",
+    "verification": "Official eight-page PDF extracted text read directly. No page rendering or new recognizer test during isolated frozen14 timing; manuscript instructions are not asserted to be universal finished-book layouts."
+  },
+  {
+    "id": "S50",
+    "title": "Corwin: Sample About the Authors",
+    "type": "Primary publisher specimen; one-page biography extract",
+    "url": "https://resources.corwin.com/sites/default/files/Sample%20About%20the%20Author.pdf",
+    "finding": "The biography subjects Harvey F. Silver and John R. Brunsting appear alongside named organizations, collaborator Richard W. Strong and prior book titles. Biography membership must follow paragraph subject and role, not all personal names in the section. The extract alone does not establish the complete creator roster of the parent book.",
+    "location": "Single PDF page, printedix; two biography paragraphs and About the Authors heading",
+    "accessed": "2026-10-18",
+    "verification": "Official specimen text read directly; visual PDF inspection and parent-book identity not claimed. Research specimen only, outside all benchmark denominators."
+  },
+  {
+    "id": "S51",
+    "title": "National Academies: workshop proceedings front matter and responsibility statement",
+    "type": "Primary publisher publication and product explanation",
+    "url": "https://www.nationalacademies.org/read/26935/chapter/1",
+    "finding": "This publication distinguishes consensus committees from workshop participants and names a rapporteur. Final content responsibility is shared by the rapporteur and institution, while reviewers, sponsors and institutional officers have other roles. Bibliographic citation and title-page responsibility need not use the same actor list.",
+    "location": "Front matter i-iv and xi",
+    "accessed": "2026-10-18",
+    "verification": "Official HTML front matter and product explanations read directly, including the responsibility statement. No PDF downloaded or visually reviewed; not added as a fresh test or relabelled benchmark source."
+  },
+  {
+    "id": "S52",
+    "title": "JATS1.4: author-note group, reprint contact and communicated-by example",
+    "type": "Primary publishing metadata specification and tagged example",
+    "url": "https://jats.nlm.nih.gov/publishing/tag-library/1.4/element/author-notes.html",
+    "finding": "Author notes can carry correspondent, address or contributor information. The example distinguishes two declared authors, a linked reprint contact and a separate communicator. A note group name does not make all named people authors, and a footnote does not exclude its linked author.",
+    "location": "Usage, related elements and Reprint and communication tagged sample",
+    "accessed": "2026-10-18",
+    "verification": "Official specification and complete tagged example read directly. Structural publishing evidence, not a claim every PDF follows JATS or a newly executed recognizer control."
+  },
+  {
+    "id": "S53",
+    "title": "JATS1.4: footnote types and custom extension",
+    "type": "Primary publishing metadata specification",
+    "url": "https://jats.nlm.nih.gov/publishing/tag-library/1.4/attribute/fn-type.html",
+    "finding": "Footnotes can express different contributor relationships, including correspondence, editing, equal contribution, prior or current affiliation, communicated-by and group membership. The schema includes custom types for meanings beyond its named list. Recognition needs role and linkage, not a closed universal footer veto.",
+    "location": "Usage, custom attribute escape hatch and permitted values",
+    "accessed": "2026-10-18",
+    "verification": "Official specification read directly. Examples guide manual hypotheses only; no measured corpus occurrence or production rule pass is claimed."
+  },
+  {
+    "id": "S54",
+    "title": "Kindle Direct Publishing: Authors and Contributors",
+    "type": "Primary self-publishing metadata guidance",
+    "url": "https://kdp.amazon.com/en_US/help/topic/G2BWJN2BY98T5PV2",
+    "finding": "The primary credit and additional contributor roles are distinct. Pen names are legitimate published identities; account identity is separate. Print and ebook setup can distribute initials, prefixes and suffixes differently, so their placement is not a universal name boundary.",
+    "location": "Authors and Contributors; format differences; pen names; multiple authors",
+    "accessed": "2026-10-18",
+    "verification": "Official help sections read directly. Used for cross-genre publishing hypotheses, not account actions, source re-identification or a new PDF trial."
+  },
+  {
+    "id": "S55",
+    "title": "Reuters: Standards and Values, datelines and bylines",
+    "type": "Primary journalistic publishing guidance",
+    "url": "https://reutersagency.com/about/standards-values/",
+    "finding": "The dateline and byline describe reporting provenance. Additional reporters can be credited at the end of the story. Attribution of material to another source and labels for opinion are separate relationships; story-end credit should not be discarded merely because it resembles footer text.",
+    "location": "Datelines and bylines; Attribution; Opinion and Analysis",
+    "accessed": "2026-10-18",
+    "verification": "Official standards read directly, including the explicit end-of-story additional-reporting instruction. These are this publisher’s conventions, not universal journalistic or academic author rules."
   }
 ]

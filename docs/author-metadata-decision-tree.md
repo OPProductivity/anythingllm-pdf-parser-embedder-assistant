@@ -1,5 +1,13 @@
 # Author metadata decision tree
 
+> Historical decision-tree snapshot. For the current complete-acquisition and
+> context-dependent responsibility architecture, see
+> [the framework](author-publishing-research/framework.txt) and
+> [the 18 October qualification](publishing-acquisition-qualification-20261018.md).
+> The older global exclusions and fixed helper caps below describe historical
+> routes and must not be read as universal publishing rules.
+
+
 The author field describes the selected work, not every named person in a PDF.
 Keep the visible interface and OCR selection independent of this policy.
 

@@ -129,17 +129,31 @@ def corroborates_filename_surname(existing_author, existing_source, native_sampl
 
 def infer_author_from_initial_pdf_pages(path: Path, title_hint="", *, page_limit=3,
                                         use_file_title_fallback=True):
-    """Fast UI suggestion, with no OCR or persisted source-text sample."""
+    """Seed a UI suggestion, then complete planned native/image acquisition.
+
+    ``page_limit`` bounds the initial seed, not the shared acquisition plan.
+    A failed seed-page read is a warning: remaining pages and OCR still run.
+    No PDF/OCR evidence is persisted for reuse by another request.
+    """
     pdf_path = Path(path)
+    sampling_errors = []
     try:
         with fitz.open(pdf_path) as doc:
             metadata = dict(doc.metadata or {})
             samples = []
-            limit = min(max(1, int(page_limit or 3)), len(doc))
-            for index in range(limit):
-                value = doc.load_page(index).get_text("text")
+
+            def read_seed_page(index):
+                try:
+                    value = doc.load_page(index).get_text("text")
+                except Exception as exc:
+                    sampling_errors.append(f"page {index + 1}: {type(exc).__name__}")
+                    return
                 if value:
                     samples.append({"page": index + 1, "text": value})
+
+            limit = min(max(1, int(page_limit or 3)), len(doc))
+            for index in range(limit):
+                read_seed_page(index)
             identity = resolve_work_identity(
                 metadata.get("title") or "", pdf_path, samples,
                 title_override=title_hint,
@@ -147,16 +161,12 @@ def infer_author_from_initial_pdf_pages(path: Path, title_hint="", *, page_limit
             )
             if limit >= 4 and identity.profile.kind == "book":
                 for index in range(limit, min(12, len(doc))):
-                    value = doc.load_page(index).get_text("text")
-                    if value:
-                        samples.append({"page": index + 1, "text": value})
+                    read_seed_page(index)
             elif identity.profile.kind == "scholarly_article" and has_editorial_opening(samples):
                 for number in dict.fromkeys((max(1, len(doc) - 1), len(doc))):
                     if number <= limit:
                         continue
-                    value = doc.load_page(number - 1).get_text("text")
-                    if value:
-                        samples.append({"page": number, "text": value})
+                    read_seed_page(number - 1)
     except Exception as exc:
         return {"author": "", "source": "error", "page": 0, "evidence": "",
                 "error": type(exc).__name__, "author_confidence": author_confidence({})}
@@ -165,9 +175,12 @@ def infer_author_from_initial_pdf_pages(path: Path, title_hint="", *, page_limit
         title_override=title_hint,
         use_file_title_fallback=use_file_title_fallback,
     )
-    report = infer_author(AuthorEvidenceContext.from_samples(
+    context = AuthorEvidenceContext.from_samples(
         samples, path=pdf_path, title_hint=identity.title, profile=identity.profile,
-    ))
+    )
+    sampling_warning = "; ".join(sampling_errors)
+    report = (infer_author(context, sampling_error=sampling_warning)
+              if sampling_warning else infer_author(context))
     context = AuthorEvidenceContext.from_samples(
         samples, path=pdf_path, title_hint=identity.title, profile=identity.profile,
     )
@@ -175,7 +188,7 @@ def infer_author_from_initial_pdf_pages(path: Path, title_hint="", *, page_limit
     report, grobid_decision = reconcile_grobid(context, report, grobid_analysis)
     resolved = resolve_author_from_metadata_and_inference(metadata.get("author") or "", report)
     resolved["grobid_agrees"] = grobid_decision == "agrees"
-    return {"author": resolved["author"], "source": resolved["source"],
+    result = {"author": resolved["author"], "source": resolved["source"],
             "page": int(report.get("page") or 0), "evidence": str(report.get("evidence") or ""),
             "work_identity": identity.as_evidence(), "author_confidence": author_confidence(resolved),
             "grobid": {"status": grobid_analysis.get("status"),
@@ -183,6 +196,9 @@ def infer_author_from_initial_pdf_pages(path: Path, title_hint="", *, page_limit
                        "title": grobid_analysis.get("title", ""),
                        "authors": [item["name"] for item in grobid_analysis.get("authors", [])]},
             }
+    if sampling_warning:
+        result["initial_sampling_warning"] = sampling_warning
+    return result
 
 
 def infer_author_from_pdf_text(path: Path, title_hint=""):

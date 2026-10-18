@@ -363,7 +363,10 @@ def _read_region(document, task, executable):
                 input=frame["payload"],
                 capture_output=True,
                 env={**os.environ, "OMP_THREAD_LIMIT": "1"},
-                timeout=10,
+                # Concurrent fresh OCR can occasionally exceed ten seconds
+                # even when the same raster normally reads in a few seconds.
+                # Keep the intended reading alive before changing segmentation.
+                timeout=30,
                 check=True,
             )
             text, lines = read_tsv(result.stdout)

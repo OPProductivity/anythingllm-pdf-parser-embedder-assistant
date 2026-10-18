@@ -1,3 +1,5 @@
+> Historical acquisition experiment. Cache behavior and measurements below describe an earlier revision. Current production independently acquires each PDF; see [the 18 October 2026 qualification](../docs/publishing-acquisition-qualification-20261018.md) for the accepted complete-acquisition path.
+
 # Complete publishing evidence before author adjudication
 
 Author selection now follows a declared acquisition plan and a review of the applicable specialists. A positive early candidate does not cancel the remaining first-five-page native or needed image/weak-text OCR tasks. Front matter and short editorial boundaries can extend acquisition. Every scheduled OCR task is attempted and failures remain in the trace. Byte-identical inputs reuse content-bound evidence; each filename still runs its own inference.
