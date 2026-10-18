@@ -111,6 +111,19 @@ def thesis_title_pages(samples):
             yield page, text
 
 
+def _scholarly_footer_citation(text):
+    """Keep the citation grammar without its whitespace-only backtracking.
+
+    Either branch of the full expression requires one of these literal cores.
+    This prerequisite changes no matches, pages, or publishing interpretations.
+    """
+    if not re.search(r"J Eng Educ\.|\d{4};\d{1,3}:\d+[-–]\d+", text, re.I):
+        return False
+    return bool(re.search(
+        r"(?im)^\s*(?:J Eng Educ\.|[A-Za-z ]+\s+\d{4};\d{1,3}:\d+[-–]\d+)", text
+    ))
+
+
 def classify_document(samples, title_hint=""):
     """Route only strongly signalled layouts; generic remains the fallback."""
     def page_number(sample):
@@ -266,7 +279,7 @@ def classify_document(samples, title_hint=""):
     )
     journal_citation_line = bool(re.search(r"(?im)^\s*[A-Z][^\n]{4,70}\s*,\s*Vol\.\s*\d+", first_head[:1200])
                                  and re.search(r"\b(?:pp\.|stable url|ISSN)\b", first_head[:1500], re.I))
-    scholarly_footer = bool(re.search(r"(?im)^\s*(?:J Eng Educ\.|[A-Za-z ]+\s+\d{4};\d{1,3}:\d+[-–]\d+)", first_text))
+    scholarly_footer = _scholarly_footer_citation(first_text)
     scholarly_footer = scholarly_footer or bool(re.search(r"\bA Journal of Feminist Cultural Studies\b", first_text, re.I))
     scholarly_footer = scholarly_footer or bool(re.search(r"(?im)^\s*new left review\s+\d+\s+(?:may|jan|mar|jul|sep|nov)", first_head[:250]))
     scholarly_footer = scholarly_footer or bool(re.search(r"(?im)^\s*(?:SPRING|SUMMER|FALL|WINTER)\s+\d{4}\s+contexts\b", "\n".join(str(s.get("text") or "")[:300] for s in opening), re.I))

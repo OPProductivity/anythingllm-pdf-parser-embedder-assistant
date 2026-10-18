@@ -14,7 +14,7 @@ class AuthorEvidenceContext:
     profile: DocumentProfile
     evidence_bundle: dict | None = None
     acquisition_mode: str = "production"
-    ocr_workers: int = 4
+    ocr_workers: int = 0
     lab_page_limit: int = 12
 
     def profile_evidence(self):
@@ -68,7 +68,7 @@ class AuthorEvidenceContext:
         path=None,
         profile=None,
         acquisition_mode="production",
-        ocr_workers=4,
+        ocr_workers=0,
         lab_page_limit=12,
     ):
         selected = tuple(

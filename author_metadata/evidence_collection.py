@@ -19,6 +19,15 @@ from typing import Callable
 _CACHE = {}
 
 
+def _ocr_worker_budget(value):
+    """Auto uses half the available logical CPUs, capped at eight jobs."""
+    requested = int(value)
+    if requested == 0:
+        available = getattr(os, "process_cpu_count", os.cpu_count)() or 1
+        requested = max(1, int(available) // 2)
+    return max(1, min(8, requested))
+
+
 def text_quality(text):
     compact = "".join(text.split())
     if not compact:
@@ -410,7 +419,7 @@ def _read_regions(document, tasks, executable, *, workers):
     from queue import Empty, Queue
     from threading import Event
 
-    workers = max(1, min(4, int(workers)))
+    workers = _ocr_worker_budget(workers)
     with ThreadPoolExecutor(
         max_workers=workers, thread_name_prefix="author-ocr"
     ) as pool:
@@ -583,7 +592,7 @@ def collect(context):
         return context
     if context.acquisition_mode not in {"production", "lab"}:
         raise ValueError("Unknown author acquisition mode")
-    workers = max(1, min(4, int(context.ocr_workers)))
+    workers = _ocr_worker_budget(context.ocr_workers)
     trace = {
         "version": 3,
         "acquisition_mode": context.acquisition_mode,
