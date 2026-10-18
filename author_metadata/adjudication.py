@@ -20,7 +20,7 @@ def infer(context):
     from .scholarly_article import _editorial_end_signature
     from .physical_work import opening_title, opening_title_hypotheses
     from .profile import classify_document
-    from .publishing_acts import embedded_chapter
+    from .publishing_acts import embedded_chapter, parent_editor_credit
     from . import structured_credit
     from .portable_book import credit_reports as book_credit_reports
     from .book_chapter import infer_reports as chapter_credit_reports
@@ -444,12 +444,26 @@ def infer(context):
     )
     proposals.extend({"expert": "ocr", **report} for report in ocr)
     # Explicit local chapter evidence may challenge a parent editorial credit.
+    parent_editor_established = any(
+        parent_editor_credit(report) for report in [current, *proposals]
+    )
     chapter = (
         current
         if current.get("mechanism")
         == "local_chapter_credit_with_repeated_running_author"
         and len(set(current.get("corroboration_pages", []))) >= 2
-        else embedded_chapter(context, current)
+        else embedded_chapter(
+            context, current, parent_editor_established=parent_editor_established
+        )
+    )
+    attempts.append(
+        {
+            "expert": "local_chapter_boundary",
+            "status": "assessed",
+            "parent_editor_evidence_seen": parent_editor_established,
+            "author": chapter.get("author", "") if chapter else "",
+            "basis": "independent parent-role evidence enables physical chapter and running-head verification; provisional author does not gate it",
+        }
     )
     if chapter:
         proposals.append({"expert": "local_chapter_boundary", **chapter})

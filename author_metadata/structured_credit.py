@@ -5,8 +5,10 @@ import unicodedata
 
 from .names import looks_like_person_name, normalize_author_candidate
 from .title_evidence import not_found
+from .lexical_scope import lexical_parse
 
 
+@lexical_parse("words")
 def _words(value):
     value = "".join(
         c
@@ -36,6 +38,7 @@ def _title_supported(visible, hint, names):
     )
 
 
+@lexical_parse("names", list_result=True)
 def _names(value):
     if re.match(r"^\s*(?:coordinated\s+by|contributing\s+authors?\s*:)", value, re.I):
         return []

@@ -90,15 +90,19 @@ def rights_claims(samples):
     return claims
 
 
-def embedded_chapter(context, current):
+def parent_editor_credit(report):
+    return report.get("source") == "text_edited_by" or bool(
+        re.search(r"\bedited\s+by\b", report.get("evidence", ""), re.I)
+    )
+
+
+def embedded_chapter(context, current, *, parent_editor_established=False):
     """A local chapter plus repeated author running heads outranks parent editors.
 
     Examine physical leaves separately, so a preceding bibliography on the left
     cannot be joined to a right-leaf chapter byline.
     """
-    parent_editor = current.get("source") == "text_edited_by" or bool(
-        re.search(r"\bedited\s+by\b", current.get("evidence", ""), re.I)
-    )
+    parent_editor = parent_editor_credit(current) or parent_editor_established
     if (
         context.path is None
         or not parent_editor

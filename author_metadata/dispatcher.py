@@ -351,7 +351,10 @@ def _infer_before_collection(context: AuthorEvidenceContext):
 def infer_author(context: AuthorEvidenceContext, *, sampling_error=""):
     from .adjudication import infer
 
-    result = infer(context)
+    from .lexical_scope import lexical_scope
+
+    with lexical_scope():
+        result = infer(context)
     if sampling_error:
         result = {**result, "initial_sampling_warning": str(sampling_error)}
     return result

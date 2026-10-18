@@ -1,4 +1,6 @@
 """Shared author name normalization and structural validation."""
+from .lexical_scope import immutable_lexical_parse
+
 import re
 import unicodedata
 from rag_pdf_tools import normalize_text
@@ -34,6 +36,7 @@ def looks_like_review_heading(value):
     )
 
 
+@immutable_lexical_parse("normalized_candidate")
 def normalize_author_candidate(value):
     # Directional formatting from PDF exports is not part of a person's name.
     candidate = normalize_text(re.sub(r"[\u202a-\u202e\u2066-\u2069]", "", value or ""))
@@ -183,6 +186,7 @@ def author_candidate_is_font_metadata(value):
     )
 
 
+@immutable_lexical_parse("person_grammar")
 def looks_like_person_name(value, title_hint="", *, allow_all_caps=True):
     candidate = normalize_author_candidate(value)
     if not candidate:
