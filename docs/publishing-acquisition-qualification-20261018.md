@@ -1,5 +1,7 @@
 # Publishing responsibility and acquisition qualification — 18 October 2026
 
+Scope correction: the table below preserves the measured historical run including one misnamed HTML input. The active PDF-only ordinary-neutral result is 310/382 (81.2%); see [the retained-metadata audit](retained-metadata-audit-20261018.md) for corrected denominators and metadata opportunity analysis. No new inference or timing run was performed for that correction.
+
 Completed acquisition now precedes authorship adjudication. Production preserves scheduled native and image evidence even after an early author proposal; the laboratory can acquire broader full-page OCR with the same responsibility experts. The accepted performance refinement preserves all recorded decisions and evidence traces from the preceding accuracy candidate while bringing aggregate metadata-inference time within the 1.7× limit.
 
 | Input condition | Baseline | Qualified candidate | Candidate accuracy |
