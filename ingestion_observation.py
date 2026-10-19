@@ -273,8 +273,11 @@ class SubmissionCommitSignal:
                 except FileNotFoundError:
                     fingerprint.append(None)
             key = (expected, tuple(fingerprint))
-            if key == self.last_key:
+            if key == self.last_key and self.complete:
                 return self.complete
+            # An unchanged size/mtime is not proof that an incomplete mapping
+            # stayed incomplete. Recheck pending commits with the same bounded
+            # read-only query; retain the fast path for completed observations.
             present = set()
             # A tiny, strictly read-only, bounded query. Busy/unavailable
             # storage is uncertainty, not an upload failure or retry license.

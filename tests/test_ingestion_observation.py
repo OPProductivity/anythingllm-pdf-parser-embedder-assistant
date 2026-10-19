@@ -63,6 +63,26 @@ def test_unchanged_mapping_does_not_repeat_sqlite_query(storage, monkeypatch):
     assert signal.observe(['custom-documents/one.json'])
 
 
+def test_pending_observation_rechecks_commit_with_unchanged_file_fingerprint(storage, monkeypatch):
+    database = storage / 'anythingllm.db'
+    initial_stat = database.stat()
+    original_stat = type(database).stat
+
+    def unchanged_stat(path, *args, **kwargs):
+        if path == database:
+            return initial_stat
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(type(database), 'stat', unchanged_stat)
+    signal = SubmissionCommitSignal(storage, 'target')
+    locations = ['custom-documents/one.json', 'custom-documents/two.json']
+    assert not signal.observe(locations)
+    with sqlite3.connect(database) as connection:
+        connection.execute('INSERT INTO workspace_documents VALUES (1, ?, ?)', (locations[1], 'two'))
+        connection.execute("INSERT INTO document_vectors VALUES ('two', 'vector-two')")
+    assert signal.observe(locations)
+
+
 def test_busy_storage_recovers_without_becoming_failure(storage):
     signal = SubmissionCommitSignal(storage, 'target')
     connection = sqlite3.connect(storage / 'anythingllm.db')
