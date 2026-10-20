@@ -1698,7 +1698,7 @@ APP_JS = """
     document.documentElement.dataset.ragConfirmPresentationBound = "true";
     document.addEventListener("click", (event) => {
       const target = event.target instanceof Element
-        ? event.target.closest("#confirm-automatic-run-button button")
+        ? event.target.closest("button#confirm-automatic-run-button, #confirm-automatic-run-button button")
         : null;
       if (target) beginConfirmPresentation(target);
     }, true);
@@ -1888,7 +1888,8 @@ APP_JS = """
       const button = host?.querySelector("button") || host;
       if (!button) continue;
       const text = (button.textContent || "").toLowerCase();
-      if (!text.includes("processing")) {
+      const processing = /^processing(?:…|\\.\\.\\.)$/.test(text.trim());
+      if (!processing) {
         delete button.dataset.ragClientConfirmPending;
         button.removeAttribute("aria-busy");
         button.classList.remove("rag-confirm-submitting");
@@ -1898,7 +1899,7 @@ APP_JS = """
       button.classList.toggle("rag-run-failed", text.includes("failed"));
       // Confirm is mounted but intentionally disabled before Review. Only the
       // accepted in-flight state should retain a bright primary appearance.
-      button.classList.toggle("rag-run-processing", text.includes("processing"));
+      button.classList.toggle("rag-run-processing", processing);
     }
   };
 
@@ -4801,18 +4802,24 @@ body.dark .automatic-run-failure {
     border: 0 !important;
     background: transparent !important;
 }
+button#automatic-process-button.rag-run-success,
+button#confirm-automatic-run-button.rag-run-success,
 #automatic-process-button button.rag-run-success,
 #confirm-automatic-run-button button.rag-run-success {
     background: #16a34a !important;
     border-color: #16a34a !important;
     color: #ffffff !important;
 }
+button#automatic-process-button.rag-run-warning,
+button#confirm-automatic-run-button.rag-run-warning,
 #automatic-process-button button.rag-run-warning,
 #confirm-automatic-run-button button.rag-run-warning {
     background: #f59e0b !important;
     border-color: #f59e0b !important;
     color: #1f2937 !important;
 }
+button#automatic-process-button.rag-run-failed,
+button#confirm-automatic-run-button.rag-run-failed,
 #automatic-process-button button.rag-run-failed,
 #confirm-automatic-run-button button.rag-run-failed {
     background: #dc2626 !important;
@@ -4821,6 +4828,8 @@ body.dark .automatic-run-failure {
 }
 /* Processing is a state label, not a disabled control. The mounted Confirm
    button is otherwise visibly inactive before Review or after a reset. */
+button#confirm-automatic-run-button.rag-run-processing,
+button#confirm-automatic-run-button.rag-run-processing:disabled,
 #confirm-automatic-run-button button.rag-run-processing,
 #confirm-automatic-run-button button.rag-run-processing:disabled {
     background: #2563eb !important;
@@ -4828,6 +4837,8 @@ body.dark .automatic-run-failure {
     color: #ffffff !important;
     opacity: 1 !important;
 }
+button#confirm-automatic-run-button.rag-confirm-submitting,
+button#confirm-automatic-run-button.rag-confirm-submitting:disabled,
 #confirm-automatic-run-button button.rag-confirm-submitting,
 #confirm-automatic-run-button button.rag-confirm-submitting:disabled {
     cursor: wait !important;
@@ -11514,8 +11525,9 @@ def batch_folder_selection_choices(manifest=None):
     return [
         (
             f"{batch_folder_relative_label(path, root)} ({file_size_label(path)}) "
-            f"({page_details.get(str(path), {}).get('pages', '?')} pages, "
-            f"{page_details.get(str(path), {}).get('ocr_label', '?')} OCR)",
+            + (f"({page_details[str(path)].get('pages', '?')} pages, "
+               f"{page_details[str(path)].get('ocr_label', '?')} OCR)"
+               if str(path) in page_details else "(pages checking…)"),
             str(path),
         )
         for path in candidates
@@ -11548,7 +11560,7 @@ def batch_folder_selected_status_html(manifest=None, selected_paths=None):
     return folder_scan_status_html(updated)
 
 
-@automatic_next_run_callback(5)
+@automatic_next_run_callback(4)
 def apply_batch_folder_file_selection(manifest=None, selected_paths=None):
     """Persist a batch subset without repainting the user's native chip list.
 
@@ -11568,6 +11580,22 @@ def apply_batch_folder_file_selection(manifest=None, selected_paths=None):
         gr.update(),
         gr.update(value=batch_folder_selected_status_html(updated, selected), visible=True),
     )
+
+
+def automatic_batch_subset_selection_update(
+    manifest, selected_paths, selection_state, viewed_run_root, pdf_files,
+    request: gr.Request = None,
+):
+    """Own a chip edit without re-emitting the browser's optimistic chip list."""
+    if automatic_lifecycle_busy():
+        return tuple(gr.update() for _ in range(10))
+    subset = apply_batch_folder_file_selection(manifest, selected_paths)
+    begun = _automatic_selection_begin_state(
+        selection_state, viewed_run_root, pdf_files, subset[0], subset[1],
+        preserve_ordinary_picker=True, force_reset=True, request=request,
+    )
+    begun[0]["preview_trigger"] = "subset"
+    return (*subset, begun[0], begun[1], *begun[3:])
 
 
 @automatic_next_run_callback(9)
@@ -11665,15 +11693,21 @@ def stream_selected_pdf_directory(path_text="", scan_requested=False):
     page_details = {}
     coverage_by_key = {}
     candidates_for_preview = manifest["pdf_candidates"]
+    manifest["selected_pdf_candidates"] = list(candidates_for_preview)
+    manifest["schema_version"] = 1
     # Header validation is intentionally quick. The visibly longer part for a
     # large folder is the all-page, read-only preview that establishes page
     # counts and likely OCR candidates. Stream that separate stage so a
     # completed 34/34 header check is never displayed as inexplicably stuck.
     if candidates_for_preview:
+        initial_selector = batch_folder_file_list_update(
+            manifest, candidates_for_preview, visible=True,
+        )
+        initial_selector["interactive"] = False
         yield (
-            gr.update(),
-            gr.update(),
-            gr.update(),
+            candidates_for_preview,
+            dict(manifest),
+            initial_selector,
             gr.update(),
             gr.update(
                 value=folder_page_preview_progress_html({
@@ -11727,10 +11761,12 @@ def stream_selected_pdf_directory(path_text="", scan_requested=False):
     candidates = manifest["pdf_candidates"]
     manifest["selected_pdf_candidates"] = list(candidates)
     has_candidates = bool(candidates)
+    final_selector = batch_folder_file_list_update(manifest, candidates, visible=has_candidates)
+    final_selector["interactive"] = True
     yield (
         candidates,
         manifest,
-        batch_folder_file_list_update(manifest, candidates, visible=has_candidates),
+        final_selector,
         gr.update(),
         gr.update(value=batch_folder_selected_status_html(manifest, candidates), visible=True),
         # A no-PDF result remains actionable: keep the folder chooser visible
@@ -12586,6 +12622,180 @@ def automatic_detected_metadata_preview(
         )
 
 
+def stream_automatic_detected_metadata_preview(
+    pdf_files,
+    folder_files,
+    current_title="",
+    current_author="",
+    current_short_label="",
+    use_file_title_fallback=True,
+    apply_batch_metadata_overrides=False,
+    folder_manifest=None,
+    selection_state=None,
+    request: gr.Request = None,
+):
+    """Publish scanning feedback and each result during one fresh inspection.
+
+    Completed HTML belongs only to this generator. No author, page text or OCR
+    evidence is retained for another selection or for the confirmed run.
+    """
+    if automatic_lifecycle_busy() or not _selection_preview_is_current(selection_state, request):
+        yield tuple(gr.update() for _ in range(6))
+        return
+    candidates, _reused = folder_manifest_candidates(folder_files, folder_manifest)
+    files = candidates or normalize_file_list(pdf_files)
+    if not files:
+        empty = detected_metadata_preview([])
+        yield (
+            *(gr.update(value="", interactive=True) for _ in range(3)),
+            *empty[3:],
+            gr.update(),
+        )
+        return
+    if (selection_state or {}).get("preview_trigger") == "subset" and not apply_batch_metadata_overrides:
+        current_title = current_author = current_short_label = ""
+    elif "metadata_user_edits" in (selection_state or {}) and not apply_batch_metadata_overrides:
+        edits = selection_state["metadata_user_edits"]
+        if not edits.get("document_label"):
+            current_title = ""
+        if not edits.get("document_author"):
+            current_author = ""
+        if not edits.get("document_short_label"):
+            current_short_label = ""
+    displayed = files[:5]
+    completed_html = []
+    field_updates = tuple(gr.update(value=value or "", interactive=False) for value in
+                          (current_title, current_author, current_short_label))
+    if len(files) > 1 and not apply_batch_metadata_overrides:
+        field_updates = tuple(gr.update(value="", interactive=False) for _ in range(3))
+    selection_note = (
+        f"{len(files)} PDF(s) selected. Previewing {len(displayed)}. "
+        "Every selected PDF will be inspected freshly after Confirm."
+    )
+    if len(files) > 1:
+        selection_note += (
+            " Shared fields apply only when the explicit batch override is enabled."
+        )
+    names_html = "<ul>" + "".join(
+        f"<li>{html.escape(Path(path).name)}</li>" for path in files
+    ) + "</ul>"
+    for index, path in enumerate(displayed):
+        if automatic_lifecycle_busy() or not _selection_preview_is_current(selection_state, request):
+            yield tuple(gr.update() for _ in range(6))
+            return
+        scanning = (
+            f"Author metadata recognition scanning… {index + 1}/{len(displayed)}: "
+            f"{Path(path).name}. {index} preview(s) complete. "
+            "Reading the planned text and OCR evidence before deciding."
+        )
+        yield (
+            *field_updates,
+            '<div class="metadata-summary" role="status" aria-live="polite">'
+            f'<div class="metadata-status">{html.escape(selection_note)}</div>'
+            f'<div class="metadata-status">{html.escape(scanning)}</div>'
+            + "".join(completed_html) + names_html + "</div>",
+            gr.update(open=True),
+            gr.update(value=automatic_selection_preparing_status_html(
+                files, [], detail=scanning,
+            ), visible=True),
+        )
+        try:
+            result = detected_metadata_preview(
+                [path], current_title, current_author, current_short_label,
+                use_file_title_fallback, apply_batch_metadata_overrides,
+            )
+            if not isinstance(result[3], str):
+                yield tuple(gr.update() for _ in range(6))
+                return
+            if len(files) == 1:
+                field_updates = result[:3]
+            completed_html.append(result[3])
+        except Exception as exc:
+            APP_LOGGER.exception("individual PDF metadata preview failed")
+            completed_html.append(
+                '<section class="metadata-file"><div class="metadata-file-name">'
+                f'{html.escape(Path(path).name)}</div><div class="metadata-status">'
+                f'Metadata preview failed: {html.escape(safe_user_error_text(exc))}. '
+                'The file remains selected for a fresh attempt after Confirm.</div></section>'
+            )
+        if automatic_lifecycle_busy() or not _selection_preview_is_current(selection_state, request):
+            yield tuple(gr.update() for _ in range(6))
+            return
+        # Publish this result before beginning another potentially slow scan.
+        completed = f"Author metadata preview: {index + 1}/{len(displayed)} complete."
+        if index + 1 == len(displayed):
+            field_updates = tuple({**update, "interactive": True} for update in field_updates)
+        yield (
+            *field_updates,
+            '<div class="metadata-summary" role="status" aria-live="polite">'
+            f'<div class="metadata-status">{html.escape(selection_note)} {completed}</div>'
+            + "".join(completed_html) + "</div>",
+            gr.update(open=True),
+            gr.update(value=automatic_selection_preparing_status_html(
+                files, [], detail=completed + (
+                    " Continuing metadata recognition."
+                    if index + 1 < len(displayed) else " Finishing selection settings."
+                ),
+            ), visible=True),
+        )
+
+
+def stream_refresh_automatic_run_estimate_for_fresh_selection(
+    pdf_files=None, folder_pdf_files=None, folder_manifest=None,
+    selection_state=None, request: gr.Request = None,
+):
+    """Make the estimate's separate wait visible without acquiring authors."""
+    def current():
+        return not automatic_lifecycle_busy() and _selection_preview_is_current(selection_state, request)
+
+    if not current():
+        yield gr.update(), gr.update()
+        return
+    yield gr.update(), gr.update(value=automatic_selection_preparing_status_html(
+        pdf_files, folder_pdf_files,
+        detail=("Calculating the processing estimate from the selected PDFs, current "
+                "settings and prior run statistics. Confirmed processing has not started."),
+    ), visible=True)
+    estimate = refresh_automatic_run_estimate_for_fresh_selection(
+        pdf_files, folder_pdf_files, folder_manifest,
+    )
+    if not current():
+        yield gr.update(), gr.update()
+        return
+    yield estimate, gr.update()
+
+
+def stream_automatic_workspace_name_preview(
+    workspace_slug, document_label, pdf_files, folder_pdf_files=None,
+    current_name="", last_suggestion=None, selection_state=None,
+    request: gr.Request = None,
+):
+    """Explain additional identity work and discard obsolete suggestions."""
+    def current():
+        return not automatic_lifecycle_busy() and _selection_preview_is_current(selection_state, request)
+
+    if not current():
+        yield tuple(gr.update() for _ in range(3))
+        return
+    files = normalize_file_list(pdf_files) + normalize_file_list(folder_pdf_files)
+    activity = gr.update()
+    if files and is_new_document_workspace_choice(workspace_slug):
+        activity = gr.update(value=automatic_selection_preparing_status_html(
+            pdf_files, folder_pdf_files,
+            detail=("Preparing the suggested workspace name. This can include additional "
+                    "author and source-identity checks; confirmed processing has not started."),
+        ), visible=True)
+    yield gr.update(), gr.update(), activity
+    result = update_new_workspace_name_control(
+        workspace_slug, document_label, pdf_files, folder_pdf_files,
+        current_name, last_suggestion,
+    )
+    if not current():
+        yield tuple(gr.update() for _ in range(3))
+        return
+    yield *result, gr.update()
+
+
 @automatic_next_run_callback(1)
 def automatic_process_button_state(pdf_files=None, folder_pdf_files=None, folder_manifest=None, processed=False):
     folder_candidates, _manifest_reused = folder_manifest_candidates(folder_pdf_files, folder_manifest)
@@ -12697,6 +12907,37 @@ def automatic_selection_preparing_status_html(pdf_files=None, folder_pdf_files=N
     })
 
 
+# Session ownership only: these tokens contain no PDF data or recognition
+# results. An older stream must not publish into a newer selection.
+SELECTION_PREVIEW_OWNERS = OrderedDict()
+SELECTION_PREVIEW_OWNERS_LOCK = threading.Lock()
+
+
+def _selection_preview_token(request):
+    session = getattr(request, "session_hash", None)
+    if not session:
+        return ""
+    token = uuid.uuid4().hex
+    with SELECTION_PREVIEW_OWNERS_LOCK:
+        SELECTION_PREVIEW_OWNERS[session] = token
+        SELECTION_PREVIEW_OWNERS.move_to_end(session)
+        while len(SELECTION_PREVIEW_OWNERS) > 512:
+            SELECTION_PREVIEW_OWNERS.popitem(last=False)
+    return token
+
+
+def _selection_preview_is_current(state, request):
+    session = getattr(request, "session_hash", None)
+    if not session:
+        return True
+    token = str((state or {}).get("preview_token") or "")
+    with SELECTION_PREVIEW_OWNERS_LOCK:
+        owner = SELECTION_PREVIEW_OWNERS.get(session)
+    # Older open browser tabs may not yet carry a token. They can proceed only
+    # until this session starts its first explicitly owned selection.
+    return owner is None if not token else owner == token
+
+
 def _automatic_selection_begin_state(
     previous_state=None,
     _viewed_run_root=None,
@@ -12707,6 +12948,7 @@ def _automatic_selection_begin_state(
     preserve_ordinary_picker=False,
     selection_not_yet_chosen=False,
     force_reset=False,
+    request=None,
 ):
     """Lock run-defining controls until a new picker selection has settled.
 
@@ -12750,6 +12992,7 @@ def _automatic_selection_begin_state(
     if (
         not force_reset
         and not selection_not_yet_chosen
+        and _selection_preview_is_current(state, request)
         and state.get("state") == "pending"
         and state.get("reset_per_run_defaults")
         and (state.get("accept_next_signature") or state.get("selection_signature") == signature)
@@ -12760,6 +13003,7 @@ def _automatic_selection_begin_state(
     if (
         not force_reset
         and not selection_not_yet_chosen
+        and _selection_preview_is_current(state, request)
         and signature
         and state.get("state") == "ready"
         and state.get("selection_signature") == signature
@@ -12772,6 +13016,8 @@ def _automatic_selection_begin_state(
         {
             "state": "pending",
             "revision": revision,
+            "preview_token": _selection_preview_token(request),
+            "metadata_user_edits": {},
             "selection_signature": "" if selection_not_yet_chosen else signature,
             "accept_next_signature": bool(selection_not_yet_chosen),
             **({"reset_per_run_defaults": True} if force_reset else {}),
@@ -12795,7 +13041,8 @@ def _automatic_selection_begin_state(
                 pdf_files,
                 folder_pdf_files,
                 detail=(
-                    "Waiting for the folder choice; PDF discovery and preview will run next"
+                    "Folder selection is preparing. Discovery, page inspection and metadata "
+                    "recognition must finish before Confirm; the folder status shows the current step."
                     if selection_not_yet_chosen
                     else "Selected files received — synchronizing the preview before Confirm becomes available"
                 ),
@@ -12811,6 +13058,7 @@ def automatic_selection_begin_state(
     pdf_files=None,
     folder_pdf_files=None,
     folder_manifest=None,
+    request: gr.Request = None,
 ):
     """Lock the ordinary picker and run controls for a direct file selection."""
     return _automatic_selection_begin_state(
@@ -12820,19 +13068,32 @@ def automatic_selection_begin_state(
         folder_pdf_files,
         folder_manifest,
         preserve_ordinary_picker=False,
+        request=request,
     )
 
 
-def automatic_retry_selection_begin_state(previous_state=None, viewed_run_root=None, pdf_files=None, folder_pdf_files=None, folder_manifest=None):
+def automatic_retry_selection_begin_state(previous_state=None, viewed_run_root=None, pdf_files=None, folder_pdf_files=None, folder_manifest=None, request: gr.Request = None):
     """An explicit retry owns a new reset even when the file paths are unchanged."""
     return _automatic_selection_begin_state(
         previous_state, viewed_run_root, pdf_files, folder_pdf_files, folder_manifest,
         preserve_ordinary_picker=bool(normalize_file_list(folder_pdf_files)), force_reset=True,
+        request=request,
     )
 
 
-def automatic_clear_selection_begin_state(previous_state=None, viewed_run_root=None, pdf_files=None, folder_pdf_files=None, folder_manifest=None):
-    result = automatic_retry_selection_begin_state(previous_state, viewed_run_root, pdf_files, folder_pdf_files, folder_manifest)
+def automatic_metadata_option_begin_state(previous_state=None, viewed_run_root=None, pdf_files=None, folder_pdf_files=None, folder_manifest=None, request: gr.Request = None):
+    """Changing a preview option preserves explicit edits for the same source."""
+    result = automatic_retry_selection_begin_state(
+        previous_state, viewed_run_root, pdf_files, folder_pdf_files, folder_manifest,
+        request=request,
+    )
+    if result[0].get("state") == "pending":
+        result[0]["metadata_user_edits"] = dict((previous_state or {}).get("metadata_user_edits") or {})
+    return result
+
+
+def automatic_clear_selection_begin_state(previous_state=None, viewed_run_root=None, pdf_files=None, folder_pdf_files=None, folder_manifest=None, request: gr.Request = None):
+    result = automatic_retry_selection_begin_state(previous_state, viewed_run_root, pdf_files, folder_pdf_files, folder_manifest, request=request)
     if result[0].get("state") == "pending" and not automatic_lifecycle_busy():
         result[0]["selection_signature"] = ""
         result[0]["accept_next_signature"] = True
@@ -12846,6 +13107,7 @@ def automatic_folder_selection_begin_state(
     folder_pdf_files=None,
     folder_manifest=None,
     picker_browser_timing=None,
+    request: gr.Request = None,
 ):
     """Start a folder-batch update without blanking the ordinary PDF picker."""
     timing = _pdf_picker_timing_start(picker_browser_timing) if picker_browser_timing is not None else None
@@ -12857,6 +13119,7 @@ def automatic_folder_selection_begin_state(
         folder_manifest,
         preserve_ordinary_picker=True,
         selection_not_yet_chosen=True,
+        request=request,
     )
     if timing is not None:
         timing["selection_callback_ms"] = round(
@@ -12866,9 +13129,12 @@ def automatic_folder_selection_begin_state(
     return result
 
 
-def automatic_selection_finish_state(selection_state, pdf_files=None, folder_pdf_files=None, folder_manifest=None):
+def automatic_selection_finish_state(selection_state, pdf_files=None, folder_pdf_files=None, folder_manifest=None, request: gr.Request = None):
     """Acknowledge that the visible selection/configuration snapshot is ready."""
     state = dict(selection_state or {})
+    if not _selection_preview_is_current(state, request):
+        # Do not replace even the State component with this obsolete revision.
+        return tuple(gr.update() for _ in range(6))
     observed_signature = automatic_selection_signature(pdf_files, folder_pdf_files, folder_manifest)
     expected_signature = str(state.get("selection_signature") or "")
     if (
@@ -25301,6 +25567,39 @@ def automatic_confirmation_payload_has_selected_pdf(values):
     )
 
 
+def mark_metadata_field_edited(field, value, selection_state):
+    """Record user intent, without retaining author or OCR evidence."""
+    state = dict(selection_state or {})
+    edits = dict(state.get("metadata_user_edits") or {})
+    edits[field] = bool(str(value or "").strip())
+    state["metadata_user_edits"] = edits
+    return state
+
+
+def metadata_field_edit_callback(field):
+    def mark(value, selection_state):
+        return mark_metadata_field_edited(field, value, selection_state)
+    return mark
+
+
+def automatic_explicit_metadata_values(selection_state, values):
+    """A preview author must not impersonate an authoritative user override."""
+    state = selection_state or {}
+    if "metadata_user_edits" not in state or len(values) < len(AUTOMATIC_RUN_FIELDS):
+        return values  # Preserve direct callers predating UI provenance.
+    values = list(values)
+    if values[AUTOMATIC_RUN_FIELDS.index("apply_batch_metadata_overrides")]:
+        return tuple(values)  # This checkbox explicitly accepts the shared values.
+    edits = state["metadata_user_edits"]
+    # Keep the displayed work title for the workspace/title contract. Author
+    # responsibility and its derived short label are freshly resolved by the
+    # preparation experts unless a person explicitly edited/accepted them.
+    for field in ("document_author", "document_short_label"):
+        if not edits.get(field):
+            values[AUTOMATIC_RUN_FIELDS.index(field)] = ""
+    return tuple(values)
+
+
 def run_automatic_from_ready_confirmation_stream(selection_state, *values, progress=gr.Progress(track_tqdm=False)):
     """Accept one visible Confirm click while preserving server-side validation.
 
@@ -25340,6 +25639,7 @@ def run_automatic_from_ready_confirmation_stream(selection_state, *values, progr
             "accepting visible Confirm payload while picker acknowledgement is stale",
             extra={"event": "automatic_confirm_selection_state_lag"},
         )
+    values = automatic_explicit_metadata_values(selection_state, values)
     yield from run_automatic_from_confirmation_stream(*values, progress=progress)
 
 
@@ -26011,8 +26311,14 @@ def detected_metadata_preview(
             continue
 
         embedded_title = meta.get("title") or ""
+        author_started = time.perf_counter()
         author_inference = infer_author_from_initial_pdf_pages(
             pdf_path, page_limit=4, use_file_title_fallback=use_file_title_fallback,
+        )
+        APP_LOGGER.info(
+            "Author metadata recognition completed in %.3fs for %s",
+            time.perf_counter() - author_started, pdf_path,
+            extra={"event": "author_metadata_preview_completed"},
         )
         work_identity = author_inference.get("work_identity") or {}
         resolved_title = resolve_title_from_metadata_or_filename(
@@ -34490,6 +34796,19 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
                 trigger_mode="always_last",
             )
+            for field, component in (
+                ("document_label", auto_label),
+                ("document_author", auto_author),
+                ("document_short_label", auto_short_label),
+            ):
+                component.input(
+                    fn=metadata_field_edit_callback(field),
+                    inputs=[component, automatic_selection_state],
+                    outputs=[automatic_selection_state],
+                    show_progress="hidden",
+                    queue=False,
+                    trigger_mode="always_last",
+                )
             # ``input`` is browser-originated for a Textbox, unlike the
             # programmatic updates above. It is therefore the reliable place
             # to distinguish an intentional workspace-name edit from a stale
@@ -34598,12 +34917,6 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 show_progress="hidden",
                 queue=False,
             ).then(
-                fn=refresh_automatic_run_estimate_for_fresh_selection,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
-                outputs=[auto_run_timing],
-                show_progress="hidden",
-                queue=False,
-            ).then(
                 fn=automatic_mode_ui_updates,
                 inputs=[auto_mode],
                 outputs=automatic_mode_ui_outputs,
@@ -34620,22 +34933,29 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 show_progress="hidden",
                 queue=False,
             ).then(
-                fn=automatic_detected_metadata_preview,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest],
-                outputs=[
-                    auto_label,
-                    auto_author,
-                    auto_short_label,
-                    auto_metadata_preview,
-                    document_metadata_section,
-                ],
+                fn=stream_automatic_detected_metadata_preview,
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest, automatic_selection_state],
+                outputs=[auto_label, auto_author, auto_short_label, auto_metadata_preview, document_metadata_section, automatic_run_activity],
                 show_progress="hidden",
+                queue=True,
+                concurrency_limit=1,
+                concurrency_id="automatic-metadata-preview",
             ).then(
-                fn=update_new_workspace_name_control,
-                inputs=[workspace_slug, auto_label, auto_pdfs, auto_folder_pdfs, new_workspace_name, new_workspace_name_auto_state],
-                outputs=[new_workspace_name, new_workspace_name_auto_state],
+                fn=stream_refresh_automatic_run_estimate_for_fresh_selection,
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state],
+                outputs=[auto_run_timing, automatic_run_activity],
                 show_progress="hidden",
-                queue=False,
+                queue=True,
+                concurrency_limit=1,
+                concurrency_id="automatic-estimate-preview",
+            ).then(
+                fn=stream_automatic_workspace_name_preview,
+                inputs=[workspace_slug, auto_label, auto_pdfs, auto_folder_pdfs, new_workspace_name, new_workspace_name_auto_state, automatic_selection_state],
+                outputs=[new_workspace_name, new_workspace_name_auto_state, automatic_run_activity],
+                show_progress="hidden",
+                queue=True,
+                concurrency_limit=1,
+                concurrency_id="automatic-workspace-preview",
             ).then(
                 fn=automatic_selection_action_states,
                 inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state],
@@ -34714,12 +35034,6 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 show_progress="hidden",
                 queue=False,
             ).then(
-                fn=deferred_pdf_inspection_preview,
-                inputs=[auto_pdfs, auto_folder_pdfs],
-                outputs=[auto_metadata_preview],
-                show_progress="hidden",
-                queue=False,
-            ).then(
                 fn=reset_automatic_run_selection_settings,
                 inputs=[workspace_slug, auto_pdfs, auto_folder_pdfs, automatic_selection_state],
                 outputs=[*fresh_run_settings_outputs, retain_detailed_evidence],
@@ -34743,6 +35057,30 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 outputs=automatic_mode_ui_outputs,
                 show_progress="hidden",
                 queue=False,
+            ).then(
+                fn=stream_automatic_detected_metadata_preview,
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest, automatic_selection_state],
+                outputs=[auto_label, auto_author, auto_short_label, auto_metadata_preview, document_metadata_section, automatic_run_activity],
+                show_progress="hidden",
+                queue=True,
+                concurrency_limit=1,
+                concurrency_id="automatic-metadata-preview",
+            ).then(
+                fn=stream_refresh_automatic_run_estimate_for_fresh_selection,
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state],
+                outputs=[auto_run_timing, automatic_run_activity],
+                show_progress="hidden",
+                queue=True,
+                concurrency_limit=1,
+                concurrency_id="automatic-estimate-preview",
+            ).then(
+                fn=stream_automatic_workspace_name_preview,
+                inputs=[workspace_slug, auto_label, auto_pdfs, auto_folder_pdfs, new_workspace_name, new_workspace_name_auto_state, automatic_selection_state],
+                outputs=[new_workspace_name, new_workspace_name_auto_state, automatic_run_activity],
+                show_progress="hidden",
+                queue=True,
+                concurrency_limit=1,
+                concurrency_id="automatic-workspace-preview",
             ).then(
                 fn=automatic_selection_finish_state,
                 inputs=[automatic_selection_state, auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
@@ -34835,34 +35173,35 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 show_progress="hidden",
                 queue=False,
             ).then(
-                fn=refresh_automatic_run_estimate_for_fresh_selection,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
-                outputs=[auto_run_timing],
-                show_progress="hidden",
-                queue=False,
-            ).then(
                 fn=automatic_mode_ui_updates,
                 inputs=[auto_mode],
                 outputs=automatic_mode_ui_outputs,
                 show_progress="hidden",
                 queue=False,
             ).then(
-                fn=folder_detected_metadata_preview,
-                inputs=[auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest],
-                outputs=[
-                    auto_label,
-                    auto_author,
-                    auto_short_label,
-                    auto_metadata_preview,
-                    document_metadata_section,
-                ],
+                fn=stream_automatic_detected_metadata_preview,
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest, automatic_selection_state],
+                outputs=[auto_label, auto_author, auto_short_label, auto_metadata_preview, document_metadata_section, automatic_run_activity],
                 show_progress="hidden",
+                queue=True,
+                concurrency_limit=1,
+                concurrency_id="automatic-metadata-preview",
             ).then(
-                fn=update_new_workspace_name_control,
-                inputs=[workspace_slug, auto_label, auto_pdfs, auto_folder_pdfs, new_workspace_name, new_workspace_name_auto_state],
-                outputs=[new_workspace_name, new_workspace_name_auto_state],
+                fn=stream_refresh_automatic_run_estimate_for_fresh_selection,
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state],
+                outputs=[auto_run_timing, automatic_run_activity],
                 show_progress="hidden",
-                queue=False,
+                queue=True,
+                concurrency_limit=1,
+                concurrency_id="automatic-estimate-preview",
+            ).then(
+                fn=stream_automatic_workspace_name_preview,
+                inputs=[workspace_slug, auto_label, auto_pdfs, auto_folder_pdfs, new_workspace_name, new_workspace_name_auto_state, automatic_selection_state],
+                outputs=[new_workspace_name, new_workspace_name_auto_state, automatic_run_activity],
+                show_progress="hidden",
+                queue=True,
+                concurrency_limit=1,
+                concurrency_id="automatic-workspace-preview",
             ).then(
                 fn=automatic_selection_action_states,
                 inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state],
@@ -34946,34 +35285,35 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 show_progress="hidden",
                 queue=False,
             ).then(
-                fn=refresh_automatic_run_estimate_for_fresh_selection,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
-                outputs=[auto_run_timing],
-                show_progress="hidden",
-                queue=False,
-            ).then(
                 fn=automatic_mode_ui_updates,
                 inputs=[auto_mode],
                 outputs=automatic_mode_ui_outputs,
                 show_progress="hidden",
                 queue=False,
             ).then(
-                fn=folder_detected_metadata_preview,
-                inputs=[auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest],
-                outputs=[
-                    auto_label,
-                    auto_author,
-                    auto_short_label,
-                    auto_metadata_preview,
-                    document_metadata_section,
-                ],
+                fn=stream_automatic_detected_metadata_preview,
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest, automatic_selection_state],
+                outputs=[auto_label, auto_author, auto_short_label, auto_metadata_preview, document_metadata_section, automatic_run_activity],
                 show_progress="hidden",
+                queue=True,
+                concurrency_limit=1,
+                concurrency_id="automatic-metadata-preview",
             ).then(
-                fn=update_new_workspace_name_control,
-                inputs=[workspace_slug, auto_label, auto_pdfs, auto_folder_pdfs, new_workspace_name, new_workspace_name_auto_state],
-                outputs=[new_workspace_name, new_workspace_name_auto_state],
+                fn=stream_refresh_automatic_run_estimate_for_fresh_selection,
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state],
+                outputs=[auto_run_timing, automatic_run_activity],
                 show_progress="hidden",
-                queue=False,
+                queue=True,
+                concurrency_limit=1,
+                concurrency_id="automatic-estimate-preview",
+            ).then(
+                fn=stream_automatic_workspace_name_preview,
+                inputs=[workspace_slug, auto_label, auto_pdfs, auto_folder_pdfs, new_workspace_name, new_workspace_name_auto_state, automatic_selection_state],
+                outputs=[new_workspace_name, new_workspace_name_auto_state, automatic_run_activity],
+                show_progress="hidden",
+                queue=True,
+                concurrency_limit=1,
+                concurrency_id="automatic-workspace-preview",
             ).then(
                 fn=automatic_selection_action_states,
                 inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state],
@@ -35059,13 +35399,19 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             )
             auto_folder_file_selector.input(
-                fn=apply_batch_folder_file_selection,
-                inputs=[auto_folder_manifest, auto_folder_file_selector],
+                fn=automatic_batch_subset_selection_update,
+                inputs=[auto_folder_manifest, auto_folder_file_selector, automatic_selection_state, automatic_viewed_run_root, auto_pdfs],
                 outputs=[
                     auto_folder_pdfs,
                     auto_folder_manifest,
                     batch_folder_selection_panel,
                     auto_folder_status,
+                    automatic_selection_state,
+                    automatic_viewed_run_root,
+                    auto_mode,
+                    confirm_automatic_run_button,
+                    cancel_automatic_run_button,
+                    automatic_run_activity,
                 ],
                 show_progress="hidden",
                 queue=False,
@@ -35080,29 +35426,21 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 show_progress="hidden",
                 queue=False,
             ).then(
-                fn=folder_detected_metadata_preview,
-                inputs=[auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest],
-                outputs=[
-                    auto_label,
-                    auto_author,
-                    auto_short_label,
-                    auto_metadata_preview,
-                    document_metadata_section,
-                ],
+                fn=stream_automatic_detected_metadata_preview,
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest, automatic_selection_state],
+                outputs=[auto_label, auto_author, auto_short_label, auto_metadata_preview, document_metadata_section, automatic_run_activity],
                 show_progress="hidden",
-                queue=False,
+                queue=True,
+                concurrency_limit=1,
+                concurrency_id="automatic-metadata-preview",
             ).then(
-                fn=update_new_workspace_name_control,
-                inputs=[workspace_slug, auto_label, auto_pdfs, auto_folder_pdfs, new_workspace_name, new_workspace_name_auto_state],
-                outputs=[new_workspace_name, new_workspace_name_auto_state],
+                fn=stream_automatic_workspace_name_preview,
+                inputs=[workspace_slug, auto_label, auto_pdfs, auto_folder_pdfs, new_workspace_name, new_workspace_name_auto_state, automatic_selection_state],
+                outputs=[new_workspace_name, new_workspace_name_auto_state, automatic_run_activity],
                 show_progress="hidden",
-                queue=False,
-            ).then(
-                fn=refresh_automatic_run_estimate_for_fresh_selection,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
-                outputs=[auto_run_timing],
-                show_progress="hidden",
-                queue=False,
+                queue=True,
+                concurrency_limit=1,
+                concurrency_id="automatic-workspace-preview",
             ).then(
                 fn=automatic_selection_action_states,
                 inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state],
@@ -35113,49 +35451,61 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 ],
                 show_progress="hidden",
                 queue=False,
-            )
-            auto_use_file_title_fallback.change(
-                fn=detected_metadata_preview,
-                inputs=[auto_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides],
-                outputs=[
-                    auto_label,
-                    auto_author,
-                    auto_short_label,
-                    auto_metadata_preview,
-                    document_metadata_section,
-                ],
-                show_progress="hidden",
-            )
-            backend_mode.change(
-                fn=extraction_backend_help,
-                inputs=[backend_mode],
-                outputs=[extraction_backend_help_box],
+            ).then(
+                fn=automatic_selection_finish_state,
+                inputs=[automatic_selection_state, auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
+                outputs=[automatic_selection_state, auto_mode, confirm_automatic_run_button, cancel_automatic_run_button, automatic_run_activity, auto_pdfs],
                 show_progress="hidden",
                 queue=False,
             )
-            refresh_metadata_button.click(
-                fn=detected_metadata_preview,
-                inputs=[auto_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides],
-                outputs=[
-                    auto_label,
-                    auto_author,
-                    auto_short_label,
-                    auto_metadata_preview,
-                    document_metadata_section,
-                ],
+            def bind_metadata_option_preview(component):
+                # User input owns a new preview. Programmatic defaults/field
+                # updates must not spawn competing recognition chains.
+                component.input(
+                    fn=automatic_metadata_option_begin_state,
+                    inputs=[automatic_selection_state, automatic_viewed_run_root, auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
+                    outputs=[automatic_selection_state, automatic_viewed_run_root, auto_pdfs, auto_mode, confirm_automatic_run_button, cancel_automatic_run_button, automatic_run_activity],
+                    show_progress="hidden",
+                    queue=False,
+                    trigger_mode="always_last",
+                ).then(
+                    fn=stream_automatic_detected_metadata_preview,
+                    inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest, automatic_selection_state],
+                    outputs=[auto_label, auto_author, auto_short_label, auto_metadata_preview, document_metadata_section, automatic_run_activity],
+                    show_progress="hidden",
+                    queue=True,
+                    concurrency_limit=1,
+                    concurrency_id="automatic-metadata-preview",
+                ).then(
+                fn=stream_refresh_automatic_run_estimate_for_fresh_selection,
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state],
+                outputs=[auto_run_timing, automatic_run_activity],
                 show_progress="hidden",
-            )
-            apply_batch_metadata_overrides.change(
-                fn=automatic_detected_metadata_preview,
-                inputs=[
-                    auto_pdfs, auto_folder_pdfs, auto_label, auto_author,
-                    auto_short_label, auto_use_file_title_fallback,
-                    apply_batch_metadata_overrides, auto_folder_manifest,
-                ],
-                outputs=[
-                    auto_label, auto_author, auto_short_label,
-                    auto_metadata_preview, document_metadata_section,
-                ],
+                queue=True,
+                concurrency_limit=1,
+                concurrency_id="automatic-estimate-preview",
+            ).then(
+                    fn=stream_automatic_workspace_name_preview,
+                    inputs=[workspace_slug, auto_label, auto_pdfs, auto_folder_pdfs, new_workspace_name, new_workspace_name_auto_state, automatic_selection_state],
+                    outputs=[new_workspace_name, new_workspace_name_auto_state, automatic_run_activity],
+                    show_progress="hidden",
+                    queue=True,
+                    concurrency_limit=1,
+                    concurrency_id="automatic-workspace-preview",
+                ).then(
+                    fn=automatic_selection_finish_state,
+                    inputs=[automatic_selection_state, auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
+                    outputs=[automatic_selection_state, auto_mode, confirm_automatic_run_button, cancel_automatic_run_button, automatic_run_activity, auto_pdfs],
+                    show_progress="hidden",
+                    queue=False,
+                )
+
+            bind_metadata_option_preview(auto_use_file_title_fallback)
+            bind_metadata_option_preview(apply_batch_metadata_overrides)
+            backend_mode.change(
+                fn=extraction_backend_help,
+                inputs=backend_mode,
+                outputs=[extraction_backend_help_box],
                 show_progress="hidden",
                 queue=False,
             )

@@ -103,6 +103,8 @@ def test_selection_acknowledgement_only_becomes_ready_after_a_file_snapshot():
     assert pending == {
         "state": "pending",
         "revision": 3,
+        "preview_token": "",
+        "metadata_user_edits": {},
         "selection_signature": "",
         "accept_next_signature": False,
     }

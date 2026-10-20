@@ -11204,8 +11204,9 @@ class PipelineCoreTests(unittest.TestCase):
             if (pdf_component["id"], "change") in dependency.get("targets", [])
         ]
         # A selection has exactly one direct owner. Its narrow chained helpers
-        # acknowledge the browser-transferred paths and restore a coherent form;
-        # authoritative inspection belongs to Confirm.
+        # acknowledge the browser-transferred paths, restore a coherent form,
+        # and stream the same supporting metadata preview as the folder route.
+        # Confirm still owns a fresh authoritative preparation.
         self.assertEqual(len(selection_dependencies), 1)
         self.assertTrue(
             str(selection_dependencies[0].get("api_name") or "").startswith(
@@ -11224,10 +11225,9 @@ class PipelineCoreTests(unittest.TestCase):
             ]
             self.assertLessEqual(len(children), 1)
             current = children[0] if children else None
-        self.assertTrue(any("deferred_pdf_inspection_preview" in name for name in chain_names))
-        self.assertFalse(any("detected_metadata_preview" in name for name in chain_names))
-        self.assertFalse(any("refresh_automatic_run_estimate" in name for name in chain_names))
-        self.assertFalse(any("update_new_workspace_name_control" in name for name in chain_names))
+        self.assertTrue(any("stream_automatic_detected_metadata_preview" in name for name in chain_names))
+        self.assertTrue(any("refresh_automatic_run_estimate" in name for name in chain_names))
+        self.assertTrue(any("stream_automatic_workspace_name_preview" in name for name in chain_names))
 
     def test_direct_picker_does_not_read_pdf_before_confirm_without_folder_batch(self):
         import rag_pdf_gradio_app as app
