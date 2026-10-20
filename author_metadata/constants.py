@@ -192,6 +192,7 @@ POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES = {
 
 
 TRUSTED_AUTHOR_INFERENCE_SOURCES = POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES | {
+    "text_metadata_corroborated_creator",
     "text_scoped_responsibility_span",
     "text_role_scoped_creator",
     "text_work_rights_credit",

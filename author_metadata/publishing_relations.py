@@ -794,6 +794,8 @@ def select(current, assertions, *, kind, work_scope):
             "primary_creators_before_edition_role",
             "local_chapter_credit_with_repeated_running_author",
             "visible_complete_credit_ocr_truncation",
+            "embedded_creator_with_visible_responsibility",
+            "embedded_bibliography_with_printed_parent_credit",
         }:
             eligible.append(claim)
         elif kind in {"book", "generic"} and work_scope not in {

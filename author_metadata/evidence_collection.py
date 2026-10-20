@@ -633,11 +633,20 @@ def collect(context):
 
     started = time.monotonic()
     native, ocr = [], []
+    embedded_metadata = {}
     try:
         executable = (
             shutil.which("tesseract") or r"C:\Program Files\Tesseract-OCR\tesseract.exe"
         )
         with fitz.open(context.path) as document:
+            from .embedded_metadata import read as read_embedded_metadata
+
+            embedded_metadata = read_embedded_metadata(document)
+            trace["embedded_metadata"] = {
+                "status": "partial" if embedded_metadata["diagnostics"] else "read",
+                "diagnostics": embedded_metadata["diagnostics"],
+                "scope": "optional embedded fields; native/image completeness is tracked separately",
+            }
             trace["document_page_count"] = len(document)
             pages, trace["extensions"] = _plan(document)
             lab_pages = (
@@ -892,7 +901,8 @@ def collect(context):
     return replace(
         context,
         samples=tuple(samples[n] for n in sorted(samples)),
-        evidence_bundle={"trace": trace, "native": native, "ocr": ocr},
+        evidence_bundle={"trace": trace, "native": native, "ocr": ocr,
+                         "embedded_metadata": embedded_metadata},
     )
 
 

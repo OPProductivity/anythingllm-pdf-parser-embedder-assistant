@@ -640,6 +640,14 @@ def infer(context):
     assertions.extend(
         visible_credit_truncation_claims(assertions, context.evidence_bundle)
     )
+    from .embedded_credit_experts import assess as assess_embedded_credits
+
+    embedded_proposals, embedded_attempts, embedded_assertions = assess_embedded_credits(
+        context, views
+    )
+    proposals.extend(embedded_proposals)
+    attempts.extend(embedded_attempts)
+    assertions.extend(embedded_assertions)
     before = {"author": current.get("author", ""), "source": current.get("source", "")}
     current, decision = select(
         current,
