@@ -48,7 +48,52 @@ def _bibliography(raw):
             "publisher": publisher.replace(",", " ")}
 
 
-def assess(context, views):
+def _reconcile_roles(assertions, responsibility_claims, attempts):
+    """An embedded hypothesis must answer later role evidence, not hide it.
+
+    A secondary role does not prohibit authorship. Without a separately scoped
+    primary-author act, however, the weaker name/title/ownership conjunction
+    cannot settle an explicit competing role. Already established local author
+    and editor claims remain available to the ordinary adjudicator.
+    """
+    secondary_roles = {"translator", "translated", "translation", "editor",
+                       "series_editor", "foreword_contributor", "designer",
+                       "photographer", "advisor", "dedicatee"}
+    primary_families = {
+        "labelled_responsibility_field", "explicit_publishing_act_span",
+        "identification_right", "author_rights_asserted",
+        "person_asserts_moral_right", "moral_rights_as_author",
+        "attribution_as_author_right", "authorship_attributed_to",
+        "author_role_and_attribution_right", "primary_creators_before_edition_role",
+        "local_byline_with_separate_translation_credit",
+    }
+    kept = []
+    for assertion in assertions:
+        people = {_words(n) for n in _names(assertion["author"])}
+        related = [c for c in responsibility_claims
+                   if c.get("work") not in {"other work", "cited work", "reviewed book"}
+                   and people.intersection(_words(n) for n in _names(c.get("author", "")))]
+        conflicts = [c for c in related if c.get("role") in secondary_roles]
+        primary = [c for c in related if c.get("role") == "author"
+                   and c.get("work") in {"selected work", "selected chapter", "selected article",
+                                         "current book or parent work"}
+                   and (c.get("family") in primary_families
+                        or c.get("family") == "local_explicit_byline"
+                        and re.search(r"(?:^|/|\n)\s*(?:written\s+by\b|by\b|authors?\s*:)",
+                                      c.get("evidence", ""), re.I))]
+        supported = not conflicts or bool(primary)
+        if conflicts:
+            attempts.append({"expert": "embedded_role_reconciliation", "status": "assessed",
+                             "author": assertion["author"], "supported": supported,
+                             "competing_roles": conflicts, "primary_author_acts": primary,
+                             "reason": "Independent selected-work authorship supports a dual role" if primary
+                             else "Explicit secondary responsibility remains unresolved; withhold the embedded author hypothesis"})
+        if supported:
+            kept.append(assertion)
+    return kept
+
+
+def assess(context, views, *, responsibility_claims=None):
     """Return proposals, expert assessments, and separately supported claims.
 
     Embedded credits alone never create an eligible responsibility claim. All
@@ -144,4 +189,15 @@ def assess(context, views):
                                "priority": 101, "source": "text_metadata_corroborated_creator",
                                "parent_title": bibliography["title"], "minimal_divider": divider,
                                "basis": "An authored parent export is corroborated on the actual pages; local contribution and secondary-role claims retain priority"})
+    if assertions and responsibility_claims is None:
+        # Standalone expert callers need the same later-role inspection. The
+        # production coordinator supplies its already collected shared claims.
+        from .publishing_relations import claims
+        responsibility_claims = []
+        for view in views:
+            found, _ = claims(view.samples, kind=view.profile.kind,
+                              work_scope=view.profile.work_scope,
+                              opening_pages={p["page"] for p in view.opening_pages})
+            responsibility_claims.extend(found)
+    assertions = _reconcile_roles(assertions, responsibility_claims or [], attempts)
     return proposals, attempts, assertions

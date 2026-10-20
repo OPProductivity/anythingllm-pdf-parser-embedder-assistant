@@ -47,6 +47,60 @@ def test_named_copyright_without_opening_byline_is_insufficient():
     assert not assess(ctx, [ctx])[2]
 
 
+def test_later_translation_role_is_not_discarded_after_opening_corroboration():
+    ctx = context("Ethics of the oceans\nCelia Rivers\n© 2025 Rivers", author="Celia Rivers",
+                  title="Ethics of the oceans")
+    ctx = replace(ctx, samples=(*ctx.samples, {"page": 3, "text": "Translation by Celia Rivers"}))
+    proposals, attempts, assertions = assess(ctx, [ctx])
+    assert proposals and not assertions
+    reconciliation = next(a for a in attempts if a["expert"] == "embedded_role_reconciliation")
+    assert reconciliation["competing_roles"][0]["page"] == 3
+    assert not reconciliation["supported"]
+
+
+def test_shared_later_ocr_role_is_reconciled_with_the_native_hypothesis():
+    ctx = context("Ethics of the oceans\nCelia Rivers\n© 2025 Rivers", author="Celia Rivers",
+                  title="Ethics of the oceans")
+    ocr = replace(ctx, samples=({"page": 4, "text": "Translated by Celia Rivers"},))
+    assert not assess(ctx, [ctx, ocr])[2]
+
+
+def test_independent_selected_authorship_can_establish_a_dual_role():
+    ctx = context("Ethics of the oceans\nCelia Rivers\n© 2025 Rivers", author="Celia Rivers",
+                  title="Ethics of the oceans")
+    roles = [
+        {"author": "Celia Rivers", "role": "translator", "work": "nested or related contribution",
+         "page": 3, "family": "explicit_role_label", "evidence": "Translation by Celia Rivers"},
+        {"author": "Celia Rivers", "role": "author", "work": "selected work", "page": 4,
+         "family": "explicit_publishing_act_span", "evidence": "Written by Celia Rivers"},
+    ]
+    _, attempts, assertions = assess(ctx, [ctx], responsibility_claims=roles)
+    assert assertions
+    assert next(a for a in attempts if a["expert"] == "embedded_role_reconciliation")["supported"]
+
+
+def test_explicitly_other_work_role_does_not_veto_selected_author():
+    ctx = context("Ethics of the oceans\nCelia Rivers\n© 2025 Rivers", author="Celia Rivers",
+                  title="Ethics of the oceans")
+    unrelated = {"author": "Celia Rivers", "role": "translator", "work": "cited work",
+                 "page": 3, "evidence": "Translation of a different book"}
+    assert assess(ctx, [ctx], responsibility_claims=[unrelated])[2]
+
+
+def test_coordinator_supplies_later_roles_before_embedded_claim_selection():
+    from author_metadata.adjudication import infer
+
+    ctx = context("Ethics of the oceans\nCelia Rivers\n© 2025 Rivers", author="Celia Rivers",
+                  title="Ethics of the oceans")
+    ctx = replace(ctx, samples=(*ctx.samples, {"page": 3, "text": "Translation by Celia Rivers"}))
+    result = infer(ctx)
+    trace = result["evidence_review"]
+    assert any(c["role"] == "translator" and c["page"] == 3 for c in trace["claims"])
+    assert not any(c["family"].startswith("embedded_") for c in trace["claims"])
+    assert any(a["expert"] == "embedded_role_reconciliation" and not a["supported"]
+               for a in trace["expert_attempts"])
+
+
 def bibliography(surname="Rivers", given="Celia", title="A history of oceans"):
     return f"{surname},,{given}.,{title.replace(' ', ',')},,Harbor,Press,,2025.,ProQuest,Ebook,Central,,http://example.invalid"
 

@@ -643,7 +643,7 @@ def infer(context):
     from .embedded_credit_experts import assess as assess_embedded_credits
 
     embedded_proposals, embedded_attempts, embedded_assertions = assess_embedded_credits(
-        context, views
+        context, views, responsibility_claims=assertions
     )
     proposals.extend(embedded_proposals)
     attempts.extend(embedded_attempts)

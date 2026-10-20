@@ -201,7 +201,7 @@ def map_atoms(atoms, page_number, width, height, title_hint=""):
             fields.append({"role": "abstract", "group_id": group["id"], "reason": "heading"})
         if re.search(r"(?i)(?:©|\bcopyright\b|\ball rights reserved\b)", content):
             fields.append({"role": "copyright", "group_id": group["id"], "reason": "printed_notice"})
-        if has_author_affiliation_hint(content) and group["kind"] in {"gap_split_line", "aligned_line"}:
+        if group["kind"] in {"gap_split_line", "aligned_line"} and has_author_affiliation_hint(content):
             fields.append({"role": "affiliation", "group_id": group["id"],
                            "reason": "institution_or_department_line"})
         if re.search(r"(?i)\b(?:doi\s*:|https?://doi\.org/)\s*10\.\d", content):

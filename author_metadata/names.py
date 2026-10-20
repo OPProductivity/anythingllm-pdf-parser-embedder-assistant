@@ -9,6 +9,10 @@ from .constants import (
     AUTHOR_ORGANIZATION_TERMS, AUTHOR_NON_PERSON_BYLINE_TERMS, HEADING_STOPWORDS,
 )
 
+_AFFILIATION_PATTERN = re.compile(
+    r"\b(?:" + "|".join(re.escape(hint) for hint in AUTHOR_AFFILIATION_HINTS) + r")\b"
+)
+
 
 def looks_like_review_heading(value):
     """Recognize a review-genre heading, not any title mentioning a review."""
@@ -288,7 +292,7 @@ def has_author_affiliation_hint(value, *, max_chars=180):
     if not normalized or len(normalized) > max(40, int(max_chars or 180)):
         return False
     lowered = normalized.casefold()
-    return any(re.search(rf"\b{re.escape(hint)}\b", lowered) for hint in AUTHOR_AFFILIATION_HINTS)
+    return bool(_AFFILIATION_PATTERN.search(lowered))
 
 
 def split_author_line_candidates(line, title_hint="", *, allow_all_caps=True, require_complete=False):
