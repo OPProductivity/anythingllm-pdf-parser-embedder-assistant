@@ -1,5 +1,7 @@
 # Retained-metadata audit and PDF-only scope — 18 October 2026
 
+Follow-up: [the field-specific audit and experimental creator qualification](embedded-creator-qualification-20261020.md) separates Info/XMP namespaces and records seven experimental neutral recoveries. The recognition candidate failed runtime and a later-role control and remains outside main. The remainder of this note preserves the earlier audit state.
+
 The ordinary neutral-filename condition preserves the PDF's internal metadata; the current recognition architecture does not fully exploit that metadata as authorship evidence. The production pipeline passes Info Title into work identity, constructs author evidence from page samples, and sends Info Author to a resolver that explicitly treats it as diagnostic-only. XMP creator and structured bibliographic Keywords are not supplied to these authorship experts. This audit changes no runtime recognition rule.
 
 ## PDF-only results
