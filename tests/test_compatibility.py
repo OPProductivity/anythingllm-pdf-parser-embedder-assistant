@@ -38,6 +38,41 @@ def _desktop_version(version):
     return version, [Evidence("fixture", "desktop", version, "fixture")], []
 
 
+def test_busy_schema_is_unavailable_without_claiming_columns_are_missing(tmp_path, monkeypatch):
+    database = tmp_path / 'anythingllm.db'
+    create_profile_database(database)
+    original_connect = sqlite3.connect
+    blocker = original_connect(database)
+    monkeypatch.setattr(anythingllm_compatibility.sqlite3, 'connect',
+                        lambda *a, **kw: original_connect(*a, **(kw | {'timeout': 0.01})))
+    monkeypatch.setattr(anythingllm_compatibility, '_desktop_version', lambda _exe: _desktop_version('1.17.0'))
+    monkeypatch.setattr(anythingllm_compatibility, '_desktop_package_identity',
+                        lambda *_a, **_kw: ({'app_asar_sha256': OBSERVED_CANDIDATE_PACKAGE_FINGERPRINTS['1.17.0']}, [], []))
+    try:
+        blocker.execute('BEGIN EXCLUSIVE')
+        result = characterize(tmp_path)
+        assert result['storage_schema_status'] == 'busy'
+        assert result['missing_required_columns'] == {}
+        assert 'sqlite_schema_busy' in result['errors']
+        for capability in ['can_upload_native_metadata', 'can_create_workspace', 'can_write_sqlite_settings']:
+            assert result['capabilities'][capability]['status'] != 'supported'
+    finally:
+        blocker.close()
+    assert characterize(tmp_path)['storage_schema_status'] == 'matched'
+
+
+def test_a_different_schema_error_is_not_reported_as_database_busy(tmp_path, monkeypatch):
+    database = tmp_path / 'anythingllm.db'
+    database.write_bytes(b'fixture')
+
+    def broken(*_a, **_kw):
+        raise sqlite3.OperationalError('unrecognized token in schema')
+
+    monkeypatch.setattr(anythingllm_compatibility.sqlite3, 'connect', broken)
+    _, _, errors = anythingllm_compatibility._sqlite_schema(database)
+    assert errors == ['sqlite_schema_error:OperationalError']
+
+
 def test_recognized_profile_grants_only_filesystem_proven_capabilities(tmp_path, monkeypatch):
     monkeypatch.setattr(anythingllm_compatibility, "_desktop_version", lambda _path: _desktop_version("1.14.2"))
     (tmp_path / ".env").write_text("EMBEDDING_ENGINE='openrouter'\n", encoding="utf-8")

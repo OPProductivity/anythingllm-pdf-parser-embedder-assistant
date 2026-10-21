@@ -2,6 +2,7 @@
 
 import os
 import tempfile
+from pathlib import Path
 
 
 _PROFILE_ENV = "ANYTHINGLLM_PDF_ASSISTANT_HOME"
@@ -16,6 +17,12 @@ def pytest_configure(config):
         prefix="pdf-assistant-pytest-", ignore_cleanup_errors=True
     )
     os.environ[_PROFILE_ENV] = config._pdf_test_profile.name
+    # The app profile and Desktop's default SQLite storage are separate roots.
+    # Collection-time capability/ETA reads must not inspect or lock the live DB.
+    config._pdf_previous_roaming = os.environ.get("APPDATA")
+    roaming = Path(config._pdf_test_profile.name) / "roaming"
+    roaming.mkdir()
+    os.environ["APPDATA"] = str(roaming)
 
 
 def pytest_unconfigure(config):
@@ -27,4 +34,9 @@ def pytest_unconfigure(config):
         os.environ.pop(_PROFILE_ENV, None)
     else:
         os.environ[_PROFILE_ENV] = previous
+    roaming = config._pdf_previous_roaming
+    if roaming is None:
+        os.environ.pop("APPDATA", None)
+    else:
+        os.environ["APPDATA"] = roaming
     profile.cleanup()

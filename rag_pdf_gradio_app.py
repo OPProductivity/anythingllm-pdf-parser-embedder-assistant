@@ -10852,6 +10852,27 @@ def automatic_native_mutation_compatibility_report(
     }
 
 
+def native_mutation_failure_explanation(compatibility_report):
+    """Distinguish an unavailable schema read from an unsupported package."""
+    report = compatibility_report or {}
+    characterization = report.get("characterization") or {}
+    if (characterization.get("storage_schema_status") == "busy"
+            or "sqlite_schema_busy" in (characterization.get("errors") or [])):
+        return (
+            "AnythingLLM database is busy",
+            ["The read-only compatibility check could not acquire the SQLite read lock.",
+             "This does not establish a package mismatch or missing database columns; workspace creation and upload remain blocked for this attempt."],
+            ["Let current chat, indexing or database activity finish, then retry. A Desktop restart requires confirming that those activities are idle."],
+        )
+    blocked = list(report.get("blocked_capabilities") or [])
+    return (
+        "Installed AnythingLLM mutation contract is not qualified",
+        ["The installed Desktop package or storage schema has not been proven compatible with workspace creation and upload.",
+         "Blocked capability: " + (", ".join(blocked) if blocked else str(report.get("reason") or "unknown"))],
+        ["Use local-files-only mode until this exact AnythingLLM build is characterized."],
+    )
+
+
 def compact_native_mutation_authority(compatibility_report):
     """Return the redacted batch authority copied into preparation workers."""
     report = dict(compatibility_report or {})
@@ -11379,6 +11400,38 @@ def pdf_picker_page_details(paths=None, *, retain_for_batch=False):
     return details
 
 
+def _folder_paths_for_uploaded_copies(direct_paths, folder_paths):
+    """Map exact same-name uploads to existing paths; keep named aliases."""
+    by_name_size = {}
+    for raw in folder_paths:
+        path = Path(raw)
+        try:
+            by_name_size.setdefault((path.name.casefold(), path.stat().st_size), []).append(raw)
+        except OSError:
+            continue
+    digests = {}
+
+    def digest(raw):
+        if raw not in digests:
+            digests[raw] = sha256_file(Path(raw))
+        return digests[raw]
+
+    mapped = []
+    for raw in direct_paths:
+        path = Path(raw)
+        canonical = raw
+        try:
+            for existing in by_name_size.get((path.name.casefold(), path.stat().st_size), []):
+                if raw == existing or digest(raw) == digest(existing):
+                    canonical = existing
+                    break
+        except OSError:
+            # Identity uncertainty keeps the source for ordinary validation.
+            canonical = raw
+        mapped.append(canonical)
+    return unique_local_path_strings(mapped)
+
+
 def merge_uploaded_pdfs_into_folder_batch(pdf_files=None, folder_manifest=None):
     """Fold a new ordinary-picker selection into an existing folder batch.
 
@@ -11389,21 +11442,28 @@ def merge_uploaded_pdfs_into_folder_batch(pdf_files=None, folder_manifest=None):
     direct_paths = [str(path) for path in inspect_uploaded_pdf_candidates(pdf_files).get("pdf_candidates", [])]
     manifest = dict(folder_manifest or {}) if isinstance(folder_manifest, dict) else {}
     folder_paths = [str(path) for path in clean_downloadable_paths(manifest.get("pdf_candidates") or [])]
-    if not direct_paths or not folder_paths:
+    if not folder_paths:
         return (
             gr.update(), [], manifest, gr.update(), gr.update(), gr.update(),
             gr.update(visible=bool(direct_paths)),
         )
-
-    candidates = unique_local_path_strings([*folder_paths, *direct_paths])
     selected_before = [str(path) for path in clean_downloadable_paths(
         manifest.get("selected_pdf_candidates")
         if "selected_pdf_candidates" in manifest
         else folder_paths
     )]
+    if not direct_paths:
+        # A File value cleared after a merge is an acknowledgement, not a
+        # request to discard the independent folder selection.
+        return (gr.update(), selected_before, manifest, gr.update(), gr.update(),
+                gr.update(), gr.update(visible=False))
+    direct_paths = _folder_paths_for_uploaded_copies(direct_paths, folder_paths)
+    candidates = unique_local_path_strings([*folder_paths, *direct_paths])
     selected = unique_local_path_strings([*selected_before, *direct_paths])
     page_details = dict(manifest.get("picker_page_details") or {})
-    page_details.update(pdf_picker_page_details(direct_paths, retain_for_batch=True))
+    new_paths = [path for path in direct_paths if path not in page_details]
+    if new_paths:
+        page_details.update(pdf_picker_page_details(new_paths, retain_for_batch=True))
     manifest["pdf_candidates"] = candidates
     manifest["selected_pdf_candidates"] = selected
     manifest["picker_page_details"] = page_details
@@ -24917,17 +24977,12 @@ def run_automatic_from_confirmation(*values, progress=gr.Progress(track_tqdm=Fal
                         "could not persist pre-workspace compatibility evidence: %s", exc
                     )
             if compatibility_report.get("status") != "pass":
-                blocked = list(compatibility_report.get("blocked_capabilities") or [])
+                failure_title, failure_details, failure_steps = native_mutation_failure_explanation(compatibility_report)
                 return automatic_confirmation_failure_response(
                     "AUTO-COMPATIBILITY-001",
-                    "Installed AnythingLLM mutation contract is not qualified",
-                    [
-                        "The installed Desktop package or storage schema has not been proven compatible with workspace creation and upload.",
-                        "Blocked capability: "
-                        + (", ".join(blocked) if blocked else str(compatibility_report.get("reason") or "unknown")),
-                        "No workspace was created.",
-                    ],
-                    ["Use local-files-only mode until this exact AnythingLLM build is characterized."],
+                    failure_title,
+                    [*failure_details, "No workspace was created."],
+                    failure_steps,
                     timing_html=automatic_run_timing_html(
                         state="failed",
                         message="Compatibility verification stopped the run before workspace creation.",
@@ -29729,18 +29784,12 @@ def run_automatic(
             APP_LOGGER.warning("could not persist AnythingLLM mutation compatibility evidence: %s", exc)
         if compatibility_report.get("status") != "pass":
             progress(None)
-            blocked = list(compatibility_report.get("blocked_capabilities") or [])
+            failure_title, failure_details, failure_steps = native_mutation_failure_explanation(compatibility_report)
             return automatic_error_outputs(
                 "AUTO-COMPATIBILITY-001",
-                "Installed AnythingLLM mutation contract is not qualified",
-                [
-                    "The local API is reachable, but this installed Desktop package or storage schema has not been proven compatible with the assistant's upload path.",
-                    "Blocked capability: " + (", ".join(blocked) if blocked else str(compatibility_report.get("reason") or "unknown")),
-                ],
-                [
-                    "Open Run history to inspect anythingllm-mutation-compatibility.json.",
-                    "Use local-files-only mode until this exact AnythingLLM build is characterized.",
-                ],
+                failure_title,
+                failure_details,
+                ["Open Run history to inspect anythingllm-mutation-compatibility.json.", *failure_steps],
                 {
                     "Compatibility report": str(compatibility_path),
                     "Desktop version": str((compatibility_report.get("characterization") or {}).get("desktop_version") or "unidentified"),
@@ -34983,7 +35032,8 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
             # Lock the run-defining mode as soon as a native picker selection
             # reaches the server.  The state chain below then restores a
             # coherent fresh-run snapshot before the control is re-enabled.
-            auto_pdfs.change(
+            gr.on(
+                triggers=[auto_pdfs.upload, auto_pdfs.delete, auto_pdfs.clear],
                 fn=automatic_selection_begin_state,
                 inputs=[automatic_selection_state, automatic_viewed_run_root, auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
                 outputs=[
@@ -34997,10 +35047,9 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 ],
                 show_progress="hidden",
                 queue=False,
-                # A file row removal emits the same change event as a fresh
-                # picker selection. Coalesce rapid add/remove edits so a
-                # stale inspection chain cannot finish after the newest
-                # selection and leave its pending presentation mounted.
+                # These user events also cover row removal and clearing. A
+                # programmatic File value update must not start a new chain
+                # and clear the batch that just absorbed its uploaded paths.
                 trigger_mode="always_last",
             ).then(
                 # A file selection has exactly one direct event owner. The

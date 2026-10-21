@@ -407,6 +407,14 @@ def _sqlite_schema(db_path: Path) -> tuple[dict[str, set[str]], list[Evidence], 
             evidence.append(_evidence("sqlite", f"{table} columns", ",".join(sorted(columns))))
     except Exception as exc:
         errors.append(f"sqlite_schema_error:{type(exc).__name__}")
+        sqlite_code = getattr(exc, "sqlite_errorcode", 0) or 0
+        if isinstance(exc, sqlite3.OperationalError) and (
+            sqlite_code & 255 in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+            or any(message in str(exc).casefold() for message in (
+                "database is locked", "database table is locked", "database is busy",
+            ))
+        ):
+            errors.append("sqlite_schema_busy")
     finally:
         if con is not None:
             con.close()
@@ -635,6 +643,11 @@ def characterize(
         for table, columns in REQUIRED_COLUMNS.items()
         if columns - schema.get(table, set())
     }
+    schema_busy = "sqlite_schema_busy" in schema_errors
+    if schema_busy:
+        # A failed read does not establish that required columns are absent.
+        # schema_errors still prevents every mutation capability from passing.
+        missing = {}
     desktop_release_status, desktop_candidate_profile = _desktop_release_status(
         desktop_version_normalized,
         desktop_package.get("app_asar_sha256", ""),
@@ -744,7 +757,7 @@ def characterize(
         "desktop_package": desktop_package,
         "desktop_release_status": desktop_release_status,
         "desktop_candidate_profile": desktop_candidate_profile,
-        "storage_schema_status": "matched" if storage_schema_match else "unmatched",
+        "storage_schema_status": "busy" if schema_busy else "matched" if storage_schema_match else "unmatched",
         "matched_profile": profile,
         "native_mutation_contract": (
             str(native_contract.get("contract_id") or "") if native_contract_match else ""

@@ -30,24 +30,56 @@ Confirm remains mounted while unavailable, and its immediate feedback supports
 both native-button and wrapped-button DOM. Exact active labels avoid treating
 the idle text 'Confirm and start processing' as an active run.
 
-## Validation at this commit
+## Mixed selections and database contention
 
-- Full offline suite on the prior UI revision: 3,312 passed, one skipped,
-  35 deselected, 28 subtests passed.
-- Latest estimate-stage/order changes: all 15 metadata stream tests and four
-  adjacent picker/selection controls passed. Ruff and whitespace checks passed.
+An actual browser session reproduced 22 chips after selecting an eleven-PDF
+folder and uploading those same eleven files. The browser copies had different
+physical paths. Clearing the ordinary picker after merging then dispatched a
+second change callback, which returned an empty folder selection. Chips remained
+visible while metadata cleared and Confirm stayed disabled.
+
+Same-name, same-size, SHA256-identical uploads now map to existing folder paths.
+Differently named aliases, different bytes and existing separate folder entries
+remain. An empty picker acknowledgement preserves the selected subset. User
+upload/delete/clear events own the selection chain; programmatic File updates
+do not create another selection transaction. Identity digests exist only within
+the merge call and contain no recognition evidence.
+
+A later actual folder run stopped before workspace creation because the live
+SQLite schema read returned SQLITE_BUSY. Its installed package fingerprint was
+unchanged. A busy read now reports storage contention without claiming missing
+columns or package incompatibility. Mutation capabilities remain blocked until
+the schema can actually be read. No database lock, contract check or activity
+condition is bypassed. Test discovery now isolates the default Desktop storage
+under the temporary test profile as well as isolating the app's own data root.
+
+## Validation and remaining live scope
+
+- Full offline suite: 3,323 passed, one skipped, 35 deselected, 28 subtests passed.
+  Coverage includes the actual locked/readable SQLite fixture, guarded mutation
+  capabilities, exact browser copies, renamed aliases, equal-size different
+  bytes, preserved existing entries and the actual selection callback graph.
+- Before the storage diagnostic additions, the 24 focused picker controls and
+  the 3,318-test full suite passed. Ruff and whitespace checks passed.
 - Opt-in actual Edge client regression: native and wrapped button controls
   pass; the previous client fails the idle/active state control.
 - Actual Gradio 6.19 direct and folder previews with the same eleven real PDFs
   reach ready and publish metadata without Refresh. The native OS folder-dialog
   return alone was supplied by a private harness. These checks do not establish
   default full processing or embedding success.
-- A real eleven-PDF direct run has started on the separate frozen installation,
-  including native layout and targeted OCR. It is still in progress at this
-  commit. The latest estimate-stage change still needs a live check.
+- An actual eleven-PDF direct run on the separate frozen installation completed:
+  2,481 selected records attached and vector-confirmed, comprising 2,477 reused
+  embeddings and four freshly embedded records. Targeted OCR contributed to six
+  selected outputs (25 pages). Seven nonempty author names agree with the manual
+  references; four sources abstained. The frozen recognition modules differ from
+  current main. No live retrieval check was performed.
+- The estimate-after-metadata status was observed in the actual browser. The
+  complete mixed-session recheck and full same-source processing on both routes
+  and both ports remain incomplete because of the persistent live database lock.
 
-These are local development results. Both ports, both routes, equal-source output
-comparison, actual embedding receipts, source-specific author timings and normal
-server restart remain required before live qualification is complete. The frozen
-installation retains its original recognition modules; a UI-only overlay is not
-an upgrade of that source snapshot.
+The one successful run establishes selected-record/vector integrity, not complete
+text equivalence or universal authorship correctness. The test observer records
+primary inference separately from repeated supporting core calls and nested
+preview helpers. It is not an author/OCR cache. The frozen installation retains
+its original recognition modules; a UI overlay is not an upgrade of that source
+snapshot. Recognition changes have their own accuracy and runtime gate.

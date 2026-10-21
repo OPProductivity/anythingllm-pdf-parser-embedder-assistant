@@ -11201,13 +11201,16 @@ class PipelineCoreTests(unittest.TestCase):
         )
         selection_dependencies = [
             dependency for dependency in app.demo.config["dependencies"]
-            if (pdf_component["id"], "change") in dependency.get("targets", [])
+            if (pdf_component["id"], "upload") in dependency.get("targets", [])
         ]
         # A selection has exactly one direct owner. Its narrow chained helpers
         # acknowledge the browser-transferred paths, restore a coherent form,
         # and stream the same supporting metadata preview as the folder route.
         # Confirm still owns a fresh authoritative preparation.
         self.assertEqual(len(selection_dependencies), 1)
+        self.assertEqual(set(selection_dependencies[0]['targets']), {
+            (pdf_component['id'], event) for event in ('upload', 'delete', 'clear')
+        })
         self.assertTrue(
             str(selection_dependencies[0].get("api_name") or "").startswith(
                 "automatic_selection_begin_state"

@@ -1,5 +1,6 @@
 """Selection feedback/ownership controls; author inference is not mocked accuracy proof."""
 from types import SimpleNamespace
+import shutil
 from unittest.mock import Mock
 
 import pytest
@@ -193,7 +194,7 @@ def test_direct_and_folder_selection_chains_use_the_same_stream():
     pdf_component = next(c for c in config["components"]
                          if c.get("props", {}).get("elem_id") == "automatic-pdf-upload")
     direct = next(d for d in config["dependencies"]
-                  if (pdf_component["id"], "change") in d.get("targets", []))
+                  if (pdf_component["id"], "upload") in d.get("targets", []))
     names = []
     while direct:
         names.append(str(direct.get("api_name") or ""))
@@ -210,6 +211,82 @@ def test_direct_and_folder_selection_chains_use_the_same_stream():
                if "stream_automatic_detected_metadata_preview" in str(d.get("api_name") or "")]
     assert len(streams) >= 5
     assert all(d["queue"] and len(d["outputs"]) == 6 for d in streams)
+    assert not any((pdf_component['id'], 'change') in d.get('targets', [])
+                   for d in config['dependencies'])
+
+
+def test_programmatic_empty_picker_keeps_the_folder_selection(tmp_path, monkeypatch):
+    first, second = tmp_path/'first.pdf', tmp_path/'second.pdf'
+    for p in [first, second]:
+        p.write_bytes(b'%PDF-1.4\nidentity fixture')
+    manifest = {'pdf_candidates':[str(first),str(second)],
+                'selected_pdf_candidates':[str(second)]}
+    monkeypatch.setattr(app, 'inspect_uploaded_pdf_candidates', lambda _paths: {'pdf_candidates':[]})
+    scan = Mock(side_effect=AssertionError('An acknowledgement must not scan PDFs'))
+    monkeypatch.setattr(app, 'pdf_picker_page_details', scan)
+    merged = app.merge_uploaded_pdfs_into_direct_selection([], manifest)
+    assert merged[1] == [str(second)]
+    assert merged[2] == manifest
+    scan.assert_not_called()
+
+
+def test_same_name_browser_copy_reselects_the_canonical_source_without_a_rescan(tmp_path, monkeypatch):
+    first=tmp_path/'original'/'source.pdf'
+    copy=tmp_path/'browser'/'source.pdf'
+    first.parent.mkdir()
+    copy.parent.mkdir()
+    first.write_bytes(b'%PDF-1.4\nsame bytes')
+    shutil.copyfile(first,copy)
+    manifest={'pdf_candidates':[str(first)],'selected_pdf_candidates':[],
+              'picker_page_details':{str(first):{'pages':1,'ocr_label':'0'}}}
+    monkeypatch.setattr(app, 'inspect_uploaded_pdf_candidates', lambda _paths: {'pdf_candidates':[str(copy)]})
+    scan=Mock(side_effect=AssertionError('The existing canonical source already has page details'))
+    monkeypatch.setattr(app,'pdf_picker_page_details',scan)
+    merged=app.merge_uploaded_pdfs_into_direct_selection([str(copy)],manifest)
+    assert merged[0]['value']==[]
+    assert merged[1]==[str(first)]
+    assert merged[2]['pdf_candidates']==[str(first)]
+    scan.assert_not_called()
+
+
+def test_identity_mapping_keeps_named_aliases_and_equal_size_different_documents(tmp_path):
+    original=tmp_path/'original'/'source.pdf'
+    browser=tmp_path/'browser'/'source.pdf'
+    alias=tmp_path/'alias.pdf'
+    original.parent.mkdir()
+    browser.parent.mkdir()
+    original.write_bytes(b'%PDF-1.4\nAAAA')
+    browser.write_bytes(b'%PDF-1.4\nBBBB')
+    shutil.copyfile(original,alias)
+    assert app._folder_paths_for_uploaded_copies([str(browser),str(alias)],[str(original)]) == [str(browser),str(alias)]
+
+
+def test_mapping_a_new_copy_does_not_collapse_existing_folder_entries(tmp_path):
+    paths=[]
+    for directory in ['a','b','browser']:
+        p=tmp_path/directory/'source.pdf'
+        p.parent.mkdir()
+        p.write_bytes(b'%PDF-1.4\nidentical')
+        paths.append(str(p))
+    canonical=app._folder_paths_for_uploaded_copies([paths[2]],paths[:2])
+    assert canonical==[paths[0]]
+    assert app.unique_local_path_strings([*paths[:2],*canonical])==paths[:2]
+
+
+def test_busy_storage_message_keeps_mutations_blocked_without_a_package_verdict():
+    report={'status':'blocked','characterization':{'storage_schema_status':'busy',
+            'errors':['sqlite_schema_error:OperationalError','sqlite_schema_busy']}}
+    title, details, steps=app.native_mutation_failure_explanation(report)
+    assert title=='AnythingLLM database is busy'
+    assert any('remain blocked' in line for line in details)
+    assert any('idle' in line for line in steps)
+
+
+def test_other_capability_failures_retain_the_compatibility_explanation():
+    title, details, _=app.native_mutation_failure_explanation(
+        {'status':'blocked','blocked_capabilities':['can_upload_native_metadata']})
+    assert title=='Installed AnythingLLM mutation contract is not qualified'
+    assert 'can_upload_native_metadata' in ' '.join(details)
 
 
 def test_preview_authors_cannot_bypass_fresh_role_reconciliation():
