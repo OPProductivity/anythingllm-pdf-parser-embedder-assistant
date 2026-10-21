@@ -13121,7 +13121,7 @@ def automatic_selection_begin_state(
     request: gr.Request = None,
 ):
     """Lock the ordinary picker and run controls for a direct file selection."""
-    return _automatic_selection_begin_state(
+    result = _automatic_selection_begin_state(
         previous_state,
         _viewed_run_root,
         pdf_files,
@@ -13130,6 +13130,20 @@ def automatic_selection_begin_state(
         preserve_ordinary_picker=False,
         request=request,
     )
+    manifest = dict(folder_manifest or {}) if isinstance(folder_manifest, dict) else {}
+    if (
+        result[0].get("state") == "pending"
+        and _selection_preview_is_current(result[0], request)
+        and not automatic_lifecycle_busy()
+        and normalize_file_list(pdf_files)
+        and clean_downloadable_paths(manifest.get("pdf_candidates") or [])
+    ):
+        # This owned chain merges browser uploads into the existing folder
+        # batch. Its final paths can legitimately differ after canonical-copy
+        # mapping and clearing the ordinary picker. A newer selection still
+        # invalidates the preview token before finish can accept these paths.
+        result[0]["accept_next_signature"] = True
+    return result
 
 
 def automatic_retry_selection_begin_state(previous_state=None, viewed_run_root=None, pdf_files=None, folder_pdf_files=None, folder_manifest=None, request: gr.Request = None):

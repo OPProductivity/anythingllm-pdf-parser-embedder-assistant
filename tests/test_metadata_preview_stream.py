@@ -249,6 +249,38 @@ def test_same_name_browser_copy_reselects_the_canonical_source_without_a_rescan(
     scan.assert_not_called()
 
 
+def test_canonical_copy_merge_can_finish_the_same_owned_selection(tmp_path, monkeypatch):
+    original = tmp_path/'folder'/'source.pdf'
+    copy = tmp_path/'browser'/'source.pdf'
+    original.parent.mkdir()
+    copy.parent.mkdir()
+    original.write_bytes(b'%PDF-1.4\nsame source')
+    shutil.copyfile(original,copy)
+    manifest={'pdf_candidates':[str(original)],'selected_pdf_candidates':[str(original)],
+              'picker_page_details':{str(original):{'pages':1,'ocr_label':'0'}}}
+    request=SimpleNamespace(session_hash='copy-merge-browser')
+    state=app.automatic_selection_begin_state({},'', [str(copy)], [str(original)],manifest,request=request)[0]
+    monkeypatch.setattr(app,'inspect_uploaded_pdf_candidates',lambda _paths:{'pdf_candidates':[str(copy)]})
+    merged=app.merge_uploaded_pdfs_into_direct_selection([str(copy)],manifest)
+    finished=app.automatic_selection_finish_state(state,[],merged[1],merged[2],request=request)
+    assert finished[0]['state']=='ready'
+    assert finished[2]['interactive']
+    assert not finished[0]['accept_next_signature']
+
+
+def test_copy_merge_acknowledgement_cannot_unlock_a_newer_selection(tmp_path):
+    original=tmp_path/'original.pdf'
+    copy=tmp_path/'copy.pdf'
+    original.write_bytes(b'%PDF-1.4\noriginal')
+    copy.write_bytes(b'%PDF-1.4\ncopy')
+    manifest={'pdf_candidates':[str(original)],'selected_pdf_candidates':[str(original)]}
+    request=SimpleNamespace(session_hash='same-browser-copy-merge')
+    previous=app.automatic_selection_begin_state({},'', [str(copy)], [str(original)],manifest,request=request)[0]
+    app.automatic_selection_begin_state(previous,'', [str(copy)],[],{},request=request)
+    finished=app.automatic_selection_finish_state(previous,[],[str(original)],manifest,request=request)
+    assert all(update==app.gr.update() for update in finished)
+
+
 def test_identity_mapping_keeps_named_aliases_and_equal_size_different_documents(tmp_path):
     original=tmp_path/'original'/'source.pdf'
     browser=tmp_path/'browser'/'source.pdf'

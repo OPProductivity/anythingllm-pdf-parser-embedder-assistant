@@ -45,6 +45,17 @@ upload/delete/clear events own the selection chain; programmatic File updates
 do not create another selection transaction. Identity digests exist only within
 the merge call and contain no recognition evidence.
 
+The final eleven-file mixed recheck found a second readiness defect: canonical
+copy mapping changed the physical-path signature after the selection began.
+The finish guard rejected that legitimate transition and left Confirm locked
+after metadata had finished. A direct upload into an existing folder batch now
+allows the final signature of that owned merge transaction. The browser-session
+preview token still rejects obsolete transactions, and the acknowledgement is
+consumed at finish. Direct selections without a folder keep the ordinary exact
+signature guard. The regression test fails against the previous implementation
+and passes with this acknowledgement; a separate test covers a newer selection
+superseding the merge.
+
 A later actual folder run stopped before workspace creation because the live
 SQLite schema read returned SQLITE_BUSY. Its installed package fingerprint was
 unchanged. A busy read now reports storage contention without claiming missing
@@ -58,8 +69,9 @@ under the temporary test profile as well as isolating the app's own data root.
 - Development suite with the recognition candidate: 3,323 passed, one skipped,
   35 deselected, 28 subtests passed. The UI-only production integration separately
   passed 3,275 tests, one skipped, 35 deselected and 28 subtests before the
-  recognition integration. After recognition integration, the production source
-  passed all 3,323 tests, with the same skip/deselection/subtest counts.
+  recognition integration. After recognition integration and the two final
+  canonical-copy readiness controls, the production source passed all 3,325
+  tests, with the same skip/deselection/subtest counts.
   Coverage includes the actual locked/readable SQLite fixture, guarded mutation
   capabilities, exact browser copies, renamed aliases, equal-size different
   bytes, preserved existing entries and the actual selection callback graph.
@@ -81,9 +93,12 @@ under the temporary test profile as well as isolating the app's own data root.
   selected outputs (25 pages). Seven nonempty author names agree with the manual
   references; four sources abstained. The frozen recognition modules differ from
   current main. No live retrieval check was performed.
-- The estimate-after-metadata status was observed in the actual browser. The
-  complete mixed-session recheck and full same-source processing on both routes
-  and both ports remain incomplete because of the persistent live database lock.
+- The final actual eleven-file folder-then-direct-upload check reaches ready,
+  retains exactly eleven canonical source chips and needs no Refresh. Its
+  displayed metadata equals the clean direct-picker preview; all eleven input
+  SHA256 records match. This is preview coverage, not full ingestion coverage.
+  Full same-source processing on both routes and both ports remains incomplete
+  because of the persistent live database lock.
 
 The one successful run establishes selected-record/vector integrity, not complete
 text equivalence or universal authorship correctness. The test observer records
