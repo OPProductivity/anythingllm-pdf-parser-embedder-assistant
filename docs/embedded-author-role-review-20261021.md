@@ -39,8 +39,16 @@ After completion, runtime was evaluated once. Candidate total: 3,799.4576 second
 Fresh paired baseline: 2,727.2093 seconds (1.39317x); older retained baseline:
 2,122.1814 seconds (1.79035x). The user's revised cap is 1.73x. The fresh paired
 comparison passes; the retained historical comparison fails. These are different
-comparisons, not interchangeable timings. Choice of governing comparison remains
-pending; this document does not authorize deployment or a push.
+comparisons, not interchangeable timings. The contemporaneous fresh paired
+baseline governs the 1.73x gate: it was collected over the same presentations,
+under the same alternating schedule and observed power conditions. The retained
+older timing is historical context. Requiring it as a second release gate was
+an additional experiment-controller condition, not a user requirement.
+
+The complete candidate therefore passes the accepted runtime gate and all
+recorded accuracy/evidence gates. No further speed experiment was run to obtain
+that decision. Production integration checks are separate from this inference
+benchmark; these timings do not describe full PDF preparation or embedding.
 
 The private artifacts retain the original controller verdict (which used the old
 1.7x cap and both comparisons), plus the final updated-cap audit. They are under
@@ -48,7 +56,7 @@ the research project's `outputs/recognition-preview-20261020` directory.
 
 ## Validation and limits
 
-The complete offline suite after the concurrent UI draft: 3,312 passed, one
+The complete offline suite on the integrated production source: 3,323 passed, one
 skipped, 35 deselected, 28 subtests passed. Targeted controls cover later native
 translation, shared later OCR roles, dual roles, unrelated-work roles, actual
 coordinator reconciliation, and affiliation-grammar equivalence. The browser

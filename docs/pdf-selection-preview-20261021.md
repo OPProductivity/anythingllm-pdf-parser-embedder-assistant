@@ -55,7 +55,11 @@ under the temporary test profile as well as isolating the app's own data root.
 
 ## Validation and remaining live scope
 
-- Full offline suite: 3,323 passed, one skipped, 35 deselected, 28 subtests passed.
+- Development suite with the recognition candidate: 3,323 passed, one skipped,
+  35 deselected, 28 subtests passed. The UI-only production integration separately
+  passed 3,275 tests, one skipped, 35 deselected and 28 subtests before the
+  recognition integration. After recognition integration, the production source
+  passed all 3,323 tests, with the same skip/deselection/subtest counts.
   Coverage includes the actual locked/readable SQLite fixture, guarded mutation
   capabilities, exact browser copies, renamed aliases, equal-size different
   bytes, preserved existing entries and the actual selection callback graph.
@@ -63,6 +67,10 @@ under the temporary test profile as well as isolating the app's own data root.
   the 3,318-test full suite passed. Ruff and whitespace checks passed.
 - Opt-in actual Edge client regression: native and wrapped button controls
   pass; the previous client fails the idle/active state control.
+- Normal servers on both ports passed real browser upload of two small PDFs,
+  user row removal to one PDF, and user Clear to an empty selection. Metadata
+  updated without Refresh and Confirm followed the selection. This is actual
+  File-event coverage, separate from the minimal client-only button fixture.
 - Actual Gradio 6.19 direct and folder previews with the same eleven real PDFs
   reach ready and publish metadata without Refresh. The native OS folder-dialog
   return alone was supplied by a private harness. These checks do not establish
