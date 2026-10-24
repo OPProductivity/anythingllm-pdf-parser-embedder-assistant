@@ -6081,7 +6081,10 @@ def workspace_name_selection_signature(pdf_files, folder_pdf_files=None):
 def automatic_selection_signature(pdf_files=None, folder_pdf_files=None, folder_manifest=None):
     """Identify the exact visible selection acknowledged by a UI callback."""
     manifest = dict(folder_manifest or {}) if isinstance(folder_manifest, dict) else {}
-    manifest_files = manifest.get("selected_pdf_candidates") or manifest.get("pdf_candidates") or []
+    manifest_files = (
+        manifest.get("selected_pdf_candidates")
+        if "selected_pdf_candidates" in manifest else manifest.get("pdf_candidates")
+    ) or []
     selected_files = list(dict.fromkeys(
         normalize_file_list(pdf_files)
         + normalize_file_list(folder_pdf_files)
@@ -12917,10 +12920,13 @@ def automatic_selection_action_states(
                 gr.update(value="Cancel", interactive=False, visible=True),
                 gr.update(value=automatic_selection_preparing_status_html(pdf_files, folder_pdf_files), visible=True),
             )
+    process_button = automatic_process_button_state(pdf_files, folder_pdf_files, folder_manifest)
     return (
-        automatic_process_button_state(pdf_files, folder_pdf_files, folder_manifest),
+        process_button,
         gr.update(value="Cancel", interactive=False, visible=True),
-        gr.update(value=automatic_live_status_html({"state": "ready"}), visible=True),
+        gr.update(value=automatic_live_status_html({
+            "state": "ready" if process_button.get("interactive") else "idle",
+        }), visible=True),
     )
 
 
@@ -13226,10 +13232,15 @@ def automatic_selection_finish_state(selection_state, pdf_files=None, folder_pdf
             # A late selection chain must never unlock controls underneath an
             # already acknowledged run.
             return state, gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+        manifest = dict(folder_manifest or {}) if isinstance(folder_manifest, dict) else {}
+        manifest_files = (
+            manifest.get("selected_pdf_candidates")
+            if "selected_pdf_candidates" in manifest else manifest.get("pdf_candidates")
+        )
         has_files = bool(
             normalize_file_list(pdf_files)
             or normalize_file_list(folder_pdf_files)
-            or (dict(folder_manifest or {}).get("pdf_candidates") or [])
+            or normalize_file_list(manifest_files)
         )
         state["state"] = "ready" if has_files else "idle"
         state["selection_signature"] = observed_signature
@@ -13241,7 +13252,7 @@ def automatic_selection_finish_state(selection_state, pdf_files=None, folder_pdf
         gr.update(interactive=True),
         automatic_process_button_state(pdf_files, folder_pdf_files, folder_manifest),
         gr.update(value="Cancel", interactive=False, visible=True),
-        gr.update(value=automatic_live_status_html({"state": "ready"}), visible=True),
+        gr.update(value=automatic_live_status_html({"state": state["state"]}), visible=True),
         gr.update(interactive=True),
     )
 
@@ -14686,9 +14697,14 @@ def automatic_live_status_html(status=None):
     """
     record = status or LIVE_AUTOMATIC_RUN_STATUS or {}
     state = str(record.get("state") or "")
-    if not state or state == "ready":
+    if not state or state in {"ready", "idle"}:
+        display_state = "idle" if state == "idle" else "ready"
+        instruction = (
+            "No PDFs selected — choose a PDF or a folder to begin."
+            if state == "idle" else "Ready — Confirm to begin processing."
+        )
         return (
-            '<div class="automatic-run-activity ready" data-run-state="ready" '
+            f'<div class="automatic-run-activity {display_state}" data-run-state="{display_state}" '
             'data-cancel-available="false" data-cancel-requested="false">'
             '<div class="automatic-run-progress" role="progressbar" aria-label="Overall run progress" '
             'aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">'
@@ -14696,7 +14712,7 @@ def automatic_live_status_html(status=None):
             '<div class="automatic-run-progress-label">'
             '<strong class="automatic-run-preflight-title">Overall progress: 0%</strong>'
             '<div class="automatic-run-preflight-history"></div>'
-            '<div class="automatic-run-preflight-current">Ready — Confirm to begin processing.</div>'
+            f'<div class="automatic-run-preflight-current">{instruction}</div>'
             '</div></div>'
         )
     if state == "selection_preparing":
@@ -15188,7 +15204,7 @@ def reset_automatic_run_presentation(pdf_files=None, folder_pdf_files=None, sele
             detail="Selected files accepted — restoring settings and preparing the confirmation preview",
         )
         if selection_paths_present
-        else automatic_live_status_html({"state": "ready"})
+        else automatic_live_status_html({"state": "idle"})
     )
     return (
         gr.update(value=activity_html, visible=True),
@@ -34333,7 +34349,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 # is the smallest useful refresh interval.
                 automatic_run_status_timer = gr.Timer(1, active=True)
                 automatic_run_activity = gr.HTML(
-                    value=automatic_live_status_html({"state": "ready"}),
+                    value=automatic_live_status_html({"state": "idle"}),
                     visible=True,
                     elem_classes=["automatic-run-activity-host"],
                 )
