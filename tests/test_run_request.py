@@ -11,7 +11,8 @@ pytestmark = pytest.mark.offline_deterministic
 def test_cli_adapter_excludes_api_key_and_round_trips_legacy_execution_fields():
     args = SimpleNamespace(
         input="C:/approved/source.pdf", out_dir="C:/runs", document_label="Source",
-        document_author="Author", document_short_label="S", lean_retention=False,
+        document_author="Author", document_short_label="S", document_publisher="Approved Press",
+        lean_retention=False,
         backend_mode="automatic", deep_extraction=True, include_front_matter=True,
         include_back_matter=True, use_file_title_fallback=True,
         first_page_override=2, end_page_override=4, end_section_names=["References"],
@@ -39,6 +40,7 @@ def test_cli_adapter_excludes_api_key_and_round_trips_legacy_execution_fields():
     assert legacy.anythingllm_chunk_overlap == 128
     assert legacy.include_back_matter is True
     assert legacy.use_file_title_fallback is True
+    assert legacy.document_publisher == "Approved Press"
     assert legacy.anythingllm_document_folder_name == "approved-folder"
 
 
@@ -64,6 +66,7 @@ def test_automatic_adapter_accepts_the_live_normalized_files_field():
     request = RunRequest.from_automatic_settings(
         {
             "files": ["C:/approved/first.pdf", "C:/approved/second.pdf"],
+            "document_publisher": "Approved Press",
             "target_passage_length": 750,
             "backend_mode": "Automatic",
         },
@@ -72,6 +75,7 @@ def test_automatic_adapter_accepts_the_live_normalized_files_field():
     )
 
     assert request.input_paths == ("C:/approved/first.pdf", "C:/approved/second.pdf")
+    assert request.to_legacy_namespace().document_publisher == "Approved Press"
 
 
 def test_default_local_request_is_valid_without_native_folder_intent():

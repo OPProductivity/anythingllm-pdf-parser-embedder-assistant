@@ -36,6 +36,7 @@ AUTOMATIC_WORKER_ARGUMENT_FIELDS = frozenset({
     "disable_inline_markers",
     "document_author",
     "document_label",
+    "document_publisher",
     "document_short_label",
     "end_page_override",
     "end_section_names",

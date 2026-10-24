@@ -58,6 +58,7 @@ class RunRequest:
     document_label: str = ""
     document_author: str = ""
     document_short_label: str = ""
+    document_publisher: str = ""
     use_file_title_fallback: bool = False
     output_root_override: str | None = None
     retain_diagnostic_evidence: bool = False
@@ -189,6 +190,7 @@ class RunRequest:
             document_label=str(settings.get("document_label") or "").strip(),
             document_author=str(settings.get("document_author") or "").strip(),
             document_short_label=str(settings.get("document_short_label") or "").strip(),
+            document_publisher=str(settings.get("document_publisher") or "").strip(),
             use_file_title_fallback=bool(settings.get("use_file_title_fallback")),
             output_root_override=_optional_text(settings.get("output_root_override")),
             retain_diagnostic_evidence=not bool(settings.get("lean_retention", True)),
@@ -232,6 +234,7 @@ class RunRequest:
             document_label=str(getattr(args, "document_label", "") or "").strip(),
             document_author=str(getattr(args, "document_author", "") or "").strip(),
             document_short_label=str(getattr(args, "document_short_label", "") or "").strip(),
+            document_publisher=str(getattr(args, "document_publisher", "") or "").strip(),
             use_file_title_fallback=bool(getattr(args, "use_file_title_fallback", False)),
             output_root_override=_optional_text(getattr(args, "out_dir", "")),
             retain_diagnostic_evidence=not bool(getattr(args, "lean_retention", True)),
@@ -292,6 +295,7 @@ class RunRequest:
             document_label=self.document_label,
             document_author=self.document_author,
             document_short_label=self.document_short_label,
+            document_publisher=self.document_publisher,
             use_file_title_fallback=self.use_file_title_fallback,
             deep_extraction=self.deep_extraction,
             include_front_matter=self.include_front_matter,

@@ -43,6 +43,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import ssl
+import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, asdict
@@ -833,6 +834,31 @@ def write_csv(path: Path, rows, fieldnames=None):
     atomic_write_text(path, buffer.getvalue())
 
 
+def xmp_publisher(xml_text):
+    """Read an explicitly named publisher, without treating Creator or Producer as one."""
+    if not xml_text or len(xml_text) > 1_000_000:
+        return ""
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return ""
+    namespaces = {
+        "http://purl.org/dc/elements/1.1/",
+        "http://prismstandard.org/namespaces/basic/2.0/",
+    }
+    for element in root.iter():
+        if not element.tag.startswith("{"):
+            continue
+        namespace, _, local_name = element.tag[1:].partition("}")
+        if namespace not in namespaces or local_name != "publisher":
+            continue
+        candidates = [normalize_text(node.text or "") for node in element.iter()
+                      if node.text and node is not element]
+        candidates.append(normalize_text(element.text or ""))
+        return next((value for value in candidates if value), "")[:250]
+    return ""
+
+
 def pdf_metadata(path: Path, include_page_geometry=False, include_author_samples=False, progress_callback=None):
     """Read PDF metadata and, optionally, author-inference samples in one open.
 
@@ -845,6 +871,11 @@ def pdf_metadata(path: Path, include_page_geometry=False, include_author_samples
     """
     with fitz.open(path) as doc:
         metadata = dict(doc.metadata or {})
+        embedded_publisher = normalize_text(metadata.get("publisher") or "")
+        try:
+            publisher = embedded_publisher or xmp_publisher(doc.get_xml_metadata())
+        except (RuntimeError, ValueError):
+            publisher = embedded_publisher
         outline = [
             {"level": level, "title": normalize_text(title), "pdf_page": page}
             for level, title, page in doc.get_toc(simple=True)
@@ -923,6 +954,8 @@ def pdf_metadata(path: Path, include_page_geometry=False, include_author_samples
             "pdf_page_count": len(doc),
             "title": normalize_text(metadata.get("title") or ""),
             "author": normalize_text(metadata.get("author") or ""),
+            "publisher": publisher,
+            "publisher_source": ("pdf_metadata" if embedded_publisher else "xmp_metadata") if publisher else "not_available",
             "subject": normalize_text(metadata.get("subject") or ""),
             "keywords": normalize_text(metadata.get("keywords") or ""),
             "creator": normalize_text(metadata.get("creator") or ""),
@@ -1003,6 +1036,7 @@ def apply_source_identity_to_segments(segments, source_meta):
         if not isinstance(segment, dict):
             continue
         segment["source_author"] = source_meta.get("source_author") or ""
+        segment["source_publisher"] = source_meta.get("source_publisher") or ""
         segment["source_short_label"] = (
             source_meta.get("source_short_label")
             or source_meta.get("source_title")
@@ -5004,6 +5038,7 @@ def make_segments(
                     "source_id": source_id,
                     "source_title": source_meta["source_title"],
                     "source_author": source_meta["source_author"],
+                    "source_publisher": source_meta.get("source_publisher") or "",
                     "source_short_label": source_meta.get("source_short_label") or default_short_label(
                         source_meta.get("source_title"), source_meta.get("source_author"), source_meta.get("source_sha256"),
                     ),
@@ -7817,7 +7852,8 @@ def generate_api_payloads(segments, mode):
             "docAuthor": row.get("source_author") or "",
             "description": (
                 f"Source title: {row['source_title']}. "
-                f"{pdf_page_metadata_label(row)} "
+                + (f"Publisher: {row['source_publisher']}. " if row.get("source_publisher") else "")
+                + f"{pdf_page_metadata_label(row)} "
                 f"Logical page: {row.get('logical_page') or 'unknown'}. "
                 f"Page lines: {row.get('page_line_start') or 'unknown'}-"
                 f"{row.get('page_line_end') or 'unknown'}. "
@@ -7861,6 +7897,7 @@ def build_page_parent_rows(segments):
                 "source_id": row["source_id"],
                 "source_title": row["source_title"],
                 "source_author": row.get("source_author") or "",
+                "source_publisher": row.get("source_publisher") or "",
                 "source_short_label": row.get("source_short_label") or default_short_label(
                     row.get("source_title"), row.get("source_author"), row.get("source_sha256"),
                 ),
@@ -7953,7 +7990,8 @@ def generate_page_parent_payloads(parent_rows, mode):
             "docAuthor": row.get("source_author") or "",
             "description": (
                 f"Source title: {row['source_title']}. "
-                f"{pdf_page_metadata_label(row)} "
+                + (f"Publisher: {row['source_publisher']}. " if row.get("source_publisher") else "")
+                + f"{pdf_page_metadata_label(row)} "
                 f"Logical page: {row.get('logical_page') or 'unknown'}. "
                 f"Page lines: {row.get('page_line_start') or 'unknown'}-"
                 f"{row.get('page_line_end') or 'unknown'}. "
@@ -22035,17 +22073,21 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     )
     author = resolved_author["author"]
     author_source = resolved_author["source"]
+    publisher_override = normalize_text(getattr(args, "document_publisher", "") or "")
+    publisher = publisher_override or pdf_meta.get("publisher") or ""
     author_confidence_record = author_confidence(resolved_author)
     source_meta = {
         "source_id": f"pdf_{source_sha[:16]}",
         "source_title": normalize_text(title),
         "source_author": normalize_text(author),
+        "source_publisher": publisher,
         "author_confidence": author_confidence_record,
         "source_sha256": source_sha,
         "source_published_epoch_ms": pdf_date_to_epoch_ms(pdf_meta.get("creationDate")),
         "metadata_provenance": {
             "source_title": title_source,
             "source_author": author_source,
+            "source_publisher": "user_override" if publisher_override else pdf_meta.get("publisher_source", "not_available"),
             "subject": "pdf_metadata" if pdf_meta.get("subject") else "not_available",
         },
         "author_inference": inferred_author,
@@ -22063,6 +22105,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         **pdf_meta,
         "detected_title": source_meta["source_title"],
         "detected_author": source_meta["source_author"],
+        "detected_publisher": source_meta["source_publisher"],
         "author_confidence": author_confidence_record,
         "source_short_label": source_meta["source_short_label"],
         "metadata_provenance": source_meta["metadata_provenance"],
@@ -26080,6 +26123,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         # PDF's detected metadata never became another PDF's page-parent base.
         "detected_title": profile.get("detected_title", ""),
         "detected_author": profile.get("detected_author", ""),
+        "detected_publisher": profile.get("detected_publisher", ""),
         "source_short_label": profile.get("source_short_label", ""),
         "metadata_provenance": dict(profile.get("metadata_provenance") or {}),
         "total_pipeline_seconds": round(time.perf_counter() - total_started, 2),
@@ -26721,6 +26765,7 @@ def main():
     parser.add_argument("--out-dir", default="")
     parser.add_argument("--document-label", default="")
     parser.add_argument("--document-author", default="")
+    parser.add_argument("--document-publisher", default="")
     parser.add_argument("--document-short-label", default="")
     parser.add_argument("--deep-extraction", action="store_true")
     parser.add_argument("--include-front-matter", action="store_true")

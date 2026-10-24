@@ -15,12 +15,13 @@ def test_worker_contract_keeps_key_ephemeral_and_rejects_new_durable_fields():
     payload, key = serializable_automatic_worker_arguments(
         SimpleNamespace(
             document_label="Approved document",
+            document_publisher="Approved Press",
             anythingllm_api_key="execution-only-key",  # pragma: allowlist secret -- redaction boundary fixture
             progress_callback=None,
         )
     )
 
-    assert payload == {"document_label": "Approved document"}
+    assert payload == {"document_label": "Approved document", "document_publisher": "Approved Press"}
     assert key == "execution-only-key"  # pragma: allowlist secret -- redaction boundary assertion
 
     with pytest.raises(ValueError, match="provider_token"):

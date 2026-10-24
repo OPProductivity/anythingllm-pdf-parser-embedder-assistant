@@ -37,6 +37,7 @@ LOCAL_BROWSER_KEY = secrets.token_urlsafe(32)
 def open_local_app(page, base_url):
     # A fresh ticket is required for every browser session; it is consumed once.
     page.goto(f"{base_url}/assistant-browser-session#{browser_ticket(LOCAL_BROWSER_KEY)}")
+    expect(page.locator(".pdf-upload-input input[type='file']")).to_have_count(1, timeout=30000)
 
 
 def free_local_port() -> int:
@@ -450,60 +451,60 @@ def test_fresh_page_shows_both_actions_disabled(page, local_app_url):
     expect(page.get_by_role("button", name="Cancel")).to_be_disabled()
 
 
-def test_file_selection_opens_identity_fields_but_keeps_technical_metadata_collapsed(
+def test_metadata_table_stays_folded_and_shows_loading_then_detected_values(
     page, local_app_url, one_page_pdf
 ):
-    """Identity fields start open while the long detected-metadata report stays folded."""
     open_local_app(page, local_app_url)
-    expect(page.get_by_label("Document title", exact=True)).to_be_visible()
-    details = page.get_by_role("button", name="Detected Metadata ▼")
-    expect(details).to_be_visible()
-    editor = page.locator(".metadata-short-label-input")
-    expect(editor).to_be_hidden()
-
+    accordion = page.locator("#document-metadata-accordion")
+    header = accordion.locator(":scope > button.label-wrap")
+    expect(header).to_be_visible()
+    expect(page.get_by_label("Override Author")).to_be_hidden()
     upload = page.locator(".pdf-upload-input input[type='file']")
     expect(upload).to_have_count(1)
     upload.set_input_files(str(one_page_pdf))
-
-    expect(page.get_by_label("Document title", exact=True)).to_be_visible(timeout=15000)
-    expect(page.get_by_label("Author", exact=True)).to_be_visible()
-    expect(page.get_by_role("checkbox", name="Use the file title as a fallback")).to_be_visible()
-
-    expect(editor).to_be_hidden()
-    expect(page.get_by_role("button", name="Refresh detected PDF metadata")).to_be_hidden()
-
-    details.click()
-    expect(editor).to_be_visible(timeout=30000)
-    expect(page.locator(".metadata-table .metadata-short-label-row")).to_have_count(1)
-    expect(page.get_by_role("button", name="Refresh detected PDF metadata")).to_be_visible()
-
-
-def test_short_citation_label_table_edit_updates_processing_field(page, local_app_url, one_page_pdf):
-    open_local_app(page, local_app_url)
-    page.locator(".document-metadata-details > button.label-wrap").click()
-    transport = page.locator(
-        "#automatic-short-label-transport input, #automatic-short-label-transport textarea"
-    )
-    expect(transport).to_be_visible()
-    page.locator(".pdf-upload-input input[type='file']").set_input_files(str(one_page_pdf))
-    editor = page.locator(".metadata-table .metadata-short-label-input")
-    expect(editor).to_be_visible(timeout=30000)
+    header.click()
+    expect(page.get_by_label("Override Author")).to_be_visible(timeout=30000)
+    expect(page.locator(".metadata-table thead th")).to_have_text(["Field", "Detected", "Override"])
     page.wait_for_function(
         "document.querySelector('#document-metadata-scan-status .metadata-scan-inline')?.dataset.state === 'ready'",
         timeout=60000,
     )
-    expect(transport).to_be_hidden()
-    expect(editor).to_have_value(transport.input_value())
-    assert editor.bounding_box()["width"] <= 270
-    editor.fill("Edited citation label")
-    expect(transport).to_have_value("Edited citation label")
+    expect(page.locator(".metadata-table .metadata-detected-value").first).not_to_have_text("Loading…")
+    expect(page.get_by_label("Override Publisher")).to_have_value("")
+    expect(page.get_by_role("checkbox", name="Use the file title as a fallback")).to_be_visible()
+    expect(page.get_by_role("button", name="Refresh detected PDF metadata")).to_be_visible()
+
+
+def test_metadata_overrides_update_processing_fields(page, local_app_url, one_page_pdf):
+    open_local_app(page, local_app_url)
+    page.locator("#document-metadata-accordion > button.label-wrap").click()
+    page.locator(".pdf-upload-input input[type='file']").set_input_files(str(one_page_pdf))
+    page.wait_for_function(
+        "document.querySelector('#document-metadata-scan-status .metadata-scan-inline')?.dataset.state === 'ready'",
+        timeout=60000,
+    )
+    for label, text, transport_id in (
+        ("Title used", "Edited title", "automatic-title-override-transport"),
+        ("Author", "Edited Author", "automatic-author-override-transport"),
+        ("Short citation label", "Edited citation label", "automatic-short-label-override-transport"),
+        ("Publisher", "Edited Publisher", "automatic-publisher-override-transport"),
+    ):
+        editor = page.get_by_label(f"Override {label}")
+        expect(editor).to_have_value("")
+        editor.fill(text)
+        transport = page.locator(f"#{transport_id} input, #{transport_id} textarea")
+        expect(transport).to_have_value(text)
     page.get_by_role("button", name="Refresh detected PDF metadata").click()
-    expect(editor).to_have_value("Edited citation label", timeout=60000)
+    expect(page.get_by_label("Override Publisher")).to_have_value("Edited Publisher", timeout=60000)
+    page.get_by_label("Override Publisher").fill("")
+    expect(page.locator(
+        "#automatic-publisher-override-transport input, #automatic-publisher-override-transport textarea"
+    )).to_have_value("")
 
 
 def test_short_citation_label_is_one_shared_edit_for_a_batch(page, local_app_url, two_pdf_files):
     open_local_app(page, local_app_url)
-    page.locator(".document-metadata-details > button.label-wrap").click()
+    page.locator("#document-metadata-accordion > button.label-wrap").click()
     page.locator(".pdf-upload-input input[type='file']").set_input_files(
         [str(path) for path in two_pdf_files]
     )
@@ -511,31 +512,24 @@ def test_short_citation_label_is_one_shared_edit_for_a_batch(page, local_app_url
         "document.querySelector('#document-metadata-scan-status .metadata-scan-inline')?.dataset.state === 'ready'",
         timeout=60000,
     )
-    editor = page.locator(".metadata-table .metadata-short-label-input")
+    editor = page.get_by_label("Override Short citation label")
     expect(editor).to_have_count(1)
     expect(editor).to_be_disabled()
     shared = page.get_by_role(
-        "checkbox", name="Apply the title, author, and short label to every selected PDF"
+        "checkbox", name="Apply title, author, citation label, and publisher overrides to every selected PDF"
     )
     shared.check()
     expect(editor).to_be_enabled(timeout=60000)
+    expect(page.get_by_label("Override Publisher")).to_be_enabled()
 
 
-def test_folded_metadata_detail_header_matches_its_parent_height(page, local_app_url, one_page_pdf):
-    """The nested folded control must not be a taller-looking field."""
+def test_document_metadata_has_one_outer_accordion(page, local_app_url, one_page_pdf):
     open_local_app(page, local_app_url)
     page.locator(".pdf-upload-input input[type='file']").set_input_files(str(one_page_pdf))
-
-    parent = page.locator(".top-level-accordion").filter(has_text="Document metadata").first
-    child = page.locator(".document-metadata-details > button.label-wrap")
-    expect(parent).to_be_visible()
-    expect(child).to_be_visible()
-
-    parent_header = parent.locator(":scope > button.label-wrap")
-    parent_box = parent_header.bounding_box()
-    child_box = child.bounding_box()
-    assert parent_box is not None and child_box is not None
-    assert abs(parent_box["height"] - child_box["height"]) <= 1
+    expect(page.locator("#document-metadata-accordion")).to_be_visible()
+    expect(page.locator(".document-metadata-details")).to_have_count(0)
+    page.locator("#document-metadata-accordion > button.label-wrap").click()
+    expect(page.locator("#document-metadata-accordion .metadata-table")).to_have_count(1, timeout=30000)
 
 
 def test_dark_theme_confirmation_action_row_does_not_overlap(page, local_app_url, one_page_pdf):

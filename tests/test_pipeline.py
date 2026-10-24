@@ -14227,7 +14227,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn("Workspace label", additional)
         self.assertNotIn("Workspace identities", html_preview)
         self.assertEqual(html_preview.count('sample.pdf'), 1)
-        self.assertTrue(accordion_update["open"])
+        self.assertNotIn("open", accordion_update)
 
     def test_download_files_update_can_package_current_outputs_as_zip(self):
         import rag_pdf_gradio_app as app
@@ -18955,10 +18955,29 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(payloads[0]["metadata"]["chunkSource"], "segment://sample-1")
         self.assertEqual(payloads[0]["metadata"]["description"], "PDF page 9; segment one.")
 
+    def test_pdf_metadata_reads_only_explicit_xmp_publisher(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pdf_path = Path(temp_dir) / "sample.pdf"
+            doc = fitz.open()
+            doc.new_page()
+            doc.set_xml_metadata(
+                '<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+                '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" '
+                'xmlns:dc="http://purl.org/dc/elements/1.1/">'
+                '<rdf:Description><dc:publisher><rdf:Seq><rdf:li>University Press</rdf:li>'
+                '</rdf:Seq></dc:publisher></rdf:Description></rdf:RDF></x:xmpmeta>'
+            )
+            doc.save(pdf_path)
+            doc.close()
+            metadata = pipeline.pdf_metadata(pdf_path)
+            self.assertEqual(metadata["publisher"], "University Press")
+            self.assertEqual(metadata["publisher_source"], "xmp_metadata")
+
     def test_raw_text_payloads_include_filename_required_by_anythingllm_workspace_rows(self):
         segment = {
             "source_title": "Sample Source",
             "source_author": "Author",
+            "source_publisher": "Chosen Press",
             "source_sha256": "abc123",
             "source_id": "sample",
             "source_short_label": "sample",
@@ -18980,12 +18999,14 @@ class PipelineCoreTests(unittest.TestCase):
         payload = pipeline.generate_api_payloads([segment], "native_header")[0]
         self.assertEqual(payload["filename"], "sample-p9-lp3-ln1-4-s00001.txt")
         self.assertEqual(payload["metadata"]["title"], "sample-p9-lp3-ln1-4-s00001")
+        self.assertIn("Publisher: Chosen Press.", payload["metadata"]["description"])
 
     def test_page_parent_payloads_include_filename_required_by_anythingllm_workspace_rows(self):
         parent = {
             "parent_id": "sample::pdf-p0009",
             "source_title": "Sample Source",
             "source_author": "Author",
+            "source_publisher": "Chosen Press",
             "source_short_label": "sample",
             "source_sha256": "abc123",
             "pdf_page": 9,
@@ -19003,6 +19024,7 @@ class PipelineCoreTests(unittest.TestCase):
         payload = pipeline.generate_page_parent_payloads([parent], "native_header")[0]
         self.assertEqual(payload["filename"], "sample-p0009-lp3-page-parent.txt")
         self.assertEqual(payload["metadata"]["chunkSource"], "page-parent://sample::pdf-p0009")
+        self.assertIn("Publisher: Chosen Press.", payload["metadata"]["description"])
 
     def test_explain_observed_columns_reports_layers(self):
         rows = pipeline.explain_observed_columns(
@@ -24952,6 +24974,7 @@ class PipelinePdfIntegrationTests(unittest.TestCase):
                 document_label="",
                 document_author="",
                 document_short_label="",
+                document_publisher="Chosen Press",
                 use_file_title_fallback=True,
                 deep_extraction=False,
                 include_front_matter=False,
@@ -25007,6 +25030,8 @@ class PipelinePdfIntegrationTests(unittest.TestCase):
             self.assertTrue(Path(summary["variant_summary"]).exists())
             self.assertTrue(Path(summary["diagnostics_report"]).exists())
             profile = json.loads((output_dir / "source-profile.json").read_text(encoding="utf-8"))
+            self.assertEqual(profile["detected_publisher"], "Chosen Press")
+            self.assertEqual(profile["metadata_provenance"]["source_publisher"], "user_override")
             self.assertEqual(profile["author_confidence"], {
                 "score": 0, "level": "unresolved", "basis": "unresolved",
             })

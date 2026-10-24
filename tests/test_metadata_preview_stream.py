@@ -351,6 +351,41 @@ def test_preview_authors_cannot_bypass_fresh_role_reconciliation():
     assert app.automatic_explicit_metadata_values({}, values) == values
 
 
+def test_blank_table_overrides_preserve_fresh_detection_and_publisher_fallback():
+    values = [None] * len(app.AUTOMATIC_RUN_FIELDS)
+    lookup = app.AUTOMATIC_RUN_FIELDS.index
+    values[lookup("pdf_files")] = ["sample.pdf"]
+    values[lookup("document_label")] = "Detected title"
+    values[lookup("document_author")] = "Preview Person"
+    values[lookup("document_short_label")] = "Preview label"
+    values[lookup("document_publisher")] = ""
+    resolved = app.automatic_explicit_metadata_values({}, values, overrides=("", "", ""))
+    assert resolved[lookup("document_label")] == "Detected title"
+    assert resolved[lookup("document_author")] == ""
+    assert resolved[lookup("document_short_label")] == ""
+    assert resolved[lookup("document_publisher")] == ""
+
+    values[lookup("document_publisher")] = "Chosen Press"
+    resolved = app.automatic_explicit_metadata_values(
+        {}, values, overrides=("Chosen title", "Chosen Author", "Chosen label")
+    )
+    assert resolved[lookup("document_label")] == "Chosen title"
+    assert resolved[lookup("document_author")] == "Chosen Author"
+    assert resolved[lookup("document_short_label")] == "Chosen label"
+    assert resolved[lookup("document_publisher")] == "Chosen Press"
+
+    values[lookup("pdf_files")] = ["first.pdf", "second.pdf"]
+    resolved = app.automatic_explicit_metadata_values({}, values, overrides=("X", "Y", "Z"))
+    assert all(resolved[lookup(field)] == "" for field in (
+        "document_label", "document_author", "document_short_label", "document_publisher"
+    ))
+    values[lookup("apply_batch_metadata_overrides")] = True
+    resolved = app.automatic_explicit_metadata_values({}, values, overrides=("X", "Y", "Z"))
+    assert [resolved[lookup(field)] for field in (
+        "document_label", "document_author", "document_short_label", "document_publisher"
+    )] == ["X", "Y", "Z", "Chosen Press"]
+
+
 def test_preview_option_change_preserves_intent_but_new_source_resets_it():
     state = app.automatic_selection_begin_state({}, "", ["first.pdf"], [], {})[0]
     state = app.mark_metadata_field_edited("document_author", "Chosen Person", state)
@@ -375,7 +410,7 @@ def test_old_inferred_fields_do_not_mask_a_new_preview_but_manual_edits_survive(
     ))
     inspect.assert_called_once_with(
         ["first.pdf"], "", "", "", True, False,
-        short_label_editor=True, short_label_editable=True,
+        override_editor=True, override_editable=True,
     )
     inspect.reset_mock()
     state = {"metadata_user_edits": {"document_author": True}}
@@ -384,5 +419,5 @@ def test_old_inferred_fields_do_not_mask_a_new_preview_but_manual_edits_survive(
     ))
     inspect.assert_called_once_with(
         ["first.pdf"], "", "manual author", "", True, False,
-        short_label_editor=True, short_label_editable=True,
+        override_editor=True, override_editable=True,
     )
