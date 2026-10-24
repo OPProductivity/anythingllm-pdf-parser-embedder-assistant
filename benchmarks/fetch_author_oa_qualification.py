@@ -1,7 +1,7 @@
 """Fetch the frozen public author-qualification cases and neutral-name copies.
 
 Author labels go into evaluation manifests only, never into PDF metadata or
-inference arguments. This does not upload or embed PDFs and does not use GROBID.
+inference arguments. This does not upload or embed PDFs.
 """
 
 import argparse

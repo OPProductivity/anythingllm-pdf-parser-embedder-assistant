@@ -153,15 +153,6 @@ def test_ocr_wrapped_title_is_not_promoted_as_a_person():
     assert _credit(text, sample, 3)["author"] == "Gabriel Santos"
 
 
-def test_grobid_is_disabled_without_any_network_call(monkeypatch):
-    from author_metadata.grobid import analyze
-
-    monkeypatch.delenv("PDF_GROBID_ENABLED", raising=False)
-    with patch("author_metadata.grobid._post_pdf") as post:
-        assert analyze("anything.pdf", context("")) == {"status": "disabled"}
-    post.assert_not_called()
-
-
 def test_chapter_wrapper_does_not_require_filename_title():
     sample = context(
         "Chapter Title: Cities and Memory\nChapter Author(s): Amina Rao\n"

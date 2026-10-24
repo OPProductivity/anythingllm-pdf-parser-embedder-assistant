@@ -179,37 +179,6 @@ def test_flattened_ocr_byline_keeps_field_boundary_unresolved():
     assert result["ocr_credit_candidates"] == ["Laura Pulido"]
 
 
-def test_positioned_ocr_title_reopens_unverified_grobid_work_link(tmp_path):
-    path = tmp_path / "embedded-title-missing.pdf"
-    doc = fitz.open()
-    page = doc.new_page(width=600, height=800)
-    page.insert_text((60, 100), "Placeholder", fontsize=11)
-    page.insert_text((60, 130), "By Laura Pulido", fontsize=13)
-    doc.save(path)
-    doc.close()
-
-    def fake_ocr(pdf_path, page, fraction, psm, *, tesseract):
-        return {"status": "ok", "text": "Racial Politics\nBy Laura Pulido",
-                "atoms": [atom(0, "Racial", 60, 84, 100, 99),
-                          atom(1, "Politics", 104, 84, 160, 99),
-                          atom(2, "By", 60, 117, 75, 130, line=1),
-                          atom(3, "Laura", 78, 117, 110, 130, line=1),
-                          atom(4, "Pulido", 114, 117, 156, 130, line=1)],
-                "recognition": {}}
-
-    result = review_author_field_map(
-        path, title_hint="Wrong embedded title", author="Laura Pulido",
-        grobid_analysis={"status": "ok", "title": "Racial Politics",
-                         "authors": [{"name": "John Smith"}]},
-        ocr_runner=fake_ocr,
-    )
-    assert result["grobid_peer"]["status"] == "same_work_candidate_by_ocr"
-    assert any(row["reason"] == "grobid_work_link_reopened_by_positioned_ocr_title"
-               for row in result["reconsiderations"])
-    assert any(row["reason"] == "grobid_same_work_author_disagreement"
-               for row in result["reconsiderations"])
-
-
 def test_one_of_two_authors_is_not_full_ocr_agreement():
     result = _check_ocr("Anthony Harkins, Meredith McCarroll",
                         "By Meredith McCarroll", None, "Appalachian Reckoning")

@@ -1,4 +1,4 @@
-"""Reproducible native-only author experiments. No upload or GROBID imports."""
+"""Reproducible native-only author experiments without upload."""
 
 import argparse
 import hashlib
@@ -194,7 +194,7 @@ def main():
             "seconds": round(sum(r["seconds"] for r in subset), 3),
         }
     result = {
-        "mode": "native_sampled_metadata_no_grobid",
+        "mode": "native_sampled_metadata",
         "repo": args.repo,
         "ablation": args.ablation,
         "manifest_sha256": hashlib.sha256(Path(args.manifest).read_bytes()).hexdigest(),

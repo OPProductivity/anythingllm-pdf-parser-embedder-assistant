@@ -1,8 +1,8 @@
 """Hash-bound, paired metadata preflight for the moved genre corpora.
 
 Build one case catalog, then run it against separate parser checkouts. This
-exercises metadata sampling, work identity, genre strategy, optional GROBID
-reconciliation, and final metadata-author resolution. It does not prepare
+exercises metadata sampling, work identity, genre strategy, and final
+metadata-author resolution. It does not prepare
 segments, run the shadow field map, upload, or embed PDFs.
 """
 
@@ -128,15 +128,13 @@ def build_cases(repo_root, archive_root, gold_manifest_path):
             }}
 
 
-def evaluate(case_path, output_path, code_root, *, with_grobid=False):
+def evaluate(case_path, output_path, code_root):
     sys.path.insert(0, str(Path(code_root).resolve()))
     from auto_anythingllm_pipeline import pdf_metadata
     from author_metadata.context import AuthorEvidenceContext
     from author_metadata.dispatcher import infer_author
     from author_metadata.identity import resolve_author_from_metadata_and_inference
     from author_metadata.work_identity import resolve_work_identity
-    if with_grobid:
-        from author_metadata.grobid import analyze, reconcile
 
     cases = _read(case_path)["cases"]
     output_path = Path(output_path)
@@ -154,8 +152,7 @@ def evaluate(case_path, output_path, code_root, *, with_grobid=False):
             path = Path(case["path"])
             start = time.perf_counter()
             row = {"sha256": case["sha256"], "file": path.name,
-                   "code_root": str(Path(code_root).resolve()),
-                   "with_grobid": with_grobid}
+                   "code_root": str(Path(code_root).resolve())}
             try:
                 metadata = pdf_metadata(path, include_author_samples=True)
                 sample_error = metadata.pop("_author_sample_error", "")
@@ -168,12 +165,6 @@ def evaluate(case_path, output_path, code_root, *, with_grobid=False):
                 inferred = infer_author(context)
                 row["native_author"] = inferred.get("author") or ""
                 row["native_author_source"] = inferred.get("source") or ""
-                if with_grobid:
-                    grobid = analyze(path, context, fulltext=True)
-                    inferred, decision = reconcile(context, inferred, grobid)
-                    row["grobid_status"] = grobid.get("status")
-                    row["grobid_decision"] = decision
-                    row["grobid_authors"] = [item.get("name") for item in grobid.get("authors") or []]
                 resolved = resolve_author_from_metadata_and_inference(
                     metadata.get("author") or "", inferred)
                 row.update({"author": resolved["author"], "author_source": resolved["source"],
@@ -203,7 +194,6 @@ def main():
     run.add_argument("--cases", required=True, type=Path)
     run.add_argument("--code-root", required=True, type=Path)
     run.add_argument("--output", required=True, type=Path)
-    run.add_argument("--grobid", action="store_true")
     args = parser.parse_args()
     if args.action == "build":
         result = build_cases(args.repo_root, args.archive_root, args.gold_manifest)
@@ -213,7 +203,7 @@ def main():
                           "missing": result["missing"],
                           "source_counts": result["source_counts"]}, ensure_ascii=False))
     else:
-        evaluate(args.cases, args.output, args.code_root, with_grobid=args.grobid)
+        evaluate(args.cases, args.output, args.code_root)
 
 
 if __name__ == "__main__":

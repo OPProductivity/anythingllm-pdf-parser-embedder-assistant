@@ -9,7 +9,6 @@ from rag_pdf_tools import normalize_text
 from .constants import POST_EXTRACTION_AUTHOR_TRUSTED_SOURCES
 from .context import AuthorEvidenceContext
 from .dispatcher import infer_author
-from .grobid import analyze as analyze_grobid, reconcile as reconcile_grobid
 from .identity import author_confidence, resolve_author_from_metadata_and_inference
 from .names import (looks_like_person_name, normalize_author_candidate,
                     split_author_line_candidates)
@@ -181,21 +180,10 @@ def infer_author_from_initial_pdf_pages(path: Path, title_hint="", *, page_limit
     sampling_warning = "; ".join(sampling_errors)
     report = (infer_author(context, sampling_error=sampling_warning)
               if sampling_warning else infer_author(context))
-    context = AuthorEvidenceContext.from_samples(
-        samples, path=pdf_path, title_hint=identity.title, profile=identity.profile,
-    )
-    grobid_analysis = analyze_grobid(pdf_path, context)
-    report, grobid_decision = reconcile_grobid(context, report, grobid_analysis)
     resolved = resolve_author_from_metadata_and_inference(metadata.get("author") or "", report)
-    resolved["grobid_agrees"] = grobid_decision == "agrees"
     result = {"author": resolved["author"], "source": resolved["source"],
             "page": int(report.get("page") or 0), "evidence": str(report.get("evidence") or ""),
-            "work_identity": identity.as_evidence(), "author_confidence": author_confidence(resolved),
-            "grobid": {"status": grobid_analysis.get("status"),
-                       "decision": grobid_decision,
-                       "title": grobid_analysis.get("title", ""),
-                       "authors": [item["name"] for item in grobid_analysis.get("authors", [])]},
-            }
+            "work_identity": identity.as_evidence(), "author_confidence": author_confidence(resolved)}
     if sampling_warning:
         result["initial_sampling_warning"] = sampling_warning
     return result

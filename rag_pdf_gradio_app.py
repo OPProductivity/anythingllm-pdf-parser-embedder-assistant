@@ -81,7 +81,6 @@ from embedder_capabilities import (
     provider_catalog_entries,
 )
 from author_metadata.context import AuthorEvidenceContext
-from author_metadata.grobid import analyze as analyze_grobid, reconcile as reconcile_grobid
 from author_metadata.constants import TRUSTED_AUTHOR_INFERENCE_SOURCES
 from author_metadata.dispatcher import infer_author as infer_profiled_author
 from author_metadata.pdf import infer_author_from_initial_pdf_pages
@@ -5658,15 +5657,10 @@ def workspace_person_identity_from_pdf(pdf_file, *, native_metadata=None):
                 profile=identity.profile,
             )
             inference = infer_profiled_author(selected_context)
-            grobid_analysis = analyze_grobid(path, selected_context)
-            inference, grobid_decision = reconcile_grobid(
-                selected_context, inference, grobid_analysis,
-            )
             resolved = resolve_author_from_metadata_and_inference(
                 metadata.get("author") or "",
                 inference,
             )
-            resolved["grobid_agrees"] = grobid_decision == "agrees"
             author_report = {
                 "author": resolved["author"],
                 "source": resolved["source"],
@@ -26494,15 +26488,6 @@ def detected_metadata_preview(
                 "PDF structure",
             ),
         ]
-        grobid_preview = author_inference.get("grobid") or {}
-        if grobid_preview.get("status") not in {None, "skipped_genre"}:
-            metadata_rows[5:5] = [
-                ("GROBID", grobid_preview.get("status", "unknown"), "local scholarly parser"),
-                ("GROBID authors", ", ".join(grobid_preview.get("authors") or []) or "None",
-                 "scholarly header"),
-                ("GROBID decision", grobid_preview.get("decision", "not assessed"),
-                 "author evidence comparison"),
-            ]
         row_html = "".join(
             '<div class="metadata-key">{}</div><div class="metadata-value">{}</div>'.format(
                 html.escape(str(key)),

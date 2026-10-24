@@ -6,9 +6,9 @@
 
 1. Read positioned native PDF words with page, box, extractor block/line, and font provenance. Keep the original words. Propose overlapping line, gap, alignment, and stacked-line groups by word IDs; no group rewrites the source or excludes an alternative.
 2. Mark possible title, author credit, affiliation, abstract, copyright, DOI, and contents fields. Record multiple page roles. The first four pages are sampled; front matter may extend the map to page twelve until a visible title and linked credit are found.
-3. Compare the final selected author with an available OCR extraction and a same-work GROBID candidate. Flattened OCR can suggest a printed byline, but its field boundary is unresolved until positioned evidence is available.
+3. Compare the final selected author with an available OCR extraction. Flattened OCR can suggest a printed byline, but its field boundary is unresolved until positioned evidence is available.
 4. Recheck a likely title/credit region with OCR. If a crop is empty or conflicts, try wider compositions within a three-call budget. OCR word boxes retain separate provenance. Re-run the author strategy under the native genre and an independently inferred OCR genre, recording differences.
-5. Return corroborated, unresolved, candidate, or disagreement for review. OCR recognition of a surname at a native title-linked credit can corroborate; a body-text occurrence alone cannot. A one-letter OCR variation is uncertainty. An unverified GROBID work match cannot settle a disagreement.
+5. Return corroborated, unresolved, candidate, or disagreement for review. OCR recognition of a surname at a native title-linked credit can corroborate; a body-text occurrence alone cannot. A one-letter OCR variation is uncertainty.
 
 An OCR failure is recorded per crop, not stored as a permanent failure for a PDF. `max_ocr_calls` bounds cost; another preparation may retry. The compact saved review keeps only atoms participating in field proposals, plus counts for the sampled page.
 

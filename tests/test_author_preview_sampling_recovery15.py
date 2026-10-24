@@ -58,7 +58,6 @@ def install_rendered_ocr_fixture(monkeypatch, native_reader):
 def test_preview_seed_failure_still_reads_later_pages_and_ocr(
     tmp_path, monkeypatch, failed_page
 ):
-    monkeypatch.setenv("PDF_GROBID_ENABLED", "0")
     path = tmp_path / "document.pdf"
     make_source(path)
     native = fitz.Page.get_text
@@ -73,7 +72,6 @@ def test_preview_seed_failure_still_reads_later_pages_and_ocr(
     reports = capture_real_inference(monkeypatch)
     result = api.infer_author_from_initial_pdf_pages(path, page_limit=4)
     assert result["author"] == "Amelia Hart"
-    assert result["grobid"]["status"] == "disabled"
     assert f"page {failed_page}" in result["initial_sampling_warning"]
     assert reports[-1]["initial_sampling_warning"]
     trace = reports[-1]["evidence_review"]
@@ -94,7 +92,6 @@ def test_preview_seed_failure_still_reads_later_pages_and_ocr(
 
 
 def test_preview_healthy_seed_preserves_a_warning_free_result(tmp_path, monkeypatch):
-    monkeypatch.setenv("PDF_GROBID_ENABLED", "0")
     path = tmp_path / "document.pdf"
     make_source(path)
     install_rendered_ocr_fixture(monkeypatch, fitz.Page.get_text)
@@ -104,7 +101,6 @@ def test_preview_healthy_seed_preserves_a_warning_free_result(tmp_path, monkeypa
 
 
 def test_preview_unopenable_pdf_remains_an_explicit_error(tmp_path, monkeypatch):
-    monkeypatch.setenv("PDF_GROBID_ENABLED", "0")
     result = api.infer_author_from_initial_pdf_pages(tmp_path / "missing.pdf")
     assert result["source"] == "error"
     assert not result["author"]

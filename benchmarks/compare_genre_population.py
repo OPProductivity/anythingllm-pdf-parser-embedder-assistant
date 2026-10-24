@@ -71,8 +71,6 @@ def compare(cases_path, baseline_path, current_path, native_path=None):
                   "versions": {name: {"author": row.get("author"),
                                       "author_source": row.get("author_source"),
                                       "genre": row.get("genre"),
-                                      "grobid_status": row.get("grobid_status"),
-                                      "grobid_decision": row.get("grobid_decision"),
                                       "error": row.get("error"),
                                       "seconds": row.get("seconds")}
                                for name, row in predictions.items()}}

@@ -1,7 +1,7 @@
 """Offline, read-only shadow evaluation of reversible metadata field proposals.
 
 This reads reviewed author labels and local PDFs. It does not run preparation,
-upload, embeddings, GROBID, or change any selected metadata.
+upload, embeddings, or change any selected metadata.
 """
 
 from __future__ import annotations

@@ -154,8 +154,6 @@ def author_confidence(resolved_author):
         score, basis = 90, "filename_and_visible_author_field"
     elif source == "filename_pdf_standalone_match":
         score, basis = 82, "filename_and_opening_byline"
-    elif source == "grobid_header_author":
-        score, basis = 85, "grobid_header_and_visible_byline"
     elif source in {
         "text_author_label",
         "text_bibliographic_author_label",
@@ -170,7 +168,5 @@ def author_confidence(resolved_author):
         score, basis = 70, "structured_filename"
     else:
         score, basis = 0, "unresolved"
-    if 0 < score < 100 and (resolved_author or {}).get("grobid_agrees"):
-        score, basis = max(score, 92), "visible_credit_and_grobid_header_agreement"
     level = "high" if score >= 90 else "moderate" if score >= 70 else "unresolved"
     return {"score": score, "level": level, "basis": basis}

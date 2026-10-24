@@ -666,7 +666,7 @@ def _check_ocr(author, text, ocr_map=None, title_hint="", native_map=None):
 
 
 def review_author_field_map(pdf_path, *, title_hint="", author="", author_source="",
-                            ocr_peer_pages=(), grobid_analysis=None, tesseract="", max_ocr_calls=3,
+                            ocr_peer_pages=(), tesseract="", max_ocr_calls=3,
                             ocr_runner=None):
     """Bounded evidence cycle. No returned candidate changes final metadata."""
     from .context import AuthorEvidenceContext
@@ -686,20 +686,6 @@ def review_author_field_map(pdf_path, *, title_hint="", author="", author_source
          for page in pages[:4]], title_hint=title_hint, path=pdf_path,
     ).profile
     report["native_profile"] = current_profile.kind
-    grobid = grobid_analysis or {}
-    if grobid.get("status") == "ok":
-        grobid_authors = [row.get("name") for row in grobid.get("authors") or []
-                          if isinstance(row, dict) and row.get("name")]
-        grobid_keys = set().union(*(_author_keys(value) for value in grobid_authors)) if grobid_authors else set()
-        title_link = max((_title_overlap(group["text"], grobid.get("title") or "")
-                          for page in pages for group in page["groups"]
-                          if any(field["role"] == "work_title" and field["group_id"] == group["id"]
-                                 for field in page["field_candidates"])), default=0)
-        report["grobid_peer"] = {"status": "same_work_candidate" if title_link >= .68 else "work_link_unverified",
-                                 "title_overlap": round(title_link, 3), "authors": grobid_authors}
-        if title_link >= .68 and _author_keys(author) and grobid_keys and grobid_keys != _author_keys(author):
-            report["reconsiderations"].append({"reason": "grobid_same_work_author_disagreement",
-                                               "grobid_authors": grobid_authors})
     peer_samples = [{"page": int(page.get("page") or 0), "text": str(page.get("text") or "")}
                     for page in ocr_peer_pages if 1 <= int(page.get("page") or 0) <= 4]
     if peer_samples:
@@ -747,25 +733,6 @@ def review_author_field_map(pdf_path, *, title_hint="", author="", author_source
                 continue
             ocr_map = map_atoms(result.get("atoms") or [], target["page"],
                                 target["width"], target["height"], title_hint)
-            if grobid.get("status") == "ok" and report.get("grobid_peer", {}).get("status") == "work_link_unverified":
-                ocr_title_link = max((
-                    _title_overlap(group["text"], grobid.get("title") or "")
-                    for group in ocr_map["groups"]
-                    if group["bbox"][1] < ocr_map["height"] * .42
-                ), default=0)
-                if ocr_title_link >= .68:
-                    report["grobid_peer"]["status"] = "same_work_candidate_by_ocr"
-                    report["grobid_peer"]["ocr_title_overlap"] = round(ocr_title_link, 3)
-                    report["reconsiderations"].append({
-                        "reason": "grobid_work_link_reopened_by_positioned_ocr_title",
-                        "composition": crop["composition"],
-                    })
-                    if (_author_keys(author) and grobid_keys
-                            and grobid_keys != _author_keys(author)):
-                        report["reconsiderations"].append({
-                            "reason": "grobid_same_work_author_disagreement",
-                            "grobid_authors": grobid_authors,
-                        })
             comparison = _check_ocr(author, result.get("text") or "", ocr_map, title_hint,
                                     native_map=target)
             crop_sample = [{"page": target["page"], "text": result.get("text") or ""}]
@@ -838,8 +805,7 @@ def review_author_field_map(pdf_path, *, title_hint="", author="", author_source
         report["final_review"] = "conflicting_ocr_compositions"
     elif "agrees" in statuses and any(
         row["reason"] in {"ocr_crop_author_strategy_disagreement",
-                          "independent_ocr_author_strategy_disagreement",
-                          "grobid_same_work_author_disagreement"}
+                          "independent_ocr_author_strategy_disagreement"}
         for row in report["reconsiderations"]
     ):
         report["final_review"] = "module_disagreement_review_required"

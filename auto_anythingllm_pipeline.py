@@ -120,7 +120,6 @@ from author_metadata.identity import (  # noqa: F401
     author_confidence,
 )
 from author_metadata.context import AuthorEvidenceContext
-from author_metadata.grobid import analyze as analyze_grobid, reconcile as reconcile_grobid
 from author_metadata.field_map import compact_field_review, review_author_field_map
 from author_metadata.dispatcher import infer_author as infer_profiled_author
 from author_metadata.work_identity import resolve_work_identity
@@ -22029,18 +22028,10 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     inferred_author = infer_profiled_author(
         author_context, sampling_error=author_sample_error,
     )
-    grobid_analysis = analyze_grobid(pdf_path, author_context, fulltext=True)
-    inferred_author, grobid_decision = reconcile_grobid(
-        author_context, inferred_author, grobid_analysis,
-    )
     resolved_author = resolve_author_from_metadata_and_inference(
         pdf_meta.get("author") or "",
         inferred_author,
         author_override=args.document_author,
-    )
-    resolved_author["grobid_agrees"] = (
-        grobid_decision == "agrees"
-        and resolved_author.get("author") == inferred_author.get("author")
     )
     author = resolved_author["author"]
     author_source = resolved_author["source"]
@@ -22076,8 +22067,6 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         "source_short_label": source_meta["source_short_label"],
         "metadata_provenance": source_meta["metadata_provenance"],
         "author_inference": inferred_author,
-        "grobid_analysis": grobid_analysis,
-        "grobid_author_decision": grobid_decision,
         "author_document_profile": (
             author_context.profile_evidence()
             | ({"sampling_warning": author_sample_error, "scope_complete": False}
@@ -23356,7 +23345,6 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             author=source_meta.get("source_author") or "",
             author_source=(source_meta.get("metadata_provenance") or {}).get("source_author") or "",
             ocr_peer_pages=(ocr_peer or {}).get("pages") or (),
-            grobid_analysis=grobid_analysis,
             tesseract=tesseract_path,
         )
         field_review_path = Path(selected["candidate_dir"]) / "author-field-review.json"

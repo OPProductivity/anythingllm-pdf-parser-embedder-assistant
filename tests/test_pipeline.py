@@ -7934,7 +7934,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(app.LIVE_AUTOMATIC_RUN_STATUS, {})
         self.assertTrue(updates[0]["visible"])
         self.assertIn('aria-valuenow="0"', updates[0]["value"])
-        self.assertIn("Ready — Confirm to begin processing.", updates[0]["value"])
+        self.assertIn("No PDFs selected — choose a PDF or a folder to begin.", updates[0]["value"])
         self.assertIn("Est: 00m00s", updates[1]["value"])
         self.assertEqual(len(updates), 16)
         self.assertFalse(updates[3]["interactive"])
