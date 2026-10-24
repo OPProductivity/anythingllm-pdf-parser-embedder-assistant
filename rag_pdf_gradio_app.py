@@ -994,6 +994,45 @@ APP_CONNECTION_WATCHDOG_HEAD = """
       syncCheckbox();
     }, true);
 
+    // The detailed preview is collapsed by default. Keep its status visible
+    // beside the title/author fields as soon as Gradio displays a selected
+    // PDF, even while the server's metadata callback is still queued.
+    let metadataSelectionKey = null;
+    const metadataSelectionNames = () => [
+      ...document.querySelectorAll("#automatic-pdf-upload .file-preview td[aria-label]"),
+      ...document.querySelectorAll("#batch-folder-file-selector .token"),
+    ].map(node => (node.getAttribute("aria-label") || node.textContent || "").trim())
+      .filter(name => /\\.pdf\\b/i.test(name));
+    const showMetadataStatus = (state, message) => {
+      const status = document.querySelector("#document-metadata-scan-status .metadata-scan-inline");
+      if (!status) return;
+      if (status.dataset.state !== state) status.dataset.state = state;
+      const copy = status.querySelector(".metadata-scan-copy");
+      if (copy && copy.textContent !== message) copy.textContent = message;
+    };
+    const syncMetadataStatus = () => {
+      const names = metadataSelectionNames();
+      const key = names.join("\\u001f");
+      if (key !== metadataSelectionKey) {
+        const existing = document.querySelector("#document-metadata-scan-status .metadata-scan-inline");
+        if (metadataSelectionKey === null && names.length &&
+            ["ready", "warning"].includes(existing?.dataset.state)) {
+          metadataSelectionKey = key;
+          return;
+        }
+        metadataSelectionKey = key;
+        showMetadataStatus(names.length ? "scanning" : "idle",
+          names.length ? `Preparing metadata preview for ${names.length} PDF${names.length === 1 ? "" : "s"}…` : "");
+      }
+    };
+    document.addEventListener("change", (event) => {
+      const target = event.target;
+      if (target instanceof HTMLInputElement &&
+          target.matches("#automatic-pdf-upload input[type='file']") && target.files?.length) {
+        showMetadataStatus("scanning", "Preparing metadata preview…");
+      }
+    }, true);
+
     // Gradio remains the complete owner of the multi-file picker: its native
     // controls, transfer state, and selected-file list are never replaced or
     // hidden. Once its authoritative preview rows have mounted, add only a
@@ -1099,12 +1138,14 @@ APP_CONNECTION_WATCHDOG_HEAD = """
         document.body?.classList.toggle("dark", appliedDark);
         document.querySelector("gradio-app")?.classList.toggle("dark", appliedDark);
         syncCheckbox();
+        syncMetadataStatus();
       });
     };
     const observer = new MutationObserver(scheduleControlSync);
     observer.observe(document.documentElement, { childList: true, subtree: true });
     applyStoredTheme();
     syncCheckbox();
+    syncMetadataStatus();
 
     // This parser-executed script runs in <head>, before the body exists.
     // Give that body the already-decided class at its very first DOM mutation,
@@ -2703,6 +2744,35 @@ body.dark #automatic-process-button[disabled] {
 .metadata-summary .metadata-status {
     padding: 18px 14px;
     color: var(--body-text-color-subdued);
+}
+#document-metadata-scan-status:has(.metadata-scan-inline[data-state="idle"]) {
+    display: none !important;
+}
+.metadata-scan-inline {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 9px 12px;
+    border: 1px solid var(--border-color-primary);
+    border-radius: 7px;
+    background: var(--background-fill-secondary);
+    color: var(--body-text-color-subdued);
+    font-size: 0.9rem;
+}
+.metadata-scan-inline[data-state="scanning"] .metadata-scan-spinner {
+    width: 14px;
+    height: 14px;
+    flex: 0 0 14px;
+    border: 2px solid #93c5fd;
+    border-top-color: #2563eb;
+    border-radius: 50%;
+    animation: metadata-scan-spin 0.8s linear infinite;
+}
+.metadata-scan-inline[data-state="ready"]::before { content: "✓"; color: #15803d; font-weight: 700; }
+.metadata-scan-inline[data-state="warning"]::before { content: "!"; color: #b45309; font-weight: 700; }
+@keyframes metadata-scan-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+    .metadata-scan-inline .metadata-scan-spinner { animation: none; }
 }
 .metadata-summary .inspector-pre {
     margin: 0;
@@ -12679,6 +12749,18 @@ def automatic_detected_metadata_preview(
         )
 
 
+def metadata_scan_status_html(state, message):
+    """A visible companion to the optional detailed preview panel."""
+    if state not in {"idle", "scanning", "ready", "warning"}:
+        raise ValueError("Unknown metadata preview state")
+    return (
+        f'<div class="metadata-scan-inline" data-state="{state}" role="status" '
+        'aria-live="polite" aria-atomic="true">'
+        '<span class="metadata-scan-spinner" aria-hidden="true"></span>'
+        f'<span class="metadata-scan-copy">{html.escape(message)}</span></div>'
+    )
+
+
 def stream_automatic_detected_metadata_preview(
     pdf_files,
     folder_files,
@@ -12697,7 +12779,7 @@ def stream_automatic_detected_metadata_preview(
     evidence is retained for another selection or for the confirmed run.
     """
     if automatic_lifecycle_busy() or not _selection_preview_is_current(selection_state, request):
-        yield tuple(gr.update() for _ in range(6))
+        yield tuple(gr.update() for _ in range(7))
         return
     candidates, _reused = folder_manifest_candidates(folder_files, folder_manifest)
     files = candidates or normalize_file_list(pdf_files)
@@ -12705,7 +12787,9 @@ def stream_automatic_detected_metadata_preview(
         empty = detected_metadata_preview([])
         yield (
             *(gr.update(value="", interactive=True) for _ in range(3)),
-            *empty[3:],
+            empty[3],
+            metadata_scan_status_html("idle", ""),
+            empty[4],
             gr.update(),
         )
         return
@@ -12721,6 +12805,7 @@ def stream_automatic_detected_metadata_preview(
             current_short_label = ""
     displayed = files[:5]
     completed_html = []
+    preview_errors = 0
     field_updates = tuple(gr.update(value=value or "", interactive=False) for value in
                           (current_title, current_author, current_short_label))
     if len(files) > 1 and not apply_batch_metadata_overrides:
@@ -12738,7 +12823,7 @@ def stream_automatic_detected_metadata_preview(
     ) + "</ul>"
     for index, path in enumerate(displayed):
         if automatic_lifecycle_busy() or not _selection_preview_is_current(selection_state, request):
-            yield tuple(gr.update() for _ in range(6))
+            yield tuple(gr.update() for _ in range(7))
             return
         scanning = (
             f"Author metadata recognition scanning… {index + 1}/{len(displayed)}: "
@@ -12751,6 +12836,9 @@ def stream_automatic_detected_metadata_preview(
             f'<div class="metadata-status">{html.escape(selection_note)}</div>'
             f'<div class="metadata-status">{html.escape(scanning)}</div>'
             + "".join(completed_html) + names_html + "</div>",
+            metadata_scan_status_html(
+                "scanning", f"Reading text and OCR for preview {index + 1} of {len(displayed)}…"
+            ),
             gr.update(open=True),
             gr.update(value=automatic_selection_preparing_status_html(
                 files, [], detail=scanning,
@@ -12762,13 +12850,16 @@ def stream_automatic_detected_metadata_preview(
                 use_file_title_fallback, apply_batch_metadata_overrides,
             )
             if not isinstance(result[3], str):
-                yield tuple(gr.update() for _ in range(6))
+                yield tuple(gr.update() for _ in range(7))
                 return
             if len(files) == 1:
                 field_updates = result[:3]
             completed_html.append(result[3])
+            if "Metadata preview could not be completed" in result[3]:
+                preview_errors += 1
         except Exception as exc:
             APP_LOGGER.exception("individual PDF metadata preview failed")
+            preview_errors += 1
             completed_html.append(
                 '<section class="metadata-file"><div class="metadata-file-name">'
                 f'{html.escape(Path(path).name)}</div><div class="metadata-status">'
@@ -12776,7 +12867,7 @@ def stream_automatic_detected_metadata_preview(
                 'The file remains selected for a fresh attempt after Confirm.</div></section>'
             )
         if automatic_lifecycle_busy() or not _selection_preview_is_current(selection_state, request):
-            yield tuple(gr.update() for _ in range(6))
+            yield tuple(gr.update() for _ in range(7))
             return
         # Publish this result before beginning another potentially slow scan.
         completed = f"Author metadata preview: {index + 1}/{len(displayed)} complete."
@@ -12787,6 +12878,19 @@ def stream_automatic_detected_metadata_preview(
             '<div class="metadata-summary" role="status" aria-live="polite">'
             f'<div class="metadata-status">{html.escape(selection_note)} {completed}</div>'
             + "".join(completed_html) + "</div>",
+            metadata_scan_status_html(
+                "warning" if preview_errors and index + 1 == len(displayed) else
+                "ready" if index + 1 == len(displayed) else "scanning",
+                "Metadata preview finished with an error. Open Detected Metadata for details."
+                if preview_errors and index + 1 == len(displayed) else
+                (
+                    f"Preview ready for {len(displayed)} of {len(files)} selected PDFs. "
+                    "Individual results are under Detected Metadata."
+                    if len(files) > 1 else
+                    "Metadata preview complete. Review the title and author above."
+                ) if index + 1 == len(displayed) else
+                f"Preview {index + 1} of {len(displayed)} complete; reading the next PDF…",
+            ),
             gr.update(open=True),
             gr.update(value=automatic_selection_preparing_status_html(
                 files, [], detail=completed + (
@@ -33649,6 +33753,10 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     lines=1,
                     max_lines=1,
                 )
+                auto_metadata_status = gr.HTML(
+                    value=metadata_scan_status_html("idle", ""),
+                    elem_id="document-metadata-scan-status",
+                )
                 auto_use_file_title_fallback = gr.Checkbox(
                     value=True,
                     label="Use the file title as a fallback",
@@ -34999,7 +35107,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
             ).then(
                 fn=stream_automatic_detected_metadata_preview,
                 inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest, automatic_selection_state],
-                outputs=[auto_label, auto_author, auto_short_label, auto_metadata_preview, document_metadata_section, automatic_run_activity],
+                outputs=[auto_label, auto_author, auto_short_label, auto_metadata_preview, auto_metadata_status, document_metadata_section, automatic_run_activity],
                 show_progress="hidden",
                 queue=True,
                 concurrency_limit=1,
@@ -35124,7 +35232,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
             ).then(
                 fn=stream_automatic_detected_metadata_preview,
                 inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest, automatic_selection_state],
-                outputs=[auto_label, auto_author, auto_short_label, auto_metadata_preview, document_metadata_section, automatic_run_activity],
+                outputs=[auto_label, auto_author, auto_short_label, auto_metadata_preview, auto_metadata_status, document_metadata_section, automatic_run_activity],
                 show_progress="hidden",
                 queue=True,
                 concurrency_limit=1,
@@ -35245,7 +35353,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
             ).then(
                 fn=stream_automatic_detected_metadata_preview,
                 inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest, automatic_selection_state],
-                outputs=[auto_label, auto_author, auto_short_label, auto_metadata_preview, document_metadata_section, automatic_run_activity],
+                outputs=[auto_label, auto_author, auto_short_label, auto_metadata_preview, auto_metadata_status, document_metadata_section, automatic_run_activity],
                 show_progress="hidden",
                 queue=True,
                 concurrency_limit=1,
@@ -35357,7 +35465,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
             ).then(
                 fn=stream_automatic_detected_metadata_preview,
                 inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest, automatic_selection_state],
-                outputs=[auto_label, auto_author, auto_short_label, auto_metadata_preview, document_metadata_section, automatic_run_activity],
+                outputs=[auto_label, auto_author, auto_short_label, auto_metadata_preview, auto_metadata_status, document_metadata_section, automatic_run_activity],
                 show_progress="hidden",
                 queue=True,
                 concurrency_limit=1,
@@ -35492,7 +35600,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
             ).then(
                 fn=stream_automatic_detected_metadata_preview,
                 inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest, automatic_selection_state],
-                outputs=[auto_label, auto_author, auto_short_label, auto_metadata_preview, document_metadata_section, automatic_run_activity],
+                outputs=[auto_label, auto_author, auto_short_label, auto_metadata_preview, auto_metadata_status, document_metadata_section, automatic_run_activity],
                 show_progress="hidden",
                 queue=True,
                 concurrency_limit=1,
@@ -35535,7 +35643,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 ).then(
                     fn=stream_automatic_detected_metadata_preview,
                     inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest, automatic_selection_state],
-                    outputs=[auto_label, auto_author, auto_short_label, auto_metadata_preview, document_metadata_section, automatic_run_activity],
+                    outputs=[auto_label, auto_author, auto_short_label, auto_metadata_preview, auto_metadata_status, document_metadata_section, automatic_run_activity],
                     show_progress="hidden",
                     queue=True,
                     concurrency_limit=1,

@@ -33,17 +33,20 @@ def test_scanning_is_yielded_before_inference_and_each_result_before_next_file(m
     stream = app.stream_automatic_detected_metadata_preview(["first.pdf", "second.pdf"], [])
     first = next(stream)
     assert "recognition scanning" in first[3]
-    assert "first.pdf" in first[5]["value"]
+    assert 'data-state="scanning"' in first[4]
+    assert "preview 1 of 2" in first[4]
+    assert "first.pdf" in first[6]["value"]
     inspect.assert_not_called()
     completed_first = next(stream)
     assert "Complete: ['first.pdf']" in completed_first[3]
     assert inspect.call_count == 1
     scanning_second = next(stream)
-    assert "second.pdf" in scanning_second[5]["value"]
+    assert "second.pdf" in scanning_second[6]["value"]
     assert "Complete: ['first.pdf']" in scanning_second[3]
     assert inspect.call_count == 1
     completed_second = next(stream)
     assert "Complete: ['second.pdf']" in completed_second[3]
+    assert 'data-state="ready"' in completed_second[4]
     assert inspect.call_count == 2
     assert all(update["value"] == "" for update in completed_second[:3])
     assert list(stream) == []
@@ -56,6 +59,7 @@ def test_preview_limit_is_explicit_and_no_document_is_inspected_twice(monkeypatc
     events = list(app.stream_automatic_detected_metadata_preview(files, []))
     assert "11 PDF(s) selected. Previewing 5." in events[-1][3]
     assert "Every selected PDF will be inspected freshly" in events[-1][3]
+    assert "5 of 11 selected PDFs" in events[-1][4]
     assert [call.args[0][0] for call in inspect.call_args_list] == files[:5]
 
 
@@ -95,7 +99,8 @@ def test_one_failed_preview_does_not_strand_selection_or_hide_other_results(monk
     events = list(app.stream_automatic_detected_metadata_preview(["first.pdf", "second.pdf"], []))
     assert "Metadata preview failed" in events[-1][3]
     assert "Complete: ['second.pdf']" in events[-1][3]
-    assert len(events[-1]) == 6
+    assert len(events[-1]) == 7
+    assert 'data-state="warning"' in events[-1][4]
 
 
 def test_later_selection_prevents_old_result_and_readiness_publication(monkeypatch):
@@ -210,7 +215,7 @@ def test_direct_and_folder_selection_chains_use_the_same_stream():
     streams = [d for d in config["dependencies"]
                if "stream_automatic_detected_metadata_preview" in str(d.get("api_name") or "")]
     assert len(streams) >= 5
-    assert all(d["queue"] and len(d["outputs"]) == 6 for d in streams)
+    assert all(d["queue"] and len(d["outputs"]) == 7 for d in streams)
     assert not any((pdf_component['id'], 'change') in d.get('targets', [])
                    for d in config['dependencies'])
 
