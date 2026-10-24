@@ -17,7 +17,7 @@ def idle_selection(monkeypatch):
     monkeypatch.setattr(app, "folder_manifest_candidates", lambda files, manifest: (files or [], True))
 
 
-def result(path, *_args):
+def result(path, *_args, **_kwargs):
     return (
         app.gr.update(value="detected title"),
         app.gr.update(value="detected author"),
@@ -109,9 +109,9 @@ def test_later_selection_prevents_old_result_and_readiness_publication(monkeypat
     request = SimpleNamespace(session_hash="same-browser")
     state = app.automatic_selection_begin_state({}, "", ["first.pdf"], [], {}, request=request)[0]
 
-    def supersede(*args):
+    def supersede(*args, **kwargs):
         app.automatic_selection_begin_state(state, "", ["new.pdf"], [], {}, request=request)
-        return result(*args)
+        return result(*args, **kwargs)
 
     monkeypatch.setattr(app, "detected_metadata_preview", supersede)
     stream = app.stream_automatic_detected_metadata_preview(
@@ -343,6 +343,9 @@ def test_preview_authors_cannot_bypass_fresh_role_reconciliation():
     values[author] = "Chosen Person"
     assert app.automatic_explicit_metadata_values(edited, values)[author] == "Chosen Person"
     assert app.automatic_explicit_metadata_values(edited, values)[short] == ""
+    edited_label = app.mark_metadata_field_edited("document_short_label", "Chosen Label", edited)
+    values[short] = "Chosen Label"
+    assert app.automatic_explicit_metadata_values(edited_label, values)[short] == "Chosen Label"
     values[shared] = True
     assert app.automatic_explicit_metadata_values(state, values) == tuple(values)
     assert app.automatic_explicit_metadata_values({}, values) == values
@@ -370,10 +373,16 @@ def test_old_inferred_fields_do_not_mask_a_new_preview_but_manual_edits_survive(
         ["first.pdf"], [], "old title", "old author", "old label",
         selection_state={"metadata_user_edits": {}},
     ))
-    inspect.assert_called_once_with(["first.pdf"], "", "", "", True, False)
+    inspect.assert_called_once_with(
+        ["first.pdf"], "", "", "", True, False,
+        short_label_editor=True, short_label_editable=True,
+    )
     inspect.reset_mock()
     state = {"metadata_user_edits": {"document_author": True}}
     list(app.stream_automatic_detected_metadata_preview(
         ["first.pdf"], [], "old title", "manual author", "old label", selection_state=state,
     ))
-    inspect.assert_called_once_with(["first.pdf"], "", "manual author", "", True, False)
+    inspect.assert_called_once_with(
+        ["first.pdf"], "", "manual author", "", True, False,
+        short_label_editor=True, short_label_editable=True,
+    )

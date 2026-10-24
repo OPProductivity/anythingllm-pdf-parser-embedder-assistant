@@ -1076,6 +1076,28 @@ APP_CONNECTION_WATCHDOG_HEAD = """
         row.hidden = !expanded;
       });
     }, true);
+    // Keep the small editor inside the metadata table connected to Gradio's
+    // existing Textbox. The latter remains the sole submitted field and still
+    // records a deliberate user edit through its normal input callback.
+    const syncShortCitationLabel = () => {
+      const editor = document.querySelector(".metadata-short-label-input");
+      const source = document.querySelector("#automatic-short-label-transport input, #automatic-short-label-transport textarea");
+      if (!editor || !source) return;
+      editor.disabled = editor.dataset.sharedDisabled === "true" || source.disabled ||
+        document.querySelector("#document-metadata-scan-status .metadata-scan-inline")?.dataset.state === "scanning";
+      if (document.activeElement !== editor && editor.value !== source.value) {
+        editor.value = source.value;
+      }
+    };
+    document.addEventListener("input", (event) => {
+      const editor = event.target;
+      if (!(editor instanceof HTMLInputElement) ||
+          !editor.matches(".metadata-short-label-input")) return;
+      const source = document.querySelector("#automatic-short-label-transport input, #automatic-short-label-transport textarea");
+      if (!source || source.disabled) return;
+      source.value = editor.value;
+      source.dispatchEvent(new Event("input", { bubbles: true }));
+    }, true);
 
     // Gradio remains the complete owner of the multi-file picker: its native
     // controls, transfer state, and selected-file list are never replaced or
@@ -1183,6 +1205,7 @@ APP_CONNECTION_WATCHDOG_HEAD = """
         document.querySelector("gradio-app")?.classList.toggle("dark", appliedDark);
         syncCheckbox();
         syncMetadataStatus();
+        syncShortCitationLabel();
       });
     };
     const observer = new MutationObserver(scheduleControlSync);
@@ -1190,6 +1213,7 @@ APP_CONNECTION_WATCHDOG_HEAD = """
     applyStoredTheme();
     syncCheckbox();
     syncMetadataStatus();
+    syncShortCitationLabel();
 
     // This parser-executed script runs in <head>, before the body exists.
     // Give that body the already-decided class at its very first DOM mutation,
@@ -2950,6 +2974,24 @@ body .gradio-container .document-metadata-preview .metadata-panel button.metadat
 .document-metadata-preview .metadata-table th {
     width: 30%;
     color: var(--body-text-color-subdued);
+}
+.document-metadata-preview .metadata-short-label-input {
+    display: block;
+    width: min(100%, 260px);
+    min-height: 27px;
+    padding: 2px 7px;
+    border: 1px solid var(--border-color-primary);
+    border-radius: 4px;
+    background: var(--input-background-fill);
+    color: var(--body-text-color);
+    font: inherit;
+}
+.document-metadata-preview .metadata-short-label-input:focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 1px;
+}
+.metadata-short-label-transport {
+    display: none !important;
 }
 .document-metadata-preview .metadata-table .metadata-extra-row[hidden] {
     display: none !important;
@@ -12991,6 +13033,8 @@ def stream_automatic_detected_metadata_preview(
             result = detected_metadata_preview(
                 [path], current_title, current_author, current_short_label,
                 use_file_title_fallback, apply_batch_metadata_overrides,
+                short_label_editor=(index == 0),
+                short_label_editable=(len(files) == 1 or apply_batch_metadata_overrides),
             )
             if not isinstance(result[3], str):
                 yield tuple(gr.update() for _ in range(7))
@@ -25012,7 +25056,7 @@ def validated_automatic_run_settings(values, *, preflight_progress_callback=None
     ):
         warnings.append(
             "Batch metadata safeguard: shared title, author, and short-label fields will be ignored; each PDF will be freshly recognized. "
-            "Enable ‘Apply the title, author, and short label above to every selected PDF’ only for an intentional shared override."
+            "Enable ‘Apply the title, author, and short label to every selected PDF’ only for an intentional shared override."
         )
     if settings["mode"] == MODE_NATIVE_UPLOAD_LABEL and not (settings["workspace_slug"] or "").strip():
         warnings.append("Native upload is blocked until you select or create a workspace.")
@@ -26612,6 +26656,8 @@ def detected_metadata_preview(
     current_short_label="",
     use_file_title_fallback=True,
     apply_batch_metadata_overrides=False,
+    short_label_editor=True,
+    short_label_editable=True,
 ):
     files = normalize_file_list(pdf_files)
     if not files:
@@ -26794,9 +26840,20 @@ def detected_metadata_preview(
         if identity.get("evidence"):
             identity_rows.append(("Evidence", identity["evidence"], "workspace"))
         additional_rows = identity_rows + record["technical_rows"]
+        short_label_row = (
+            '<tr class="metadata-short-label-row"><th scope="row">'
+            '<label for="metadata-short-label-input">Short citation label</label></th>'
+            '<td><input id="metadata-short-label-input" class="metadata-short-label-input" '
+            'type="text" autocomplete="off" '
+            f'data-shared-disabled="{str(not (short_label_editable and (len(files) == 1 or apply_batch_metadata_overrides))).lower()}" '
+            'title="Used in uploaded document names and citations; for multiple PDFs enable the shared override above" '
+            f'value="{html.escape(short_value, quote=True)}"></td></tr>'
+            if short_label_editor and index == 0 else ""
+        )
         table = (
             '<table class="metadata-table"><tbody>'
             + table_rows(record["primary_rows"])
+            + short_label_row
             + table_rows(additional_rows, additional=True)
             + '</tbody></table>'
         )
@@ -33946,7 +34003,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 )
                 apply_batch_metadata_overrides = gr.Checkbox(
                     value=False,
-                    label="Apply the title, author, and short label above to every selected PDF",
+                    label="Apply the title, author, and short label to every selected PDF",
                     info=(
                         "Off by default. With multiple PDFs, each file is freshly read and keeps its own detected "
                         "metadata. Turn this on only for an intentional shared override."
@@ -33961,7 +34018,8 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 ):
                     auto_short_label = gr.Textbox(
                         label="Short citation label",
-                        placeholder="Filled from author/title when available; used in filenames and segment metadata",
+                        elem_id="automatic-short-label-transport",
+                        elem_classes=["metadata-short-label-transport"],
                         lines=1,
                         max_lines=1,
                     )

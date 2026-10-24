@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import re
+import secrets
 import socket
 import subprocess
 import sys
@@ -21,6 +22,7 @@ from pathlib import Path
 
 import fitz
 import pytest
+from browser_access import browser_ticket
 
 playwright_sync = pytest.importorskip("playwright.sync_api")
 expect = playwright_sync.expect
@@ -29,6 +31,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 APP_PATH = PROJECT_ROOT / "rag_pdf_gradio_app.py"
 
 pytestmark = pytest.mark.ui_local
+LOCAL_BROWSER_KEY = secrets.token_urlsafe(32)
+
+
+def open_local_app(page, base_url):
+    # A fresh ticket is required for every browser session; it is consumed once.
+    page.goto(f"{base_url}/assistant-browser-session#{browser_ticket(LOCAL_BROWSER_KEY)}")
 
 
 def free_local_port() -> int:
@@ -57,6 +65,7 @@ def local_app_url(tmp_path_factory):
     url = f"http://127.0.0.1:{port}"
     environment = dict(os.environ)
     environment["GRADIO_SERVER_PORT"] = str(port)
+    environment["ANYTHINGLLM_PDF_ASSISTANT_BROWSER_KEY"] = LOCAL_BROWSER_KEY
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     environment["ANYTHINGLLM_PDF_ASSISTANT_HOME"] = str(tmp_path_factory.mktemp("gradio-local-home"))
     stderr_path = tmp_path_factory.mktemp("gradio-local-app") / "stderr.log"
@@ -69,7 +78,7 @@ def local_app_url(tmp_path_factory):
             stderr=stderr_handle,
         )
         try:
-            wait_for_http(url, process)
+            wait_for_http(url + "/healthz", process)
             yield url
         finally:
             if process.poll() is None:
@@ -130,7 +139,7 @@ def six_pdf_files(tmp_path: Path) -> list[Path]:
 
 
 def test_fresh_file_selection_never_displays_prior_success(page, local_app_url, one_page_pdf):
-    page.goto(local_app_url)
+    open_local_app(page, local_app_url)
     expect(page.get_by_text("Processing successful", exact=False)).to_have_count(0)
     expect(page.get_by_text("Overall progress: 100%", exact=False)).to_have_count(0)
     cancel = page.locator("#cancel-automatic-run-button")
@@ -140,7 +149,7 @@ def test_fresh_file_selection_never_displays_prior_success(page, local_app_url, 
 
 def test_local_only_mode_hides_upload_controls_even_when_advanced_is_open(page, local_app_url):
     """Mode changes must survive Gradio's lazy accordion mounting."""
-    page.goto(local_app_url)
+    open_local_app(page, local_app_url)
 
     local_only = page.get_by_role("radio", name="Create local files only")
     expect(local_only).to_have_count(1)
@@ -176,7 +185,7 @@ def test_local_only_mode_hides_upload_controls_even_when_advanced_is_open(page, 
 
 
 def test_compact_local_only_mode_remains_a_visible_choice(page, local_app_url):
-    page.goto(local_app_url)
+    open_local_app(page, local_app_url)
 
     compact_local_only = page.get_by_role("radio", name="Create local files only")
     expect(compact_local_only).to_have_count(1)
@@ -194,7 +203,7 @@ def test_pdf_picker_exposes_only_the_native_pdf_accept_filter(page, local_app_ur
     Windows Open-dialog filter; it is also intentionally a multiple-file
     picker for the batch workflow.
     """
-    page.goto(local_app_url)
+    open_local_app(page, local_app_url)
     upload = page.locator(".pdf-upload-input input[type='file']")
     expect(upload).to_have_count(1)
     expect(upload).to_have_attribute("accept", ".pdf")
@@ -210,7 +219,7 @@ def test_pdf_picker_exposes_only_the_native_pdf_accept_filter(page, local_app_ur
 
 
 def test_new_workspace_name_field_enforces_the_creation_length_limit(page, local_app_url):
-    page.goto(local_app_url)
+    open_local_app(page, local_app_url)
     workspace_name = page.get_by_placeholder(
         "Optional: type a name, or leave blank to derive one after Confirm",
         exact=True,
@@ -225,7 +234,7 @@ def test_selecting_a_pdf_resets_a_prior_local_only_choice_to_the_new_run_default
     page, local_app_url, one_page_pdf
 ):
     """A new selection is a new run, rather than a partially inherited run."""
-    page.goto(local_app_url)
+    open_local_app(page, local_app_url)
     local_only = page.get_by_role("radio", name="Create local files only")
     expect(local_only).to_have_count(1)
     local_only.check()
@@ -242,7 +251,7 @@ def test_selecting_a_pdf_resets_a_prior_local_only_choice_to_the_new_run_default
 
 
 def test_future_defaults_editor_does_not_change_a_selected_automatic_job(page, local_app_url, one_page_pdf):
-    page.goto(local_app_url)
+    open_local_app(page, local_app_url)
     page.locator(".pdf-upload-input input[type='file']").set_input_files(str(one_page_pdf))
     expect(page.get_by_role("button", name="Confirm and start processing")).to_be_enabled(timeout=15000)
     local_only = page.get_by_role("radio", name="Create local files only")
@@ -259,7 +268,7 @@ def test_future_defaults_editor_does_not_change_a_selected_automatic_job(page, l
 
 def test_selected_pdf_exposes_one_confirm_action_and_safe_prestart_cancel(page, local_app_url, one_page_pdf):
     """Selection exposes one action; Cancel before Confirm does not fake a stop."""
-    page.goto(local_app_url)
+    open_local_app(page, local_app_url)
     upload = page.locator(".pdf-upload-input input[type='file']")
     expect(upload).to_have_count(1)
     upload.set_input_files(str(one_page_pdf))
@@ -283,7 +292,7 @@ def test_selected_pdf_exposes_one_confirm_action_and_safe_prestart_cancel(page, 
 
 
 def test_multiple_pdf_selection_keeps_both_files_in_the_pending_batch(page, local_app_url, two_pdf_files):
-    page.goto(local_app_url)
+    open_local_app(page, local_app_url)
     upload = page.locator(".pdf-upload-input input[type='file']")
     expect(upload).to_have_count(1)
     upload.set_input_files([str(path) for path in two_pdf_files])
@@ -315,7 +324,7 @@ def test_multiple_pdf_transfer_does_not_replace_the_native_picker_before_local_c
     page, local_app_url, two_pdf_files
 ):
     """The native picker remains visible while Gradio transfers files."""
-    page.goto(local_app_url)
+    open_local_app(page, local_app_url)
     upload = page.locator("#automatic-pdf-upload input[type='file']")
     expect(upload).to_have_count(1, timeout=15000)
     first_frame = page.evaluate(
@@ -343,7 +352,7 @@ def test_multiple_pdf_transfer_does_not_replace_the_native_picker_before_local_c
 
 def test_six_pdf_selection_keeps_every_file_in_the_pending_batch(page, local_app_url, six_pdf_files):
     """The ordinary picker must not truncate a six-file selection before Confirm."""
-    page.goto(local_app_url)
+    open_local_app(page, local_app_url)
     upload = page.locator(".pdf-upload-input input[type='file']")
     expect(upload).to_have_count(1)
     upload.set_input_files([str(path) for path in six_pdf_files])
@@ -356,7 +365,7 @@ def test_six_pdf_selection_keeps_every_file_in_the_pending_batch(page, local_app
 
 def test_six_pdf_local_batch_prepares_every_selected_source(page, local_app_url, six_pdf_files):
     """Exercise the real batch loop without contacting AnythingLLM Desktop."""
-    page.goto(local_app_url)
+    open_local_app(page, local_app_url)
     page.locator(".pdf-upload-input input[type='file']").set_input_files(
         [str(path) for path in six_pdf_files]
     )
@@ -380,7 +389,7 @@ def test_six_pdf_local_batch_prepares_every_selected_source(page, local_app_url,
 
 def test_selected_pdf_reuse_action_has_an_icon_not_an_empty_square(page, local_app_url, one_page_pdf):
     """The selected-file controls retain distinct, meaningful compact glyphs."""
-    page.goto(local_app_url)
+    open_local_app(page, local_app_url)
     reuse_actions = page.locator('.pdf-upload-input button[aria-label="Use selected files again"]')
     expect(reuse_actions).to_be_hidden()
 
@@ -390,17 +399,23 @@ def test_selected_pdf_reuse_action_has_an_icon_not_an_empty_square(page, local_a
         '.pdf-upload-input button[aria-label="Use selected files again"]:visible'
     )
     expect(visible_reuse_action).not_to_have_count(0, timeout=15000)
-    visible_icon_styles = visible_reuse_action.evaluate_all(
-        "buttons => buttons.map(button => getComputedStyle(button, '::after').backgroundImage)"
-    )
-    assert visible_icon_styles and all("M3 12a9" in style for style in visible_icon_styles)
+    def wait_for_icon(selector, marker):
+        # The picker and stylesheet hydrate separately after a file transfer.
+        page.wait_for_function(
+            """({selector, marker}) => {
+              const buttons = Array.from(document.querySelectorAll(selector))
+                .filter(button => button.getClientRects().length);
+              return buttons.length > 0 && buttons.every(button =>
+                getComputedStyle(button, '::after').backgroundImage.includes(marker));
+            }""",
+            arg={"selector": selector, "marker": marker}, timeout=15000,
+        )
+
+    wait_for_icon('.pdf-upload-input button[aria-label="Use selected files again"]', "M3 12a9")
     visible_upload_action = page.locator(
         '.pdf-upload-input button[aria-label="common.upload"]:visible'
     )
-    visible_upload_icon_styles = visible_upload_action.evaluate_all(
-        "buttons => buttons.map(button => getComputedStyle(button, '::after').backgroundImage)"
-    )
-    assert visible_upload_icon_styles and all("M12 19V5" in style for style in visible_upload_icon_styles)
+    wait_for_icon('.pdf-upload-input button[aria-label="common.upload"]', "M12 19V5")
     with page.expect_file_chooser(timeout=10000) as chooser_info:
         visible_upload_action.click()
     chooser_info.value
@@ -429,7 +444,7 @@ def test_selected_pdf_reuse_action_has_an_icon_not_an_empty_square(page, local_a
 
 def test_fresh_page_shows_both_actions_disabled(page, local_app_url):
     """There is no run to cancel before a PDF is selected."""
-    page.goto(local_app_url)
+    open_local_app(page, local_app_url)
     expect(page.get_by_role("button", name="Confirm and start processing")).to_be_disabled()
     expect(page.get_by_role("button", name="Cancel")).to_be_visible()
     expect(page.get_by_role("button", name="Cancel")).to_be_disabled()
@@ -439,11 +454,12 @@ def test_file_selection_opens_identity_fields_but_keeps_technical_metadata_colla
     page, local_app_url, one_page_pdf
 ):
     """Identity fields start open while the long detected-metadata report stays folded."""
-    page.goto(local_app_url)
+    open_local_app(page, local_app_url)
     expect(page.get_by_label("Document title", exact=True)).to_be_visible()
     details = page.get_by_role("button", name="Detected Metadata ▼")
     expect(details).to_be_visible()
-    expect(page.get_by_label("Short citation label", exact=True)).to_be_hidden()
+    editor = page.locator(".metadata-short-label-input")
+    expect(editor).to_be_hidden()
 
     upload = page.locator(".pdf-upload-input input[type='file']")
     expect(upload).to_have_count(1)
@@ -453,17 +469,59 @@ def test_file_selection_opens_identity_fields_but_keeps_technical_metadata_colla
     expect(page.get_by_label("Author", exact=True)).to_be_visible()
     expect(page.get_by_role("checkbox", name="Use the file title as a fallback")).to_be_visible()
 
-    expect(page.get_by_label("Short citation label", exact=True)).to_be_hidden()
+    expect(editor).to_be_hidden()
     expect(page.get_by_role("button", name="Refresh detected PDF metadata")).to_be_hidden()
 
     details.click()
-    expect(page.get_by_label("Short citation label", exact=True)).to_be_visible()
+    expect(editor).to_be_visible(timeout=30000)
+    expect(page.locator(".metadata-table .metadata-short-label-row")).to_have_count(1)
     expect(page.get_by_role("button", name="Refresh detected PDF metadata")).to_be_visible()
+
+
+def test_short_citation_label_table_edit_updates_processing_field(page, local_app_url, one_page_pdf):
+    open_local_app(page, local_app_url)
+    page.locator(".document-metadata-details > button.label-wrap").click()
+    page.locator(".pdf-upload-input input[type='file']").set_input_files(str(one_page_pdf))
+    editor = page.locator(".metadata-table .metadata-short-label-input")
+    expect(editor).to_be_visible(timeout=30000)
+    page.wait_for_function(
+        "document.querySelector('#document-metadata-scan-status .metadata-scan-inline')?.dataset.state === 'ready'",
+        timeout=60000,
+    )
+    transport = page.locator(
+        "#automatic-short-label-transport input, #automatic-short-label-transport textarea"
+    )
+    expect(editor).to_have_value(transport.input_value())
+    assert editor.bounding_box()["width"] <= 270
+    editor.fill("Edited citation label")
+    expect(transport).to_have_value("Edited citation label")
+    page.get_by_role("button", name="Refresh detected PDF metadata").click()
+    expect(editor).to_have_value("Edited citation label", timeout=60000)
+
+
+def test_short_citation_label_is_one_shared_edit_for_a_batch(page, local_app_url, two_pdf_files):
+    open_local_app(page, local_app_url)
+    page.locator(".document-metadata-details > button.label-wrap").click()
+    page.locator(".pdf-upload-input input[type='file']").set_input_files(
+        [str(path) for path in two_pdf_files]
+    )
+    page.wait_for_function(
+        "document.querySelector('#document-metadata-scan-status .metadata-scan-inline')?.dataset.state === 'ready'",
+        timeout=60000,
+    )
+    editor = page.locator(".metadata-table .metadata-short-label-input")
+    expect(editor).to_have_count(1)
+    expect(editor).to_be_disabled()
+    shared = page.get_by_role(
+        "checkbox", name="Apply the title, author, and short label to every selected PDF"
+    )
+    shared.check()
+    expect(editor).to_be_enabled(timeout=60000)
 
 
 def test_folded_metadata_detail_header_matches_its_parent_height(page, local_app_url, one_page_pdf):
     """The nested folded control must not be a taller-looking field."""
-    page.goto(local_app_url)
+    open_local_app(page, local_app_url)
     page.locator(".pdf-upload-input input[type='file']").set_input_files(str(one_page_pdf))
 
     parent = page.locator(".top-level-accordion").filter(has_text="Document metadata").first
@@ -481,7 +539,7 @@ def test_folded_metadata_detail_header_matches_its_parent_height(page, local_app
 def test_dark_theme_confirmation_action_row_does_not_overlap(page, local_app_url, one_page_pdf):
     """The confirmation row must keep two separately clickable actions in dark mode."""
     page.emulate_media(color_scheme="dark")
-    page.goto(local_app_url)
+    open_local_app(page, local_app_url)
     expect(page.locator("body")).to_have_class(re.compile(r"(?:^|\\s)dark(?:\\s|$)"))
     upload = page.locator(".pdf-upload-input input[type='file']")
     expect(upload).to_have_count(1)
@@ -503,7 +561,7 @@ def test_dark_theme_confirmation_action_row_does_not_overlap(page, local_app_url
 def test_narrow_confirmation_action_row_wraps_without_overlap(page, local_app_url, one_page_pdf):
     """Small displays may wrap the actions, but may never stack click targets."""
     page.set_viewport_size({"width": 640, "height": 900})
-    page.goto(local_app_url)
+    open_local_app(page, local_app_url)
     upload = page.locator(".pdf-upload-input input[type='file']")
     expect(upload).to_have_count(1)
     upload.set_input_files(str(one_page_pdf))
@@ -523,7 +581,7 @@ def test_narrow_confirmation_action_row_wraps_without_overlap(page, local_app_ur
 
 def test_system_theme_switch_preserves_the_fresh_run_controls(page, local_app_url, one_page_pdf):
     page.emulate_media(color_scheme="dark")
-    page.goto(local_app_url)
+    open_local_app(page, local_app_url)
     expect(page.locator("body")).to_have_class(re.compile(r"(?:^|\\s)dark(?:\\s|$)"))
     assert "__theme=" not in page.url
     upload = page.locator(".pdf-upload-input input[type='file']")
