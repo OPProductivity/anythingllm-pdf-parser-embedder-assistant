@@ -1095,15 +1095,36 @@ APP_CONNECTION_WATCHDOG_HEAD = """
       const id = overrideTransports[field];
       return id ? document.querySelector(`#${id} input, #${id} textarea`) : null;
     };
+    let metadataOverrideFocus = null;
+    const rememberMetadataOverrideFocus = () => {
+      const editor = document.activeElement;
+      if (editor instanceof HTMLInputElement && editor.matches(".metadata-override-input")) {
+        metadataOverrideFocus = { field: editor.dataset.metadataOverride, node: editor,
+          start: editor.selectionStart, end: editor.selectionEnd };
+      }
+    };
+    document.addEventListener("focusin", (event) => {
+      if (event.target instanceof HTMLInputElement && event.target.matches(".metadata-override-input")) {
+        rememberMetadataOverrideFocus();
+      } else {
+        metadataOverrideFocus = null;
+      }
+    }, true);
+    document.addEventListener("selectionchange", rememberMetadataOverrideFocus);
     const syncMetadataOverrideEditors = () => {
-      const scanning = document.querySelector(
-        "#document-metadata-scan-status .metadata-scan-inline")?.dataset.state === "scanning";
       document.querySelectorAll(".metadata-override-input").forEach(editor => {
         const source = overrideSource(editor.dataset.metadataOverride);
         if (!source) return;
-        editor.disabled = editor.dataset.sharedDisabled === "true" || source.disabled || scanning;
         if (document.activeElement !== editor && editor.value !== source.value) {
           editor.value = source.value;
+        }
+        // Preview HTML can be replaced while someone is typing. Restore the
+        // same field and caret only when that removal displaced their focus.
+        const prior = metadataOverrideFocus;
+        if (prior?.field === editor.dataset.metadataOverride && !prior.node.isConnected &&
+            document.activeElement === document.body && editor.getClientRects().length) {
+          editor.focus({ preventScroll: true });
+          editor.setSelectionRange(prior.start, prior.end);
         }
       });
     };
@@ -1112,9 +1133,10 @@ APP_CONNECTION_WATCHDOG_HEAD = """
       if (!(editor instanceof HTMLInputElement) ||
           !editor.matches(".metadata-override-input")) return;
       const source = overrideSource(editor.dataset.metadataOverride);
-      if (!source || source.disabled) return;
+      if (!source) return;
       source.value = editor.value;
       source.dispatchEvent(new Event("input", { bubbles: true }));
+      rememberMetadataOverrideFocus();
     }, true);
 
     // Gradio remains the complete owner of the multi-file picker: its native
@@ -12334,8 +12356,8 @@ def output_folder_button_state(paths, output_root=""):
 
 @automatic_next_run_callback(1)
 def metadata_selection_layout_state(pdf_files=None, folder_pdf_files=None):
-    """Keep the metadata table folded when a new selection begins."""
-    return gr.update(open=False)
+    """The table starts folded; leave an operator's open editor in place."""
+    return gr.update()
 
 
 def deferred_pdf_inspection_preview(pdf_files=None, folder_pdf_files=None):
@@ -13044,7 +13066,6 @@ def stream_automatic_detected_metadata_preview(
             + pending_metadata_panel_html(
                 f"{selection_note} {scanning}", filename=Path(path).name,
                 loading=True, include_overrides=(index == 0),
-                editable=(len(files) == 1 or apply_batch_metadata_overrides),
             ) + "</div>",
             metadata_scan_status_html(
                 "scanning", f"Inspecting metadata for preview {index + 1} of {len(displayed)}…"
@@ -13059,7 +13080,6 @@ def stream_automatic_detected_metadata_preview(
                 [path], current_title, current_author, current_short_label,
                 use_file_title_fallback, apply_batch_metadata_overrides,
                 override_editor=(index == 0),
-                override_editable=(len(files) == 1 or apply_batch_metadata_overrides),
             )
             if not isinstance(result[3], str):
                 yield tuple(gr.update() for _ in range(7))
@@ -13077,7 +13097,6 @@ def stream_automatic_detected_metadata_preview(
                 "The file remains selected for a fresh attempt after Confirm.",
                 filename=Path(path).name, detected_value="Unavailable",
                 include_overrides=(index == 0),
-                editable=(len(files) == 1 or apply_batch_metadata_overrides),
             ))
         if automatic_lifecycle_busy() or not _selection_preview_is_current(selection_state, request):
             yield tuple(gr.update() for _ in range(7))
@@ -15630,7 +15649,9 @@ def reset_automatic_run_settings_to_defaults(selected_workspace=""):
         gr.update(value=defaults["automatic_validation_phrases"]),
         gr.update(value=defaults["unstructured_strategy"]),
         gr.update(value=defaults["generate_inline_fallback"]),
-        *(gr.update(value="") for _ in range(4)),
+        # Manual overrides are operator intent. A late defaults/selection
+        # response must not erase edits made before or during recognition.
+        *(gr.update() for _ in range(4)),
     )
 
 
@@ -15649,7 +15670,7 @@ def reset_automatic_run_selection_settings(selected_workspace="", pdf_files=None
 
 @automatic_next_run_callback(50)
 def reset_automatic_run_retry_settings():
-    """Explicit clear/retry restores all per-run defaults, not the previous target."""
+    """Restore run defaults while keeping deliberate metadata edits in the form."""
     updates = reset_automatic_run_settings_to_defaults()
     evidence = gr.update(value=False) if "value" in updates[0] else gr.update()
     return (*updates, evidence)
@@ -26711,7 +26732,7 @@ METADATA_OVERRIDE_FIELDS = {
 }
 
 
-def metadata_table_html(primary_rows, additional_rows=(), *, include_overrides=True, editable=True):
+def metadata_table_html(primary_rows, additional_rows=(), *, include_overrides=True):
     """Keep detected evidence and optional user overrides in distinct columns."""
     def render_rows(rows, additional=False):
         rendered = []
@@ -26719,10 +26740,9 @@ def metadata_table_html(primary_rows, additional_rows=(), *, include_overrides=T
             field = METADATA_OVERRIDE_FIELDS.get(key) if include_overrides else None
             control = (
                 f'<input class="metadata-override-input metadata-{field}-input" '
-                f'data-metadata-override="{field}" data-shared-disabled="{str(not editable).lower()}" '
+                f'data-metadata-override="{field}" '
                 f'aria-label="Override {html.escape(key, quote=True)}" '
-                'placeholder="Leave blank to use detected" autocomplete="off" '
-                f'{"disabled " if not editable else ""}value="">'
+                'autocomplete="off" value="">'
                 if field else ""
             )
             row_class = ' class="metadata-extra-row" hidden' if additional else ""
@@ -26737,7 +26757,7 @@ def metadata_table_html(primary_rows, additional_rows=(), *, include_overrides=T
         '<table class="metadata-table"><colgroup><col class="metadata-key-column">'
         '<col class="metadata-detected-column"><col class="metadata-override-column"></colgroup>'
         '<thead><tr><th scope="col">Field</th><th scope="col">Detected</th>'
-        '<th scope="col">Override</th></tr></thead><tbody>'
+        '<th scope="col">Override (if applied)</th></tr></thead><tbody>'
         + render_rows(primary_rows)
         + render_rows(additional_rows, additional=True)
         + '</tbody></table>'
@@ -26745,13 +26765,13 @@ def metadata_table_html(primary_rows, additional_rows=(), *, include_overrides=T
 
 
 def pending_metadata_panel_html(message, *, filename="", loading=False,
-                                include_overrides=True, editable=True, detected_value=""):
+                                include_overrides=True, detected_value=""):
     value = detected_value or ("Loading…" if loading else "Select a PDF")
     rows = [(key, value, "pending") for key in METADATA_OVERRIDE_FIELDS]
     heading = f'<div class="metadata-file-name">{html.escape(filename)}</div>' if filename else ""
     return detected_pdf_metadata_panel_html(
         heading + f'<div class="metadata-status">{html.escape(message)}</div>'
-        + metadata_table_html(rows, include_overrides=include_overrides, editable=editable)
+        + metadata_table_html(rows, include_overrides=include_overrides)
     )
 
 
@@ -26764,7 +26784,6 @@ def detected_metadata_preview(
     use_file_title_fallback=True,
     apply_batch_metadata_overrides=False,
     override_editor=True,
-    override_editable=True,
 ):
     files = normalize_file_list(pdf_files)
     if not files:
@@ -26928,7 +26947,6 @@ def detected_metadata_preview(
             panels.append(pending_metadata_panel_html(
                 record["error"], filename=record["filename"], detected_value="Unavailable",
                 include_overrides=override_editor and index == 0,
-                editable=override_editable and (len(files) == 1 or apply_batch_metadata_overrides),
             ))
             continue
         identity = identities[index] if index < len(identities) else {}
@@ -26944,7 +26962,6 @@ def detected_metadata_preview(
         table = metadata_table_html(
             record["primary_rows"], additional_rows,
             include_overrides=override_editor and index == 0,
-            editable=override_editable and (len(files) == 1 or apply_batch_metadata_overrides),
         )
         panels.append(detected_pdf_metadata_panel_html(
             f'<div class="metadata-file-name">{filename}</div>{table}',
@@ -34081,14 +34098,14 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                                           elem_id="automatic-detected-short-label-transport",
                                           elem_classes=["metadata-field-transport"])
             auto_title_override = gr.Textbox(label="Title override", elem_id="automatic-title-override-transport",
-                                              elem_classes=["metadata-field-transport"])
+                                              elem_classes=["metadata-field-transport"], interactive=True)
             auto_author_override = gr.Textbox(label="Author override", elem_id="automatic-author-override-transport",
-                                               elem_classes=["metadata-field-transport"])
+                                               elem_classes=["metadata-field-transport"], interactive=True)
             auto_short_label_override = gr.Textbox(label="Short citation label override",
                                                     elem_id="automatic-short-label-override-transport",
-                                                    elem_classes=["metadata-field-transport"])
+                                                    elem_classes=["metadata-field-transport"], interactive=True)
             auto_publisher = gr.Textbox(label="Publisher override", elem_id="automatic-publisher-override-transport",
-                                        elem_classes=["metadata-field-transport"])
+                                        elem_classes=["metadata-field-transport"], interactive=True)
             auto_metadata_status = gr.HTML(
                 value=metadata_scan_status_html("idle", ""),
                 elem_id="document-metadata-scan-status",

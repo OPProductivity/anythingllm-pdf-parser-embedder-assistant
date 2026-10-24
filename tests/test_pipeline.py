@@ -4341,14 +4341,14 @@ class PipelineCoreTests(unittest.TestCase):
 
         open_explorer.assert_called_once_with(str(completed_directory))
 
-    def test_metadata_layout_reserves_the_identity_area_as_soon_as_a_file_is_selected(self):
+    def test_metadata_selection_preserves_the_operators_accordion_state(self):
         import rag_pdf_gradio_app as app
 
         selected = app.metadata_selection_layout_state(["example.pdf"], [])
         cleared = app.metadata_selection_layout_state([], [])
 
-        self.assertTrue(selected["open"])
-        self.assertFalse(cleared["open"])
+        self.assertNotIn("open", selected)
+        self.assertNotIn("open", cleared)
 
     def test_retained_run_diagnostics_renders_compact_summary(self):
         import rag_pdf_gradio_app as app

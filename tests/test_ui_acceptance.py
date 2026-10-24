@@ -10,6 +10,7 @@ and uses only a disposable one-page PDF created in pytest's temporary folder.
 from __future__ import annotations
 
 import os
+import json
 import re
 import secrets
 import socket
@@ -91,6 +92,57 @@ def local_app_url(tmp_path_factory):
                     process.wait(timeout=15)
     stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace")
     assert "didn't receive enough input values" not in stderr_text
+
+
+@pytest.fixture
+def paused_metadata_app(tmp_path, tmp_path_factory):
+    """Hold one real preview at inference so editing during scanning is deterministic."""
+    port = free_local_port()
+    app_home = tmp_path_factory.mktemp("edit-home")
+    started, release = tmp_path / "scan-started", tmp_path / "scan-release"
+    environment = dict(os.environ)
+    environment.update({
+        "GRADIO_SERVER_PORT": str(port),
+        "ANYTHINGLLM_PDF_ASSISTANT_BROWSER_KEY": LOCAL_BROWSER_KEY,
+        "ANYTHINGLLM_PDF_ASSISTANT_HOME": str(app_home),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    })
+    script = """
+import sys, time
+from pathlib import Path
+import rag_pdf_gradio_app as app
+started, release = (Path(p) for p in sys.argv[1:3])
+infer = app.infer_author_from_initial_pdf_pages
+def paused_infer(*args, **kwargs):
+    started.touch()
+    deadline = time.monotonic() + 60
+    while not release.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError('Browser test did not release metadata preview')
+        time.sleep(0.05)
+    return infer(*args, **kwargs)
+app.infer_author_from_initial_pdf_pages = paused_infer
+app.launch_application(port=int(sys.argv[3]), inbrowser=False)
+"""
+    with (tmp_path / "app-stderr.log").open("wb") as stderr:
+        process = subprocess.Popen(
+            [sys.executable, "-c", script, str(started), str(release), str(port)],
+            cwd=str(PROJECT_ROOT), env=environment,
+            stdout=subprocess.DEVNULL, stderr=stderr,
+        )
+        try:
+            url = f"http://127.0.0.1:{port}"
+            wait_for_http(url + "/healthz", process)
+            yield url, started, release, app_home
+        finally:
+            release.touch()
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=15)
 
 
 @pytest.fixture
@@ -464,7 +516,7 @@ def test_metadata_table_stays_folded_and_shows_loading_then_detected_values(
     upload.set_input_files(str(one_page_pdf))
     header.click()
     expect(page.get_by_label("Override Author")).to_be_visible(timeout=30000)
-    expect(page.locator(".metadata-table thead th")).to_have_text(["Field", "Detected", "Override"])
+    expect(page.locator(".metadata-table thead th")).to_have_text(["Field", "Detected", "Override (if applied)"])
     page.wait_for_function(
         "document.querySelector('#document-metadata-scan-status .metadata-scan-inline')?.dataset.state === 'ready'",
         timeout=60000,
@@ -502,6 +554,63 @@ def test_metadata_overrides_update_processing_fields(page, local_app_url, one_pa
     )).to_have_value("")
 
 
+def test_overrides_survive_before_during_and_after_detection_and_save_on_confirm(
+    page, paused_metadata_app, one_page_pdf
+):
+    url, started, release, app_home = paused_metadata_app
+    open_local_app(page, url)
+    page.locator("#document-metadata-accordion > button.label-wrap").click()
+    fields = ("Title used", "Author", "Short citation label", "Publisher")
+    for field in fields:
+        editor = page.get_by_label(f"Override {field}", exact=True)
+        expect(editor).to_be_enabled()
+        assert editor.get_attribute("placeholder") is None
+        editor.fill(f"Before {field}")
+    page.locator(".pdf-upload-input input[type='file']").set_input_files(str(one_page_pdf))
+    deadline = time.monotonic() + 30
+    while not started.exists():
+        assert time.monotonic() < deadline, "Preview did not reach the paused inference"
+        page.wait_for_timeout(50)
+    expect(page.locator(".metadata-detected-value").first).to_have_text("Loading…")
+    for field in fields:
+        editor = page.get_by_label(f"Override {field}", exact=True)
+        expect(editor).to_be_visible()
+        expect(editor).to_be_enabled()
+        expect(editor).to_have_value(f"Before {field}")
+        editor.fill(f"During {field}")
+    release.touch()
+    page.wait_for_function(
+        "document.querySelector('#document-metadata-scan-status .metadata-scan-inline')?.dataset.state === 'ready'",
+        timeout=60000,
+    )
+    expect(page.get_by_label("Override Publisher", exact=True)).to_be_focused()
+    for field in fields:
+        editor = page.get_by_label(f"Override {field}", exact=True)
+        expect(editor).to_be_enabled()
+        expect(editor).to_have_value(f"During {field}")
+        editor.fill(f"After {field}")
+
+    page.get_by_role("radio", name="Create local files only").check()
+    page.get_by_role("button", name=re.compile(r"^Advanced preparation overrides")).click()
+    page.get_by_role("checkbox", name="Retain detailed evidence even if this run is ready").check()
+    confirm = page.locator("#confirm-automatic-run-button")
+    expect(confirm).to_be_enabled(timeout=30000)
+    confirm.click()
+    page.wait_for_function(
+        "['successful', 'warning', 'failed', 'cancelled'].includes("
+        "document.querySelector('.automatic-run-activity')?.dataset.runState)",
+        timeout=120000,
+    )
+    expect(confirm).to_have_text("Processing successful ✓")
+    profiles = list((app_home / "run-state").rglob("source-profile.json"))
+    assert len(profiles) == 1
+    profile = json.loads(profiles[0].read_text(encoding="utf-8"))
+    assert profile["detected_title"] == "After Title used"
+    assert profile["detected_author"] == "After Author"
+    assert profile["source_short_label"] == "After Short citation label"
+    assert profile["detected_publisher"] == "After Publisher"
+
+
 def test_short_citation_label_is_one_shared_edit_for_a_batch(page, local_app_url, two_pdf_files):
     open_local_app(page, local_app_url)
     page.locator("#document-metadata-accordion > button.label-wrap").click()
@@ -514,7 +623,7 @@ def test_short_citation_label_is_one_shared_edit_for_a_batch(page, local_app_url
     )
     editor = page.get_by_label("Override Short citation label")
     expect(editor).to_have_count(1)
-    expect(editor).to_be_disabled()
+    expect(editor).to_be_enabled()
     shared = page.get_by_role(
         "checkbox", name="Apply title, author, citation label, and publisher overrides to every selected PDF"
     )

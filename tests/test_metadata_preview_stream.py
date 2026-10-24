@@ -410,7 +410,7 @@ def test_old_inferred_fields_do_not_mask_a_new_preview_but_manual_edits_survive(
     ))
     inspect.assert_called_once_with(
         ["first.pdf"], "", "", "", True, False,
-        override_editor=True, override_editable=True,
+        override_editor=True,
     )
     inspect.reset_mock()
     state = {"metadata_user_edits": {"document_author": True}}
@@ -419,5 +419,5 @@ def test_old_inferred_fields_do_not_mask_a_new_preview_but_manual_edits_survive(
     ))
     inspect.assert_called_once_with(
         ["first.pdf"], "", "manual author", "", True, False,
-        override_editor=True, override_editable=True,
+        override_editor=True,
     )
