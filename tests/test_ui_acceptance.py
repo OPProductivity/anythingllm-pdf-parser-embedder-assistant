@@ -664,10 +664,15 @@ def test_filled_batch_overrides_apply_without_a_checkbox_and_blank_fields_stay_p
 
 
 @pytest.mark.parametrize("theme", ["light", "dark"])
-def test_metadata_table_compact_inputs_and_alternating_rows(page, local_app_url, theme):
+def test_metadata_table_compact_inputs_and_alternating_rows(page, local_app_url, one_page_pdf, theme):
     page.emulate_media(color_scheme=theme)
     open_local_app(page, local_app_url)
     page.locator("#document-metadata-accordion > button.label-wrap").click()
+    page.locator(".pdf-upload-input input[type='file']").set_input_files(str(one_page_pdf))
+    page.wait_for_function(
+        "document.querySelector('#document-metadata-scan-status .metadata-scan-inline')?.dataset.state === 'ready'",
+        timeout=60000,
+    )
     editor = page.get_by_label("Override Publisher", exact=True)
     expect(editor).to_be_enabled()
     assert editor.bounding_box()["height"] == 24
@@ -683,6 +688,36 @@ def test_metadata_table_compact_inputs_and_alternating_rows(page, local_app_url,
     assert set(page.locator(".metadata-table tbody th, .metadata-table tbody td").evaluate_all(
         "cells => cells.map(c => getComputedStyle(c).verticalAlign)"
     )) == {"middle"}
+    info = page.get_by_role("button", name="More detected PDF metadata", exact=True)
+    geometry = info.evaluate("""button => {
+        const b = button.getBoundingClientRect();
+        const range = document.createRange(); range.selectNodeContents(button);
+        const glyph = range.getBoundingClientRect();
+        return {width: b.width, height: b.height, radius: getComputedStyle(button).borderRadius,
+            dx: (glyph.left + glyph.width / 2) - (b.left + b.width / 2),
+            dy: (glyph.top + glyph.height / 2) - (b.top + b.height / 2)};
+    }""")
+    assert geometry["width"] == geometry["height"] == 24
+    assert geometry["radius"] == "50%"
+    assert abs(geometry["dx"]) <= 1 and abs(geometry["dy"]) <= 1.5
+    info.click()
+    expect(info).to_have_attribute("aria-expanded", "true")
+    expect(page.locator(".metadata-extra-row").first).to_be_visible()
+    info.click()
+
+    widths = page.locator(".metadata-table tbody tr").first.locator("th,td").evaluate_all(
+        "cells => cells.map(c => c.getBoundingClientRect().width)"
+    )
+    assert widths[1] > 3.5 * widths[0] and widths[1] > 3.5 * widths[2]
+    table_width = page.locator(".metadata-table").bounding_box()["width"]
+    assert editor.bounding_box()["width"] < 0.17 * table_width
+    editor.fill("A long override that continues horizontally inside the compact field. " * 8)
+    assert editor.evaluate("e => e.scrollWidth > e.clientWidth")
+
+    batch = page.locator(".batch-folder-panel").first.bounding_box()
+    metadata = page.locator("#document-metadata-accordion").bounding_box()
+    assert batch["height"] == 88  # 80% of the previous 110px chooser surface.
+    assert 4 <= metadata["y"] - (batch["y"] + batch["height"]) <= 8.5
 
 
 def test_document_metadata_has_one_outer_accordion(page, local_app_url, one_page_pdf):

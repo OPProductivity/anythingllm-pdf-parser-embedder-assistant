@@ -2859,6 +2859,14 @@ body.dark #automatic-process-button[disabled] {
 #document-metadata-accordion > button.label-wrap {
     align-items: center;
 }
+#document-metadata-accordion {
+    margin-top: -8px !important;
+}
+/* All children of this generated form are hidden metadata transports. Hide
+   its empty border and layout slot too, keeping the actual inputs mounted. */
+.gradio-container .form:has(> #automatic-title-override-transport) {
+    display: none !important;
+}
 #document-metadata-accordion > button.label-wrap .metadata-header-status {
     display: inline-flex;
     align-items: center;
@@ -2968,14 +2976,22 @@ body .gradio-container .document-metadata-preview .metadata-panel button.metadat
     position: absolute;
     top: 8px;
     right: 12px;
-    display: grid;
-    place-items: center;
-    width: 23px;
-    height: 23px;
-    border-radius: 50%;
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    box-sizing: border-box !important;
+    width: 24px !important;
+    min-width: 24px !important;
+    max-width: 24px !important;
+    height: 24px !important;
+    min-height: 24px !important;
+    max-height: 24px !important;
+    padding: 0 !important;
+    border-radius: 50% !important;
+    text-align: center !important;
     background: #4b5563 !important;
     color: white !important;
-    font: 700 15px/1 Arial, sans-serif;
+    font: 700 14px/1 Arial, sans-serif !important;
     cursor: pointer;
     border: 0 !important;
     box-shadow: none !important;
@@ -2997,9 +3013,9 @@ body .gradio-container .document-metadata-preview .metadata-panel button.metadat
     border: 0 !important;
     background: transparent !important;
 }
-.document-metadata-preview .metadata-key-column { width: 23%; }
-.document-metadata-preview .metadata-detected-column { width: 47%; }
-.document-metadata-preview .metadata-override-column { width: 30%; }
+.document-metadata-preview .metadata-key-column { width: 16%; }
+.document-metadata-preview .metadata-detected-column { width: 68%; }
+.document-metadata-preview .metadata-override-column { width: 16%; }
 .document-metadata-preview .metadata-table thead th {
     font-weight: 700;
     border-bottom: 1px solid var(--border-color-primary) !important;
@@ -3016,7 +3032,7 @@ body:not(.dark) .gradio-container #document-metadata-accordion .metadata-table t
 }
 .document-metadata-preview .metadata-table th,
 .document-metadata-preview .metadata-table td {
-    padding: 2px 8px;
+    padding: 2px 4px;
     vertical-align: middle;
     text-align: left;
     font-weight: 400;
@@ -3431,7 +3447,7 @@ body .gradio-container .document-metadata-preview input.metadata-override-input:
     box-shadow: none !important;
     color: var(--rag-control-text) !important;
     position: relative !important;
-    min-height: 96px !important;
+    min-height: 76.8px !important;
     overflow: hidden !important;
 }
 .batch-folder-panel > div,
@@ -3522,7 +3538,7 @@ body .gradio-container .document-metadata-preview input.metadata-override-input:
     flex-direction: column !important;
     align-items: center !important;
     position: static !important;
-    /* The chooser itself supplies its 110px height while it is visible.
+    /* The chooser itself supplies its 88px height while it is visible.
        Retaining that height after a completed scan created an empty grey tail
        below the retry/clear row. */
     min-height: 0 !important;
@@ -3762,9 +3778,9 @@ body.dark .batch-folder-file-selector .token {
 .batch-folder-inner .batch-folder-chooser {
     position: relative !important;
     inset: auto !important;
-    flex: 0 0 110px !important;
-    min-height: 110px !important;
-    height: 110px !important;
+    flex: 0 0 88px !important;
+    min-height: 88px !important;
+    height: 88px !important;
 }
 .batch-folder-inner #choose-pdf-folder-button.hide,
 .batch-folder-inner #choose-pdf-folder-button[style*="display: none"],
