@@ -447,6 +447,7 @@ AUTOMATIC_RUN_FIELDS = (
     "anythingllm_chunk_overlap", "auto_apply_recommended_settings", "download_full_folder",
     "download_segments_folder", "existing_workspace_duplicate_policy",
     "document_publisher",
+    "document_metadata_overrides",
 )
 ANYTHINGLLM_EMBEDDER_ENGINE_CHOICES = [
     "anythingllm",
@@ -1095,11 +1096,26 @@ APP_CONNECTION_WATCHDOG_HEAD = """
       const id = overrideTransports[field];
       return id ? document.querySelector(`#${id} input, #${id} textarea`) : null;
     };
+    const documentEditsSource = () => document.querySelector(
+      "#automatic-document-overrides-transport input, #automatic-document-overrides-transport textarea");
+    const readDocumentEdits = () => {
+      try { return JSON.parse(documentEditsSource()?.value || "{}"); }
+      catch { return {}; }
+    };
+    const writeDocumentEdits = (edits) => {
+      const source = documentEditsSource();
+      if (!source) return;
+      source.value = JSON.stringify(edits);
+      source.dispatchEvent(new Event("input", { bubbles: true }));
+    };
+    const firstMetadataDocument = () => document.querySelector(
+      ".metadata-override-input[data-metadata-document]")?.dataset.metadataDocument || "";
     let metadataOverrideFocus = null;
     const rememberMetadataOverrideFocus = () => {
       const editor = document.activeElement;
       if (editor instanceof HTMLInputElement && editor.matches(".metadata-override-input")) {
-        metadataOverrideFocus = { field: editor.dataset.metadataOverride, node: editor,
+        metadataOverrideFocus = { field: editor.dataset.metadataOverride,
+          document: editor.dataset.metadataDocument || "", node: editor,
           start: editor.selectionStart, end: editor.selectionEnd };
       }
     };
@@ -1112,16 +1128,31 @@ APP_CONNECTION_WATCHDOG_HEAD = """
     }, true);
     document.addEventListener("selectionchange", rememberMetadataOverrideFocus);
     const syncMetadataOverrideEditors = () => {
+      const edits = readDocumentEdits();
+      const first = firstMetadataDocument();
+      // Values typed before a PDF is selected belong to its first document,
+      // rather than becoming accidental shared values for every batch member.
+      if (first && !Object.keys(edits).length) {
+        const draft = Object.fromEntries(Object.keys(overrideTransports).map(field =>
+          [field, overrideSource(field)?.value || ""]));
+        if (Object.values(draft).some(value => value.trim())) {
+          edits[first] = draft;
+          writeDocumentEdits(edits);
+        }
+      }
       document.querySelectorAll(".metadata-override-input").forEach(editor => {
-        const source = overrideSource(editor.dataset.metadataOverride);
+        const field = editor.dataset.metadataOverride;
+        const key = editor.dataset.metadataDocument || "";
+        const source = overrideSource(field);
         if (!source) return;
-        if (document.activeElement !== editor && editor.value !== source.value) {
-          editor.value = source.value;
+        const value = key ? (edits[key]?.[field] || "") : source.value;
+        if (document.activeElement !== editor && editor.value !== value) {
+          editor.value = value;
         }
         // Preview HTML can be replaced while someone is typing. Restore the
         // same field and caret only when that removal displaced their focus.
         const prior = metadataOverrideFocus;
-        if (prior?.field === editor.dataset.metadataOverride && !prior.node.isConnected &&
+        if (prior?.field === field && prior.document === key && !prior.node.isConnected &&
             document.activeElement === document.body && editor.getClientRects().length) {
           editor.focus({ preventScroll: true });
           editor.setSelectionRange(prior.start, prior.end);
@@ -1134,8 +1165,16 @@ APP_CONNECTION_WATCHDOG_HEAD = """
           !editor.matches(".metadata-override-input")) return;
       const source = overrideSource(editor.dataset.metadataOverride);
       if (!source) return;
-      source.value = editor.value;
-      source.dispatchEvent(new Event("input", { bubbles: true }));
+      const key = editor.dataset.metadataDocument || "";
+      if (key) {
+        const edits = readDocumentEdits();
+        edits[key] = { ...edits[key], [editor.dataset.metadataOverride]: editor.value };
+        writeDocumentEdits(edits);
+      }
+      if (!key || key === firstMetadataDocument()) {
+        source.value = editor.value;
+        source.dispatchEvent(new Event("input", { bubbles: true }));
+      }
       rememberMetadataOverrideFocus();
     }, true);
 
@@ -2962,11 +3001,6 @@ body.dark #automatic-process-button[disabled] {
     position: relative;
     background: transparent;
 }
-.document-metadata-preview .metadata-panel-heading {
-    padding: 10px 42px 10px 8px;
-    font-weight: 700;
-    border-bottom: 1px solid var(--border-color-primary);
-}
 .document-metadata-preview .metadata-summary {
     border: 0;
     border-radius: 0;
@@ -2974,8 +3008,8 @@ body.dark #automatic-process-button[disabled] {
 }
 body .gradio-container .document-metadata-preview .metadata-panel button.metadata-info-toggle {
     position: absolute;
-    top: 8px;
-    right: 12px;
+    top: 6px;
+    right: 8px;
     display: inline-flex !important;
     align-items: center !important;
     justify-content: center !important;
@@ -3001,7 +3035,8 @@ body .gradio-container .document-metadata-preview .metadata-panel button.metadat
     outline-offset: 2px;
 }
 .document-metadata-preview .metadata-panel .metadata-file-name {
-    padding: 10px 14px 4px;
+    padding: 6px 40px 6px 8px;
+    min-height: 36px;
     font-weight: 700;
     overflow-wrap: anywhere;
 }
@@ -7912,6 +7947,7 @@ def automatic_run_processing_settings(values):
         "document_author": settings.get("document_author"),
         "document_short_label": settings.get("document_short_label"),
         "document_publisher": settings.get("document_publisher"),
+        "document_metadata_overrides": settings.get("document_metadata_overrides"),
         "use_file_title_fallback": settings.get("use_file_title_fallback"),
         # A batch has no shared metadata by default.  The explicit opt-in is
         # part of the processing identity so a past accidental shared title
@@ -7979,6 +8015,7 @@ def builtin_automatic_run_setting_values(pdf_files=None, folder_pdf_files=None, 
         "document_author": "",
         "document_short_label": "",
         "document_publisher": "",
+        "document_metadata_overrides": "",
         "use_file_title_fallback": True,
         "apply_batch_metadata_overrides": False,
         "mode": MODE_NATIVE_UPLOAD_LABEL,
@@ -10635,6 +10672,41 @@ def local_path_identity_key(value):
     return os.path.normcase(os.path.normpath(normalized))
 
 
+DOCUMENT_METADATA_FIELDS = (
+    "document_label", "document_author", "document_short_label", "document_publisher",
+)
+
+
+def selected_document_metadata_overrides(value, files):
+    """Keep explicit edits bound to selected source paths, never to list position."""
+    parsed = json.loads(value or "{}") if isinstance(value, str) else (value or {})
+    if not isinstance(parsed, dict):
+        raise ValueError("Document metadata overrides must be a JSON object.")
+    selected = {local_path_identity_key(path) for path in files}
+    result = {}
+    for path, fields in parsed.items():
+        key = local_path_identity_key(path)
+        if key in selected and isinstance(fields, dict):
+            result[key] = {
+                field: str(fields.get(field) or "").strip()
+                for field in DOCUMENT_METADATA_FIELDS
+                if str(fields.get(field) or "").strip()
+            }
+    return result
+
+
+@automatic_next_run_callback(10)
+def clear_selected_batch_metadata():
+    """Clear the preview and explicit drafts alongside the selection."""
+    return (
+        *(gr.update(value="") for _ in range(3)),
+        pending_metadata_panel_html("Select a PDF to inspect its metadata."),
+        metadata_scan_status_html("idle", ""),
+        gr.update(value="{}"),
+        *(gr.update(value="") for _ in range(4)),
+    )
+
+
 def unique_local_path_strings(values):
     """De-duplicate local paths by identity while preserving first display path."""
     result = []
@@ -12028,9 +12100,12 @@ def choose_pdf_input_directory_for_scan(current_value="", selection_state=None):
     )
 
 
-def stream_selected_pdf_directory(path_text="", scan_requested=False):
+def stream_selected_pdf_directory(path_text="", scan_requested=False, selection_state=None, request: gr.Request = None):
     """Stream recursive discovery UI updates, then return one validated manifest."""
-    if automatic_lifecycle_busy():
+    def current():
+        return not automatic_lifecycle_busy() and _selection_preview_is_current(selection_state, request)
+
+    if not current():
         yield tuple(gr.update() for _ in range(7))
         return
     if not scan_requested:
@@ -12047,7 +12122,7 @@ def stream_selected_pdf_directory(path_text="", scan_requested=False):
 
     final_scan = None
     for stage, scan in iter_recursive_pdf_folder_scan(path_text):
-        if automatic_lifecycle_busy():
+        if not current():
             yield tuple(gr.update() for _ in range(7))
             return
         final_scan = scan
@@ -12064,7 +12139,7 @@ def stream_selected_pdf_directory(path_text="", scan_requested=False):
     manifest = dict(final_scan or {})
     inspection = None
     for stage, payload in iter_uploaded_pdf_candidate_inspection(manifest.get("pdf_paths") or []):
-        if automatic_lifecycle_busy():
+        if not current():
             yield tuple(gr.update() for _ in range(7))
             return
         if stage == "progress":
@@ -12112,7 +12187,7 @@ def stream_selected_pdf_directory(path_text="", scan_requested=False):
             gr.update(value="Inspecting PDF pages…", interactive=False),
         )
     for preview_progress in iter_pdf_picker_page_details(candidates_for_preview):
-        if automatic_lifecycle_busy():
+        if not current():
             yield tuple(gr.update() for _ in range(7))
             return
         # The generator owns these dictionaries until the next iteration.
@@ -12137,6 +12212,9 @@ def stream_selected_pdf_directory(path_text="", scan_requested=False):
             gr.update(value="Inspecting PDF pages…", interactive=False),
         )
     manifest["picker_page_details"] = dict(page_details)
+    if not current():
+        yield tuple(gr.update() for _ in range(7))
+        return
     retain_batch_native_inspection(coverage_by_key)
     manifest["schema_version"] = 1
     APP_LOGGER.info(
@@ -13082,8 +13160,26 @@ def stream_automatic_detected_metadata_preview(
     )
     if len(files) > 1:
         selection_note += (
-            " Filled overrides apply to the selected PDFs at Confirm; blank fields use each PDF's detected values."
+            " Each PDF has independent overrides; blank fields use that PDF's detected values."
         )
+
+    def preview_list_html(active_index=None, detail=""):
+        panels = list(completed_html)
+        for pending_index in range(len(panels), len(files)):
+            path = files[pending_index]
+            will_preview = pending_index < len(displayed)
+            message = detail if pending_index == active_index else (
+                "Waiting for metadata detection." if will_preview else
+                "This PDF will be detected freshly at Confirm; its overrides can be entered now."
+            )
+            panels.append(pending_metadata_panel_html(
+                message, filename=Path(path).name, loading=will_preview,
+                detected_value="" if will_preview else "Not previewed",
+                document_key=local_path_identity_key(path),
+            ))
+        note = f'<div class="metadata-selection-note">{html.escape(selection_note)}</div>' if len(files) > 1 else ""
+        return '<div class="metadata-preview-list">' + note + "".join(panels) + "</div>"
+
     for index, path in enumerate(displayed):
         if automatic_lifecycle_busy() or not _selection_preview_is_current(selection_state, request):
             yield tuple(gr.update() for _ in range(7))
@@ -13095,12 +13191,7 @@ def stream_automatic_detected_metadata_preview(
         )
         yield (
             *field_updates,
-            '<div class="metadata-preview-list" role="status" aria-live="polite">'
-            + "".join(completed_html)
-            + pending_metadata_panel_html(
-                f"{selection_note} {scanning}", filename=Path(path).name,
-                loading=True, include_overrides=(index == 0),
-            ) + "</div>",
+            preview_list_html(index, scanning),
             metadata_scan_status_html(
                 "scanning", f"Inspecting metadata for preview {index + 1} of {len(displayed)}…"
             ),
@@ -13113,7 +13204,7 @@ def stream_automatic_detected_metadata_preview(
             result = detected_metadata_preview(
                 [path], current_title, current_author, current_short_label,
                 use_file_title_fallback, apply_batch_metadata_overrides,
-                override_editor=(index == 0),
+                override_editor=True,
             )
             if not isinstance(result[3], str):
                 yield tuple(gr.update() for _ in range(7))
@@ -13121,7 +13212,7 @@ def stream_automatic_detected_metadata_preview(
             if len(files) == 1:
                 field_updates = result[:3]
             completed_html.append(result[3])
-            if "Metadata preview could not be completed" in result[3]:
+            if 'data-preview-error="true"' in result[3] or "Metadata preview could not be completed" in result[3]:
                 preview_errors += 1
         except Exception as exc:
             APP_LOGGER.exception("individual PDF metadata preview failed")
@@ -13130,7 +13221,7 @@ def stream_automatic_detected_metadata_preview(
                 f"Metadata preview failed: {safe_user_error_text(exc)}. "
                 "The file remains selected for a fresh attempt after Confirm.",
                 filename=Path(path).name, detected_value="Unavailable",
-                include_overrides=(index == 0),
+                document_key=local_path_identity_key(path), error=True,
             ))
         if automatic_lifecycle_busy() or not _selection_preview_is_current(selection_state, request):
             yield tuple(gr.update() for _ in range(7))
@@ -13141,10 +13232,7 @@ def stream_automatic_detected_metadata_preview(
             field_updates = tuple({**update, "interactive": True} for update in field_updates)
         yield (
             *field_updates,
-            '<div class="metadata-preview-list" role="status" aria-live="polite">'
-            + (f'<div class="metadata-selection-note">{html.escape(selection_note)} {completed}</div>'
-               if len(files) > 1 else "")
-            + "".join(completed_html) + "</div>",
+            preview_list_html(),
             metadata_scan_status_html(
                 "warning" if preview_errors and index + 1 == len(displayed) else
                 "ready" if index + 1 == len(displayed) else "scanning",
@@ -13542,6 +13630,7 @@ def automatic_clear_selection_begin_state(previous_state=None, viewed_run_root=N
     if result[0].get("state") == "pending" and not automatic_lifecycle_busy():
         result[0]["selection_signature"] = ""
         result[0]["accept_next_signature"] = True
+        result = (*result[:2], gr.update(value=[], interactive=True), *result[3:])
     return result
 
 
@@ -24979,6 +25068,11 @@ def validated_automatic_run_settings(values, *, preflight_progress_callback=None
     if validation_report:
         return settings, validation_report, [], False
     settings["files"] = files
+    if settings.get("document_metadata_overrides"):
+        settings["document_metadata_overrides"] = json.dumps(
+            selected_document_metadata_overrides(settings["document_metadata_overrides"], files),
+            ensure_ascii=False,
+        )
     batch_metadata_shared_values_present = bool(
         len(files) > 1
         and any(
@@ -26044,6 +26138,20 @@ def automatic_explicit_metadata_values(selection_state, values, overrides=None):
             + normalize_file_list(values[AUTOMATIC_RUN_FIELDS.index("folder_pdf_files")])
         )
         batch = len(files) > 1
+        document_edits = values[AUTOMATIC_RUN_FIELDS.index("document_metadata_overrides")]
+        if document_edits:
+            per_document = selected_document_metadata_overrides(document_edits, files)
+            for field in DOCUMENT_METADATA_FIELDS:
+                if field != "document_label" or batch:
+                    values[AUTOMATIC_RUN_FIELDS.index(field)] = ""
+            if len(files) == 1:
+                own_title = per_document.get(local_path_identity_key(files[0]), {}).get("document_label")
+                if own_title:
+                    values[AUTOMATIC_RUN_FIELDS.index("document_label")] = own_title
+            values[AUTOMATIC_RUN_FIELDS.index("document_metadata_overrides")] = json.dumps(per_document, ensure_ascii=False)
+            values[AUTOMATIC_RUN_FIELDS.index("apply_batch_metadata_overrides")] = False
+            values[AUTOMATIC_RUN_FIELDS.index("use_file_title_fallback")] = True
+            return tuple(values)
         filled = bool(str(values[AUTOMATIC_RUN_FIELDS.index("document_publisher")] or "").strip())
         for field, entered in zip(
             ("document_label", "document_author", "document_short_label"), overrides, strict=True
@@ -26748,7 +26856,7 @@ def extraction_backend_help(choice):
     return f'<div class="metadata-summary"><div class="metadata-file"><div class="metadata-status">{body}</div></div></div>'
 
 
-def detected_pdf_metadata_panel_html(primary_html, has_additional=False):
+def detected_pdf_metadata_panel_html(primary_html, has_additional=False, error=False):
     """Render one metadata panel; the info button reveals rows in its table."""
     info = (
         '<button type="button" class="metadata-info-toggle" aria-label="More detected PDF metadata" '
@@ -26756,8 +26864,7 @@ def detected_pdf_metadata_panel_html(primary_html, has_additional=False):
         if has_additional else ""
     )
     return (
-        '<div class="metadata-panel"><div class="metadata-panel-heading">Detected PDF metadata</div>'
-        f'{info}{primary_html}</div>'
+        f'<div class="metadata-panel" data-preview-error="{str(error).lower()}">{info}{primary_html}</div>'
     )
 
 
@@ -26769,7 +26876,7 @@ METADATA_OVERRIDE_FIELDS = {
 }
 
 
-def metadata_table_html(primary_rows, additional_rows=(), *, include_overrides=True):
+def metadata_table_html(primary_rows, additional_rows=(), *, include_overrides=True, document_key=""):
     """Keep detected evidence and optional user overrides in distinct columns."""
     def render_rows(rows, additional=False):
         rendered = []
@@ -26778,6 +26885,7 @@ def metadata_table_html(primary_rows, additional_rows=(), *, include_overrides=T
             control = (
                 f'<input class="metadata-override-input metadata-{field}-input" '
                 f'data-metadata-override="{field}" '
+                f'data-metadata-document="{html.escape(document_key, quote=True)}" '
                 f'aria-label="Override {html.escape(key, quote=True)}" '
                 'autocomplete="off" value="">'
                 if field else ""
@@ -26802,13 +26910,14 @@ def metadata_table_html(primary_rows, additional_rows=(), *, include_overrides=T
 
 
 def pending_metadata_panel_html(message, *, filename="", loading=False,
-                                include_overrides=True, detected_value=""):
+                                include_overrides=True, detected_value="", document_key="", error=False):
     value = detected_value or ("Loading…" if loading else "Select a PDF")
     rows = [(key, value, "pending") for key in METADATA_OVERRIDE_FIELDS]
     heading = f'<div class="metadata-file-name">{html.escape(filename)}</div>' if filename else ""
     return detected_pdf_metadata_panel_html(
         heading + f'<div class="metadata-status">{html.escape(message)}</div>'
-        + metadata_table_html(rows, include_overrides=include_overrides)
+        + metadata_table_html(rows, include_overrides=include_overrides, document_key=document_key),
+        error=error,
     )
 
 
@@ -26980,10 +27089,11 @@ def detected_metadata_preview(
     panels = []
     for index, record in enumerate(records):
         filename = html.escape(record["filename"])
+        document_key = local_path_identity_key(files[index])
         if record.get("error"):
             panels.append(pending_metadata_panel_html(
                 record["error"], filename=record["filename"], detected_value="Unavailable",
-                include_overrides=override_editor and index == 0,
+                include_overrides=override_editor, document_key=document_key, error=True,
             ))
             continue
         identity = identities[index] if index < len(identities) else {}
@@ -26998,7 +27108,7 @@ def detected_metadata_preview(
         additional_rows = identity_rows + record["technical_rows"]
         table = metadata_table_html(
             record["primary_rows"], additional_rows,
-            include_overrides=override_editor and index == 0,
+            include_overrides=override_editor, document_key=document_key,
         )
         panels.append(detected_pdf_metadata_panel_html(
             f'<div class="metadata-file-name">{filename}</div>{table}',
@@ -29839,6 +29949,7 @@ def run_automatic(
     existing_workspace_duplicate_policy=WORKSPACE_DUPLICATE_POLICY_SKIP,
     apply_batch_metadata_overrides=False,
     document_publisher="",
+    document_metadata_overrides="",
     progress=gr.Progress(track_tqdm=False),
 ):
     # Progress ownership stays with ``update_live_automatic_run_status`` and
@@ -31358,8 +31469,11 @@ def run_automatic(
     # runtime-failure reason, never extracted text, and prevents a known-missing
     # OCR dependency from being retried for every remaining scan PDF.
     unstructured_circuit_breaker = {}
+    per_document_override_mode = bool(document_metadata_overrides)
+    overrides_by_document = selected_document_metadata_overrides(document_metadata_overrides, files)
     batch_uses_per_pdf_metadata = len(files) > 1 and not bool(apply_batch_metadata_overrides)
     batch_metadata_policy = (
+        "per_pdf_override_or_detection" if per_document_override_mode else
         "per_pdf_detected_metadata"
         if batch_uses_per_pdf_metadata
         else ("explicit_shared_override" if len(files) > 1 else "single_pdf_override_or_detection")
@@ -31842,15 +31956,17 @@ def run_automatic(
         # directory. A safe worker restart for this run can resume completed
         # pages, while a newly created run can never consume older OCR text.
         ocr_checkpoint_dir = out_dir / ".ocr-page-checkpoints"
+        source_metadata = {
+            "document_label": "" if batch_uses_per_pdf_metadata or per_document_override_mode else (document_label or "").strip(),
+            "document_author": "" if batch_uses_per_pdf_metadata or per_document_override_mode else (document_author or "").strip(),
+            "document_short_label": "" if batch_uses_per_pdf_metadata or per_document_override_mode else (document_short_label or "").strip(),
+            "document_publisher": "" if batch_uses_per_pdf_metadata or per_document_override_mode else (document_publisher or "").strip(),
+        }
+        source_metadata.update(overrides_by_document.get(local_path_identity_key(pdf_path), {}))
         args = SimpleNamespace(
-            # Never allow a title inferred for (or left over from) one PDF to
-            # become the page-parent base for every member of a batch. A
-            # shared override remains available, but only after an explicit
-            # opt-in control records that intent in the confirmed settings.
-            document_label="" if batch_uses_per_pdf_metadata else (document_label or "").strip(),
-            document_author="" if batch_uses_per_pdf_metadata else (document_author or "").strip(),
-            document_short_label="" if batch_uses_per_pdf_metadata else (document_short_label or "").strip(),
-            document_publisher="" if batch_uses_per_pdf_metadata else (document_publisher or "").strip(),
+            # Each selected path owns its edits. Empty fields still resolve
+            # from that PDF; first-file preview values cannot leak across it.
+            **source_metadata,
             use_file_title_fallback=bool(use_file_title_fallback),
             deep_extraction=bool(deep_extraction),
             include_front_matter=bool(include_front_matter),
@@ -34143,6 +34259,11 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                                                     elem_classes=["metadata-field-transport"], interactive=True)
             auto_publisher = gr.Textbox(label="Publisher override", elem_id="automatic-publisher-override-transport",
                                         elem_classes=["metadata-field-transport"], interactive=True)
+            auto_document_overrides = gr.Textbox(
+                value="{}", label="Document metadata override drafts",
+                elem_id="automatic-document-overrides-transport",
+                elem_classes=["metadata-field-transport"], interactive=True,
+            )
             auto_metadata_status = gr.HTML(
                 value=metadata_scan_status_html("idle", ""),
                 elem_id="document-metadata-scan-status",
@@ -34159,7 +34280,6 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     ),
                     elem_classes=["document-metadata-preview"],
                 )
-                refresh_metadata_button = gr.Button("Refresh detected PDF metadata")
             with gr.Row():
                 auto_mode = gr.Radio(
                     choices=[MODE_LOCAL_ONLY_LABEL, MODE_LOCAL_WITH_LOGS_LABEL, MODE_NATIVE_UPLOAD_LABEL],
@@ -35276,6 +35396,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 auto_download_segments_folder,
                 existing_workspace_duplicate_policy,
                 auto_publisher,
+                auto_document_overrides,
                 new_workspace_name,
                 retain_detailed_evidence,
                 new_workspace_name_auto_state,
@@ -35678,7 +35799,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=stream_selected_pdf_directory,
-                inputs=[auto_folder_path, auto_folder_scan_requested],
+                inputs=[auto_folder_path, auto_folder_scan_requested, automatic_selection_state],
                 outputs=[
                     auto_folder_pdfs,
                     auto_folder_manifest,
@@ -35914,6 +36035,13 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     pdf_folder_picker_area,
                     choose_pdf_folder_button,
                 ],
+                show_progress="hidden",
+                queue=False,
+            ).then(
+                fn=clear_selected_batch_metadata,
+                outputs=[auto_label, auto_author, auto_short_label, auto_metadata_preview,
+                         auto_metadata_status, auto_document_overrides,
+                         auto_title_override, auto_author_override, auto_short_label_override, auto_publisher],
                 show_progress="hidden",
                 queue=False,
             ).then(

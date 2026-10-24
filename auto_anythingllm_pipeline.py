@@ -872,10 +872,14 @@ def pdf_metadata(path: Path, include_page_geometry=False, include_author_samples
     with fitz.open(path) as doc:
         metadata = dict(doc.metadata or {})
         embedded_publisher = normalize_text(metadata.get("publisher") or "")
+        publisher_error = ""
         try:
             publisher = embedded_publisher or xmp_publisher(doc.get_xml_metadata())
-        except (RuntimeError, ValueError):
+        except Exception as exc:
+            # Optional XMP can point at a malformed non-stream object even
+            # when the standard metadata and page text are fully readable.
             publisher = embedded_publisher
+            publisher_error = f"{type(exc).__name__}: {exc}"
         outline = [
             {"level": level, "title": normalize_text(title), "pdf_page": page}
             for level, title, page in doc.get_toc(simple=True)
@@ -955,6 +959,7 @@ def pdf_metadata(path: Path, include_page_geometry=False, include_author_samples
             "title": normalize_text(metadata.get("title") or ""),
             "author": normalize_text(metadata.get("author") or ""),
             "publisher": publisher,
+            "publisher_error": publisher_error,
             "publisher_source": ("pdf_metadata" if embedded_publisher else "xmp_metadata") if publisher else "not_available",
             "subject": normalize_text(metadata.get("subject") or ""),
             "keywords": normalize_text(metadata.get("keywords") or ""),

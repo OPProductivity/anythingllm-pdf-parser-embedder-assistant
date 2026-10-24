@@ -1,5 +1,6 @@
 """Selection feedback/ownership controls; author inference is not mocked accuracy proof."""
 from types import SimpleNamespace
+import json
 import shutil
 from unittest.mock import Mock
 
@@ -63,6 +64,8 @@ def test_preview_limit_is_explicit_and_no_document_is_inspected_twice(monkeypatc
     assert "Every selected PDF will be inspected freshly" in events[-1][3]
     assert "5 of 11 selected PDFs" in events[-1][4]
     assert [call.args[0][0] for call in inspect.call_args_list] == files[:5]
+    assert events[0][3].count('data-metadata-override="document_publisher"') == len(files)
+    assert "source-10.pdf" in events[0][3] and "Not previewed" in events[0][3]
 
 
 def test_folder_names_are_visible_before_the_all_page_inspection_starts(monkeypatch, tmp_path):
@@ -93,6 +96,28 @@ def test_folder_names_are_visible_before_the_all_page_inspection_starts(monkeypa
     final = list(stream)[-1]
     assert final[2]["interactive"]
     assert "12 pages" in final[2]["choices"][0][0]
+
+
+def test_clear_invalidates_folder_scan_before_it_can_restore_old_sources(monkeypatch, tmp_path):
+    path = str(tmp_path / "selected.pdf")
+    request = SimpleNamespace(session_hash="clear-during-scan")
+    state = app.automatic_folder_selection_begin_state({}, "", [], [], {}, request=request)[0]
+    monkeypatch.setattr(app, "iter_recursive_pdf_folder_scan", lambda _root: iter([
+        ("complete", {"root": str(tmp_path), "pdf_paths": [path]}),
+    ]))
+    monkeypatch.setattr(app, "iter_uploaded_pdf_candidate_inspection", lambda _paths: iter([
+        ("complete", {"pdf_candidates": [path]}),
+    ]))
+    monkeypatch.setattr(app, "iter_pdf_picker_page_details", lambda _paths: iter([{
+        "details": {}, "coverage_by_key": {}, "completed": 1, "total": 1,
+    }]))
+    stream = app.stream_selected_pdf_directory(str(tmp_path), True, state, request)
+    next(stream)
+    cleared = app.automatic_clear_selection_begin_state(state, "", [], [path], {}, request=request)
+    assert cleared[2]["value"] == []
+    assert not app._selection_preview_is_current(state, request)
+    remaining = list(stream)
+    assert all(update.get("__type__") == "update" for event in remaining for update in event)
 
 
 def test_one_failed_preview_does_not_strand_selection_or_hide_other_results(monkeypatch):
@@ -399,6 +424,26 @@ def test_preview_option_change_preserves_intent_but_new_source_resets_it():
     assert changed_option["metadata_user_edits"]["document_author"]
     new_source = app.automatic_selection_begin_state(state, "", ["next.pdf"], [], {})[0]
     assert new_source["metadata_user_edits"] == {}
+
+
+def test_per_document_overrides_are_filtered_by_path_and_never_become_shared():
+    values = [None] * len(app.AUTOMATIC_RUN_FIELDS)
+    at = app.AUTOMATIC_RUN_FIELDS.index
+    values[at("pdf_files")] = ["first.pdf", "second.pdf"]
+    values[at("document_author")] = "Stale shared author"
+    values[at("document_publisher")] = "Stale shared press"
+    values[at("document_metadata_overrides")] = json.dumps({
+        "first.pdf": {"document_author": "Alpha Author", "document_label": "Alpha title"},
+        "second.pdf": {"document_publisher": "Beta Press"},
+        "unselected.pdf": {"document_author": "Do not apply"},
+    })
+    resolved = app.automatic_explicit_metadata_values({}, values, overrides=("Old title", "Old author", "Old label"))
+    assert all(resolved[at(field)] == "" for field in app.DOCUMENT_METADATA_FIELDS)
+    assert resolved[at("apply_batch_metadata_overrides")] is False
+    own = json.loads(resolved[at("document_metadata_overrides")])
+    assert set(own) == {app.local_path_identity_key("first.pdf"), app.local_path_identity_key("second.pdf")}
+    assert own[app.local_path_identity_key("first.pdf")]["document_author"] == "Alpha Author"
+    assert own[app.local_path_identity_key("second.pdf")] == {"document_publisher": "Beta Press"}
 
 
 def test_empty_selection_clears_and_unlocks_inferred_fields(monkeypatch):

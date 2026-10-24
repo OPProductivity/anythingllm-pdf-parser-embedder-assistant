@@ -164,6 +164,61 @@ def one_page_pdf(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def batch_metadata_app(tmp_path, tmp_path_factory, two_pdf_files):
+    """Exercise real folder/direct paths with only the second preview paused."""
+    port = free_local_port()
+    app_home = tmp_path_factory.mktemp("batch-edit")
+    started, release = tmp_path / "second-started", tmp_path / "second-release"
+    environment = dict(os.environ)
+    environment.update({
+        "GRADIO_SERVER_PORT": str(port),
+        "ANYTHINGLLM_PDF_ASSISTANT_BROWSER_KEY": LOCAL_BROWSER_KEY,
+        "ANYTHINGLLM_PDF_ASSISTANT_HOME": str(app_home),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    })
+    script = """
+import sys, time
+from pathlib import Path
+import rag_pdf_gradio_app as app
+folder, started, release = (Path(p) for p in sys.argv[1:4])
+app.choose_pdf_input_directory = lambda *_a, **_kw: str(folder)
+infer = app.infer_author_from_initial_pdf_pages
+calls = 0
+def paused_infer(*args, **kwargs):
+    global calls
+    calls += 1
+    if calls == 2:
+        started.touch()
+        deadline = time.monotonic() + 60
+        while not release.exists():
+            if time.monotonic() >= deadline:
+                raise TimeoutError('Browser test did not release second preview')
+            time.sleep(0.05)
+    return infer(*args, **kwargs)
+app.infer_author_from_initial_pdf_pages = paused_infer
+app.launch_application(port=int(sys.argv[4]), inbrowser=False)
+"""
+    with (tmp_path / "batch-app-stderr.log").open("wb") as stderr:
+        process = subprocess.Popen(
+            [sys.executable, "-c", script, str(two_pdf_files[0].parent), str(started), str(release), str(port)],
+            cwd=str(PROJECT_ROOT), env=environment, stdout=subprocess.DEVNULL, stderr=stderr,
+        )
+        try:
+            url = f"http://127.0.0.1:{port}"
+            wait_for_http(url + "/healthz", process)
+            yield url, started, release, app_home, two_pdf_files
+        finally:
+            release.touch()
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=15)
+
+
+@pytest.fixture
 def two_pdf_files(tmp_path: Path) -> list[Path]:
     paths = [tmp_path / "browser-first.pdf", tmp_path / "browser-second.pdf"]
     for index, path in enumerate(paths, start=1):
@@ -535,7 +590,7 @@ def test_metadata_table_stays_folded_and_shows_loading_then_detected_values(
     expect(page.locator(".metadata-table .metadata-detected-value").first).not_to_have_text("Loading…")
     expect(page.get_by_label("Override Publisher")).to_have_value("")
     expect(accordion.get_by_role("checkbox")).to_have_count(0)
-    expect(page.get_by_role("button", name="Refresh detected PDF metadata")).to_be_visible()
+    expect(page.get_by_role("button", name="Refresh detected PDF metadata")).to_have_count(0)
 
 
 def test_metadata_overrides_update_processing_fields(page, local_app_url, one_page_pdf):
@@ -557,7 +612,6 @@ def test_metadata_overrides_update_processing_fields(page, local_app_url, one_pa
         editor.fill(text)
         transport = page.locator(f"#{transport_id} input, #{transport_id} textarea")
         expect(transport).to_have_value(text)
-    page.get_by_role("button", name="Refresh detected PDF metadata").click()
     expect(page.get_by_label("Override Publisher")).to_have_value("Edited Publisher", timeout=60000)
     page.get_by_label("Override Publisher").fill("")
     expect(page.locator(
@@ -622,26 +676,45 @@ def test_overrides_survive_before_during_and_after_detection_and_save_on_confirm
     assert profile["detected_publisher"] == "After Publisher"
 
 
-def test_filled_batch_overrides_apply_without_a_checkbox_and_blank_fields_stay_per_pdf(
-    page, local_app_url, local_app_home, two_pdf_files
+@pytest.mark.parametrize("route", ["direct", "folder"])
+def test_independent_pdf_edits_during_later_preview_save_without_cross_file_leakage(
+    page, batch_metadata_app, route
 ):
-    previous_profiles = set((local_app_home / "run-state").rglob("source-profile.json"))
-    open_local_app(page, local_app_url)
+    url, started, release, app_home, files = batch_metadata_app
+    open_local_app(page, url)
     page.locator("#document-metadata-accordion > button.label-wrap").click()
-    page.locator(".pdf-upload-input input[type='file']").set_input_files(
-        [str(path) for path in two_pdf_files]
-    )
+    if route == "folder":
+        page.locator("#choose-pdf-folder-button").click()
+    else:
+        page.locator(".pdf-upload-input input[type='file']").set_input_files([str(p) for p in files])
+    deadline = time.monotonic() + 30
+    while not started.exists():
+        assert time.monotonic() < deadline, "Second preview did not reach inference"
+        page.wait_for_timeout(50)
+    expect(page.locator(".metadata-panel-heading")).to_have_count(0)
+    expect(page.get_by_role("button", name="Refresh detected PDF metadata")).to_have_count(0)
+    expect(page.get_by_label("Override Publisher", exact=True)).to_have_count(2)
+    first = page.locator(".metadata-panel").filter(has_text=files[0].name)
+    second = page.locator(".metadata-panel").filter(has_text=files[1].name)
+    edits = {"Title used": "Chosen Alpha", "Author": "Chosen Alpha Author",
+             "Short citation label": "AlphaEdit", "Publisher": "Alpha Press"}
+    for field, value in edits.items():
+        editor = first.get_by_label(f"Override {field}", exact=True)
+        expect(editor).to_be_enabled()
+        editor.click()
+        editor.fill(value)
+    second.get_by_label("Override Publisher", exact=True).click()
+    second.get_by_label("Override Publisher", exact=True).fill("Beta Press")
+    release.touch()
     page.wait_for_function(
         "document.querySelector('#document-metadata-scan-status .metadata-scan-inline')?.dataset.state === 'ready'",
         timeout=60000,
     )
-    editor = page.get_by_label("Override Short citation label")
-    expect(editor).to_have_count(1)
-    expect(editor).to_be_enabled()
-    expect(page.locator("#document-metadata-accordion").get_by_role("checkbox")).to_have_count(0)
-    expect(page.get_by_label("Override Publisher")).to_be_enabled()
-    editor.fill("Shared citation")
-    page.get_by_label("Override Publisher").fill("Shared Press")
+    expect(second.get_by_label("Override Publisher", exact=True)).to_be_focused()
+    for field, value in edits.items():
+        expect(first.get_by_label(f"Override {field}", exact=True)).to_have_value(value)
+    expect(second.get_by_label("Override Author", exact=True)).to_have_value("")
+    expect(second.get_by_label("Override Publisher", exact=True)).to_have_value("Beta Press")
     page.get_by_role("radio", name="Create local files only").check()
     page.get_by_role("button", name=re.compile(r"^Advanced preparation overrides")).click()
     page.get_by_role("checkbox", name="Retain detailed evidence even if this run is ready").check()
@@ -654,13 +727,48 @@ def test_filled_batch_overrides_apply_without_a_checkbox_and_blank_fields_stay_p
         timeout=120000,
     )
     expect(confirm).to_have_text("Processing successful ✓")
-    paths = set((local_app_home / "run-state").rglob("source-profile.json")) - previous_profiles
+    paths = list((app_home / "run-state").rglob("source-profile.json"))
     assert len(paths) == 2
     profiles = [json.loads(path.read_text(encoding="utf-8")) for path in paths]
-    assert {p["detected_title"] for p in profiles} == {"Harbor Studies Alpha", "Meadow Studies Beta"}
-    assert {p["detected_author"] for p in profiles} == {"Ada Miriam West", "Clara Ellen North"}
-    assert all(p["detected_publisher"] == "Shared Press" for p in profiles)
-    assert all(p["source_short_label"] == "Shared citation" for p in profiles)
+    by_title = {p["detected_title"]: p for p in profiles}
+    assert set(by_title) == {"Chosen Alpha", "Meadow Studies Beta"}
+    assert by_title["Chosen Alpha"]["detected_author"] == "Chosen Alpha Author"
+    assert by_title["Chosen Alpha"]["detected_publisher"] == "Alpha Press"
+    assert by_title["Chosen Alpha"]["source_short_label"] == "AlphaEdit"
+    assert by_title["Meadow Studies Beta"]["detected_author"] == "Clara Ellen North"
+    assert by_title["Meadow Studies Beta"]["detected_publisher"] == "Beta Press"
+    assert by_title["Meadow Studies Beta"]["source_short_label"] == "North"
+
+
+def test_clear_batch_clears_inflight_preview_and_stale_results_cannot_restore_it(page, batch_metadata_app):
+    url, started, release, _home, files = batch_metadata_app
+    open_local_app(page, url)
+    page.locator("#document-metadata-accordion > button.label-wrap").click()
+    page.locator("#choose-pdf-folder-button").click()
+    deadline = time.monotonic() + 30
+    while not started.exists():
+        assert time.monotonic() < deadline
+        page.wait_for_timeout(50)
+    page.locator("#clear-selected-pdf-batch").click()
+    expect(page.locator("#batch-folder-file-selector .token")).to_have_count(0)
+    expect(page.locator("#choose-pdf-folder-button")).to_be_visible()
+    expect(page.locator("#choose-pdf-folder-button")).to_be_enabled()
+    expect(page.locator("#document-metadata-accordion .metadata-file-name")).to_have_count(0)
+    expect(page.locator("#confirm-automatic-run-button")).to_be_disabled()
+    release.touch()
+    page.wait_for_timeout(1000)  # Let the superseded stream attempt its next publication.
+    expect(page.locator("#document-metadata-accordion .metadata-file-name")).to_have_count(0)
+    expect(page.locator("#batch-folder-file-selector .token")).to_have_count(0)
+    page.locator("#choose-pdf-folder-button").click()
+    page.wait_for_function(
+        "document.querySelector('#document-metadata-scan-status .metadata-scan-inline')?.dataset.state === 'ready'",
+        timeout=60000,
+    )
+    expect(page.locator("#document-metadata-accordion .metadata-file-name")).to_have_count(2)
+    page.locator("#clear-selected-pdf-batch").click()
+    expect(page.locator("#document-metadata-accordion .metadata-file-name")).to_have_count(0)
+    expect(page.locator("#batch-folder-file-selector .token")).to_have_count(0)
+    expect(page.locator("#confirm-automatic-run-button")).to_be_disabled()
 
 
 @pytest.mark.parametrize("theme", ["light", "dark"])

@@ -14226,7 +14226,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn("Outline entries", additional)
         self.assertIn("Workspace label", additional)
         self.assertNotIn("Workspace identities", html_preview)
-        self.assertEqual(html_preview.count('sample.pdf'), 1)
+        self.assertEqual(html_preview.count('class="metadata-file-name">sample.pdf</div>'), 1)
         self.assertNotIn("open", accordion_update)
 
     def test_download_files_update_can_package_current_outputs_as_zip(self):
