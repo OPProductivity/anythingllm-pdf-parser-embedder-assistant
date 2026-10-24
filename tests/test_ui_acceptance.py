@@ -678,6 +678,8 @@ def test_metadata_table_compact_inputs_and_alternating_rows(page, local_app_url,
     rows = page.locator(".metadata-table tbody tr")
     colors = rows.evaluate_all("rows => rows.map(r => getComputedStyle(r).backgroundColor)")
     assert colors[0] == colors[2] and colors[1] == colors[3] and colors[0] != colors[1]
+    stripe_alpha = float(re.findall(r"[\d.]+", colors[1])[-1])
+    assert stripe_alpha > 0.5 if theme == "light" else stripe_alpha < 0.1
     assert set(page.locator(".metadata-table tbody th, .metadata-table tbody td").evaluate_all(
         "cells => cells.map(c => getComputedStyle(c).verticalAlign)"
     )) == {"middle"}

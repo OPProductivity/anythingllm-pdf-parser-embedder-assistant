@@ -3011,7 +3011,7 @@ body .gradio-container .document-metadata-preview .metadata-panel button.metadat
 .document-metadata-preview .metadata-table tbody tr:nth-child(even) {
     background: rgba(255, 255, 255, 0.045) !important;
 }
-body:not(.dark) .document-metadata-preview .metadata-table tbody tr:nth-child(even) {
+body:not(.dark) .gradio-container #document-metadata-accordion .metadata-table tbody tr:nth-child(even) {
     background: rgba(255, 255, 255, 0.7) !important;
 }
 .document-metadata-preview .metadata-table th,
