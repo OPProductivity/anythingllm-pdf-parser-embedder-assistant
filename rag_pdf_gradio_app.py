@@ -2991,6 +2991,9 @@ body .gradio-container .document-metadata-preview .metadata-panel button.metadat
     outline-offset: 1px;
 }
 .metadata-short-label-transport {
+    max-width: 300px;
+}
+.document-metadata-details:has(.metadata-short-label-input) .metadata-short-label-transport {
     display: none !important;
 }
 .document-metadata-preview .metadata-table .metadata-extra-row[hidden] {

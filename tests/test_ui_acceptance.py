@@ -481,6 +481,10 @@ def test_file_selection_opens_identity_fields_but_keeps_technical_metadata_colla
 def test_short_citation_label_table_edit_updates_processing_field(page, local_app_url, one_page_pdf):
     open_local_app(page, local_app_url)
     page.locator(".document-metadata-details > button.label-wrap").click()
+    transport = page.locator(
+        "#automatic-short-label-transport input, #automatic-short-label-transport textarea"
+    )
+    expect(transport).to_be_visible()
     page.locator(".pdf-upload-input input[type='file']").set_input_files(str(one_page_pdf))
     editor = page.locator(".metadata-table .metadata-short-label-input")
     expect(editor).to_be_visible(timeout=30000)
@@ -488,9 +492,7 @@ def test_short_citation_label_table_edit_updates_processing_field(page, local_ap
         "document.querySelector('#document-metadata-scan-status .metadata-scan-inline')?.dataset.state === 'ready'",
         timeout=60000,
     )
-    transport = page.locator(
-        "#automatic-short-label-transport input, #automatic-short-label-transport textarea"
-    )
+    expect(transport).to_be_hidden()
     expect(editor).to_have_value(transport.input_value())
     assert editor.bounding_box()["width"] <= 270
     editor.fill("Edited citation label")
