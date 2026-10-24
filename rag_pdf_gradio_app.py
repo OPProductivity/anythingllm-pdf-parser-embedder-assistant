@@ -1032,6 +1032,18 @@ APP_CONNECTION_WATCHDOG_HEAD = """
         showMetadataStatus("scanning", "Preparing metadata preview…");
       }
     }, true);
+    document.addEventListener("click", (event) => {
+      const button = event.target instanceof Element
+        ? event.target.closest(".metadata-info-toggle") : null;
+      if (!button) return;
+      const panel = button.closest(".metadata-panel");
+      if (!panel) return;
+      const expanded = button.getAttribute("aria-expanded") !== "true";
+      button.setAttribute("aria-expanded", String(expanded));
+      panel.querySelectorAll(".metadata-extra-row").forEach(row => {
+        row.hidden = !expanded;
+      });
+    }, true);
 
     // Gradio remains the complete owner of the multi-file picker: its native
     // controls, transfer state, and selected-file list are never replaced or
@@ -2832,10 +2844,7 @@ body.dark #automatic-process-button[disabled] {
     border-radius: 0;
     background: transparent;
 }
-.document-metadata-preview .metadata-primary .metadata-file:first-child {
-    border-top: 0;
-}
-.document-metadata-preview .metadata-info-toggle summary {
+body .gradio-container .document-metadata-preview .metadata-panel button.metadata-info-toggle {
     position: absolute;
     top: 8px;
     right: 12px;
@@ -2844,23 +2853,50 @@ body.dark #automatic-process-button[disabled] {
     width: 23px;
     height: 23px;
     border-radius: 50%;
-    background: #4b5563;
-    color: white;
+    background: #4b5563 !important;
+    color: white !important;
     font: 700 15px/1 Arial, sans-serif;
     cursor: pointer;
-    list-style: none;
+    border: 0 !important;
+    box-shadow: none !important;
 }
-.document-metadata-preview .metadata-info-toggle summary::-webkit-details-marker { display: none; }
-.document-metadata-preview .metadata-info-toggle summary:focus-visible {
+body .gradio-container .document-metadata-preview .metadata-panel button.metadata-info-toggle:focus-visible {
     outline: 2px solid #2563eb;
     outline-offset: 2px;
 }
-.document-metadata-preview .metadata-info-content {
-    border-top: 1px solid var(--border-color-primary);
-}
-.document-metadata-preview .metadata-info-content > .metadata-info-heading {
-    padding: 10px 14px 0;
+.document-metadata-preview .metadata-panel .metadata-file-name {
+    padding: 10px 14px 4px;
     font-weight: 700;
+    overflow-wrap: anywhere;
+}
+.document-metadata-preview .metadata-table {
+    width: 100%;
+    border-collapse: collapse;
+    table-layout: fixed;
+    font-size: inherit;
+    border: 0 !important;
+    background: transparent !important;
+}
+.document-metadata-preview .metadata-table tr {
+    border: 0 !important;
+    background: transparent !important;
+}
+.document-metadata-preview .metadata-table th,
+.document-metadata-preview .metadata-table td {
+    padding: 2px 8px;
+    vertical-align: top;
+    text-align: left;
+    font-weight: 400;
+    overflow-wrap: anywhere;
+    border: 0 !important;
+    background: transparent !important;
+}
+.document-metadata-preview .metadata-table th {
+    width: 30%;
+    color: var(--body-text-color-subdued);
+}
+.document-metadata-preview .metadata-table .metadata-extra-row[hidden] {
+    display: none !important;
 }
 .document-metadata-preview .metadata-preview-list > .metadata-panel + .metadata-panel {
     margin-top: 8px;
@@ -26499,17 +26535,16 @@ def extraction_backend_help(choice):
     return f'<div class="metadata-summary"><div class="metadata-file"><div class="metadata-status">{body}</div></div></div>'
 
 
-def detected_pdf_metadata_panel_html(primary_html, additional_html=""):
-    """One compact boundary, with optional technical and workspace details."""
+def detected_pdf_metadata_panel_html(primary_html, has_additional=False):
+    """Render one metadata panel; the info button reveals rows in its table."""
     info = (
-        '<details class="metadata-info-toggle"><summary aria-label="More detected PDF metadata" '
-        'title="More detected PDF metadata">i</summary>'
-        f'<div class="metadata-info-content">{additional_html}</div></details>'
-        if additional_html else ""
+        '<button type="button" class="metadata-info-toggle" aria-label="More detected PDF metadata" '
+        'title="More detected PDF metadata" aria-expanded="false">i</button>'
+        if has_additional else ""
     )
     return (
         '<div class="metadata-panel"><div class="metadata-panel-heading">Detected PDF metadata</div>'
-        f'{info}<div class="metadata-summary metadata-primary">{primary_html}</div></div>'
+        f'{info}{primary_html}</div>'
     )
 
 
@@ -26535,32 +26570,23 @@ def detected_metadata_preview(
             gr.update(open=False),
         )
 
-    previews = []
-    technical_previews = []
+    records = []
     detected_title = ""
     detected_author = ""
     detected_short = ""
     for index, raw_path in enumerate(files[:5], start=1):
         pdf_path = Path(raw_path)
         if not pdf_path.exists():
-            previews.append(
-                f'<section class="metadata-file"><div class="metadata-file-name">{html.escape(pdf_path.name)}</div>'
-                '<div class="metadata-status">File is no longer available.</div></section>'
-            )
+            records.append({"filename": pdf_path.name, "error": "File is no longer available."})
             continue
         if pdf_path.suffix.casefold() != ".pdf":
-            previews.append(
-                f'<section class="metadata-file"><div class="metadata-file-name">{html.escape(pdf_path.name)}</div>'
-                '<div class="metadata-status">This file is not a PDF.</div></section>'
-            )
+            records.append({"filename": pdf_path.name, "error": "This file is not a PDF."})
             continue
         try:
             meta = pdf_metadata(pdf_path)
         except Exception as exc:
-            previews.append(
-                f'<section class="metadata-file"><div class="metadata-file-name">{html.escape(pdf_path.name)}</div>'
-                f'<div class="metadata-status">Metadata inspection failed: {html.escape(safe_user_error_text(exc))}</div></section>'
-            )
+            records.append({"filename": pdf_path.name,
+                            "error": f"Metadata inspection failed: {safe_user_error_text(exc)}"})
             continue
 
         embedded_title = meta.get("title") or ""
@@ -26662,33 +26688,14 @@ def detected_metadata_preview(
                 "PDF structure",
             ),
         ]
-        def grid_rows(rows):
-            return "".join(
-                '<div class="metadata-key">{}</div><div class="metadata-value">{}</div>'.format(
-                    html.escape(str(key)), html.escape(str(value)),
-                )
-                for key, value, _origin in rows
-            )
-
         primary_keys = {
             "Title used", "Embedded title", "Author", "Author confidence",
             "Author evidence", "Text-layer check", "Sample extracted text", "Pages",
         }
         primary_rows = [row for row in metadata_rows if row[0] in primary_keys]
         technical_rows = [row for row in metadata_rows if row[0] not in primary_keys]
-        previews.append(
-            f'<section class="metadata-file"><div class="metadata-file-name">{html.escape(pdf_path.name)}</div>'
-            f'<div class="metadata-grid">{grid_rows(primary_rows)}</div></section>'
-        )
-        technical_previews.append(
-            f'<section class="metadata-file"><div class="metadata-file-name">{html.escape(pdf_path.name)}</div>'
-            f'<div class="metadata-grid">{grid_rows(technical_rows)}</div></section>'
-        )
-
-    if len(files) > 5:
-        previews.append(
-            f'<section class="metadata-file"><div class="metadata-status">{len(files) - 5} more file(s) are selected but not shown.</div></section>'
-        )
+        records.append({"filename": pdf_path.name, "primary_rows": primary_rows,
+                        "technical_rows": technical_rows})
 
     should_fill_fields = len(files) == 1
     title_value = current_title or (detected_title if should_fill_fields else "")
@@ -26702,25 +26709,58 @@ def detected_metadata_preview(
             title_value = ""
             author_value = ""
             short_value = ""
-        previews.insert(
-            0,
-            '<section class="metadata-file"><div class="metadata-status">Multiple PDFs selected. Each file is inspected independently, and the run will freshly inspect every selected PDF again before preparation. Shared fields are cleared and do not affect this batch unless “Apply the title, author, and short label above to every selected PDF” is explicitly enabled.</div></section>',
+
+    def table_rows(rows, *, additional=False):
+        attributes = ' class="metadata-extra-row" hidden' if additional else ""
+        return "".join(
+            f'<tr{attributes}><th scope="row">{html.escape(str(key))}</th>'
+            f'<td>{html.escape(str(value))}</td></tr>'
+            for key, value, _origin in rows
         )
+
+    identities = workspace_source_identity_plan(files)
+    panels = []
+    for index, record in enumerate(records):
+        filename = html.escape(record["filename"])
+        if record.get("error"):
+            panels.append(detected_pdf_metadata_panel_html(
+                f'<div class="metadata-file-name">{filename}</div>'
+                f'<div class="metadata-status">{html.escape(record["error"])}</div>'
+            ))
+            continue
+        identity = identities[index] if index < len(identities) else {}
+        kind = str(identity.get("kind") or "unknown").replace("_", " ").title()
+        identity_rows = [
+            ("Workspace label", identity.get("label") or WORKSPACE_UNKNOWN_SOURCE_LABEL, "workspace"),
+            ("Identity type", kind, "workspace"),
+            ("How identified", identity.get("provenance") or "not available", "workspace"),
+        ]
+        if identity.get("evidence"):
+            identity_rows.append(("Evidence", identity["evidence"], "workspace"))
+        additional_rows = identity_rows + record["technical_rows"]
+        table = (
+            '<table class="metadata-table"><tbody>'
+            + table_rows(record["primary_rows"])
+            + table_rows(additional_rows, additional=True)
+            + '</tbody></table>'
+        )
+        panels.append(detected_pdf_metadata_panel_html(
+            f'<div class="metadata-file-name">{filename}</div>{table}',
+            has_additional=bool(additional_rows),
+        ))
+    preview_html = '<div class="metadata-preview-list">' + "".join(panels)
+    if len(files) > 5:
+        preview_html += (
+            f'<div class="metadata-selection-note">{len(files) - 5} more file(s) '
+            'are selected but not shown.</div>'
+        )
+    preview_html += '</div>'
 
     return (
         gr.update(value=title_value),
         gr.update(value=author_value),
         gr.update(value=short_value),
-        # Source identity is review evidence for the editable workspace name,
-        # not a second workspace-setting surface. Keep it with the other
-        # detected PDF metadata so it remains available on demand.
-        detected_pdf_metadata_panel_html(
-            "".join(previews),
-            '<div class="metadata-info-heading">Workspace identities</div>'
-            + workspace_source_identity_plan_html(files)
-            + '<div class="metadata-info-heading">Additional PDF properties</div>'
-            + '<div class="metadata-summary">' + "".join(technical_previews) + "</div>",
-        ),
+        preview_html,
         gr.update(open=True),
     )
 

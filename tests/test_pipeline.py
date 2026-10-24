@@ -14216,14 +14216,17 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn("Sample extracted text", html_preview)
         self.assertIn("Possible scanned or low-text PDF", html_preview)
         self.assertIn('class="metadata-info-toggle"', html_preview)
-        additional_and_primary = html_preview.split('class="metadata-info-content"', 1)[1]
-        additional, primary = additional_and_primary.split('class="metadata-summary metadata-primary"', 1)
+        self.assertEqual(html_preview.count('<table class="metadata-table">'), 1)
+        primary, additional = html_preview.split('class="metadata-extra-row"', 1)
+        self.assertIn('<tbody><tr><th scope="row">Title used</th>', primary)
         self.assertIn("Author evidence", primary)
         self.assertIn("Pages", primary)
         self.assertNotIn("OCR / scanned risk", primary)
         self.assertIn("OCR / scanned risk", additional)
         self.assertIn("Outline entries", additional)
-        self.assertIn("Workspace identities", additional)
+        self.assertIn("Workspace label", additional)
+        self.assertNotIn("Workspace identities", html_preview)
+        self.assertEqual(html_preview.count('sample.pdf'), 1)
         self.assertTrue(accordion_update["open"])
 
     def test_download_files_update_can_package_current_outputs_as_zip(self):
