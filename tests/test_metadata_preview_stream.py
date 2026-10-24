@@ -35,6 +35,7 @@ def test_scanning_is_yielded_before_inference_and_each_result_before_next_file(m
     assert "recognition scanning" in first[3]
     assert 'data-state="scanning"' in first[4]
     assert "preview 1 of 2" in first[4]
+    assert "OCR" not in first[3] + first[4]
     assert "first.pdf" in first[6]["value"]
     inspect.assert_not_called()
     completed_first = next(stream)

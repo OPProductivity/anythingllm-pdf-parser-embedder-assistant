@@ -994,29 +994,61 @@ APP_CONNECTION_WATCHDOG_HEAD = """
       syncCheckbox();
     }, true);
 
-    // The detailed preview is collapsed by default. Keep its status visible
-    // beside the title/author fields as soon as Gradio displays a selected
-    // PDF, even while the server's metadata callback is still queued.
+    // Keep preview progress in the Document metadata accordion heading. The
+    // server streams status through a hidden HTML component while the picker
+    // can announce a new selection before that callback begins.
     let metadataSelectionKey = null;
+    let metadataHeaderState = "idle";
+    let metadataHeaderMessage = "";
+    let metadataTransportSignature = null;
     const metadataSelectionNames = () => [
       ...document.querySelectorAll("#automatic-pdf-upload .file-preview td[aria-label]"),
       ...document.querySelectorAll("#batch-folder-file-selector .token"),
     ].map(node => (node.getAttribute("aria-label") || node.textContent || "").trim())
       .filter(name => /\\.pdf\\b/i.test(name));
+    const ensureMetadataHeaderStatus = () => {
+      const heading = document.querySelector("#document-metadata-accordion > button.label-wrap");
+      if (!heading) return null;
+      let status = heading.querySelector(".metadata-header-status");
+      if (!status) {
+        status = document.createElement("span");
+        status.className = "metadata-header-status";
+        status.setAttribute("role", "status");
+        status.setAttribute("aria-live", "polite");
+        status.innerHTML = '<span class="metadata-header-spinner" aria-hidden="true"></span>'
+          + '<span class="metadata-header-copy"></span>';
+        heading.insertBefore(status, heading.querySelector(".icon"));
+      }
+      status.dataset.state = metadataHeaderState;
+      const copy = status.querySelector(".metadata-header-copy");
+      if (copy && copy.textContent !== metadataHeaderMessage) copy.textContent = metadataHeaderMessage;
+      status.title = metadataHeaderMessage;
+      return status;
+    };
     const showMetadataStatus = (state, message) => {
-      const status = document.querySelector("#document-metadata-scan-status .metadata-scan-inline");
-      if (!status) return;
-      if (status.dataset.state !== state) status.dataset.state = state;
-      const copy = status.querySelector(".metadata-scan-copy");
-      if (copy && copy.textContent !== message) copy.textContent = message;
+      metadataHeaderState = state;
+      metadataHeaderMessage = message;
+      ensureMetadataHeaderStatus();
+    };
+    const mirrorServerMetadataStatus = () => {
+      const source = document.querySelector("#document-metadata-scan-status .metadata-scan-inline");
+      if (!source) return;
+      const state = source.dataset.state || "idle";
+      const message = source.querySelector(".metadata-scan-copy")?.textContent || "";
+      const signature = `${state}\\u001f${message}`;
+      if (signature === metadataTransportSignature) return;
+      const first = metadataTransportSignature === null;
+      metadataTransportSignature = signature;
+      if (!first || state !== "idle") showMetadataStatus(state, message);
     };
     const syncMetadataStatus = () => {
+      mirrorServerMetadataStatus();
+      ensureMetadataHeaderStatus();
       const names = metadataSelectionNames();
       const key = names.join("\\u001f");
       if (key !== metadataSelectionKey) {
-        const existing = document.querySelector("#document-metadata-scan-status .metadata-scan-inline");
         if (metadataSelectionKey === null && names.length &&
-            ["ready", "warning"].includes(existing?.dataset.state)) {
+            ["ready", "warning"].includes(metadataHeaderState)) {
           metadataSelectionKey = key;
           return;
         }
@@ -2757,34 +2789,58 @@ body.dark #automatic-process-button[disabled] {
     padding: 18px 14px;
     color: var(--body-text-color-subdued);
 }
-#document-metadata-scan-status:has(.metadata-scan-inline[data-state="idle"]) {
+.metadata-status-transport {
     display: none !important;
 }
-.metadata-scan-inline {
-    display: flex;
+#document-metadata-accordion > button.label-wrap {
     align-items: center;
-    gap: 9px;
-    padding: 9px 12px;
-    border: 1px solid var(--border-color-primary);
-    border-radius: 7px;
-    background: var(--background-fill-secondary);
-    color: var(--body-text-color-subdued);
-    font-size: 0.9rem;
 }
-.metadata-scan-inline[data-state="scanning"] .metadata-scan-spinner {
-    width: 14px;
-    height: 14px;
-    flex: 0 0 14px;
+#document-metadata-accordion > button.label-wrap .metadata-header-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    margin-left: auto;
+    min-width: 0;
+    max-width: 65%;
+    color: var(--body-text-color-subdued);
+    font-size: 0.83rem;
+    font-weight: 400;
+    text-align: right;
+}
+#document-metadata-accordion > button.label-wrap .metadata-header-status[data-state="idle"] {
+    display: none;
+}
+#document-metadata-accordion > button.label-wrap .metadata-header-copy {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+#document-metadata-accordion > button.label-wrap .metadata-header-status[data-state="scanning"] .metadata-header-spinner {
+    width: 13px;
+    height: 13px;
+    flex: 0 0 13px;
     border: 2px solid #93c5fd;
     border-top-color: #2563eb;
     border-radius: 50%;
     animation: metadata-scan-spin 0.8s linear infinite;
 }
-.metadata-scan-inline[data-state="ready"]::before { content: "✓"; color: #15803d; font-weight: 700; }
-.metadata-scan-inline[data-state="warning"]::before { content: "!"; color: #b45309; font-weight: 700; }
+#document-metadata-accordion > button.label-wrap .metadata-header-status[data-state="ready"]::before {
+    content: "✓";
+    color: #15803d;
+    font-weight: 700;
+}
+#document-metadata-accordion > button.label-wrap .metadata-header-status[data-state="warning"]::before {
+    content: "!";
+    color: #b45309;
+    font-weight: 700;
+}
+#document-metadata-accordion > button.label-wrap .icon {
+    flex: 0 0 auto;
+    margin-left: 9px;
+}
 @keyframes metadata-scan-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) {
-    .metadata-scan-inline .metadata-scan-spinner { animation: none; }
+    .metadata-header-spinner { animation: none; }
 }
 .metadata-summary .inspector-pre {
     margin: 0;
@@ -12835,7 +12891,7 @@ def automatic_detected_metadata_preview(
 
 
 def metadata_scan_status_html(state, message):
-    """A visible companion to the optional detailed preview panel."""
+    """A hidden transport for the visible accordion-heading status."""
     if state not in {"idle", "scanning", "ready", "warning"}:
         raise ValueError("Unknown metadata preview state")
     return (
@@ -12913,7 +12969,7 @@ def stream_automatic_detected_metadata_preview(
         scanning = (
             f"Author metadata recognition scanning… {index + 1}/{len(displayed)}: "
             f"{Path(path).name}. {index} preview(s) complete. "
-            "Reading the planned text and OCR evidence before deciding."
+            "Reviewing available document evidence before deciding."
         )
         yield (
             *field_updates,
@@ -12924,7 +12980,7 @@ def stream_automatic_detected_metadata_preview(
                 f'{html.escape(scanning)}</div>{names_html}'
             ) + "</div>",
             metadata_scan_status_html(
-                "scanning", f"Reading text and OCR for preview {index + 1} of {len(displayed)}…"
+                "scanning", f"Inspecting metadata for preview {index + 1} of {len(displayed)}…"
             ),
             gr.update(open=True),
             gr.update(value=automatic_selection_preparing_status_html(
@@ -12975,7 +13031,7 @@ def stream_automatic_detected_metadata_preview(
                     f"Preview ready for {len(displayed)} of {len(files)} selected PDFs. "
                     "Individual results are under Detected Metadata."
                     if len(files) > 1 else
-                    "Metadata preview complete. Review the title and author above."
+                    "Metadata preview complete. Review the title and author below."
                 ) if index + 1 == len(displayed) else
                 f"Preview {index + 1} of {len(displayed)} complete; reading the next PDF…",
             ),
@@ -33866,7 +33922,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                                 elem_id="clear-selected-pdf-batch",
                                 elem_classes=["clear-selected-files-button"],
                             )
-            with gr.Accordion("Document metadata", open=True, elem_classes=["top-level-accordion"]) as document_metadata_section:
+            with gr.Accordion("Document metadata", open=True, elem_id="document-metadata-accordion", elem_classes=["top-level-accordion"]) as document_metadata_section:
                 auto_label = gr.Textbox(
                     label="Document title",
                     placeholder="Filled from PDF metadata when available; edit if needed",
@@ -33882,6 +33938,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 auto_metadata_status = gr.HTML(
                     value=metadata_scan_status_html("idle", ""),
                     elem_id="document-metadata-scan-status",
+                    elem_classes=["metadata-status-transport"],
                 )
                 auto_use_file_title_fallback = gr.Checkbox(
                     value=True,
