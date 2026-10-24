@@ -376,14 +376,20 @@ def test_blank_table_overrides_preserve_fresh_detection_and_publisher_fallback()
 
     values[lookup("pdf_files")] = ["first.pdf", "second.pdf"]
     resolved = app.automatic_explicit_metadata_values({}, values, overrides=("X", "Y", "Z"))
-    assert all(resolved[lookup(field)] == "" for field in (
-        "document_label", "document_author", "document_short_label", "document_publisher"
-    ))
-    values[lookup("apply_batch_metadata_overrides")] = True
-    resolved = app.automatic_explicit_metadata_values({}, values, overrides=("X", "Y", "Z"))
     assert [resolved[lookup(field)] for field in (
         "document_label", "document_author", "document_short_label", "document_publisher"
     )] == ["X", "Y", "Z", "Chosen Press"]
+    assert resolved[lookup("apply_batch_metadata_overrides")] is True
+    partial = app.automatic_explicit_metadata_values({}, values, overrides=("", "", ""))
+    assert partial[lookup("apply_batch_metadata_overrides")] is True
+    assert partial[lookup("document_publisher")] == "Chosen Press"
+    assert partial[lookup("document_label")] == partial[lookup("document_author")] == ""
+    values[lookup("document_publisher")] = ""
+    empty = app.automatic_explicit_metadata_values({}, values, overrides=("", "", ""))
+    assert empty[lookup("apply_batch_metadata_overrides")] is False
+    assert all(empty[lookup(field)] == "" for field in (
+        "document_label", "document_author", "document_short_label", "document_publisher"
+    ))
 
 
 def test_preview_option_change_preserves_intent_but_new_source_resets_it():

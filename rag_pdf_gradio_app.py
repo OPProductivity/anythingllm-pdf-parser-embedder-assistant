@@ -3008,10 +3008,16 @@ body .gradio-container .document-metadata-preview .metadata-panel button.metadat
     border: 0 !important;
     background: transparent !important;
 }
+.document-metadata-preview .metadata-table tbody tr:nth-child(even) {
+    background: rgba(255, 255, 255, 0.045) !important;
+}
+body:not(.dark) .document-metadata-preview .metadata-table tbody tr:nth-child(even) {
+    background: rgba(255, 255, 255, 0.7) !important;
+}
 .document-metadata-preview .metadata-table th,
 .document-metadata-preview .metadata-table td {
     padding: 2px 8px;
-    vertical-align: top;
+    vertical-align: middle;
     text-align: left;
     font-weight: 400;
     overflow-wrap: anywhere;
@@ -3021,20 +3027,32 @@ body .gradio-container .document-metadata-preview .metadata-panel button.metadat
 .document-metadata-preview .metadata-table th {
     color: var(--body-text-color-subdued);
 }
-.document-metadata-preview .metadata-override-input {
+body .gradio-container .document-metadata-preview input.metadata-override-input {
     display: block;
     width: 100%;
-    min-height: 27px;
-    padding: 2px 7px;
-    border: 1px solid var(--border-color-primary);
-    border-radius: 4px;
-    background: var(--input-background-fill);
+    box-sizing: border-box;
+    height: 24px !important;
+    min-height: 24px !important;
+    padding: 1px 5px !important;
+    margin: 0 !important;
+    border: 1px solid color-mix(in srgb, currentColor 14%, transparent) !important;
+    border-radius: 2px !important;
+    background: transparent !important;
     color: var(--body-text-color);
     font: inherit;
+    line-height: 20px !important;
+    outline: none !important;
+    box-shadow: none !important;
+    transition: none !important;
 }
-.document-metadata-preview .metadata-override-input:focus-visible {
-    outline: 2px solid var(--color-accent);
-    outline-offset: 1px;
+body .gradio-container .document-metadata-preview input.metadata-override-input:hover {
+    background: transparent !important;
+    box-shadow: none !important;
+    outline: none !important;
+}
+body .gradio-container .document-metadata-preview input.metadata-override-input:focus-visible {
+    border-color: color-mix(in srgb, currentColor 40%, transparent) !important;
+    box-shadow: none !important;
 }
 .metadata-field-transport {
     display: none !important;
@@ -13048,7 +13066,7 @@ def stream_automatic_detected_metadata_preview(
     )
     if len(files) > 1:
         selection_note += (
-            " Shared fields apply only when the explicit batch override is enabled."
+            " Filled overrides apply to the selected PDFs at Confirm; blank fields use each PDF's detected values."
         )
     for index, path in enumerate(displayed):
         if automatic_lifecycle_busy() or not _selection_preview_is_current(selection_state, request):
@@ -26010,27 +26028,30 @@ def automatic_explicit_metadata_values(selection_state, values, overrides=None):
             + normalize_file_list(values[AUTOMATIC_RUN_FIELDS.index("folder_pdf_files")])
         )
         batch = len(files) > 1
-        shared = bool(values[AUTOMATIC_RUN_FIELDS.index("apply_batch_metadata_overrides")])
+        filled = bool(str(values[AUTOMATIC_RUN_FIELDS.index("document_publisher")] or "").strip())
         for field, entered in zip(
             ("document_label", "document_author", "document_short_label"), overrides, strict=True
         ):
-            replacement = str(entered or "").strip() if not batch or shared else ""
+            replacement = str(entered or "").strip()
             index = AUTOMATIC_RUN_FIELDS.index(field)
             if replacement:
+                filled = True
                 values[index] = replacement
             elif batch or field != "document_label":
                 # A blank override means fresh per-PDF recognition. The single
                 # work title may keep its detected preview for workspace naming.
                 values[index] = ""
-        if batch and not shared:
-            values[AUTOMATIC_RUN_FIELDS.index("document_publisher")] = ""
+        # Entering a value is the explicit override intent. Empty fields still
+        # resolve from each source; no separate batch opt-in is required.
+        values[AUTOMATIC_RUN_FIELDS.index("apply_batch_metadata_overrides")] = batch and filled
+        values[AUTOMATIC_RUN_FIELDS.index("use_file_title_fallback")] = True
         return tuple(values)
     state = selection_state or {}
     if "metadata_user_edits" not in state or len(values) < len(AUTOMATIC_RUN_FIELDS):
         return values  # Preserve direct callers predating UI provenance.
     values = list(values)
     if values[AUTOMATIC_RUN_FIELDS.index("apply_batch_metadata_overrides")]:
-        return tuple(values)  # This checkbox explicitly accepts the shared values.
+        return tuple(values)  # Legacy callers explicitly request shared values.
     edits = state["metadata_user_edits"]
     # Keep the displayed work title for the workspace/title contract. Author
     # responsibility and its derived short label are freshly resolved by the
@@ -34111,24 +34132,16 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 elem_id="document-metadata-scan-status",
                 elem_classes=["metadata-status-transport"],
             )
+            # Retain the existing callback/worker argument slots as internal
+            # policy values. Confirm derives shared override intent from edits.
+            auto_use_file_title_fallback = gr.State(True)
+            apply_batch_metadata_overrides = gr.State(False)
             with gr.Accordion("Document metadata", open=False, elem_id="document-metadata-accordion", elem_classes=["top-level-accordion"]) as document_metadata_section:
                 auto_metadata_preview = gr.HTML(
                     value=pending_metadata_panel_html(
                         "Select a PDF to inspect embedded metadata, technical properties, page count, and bookmarks."
                     ),
                     elem_classes=["document-metadata-preview"],
-                )
-                auto_use_file_title_fallback = gr.Checkbox(
-                    value=True,
-                    label="Use the file title as a fallback",
-                )
-                apply_batch_metadata_overrides = gr.Checkbox(
-                    value=False,
-                    label="Apply title, author, citation label, and publisher overrides to every selected PDF",
-                    info=(
-                        "Off by default. With multiple PDFs, each file is freshly read and keeps its own detected "
-                        "metadata. Turn this on only for an intentional shared override."
-                    ),
                 )
                 refresh_metadata_button = gr.Button("Refresh detected PDF metadata")
             with gr.Row():
@@ -35979,50 +35992,6 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 show_progress="hidden",
                 queue=False,
             )
-            def bind_metadata_option_preview(component):
-                # User input owns a new preview. Programmatic defaults/field
-                # updates must not spawn competing recognition chains.
-                component.input(
-                    fn=automatic_metadata_option_begin_state,
-                    inputs=[automatic_selection_state, automatic_viewed_run_root, auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
-                    outputs=[automatic_selection_state, automatic_viewed_run_root, auto_pdfs, auto_mode, confirm_automatic_run_button, cancel_automatic_run_button, automatic_run_activity],
-                    show_progress="hidden",
-                    queue=False,
-                    trigger_mode="always_last",
-                ).then(
-                    fn=stream_automatic_detected_metadata_preview,
-                    inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest, automatic_selection_state],
-                    outputs=[auto_label, auto_author, auto_short_label, auto_metadata_preview, auto_metadata_status, document_metadata_section, automatic_run_activity],
-                    show_progress="hidden",
-                    queue=True,
-                    concurrency_limit=1,
-                    concurrency_id="automatic-metadata-preview",
-                ).then(
-                fn=stream_refresh_automatic_run_estimate_for_fresh_selection,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state],
-                outputs=[auto_run_timing, automatic_run_activity],
-                show_progress="hidden",
-                queue=True,
-                concurrency_limit=1,
-                concurrency_id="automatic-estimate-preview",
-            ).then(
-                    fn=stream_automatic_workspace_name_preview,
-                    inputs=[workspace_slug, auto_label, auto_pdfs, auto_folder_pdfs, new_workspace_name, new_workspace_name_auto_state, automatic_selection_state],
-                    outputs=[new_workspace_name, new_workspace_name_auto_state, automatic_run_activity],
-                    show_progress="hidden",
-                    queue=True,
-                    concurrency_limit=1,
-                    concurrency_id="automatic-workspace-preview",
-                ).then(
-                    fn=automatic_selection_finish_state,
-                    inputs=[automatic_selection_state, auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
-                    outputs=[automatic_selection_state, auto_mode, confirm_automatic_run_button, cancel_automatic_run_button, automatic_run_activity, auto_pdfs],
-                    show_progress="hidden",
-                    queue=False,
-                )
-
-            bind_metadata_option_preview(auto_use_file_title_fallback)
-            bind_metadata_option_preview(apply_batch_metadata_overrides)
             backend_mode.change(
                 fn=extraction_backend_help,
                 inputs=backend_mode,

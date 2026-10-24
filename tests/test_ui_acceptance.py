@@ -62,14 +62,19 @@ def wait_for_http(url: str, process: subprocess.Popen[bytes], timeout_seconds: f
 
 
 @pytest.fixture(scope="module")
-def local_app_url(tmp_path_factory):
+def local_app_home(tmp_path_factory):
+    return tmp_path_factory.mktemp("gradio-local-home")
+
+
+@pytest.fixture(scope="module")
+def local_app_url(tmp_path_factory, local_app_home):
     port = free_local_port()
     url = f"http://127.0.0.1:{port}"
     environment = dict(os.environ)
     environment["GRADIO_SERVER_PORT"] = str(port)
     environment["ANYTHINGLLM_PDF_ASSISTANT_BROWSER_KEY"] = LOCAL_BROWSER_KEY
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
-    environment["ANYTHINGLLM_PDF_ASSISTANT_HOME"] = str(tmp_path_factory.mktemp("gradio-local-home"))
+    environment["ANYTHINGLLM_PDF_ASSISTANT_HOME"] = str(local_app_home)
     stderr_path = tmp_path_factory.mktemp("gradio-local-app") / "stderr.log"
     with stderr_path.open("wb") as stderr_handle:
         process = subprocess.Popen(
@@ -164,8 +169,14 @@ def two_pdf_files(tmp_path: Path) -> list[Path]:
     for index, path in enumerate(paths, start=1):
         document = fitz.open()
         try:
+            title = "Harbor Studies Alpha" if index == 1 else "Meadow Studies Beta"
+            author = "Ada Miriam West" if index == 1 else "Clara Ellen North"
+            document.set_metadata({"title": title, "author": author})
             page = document.new_page()
-            page.insert_text((72, 72), f"Browser multi-file acceptance PDF {index}.")
+            page.insert_text((72, 72), title + "\nby " + author + "\n\n" + "\n".join(
+                f"Browser multi-file acceptance PDF {index}, native text line {line}."
+                for line in range(1, 12)
+            ))
             document.save(path)
         finally:
             document.close()
@@ -523,7 +534,7 @@ def test_metadata_table_stays_folded_and_shows_loading_then_detected_values(
     )
     expect(page.locator(".metadata-table .metadata-detected-value").first).not_to_have_text("Loading…")
     expect(page.get_by_label("Override Publisher")).to_have_value("")
-    expect(page.get_by_role("checkbox", name="Use the file title as a fallback")).to_be_visible()
+    expect(accordion.get_by_role("checkbox")).to_have_count(0)
     expect(page.get_by_role("button", name="Refresh detected PDF metadata")).to_be_visible()
 
 
@@ -611,7 +622,10 @@ def test_overrides_survive_before_during_and_after_detection_and_save_on_confirm
     assert profile["detected_publisher"] == "After Publisher"
 
 
-def test_short_citation_label_is_one_shared_edit_for_a_batch(page, local_app_url, two_pdf_files):
+def test_filled_batch_overrides_apply_without_a_checkbox_and_blank_fields_stay_per_pdf(
+    page, local_app_url, local_app_home, two_pdf_files
+):
+    previous_profiles = set((local_app_home / "run-state").rglob("source-profile.json"))
     open_local_app(page, local_app_url)
     page.locator("#document-metadata-accordion > button.label-wrap").click()
     page.locator(".pdf-upload-input input[type='file']").set_input_files(
@@ -624,12 +638,49 @@ def test_short_citation_label_is_one_shared_edit_for_a_batch(page, local_app_url
     editor = page.get_by_label("Override Short citation label")
     expect(editor).to_have_count(1)
     expect(editor).to_be_enabled()
-    shared = page.get_by_role(
-        "checkbox", name="Apply title, author, citation label, and publisher overrides to every selected PDF"
-    )
-    shared.check()
-    expect(editor).to_be_enabled(timeout=60000)
+    expect(page.locator("#document-metadata-accordion").get_by_role("checkbox")).to_have_count(0)
     expect(page.get_by_label("Override Publisher")).to_be_enabled()
+    editor.fill("Shared citation")
+    page.get_by_label("Override Publisher").fill("Shared Press")
+    page.get_by_role("radio", name="Create local files only").check()
+    page.get_by_role("button", name=re.compile(r"^Advanced preparation overrides")).click()
+    page.get_by_role("checkbox", name="Retain detailed evidence even if this run is ready").check()
+    confirm = page.locator("#confirm-automatic-run-button")
+    expect(confirm).to_be_enabled(timeout=30000)
+    confirm.click()
+    page.wait_for_function(
+        "['successful', 'warning', 'failed', 'cancelled'].includes("
+        "document.querySelector('.automatic-run-activity')?.dataset.runState)",
+        timeout=120000,
+    )
+    expect(confirm).to_have_text("Processing successful ✓")
+    paths = set((local_app_home / "run-state").rglob("source-profile.json")) - previous_profiles
+    assert len(paths) == 2
+    profiles = [json.loads(path.read_text(encoding="utf-8")) for path in paths]
+    assert {p["detected_title"] for p in profiles} == {"Harbor Studies Alpha", "Meadow Studies Beta"}
+    assert {p["detected_author"] for p in profiles} == {"Ada Miriam West", "Clara Ellen North"}
+    assert all(p["detected_publisher"] == "Shared Press" for p in profiles)
+    assert all(p["source_short_label"] == "Shared citation" for p in profiles)
+
+
+@pytest.mark.parametrize("theme", ["light", "dark"])
+def test_metadata_table_compact_inputs_and_alternating_rows(page, local_app_url, theme):
+    page.emulate_media(color_scheme=theme)
+    open_local_app(page, local_app_url)
+    page.locator("#document-metadata-accordion > button.label-wrap").click()
+    editor = page.get_by_label("Override Publisher", exact=True)
+    expect(editor).to_be_enabled()
+    assert editor.bounding_box()["height"] == 24
+    before = editor.evaluate("e => ({shadow: getComputedStyle(e).boxShadow, background: getComputedStyle(e).backgroundColor})")
+    editor.hover()
+    assert editor.evaluate("e => ({shadow: getComputedStyle(e).boxShadow, background: getComputedStyle(e).backgroundColor})") == before
+    assert before["shadow"] == "none"
+    rows = page.locator(".metadata-table tbody tr")
+    colors = rows.evaluate_all("rows => rows.map(r => getComputedStyle(r).backgroundColor)")
+    assert colors[0] == colors[2] and colors[1] == colors[3] and colors[0] != colors[1]
+    assert set(page.locator(".metadata-table tbody th, .metadata-table tbody td").evaluate_all(
+        "cells => cells.map(c => getComputedStyle(c).verticalAlign)"
+    )) == {"middle"}
 
 
 def test_document_metadata_has_one_outer_accordion(page, local_app_url, one_page_pdf):
