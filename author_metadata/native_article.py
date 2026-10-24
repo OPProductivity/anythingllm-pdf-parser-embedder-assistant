@@ -683,13 +683,16 @@ def email_roster_reports(lines, width, height):
     Email is a role cue only in a title-bound opening roster, never a general
     licence to treat contacts or names in prose as authors.
     """
-    lines = _column_lines(_pair_email_columns(lines), 0, width)
+    # Keep parallel name/email blocks separate. A column merger joins authors
+    # printed on the same baseline into one non-name line.
+    lines = _pair_email_columns(lines)
     stop = next(
         (
             i
             for i, line in enumerate(lines)
             if re.fullmatch(
-                r"abstract|summary|(?:1[. ]+)?introduction", line["text"].strip(), re.I
+                r"(?:abstract|summary)(?:\s*[-:–—.]\s*.*)?|(?:1[. ]+)?introduction",
+                line["text"].strip(), re.I
             )
         ),
         None,

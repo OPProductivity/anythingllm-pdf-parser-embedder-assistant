@@ -45,6 +45,20 @@ def test_multiline_email_affiliations_collect_complete_roster():
     doc.close()
 
 
+def test_parallel_inline_name_email_blocks_before_dash_abstract():
+    doc = fitz.open()
+    page = doc.new_page(width=620, height=840)
+    page.insert_text((80, 75), "Rule-Based Metadata Extraction for Research Papers", fontsize=17)
+    page.insert_text((80, 125), "Jahongir Azimjonov, aazim@example.invalid", fontsize=10)
+    page.insert_text((335, 125), "Jumabek Alikhanov, jumabek@example.invalid", fontsize=10)
+    page.insert_text((80, 145), "Westport University", fontsize=9)
+    page.insert_text((335, 145), "Eastport University", fontsize=9)
+    page.insert_text((80, 205), "Abstract- This article considers metadata extraction.", fontsize=10)
+    reports = list(email_roster_reports(positioned_lines(page), 620, 840))
+    assert [r["author"] for r in reports] == ["Jahongir Azimjonov, Jumabek Alikhanov"]
+    doc.close()
+
+
 def test_stacked_roster_is_not_limited_to_eight_name_lines():
     doc = fitz.open()
     page = doc.new_page(width=700, height=1100)

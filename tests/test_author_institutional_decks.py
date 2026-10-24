@@ -25,6 +25,28 @@ def test_company_profile_needs_profile_act_and_self_responsibility():
     )
 
 
+def test_annual_report_running_issuer_outweighs_nested_ceo_letter():
+    samples = [
+        {"page": 1, "text": "2024 Annual Report"},
+        {"page": 3, "text": "EXAMPLE 2024 Annual Report\nDear EXAMPLE Investor:\nOur CEO writes this letter."},
+        {"page": 5, "text": "EXAMPLE 2024 Annual Report\nFinancial statements and notes"},
+    ]
+    found = claims(samples, kind="corporate_publication", work_scope="single_work")
+    assert select({}, found, kind="corporate_publication", work_scope="single_work")[0]["author"] == "EXAMPLE"
+    assert not claims(samples[:2], kind="corporate_publication", work_scope="single_work")
+
+
+def test_product_brochure_needs_owned_product_and_separate_publisher_voice():
+    samples = [
+        {"page": 1, "text": "Less time evaluating software. More time delighting customers.\nLearn more"},
+        {"page": 7, "text": "With Marketing Hub Enterprise, our dashboards show results — all within ExampleCo."},
+        {"page": 8, "text": "Results with ExampleCo:\nThe platform helps teams connect with customers."},
+    ]
+    found = claims(samples, kind="generic", work_scope="single_work")
+    assert select({}, found, kind="generic", work_scope="single_work")[0]["author"] == "ExampleCo"
+    assert not claims(samples[:2], kind="generic", work_scope="single_work")
+
+
 def test_financial_deck_requires_reporting_subject_beyond_ownership():
     samples = [
         {"page": 1, "text": "Financial Results\n©2025 ExampleCo. All rights reserved."},

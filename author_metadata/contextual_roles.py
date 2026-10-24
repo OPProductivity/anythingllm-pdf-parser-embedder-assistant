@@ -155,10 +155,54 @@ def _claim(author, sample, evidence, family, creator_type, priority=109):
     }
 
 
-def _institutional_deck_claims(opening, all_text, opening_text):
+def _institutional_deck_claims(opening, all_text, opening_text, sampled_pages=()):
     """A company's own investor/profile act, not a logo or ownership alone."""
     result = []
     cover = opening_text[:1800]
+    # Annual-report running heads name the issuer of the whole publication.
+    # The CEO's signed investor letter inside it has a narrower work scope.
+    if re.search(r"\b20\d{2}\s+Annual\s+Report\b", cover, re.I):
+        running = {}
+        for sample in opening:
+            for match in re.finditer(
+                r"(?im)^\s*([A-Z][A-Za-z&.'’ -]{1,60}?)\s+20\d{2}\s+Annual\s+Report\b",
+                str(sample.get("text") or ""),
+            ):
+                name = " ".join(match[1].split())
+                running.setdefault(name.casefold(), {"name": name, "pages": set(), "sample": sample})["pages"].add(int(sample.get("page") or 0))
+        for issuer in running.values():
+            name = issuer["name"]
+            if len(issuer["pages"]) >= 2 and re.search(
+                r"\bDear\s+" + re.escape(name) + r"\s+Investor\b", all_text, re.I
+            ):
+                result.append(_claim(name, issuer["sample"],
+                    name + " annual report running title / investor address",
+                    "annual_report_issuer_and_investor_apparatus", "organization", priority=104))
+    # A branded product brochure can speak in the publisher's voice. Require
+    # that voice in its own feature description and repeated branded results
+    # on another page; a customer testimonial is not publisher attribution.
+    if re.search(r"\blearn more\b", cover, re.I) and re.search(
+        r"\b(?:customers?|software|platform|product)\b", cover, re.I
+    ):
+        for sample in sampled_pages:
+            text = str(sample.get("text") or "")
+            for match in re.finditer(
+                r"(?im)^\s*With\s+([A-Z][^.,\n]{3,90}),\s*our\s+"
+                r"[\s\S]{5,700}?\bwithin\s+([A-Z][A-Za-z0-9&.-]{2,45})\b",
+                text,
+            ):
+                name = match[2]
+                if (re.search(r"\b(?:customer|client|reviewer|analyst)\b", name, re.I)
+                    or re.search(r"\b(?:why it matters|results with)\b|[“”]", match[0], re.I)):
+                    continue
+                repeat = next((other for other in sampled_pages
+                    if int(other.get("page") or 0) != int(sample.get("page") or 0)
+                    and re.search(r"\bResults\s+with\s+" + re.escape(name) + r"\b",
+                                  str(other.get("text") or ""), re.I)), None)
+                if repeat:
+                    result.append(_claim(name, sample,
+                        match[0][:260] + " / branded results on page " + str(repeat["page"]) + " / promotional cover",
+                        "branded_product_and_publisher_voice", "organization", priority=104))
     if re.search(r"\bcompany overview\b", cover, re.I):
         for sample in opening:
             text = str(sample.get("text") or "")
@@ -294,7 +338,7 @@ def claims(samples, *, kind, work_scope, opening_pages=None):
         ),
         "",
     )
-    result.extend(_institutional_deck_claims(opening, all_text, opening_text))
+    result.extend(_institutional_deck_claims(opening, all_text, opening_text, samples))
     personal_post = _personal_post_claim(opening_text, all_text)
     if personal_post:
         result.append(personal_post)

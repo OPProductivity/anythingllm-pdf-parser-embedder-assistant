@@ -90,6 +90,12 @@ def _heading(
     return heading, selected
 
 
+def _same_credit_column(credit, heading_lines, width):
+    left = min(v["box"][0] for v in heading_lines)
+    right = max(v["box"][2] for v in heading_lines)
+    return max(left - credit["box"][2], credit["box"][0] - right, 0) <= width * 0.12
+
+
 def layout_credit_reports(lines, width, height, *, page=1, repeated_headers=()):
     """A heading, separately sized byline and following body share a column."""
     lines = sorted(lines, key=lambda v: (v["box"][1], v["box"][0]))
@@ -165,7 +171,8 @@ def layout_credit_reports(lines, width, height, *, page=1, repeated_headers=()):
                 and re.match(r"^\s*(?:by|written by)\s+", credit["text"], re.I)
             ),
         )
-        if heading and 0 <= credit["box"][1] - cluster[-1]["box"][3] <= 80:
+        if (heading and 0 <= credit["box"][1] - cluster[-1]["box"][3] <= 80
+                and _same_credit_column(credit, cluster, width)):
             left = min((v["box"][0] for v in cluster))
             right = max((v["box"][2] for v in cluster))
             following = [

@@ -102,6 +102,17 @@ def test_right_aligned_credit_can_follow_a_mid_page_work_heading():
     assert layout_credit(lines, 600, 850)["author"] == "Amina Rao"
 
 
+def test_product_tier_in_adjacent_column_is_not_author_of_left_panel():
+    lines = [
+        line("What you can do:", 172, 12, x=57, right=161),
+        line("Marketing Hub Enterprise", 193, 12, x=447, right=574),
+        line("With Marketing Hub Enterprise, you can do all of that and:", 213, 10, x=447, right=724),
+        line("These features help teams manage customer journeys and campaigns.", 230, 10, x=447, right=724),
+        line("Reports and analytics show how campaigns contribute to revenue.", 245, 10, x=447, right=724),
+    ]
+    assert not layout_credit(lines, 800, 850)["author"]
+
+
 def test_quoted_endorsement_cannot_be_a_heading_for_its_speaker():
     lines = [
         line("“An excellent history of cities”", 100, 24),
