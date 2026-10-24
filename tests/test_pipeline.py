@@ -5273,7 +5273,8 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn("1. known.pdf", rendered)
         self.assertIn("2. unresolved.pdf", rendered)
         self.assertIn("Example University", rendered)
-        self.assertIn("Unknown means the app did not find enough evidence", rendered)
+        self.assertIn("no defensible person or institutional evidence", rendered)
+        self.assertNotIn("These labels are read-only suggestions", rendered)
 
     def test_workspace_batch_labels_retain_source_order_and_unknown_placeholders(self):
         import rag_pdf_gradio_app as app
@@ -14214,6 +14215,15 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn("OCR / scanned risk", html_preview)
         self.assertIn("Sample extracted text", html_preview)
         self.assertIn("Possible scanned or low-text PDF", html_preview)
+        self.assertIn('class="metadata-info-toggle"', html_preview)
+        additional_and_primary = html_preview.split('class="metadata-info-content"', 1)[1]
+        additional, primary = additional_and_primary.split('class="metadata-summary metadata-primary"', 1)
+        self.assertIn("Author evidence", primary)
+        self.assertIn("Pages", primary)
+        self.assertNotIn("OCR / scanned risk", primary)
+        self.assertIn("OCR / scanned risk", additional)
+        self.assertIn("Outline entries", additional)
+        self.assertIn("Workspace identities", additional)
         self.assertTrue(accordion_update["open"])
 
     def test_download_files_update_can_package_current_outputs_as_zip(self):

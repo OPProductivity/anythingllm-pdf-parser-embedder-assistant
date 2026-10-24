@@ -2805,12 +2805,70 @@ body.dark #automatic-process-button[disabled] {
     max-height: min(52vh, 520px);
     overflow-y: auto !important;
     overflow-x: hidden !important;
+    padding: 0 !important;
+    border: 0 !important;
+    background: transparent !important;
+}
+.document-metadata-preview .html-container {
+    padding: 0 !important;
 }
 .document-metadata-preview > div,
 .document-metadata-preview .metadata-summary {
     width: 100% !important;
     max-width: 100% !important;
     min-width: 0 !important;
+}
+.document-metadata-preview .metadata-panel {
+    position: relative;
+    background: transparent;
+}
+.document-metadata-preview .metadata-panel-heading {
+    padding: 10px 42px 10px 8px;
+    font-weight: 700;
+    border-bottom: 1px solid var(--border-color-primary);
+}
+.document-metadata-preview .metadata-summary {
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+}
+.document-metadata-preview .metadata-primary .metadata-file:first-child {
+    border-top: 0;
+}
+.document-metadata-preview .metadata-info-toggle summary {
+    position: absolute;
+    top: 8px;
+    right: 12px;
+    display: grid;
+    place-items: center;
+    width: 23px;
+    height: 23px;
+    border-radius: 50%;
+    background: #4b5563;
+    color: white;
+    font: 700 15px/1 Arial, sans-serif;
+    cursor: pointer;
+    list-style: none;
+}
+.document-metadata-preview .metadata-info-toggle summary::-webkit-details-marker { display: none; }
+.document-metadata-preview .metadata-info-toggle summary:focus-visible {
+    outline: 2px solid #2563eb;
+    outline-offset: 2px;
+}
+.document-metadata-preview .metadata-info-content {
+    border-top: 1px solid var(--border-color-primary);
+}
+.document-metadata-preview .metadata-info-content > .metadata-info-heading {
+    padding: 10px 14px 0;
+    font-weight: 700;
+}
+.document-metadata-preview .metadata-preview-list > .metadata-panel + .metadata-panel {
+    margin-top: 8px;
+}
+.document-metadata-preview .metadata-selection-note {
+    padding: 6px 8px;
+    color: var(--body-text-color-subdued);
+    font-size: 0.86rem;
 }
 .document-metadata-preview::-webkit-scrollbar {
     width: 10px;
@@ -5955,11 +6013,6 @@ def workspace_source_identity_plan_html(pdf_files):
             'Select PDF files to preview the ordered source identities used for a new workspace name.'
             '</div></section></div>'
         )
-    unresolved = sum(identity.get("kind") == "unknown" for identity in identities)
-    heading = (
-        f"{len(identities)} selected PDF{'s' if len(identities) != 1 else ''}; "
-        f"{unresolved} marked Unknown."
-    )
     rows = []
     for index, identity in enumerate(identities, start=1):
         kind = str(identity.get("kind") or "unknown").replace("_", " ").title()
@@ -5984,10 +6037,6 @@ def workspace_source_identity_plan_html(pdf_files):
         )
     return (
         '<div class="metadata-summary workspace-source-identity-plan">'
-        '<section class="metadata-file">'
-        f'<div class="metadata-status">{html.escape(heading)} These labels are read-only suggestions; '
-        'the workspace name remains editable. Unknown means the app did not find enough evidence to name that source safely.'
-        '</div></section>'
         + "".join(rows)
         + "</div>"
     )
@@ -12832,10 +12881,12 @@ def stream_automatic_detected_metadata_preview(
         )
         yield (
             *field_updates,
-            '<div class="metadata-summary" role="status" aria-live="polite">'
-            f'<div class="metadata-status">{html.escape(selection_note)}</div>'
-            f'<div class="metadata-status">{html.escape(scanning)}</div>'
-            + "".join(completed_html) + names_html + "</div>",
+            '<div class="metadata-preview-list" role="status" aria-live="polite">'
+            + "".join(completed_html)
+            + detected_pdf_metadata_panel_html(
+                f'<div class="metadata-status">{html.escape(selection_note)} '
+                f'{html.escape(scanning)}</div>{names_html}'
+            ) + "</div>",
             metadata_scan_status_html(
                 "scanning", f"Reading text and OCR for preview {index + 1} of {len(displayed)}…"
             ),
@@ -12860,12 +12911,12 @@ def stream_automatic_detected_metadata_preview(
         except Exception as exc:
             APP_LOGGER.exception("individual PDF metadata preview failed")
             preview_errors += 1
-            completed_html.append(
+            completed_html.append(detected_pdf_metadata_panel_html(
                 '<section class="metadata-file"><div class="metadata-file-name">'
                 f'{html.escape(Path(path).name)}</div><div class="metadata-status">'
                 f'Metadata preview failed: {html.escape(safe_user_error_text(exc))}. '
                 'The file remains selected for a fresh attempt after Confirm.</div></section>'
-            )
+            ))
         if automatic_lifecycle_busy() or not _selection_preview_is_current(selection_state, request):
             yield tuple(gr.update() for _ in range(7))
             return
@@ -12875,8 +12926,9 @@ def stream_automatic_detected_metadata_preview(
             field_updates = tuple({**update, "interactive": True} for update in field_updates)
         yield (
             *field_updates,
-            '<div class="metadata-summary" role="status" aria-live="polite">'
-            f'<div class="metadata-status">{html.escape(selection_note)} {completed}</div>'
+            '<div class="metadata-preview-list" role="status" aria-live="polite">'
+            + (f'<div class="metadata-selection-note">{html.escape(selection_note)} {completed}</div>'
+               if len(files) > 1 else "")
             + "".join(completed_html) + "</div>",
             metadata_scan_status_html(
                 "warning" if preview_errors and index + 1 == len(displayed) else
@@ -26447,6 +26499,20 @@ def extraction_backend_help(choice):
     return f'<div class="metadata-summary"><div class="metadata-file"><div class="metadata-status">{body}</div></div></div>'
 
 
+def detected_pdf_metadata_panel_html(primary_html, additional_html=""):
+    """One compact boundary, with optional technical and workspace details."""
+    info = (
+        '<details class="metadata-info-toggle"><summary aria-label="More detected PDF metadata" '
+        'title="More detected PDF metadata">i</summary>'
+        f'<div class="metadata-info-content">{additional_html}</div></details>'
+        if additional_html else ""
+    )
+    return (
+        '<div class="metadata-panel"><div class="metadata-panel-heading">Detected PDF metadata</div>'
+        f'{info}<div class="metadata-summary metadata-primary">{primary_html}</div></div>'
+    )
+
+
 @automatic_next_run_callback(5)
 def detected_metadata_preview(
     pdf_files,
@@ -26462,11 +26528,15 @@ def detected_metadata_preview(
             gr.update(value=current_title or ""),
             gr.update(value=current_author or ""),
             gr.update(value=current_short_label or ""),
-            '<div class="metadata-summary"><div class="metadata-status">Select a PDF to inspect embedded metadata, technical properties, page count, and bookmarks.</div></div>',
+            detected_pdf_metadata_panel_html(
+                '<div class="metadata-status">Select a PDF to inspect embedded metadata, '
+                'technical properties, page count, and bookmarks.</div>'
+            ),
             gr.update(open=False),
         )
 
     previews = []
+    technical_previews = []
     detected_title = ""
     detected_author = ""
     detected_short = ""
@@ -26592,16 +26662,27 @@ def detected_metadata_preview(
                 "PDF structure",
             ),
         ]
-        row_html = "".join(
-            '<div class="metadata-key">{}</div><div class="metadata-value">{}</div>'.format(
-                html.escape(str(key)),
-                html.escape(str(value)),
+        def grid_rows(rows):
+            return "".join(
+                '<div class="metadata-key">{}</div><div class="metadata-value">{}</div>'.format(
+                    html.escape(str(key)), html.escape(str(value)),
+                )
+                for key, value, _origin in rows
             )
-            for key, value, _origin in metadata_rows
-        )
+
+        primary_keys = {
+            "Title used", "Embedded title", "Author", "Author confidence",
+            "Author evidence", "Text-layer check", "Sample extracted text", "Pages",
+        }
+        primary_rows = [row for row in metadata_rows if row[0] in primary_keys]
+        technical_rows = [row for row in metadata_rows if row[0] not in primary_keys]
         previews.append(
             f'<section class="metadata-file"><div class="metadata-file-name">{html.escape(pdf_path.name)}</div>'
-            f'<div class="metadata-grid">{row_html}</div></section>'
+            f'<div class="metadata-grid">{grid_rows(primary_rows)}</div></section>'
+        )
+        technical_previews.append(
+            f'<section class="metadata-file"><div class="metadata-file-name">{html.escape(pdf_path.name)}</div>'
+            f'<div class="metadata-grid">{grid_rows(technical_rows)}</div></section>'
         )
 
     if len(files) > 5:
@@ -26633,8 +26714,13 @@ def detected_metadata_preview(
         # Source identity is review evidence for the editable workspace name,
         # not a second workspace-setting surface. Keep it with the other
         # detected PDF metadata so it remains available on demand.
-        '<div class="metadata-summary">' + "".join(previews) + "</div>"
-        + workspace_source_identity_plan_html(files),
+        detected_pdf_metadata_panel_html(
+            "".join(previews),
+            '<div class="metadata-info-heading">Workspace identities</div>'
+            + workspace_source_identity_plan_html(files)
+            + '<div class="metadata-info-heading">Additional PDF properties</div>'
+            + '<div class="metadata-summary">' + "".join(technical_previews) + "</div>",
+        ),
         gr.update(open=True),
     )
 
@@ -33783,9 +33869,11 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                         max_lines=1,
                     )
                     refresh_metadata_button = gr.Button("Refresh detected PDF metadata")
-                    gr.Markdown("**Detected PDF metadata**")
                     auto_metadata_preview = gr.HTML(
-                        value='<div class="metadata-summary"><div class="metadata-status">Select a PDF to inspect embedded metadata, technical properties, page count, and bookmarks.</div></div>',
+                        value=detected_pdf_metadata_panel_html(
+                            '<div class="metadata-status">Select a PDF to inspect embedded metadata, '
+                            'technical properties, page count, and bookmarks.</div>'
+                        ),
                         elem_classes=["document-metadata-preview"],
                     )
             with gr.Row():

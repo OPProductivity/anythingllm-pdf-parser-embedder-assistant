@@ -49,6 +49,7 @@ def test_scanning_is_yielded_before_inference_and_each_result_before_next_file(m
     assert 'data-state="ready"' in completed_second[4]
     assert inspect.call_count == 2
     assert all(update["value"] == "" for update in completed_second[:3])
+    assert all(update["interactive"] for update in completed_second[:3])
     assert list(stream) == []
 
 
