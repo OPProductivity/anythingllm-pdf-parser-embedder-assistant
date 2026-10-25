@@ -157,3 +157,44 @@ integrity audit reported no errors or warnings.
 These controlled inputs test override persistence and blank-field fallback.
 They do not establish corpus recognition accuracy or retrieval-answer quality.
 No runtime benchmark is part of this qualification.
+
+## Restored snapshot and concurrent browser sessions on 2026-10-25
+
+After the complete 1,150-presentation metadata benchmark finished, a new source
+archive was restored at commit `b540d59a5dfc513e2e4ded4e2fee12547d7277b3`.
+The separate deployment root is `AnythingLLM PDF Assistant Stable 7861`, beside
+the main repository. It contains `SOURCE-COMMIT.txt`, the source ZIP and expanded
+`code-b540d59`, a runtime-version inventory, README, dedicated data, and Start/Stop
+PowerShell launchers. Dedicated desktop shortcuts include `Stable 7861` in their
+names; the normal 7860 shortcuts were preserved.
+
+The Start launcher sets `ANYTHINGLLM_PDF_ASSISTANT_HOME` to its own data directory,
+`GRADIO_TEMP_DIR` to its private upload directory, and `TEMP`, `TMP` and `TMPDIR`
+to private scratch. It restores parent environment values after spawning the
+hidden child. This also isolates the existing download-preparation scratch path,
+which is derived from the process temporary directory. These are upload and
+processing directories, not a recognition-result or OCR-evidence cache. Source
+is frozen; the Python environment remains shared and is recorded explicitly.
+
+Cookies are shared across ports on the same hostname. The original common
+cookie name caused the second login to replace the first. The integrated fix
+uses the trusted ASGI listener port in each cookie name and retains per-server
+session-token validation, HttpOnly, SameSite and origin restrictions. It does
+not make two mutually hostile same-host services a browser security boundary.
+Four new regression tests and an actual shared-browser-jar check cover
+coexistence; foreign-server tokens remain invalid.
+
+Both real servers remained authenticated before and after one fresh controlled
+one-page upload through 7861. Blank overrides used the detected title, author,
+citation label and Publisher. Raw JSON, SQLite metadata, document/vector mapping
+and the actual 4,096-dimensional LanceDB row agreed. One record was freshly
+embedded; the integrity audit had no errors or warnings. Live retrieval was not
+tested in this restoration check.
+
+AnythingLLM Desktop's database, workspaces, provider settings, embedding queue
+and vector store remain shared. A separately named API key helps identify or
+revoke a client but does not isolate those resources or prevent duplicate
+embeddings. Development uploads should use dedicated test workspaces; do not
+restart or reconfigure the backend during personal work. No new cross-client
+ingestion coordinator or general duplicate-upload prevention was implemented
+by restoring this snapshot.

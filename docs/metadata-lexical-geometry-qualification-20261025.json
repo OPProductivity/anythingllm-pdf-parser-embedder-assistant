@@ -118,5 +118,7 @@
   "bootstrap_scope": "3000 paired resamples of 382 review IDs, keeping filename conditions and aliases together. Describes observed document mix; does not estimate machine or run-to-run variability.",
   "publishable": true,
   "source_pin": "frozen candidate-03 against main 903ad6d; browser cookie fix tested separately",
-  "integration_status": "Offline integration and two-port live qualification pending"
+  "integration_status": "3353 offline tests passed; actual shared-browser sessions passed on both ports; one fresh blank-override default upload on stable 7861 passed raw JSON, SQLite, LanceDB and integrity checks",
+  "snapshot_source_commit": "git:b540d59",
+  "slow_tail_diagnostic": "Separate read-only counterfactual; no corpus exclusions, source-rule changes or new runtime qualification"
 }

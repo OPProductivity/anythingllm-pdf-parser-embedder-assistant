@@ -134,7 +134,29 @@ A same-cookie-jar regression reproduced the 7860 logout after authenticating
 port, retaining per-server token validation and origin restrictions. It is
 outside the timed recognition path and is qualified separately.
 
-Final integrated tests, real server checks and snapshot deployment are pending.
+Final integrated tests passed: 3,353 passed, one skipped, 43 deselected and 28
+passing subtests. Commit hooks also passed source lint, core type checks and
+secret scanning. Both actual listeners passed authentication using one shared
+browser cookie jar, before and after a controlled upload. The restored 7861
+source pin is `b540d59a5dfc513e2e4ded4e2fee12547d7277b3`; its recognition modules
+match the immutable timed candidate and its browser module matches integrated
+main. The source snapshot shares the existing Python environment; packages are
+not independently frozen.
+
+One newly generated, uniquely identified one-page PDF was processed through
+7861's actual browser and default upload path into a new verification workspace.
+All overrides were blank. Detected title, author, citation label and Publisher
+matched the saved raw document JSON, workspace SQLite metadata and the actual
+LanceDB vector row. One 4,096-dimensional record was freshly embedded; the
+retained integrity audit had zero errors and warnings. Both browser sessions
+remained authenticated. This is one upload on 7861 and two-port authentication
+coverage, not fresh upload qualification of every route or retrieval quality.
+
 Local experiment records and expanded workbook remain under the Codex project's
 `outputs/metadata-lexical-geometry-20261025/` directory. The previous expanded
-workbook and all its historical sheets remain intact.
+workbook and all its 73 historical sheets remain intact: all populated original
+values, formulas and resolved cell styles were compared. The new copy adds four
+sheets: 23 source reviews, eight rule trials, runtime results, and a twenty-PDF
+slow-tail diagnostic. The original workbook was not modified. See
+`metadata-slow-tail-diagnostic-20261025.md` for the counterfactual analysis, which
+does not alter recognition code, evidence plans, scores or corpus membership.
