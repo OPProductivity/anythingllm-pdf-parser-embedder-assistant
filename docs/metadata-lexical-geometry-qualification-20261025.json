@@ -1,0 +1,122 @@
+{
+  "complete_presentations": 1150,
+  "reviewed_PDFs": 382,
+  "accuracy_and_evidence_qualified": true,
+  "candidate_to_current_main_ratio": 0.9892212489905743,
+  "candidate_to_original_control_ratio": 1.314200525771652,
+  "target_1_2_met": false,
+  "summary": {
+    "original": {
+      "presentations": 386,
+      "candidate": {
+        "correct": 355,
+        "seconds": 959.6714,
+        "mean_seconds": 2.486195336787565,
+        "median_seconds": 1.6665999999999999,
+        "processing_errors": 0
+      },
+      "reference": {
+        "correct": 352,
+        "seconds": 977.8746,
+        "mean_seconds": 2.533353886010363,
+        "median_seconds": 1.7496,
+        "processing_errors": 0
+      },
+      "control": {
+        "correct": 326,
+        "seconds": 736.2894,
+        "mean_seconds": 1.9074854922279794,
+        "median_seconds": 1.1695,
+        "processing_errors": 0
+      }
+    },
+    "neutral_filename": {
+      "presentations": 382,
+      "candidate": {
+        "correct": 320,
+        "seconds": 966.7733,
+        "mean_seconds": 2.530820157068063,
+        "median_seconds": 1.7127,
+        "processing_errors": 0
+      },
+      "reference": {
+        "correct": 318,
+        "seconds": 983.5584,
+        "mean_seconds": 2.574760209424084,
+        "median_seconds": 1.7359,
+        "processing_errors": 0
+      },
+      "control": {
+        "correct": 289,
+        "seconds": 730.5236,
+        "mean_seconds": 1.912365445026178,
+        "median_seconds": 1.1870500000000002,
+        "processing_errors": 0
+      }
+    },
+    "pure_neutral": {
+      "presentations": 382,
+      "candidate": {
+        "correct": 295,
+        "seconds": 987.0485,
+        "mean_seconds": 2.5838965968586387,
+        "median_seconds": 1.7671000000000001,
+        "processing_errors": 0
+      },
+      "reference": {
+        "correct": 293,
+        "seconds": 983.8062,
+        "mean_seconds": 2.57540890052356,
+        "median_seconds": 1.723,
+        "processing_errors": 0
+      },
+      "control": {
+        "correct": 264,
+        "seconds": 750.119,
+        "mean_seconds": 1.9636623036649214,
+        "median_seconds": 1.25145,
+        "processing_errors": 0
+      }
+    },
+    "all_presentations": {
+      "presentations": 1150,
+      "candidate": {
+        "correct": 970,
+        "seconds": 2913.4932,
+        "mean_seconds": 2.5334723478260868,
+        "median_seconds": 1.715,
+        "processing_errors": 0
+      },
+      "reference": {
+        "correct": 963,
+        "seconds": 2945.2392,
+        "mean_seconds": 2.561077565217391,
+        "median_seconds": 1.742,
+        "processing_errors": 0
+      },
+      "control": {
+        "correct": 879,
+        "seconds": 2216.932,
+        "mean_seconds": 1.9277669565217392,
+        "median_seconds": 1.2033,
+        "processing_errors": 0
+      }
+    }
+  },
+  "manual_decision_review_complete": true,
+  "retained_success_regressions": [],
+  "grouped_bootstrap_95_percent_intervals": {
+    "candidate_to_current_main": [
+      0.9806174445588265,
+      0.9975742056296599
+    ],
+    "candidate_to_original_control": [
+      1.1787830525710243,
+      1.4641629343334652
+    ]
+  },
+  "bootstrap_scope": "3000 paired resamples of 382 review IDs, keeping filename conditions and aliases together. Describes observed document mix; does not estimate machine or run-to-run variability.",
+  "publishable": true,
+  "source_pin": "frozen candidate-03 against main 903ad6d; browser cookie fix tested separately",
+  "integration_status": "Offline integration and two-port live qualification pending"
+}

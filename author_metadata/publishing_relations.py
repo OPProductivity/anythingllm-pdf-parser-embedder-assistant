@@ -708,6 +708,42 @@ def visible_credit_truncation_claims(assertions, bundle):
     return result
 
 
+def reconcile_report_foreword(current, bundle, proposals, assertions):
+    """A local foreword byline does not alone identify a larger report's author."""
+    if (current.get("source") != "text_structured_opening_credit"
+            or current.get("mechanism") != "physical_heading_byline_body"
+            or int(current.get("page") or 0) <= 1
+            or not re.match(r"\s*foreword\b", current.get("evidence", ""), re.I)):
+        return current, None
+    native = (bundle or {}).get("native", [])
+    page = int(current["page"])
+    cover = next((p.get("text", "") for p in native if p.get("page") == 1), "")
+    if (not re.search(r"\breport\b", cover[:700], re.I)
+            or re.search(r"\bforeword\b", cover[:700], re.I)
+            or (bundle or {}).get("trace", {}).get("document_page_count", 0) <= page + 2):
+        return current, None
+    contents = [p for p in native if 1 < int(p.get("page") or 0) < page
+                and re.search(r"\bcontents\b", p.get("text", "")[:600], re.I)
+                and re.search(r"\bforeword\b", p.get("text", ""), re.I)
+                and re.search(r"\b(?:introduction|chapter)\b", p.get("text", ""), re.I)]
+    if not contents:
+        return current, None
+    # Independent work-level responsibility can establish that a report author
+    # also wrote its foreword. Repeated copies of this local byline cannot.
+    strong = {"text_author_label", "text_byline", "text_work_rights_credit",
+              "text_bibliographic_author_label", "text_corporate_cover_byline"}
+    actor = _words(current.get("author", ""))
+    if any(_words(p.get("author", "")) == actor and p.get("source") in strong
+           for p in [*proposals, *assertions]):
+        return current, None
+    audit = {"author": current["author"], "role": "foreword contributor",
+             "work": "nested foreword", "page": page,
+             "contents_pages": [p["page"] for p in contents],
+             "basis": "A separate report cover and contents place this geometric byline in a foreword before the main chapters; no independent whole-report credit supports the person."}
+    return {"author": "", "source": "not_found", "page": 0,
+            "evidence": audit["basis"]}, audit
+
+
 def select(current, assertions, *, kind, work_scope):
     """Specific responsibility can overturn an incumbent; region alone cannot."""
     if work_scope == "whole_issue":

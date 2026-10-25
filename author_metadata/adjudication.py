@@ -649,6 +649,11 @@ def infer(context):
     attempts.extend(embedded_attempts)
     assertions.extend(embedded_assertions)
     before = {"author": current.get("author", ""), "source": current.get("source", "")}
+    from .publishing_relations import reconcile_report_foreword
+
+    current, nested_scope = reconcile_report_foreword(
+        current, context.evidence_bundle, proposals, assertions
+    )
     current, decision = select(
         current,
         assertions,
@@ -671,6 +676,8 @@ def infer(context):
         "decision": decision,
         "all_scheduled_experts_assessed": True,
     }
+    if nested_scope is not None:
+        trace["nested_contribution_scope"] = nested_scope
     if chapter or current.get("mechanism") in {
         "local_chapter_contributors",
         "local_chapter_with_two_later_author_heads",

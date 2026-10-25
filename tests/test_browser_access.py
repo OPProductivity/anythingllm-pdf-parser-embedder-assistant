@@ -36,7 +36,7 @@ def test_routes_reject_unauthorized_clients_and_accept_launcher_session():
         assert c.post("/gradio_api/queue/join").status_code == 403
         assert c.get("/gradio_api/startup-events").status_code == 403
         assert authenticate(c).status_code == 204
-        cookie = c.cookies.get("pdf_assistant_session")
+        cookie = c.cookies.get("pdf_assistant_session_7860")
         assert cookie
         assert c.get("/").status_code == 200
         assert c.post("/gradio_api/queue/join").status_code == 200

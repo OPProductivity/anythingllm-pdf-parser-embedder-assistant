@@ -53,7 +53,7 @@ def _people(value):
     ):
         return []
     value = re.sub(r"(?<=\w)[*†‡\d]+(?=\s|$)", "", value)
-    value = re.sub(r"\s+(?:editors?|authors?)\.?$", "", value, flags=re.I)
+    value = re.sub(r"(?<!\s)\s+(?:editors?|authors?)\.?$", "", value, flags=re.I)
     # Spaced display dashes can separate complete people in an explicit role
     # field. An internal surname hyphen remains part of the person's name.
     displayed = re.split(r"(?<!\s)\s+[–—-]\s+", value)

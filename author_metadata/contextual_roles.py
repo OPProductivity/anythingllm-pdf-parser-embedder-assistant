@@ -213,7 +213,7 @@ def _institutional_deck_claims(opening, all_text, opening_text, sampled_pages=()
                 if not re.fullmatch(r"[A-Z][A-Za-z&.'’ -]{1,60}", name):
                     continue
                 if re.search(re.escape(name) + r"[’']s\b", text) and re.search(
-                    r"\bour\s+(?:platform|products?|company|business)\b", text, re.I
+                    r"\bour(?:\s+[\w-]+){0,5}\s+(?:platform|products?|company|business)\b", text, re.I
                 ):
                     result.append(
                         _claim(
@@ -368,12 +368,21 @@ def claims(samples, *, kind, work_scope, opening_pages=None):
             roster = []
             for index, value in enumerate(left[:-1]):
                 people = _names(value)
-                following = " ".join(left[index + 1 : index + 6])
+                # A right-hand biography can contribute a physical line before
+                # the left-hand credential. Preserve that local layout gap and
+                # enough lines for the same person's contact block.
+                following = " ".join(left[index + 1 : index + 9])
                 if (
                     len(people) == 1
+                    and not re.fullmatch(
+                        r"(?:(?:distinguished|senior|principal|lead|chief|visiting|assistant|associate|emeritus|research)\s+)*"
+                        r"(?:engineer|fellow|professor|researcher|director|scientist|lecturer)(?:\s*,.*)?",
+                        value,
+                        re.I,
+                    )
                     and re.search(
                         r"\b(?:Engineer|Fellow|Professor|Researcher|Director|Scientist|Lecturer)\b",
-                        left[index + 1],
+                        " ".join(left[index + 1 : index + 4]),
                         re.I,
                     )
                     and re.search(r"@|linkedin|https?://", following, re.I)

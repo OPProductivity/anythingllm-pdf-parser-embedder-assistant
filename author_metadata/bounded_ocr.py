@@ -104,12 +104,30 @@ def _credit_reports(text, context, page):
             )
             if explicit and 1 <= len(core) <= 3 and seen == core:
                 title_ok = True
+            local_heading = False
+            if not title_ok and context.path is not None:
+                filename_words = set(_words(context.path.stem))
+                heading = lines[start:index]
+                # A curatorial surname can corroborate a complete printed
+                # credit on one scanned leaf, even if a scanner's technical
+                # title prevents literal title matching. It cannot supply a
+                # missing first name or replace the local heading/byline/body.
+                local_heading = (
+                    len(names) == 1
+                    and _words(names[0])[-1] in filename_words
+                    and 5 <= len(seen) <= 24
+                    and len(heading) <= 4
+                    and all(value.isupper() for value in heading)
+                    and not re.search(r"\b(?:references|bibliography|contents|index|figure|table)\b", visible, re.I)
+                )
+                title_ok = local_heading
             if title_ok and len(" ".join(lines[index + 1 : index + 4]).split()) >= 12:
                 yield {
                     "author": ", ".join(names),
                     "source": "text_ocr_author_credit",
                     "page": page,
                     "evidence": visible + " / " + line,
+                    **({"mechanism": "printed_leaf_credit_with_curatorial_surname"} if local_heading else {}),
                 }
     return
 

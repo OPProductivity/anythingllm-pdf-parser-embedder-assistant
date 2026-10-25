@@ -4,6 +4,7 @@ import re
 
 from .names import normalize_author_candidate, looks_like_person_name, split_author_line_candidates
 from .title_evidence import matches, not_found, words
+from .lexical_scope import lexical_parse
 
 _OTHER_ROLE = re.compile(r"\b(?:series\s+editors?|volume\s+editors?|editorial\s+board|"
                          r"contributors?|translated\s+by|translation\s+by|foreword\s+by|"
@@ -13,6 +14,7 @@ _IMPRINT = re.compile(r"\b(?:university\s+press|publishing|publishers|press|rout
                       r"palgrave|macmillan|penguin|harpercollins|polity)\b", re.I)
 
 
+@lexical_parse("book_name_lexemes", list_result=True)
 def _names(line):
     if _OTHER_ROLE.search(line) or _IMPRINT.search(line) or any(mark in line for mark in ('"', '\u201c', '\u201d', ':', '\u2022')):
         return []

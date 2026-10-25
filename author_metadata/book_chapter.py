@@ -221,6 +221,22 @@ def chapter_cues(samples):
     return ()
 
 
+def _running_head_is_catalog_title(context, name):
+    """A chapter catalog's later book-title segment is not an author label."""
+    if context.path is None:
+        return False
+    parts = re.split(r"\s+[-–—]{1,2}\s+", context.path.stem)
+    if len(parts) < 4 or not any(
+        re.fullmatch(r"(?:ch(?:apter)?\.?|chapitre|hoofdstuk|kapitel|cap[ií]tulo)\s*\d+", part, re.I)
+        for part in parts[1:3]
+    ):
+        return False
+    candidate = words(name)
+    if not candidate or candidate[-1] in words(parts[0]):
+        return False
+    return any(words(part) == candidate for part in parts[2:])
+
+
 def infer_reports(context):
     if context.profile.kind != "book_chapter":
         return
@@ -242,7 +258,8 @@ def infer_reports(context):
                 match = re.fullmatch(r"\s*\d{2,4}\s+(.{5,90})\s*", line)
                 name = normalize_author_candidate(match.group(1)) if match else ""
                 surname = name_key(name.split()[-1]) if name else ""
-                if surname and surname in hint and looks_like_person_name(name):
+                if (surname and surname in hint and looks_like_person_name(name)
+                        and not _running_head_is_catalog_title(context, name)):
                     yield {
                         "author": name,
                         "source": "text_strict_credit_block",

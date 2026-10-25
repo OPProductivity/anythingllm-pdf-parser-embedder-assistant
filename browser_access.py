@@ -49,6 +49,16 @@ class BrowserAccessMiddleware:
         self.sessions = set()
         self.used_tickets = {}
         self.lock = threading.Lock()
+        self.fallback_cookie = f"{COOKIE}_{hashlib.sha256(key.encode()).hexdigest()[:12]}"
+
+    def cookie_name(self, scope):
+        # Cookies are shared across ports on a hostname. Use the trusted ASGI
+        # listener address, not a request's Host header, to prevent one local
+        # application from overwriting the other application's login cookie.
+        server = scope.get("server")
+        if server and isinstance(server[1], int) and 0 < server[1] <= 65535:
+            return f"{COOKIE}_{server[1]}"
+        return self.fallback_cookie
 
     def consume_ticket(self, ticket):
         if not re.fullmatch(r"[0-9]{1,12}\.[0-9a-f]{32}\.[0-9a-f]{64}", ticket):
@@ -108,7 +118,7 @@ class BrowserAccessMiddleware:
                         else:
                             self.sessions.add(session)
                             response = Response(status_code=204, headers={"Cache-Control": "no-store"})
-                            response.set_cookie(COOKIE, session, httponly=True, samesite="strict", path="/")
+                            response.set_cookie(self.cookie_name(scope), session, httponly=True, samesite="strict", path="/")
                     return await response(scope, receive, send)
                 return await PlainTextResponse("Invalid or already used browser ticket.", status_code=403)(scope, receive, send)
             if path in {"/assistant-lifecycle/stop_requested", "/assistant-lifecycle/stop_cancelled"}:
@@ -118,7 +128,8 @@ class BrowserAccessMiddleware:
         cookie = SimpleCookie()
         try:
             cookie.load(headers.get("cookie", ""))
-            token = cookie[COOKIE].value if COOKIE in cookie else ""
+            name = self.cookie_name(scope)
+            token = cookie[name].value if name in cookie else ""
         except Exception:
             token = ""
         with self.lock:

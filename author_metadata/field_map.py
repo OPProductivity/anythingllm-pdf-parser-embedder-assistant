@@ -7,7 +7,9 @@ names positioned source atoms, so alternative layouts can be reconsidered.
 from __future__ import annotations
 
 from collections import defaultdict
+from bisect import bisect_left
 from difflib import SequenceMatcher
+import math
 from pathlib import Path
 import re
 import unicodedata
@@ -81,6 +83,7 @@ def _line_compositions(atoms, page_width):
         return []
     proposals = []
     seen = set()
+    membership_geometry = {}
     atom_index = {atom["id"]: index for index, atom in enumerate(atoms)}
 
     def add(indexes, kind):
@@ -88,7 +91,22 @@ def _line_compositions(atoms, page_width):
         if not indexes or (indexes, kind) in seen:
             return
         seen.add((indexes, kind))
-        proposals.append(_composition(atoms, indexes, kind))
+        # Distinct layout interpretations may have identical membership. Their
+        # geometry and text are the same facts, while kind/ID and mutable lists
+        # must remain independent for each expert's interpretation.
+        if indexes not in membership_geometry:
+            group = _composition(atoms, indexes, kind)
+            membership_geometry[indexes] = group
+        else:
+            source = membership_geometry[indexes]
+            group = {
+                **source,
+                "id": f"g{len(indexes)}-{indexes[0]}-{indexes[-1]}-{kind}",
+                "kind": kind,
+                "atom_ids": list(source["atom_ids"]),
+                "bbox": list(source["bbox"]),
+            }
+        proposals.append(group)
 
     native_lines = defaultdict(list)
     for index, atom in enumerate(atoms):
@@ -116,13 +134,25 @@ def _line_compositions(atoms, page_width):
     ordered = sorted(range(len(atoms)), key=lambda index: (
         (atoms[index]["y0"] + atoms[index]["y1"]) / 2, atoms[index]["x0"]))
     baselines = []
+    baseline_centers = []
+    finite_centers = True
     for index in ordered:
         atom = atoms[index]
         center = (atom["y0"] + atom["y1"]) / 2
         height = max(1.0, atom["y1"] - atom["y0"])
-        match = next((row for row in baselines if abs(center - row["center"]) <= min(height, row["height"]) * .36), None)
+        start = 0
+        if finite_centers and math.isfinite(center) and math.isfinite(height):
+            # Centers are appended in sorted order and never moved. Anything
+            # below this conservative bound cannot pass the original predicate.
+            # Keep its exact first-match order and floating-point comparison.
+            extent = height * .36
+            slack = max(1.0, abs(center), extent) * 1e-12
+            start = bisect_left(baseline_centers, center - extent - slack)
+        match = next((row for row in baselines[start:] if abs(center - row["center"]) <= min(height, row["height"]) * .36), None)
         if match is None:
             baselines.append({"center": center, "height": height, "indexes": [index]})
+            baseline_centers.append(center)
+            finite_centers = finite_centers and math.isfinite(center)
         else:
             match["indexes"].append(index)
     for row in baselines:
