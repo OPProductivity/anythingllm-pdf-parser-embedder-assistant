@@ -157,7 +157,7 @@ def test_workspace_identity_reads_shared_native_evidence_once(tmp_path):
     assert institution.call_args.kwargs["native_metadata"] is native
 
 
-def test_concurrent_workspace_identity_callbacks_share_one_inspection(tmp_path):
+def test_concurrent_workspace_identity_callbacks_acquire_independent_fresh_evidence(tmp_path):
     pdf = tmp_path / "concurrent.pdf"
     pdf.write_bytes(b"%PDF-1.4\n")
     native = {"author": "", "title": "", "_author_text_samples": []}
@@ -185,7 +185,9 @@ def test_concurrent_workspace_identity_callbacks_share_one_inspection(tmp_path):
             worker.join(timeout=1)
     assert all(not worker.is_alive() for worker in workers)
     assert [result["label"] for result in results] == ["Author", "Author"]
-    assert read_metadata.call_count == 1
+    # Each callback is a new request. The no-result-caching contract takes
+    # precedence over the former cross-request identity/in-flight cache.
+    assert read_metadata.call_count == 2
 
 
 def test_title_adjacent_author_is_trusted_but_one_word_style_markers_are_not():

@@ -311,6 +311,10 @@ def _prepare_region(document, task, *, factors=None):
             pixels = Image.frombytes("RGB", (pix.width, pix.height), samples)
             histogram = pixels.convert("L").histogram()
             total = max(1, pix.width * pix.height)
+            visual_profile = {
+                "mid_tone_fraction": sum(histogram[45:210]) / total,
+                "light_fraction": sum(histogram[220:]) / total,
+            }
             preprocessing = []
             if (
                 sum(histogram[:90]) / total > 0.70
@@ -331,6 +335,7 @@ def _prepare_region(document, task, *, factors=None):
                 "payload": payload.getvalue(),
                 "border": border,
                 "preprocessing": preprocessing,
+                "visual_profile": visual_profile,
             }
         except (OSError, ValueError, RuntimeError) as error:
             frames[factor] = {"error": str(error)}
@@ -356,6 +361,7 @@ def _read_region(document, task, executable):
     schedule = [(7 if line_task else 3, scale, task["reason"])]
     for psm, factor, reason in schedule:
         attempt = {"kind": "ocr", **task, "reason": reason, "psm": psm, "scale": factor}
+        deferred = None
         try:
             if not Path(executable).is_file():
                 raise OSError("Tesseract unavailable")
@@ -374,6 +380,10 @@ def _read_region(document, task, executable):
             if frame.get("blank"):
                 attempt.update(status="blank_region", characters=0)
                 attempts.append(attempt)
+                if readings:
+                    # A blank lower-scale retry must not discard an earlier
+                    # successful reading. Both assessments remain recorded.
+                    break
                 return [], attempts
             attempt["preprocessing"] = frame["preprocessing"]
             result = subprocess.run(
@@ -408,13 +418,24 @@ def _read_region(document, task, executable):
             }
             readings.append(block)
             attempt.update(
-                status="read", characters=len(text), ocr_word_confidence_mean=confidence
+                status="read", characters=len(text), ocr_word_confidence_mean=confidence,
+                alphabetic_characters=sum(character.isalpha() for character in text),
             )
             if len(schedule) == 1:
                 if not text.strip() or (confidence is not None and confidence < 40):
-                    schedule.append(
-                        (1, factor, "empty_or_low_quality_orientation_recheck")
-                    )
+                    from .ocr_effort_policy import defer_photographic_orientation_retry
+
+                    if defer_photographic_orientation_retry(task, frame, text, confidence):
+                        deferred = {"kind": "ocr", **task, "reason": "empty_or_low_quality_orientation_recheck",
+                                    "status": "deferred_by_effort", "primary_reading_preserved": True,
+                                    "basis": ("interior continuous-tone region after three completed empty orientation rechecks"
+                                              if task.get("empty_orientation_prefix_exhausted") else
+                                              "interior photographic region; essentially no alphabetic text at first segmentation"),
+                                    "visual_profile": frame["visual_profile"]}
+                    else:
+                        schedule.append(
+                            (1, factor, "empty_or_low_quality_orientation_recheck")
+                        )
                 elif re.search(r"\b[A-Z]{2,3}\.\s+[A-Z][a-z]+", text):
                     schedule.append((3, 2.0, "ambiguous_initials_recheck"))
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
@@ -422,6 +443,8 @@ def _read_region(document, task, executable):
             if len(schedule) == 1 and Path(executable).is_file():
                 schedule.append((6, min(2.0, scale), "transient_read_retry"))
         attempts.append(attempt)
+        if deferred:
+            attempts.append(deferred)
     if not readings:
         return [], attempts
     chosen = max(
@@ -595,6 +618,29 @@ def _hidden_explicit_byline_lines(page, *, require_person=True):
     return found
 
 
+def _read_regions_with_effort(document, tasks, executable, *, workers):
+    """Use an observed plan-ordered prefix without dropping any primary region.
+
+    A high-image-count PDF first completes eight tasks with the strict regional
+    policy. Only three actually empty primary/orientation pairs can enable the
+    broader regional retry limit for the remaining tasks. The phase boundary
+    keeps decisions independent of which parallel OCR worker happens to finish
+    first. Extremely Thorough does not use this boundary or policy.
+    """
+    from .ocr_effort_policy import empty_orientation_rechecks
+
+    if sum(task.get("reason") == "image_without_native_overlay" for task in tasks) < 8:
+        yield from _read_regions(document, tasks, executable, workers=workers)
+        return
+    prefix = []
+    for result in _read_regions(document, tasks[:8], executable, workers=workers):
+        prefix.append(result)
+        yield result
+    exhausted = empty_orientation_rechecks(prefix) >= 3
+    remaining = [{**task, "empty_orientation_prefix_exhausted": exhausted} for task in tasks[8:]]
+    yield from _read_regions(document, remaining, executable, workers=workers)
+
+
 def collect(context):
     """Finish every planned native and image-region inspection before deciding."""
     if context.evidence_bundle is not None:
@@ -602,6 +648,7 @@ def collect(context):
     if context.acquisition_mode not in {"production", "lab"}:
         raise ValueError("Unknown author acquisition mode")
     workers = _ocr_worker_budget(context.ocr_workers)
+    effort = "extremely_thorough" if context.acquisition_mode == "lab" else context.recognition_effort
     trace = {
         "version": 3,
         "acquisition_mode": context.acquisition_mode,
@@ -612,6 +659,7 @@ def collect(context):
             "output_order": "plan_order",
         },
         "cross_call_cache": False,
+        "recognition_effort": effort,
         "native_plan": [],
         "opening_plan": [],
         "ocr_plan": [],
@@ -640,6 +688,50 @@ def collect(context):
     started = time.monotonic()
     native, ocr = [], []
     embedded_metadata = {}
+    completed_regions = 0
+
+    def checkpoint(phase, *, finished=False):
+        """Lab observer sees an isolated prefix, never future OCR results.
+
+        This does not stop acquisition. The observer is for counterfactual
+        expert trials before an early-stop policy can qualify. Copies exist
+        only for this callback; no PDF/OCR/result cache is introduced.
+        """
+        if context.acquisition_checkpoint is None:
+            return
+        from copy import deepcopy
+
+        selected = {int(s.get("page") or 0): dict(s) for s in context.samples}
+        for sample in native:
+            selected.setdefault(sample["page"], sample)
+        prefix_trace = deepcopy(trace)
+        prefix_trace["complete"] = bool(finished and trace["complete"])
+        prefix_trace["acquisition_prefix"] = {
+            "phase": phase,
+            "completed_regions": completed_regions,
+            "remaining_currently_planned_regions": max(0, len(trace["ocr_plan"]) - completed_regions),
+            "future_extensions_known": finished,
+        }
+        prefix = replace(
+            context,
+            acquisition_checkpoint=None,
+            samples=deepcopy(tuple(selected[n] for n in sorted(selected))),
+            evidence_bundle={
+                "trace": prefix_trace,
+                "native": deepcopy(native),
+                "ocr": deepcopy(ocr),
+                "embedded_metadata": deepcopy(embedded_metadata),
+            },
+        )
+        try:
+            context.acquisition_checkpoint(prefix)
+        except Exception as error:
+            # Diagnostic failure is visible without deleting unread evidence
+            # or turning it into a technical PDF/OCR failure. The trial runner
+            # must reject incomplete audit data rather than use it as a score.
+            trace.setdefault("checkpoint_audit_errors", []).append(
+                {"phase": phase, "error": f"{type(error).__name__}: {error}"}
+            )
     try:
         executable = (
             shutil.which("tesseract") or r"C:\Program Files\Tesseract-OCR\tesseract.exe"
@@ -841,15 +933,20 @@ def collect(context):
 
             for number in pages:
                 read_native(number)
+            trace["ocr_plan"] = tasks
+            checkpoint("native_complete")
             consumed = 0
             # OCR may reveal a front-matter sequence hidden from native text.
             # Continue from publishing structure, regardless of any author guess.
             stage = 0
             while True:
                 pending = tasks[consumed:]
+                if effort == "thorough":
+                    pending = [{**task, "recognition_effort": effort} for task in pending]
                 consumed = len(tasks)
                 trace["ocr_plan"] = tasks
-                for task, readings, attempts in _read_regions(
+                reader = _read_regions_with_effort if effort == "thorough" else _read_regions
+                for task, readings, attempts in reader(
                     document, pending, executable, workers=workers
                 ):
                     try:
@@ -869,6 +966,8 @@ def collect(context):
                                 "error": str(error),
                             }
                         )
+                    completed_regions += 1
+                    checkpoint("ocr_region_complete")
                 if stage == 0:
                     extra = "\n".join(r["text"] for r in ocr)
                     expanded, _ = _plan(
@@ -913,11 +1012,17 @@ def collect(context):
                     for number in additional:
                         read_native(number)
                 stage += 1
+                if additional or opening_progress:
+                    trace["ocr_plan"] = tasks
+                    checkpoint("plan_extended")
                 if consumed == len(tasks) and not additional and not opening_progress:
                     break
     except (OSError, ValueError, RuntimeError) as error:
         trace.update(complete=False, error=str(error))
     trace["collection_seconds"] = round(time.monotonic() - started, 4)
+    trace["deliberately_deferred_retries"] = sum(a.get("status") == "deferred_by_effort" for a in trace["attempts"])
+    trace["full_schedule_complete"] = trace["complete"] and not trace["deliberately_deferred_retries"]
+    checkpoint("acquisition_finished", finished=True)
     samples = {int(s.get("page") or 0): dict(s) for s in context.samples}
     for sample in native:
         samples.setdefault(sample["page"], dict(sample))

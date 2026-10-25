@@ -22067,6 +22067,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     author_context = AuthorEvidenceContext.from_samples(
         author_text_samples, path=pdf_path, title_hint=title,
         profile=work_identity.profile,
+        recognition_effort=getattr(args, "recognition_effort", "extremely_thorough"),
     )
     inferred_author = infer_profiled_author(
         author_context, sampling_error=author_sample_error,
@@ -22086,6 +22087,8 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         "source_title": normalize_text(title),
         "source_author": normalize_text(author),
         "source_publisher": publisher,
+        "author_recognition_effort": author_context.recognition_effort,
+        "author_optional_retries_deferred": inferred_author.get("evidence_review", {}).get("collection", {}).get("deliberately_deferred_retries", 0),
         "author_confidence": author_confidence_record,
         "source_sha256": source_sha,
         "source_published_epoch_ms": pdf_date_to_epoch_ms(pdf_meta.get("creationDate")),
@@ -22111,6 +22114,8 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         "detected_title": source_meta["source_title"],
         "detected_author": source_meta["source_author"],
         "detected_publisher": source_meta["source_publisher"],
+        "author_recognition_effort": source_meta["author_recognition_effort"],
+        "author_optional_retries_deferred": source_meta["author_optional_retries_deferred"],
         "author_confidence": author_confidence_record,
         "source_short_label": source_meta["source_short_label"],
         "metadata_provenance": source_meta["metadata_provenance"],
@@ -23394,6 +23399,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             author_source=(source_meta.get("metadata_provenance") or {}).get("source_author") or "",
             ocr_peer_pages=(ocr_peer or {}).get("pages") or (),
             tesseract=tesseract_path,
+            recognition_effort=author_context.recognition_effort,
         )
         field_review_path = Path(selected["candidate_dir"]) / "author-field-review.json"
         write_json(field_review_path, compact_field_review(field_review))
@@ -26129,6 +26135,8 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         "detected_title": profile.get("detected_title", ""),
         "detected_author": profile.get("detected_author", ""),
         "detected_publisher": profile.get("detected_publisher", ""),
+        "author_recognition_effort": profile.get("author_recognition_effort", "extremely_thorough"),
+        "author_optional_retries_deferred": profile.get("author_optional_retries_deferred", 0),
         "source_short_label": profile.get("source_short_label", ""),
         "metadata_provenance": dict(profile.get("metadata_provenance") or {}),
         "total_pipeline_seconds": round(time.perf_counter() - total_started, 2),
@@ -26771,6 +26779,7 @@ def main():
     parser.add_argument("--document-label", default="")
     parser.add_argument("--document-author", default="")
     parser.add_argument("--document-publisher", default="")
+    parser.add_argument("--recognition-effort", choices=["thorough", "extremely_thorough"], default="extremely_thorough")
     parser.add_argument("--document-short-label", default="")
     parser.add_argument("--deep-extraction", action="store_true")
     parser.add_argument("--include-front-matter", action="store_true")

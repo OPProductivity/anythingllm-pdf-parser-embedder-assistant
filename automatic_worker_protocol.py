@@ -37,6 +37,7 @@ AUTOMATIC_WORKER_ARGUMENT_FIELDS = frozenset({
     "document_author",
     "document_label",
     "document_publisher",
+    "recognition_effort",
     "document_short_label",
     "end_page_override",
     "end_section_names",

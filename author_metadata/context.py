@@ -1,7 +1,8 @@
 """Transient evidence supplied to one publication-specific author parser."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from .profile import DocumentProfile, classify_document
 
@@ -16,6 +17,8 @@ class AuthorEvidenceContext:
     acquisition_mode: str = "production"
     ocr_workers: int = 0
     lab_page_limit: int = 12
+    recognition_effort: str = "extremely_thorough"
+    acquisition_checkpoint: Callable | None = field(default=None, repr=False, compare=False)
 
     def profile_evidence(self):
         pages = []
@@ -70,7 +73,11 @@ class AuthorEvidenceContext:
         acquisition_mode="production",
         ocr_workers=0,
         lab_page_limit=12,
+        recognition_effort="extremely_thorough",
+        acquisition_checkpoint=None,
     ):
+        from recognition_effort import normalize_effort
+
         selected = tuple(
             dict(sample) for sample in samples or [] if isinstance(sample, dict)
         )
@@ -82,4 +89,6 @@ class AuthorEvidenceContext:
             acquisition_mode=acquisition_mode,
             ocr_workers=ocr_workers,
             lab_page_limit=lab_page_limit,
+            recognition_effort=normalize_effort(recognition_effort).value,
+            acquisition_checkpoint=acquisition_checkpoint,
         )

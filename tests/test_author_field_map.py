@@ -52,6 +52,30 @@ def test_adjacent_columns_same_height_remain_alternative_regions():
     assert "author_credit" in {row["role"] for row in mapped["field_candidates"]}
 
 
+def test_later_extractor_line_uses_its_own_word_indexes_for_byline_split():
+    atoms = [atom(0, "Journal", 50, 20, 100, 32, line=0),
+             atom(1, "Issue", 103, 20, 150, 32, line=0),
+             atom(2, "Racial", 50, 80, 100, 92, line=1),
+             atom(3, "Politics", 103, 80, 158, 92, line=1),
+             atom(4, "By", 165, 80, 180, 92, line=1),
+             atom(5, "Laura", 183, 80, 220, 92, line=1),
+             atom(6, "Pulido", 223, 80, 270, 92, line=1)]
+    groups = _line_compositions(atoms, 600)
+    assert any(g["kind"] == "before_by" and g["text"] == "Racial Politics" for g in groups)
+    assert any(g["kind"] == "byline_tail" and g["text"] == "By Laura Pulido" for g in groups)
+
+
+def test_by_in_another_line_does_not_split_an_unrelated_title():
+    atoms = [atom(0, "Published", 50, 20, 100, 32, line=0),
+             atom(1, "By", 103, 20, 120, 32, line=0),
+             atom(2, "Journal", 125, 20, 175, 32, line=0),
+             atom(3, "A", 50, 80, 65, 92, line=1),
+             atom(4, "Separate", 70, 80, 120, 92, line=1),
+             atom(5, "Title", 125, 80, 160, 92, line=1)]
+    groups = _line_compositions(atoms, 600)
+    assert not any(g["kind"] == "byline_tail" and g["text"] == "Separate Title" for g in groups)
+
+
 def _sample_pdf(path: Path):
     doc = fitz.open()
     page = doc.new_page(width=600, height=800)
@@ -123,6 +147,29 @@ def test_frontmatter_expansion_finds_later_title_page(tmp_path):
     pages = map_pdf_opening(path, "Racial Politics")
     assert [page["page"] for page in pages] == [1, 2, 3, 4, 5]
     assert "visible_work_title" in pages[-1]["page_roles"]
+
+
+@pytest.mark.parametrize("effort", ["thorough", "extremely_thorough"])
+def test_shadow_review_peer_and_both_crop_experts_receive_the_selected_mode(tmp_path, monkeypatch, effort):
+    from author_metadata import dispatcher
+
+    path = tmp_path / "sample.pdf"
+    _sample_pdf(path)
+    observed = []
+    monkeypatch.setattr(dispatcher, "infer_author", lambda context: observed.append(context.recognition_effort) or {})
+
+    def fake_ocr(_pdf_path, _page, _fraction, _psm, **_kwargs):
+        return {"status": "ok", "text": "Racial Politics\nBy Laura Pulido",
+                "atoms": [atom(0, "By", 60, 117, 75, 130),
+                          atom(1, "Laura", 78, 117, 110, 130),
+                          atom(2, "Pulido", 114, 117, 156, 130)], "recognition": {}}
+
+    report = review_author_field_map(path, title_hint="Racial Politics", author="Laura Pulido",
+        ocr_peer_pages=[{"page": 1, "text": "By Laura Pulido"}], ocr_runner=fake_ocr,
+        recognition_effort=effort)
+    assert len(observed) >= 3 and set(observed) == {effort}
+    assert report["recognition_effort"] == effort
+    assert report["changes_final_metadata"] is False
 
 
 def test_ocr_affiliation_name_shape_does_not_override_title_linked_author():

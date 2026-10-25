@@ -129,7 +129,7 @@ def _line_compositions(atoms, page_width):
         for run in runs:
             add(run, "gap_split_line")
         for index in range(1, len(indexes)):
-            if _fold(atoms[index]["text"]).strip(".:--") == "by":
+            if _fold(atoms[indexes[index]]["text"]).strip(".:--") == "by":
                 add(indexes[:index], "before_by")
                 add(indexes[index:], "byline_tail")
 
@@ -711,30 +711,33 @@ def _check_ocr(author, text, ocr_map=None, title_hint="", native_map=None):
 
 def review_author_field_map(pdf_path, *, title_hint="", author="", author_source="",
                             ocr_peer_pages=(), tesseract="", max_ocr_calls=3,
-                            ocr_runner=None):
+                            ocr_runner=None, recognition_effort="extremely_thorough"):
     """Bounded evidence cycle. No returned candidate changes final metadata."""
     from .context import AuthorEvidenceContext
     from .dispatcher import infer_author
+    from recognition_effort import normalize_effort
 
+    recognition_effort = normalize_effort(recognition_effort).value
     pdf_path = Path(pdf_path)
     pages = map_pdf_opening(pdf_path, title_hint)
     report = {"status": "reviewed", "mode": "shadow_v1", "title_hint": title_hint,
               "current_author": author, "current_author_source": author_source,
               "pages": pages, "checks": [], "reconsiderations": [],
-              "final_review": "unresolved", "changes_final_metadata": False}
+              "final_review": "unresolved", "changes_final_metadata": False,
+              "recognition_effort": recognition_effort}
     if not pages:
         report["status"] = "no_pages"
         return report
     current_profile = AuthorEvidenceContext.from_samples(
         [{"page": page["page"], "text": " ".join(atom["text"] for atom in page["atoms"])}
-         for page in pages[:4]], title_hint=title_hint, path=pdf_path,
+         for page in pages[:4]], title_hint=title_hint, path=pdf_path, recognition_effort=recognition_effort,
     ).profile
     report["native_profile"] = current_profile.kind
     peer_samples = [{"page": int(page.get("page") or 0), "text": str(page.get("text") or "")}
                     for page in ocr_peer_pages if 1 <= int(page.get("page") or 0) <= 4]
     if peer_samples:
         peer_context = AuthorEvidenceContext.from_samples(
-            peer_samples, title_hint=title_hint, path=pdf_path,
+            peer_samples, title_hint=title_hint, path=pdf_path, recognition_effort=recognition_effort,
         )
         peer_author = infer_author(peer_context)
         peer_text = "\n".join(sample["text"] for sample in peer_samples)
@@ -781,13 +784,13 @@ def review_author_field_map(pdf_path, *, title_hint="", author="", author_source
                                     native_map=target)
             crop_sample = [{"page": target["page"], "text": result.get("text") or ""}]
             crop_context = AuthorEvidenceContext.from_samples(
-                crop_sample, title_hint=title_hint, path=pdf_path, profile=current_profile,
+                crop_sample, title_hint=title_hint, path=pdf_path, profile=current_profile, recognition_effort=recognition_effort,
             )
             parser_credit = infer_author(crop_context)
             parser_source = str(parser_credit.get("source") or "")
             text_parser_author = (parser_credit.get("author") or "") if parser_source.startswith("text_") else ""
             independent_context = AuthorEvidenceContext.from_samples(
-                crop_sample, title_hint=title_hint, path=pdf_path,
+                crop_sample, title_hint=title_hint, path=pdf_path, recognition_effort=recognition_effort,
             )
             independent_credit = infer_author(independent_context)
             independent_source = str(independent_credit.get("source") or "")

@@ -127,7 +127,8 @@ def corroborates_filename_surname(existing_author, existing_source, native_sampl
 
 
 def infer_author_from_initial_pdf_pages(path: Path, title_hint="", *, page_limit=3,
-                                        use_file_title_fallback=True):
+                                        use_file_title_fallback=True,
+                                        recognition_effort="extremely_thorough"):
     """Seed a UI suggestion, then complete planned native/image acquisition.
 
     ``page_limit`` bounds the initial seed, not the shared acquisition plan.
@@ -176,6 +177,7 @@ def infer_author_from_initial_pdf_pages(path: Path, title_hint="", *, page_limit
     )
     context = AuthorEvidenceContext.from_samples(
         samples, path=pdf_path, title_hint=identity.title, profile=identity.profile,
+        recognition_effort=recognition_effort,
     )
     sampling_warning = "; ".join(sampling_errors)
     report = (infer_author(context, sampling_error=sampling_warning)
@@ -184,6 +186,9 @@ def infer_author_from_initial_pdf_pages(path: Path, title_hint="", *, page_limit
     result = {"author": resolved["author"], "source": resolved["source"],
             "page": int(report.get("page") or 0), "evidence": str(report.get("evidence") or ""),
             "work_identity": identity.as_evidence(), "author_confidence": author_confidence(resolved)}
+    collection = report.get("evidence_review", {}).get("collection", {})
+    result.update(recognition_effort=context.recognition_effort,
+                  optional_retries_deferred=collection.get("deliberately_deferred_retries", 0))
     if sampling_warning:
         result["initial_sampling_warning"] = sampling_warning
     return result

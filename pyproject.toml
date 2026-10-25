@@ -109,6 +109,7 @@ py-modules = [
   "run_evidence",
   "ingestion_observation",
   "run_request",
+  "recognition_effort",
   "reliability_audit",
   "reliability_acceptance",
   "reliability_fault_injection",

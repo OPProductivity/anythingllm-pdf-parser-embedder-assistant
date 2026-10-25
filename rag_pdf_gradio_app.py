@@ -43,6 +43,7 @@ from ingestion_observation import SubmissionCommitSignal
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from recognition_effort import load_recognition_effort, save_recognition_effort, normalize_effort
 
 from automatic_worker_protocol import (
     AUTOMATIC_WORKER_TRANSPORT_ARTIFACTS,
@@ -448,6 +449,7 @@ AUTOMATIC_RUN_FIELDS = (
     "download_segments_folder", "existing_workspace_duplicate_policy",
     "document_publisher",
     "document_metadata_overrides",
+    "recognition_effort",
 )
 ANYTHINGLLM_EMBEDDER_ENGINE_CHOICES = [
     "anythingllm",
@@ -2148,6 +2150,9 @@ EXPAND_ALL_CLICK_JS = """
 }
 """
 APP_CSS = """
+#author-recognition-effort { max-width: 420px; }
+#author-recognition-effort input[type="number"] { display: none; }
+.recognition-effort-endpoints { display: flex; justify-content: space-between; max-width: 420px; font-size: .8rem; opacity: .85; margin-top: -.5rem; }
 :root {
     /* Custom controls may need bespoke geometry, but their colours remain
        part of the document theme.  This avoids a separate light palette
@@ -5836,10 +5841,6 @@ WORKSPACE_NAME_SOURCE_LABEL_LIMIT = LANCEDB_WORKSPACE_NAME_LIMIT
 # provenance. Retain enough exact source versions for two maximum-size picker
 # selections so later confirmation callbacks do not reopen the first 904 PDFs
 # after an ordinary 96-entry LRU eviction.
-WORKSPACE_SOURCE_IDENTITY_CACHE_LIMIT = BATCH_FOLDER_MAX_DOCUMENTS * 2
-WORKSPACE_SOURCE_IDENTITY_CACHE = OrderedDict()
-WORKSPACE_SOURCE_IDENTITY_CACHE_LOCK = threading.Lock()
-WORKSPACE_SOURCE_IDENTITY_INFLIGHT = {}
 _WORKSPACE_AUTHOR_STOP_WORDS = {
     "a", "an", "and", "by", "for", "from", "in", "of", "on", "the", "to", "with",
 }
@@ -6000,13 +6001,53 @@ def workspace_institutional_label_from_pdf(pdf_file):
     return str(workspace_institutional_identity_from_pdf(pdf_file).get("label") or "")
 
 
-def workspace_person_identity_from_pdf(pdf_file, *, native_metadata=None):
+def _effort_kwargs(value):
+    mode = normalize_effort(value if value is not None and value != "" else "extremely_thorough")
+    return {"recognition_effort": mode.value} if mode.value != "extremely_thorough" else {}
+
+
+def load_effort_control():
+    preference = load_recognition_effort()
+    return (gr.update(value=preference.effort.slider_value,
+                      label=f"Recognition effort: {preference.effort.label}"),
+            gr.update(value=preference.notice, visible=bool(preference.notice)))
+
+
+def persist_and_begin_effort_preview(value, previous_state=None, viewed_run_root=None,
+                                    pdf_files=None, folder_files=None, folder_manifest=None,
+                                    request: gr.Request = None):
+    effort = normalize_effort(value)
+    notice = ""
+    try:
+        save_recognition_effort(effort)
+    except (OSError, TimeoutError) as error:
+        notice = "This session uses the selected effort, but it could not be saved for the next session: " + safe_user_error_text(error)
+    busy = automatic_lifecycle_busy()
+    updates = automatic_metadata_option_begin_state(
+        previous_state, viewed_run_root, pdf_files, folder_files, folder_manifest, request=request)
+    if not busy:
+        updates[0]["recognition_effort"] = effort.value
+        updates[0]["preview_request_identity"] = hashlib.sha256(
+            (automatic_selection_signature(pdf_files, folder_files, folder_manifest) + "|" + effort.value).encode()).hexdigest()
+    elif not notice:
+        notice = "Saved for the next run. The current run keeps its confirmed recognition effort."
+    status = (metadata_scan_status_html("scanning", "Preparing metadata preview with the selected recognition effort…")
+              if not busy and (normalize_file_list(pdf_files) or normalize_file_list(folder_files)) else gr.update())
+    return (gr.update(value=effort.slider_value, label=f"Recognition effort: {effort.label}"),
+            gr.update(value=notice, visible=bool(notice)), *updates, status)
+
+
+def workspace_person_identity_from_pdf(pdf_file, *, native_metadata=None, author_report=None, recognition_effort="extremely_thorough"):
     """Return one person identity record from the shared author inference path."""
     path = Path(str(pdf_file))
     if not path.exists() or path.suffix.casefold() != ".pdf":
         return {}
     try:
-        if isinstance(native_metadata, dict):
+        if isinstance(author_report, dict):
+            # This report belongs to the same preview call, not a global or
+            # cross-request result cache. Apply the usual workspace-role guards.
+            author_report = dict(author_report)
+        elif isinstance(native_metadata, dict):
             metadata = dict(native_metadata)
             available_samples = [
                 sample for sample in (metadata.get("_author_text_samples") or [])
@@ -6018,7 +6059,7 @@ def workspace_person_identity_from_pdf(pdf_file, *, native_metadata=None):
             resolved_title = normalize_text(identity.title)
             context = AuthorEvidenceContext.from_samples(
                 available_samples, path=path, title_hint=resolved_title,
-                profile=identity.profile,
+                profile=identity.profile, recognition_effort=recognition_effort,
             )
             if context.profile.kind == "book":
                 selected_samples = [sample for sample in available_samples
@@ -6031,7 +6072,7 @@ def workspace_person_identity_from_pdf(pdf_file, *, native_metadata=None):
                                     if int(sample["page"]) <= 4]
             selected_context = AuthorEvidenceContext.from_samples(
                 selected_samples, path=path, title_hint=resolved_title,
-                profile=identity.profile,
+                profile=identity.profile, recognition_effort=recognition_effort,
             )
             inference = infer_profiled_author(selected_context)
             resolved = resolve_author_from_metadata_and_inference(
@@ -6047,7 +6088,7 @@ def workspace_person_identity_from_pdf(pdf_file, *, native_metadata=None):
             }
         else:
             metadata = None
-            author_report = infer_author_from_initial_pdf_pages(path, page_limit=4)
+            author_report = infer_author_from_initial_pdf_pages(path, page_limit=4, **_effort_kwargs(recognition_effort))
         author = str(author_report.get("author") or "").strip()
     except Exception:
         return {}
@@ -6114,20 +6155,15 @@ def workspace_person_identity_from_pdf(pdf_file, *, native_metadata=None):
 def workspace_name_surname_from_filename(pdf_file):
     """Return one conservative author surname for a workspace suggestion.
 
-    The name is intentionally derived from the same metadata/text-recognition
-    rules used by normal preparation. Only the first three text pages are read
-    here; this remains a responsive, no-OCR, suggestion-only operation.
+    The name follows the shared fresh metadata recognizer and its planned
+    native/image acquisition. It is a workspace suggestion, not an override of
+    prepared document authorship.
     """
     return str(workspace_person_identity_from_pdf(pdf_file).get("label") or "")
 
 
-def workspace_source_identity_from_pdf(pdf_file):
-    """Resolve one workspace-only identity without changing prepared metadata.
-
-    The return value is a compact, explainable planning record.  It does not
-    write to ``source_author`` or infer a publisher from a filename: that field
-    remains under the parser's stricter person-author contract.
-    """
+def workspace_source_identity_from_pdf(pdf_file, *, author_report=None, recognition_effort="extremely_thorough"):
+    """Fresh workspace identity; optional sharing is local to its caller."""
     path = Path(str(pdf_file))
     fallback = {
         "path": str(path), "filename": path.name, "label": WORKSPACE_UNKNOWN_SOURCE_LABEL,
@@ -6136,59 +6172,20 @@ def workspace_source_identity_from_pdf(pdf_file):
     }
     if not path.exists() or path.suffix.casefold() != ".pdf":
         return fallback
+    if isinstance(author_report, dict):
+        identity = workspace_person_identity_from_pdf(path, author_report=author_report,
+                                                     **_effort_kwargs(recognition_effort))
+        if identity:
+            return {**fallback, **identity}
     try:
-        inspection_key = pdf_picker_native_inspection_key(path)
-        cache_key = ("workspace-source-identity-v5", *inspection_key)
-    except OSError:
-        cache_key = None
-    if cache_key is not None:
-        with WORKSPACE_SOURCE_IDENTITY_CACHE_LOCK:
-            cached = WORKSPACE_SOURCE_IDENTITY_CACHE.get(cache_key)
-            if cached is not None:
-                WORKSPACE_SOURCE_IDENTITY_CACHE.move_to_end(cache_key)
-                return dict(cached)
-            identity_ready = WORKSPACE_SOURCE_IDENTITY_INFLIGHT.get(cache_key)
-            owns_inspection = identity_ready is None
-            if owns_inspection:
-                identity_ready = threading.Event()
-                WORKSPACE_SOURCE_IDENTITY_INFLIGHT[cache_key] = identity_ready
-        if not owns_inspection:
-            # Another callback is inspecting this exact source version. Wait
-            # for its compact result rather than opening the same large PDF in
-            # parallel. The owner always signals in ``finally``; the timeout
-            # is only a defensive escape if the hosting thread itself dies.
-            identity_ready.wait(timeout=120.0)
-            with WORKSPACE_SOURCE_IDENTITY_CACHE_LOCK:
-                cached = WORKSPACE_SOURCE_IDENTITY_CACHE.get(cache_key)
-                if cached is not None:
-                    WORKSPACE_SOURCE_IDENTITY_CACHE.move_to_end(cache_key)
-                    return dict(cached)
-    # Person and institutional identity use overlapping native evidence. Read
-    # it once so an unresolved person does not cause a second open of a large
-    # PDF before the user can confirm. This retains opening-page and final-page
-    # provenance evidence; it only removes duplicated I/O.
-    try:
-        try:
-            native_metadata = pdf_metadata(path, include_author_samples=True)
-        except Exception:
-            native_metadata = None
-        identity = workspace_person_identity_from_pdf(path, native_metadata=native_metadata)
-        if not identity:
-            identity = workspace_institutional_identity_from_pdf(path, native_metadata=native_metadata)
-        result = {**fallback, **identity}
-        if cache_key is not None:
-            with WORKSPACE_SOURCE_IDENTITY_CACHE_LOCK:
-                WORKSPACE_SOURCE_IDENTITY_CACHE[cache_key] = dict(result)
-                WORKSPACE_SOURCE_IDENTITY_CACHE.move_to_end(cache_key)
-                while len(WORKSPACE_SOURCE_IDENTITY_CACHE) > WORKSPACE_SOURCE_IDENTITY_CACHE_LIMIT:
-                    WORKSPACE_SOURCE_IDENTITY_CACHE.popitem(last=False)
-        return result
-    finally:
-        if cache_key is not None and 'owns_inspection' in locals() and owns_inspection:
-            with WORKSPACE_SOURCE_IDENTITY_CACHE_LOCK:
-                event = WORKSPACE_SOURCE_IDENTITY_INFLIGHT.pop(cache_key, None)
-                if event is not None:
-                    event.set()
+        native_metadata = pdf_metadata(path, include_author_samples=True)
+    except Exception:
+        native_metadata = None
+    identity = ({} if isinstance(author_report, dict) else workspace_person_identity_from_pdf(
+        path, native_metadata=native_metadata, **_effort_kwargs(recognition_effort)))
+    if not identity:
+        identity = workspace_institutional_identity_from_pdf(path, native_metadata=native_metadata)
+    return {**fallback, **identity}
 
 
 def workspace_filename_leading_surname_candidate(pdf_file):
@@ -6243,10 +6240,10 @@ def corroborate_workspace_source_identities(identities):
     return rows
 
 
-def workspace_source_identity_plan(pdf_files):
+def workspace_source_identity_plan(pdf_files, *, recognition_effort="extremely_thorough"):
     """Return one source identity record per selected PDF, retaining order."""
     identities = [
-        workspace_source_identity_from_pdf(pdf_file)
+        workspace_source_identity_from_pdf(pdf_file, **_effort_kwargs(recognition_effort))
         for pdf_file in normalize_file_list(pdf_files)
     ]
     return corroborate_workspace_source_identities(identities)
@@ -6307,7 +6304,7 @@ def batch_workspace_author_labels(pdf_files):
     return [identity["label"] for identity in workspace_source_identity_plan(pdf_files)]
 
 
-def batch_workspace_author_labels_for_suggestion(pdf_files):
+def batch_workspace_author_labels_for_suggestion(pdf_files, *, recognition_effort="extremely_thorough"):
     """Return the useful leading identity labels without blocking a batch.
 
     A workspace mnemonic has a fixed visible length, so source identities
@@ -6326,7 +6323,7 @@ def batch_workspace_author_labels_for_suggestion(pdf_files):
         if index and time.monotonic() - started >= WORKSPACE_NAME_IDENTITY_LOOKAHEAD_SECONDS:
             enriched = corroborate_workspace_source_identities(identities)
             return [str(row.get("label") or WORKSPACE_UNKNOWN_SOURCE_LABEL) for row in enriched], True
-        identity = workspace_source_identity_from_pdf(pdf_file)
+        identity = workspace_source_identity_from_pdf(pdf_file, **_effort_kwargs(recognition_effort))
         identities.append(identity)
     enriched = corroborate_workspace_source_identities(identities)
     return [str(row.get("label") or WORKSPACE_UNKNOWN_SOURCE_LABEL) for row in enriched], False
@@ -6364,7 +6361,7 @@ def workspace_name_from_batch_labels(labels, *, date_stamp=None, has_unexamined_
     return with_date or without_date or f"PDF-etc {date_stamp}"
 
 
-def document_workspace_name(document_label, pdf_files):
+def document_workspace_name(document_label, pdf_files, *, recognition_effort="extremely_thorough"):
     files = normalize_file_list(pdf_files)
     source_name = (document_label or "").strip()
     batch_name_generated = False
@@ -6377,7 +6374,7 @@ def document_workspace_name(document_label, pdf_files):
         # A batch needs a useful, editable mnemonic rather than inheriting the
         # first selected filename. Keep the labels visually separable and make
         # any omitted tail explicit rather than stopping at a long fallback.
-        labels, has_unexamined_tail = batch_workspace_author_labels_for_suggestion(files)
+        labels, has_unexamined_tail = batch_workspace_author_labels_for_suggestion(files, **_effort_kwargs(recognition_effort))
         source_name = workspace_name_from_batch_labels(
             labels,
             has_unexamined_tail=has_unexamined_tail,
@@ -6403,8 +6400,8 @@ def document_workspace_name(document_label, pdf_files):
     return f"{clean_name} {date_stamp}"
 
 
-def suggested_document_workspace_name(document_label, pdf_files):
-    return unicode_workspace_display_name(document_workspace_name(document_label, pdf_files))
+def suggested_document_workspace_name(document_label, pdf_files, *, recognition_effort="extremely_thorough"):
+    return unicode_workspace_display_name(document_workspace_name(document_label, pdf_files, **_effort_kwargs(recognition_effort)))
 
 
 def canonical_new_workspace_name(value):
@@ -6471,6 +6468,7 @@ def update_new_workspace_name_control(
     folder_pdf_files=None,
     current_name="",
     last_suggestion=None,
+    recognition_effort="extremely_thorough",
 ):
     """Show an editable proposed name only when the new-workspace choice is active."""
     # Keep the callable backward-compatible for non-UI integrations that
@@ -6485,7 +6483,7 @@ def update_new_workspace_name_control(
     selected_files = list(dict.fromkeys(
         normalize_file_list(pdf_files) + normalize_file_list(folder_pdf_files)
     ))
-    suggestion = suggested_document_workspace_name(document_label, selected_files)
+    suggestion = suggested_document_workspace_name(document_label, selected_files, **_effort_kwargs(recognition_effort))
     state = workspace_name_auto_state(last_suggestion)
     # The textbox is an override, never storage for an automatic suggestion.
     # Do not write its value from an asynchronous selection callback: an older
@@ -6518,9 +6516,9 @@ def update_new_workspace_name_without_pdf_inspection(
     return gr.update(placeholder=placeholder, visible=True, interactive=True), state
 
 
-def create_new_document_workspace(api_url, api_key, document_label, pdf_files, workspace_name_override=""):
+def create_new_document_workspace(api_url, api_key, document_label, pdf_files, workspace_name_override="", *, recognition_effort="extremely_thorough"):
     workspace_name = canonical_new_workspace_name(workspace_name_override) or suggested_document_workspace_name(
-        document_label, pdf_files
+        document_label, pdf_files, **_effort_kwargs(recognition_effort)
     )
     if not workspace_name:
         return {
@@ -7948,6 +7946,7 @@ def automatic_run_processing_settings(values):
         "document_short_label": settings.get("document_short_label"),
         "document_publisher": settings.get("document_publisher"),
         "document_metadata_overrides": settings.get("document_metadata_overrides"),
+        "recognition_effort": normalize_effort(settings.get("recognition_effort") if settings.get("recognition_effort") is not None and settings.get("recognition_effort") != "" else "extremely_thorough").value,
         "use_file_title_fallback": settings.get("use_file_title_fallback"),
         # A batch has no shared metadata by default.  The explicit opt-in is
         # part of the processing identity so a past accidental shared title
@@ -8016,6 +8015,7 @@ def builtin_automatic_run_setting_values(pdf_files=None, folder_pdf_files=None, 
         "document_short_label": "",
         "document_publisher": "",
         "document_metadata_overrides": "",
+        "recognition_effort": "thorough",
         "use_file_title_fallback": True,
         "apply_batch_metadata_overrides": False,
         "mode": MODE_NATIVE_UPLOAD_LABEL,
@@ -8087,6 +8087,7 @@ def fresh_automatic_run_setting_values(pdf_files=None, folder_pdf_files=None, *,
     saved = load_automatic_defaults(builtin)
     effective = builtin | saved["defaults"]
     effective["mode"] = normalized_automatic_output_mode(effective.get("mode"))
+    effective["recognition_effort"] = load_recognition_effort().effort.value
     return effective
 
 
@@ -12693,6 +12694,7 @@ def run_advanced_diagnostics(
     validation_phrases,
     unstructured_strategy,
     retain_detailed_evidence,
+    recognition_effort="extremely_thorough",
     progress=gr.Progress(track_tqdm=False),
 ):
     """Create one timestamped, local-only diagnostic run through ``prepare_pdf``.
@@ -12746,6 +12748,7 @@ def run_advanced_diagnostics(
         )
 
     args = SimpleNamespace(
+        recognition_effort=normalize_effort(recognition_effort).value,
         document_label=(document_title or "").strip(),
         document_author=(document_author or "").strip(),
         document_short_label=(document_short_label or "").strip(),
@@ -13159,6 +13162,7 @@ def stream_automatic_detected_metadata_preview(
     apply_batch_metadata_overrides=False,
     folder_manifest=None,
     selection_state=None,
+    recognition_effort="extremely_thorough",
     request: gr.Request = None,
 ):
     """Publish scanning feedback and each result during one fresh inspection.
@@ -13248,7 +13252,7 @@ def stream_automatic_detected_metadata_preview(
             result = detected_metadata_preview(
                 [path], current_title, current_author, current_short_label,
                 use_file_title_fallback, apply_batch_metadata_overrides,
-                override_editor=True,
+                override_editor=True, **_effort_kwargs(recognition_effort),
             )
             if not isinstance(result[3], str):
                 yield tuple(gr.update() for _ in range(7))
@@ -13328,6 +13332,7 @@ def stream_refresh_automatic_run_estimate_for_fresh_selection(
 def stream_automatic_workspace_name_preview(
     workspace_slug, document_label, pdf_files, folder_pdf_files=None,
     current_name="", last_suggestion=None, selection_state=None,
+    recognition_effort="extremely_thorough",
     request: gr.Request = None,
 ):
     """Explain additional identity work and discard obsolete suggestions."""
@@ -13348,7 +13353,7 @@ def stream_automatic_workspace_name_preview(
     yield gr.update(), gr.update(), activity
     result = update_new_workspace_name_control(
         workspace_slug, document_label, pdf_files, folder_pdf_files,
-        current_name, last_suggestion,
+        current_name, last_suggestion, **_effort_kwargs(recognition_effort),
     )
     if not current():
         yield tuple(gr.update() for _ in range(3))
@@ -25542,6 +25547,7 @@ def run_automatic_from_confirmation(*values, progress=gr.Progress(track_tqdm=Fal
                 confirmed_settings.get("document_label"),
                 confirmed_settings.get("files"),
                 confirmed_settings.get("new_workspace_name"),
+                **_effort_kwargs(confirmed_settings.get("recognition_effort")),
             )
             if result.get("status") != "created" or not result.get("workspace_slug"):
                 return automatic_confirmation_failure_response(
@@ -26977,6 +26983,7 @@ def detected_metadata_preview(
     use_file_title_fallback=True,
     apply_batch_metadata_overrides=False,
     override_editor=True,
+    recognition_effort="extremely_thorough",
 ):
     files = normalize_file_list(pdf_files)
     if not files:
@@ -27013,6 +27020,7 @@ def detected_metadata_preview(
         author_started = time.perf_counter()
         author_inference = infer_author_from_initial_pdf_pages(
             pdf_path, page_limit=4, use_file_title_fallback=use_file_title_fallback,
+            **_effort_kwargs(recognition_effort),
         )
         APP_LOGGER.info(
             "Author metadata recognition completed in %.3fs for %s",
@@ -27089,6 +27097,8 @@ def detected_metadata_preview(
             ("Author confidence", f"{author_inference.get('author_confidence', {}).get('score', 0)}/100 — "
              f"{author_inference.get('author_confidence', {}).get('basis', 'unresolved')}", "evidence grade"),
             ("Author evidence", author_inference.get("evidence") or "None", "PDF text scan"),
+            ("Recognition effort", normalize_effort(recognition_effort).label, "selected policy"),
+            ("Optional retries deferred", author_inference.get("optional_retries_deferred", 0), "effort policy"),
             ("Text-layer check", text_layer_status, "PyMuPDF sample"),
             ("OCR / scanned risk", text_layer_detail, "PyMuPDF page profile"),
             ("Sample extracted text", sample_text, sample_origin),
@@ -27117,7 +27127,9 @@ def detected_metadata_preview(
         primary_rows = [row for row in metadata_rows if row[0] in primary_keys]
         technical_rows = [row for row in metadata_rows if row[0] not in primary_keys]
         records.append({"filename": pdf_path.name, "primary_rows": primary_rows,
-                        "technical_rows": technical_rows})
+                        "technical_rows": technical_rows,
+                        "identity": workspace_source_identity_from_pdf(
+                            pdf_path, author_report=author_inference, **_effort_kwargs(recognition_effort))})
 
     should_fill_fields = len(files) == 1
     title_value = current_title or (detected_title if should_fill_fields else "")
@@ -27132,7 +27144,11 @@ def detected_metadata_preview(
             author_value = ""
             short_value = ""
 
-    identities = workspace_source_identity_plan(files)
+    identities = corroborate_workspace_source_identities([
+        record.get("identity") or {"path": files[index], "filename": Path(files[index]).name,
+                                  "label": WORKSPACE_UNKNOWN_SOURCE_LABEL, "kind": "unknown"}
+        for index, record in enumerate(records)
+    ])
     panels = []
     for index, record in enumerate(records):
         filename = html.escape(record["filename"])
@@ -29997,6 +30013,7 @@ def run_automatic(
     apply_batch_metadata_overrides=False,
     document_publisher="",
     document_metadata_overrides="",
+    recognition_effort="extremely_thorough",
     progress=gr.Progress(track_tqdm=False),
 ):
     # Progress ownership stays with ``update_live_automatic_run_status`` and
@@ -30022,6 +30039,7 @@ def run_automatic(
         if resolved_segment_mode == "custom_page_ranges"
         else ()
     )
+    recognition_effort = normalize_effort(recognition_effort if recognition_effort is not None and recognition_effort != "" else "extremely_thorough").value
     run_local_values = locals().copy()
     processing_settings = automatic_run_processing_settings(
         {field: run_local_values.get(field) for field in AUTOMATIC_RUN_FIELDS}
@@ -32014,6 +32032,7 @@ def run_automatic(
             # Each selected path owns its edits. Empty fields still resolve
             # from that PDF; first-file preview values cannot leak across it.
             **source_metadata,
+            recognition_effort=recognition_effort,
             use_file_title_fallback=bool(use_file_title_fallback),
             deep_extraction=bool(deep_extraction),
             include_front_matter=bool(include_front_matter),
@@ -34320,6 +34339,14 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
             # policy values. Confirm derives shared override intent from edits.
             auto_use_file_title_fallback = gr.State(True)
             apply_batch_metadata_overrides = gr.State(False)
+            effort_initial = load_recognition_effort()
+            auto_recognition_effort = gr.Slider(0, 1, step=1,
+                value=effort_initial.effort.slider_value,
+                label=f"Recognition effort: {effort_initial.effort.label}",
+                info="Thorough limits unproductive optional image retries. Extremely Thorough keeps the full schedule. Your choice is saved immediately.",
+                elem_id="author-recognition-effort", interactive=True)
+            gr.HTML('<div class="recognition-effort-endpoints"><span>Thorough</span><span>Extremely Thorough</span></div>')
+            auto_effort_notice = gr.Markdown(effort_initial.notice, visible=bool(effort_initial.notice))
             with gr.Accordion("Document metadata", open=False, elem_id="document-metadata-accordion", elem_classes=["top-level-accordion"]) as document_metadata_section:
                 auto_metadata_preview = gr.HTML(
                     value=pending_metadata_panel_html(
@@ -35444,6 +35471,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 existing_workspace_duplicate_policy,
                 auto_publisher,
                 auto_document_overrides,
+                auto_recognition_effort,
                 new_workspace_name,
                 retain_detailed_evidence,
                 new_workspace_name_auto_state,
@@ -35513,6 +35541,36 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
                 trigger_mode="always_last",
             )
+            demo.load(fn=load_effort_control, inputs=None,
+                outputs=[auto_recognition_effort, auto_effort_notice], queue=False, show_progress="hidden")
+            auto_recognition_effort.input(
+                fn=persist_and_begin_effort_preview,
+                inputs=[auto_recognition_effort, automatic_selection_state, automatic_viewed_run_root,
+                        auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
+                outputs=[auto_recognition_effort, auto_effort_notice, automatic_selection_state,
+                         automatic_viewed_run_root, auto_pdfs, auto_mode, confirm_automatic_run_button,
+                         cancel_automatic_run_button, automatic_run_activity, auto_metadata_status],
+                queue=False, show_progress="hidden", trigger_mode="always_last",
+            ).then(fn=pending_selected_metadata_preview,
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state],
+                outputs=[auto_metadata_preview], queue=False, show_progress="hidden",
+            ).then(fn=stream_automatic_detected_metadata_preview,
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label,
+                        auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest,
+                        automatic_selection_state, auto_recognition_effort],
+                outputs=[auto_label, auto_author, auto_short_label, auto_metadata_preview,
+                         auto_metadata_status, document_metadata_section, automatic_run_activity],
+                queue=True, concurrency_limit=1, concurrency_id="automatic-metadata-preview", show_progress="hidden",
+            ).then(fn=stream_automatic_workspace_name_preview,
+                inputs=[workspace_slug, auto_label, auto_pdfs, auto_folder_pdfs, new_workspace_name,
+                        new_workspace_name_auto_state, automatic_selection_state, auto_recognition_effort],
+                outputs=[new_workspace_name, new_workspace_name_auto_state, automatic_run_activity],
+                queue=True, concurrency_limit=1, concurrency_id="automatic-workspace-preview", show_progress="hidden",
+            ).then(fn=automatic_selection_finish_state,
+                inputs=[automatic_selection_state, auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
+                outputs=[automatic_selection_state, auto_mode, confirm_automatic_run_button,
+                         cancel_automatic_run_button, automatic_run_activity, auto_pdfs],
+                queue=False, show_progress="hidden")
             for field, component in (
                 ("document_label", auto_title_override),
                 ("document_author", auto_author_override),
@@ -35658,7 +35716,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=stream_automatic_detected_metadata_preview,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest, automatic_selection_state],
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest, automatic_selection_state, auto_recognition_effort],
                 outputs=[auto_label, auto_author, auto_short_label, auto_metadata_preview, auto_metadata_status, document_metadata_section, automatic_run_activity],
                 show_progress="hidden",
                 queue=True,
@@ -35674,7 +35732,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 concurrency_id="automatic-estimate-preview",
             ).then(
                 fn=stream_automatic_workspace_name_preview,
-                inputs=[workspace_slug, auto_label, auto_pdfs, auto_folder_pdfs, new_workspace_name, new_workspace_name_auto_state, automatic_selection_state],
+                inputs=[workspace_slug, auto_label, auto_pdfs, auto_folder_pdfs, new_workspace_name, new_workspace_name_auto_state, automatic_selection_state, auto_recognition_effort],
                 outputs=[new_workspace_name, new_workspace_name_auto_state, automatic_run_activity],
                 show_progress="hidden",
                 queue=True,
@@ -35789,7 +35847,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=stream_automatic_detected_metadata_preview,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest, automatic_selection_state],
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest, automatic_selection_state, auto_recognition_effort],
                 outputs=[auto_label, auto_author, auto_short_label, auto_metadata_preview, auto_metadata_status, document_metadata_section, automatic_run_activity],
                 show_progress="hidden",
                 queue=True,
@@ -35805,7 +35863,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 concurrency_id="automatic-estimate-preview",
             ).then(
                 fn=stream_automatic_workspace_name_preview,
-                inputs=[workspace_slug, auto_label, auto_pdfs, auto_folder_pdfs, new_workspace_name, new_workspace_name_auto_state, automatic_selection_state],
+                inputs=[workspace_slug, auto_label, auto_pdfs, auto_folder_pdfs, new_workspace_name, new_workspace_name_auto_state, automatic_selection_state, auto_recognition_effort],
                 outputs=[new_workspace_name, new_workspace_name_auto_state, automatic_run_activity],
                 show_progress="hidden",
                 queue=True,
@@ -35911,7 +35969,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=stream_automatic_detected_metadata_preview,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest, automatic_selection_state],
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest, automatic_selection_state, auto_recognition_effort],
                 outputs=[auto_label, auto_author, auto_short_label, auto_metadata_preview, auto_metadata_status, document_metadata_section, automatic_run_activity],
                 show_progress="hidden",
                 queue=True,
@@ -35927,7 +35985,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 concurrency_id="automatic-estimate-preview",
             ).then(
                 fn=stream_automatic_workspace_name_preview,
-                inputs=[workspace_slug, auto_label, auto_pdfs, auto_folder_pdfs, new_workspace_name, new_workspace_name_auto_state, automatic_selection_state],
+                inputs=[workspace_slug, auto_label, auto_pdfs, auto_folder_pdfs, new_workspace_name, new_workspace_name_auto_state, automatic_selection_state, auto_recognition_effort],
                 outputs=[new_workspace_name, new_workspace_name_auto_state, automatic_run_activity],
                 show_progress="hidden",
                 queue=True,
@@ -36029,7 +36087,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=stream_automatic_detected_metadata_preview,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest, automatic_selection_state],
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest, automatic_selection_state, auto_recognition_effort],
                 outputs=[auto_label, auto_author, auto_short_label, auto_metadata_preview, auto_metadata_status, document_metadata_section, automatic_run_activity],
                 show_progress="hidden",
                 queue=True,
@@ -36045,7 +36103,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 concurrency_id="automatic-estimate-preview",
             ).then(
                 fn=stream_automatic_workspace_name_preview,
-                inputs=[workspace_slug, auto_label, auto_pdfs, auto_folder_pdfs, new_workspace_name, new_workspace_name_auto_state, automatic_selection_state],
+                inputs=[workspace_slug, auto_label, auto_pdfs, auto_folder_pdfs, new_workspace_name, new_workspace_name_auto_state, automatic_selection_state, auto_recognition_effort],
                 outputs=[new_workspace_name, new_workspace_name_auto_state, automatic_run_activity],
                 show_progress="hidden",
                 queue=True,
@@ -36171,7 +36229,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=stream_automatic_detected_metadata_preview,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest, automatic_selection_state],
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest, automatic_selection_state, auto_recognition_effort],
                 outputs=[auto_label, auto_author, auto_short_label, auto_metadata_preview, auto_metadata_status, document_metadata_section, automatic_run_activity],
                 show_progress="hidden",
                 queue=True,
@@ -36179,7 +36237,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 concurrency_id="automatic-metadata-preview",
             ).then(
                 fn=stream_automatic_workspace_name_preview,
-                inputs=[workspace_slug, auto_label, auto_pdfs, auto_folder_pdfs, new_workspace_name, new_workspace_name_auto_state, automatic_selection_state],
+                inputs=[workspace_slug, auto_label, auto_pdfs, auto_folder_pdfs, new_workspace_name, new_workspace_name_auto_state, automatic_selection_state, auto_recognition_effort],
                 outputs=[new_workspace_name, new_workspace_name_auto_state, automatic_run_activity],
                 show_progress="hidden",
                 queue=True,
@@ -37387,6 +37445,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     advanced_validation_phrases,
                     advanced_unstructured_strategy,
                     advanced_retain_detailed_evidence,
+                    auto_recognition_effort,
                 ],
                 outputs=[
                     advanced_run_result,

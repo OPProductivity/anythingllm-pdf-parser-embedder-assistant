@@ -587,6 +587,15 @@ def infer(context):
             work_scope=context.profile.work_scope,
         )
     )
+    from .chapter_geometry import claims as above_title_chapter_claims
+
+    chapter_assertions = above_title_chapter_claims(
+        context.evidence_bundle, kind=context.profile.kind,
+        work_scope=context.profile.work_scope,
+    )
+    assertions.extend(chapter_assertions)
+    attempts.append({"expert": "author_above_chapter_title", "status": "assessed",
+                     "proposals": len(chapter_assertions)})
     # A repository's broad Author(s) field may include a translator. Only
     # revise that roster when an explicit local byline supplies the remaining
     # people and a separately read translation credit explains the difference.
