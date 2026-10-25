@@ -96,8 +96,10 @@ def _image_regions(page, *, invisible_overlay=None):
     return regions
 
 
-def _plan(document, extra_text="", *, ocr_pages=None, native_text=None):
+def _plan(document, extra_text="", *, ocr_pages=None, native_text=None, native_dicts=None):
     """Opening and closing apparatus, extended by publishing structure."""
+    if native_dicts is not None:
+        import fitz
     pages = set(range(1, min(5, len(document)) + 1))
     # Forward the same native readings through this collection, including the
     # OCR-informed planning pass. Nothing survives the current PDF request.
@@ -106,7 +108,14 @@ def _plan(document, extra_text="", *, ocr_pages=None, native_text=None):
     for number in sorted(pages):
         try:
             if number not in native_text:
-                native_text[number] = document[number - 1].get_text("text", sort=True)
+                page = document[number - 1]
+                if native_dicts is None:
+                    native_text[number] = page.get_text("text", sort=True)
+                else:
+                    flags = fitz.TEXTFLAGS_DICT & ~fitz.TEXT_PRESERVE_IMAGES
+                    textpage = page.get_textpage(flags=flags)
+                    native_text[number] = page.get_text("text", sort=True, textpage=textpage)
+                    native_dicts[number] = page.get_text("dict", flags=flags, textpage=textpage)
             page_text[number] = native_text[number]
         except OSError, ValueError, RuntimeError:
             # The scheduled native attempt records this failure later and
@@ -426,28 +435,57 @@ def _read_region(document, task, executable):
 
 
 def _read_regions(document, tasks, executable, *, workers):
-    """Bound both in-flight image memory and external OCR; retain plan order."""
+    """Keep every reading and plan order while reusing newly available slots."""
     from concurrent.futures import ThreadPoolExecutor
     from queue import Empty, Queue
     from threading import Event
 
     workers = _ocr_worker_budget(workers)
-    with ThreadPoolExecutor(
-        max_workers=workers, thread_name_prefix="author-ocr"
-    ) as pool:
-        for offset in range(0, len(tasks), workers):
-            requests = Queue()
-            cancelled = Event()
-            pending = []
-            for task in tasks[offset : offset + workers]:
-                try:
-                    if workers == 1:
-                        readings, attempts = _read_region(document, task, executable)
-                        pending.append((task, (readings, attempts)))
-                    else:
-                        prepared = _prepare_region(
-                            document, task, factors=(_region_scale(task),)
-                        )
+
+    def failure(task, error):
+        return [], [{"kind": "ocr", **task, "status": "failed", "error": str(error)}]
+
+    if workers == 1:
+        for task in tasks:
+            try:
+                readings, attempts = _read_region(document, task, executable)
+            except (OSError, ValueError, RuntimeError) as error:
+                readings, attempts = failure(task, error)
+            yield task, readings, attempts
+        return
+    requests = Queue()
+    cancelled = Event()
+
+    def service_request(request):
+        task, factor, ready, response = request
+        try:
+            frame = _prepare_region(document, task, factors=(factor,)).frames[factor]
+        except (OSError, ValueError, RuntimeError) as error:
+            frame = {"error": str(error)}
+        response.append(frame)
+        ready.set()
+
+    def drain_requests():
+        while True:
+            try:
+                service_request(requests.get_nowait())
+            except Empty:
+                return
+
+    # Completed text/geometry may wait for an earlier region, but completed
+    # image payloads are released. At most `workers` raster jobs are in flight.
+    inflight, completed = {}, {}
+    next_submit = next_yield = 0
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="author-ocr") as pool:
+        try:
+            while next_yield < len(tasks):
+                drain_requests()
+                while next_submit < len(tasks) and len(inflight) < workers:
+                    index = next_submit
+                    task = tasks[index]
+                    next_submit += 1
+                    try:
+                        prepared = _prepare_region(document, task, factors=(_region_scale(task),))
 
                         def request_frame(factor, task=task):
                             ready, response = Event(), []
@@ -458,76 +496,32 @@ def _read_regions(document, tasks, executable, *, workers):
                             return response[0]
 
                         prepared = replace(prepared, request_frame=request_frame)
-                        # The lossless uncompressed transport has no PNG
-                        # encoder holding up pipe readers. Start this reading
-                        # while the owner renders the remaining bounded batch.
-                        pending.append(
-                            (task, pool.submit(_read_region, prepared, task, executable))
-                        )
-                except (OSError, ValueError, RuntimeError) as error:
-                    pending.append(
-                        (
-                            task,
-                            (
-                                [],
-                                [
-                                    {
-                                        "kind": "ocr",
-                                        **task,
-                                        "status": "failed",
-                                        "error": str(error),
-                                    }
-                                ],
-                            ),
-                        )
-                    )
-                except BaseException:
-                    # A programming error or cancellation during a later
-                    # render must release workers already waiting for a retry
-                    # raster before the executor joins their threads.
-                    cancelled.set()
-                    raise
-            # Only a retry actually requested by recognition needs another
-            # raster. The owner services requests; workers never touch the PDF.
-            # This removes unused image encoding, not acquisition opportunities.
-            try:
-                while any(
-                    not result.done()
-                    for _, result in pending
-                    if not isinstance(result, tuple)
-                ):
-                    try:
-                        task, factor, ready, response = requests.get(timeout=0.02)
-                    except Empty:
-                        continue
-                    try:
-                        frame = _prepare_region(
-                            document, task, factors=(factor,)
-                        ).frames[factor]
+                        inflight[index] = pool.submit(_read_region, prepared, task, executable)
+                        del prepared
                     except (OSError, ValueError, RuntimeError) as error:
-                        frame = {"error": str(error)}
-                    response.append(frame)
-                    ready.set()
-            finally:
-                cancelled.set()
-            for task, result in pending:
-                try:
-                    readings, attempts = (
-                        result if isinstance(result, tuple) else result.result()
-                    )
-                except (OSError, ValueError, RuntimeError) as error:
-                    readings, attempts = (
-                        [],
-                        [
-                            {
-                                "kind": "ocr",
-                                **task,
-                                "status": "failed",
-                                "error": str(error),
-                            }
-                        ],
-                    )
-                yield task, readings, attempts
+                        completed[index] = failure(task, error)
+                for index in [i for i, future in inflight.items() if future.done()]:
+                    future = inflight.pop(index)
+                    try:
+                        completed[index] = future.result()
+                    except (OSError, ValueError, RuntimeError) as error:
+                        completed[index] = failure(tasks[index], error)
+                while next_yield in completed:
+                    readings, attempts = completed.pop(next_yield)
+                    task = tasks[next_yield]
+                    next_yield += 1
+                    yield task, readings, attempts
+                if next_submit < len(tasks) and len(inflight) < workers:
+                    continue
+                if inflight:
+                    try:
+                        service_request(requests.get(timeout=0.02))
+                    except Empty:
+                        pass
+        finally:
+            # Close/cancellation or an unexpected renderer failure must release
+            # any worker awaiting an owner-thread retry before executor shutdown.
+            cancelled.set()
 
 
 def _hidden_explicit_byline_lines(page, *, require_person=True):
@@ -661,7 +655,10 @@ def collect(context):
             }
             trace["document_page_count"] = len(document)
             planning_text = {}
-            pages, trace["extensions"] = _plan(document, native_text=planning_text)
+            planning_dicts = {}
+            pages, trace["extensions"] = _plan(
+                document, native_text=planning_text, native_dicts=planning_dicts
+            )
             lab_pages = (
                 list(
                     range(1, min(max(5, context.lab_page_limit), 32, len(document)) + 1)
@@ -690,17 +687,24 @@ def collect(context):
             def read_native(number):
                 try:
                     page = document[number - 1]
+                    native_dict = planning_dicts.pop(number, None)
+                    flags = fitz.TEXTFLAGS_DICT & ~fitz.TEXT_PRESERVE_IMAGES
+                    textpage = (
+                        None if native_dict is not None else page.get_textpage(flags=flags)
+                    )
                     text = (
                         planning_text[number]
                         if number in planning_text
-                        else page.get_text("text", sort=True)
+                        else page.get_text("text", sort=True, textpage=textpage)
                     )
+                    if native_dict is None:
+                        native_dict = page.get_text("dict", flags=flags, textpage=textpage)
                     native.append(
                         {
                             "page": number,
                             "text": text,
-                            "horizontal_lines": positioned_lines(page),
-                            "layout_lines": _native_page(page),
+                            "horizontal_lines": positioned_lines(page, native_dict=native_dict),
+                            "layout_lines": _native_page(page, native_dict=native_dict),
                             "width": page.rect.width,
                             "height": page.rect.height,
                         }

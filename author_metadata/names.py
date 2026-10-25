@@ -286,6 +286,7 @@ def strip_known_extraction_structure_labels(text):
     return re.sub(rf"(?mi)^\s*\[(?:{labels})\]\s*", "", str(text or ""))
 
 
+@immutable_lexical_parse("affiliation_hint")
 def has_author_affiliation_hint(value, *, max_chars=180):
     """Recognize a compact affiliation tail without treating prose as one."""
     normalized = normalize_text(value or "")

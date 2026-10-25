@@ -50,10 +50,14 @@ def _composition(atoms, indexes, kind):
 
 def native_page_atoms(page, page_number):
     """Keep positioned words and their extractor references, without reflow."""
-    data = page.get_text("dict", sort=False, flags=fitz.TEXTFLAGS_DICT & ~fitz.TEXT_PRESERVE_IMAGES)
+    # Both views use identical flags. Extract the page once, then derive each
+    # existing representation; this TextPage never leaves the current call.
+    flags = fitz.TEXTFLAGS_DICT & ~fitz.TEXT_PRESERVE_IMAGES
+    textpage = page.get_textpage(flags=flags)
+    data = page.get_text("dict", sort=False, flags=flags, textpage=textpage)
     blocks = data.get("blocks") or []
     atoms = []
-    for index, word in enumerate(page.get_text("words", sort=False)):
+    for index, word in enumerate(page.get_text("words", sort=False, textpage=textpage)):
         if len(word) < 8 or not str(word[4]).strip():
             continue
         x0, y0, x1, y1, value, block_no, line_no, word_no = word[:8]
@@ -206,8 +210,8 @@ def _line_compositions(atoms, page_width):
     return proposals
 
 
-def _title_overlap(text, title_hint):
-    expected = title_words(title_hint)
+def _title_overlap(text, title_hint, *, expected_words=None):
+    expected = title_words(title_hint) if expected_words is None else expected_words
     observed = title_words(text)
     if len(expected) < 2 or not observed:
         return 0.0
@@ -219,11 +223,21 @@ def _title_overlap(text, title_hint):
 def map_atoms(atoms, page_number, width, height, title_hint=""):
     width, height = float(width), float(height)
     groups = _line_compositions(atoms, width)
+    groups_by_id = {}
+    for group in groups:
+        # Preserve the original first-match semantics even for colliding IDs.
+        groups_by_id.setdefault(group["id"], group)
+    expected_title_words = title_words(title_hint)
+    title_scores = {}
     fields = []
     for group in groups:
         content = group["text"].strip()
         top = group["bbox"][1]
-        title_score = _title_overlap(content, title_hint)
+        if content not in title_scores:
+            title_scores[content] = _title_overlap(
+                content, title_hint, expected_words=expected_title_words
+            )
+        title_score = title_scores[content]
         if title_score >= .68 and top <= height * .82:
             fields.append({"role": "work_title", "group_id": group["id"],
                            "score": round(title_score, 3), "reason": "visible_title_overlap"})
@@ -278,7 +292,7 @@ def map_atoms(atoms, page_number, width, height, title_hint=""):
     for field in list(fields):
         if field["role"] != "work_title" or field.get("reason") != "visible_title_overlap":
             continue
-        base = next((group for group in groups if group["id"] == field["group_id"]), None)
+        base = groups_by_id.get(field["group_id"])
         if base is None:
             continue
         base_ids = set(base["atom_ids"])
@@ -298,16 +312,16 @@ def map_atoms(atoms, page_number, width, height, title_hint=""):
     if contents_headings:
         heading_bottom = min(group["bbox"][3] for group in contents_headings)
         for field in fields:
-            group = next((item for item in groups if item["id"] == field["group_id"]), None)
+            group = groups_by_id.get(field["group_id"])
             if field["role"] == "work_title" and group and group["bbox"][1] > heading_bottom:
                 field["role"] = "contents_entry_title"
                 field["reason"] = "title_words_inside_contents_entry"
-    title_groups = [group for group in groups if any(
-        row["role"] == "work_title" and row["group_id"] == group["id"] for row in fields)]
+    title_group_ids = {row["group_id"] for row in fields if row["role"] == "work_title"}
+    title_groups = [group for group in groups if group["id"] in title_group_ids]
     for row in fields:
         if row["role"] not in {"author_credit", "possible_person_credit"}:
             continue
-        candidate = next(group for group in groups if group["id"] == row["group_id"])
+        candidate = groups_by_id[row["group_id"]]
         row["near_title"] = False
         for title in title_groups:
             below_aligned = (

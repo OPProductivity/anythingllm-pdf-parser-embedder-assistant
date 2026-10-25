@@ -155,6 +155,55 @@ def _claim(author, sample, evidence, family, creator_type, priority=109):
     }
 
 
+def _owned_brochure_claims(samples):
+    """Join a company's publishing voice, recurring domain and legal credit.
+
+    Ownership alone is insufficient. Named individual authors still outrank
+    this organizational proposal during selected-work reconciliation.
+    """
+    result = []
+    for sample in samples:
+        text = " ".join(str(sample.get("text") or "").split())
+        notice = re.search(
+            r"(?:©\s*(?:Copyright\s*)?|Copyright\s*(?:©\s*)?)"
+            r"(?:19|20)\d{2}(?:\s*[-–]\s*(?:19|20)?\d{2})?[,\s]+"
+            r"(.{2,100}?)\s+All rights reserved\b", text, re.I
+        )
+        if not notice:
+            continue
+        legal = notice[1].strip(" .,;")
+        owner = re.sub(
+            r"(?:,\s*|\s+)(?:Inc(?:orporated)?|Corp(?:oration)?|Ltd|Limited|LLC|PLC)\.?$",
+            "", legal, flags=re.I
+        ).strip(" .,;")
+        if owner == legal or re.search(r"\b(?:press|publishers?|publishing|printing)\b", owner, re.I):
+            continue
+        owner_key = "".join(c.casefold() for c in owner if c.isalnum())
+        domains = set()
+        narration = None
+        for other in samples:
+            lines = [line.strip() for line in str(other.get("text") or "").splitlines() if line.strip()]
+            for line in lines[:3] + lines[-3:]:
+                compact = re.sub(r"\s+", "", line)
+                domain = re.search(r"(?:https?://)?(?:www\.)?([A-Za-z0-9-]{3,65})\.(?:com|org|net|io|co)(?=$|[/\d:])", compact, re.I)
+                if domain and domain[1].replace("-", "").casefold() == owner_key:
+                    domains.add(int(other.get("page") or 0))
+            compact = " ".join(str(other.get("text") or "").split())
+            voice = re.search(
+                r"\bwe(?:['’](?:ve|re)|\s+(?:have|are|offer|present|share|bring|provide))"
+                r"\s+[^.!?]{0,180}\b(?:tips|guides?|insights|findings|recommendations|case studies)\b",
+                compact, re.I
+            )
+            if voice and not re.search(r'[“”"]', compact[max(0, voice.start()-180):voice.end()+120]):
+                narration = (int(other.get("page") or 0), voice[0])
+        if len(domains) >= 2 and narration:
+            result.append(_claim(owner, sample,
+                notice[0] + " / matching recurring domain on pages " + ", ".join(map(str,sorted(domains)))
+                + " / publisher narrative on page " + str(narration[0]) + ": " + narration[1],
+                "corporate_brochure_domain_voice_and_legal_credit", "organization", priority=104))
+    return result
+
+
 def _institutional_deck_claims(opening, all_text, opening_text, sampled_pages=()):
     """A company's own investor/profile act, not a logo or ownership alone."""
     result = []
@@ -339,6 +388,8 @@ def claims(samples, *, kind, work_scope, opening_pages=None):
         "",
     )
     result.extend(_institutional_deck_claims(opening, all_text, opening_text, samples))
+    if kind in {"generic", "report", "corporate_publication"}:
+        result.extend(_owned_brochure_claims(samples))
     personal_post = _personal_post_claim(opening_text, all_text)
     if personal_post:
         result.append(personal_post)

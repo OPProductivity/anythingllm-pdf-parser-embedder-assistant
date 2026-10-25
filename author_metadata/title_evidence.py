@@ -2,8 +2,10 @@
 
 import re
 import unicodedata
+from .lexical_scope import lexical_parse
 
 
+@lexical_parse("title_words")
 def words(value):
     return tuple(re.findall(r"[^\W_]+", unicodedata.normalize("NFC", value).casefold()))
 

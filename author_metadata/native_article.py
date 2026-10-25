@@ -17,7 +17,7 @@ _INSTITUTION = re.compile(
 )
 
 
-def positioned_lines(page):
+def positioned_lines(page, *, native_dict=None):
     """Keep name letters at their own baseline; discard smaller footnote markers."""
     import fitz
 
@@ -44,9 +44,10 @@ def positioned_lines(page):
 
     fragments = []
     detached_identifiers = []
-    for block in page.get_text(
+    data = native_dict if native_dict is not None else page.get_text(
         "dict", flags=fitz.TEXTFLAGS_DICT & ~fitz.TEXT_PRESERVE_IMAGES
-    )["blocks"]:
+    )
+    for block in data["blocks"]:
         for line in block.get("lines", []):
             if abs(line.get("dir", (1, 0))[0]) < 0.9:
                 continue

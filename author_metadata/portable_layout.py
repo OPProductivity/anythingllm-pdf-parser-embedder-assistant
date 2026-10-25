@@ -423,13 +423,14 @@ def read_tsv(payload):
     return "\n".join(v["text"] for v in lines), lines
 
 
-def _native_page(page):
+def _native_page(page, *, native_dict=None):
     import fitz
 
     lines = []
-    for block in page.get_text(
+    data = native_dict if native_dict is not None else page.get_text(
         "dict", flags=fitz.TEXTFLAGS_DICT & ~fitz.TEXT_PRESERVE_IMAGES
-    )["blocks"]:
+    )
+    for block in data["blocks"]:
         for line in block.get("lines", []):
             spans = line["spans"]
             text = "".join(s["text"] for s in spans)
