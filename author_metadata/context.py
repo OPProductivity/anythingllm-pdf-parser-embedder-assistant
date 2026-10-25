@@ -17,7 +17,7 @@ class AuthorEvidenceContext:
     acquisition_mode: str = "production"
     ocr_workers: int = 0
     lab_page_limit: int = 12
-    recognition_effort: str = "extremely_thorough"
+    recognition_effort: str = "thorough"
     acquisition_checkpoint: Callable | None = field(default=None, repr=False, compare=False)
 
     def profile_evidence(self):
@@ -73,7 +73,7 @@ class AuthorEvidenceContext:
         acquisition_mode="production",
         ocr_workers=0,
         lab_page_limit=12,
-        recognition_effort="extremely_thorough",
+        recognition_effort="thorough",
         acquisition_checkpoint=None,
     ):
         from recognition_effort import normalize_effort
@@ -89,6 +89,6 @@ class AuthorEvidenceContext:
             acquisition_mode=acquisition_mode,
             ocr_workers=ocr_workers,
             lab_page_limit=lab_page_limit,
-            recognition_effort=normalize_effort(recognition_effort).value,
+            recognition_effort=normalize_effort("thorough" if recognition_effort is None else recognition_effort).value,
             acquisition_checkpoint=acquisition_checkpoint,
         )

@@ -68,8 +68,8 @@ def test_confirmed_request_freezes_the_selected_effort_and_passes_it_to_worker_n
     assert request.to_legacy_namespace().recognition_effort == "thorough"
 
 
-def test_legacy_engine_request_retains_extremely_thorough_acquisition():
-    assert RunRequest(input_paths=("sample.pdf",)).recognition_effort == "extremely_thorough"
+def test_default_production_request_uses_the_qualified_thorough_policy():
+    assert RunRequest(input_paths=("sample.pdf",)).recognition_effort == "thorough"
 
 
 @pytest.mark.parametrize("empty_pairs,expected", [(2, False), (3, True), (8, True)])

@@ -14,6 +14,7 @@ does not prove a later one.
 """
 
 import argparse
+from recognition_effort import production_effort_value
 from text_export_hygiene import ascii_label_word, prepare_readable_pages, readable_export_text
 import csv
 import concurrent.futures
@@ -22067,7 +22068,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     author_context = AuthorEvidenceContext.from_samples(
         author_text_samples, path=pdf_path, title_hint=title,
         profile=work_identity.profile,
-        recognition_effort=getattr(args, "recognition_effort", "extremely_thorough"),
+        recognition_effort=production_effort_value(getattr(args, "recognition_effort", None)),
     )
     inferred_author = infer_profiled_author(
         author_context, sampling_error=author_sample_error,
@@ -26135,7 +26136,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         "detected_title": profile.get("detected_title", ""),
         "detected_author": profile.get("detected_author", ""),
         "detected_publisher": profile.get("detected_publisher", ""),
-        "author_recognition_effort": profile.get("author_recognition_effort", "extremely_thorough"),
+        "author_recognition_effort": profile.get("author_recognition_effort", "thorough"),
         "author_optional_retries_deferred": profile.get("author_optional_retries_deferred", 0),
         "source_short_label": profile.get("source_short_label", ""),
         "metadata_provenance": dict(profile.get("metadata_provenance") or {}),
@@ -26779,7 +26780,8 @@ def main():
     parser.add_argument("--document-label", default="")
     parser.add_argument("--document-author", default="")
     parser.add_argument("--document-publisher", default="")
-    parser.add_argument("--recognition-effort", choices=["thorough", "extremely_thorough"], default="extremely_thorough")
+    parser.add_argument("--recognition-effort", type=production_effort_value, choices=["thorough"], default="thorough",
+                        help="Author recognition uses Thorough; historical effort values are migrated to it.")
     parser.add_argument("--document-short-label", default="")
     parser.add_argument("--deep-extraction", action="store_true")
     parser.add_argument("--include-front-matter", action="store_true")

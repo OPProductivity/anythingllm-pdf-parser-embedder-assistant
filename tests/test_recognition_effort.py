@@ -83,3 +83,16 @@ def test_round_trip_serializes_only_preference(tmp_path):
     assert raw == {"schema_version": 1, "effort": "extremely_thorough"}
     assert normalize_effort(RecognitionEffort.THOROUGH).slider_value == 0
     assert normalize_effort("Extremely Thorough").label == "Extremely Thorough"
+
+
+@pytest.mark.parametrize("value", [None, "", 0, 1, 0.0, 1.0, "thorough", "Extremely Thorough"])
+def test_production_policy_accepts_known_historical_values_without_restoring_retired_mode(value):
+    from recognition_effort import production_effort
+    assert production_effort(value) is RecognitionEffort.THOROUGH
+
+
+@pytest.mark.parametrize("value", [False, True, 2, .5, "fast", {}, []])
+def test_fixed_production_policy_does_not_silently_accept_invalid_intent(value):
+    from recognition_effort import production_effort
+    with pytest.raises(ValueError):
+        production_effort(value)

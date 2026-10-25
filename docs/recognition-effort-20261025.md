@@ -1,5 +1,9 @@
 # Recognition effort and chapter geometry
 
+Production mode selection was retired on October 26: see
+`thorough-only-20261026.md`. This document preserves the earlier two-mode
+architecture and qualification context.
+
 Status: source 03 passed the completed corpus, evidence and bounded live-path
 checks. See recognition-effort-qualification-20261025.md for scores, runtime
 review, coverage and limits. Git/runtime release receipts distinguish publication

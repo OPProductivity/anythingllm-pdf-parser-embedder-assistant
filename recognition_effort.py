@@ -1,7 +1,8 @@
 """Persist the last author-recognition effort choice, separately from run data.
 
-The UI will use Thorough on first use. Legacy engine calls keep their full
-acquisition behavior unless they explicitly receive another effort value.
+Production uses Thorough only. The former selectable preference is retained
+for compatibility with historical research tools; production does not read it.
+Full acquisition remains available explicitly to laboratory callers.
 This module stores a preference only; it cannot authorize an unqualified
 early-stop policy or turn a workload heuristic into a failure probability.
 """
@@ -47,6 +48,23 @@ def normalize_effort(value: object) -> RecognitionEffort:
         except ValueError:
             pass
     raise ValueError("Choose Thorough or Extremely Thorough.")
+
+
+def production_effort(value: object = None) -> RecognitionEffort:
+    """Validate legacy intent, then use the sole qualified production policy.
+
+    Old profiles/requests may still contain 0/1 or extremely_thorough. Accept
+    those known historical values without allowing them to restore a retired
+    user choice. Invalid values remain errors. Laboratory callers use
+    normalize_effort directly, outside production request construction.
+    """
+    if value is not None and value != "":
+        normalize_effort(value)
+    return RecognitionEffort.THOROUGH
+
+
+def production_effort_value(value: object = None) -> str:
+    return production_effort(value).value
 
 
 @dataclass(frozen=True)

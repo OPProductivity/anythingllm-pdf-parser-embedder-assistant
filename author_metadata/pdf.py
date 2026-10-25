@@ -128,7 +128,7 @@ def corroborates_filename_surname(existing_author, existing_source, native_sampl
 
 def infer_author_from_initial_pdf_pages(path: Path, title_hint="", *, page_limit=3,
                                         use_file_title_fallback=True,
-                                        recognition_effort="extremely_thorough"):
+                                        recognition_effort="thorough"):
     """Seed a UI suggestion, then complete planned native/image acquisition.
 
     ``page_limit`` bounds the initial seed, not the shared acquisition plan.

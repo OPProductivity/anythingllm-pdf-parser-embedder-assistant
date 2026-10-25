@@ -711,7 +711,7 @@ def _check_ocr(author, text, ocr_map=None, title_hint="", native_map=None):
 
 def review_author_field_map(pdf_path, *, title_hint="", author="", author_source="",
                             ocr_peer_pages=(), tesseract="", max_ocr_calls=3,
-                            ocr_runner=None, recognition_effort="extremely_thorough"):
+                            ocr_runner=None, recognition_effort="thorough"):
     """Bounded evidence cycle. No returned candidate changes final metadata."""
     from .context import AuthorEvidenceContext
     from .dispatcher import infer_author

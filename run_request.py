@@ -59,7 +59,7 @@ class RunRequest:
     document_author: str = ""
     document_short_label: str = ""
     document_publisher: str = ""
-    recognition_effort: str = "extremely_thorough"
+    recognition_effort: str = "thorough"
     use_file_title_fallback: bool = False
     output_root_override: str | None = None
     retain_diagnostic_evidence: bool = False
@@ -102,9 +102,9 @@ class RunRequest:
     temporary_validation_cleanup_policy: str = "cleanup_always"
 
     def __post_init__(self) -> None:
-        from recognition_effort import normalize_effort
+        from recognition_effort import production_effort as normalize_effort
 
-        object.__setattr__(self, "recognition_effort", normalize_effort(self.recognition_effort if self.recognition_effort is not None and self.recognition_effort != "" else "extremely_thorough").value)
+        object.__setattr__(self, "recognition_effort", normalize_effort(self.recognition_effort if self.recognition_effort is not None and self.recognition_effort != "" else "thorough").value)
         if not self.input_paths:
             raise ValueError("RunRequest requires at least one input path.")
         if self.mode not in {LOCAL_ONLY, NATIVE_UPLOAD}:
@@ -195,7 +195,7 @@ class RunRequest:
             document_author=str(settings.get("document_author") or "").strip(),
             document_short_label=str(settings.get("document_short_label") or "").strip(),
             document_publisher=str(settings.get("document_publisher") or "").strip(),
-            recognition_effort=settings.get("recognition_effort", "extremely_thorough"),
+            recognition_effort=settings.get("recognition_effort", "thorough"),
             use_file_title_fallback=bool(settings.get("use_file_title_fallback")),
             output_root_override=_optional_text(settings.get("output_root_override")),
             retain_diagnostic_evidence=not bool(settings.get("lean_retention", True)),
@@ -240,7 +240,7 @@ class RunRequest:
             document_author=str(getattr(args, "document_author", "") or "").strip(),
             document_short_label=str(getattr(args, "document_short_label", "") or "").strip(),
             document_publisher=str(getattr(args, "document_publisher", "") or "").strip(),
-            recognition_effort=getattr(args, "recognition_effort", "extremely_thorough"),
+            recognition_effort=getattr(args, "recognition_effort", "thorough"),
             use_file_title_fallback=bool(getattr(args, "use_file_title_fallback", False)),
             output_root_override=_optional_text(getattr(args, "out_dir", "")),
             retain_diagnostic_evidence=not bool(getattr(args, "lean_retention", True)),
