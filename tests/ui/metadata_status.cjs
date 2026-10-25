@@ -10,7 +10,10 @@ const server = http.createServer((_request, response) => {
     + '<div id="automatic-pdf-upload"><div class="file-preview"><table><tbody></tbody></table></div></div>'
     + '<div id="batch-folder-file-selector"></div>'
     + '<div id="document-metadata-accordion"><button class="label-wrap"><span>Document metadata</span>'
-    + '<span class="icon">▼</span></button></div>'
+    + '<span class="icon">▼</span></button><div id="metadata-tables"></div></div>'
+    + ['title', 'author', 'short-label', 'publisher'].map(field =>
+      '<div hidden id="automatic-' + field + '-override-transport"><textarea></textarea></div>').join('')
+    + '<div hidden id="automatic-document-overrides-transport"><textarea>{}</textarea></div>'
     + '<div class="metadata-status-transport" id="document-metadata-scan-status"><div class="metadata-scan-inline" data-state="idle" role="status" aria-live="polite">'
     + '<span class="metadata-scan-spinner"></span><span class="metadata-scan-copy"></span></div></div>');
 });
@@ -76,6 +79,42 @@ const server = http.createServer((_request, response) => {
       node.innerHTML = '<div class="metadata-scan-inline" data-state="warning" role="status"><span class="metadata-scan-copy">Metadata preview finished with an error.</span></div>';
     });
     await page.waitForFunction(() => document.querySelector('.metadata-header-status')?.dataset.state === 'warning');
+
+    // These are the actual Python-rendered tables and application JS. No PDF
+    // inference is simulated as correctness evidence: this exercises early
+    // editing and HTML replacement before/during/after metadata detection.
+    await page.locator('#metadata-tables').evaluate((node, html) => { node.innerHTML = html; }, source.pending);
+    const editors = page.locator('.metadata-override-input');
+    assert.equal(await editors.count(), 8);
+    const titleSuggestions = page.locator('[data-metadata-known="filename"]');
+    assert.deepEqual(await titleSuggestions.allTextContents(), ['first', 'second']);
+    const firstAuthor = page.locator('[data-metadata-override="document_author"]').first();
+    const secondPublisher = page.locator('[data-metadata-override="document_publisher"]').nth(1);
+    await firstAuthor.fill('First independent author');
+    await secondPublisher.fill('Second independent press');
+    const transport = page.locator('#automatic-document-overrides-transport textarea');
+    const saved = JSON.parse(await transport.inputValue());
+    const documents = Object.values(saved);
+    assert.equal(documents.filter(item => item.document_author === 'First independent author').length, 1);
+    assert.equal(documents.filter(item => item.document_publisher === 'Second independent press').length, 1);
+
+    // A new file-list mutation invokes the immediate loading pass. Known
+    // filename suggestions survive it; unknown author/publisher cells load.
+    await page.evaluate(() => {
+      const token = document.createElement('span'); token.className = 'token'; token.textContent = 'fourth.pdf ×';
+      document.querySelector('#batch-folder-file-selector').appendChild(token);
+    });
+    await page.waitForFunction(() => document.querySelector('.metadata-header-copy')?.textContent?.includes('4 PDFs'));
+    assert.deepEqual(await titleSuggestions.allTextContents(), ['first', 'second']);
+    assert.equal(await editors.evaluateAll(nodes => nodes.every(node => !node.disabled)), true);
+    await page.locator('#metadata-tables').evaluate((node, html) => { node.innerHTML = html; }, source.pending);
+    await page.waitForFunction(() => document.querySelectorAll('[data-metadata-override="document_author"]')[0]?.value === 'First independent author');
+    assert.equal(await secondPublisher.inputValue(), 'Second independent press');
+    assert.equal(await page.locator('[data-metadata-override="document_author"]').nth(1).inputValue(), '');
+    assert.equal(await page.locator('[data-metadata-override="document_publisher"]').first().inputValue(), '');
+    await secondPublisher.fill('Second press after replacement');
+    assert.equal(Object.values(JSON.parse(await transport.inputValue())).filter(item =>
+      item.document_publisher === 'Second press after replacement').length, 1);
     console.log('Immediate single, batch, progress, completion, reselection and warning states passed');
   } finally { await browser.close(); server.close(); }
 })().catch(error => { console.error(error.stack); process.exitCode = 1; });

@@ -15,11 +15,14 @@ def test_selected_pdf_metadata_status_is_visible_until_preview_finishes(tmp_path
     if not node:
         pytest.skip("This local browser test requires Node.js and Playwright")
     root = Path(__file__).resolve().parent.parent
-    from rag_pdf_gradio_app import APP_BROWSER_THEME_HEAD, APP_CSS
+    from rag_pdf_gradio_app import APP_BROWSER_THEME_HEAD, APP_CSS, pending_selected_metadata_preview
 
     fixture = tmp_path / "metadata-status-source.json"
     fixture.write_text(json.dumps({"APP_BROWSER_THEME_HEAD": APP_BROWSER_THEME_HEAD,
-                                   "APP_CSS": APP_CSS}), encoding="utf8")
+                                   "APP_CSS": APP_CSS,
+                                   "pending": pending_selected_metadata_preview(
+                                       ["first.pdf", "second.pdf"], []),
+                                   }), encoding="utf8")
     result = subprocess.run(
         [node, str(root / "tests/ui/metadata_status.cjs"), str(fixture)],
         capture_output=True, text=True, encoding="utf8", timeout=60,

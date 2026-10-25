@@ -86,16 +86,67 @@ def test_folder_names_are_visible_before_the_all_page_inspection_starts(monkeypa
     monkeypatch.setattr(app, "iter_pdf_picker_page_details", inspect)
     monkeypatch.setattr(app, "batch_folder_selected_status_html", lambda *_args: "Selected")
     monkeypatch.setattr(app, "retain_batch_native_inspection", lambda _coverage: None)
-    stream = app.stream_selected_pdf_directory(str(tmp_path), True)
+    stream = app.stream_selected_pdf_directory_with_metadata(str(tmp_path), True)
     initial = next(stream)
     inspect.assert_not_called()
     assert initial[0] == [path]
     assert initial[2]["visible"] and not initial[2]["interactive"]
     assert "selected.pdf" in initial[2]["choices"][0][0]
     assert "pages checking" in initial[2]["choices"][0][0]
+    assert len(initial) == 8
+    assert 'data-metadata-known="filename">selected<' in initial[7]
+    assert initial[7].count('class="metadata-override-input ') == 4
     final = list(stream)[-1]
     assert final[2]["interactive"]
     assert "12 pages" in final[2]["choices"][0][0]
+
+
+@pytest.mark.parametrize("picker", ["direct", "folder"])
+def test_all_eleven_documents_have_editors_and_known_titles_before_any_pdf_read(monkeypatch, picker):
+    files = [f"selection/source-{index}.pdf" for index in range(11)]
+    read = Mock(side_effect=AssertionError("Pending editors must not inspect PDF pages or metadata"))
+    monkeypatch.setattr(app, "detected_metadata_preview", read)
+    monkeypatch.setattr(app, "pdf_picker_page_details", read)
+    monkeypatch.setattr(app, "folder_manifest_candidates", read)
+    panel = app.pending_selected_metadata_preview(
+        files if picker == "direct" else [], files if picker == "folder" else [],
+    )
+    assert panel.count('class="metadata-override-input ') == 44
+    assert panel.count('data-metadata-known="filename"') == 11
+    for index, path in enumerate(files):
+        assert f'>source-{index}<' in panel
+        assert f'data-metadata-document="{app.local_path_identity_key(path)}"' in panel
+    assert 'disabled' not in panel
+    assert 'Loading' in panel
+    read.assert_not_called()
+
+
+def test_pending_edit_keys_survive_upload_copy_merge_and_keep_distinct_folder_sources(tmp_path):
+    files = []
+    for directory in ["folder-a", "folder-b", "browser"]:
+        path = tmp_path / directory / "same.pdf"
+        path.parent.mkdir()
+        path.write_bytes(b"%PDF-1.4\nidentical")
+        files.append(str(path))
+    panel = app.pending_selected_metadata_preview([files[2]], files[:2], {"pdf_candidates": files[:2]})
+    assert panel.count('class="metadata-override-input ') == 8
+    assert app.local_path_identity_key(files[2]) not in panel
+    assert all(app.local_path_identity_key(path) in panel for path in files[:2])
+
+
+def test_pending_editor_cannot_publish_for_a_cleared_selection_or_running_job():
+    request = SimpleNamespace(session_hash="early-editors")
+    state = app.automatic_selection_begin_state({}, "", ["old.pdf"], [], {}, request=request)[0]
+    app.automatic_clear_selection_begin_state(state, "", ["old.pdf"], [], {}, request=request)
+    assert app.pending_selected_metadata_preview(["old.pdf"], selection_state=state, request=request) == app.gr.update()
+    app.LIVE_AUTOMATIC_RUN_STATUS.update(state="running", run_root="owned-run")
+    assert app.pending_selected_metadata_preview(["new.pdf"]) == app.gr.update()
+
+
+def test_selection_defaults_never_reset_the_four_editable_override_transports(monkeypatch):
+    monkeypatch.setattr(app, "local_workspace_choices", lambda: ([], ""))
+    updates = app.reset_automatic_run_selection_settings("", ["first.pdf", "second.pdf"], [], {"state": "pending"})
+    assert updates[45:49] == (app.gr.update(),) * 4
 
 
 def test_clear_invalidates_folder_scan_before_it_can_restore_old_sources(monkeypatch, tmp_path):
@@ -236,6 +287,12 @@ def test_direct_and_folder_selection_chains_use_the_same_stream():
     assert names.index(next(n for n in names if "reset_automatic_run_selection_settings" in n)) < names.index(
         next(n for n in names if "stream_automatic_detected_metadata_preview" in n)
     )
+    assert names.index(next(n for n in names if "pending_selected_metadata_preview" in n)) < names.index(
+        next(n for n in names if "merge_uploaded_pdfs_into_direct_selection" in n)
+    )
+    folder = next(d for d in config["dependencies"]
+                  if "stream_selected_pdf_directory_with_metadata" in str(d.get("api_name") or ""))
+    assert len(folder["outputs"]) == 8
     assert names.index(next(n for n in names if 'stream_automatic_detected_metadata_preview' in n)) < names.index(
         next(n for n in names if 'stream_refresh_automatic_run_estimate_for_fresh_selection' in n)
     )

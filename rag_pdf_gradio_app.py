@@ -1044,7 +1044,7 @@ APP_CONNECTION_WATCHDOG_HEAD = """
       if (!first || state !== "idle") showMetadataStatus(state, message);
     };
     const markDetectedValuesLoading = () => {
-      document.querySelectorAll("#document-metadata-accordion .metadata-detected-value")
+      document.querySelectorAll("#document-metadata-accordion .metadata-detected-value:not([data-metadata-known='filename'])")
         .forEach(cell => { cell.textContent = "Loading…"; });
     };
     const syncMetadataStatus = () => {
@@ -12100,6 +12100,22 @@ def choose_pdf_input_directory_for_scan(current_value="", selection_state=None):
     )
 
 
+def stream_selected_pdf_directory_with_metadata(path_text="", scan_requested=False, selection_state=None, request: gr.Request = None):
+    """Publish keyed editors in the same stream as the first discovered paths.
+
+    Keep page inspection's existing output contract for other callers. The UI
+    receives one extra HTML output before requesting the next scan step.
+    """
+    for update in stream_selected_pdf_directory(path_text, scan_requested, selection_state, request):
+        metadata = gr.update()
+        if isinstance(update[0], list):
+            metadata = pending_selected_metadata_preview(
+                [], update[0], update[1] if isinstance(update[1], dict) else {},
+                selection_state, request,
+            )
+        yield (*update, metadata)
+
+
 def stream_selected_pdf_directory(path_text="", scan_requested=False, selection_state=None, request: gr.Request = None):
     """Stream recursive discovery UI updates, then return one validated manifest."""
     def current():
@@ -13103,6 +13119,34 @@ def metadata_scan_status_html(state, message):
         '<span class="metadata-scan-spinner" aria-hidden="true"></span>'
         f'<span class="metadata-scan-copy">{html.escape(message)}</span></div>'
     )
+
+
+def pending_selected_metadata_preview(pdf_files=None, folder_files=None, folder_manifest=None,
+                                      selection_state=None, request: gr.Request = None):
+    """Show every document's editors from paths alone, before PDF inspection."""
+    if automatic_lifecycle_busy() or not _selection_preview_is_current(selection_state, request):
+        return gr.update()
+    direct = normalize_file_list(pdf_files)
+    folder = normalize_file_list(folder_files)
+    manifest = folder_manifest if isinstance(folder_manifest, dict) else {}
+    available = normalize_file_list(manifest.get("pdf_candidates") or folder)
+    if direct and available:
+        # Use the merge's existing byte-identity mapping so early edits bind
+        # to the same document after an exact uploaded copy is canonicalized.
+        direct = _folder_paths_for_uploaded_copies(direct, available)
+    files = unique_local_path_strings([*folder, *direct])
+    if not files:
+        return pending_metadata_panel_html("Select a PDF to inspect its metadata.")
+    panels = [pending_metadata_panel_html(
+        "Filename suggestion shown while metadata is being prepared. You can enter overrides now.",
+        filename=Path(path).name, loading=True,
+        document_key=local_path_identity_key(path),
+    ) for path in files]
+    note = (f'<div class="metadata-selection-note">{len(files)} PDFs selected. '
+            'Each PDF has independent overrides; blank overrides use its detected values.</div>') if len(files) > 1 else ""
+    if not _selection_preview_is_current(selection_state, request):
+        return gr.update()
+    return '<div class="metadata-preview-list">' + note + "".join(panels) + '</div>'
 
 
 def stream_automatic_detected_metadata_preview(
@@ -26891,9 +26935,10 @@ def metadata_table_html(primary_rows, additional_rows=(), *, include_overrides=T
                 if field else ""
             )
             row_class = ' class="metadata-extra-row" hidden' if additional else ""
+            known = ' data-metadata-known="filename"' if _origin == "filename_pending" else ""
             rendered.append(
                 f'<tr{row_class}><th scope="row">{html.escape(str(key))}</th>'
-                f'<td class="metadata-detected-value">{html.escape(str(value))}</td>'
+                f'<td class="metadata-detected-value"{known}>{html.escape(str(value))}</td>'
                 f'<td class="metadata-override-value">{control}</td></tr>'
             )
         return "".join(rendered)
@@ -26912,7 +26957,9 @@ def metadata_table_html(primary_rows, additional_rows=(), *, include_overrides=T
 def pending_metadata_panel_html(message, *, filename="", loading=False,
                                 include_overrides=True, detected_value="", document_key="", error=False):
     value = detected_value or ("Loading…" if loading else "Select a PDF")
-    rows = [(key, value, "pending") for key in METADATA_OVERRIDE_FIELDS]
+    rows = [(key, Path(filename).stem if key == "Title used" and filename else value,
+             "filename_pending" if key == "Title used" and filename else "pending")
+            for key in METADATA_OVERRIDE_FIELDS]
     heading = f'<div class="metadata-file-name">{html.escape(filename)}</div>' if filename else ""
     return detected_pdf_metadata_panel_html(
         heading + f'<div class="metadata-status">{html.escape(message)}</div>'
@@ -35543,6 +35590,12 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 show_progress="minimal",
                 queue=False,
             ).then(
+                fn=pending_selected_metadata_preview,
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state],
+                outputs=[auto_metadata_preview],
+                show_progress="hidden",
+                queue=False,
+            ).then(
                 fn=merge_uploaded_pdfs_into_direct_selection,
                 inputs=[auto_pdfs, auto_folder_manifest],
                 outputs=[
@@ -35674,6 +35727,12 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 # and clear the batch that just absorbed its uploaded paths.
                 trigger_mode="always_last",
             ).then(
+                fn=pending_selected_metadata_preview,
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state],
+                outputs=[auto_metadata_preview],
+                show_progress="hidden",
+                queue=False,
+            ).then(
                 # A file selection has exactly one direct event owner. The
                 # batch merge must run after the lock/reset boundary, rather
                 # than racing a second ``change`` request that can restore an
@@ -35798,7 +35857,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 show_progress="minimal",
                 queue=False,
             ).then(
-                fn=stream_selected_pdf_directory,
+                fn=stream_selected_pdf_directory_with_metadata,
                 inputs=[auto_folder_path, auto_folder_scan_requested, automatic_selection_state],
                 outputs=[
                     auto_folder_pdfs,
@@ -35808,6 +35867,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     auto_folder_status,
                     pdf_folder_picker_area,
                     choose_pdf_folder_button,
+                    auto_metadata_preview,
                 ],
                 show_progress="minimal",
                 queue=True,
@@ -35909,6 +35969,12 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     cancel_automatic_run_button,
                     automatic_run_activity,
                 ],
+                show_progress="hidden",
+                queue=False,
+            ).then(
+                fn=pending_selected_metadata_preview,
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state],
+                outputs=[auto_metadata_preview],
                 show_progress="hidden",
                 queue=False,
             ).then(
