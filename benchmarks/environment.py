@@ -103,6 +103,9 @@ class Observer:
             while not self.stop_event.wait(self.interval):
                 start = time.perf_counter()
                 m = psutil.virtual_memory()
+                # Callers can replace/register workers while sampling. Use one
+                # stable ownership view for this sample and its memory loop.
+                worker_pids = self.worker_pids.copy()
                 deep = None
                 if start - previous_time >= self.inventory_interval:
                     now = inventory()
@@ -124,7 +127,7 @@ class Observer:
                     def owned(pid):
                         seen = set()
                         while pid and pid not in seen:
-                            if pid in self.worker_pids:
+                            if pid in worker_pids:
                                 return True
                             seen.add(pid)
                             pid = parents.get(pid)
@@ -146,7 +149,7 @@ class Observer:
                     }
                     previous, previous_time = now, start
                 worker_memory = {}
-                for pid in self.worker_pids:
+                for pid in worker_pids:
                     try:
                         worker_memory[str(pid)] = psutil.Process(pid).memory_info().rss
                     except (psutil.Error, OSError):
