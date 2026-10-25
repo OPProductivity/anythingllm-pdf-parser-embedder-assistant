@@ -60,7 +60,15 @@ def _names(value):
         r",\s*(Jr\.|Sr\.)(?=\s*(?:[,;]|and\b|&|$))", r" \1", value, flags=re.I
     )
     value = re.sub(r",\s*(?:and|&)\s+", ", ", value, flags=re.I)
-    parts = re.split(r"\s+(?:and|&)\s+|\s*[;·•]\s*|\s*,\s*", value, flags=re.I)
+    # Start a whitespace-prefixed separator only at the start of its run.
+    # A bare punctuation branch also handles consecutive separators after an
+    # earlier match consumed the preceding whitespace. The split stays the
+    # same, without restarting a greedy scan at every space in PDF prose.
+    parts = re.split(
+        r"(?<!\s)\s+(?:and|&)\s+|(?<!\s)\s+[;·•,]\s*|[;·•,]\s*",
+        value,
+        flags=re.I,
+    )
     if terminal_separator and len(parts) > 1:
         # A multi-person line ending in a separator may continue on the next
         # line. Its prefix is not a complete roster. A single byline followed

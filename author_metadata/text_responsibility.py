@@ -56,7 +56,7 @@ def _people(value):
     value = re.sub(r"\s+(?:editors?|authors?)\.?$", "", value, flags=re.I)
     # Spaced display dashes can separate complete people in an explicit role
     # field. An internal surname hyphen remains part of the person's name.
-    displayed = re.split(r"\s+[–—-]\s+", value)
+    displayed = re.split(r"(?<!\s)\s+[–—-]\s+", value)
     if len(displayed) > 1:
         rosters = [_names(part) for part in displayed]
         if all(rosters):
@@ -66,7 +66,9 @@ def _people(value):
         return names
     # A labelled catalogue field can use inverted order. Preserve the roster:
     # never split each comma into a separate supposed author.
-    inverted = re.split(r"\s+and\s+|\s*;\s*", value, flags=re.I)
+    inverted = re.split(
+        r"(?<!\s)\s+and\s+|(?<!\s)\s+;\s*|;\s*", value, flags=re.I
+    )
     if all(part.count(",") == 1 for part in inverted):
         names = [normalize_author_candidate(part) for part in inverted]
         if all(looks_like_person_name(name, allow_all_caps=True) for name in names):
@@ -81,14 +83,14 @@ def _credit(value):
     # CIP physical-description shorthand follows the responsibility statement;
     # it is not an extension of the final contributor's surname.
     value = re.split(r"\bp[.]\s*cm[.](?=\s|$)", value, maxsplit=1, flags=re.I)[0]
-    display_parts = re.split(r"\s+[—–]\s+", value)
+    display_parts = re.split(r"(?<!\s)\s+[—–]\s+", value)
     if len(display_parts) > 1 and not all(_names(part) for part in display_parts):
         value = display_parts[0]
     # Preserve a wrapped roster within its paragraph. A blank line ends the
     # credit block, while "and Name" on the next line continues it.
     # Display spacing does not terminate a roster after an explicit separator.
     value = re.sub(r"([,;])(?:[ \t]*\n){2,}(?=[ \t]*[^\W\d_])", r"\1\n", value)
-    value = re.sub(r"\n\s*\n(?=\s*(?:and\b|&))", "\n", value, flags=re.I)
+    value = re.sub(r"\n\s*\n(?=[^\S\n]*(?:and\b|&))", "\n", value, flags=re.I)
     value = re.sub(r"(?im)(\band|&)\s*\n\s*\n", r"\1\n", value)
     value = re.split(r"\n\s*\n", value.strip(), maxsplit=1)[0]
     parts = [line.strip() for line in value.splitlines() if line.strip()]

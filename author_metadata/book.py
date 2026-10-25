@@ -54,17 +54,21 @@ def _title_matches(visible, hint, names):
     return len(expected) >= 3 and observed[:len(expected)] == expected
 
 
-def _copyright_corroborates(samples, names):
-    name_words = tuple(words(name) for name in names)
+def _copyright_rosters(samples):
+    """Read the same explicit credits once before comparing candidate rosters."""
+    rosters = set()
     for sample in samples:
         for line in sample["text"].splitlines():
             credit = re.match(r"^\s*Copyright\s*(?:\u00a9|\(c\))?\s*(?:\d{4}\s*)?(?:by\s+)?(.+)", line, re.I)
             if credit:
                 raw = re.sub(r"\s*\d{4}\.?$", "", credit.group(1)).strip(" .")
                 credited_names = _names(raw)
-                if tuple(words(name) for name in credited_names) == name_words:
-                    return True
-    return False
+                rosters.add(tuple(tuple(words(name)) for name in credited_names))
+    return rosters
+
+
+def _copyright_corroborates(samples, names):
+    return tuple(tuple(words(name)) for name in names) in _copyright_rosters(samples)
 
 
 def _catalog_credit(context):
@@ -292,6 +296,7 @@ def infer(context):
         return embedded
     explicit_credit = _explicit_titlepage_credit(context, samples)
     frontmatter_credit = _frontmatter_credit(context, samples)
+    copyright_rosters = _copyright_rosters(samples)
     for sample in samples:
         lines = [" ".join(line.split()) for line in sample["text"].splitlines() if line.strip()][:32]
         if any(_PRAISE.match(line) for line in lines[:6]):
@@ -353,7 +358,9 @@ def infer(context):
             # Bare title-page names need a nearby publisher imprint. Explicit
             # work-level authors/editors need the matched work title instead.
             publisher_backed = any(_IMPRINT.search(line) for line in lines[cursor:cursor + 3])
-            copyright_backed = _copyright_corroborates(samples, names)
+            copyright_backed = (
+                tuple(tuple(words(name)) for name in names) in copyright_rosters
+            )
             if not (explicit or inline) and not publisher_backed and not copyright_backed:
                 continue
             for width in range(1, min(start, 5) + 1):

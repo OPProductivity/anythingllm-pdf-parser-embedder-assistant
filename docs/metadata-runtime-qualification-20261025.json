@@ -1,0 +1,139 @@
+{
+  "complete_presentations": 1150,
+  "reviewed_PDFs": 382,
+  "accuracy_and_evidence_qualified": true,
+  "candidate_to_current_main_ratio": 0.964697687022804,
+  "candidate_to_original_control_ratio": 1.2796944939189663,
+  "target_1_2_met": false,
+  "summary": {
+    "original": {
+      "presentations": 386,
+      "candidate": {
+        "correct": 352,
+        "seconds": 819.7849,
+        "mean_seconds": 2.123795077720207,
+        "median_seconds": 1.4339,
+        "processing_errors": 0
+      },
+      "reference": {
+        "correct": 352,
+        "seconds": 854.8617,
+        "mean_seconds": 2.2146676165803107,
+        "median_seconds": 1.555,
+        "processing_errors": 0
+      },
+      "control": {
+        "correct": 326,
+        "seconds": 643.1937,
+        "mean_seconds": 1.6663049222797928,
+        "median_seconds": 0.9184,
+        "processing_errors": 0
+      }
+    },
+    "neutral_filename": {
+      "presentations": 382,
+      "candidate": {
+        "correct": 318,
+        "seconds": 817.6053,
+        "mean_seconds": 2.140328010471204,
+        "median_seconds": 1.4452,
+        "processing_errors": 0
+      },
+      "reference": {
+        "correct": 318,
+        "seconds": 847.8025,
+        "mean_seconds": 2.219378272251309,
+        "median_seconds": 1.5642999999999998,
+        "processing_errors": 0
+      },
+      "control": {
+        "correct": 289,
+        "seconds": 634.7469,
+        "mean_seconds": 1.6616410994764397,
+        "median_seconds": 0.9373499999999999,
+        "processing_errors": 0
+      }
+    },
+    "pure_neutral": {
+      "presentations": 382,
+      "candidate": {
+        "correct": 293,
+        "seconds": 828.9069,
+        "mean_seconds": 2.16991335078534,
+        "median_seconds": 1.5026,
+        "processing_errors": 0
+      },
+      "reference": {
+        "correct": 293,
+        "seconds": 853.885,
+        "mean_seconds": 2.235301047120419,
+        "median_seconds": 1.5694,
+        "processing_errors": 0
+      },
+      "control": {
+        "correct": 264,
+        "seconds": 649.314,
+        "mean_seconds": 1.6997748691099477,
+        "median_seconds": 0.9904999999999999,
+        "processing_errors": 0
+      }
+    },
+    "all_presentations": {
+      "presentations": 1150,
+      "candidate": {
+        "correct": 963,
+        "seconds": 2466.2971,
+        "mean_seconds": 2.1446061739130435,
+        "median_seconds": 1.45815,
+        "processing_errors": 0
+      },
+      "reference": {
+        "correct": 963,
+        "seconds": 2556.5492,
+        "mean_seconds": 2.2230862608695654,
+        "median_seconds": 1.5649,
+        "processing_errors": 0
+      },
+      "control": {
+        "correct": 879,
+        "seconds": 1927.2546,
+        "mean_seconds": 1.6758735652173913,
+        "median_seconds": 0.95675,
+        "processing_errors": 0
+      }
+    }
+  },
+  "changed_input_files": [],
+  "reference_errors": [],
+  "grouped_bootstrap_95_percent_intervals": {
+    "candidate_to_current_main": [
+      0.944462816552798,
+      0.9847011894802877
+    ],
+    "candidate_to_original_control": [
+      1.1330966435292722,
+      1.445703545889468
+    ]
+  },
+  "bootstrap_scope": "3000 paired resamples of 382 review IDs, keeping filename conditions and aliases together. Describes observed document mix; does not estimate machine or run-to-run variability.",
+  "publishable": true,
+  "final_offline_tests": {
+    "passed": 3337,
+    "skipped": 1,
+    "deselected": 43,
+    "passing_subtests": 28,
+    "junit_artifact": "offline-final-integrated.xml"
+  },
+  "production_source_comparison": {
+    "production_recognition_and_root_modules_match_frozen_candidate": true,
+    "python_files_checked": 106
+  },
+  "checksummed_local_artifacts": [
+    "candidate-02-full-start.json",
+    "candidate-02-full-matched.jsonl",
+    "candidate-02-full-qualification.json",
+    "corpus-manifest.json",
+    "qualify_speed.py"
+  ],
+  "checksum_provenance": "Full SHA-256 values are retained in publication-audit.json in the local outputs/metadata-speed-20261025 experiment directory."
+}

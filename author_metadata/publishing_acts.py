@@ -27,13 +27,22 @@ def frontmatter_samples(context):
         if 1 <= int(s.get("page") or 0) <= 8
     }
     acquired = []
+    native_pages = {
+        int(s.get("page") or 0): s
+        for s in (context.evidence_bundle or {}).get("native", [])
+    }
     if context.path is not None:
         import fitz
 
         try:
             with fitz.open(context.path) as doc:
                 for index in range(min(5, len(doc))):
-                    native = doc[index].get_text("text", sort=True)
+                    page_evidence = native_pages.get(index + 1)
+                    native = (
+                        page_evidence["text"]
+                        if page_evidence is not None and "text" in page_evidence
+                        else doc[index].get_text("text", sort=True)
+                    )
                     if (
                         index + 1 not in samples
                         or samples[index + 1].get("text") != native

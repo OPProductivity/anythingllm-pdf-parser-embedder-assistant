@@ -96,13 +96,18 @@ def _image_regions(page, *, invisible_overlay=None):
     return regions
 
 
-def _plan(document, extra_text="", *, ocr_pages=None):
+def _plan(document, extra_text="", *, ocr_pages=None, native_text=None):
     """Opening and closing apparatus, extended by publishing structure."""
     pages = set(range(1, min(5, len(document)) + 1))
+    # Forward the same native readings through this collection, including the
+    # OCR-informed planning pass. Nothing survives the current PDF request.
+    native_text = {} if native_text is None else native_text
     page_text = {}
     for number in sorted(pages):
         try:
-            page_text[number] = document[number - 1].get_text("text", sort=True)
+            if number not in native_text:
+                native_text[number] = document[number - 1].get_text("text", sort=True)
+            page_text[number] = native_text[number]
         except OSError, ValueError, RuntimeError:
             # The scheduled native attempt records this failure later and
             # still schedules a rendered-image reading of the page.
@@ -270,7 +275,7 @@ def _region_scale(task):
 
 
 def _prepare_region(document, task, *, factors=None):
-    """Render on the caller thread; workers receive only PNG bytes and numbers."""
+    """Render on the caller thread; workers receive only image bytes and numbers."""
     import fitz
     from PIL import Image, ImageOps
 
@@ -290,10 +295,11 @@ def _prepare_region(document, task, *, factors=None):
             pix = page.get_pixmap(
                 matrix=fitz.Matrix(factor, factor), clip=region, alpha=False
             )
-            if pix.samples and pix.samples.count(b"\xff") == len(pix.samples):
+            samples = pix.samples
+            if samples and samples.count(b"\xff") == len(samples):
                 frames[factor] = {"blank": True}
                 continue
-            pixels = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+            pixels = Image.frombytes("RGB", (pix.width, pix.height), samples)
             histogram = pixels.convert("L").histogram()
             total = max(1, pix.width * pix.height)
             preprocessing = []
@@ -308,7 +314,10 @@ def _prepare_region(document, task, *, factors=None):
                 pixels = ImageOps.expand(pixels, border=border, fill="white")
                 preprocessing.append("tight_line_white_border")
             payload = io.BytesIO()
-            pixels.save(payload, format="PNG", compress_level=1)
+            # PPM transports the identical RGB pixels without PNG compression
+            # and checksums. Tesseract still performs the same segmentation and
+            # recognition; this changes only the lossless stdin image container.
+            pixels.save(payload, format="PPM")
             frames[factor] = {
                 "payload": payload.getvalue(),
                 "border": border,
@@ -449,7 +458,12 @@ def _read_regions(document, tasks, executable, *, workers):
                             return response[0]
 
                         prepared = replace(prepared, request_frame=request_frame)
-                        pending.append((task, prepared))
+                        # The lossless uncompressed transport has no PNG
+                        # encoder holding up pipe readers. Start this reading
+                        # while the owner renders the remaining bounded batch.
+                        pending.append(
+                            (task, pool.submit(_read_region, prepared, task, executable))
+                        )
                 except (OSError, ValueError, RuntimeError) as error:
                     pending.append(
                         (
@@ -467,14 +481,12 @@ def _read_regions(document, tasks, executable, *, workers):
                             ),
                         )
                     )
-            # Finish this bounded render batch before starting recognition.
-            # PNG encoding must not starve worker pipe draining or deadlines.
-            pending = [
-                (task, pool.submit(_read_region, result, task, executable))
-                if isinstance(result, _RasterRegion)
-                else (task, result)
-                for task, result in pending
-            ]
+                except BaseException:
+                    # A programming error or cancellation during a later
+                    # render must release workers already waiting for a retry
+                    # raster before the executor joins their threads.
+                    cancelled.set()
+                    raise
             # Only a retry actually requested by recognition needs another
             # raster. The owner services requests; workers never touch the PDF.
             # This removes unused image encoding, not acquisition opportunities.
@@ -648,7 +660,8 @@ def collect(context):
                 "scope": "optional embedded fields; native/image completeness is tracked separately",
             }
             trace["document_page_count"] = len(document)
-            pages, trace["extensions"] = _plan(document)
+            planning_text = {}
+            pages, trace["extensions"] = _plan(document, native_text=planning_text)
             lab_pages = (
                 list(
                     range(1, min(max(5, context.lab_page_limit), 32, len(document)) + 1)
@@ -677,7 +690,11 @@ def collect(context):
             def read_native(number):
                 try:
                     page = document[number - 1]
-                    text = page.get_text("text", sort=True)
+                    text = (
+                        planning_text[number]
+                        if number in planning_text
+                        else page.get_text("text", sort=True)
+                    )
                     native.append(
                         {
                             "page": number,
@@ -850,7 +867,9 @@ def collect(context):
                         )
                 if stage == 0:
                     extra = "\n".join(r["text"] for r in ocr)
-                    expanded, _ = _plan(document, extra, ocr_pages=ocr)
+                    expanded, _ = _plan(
+                        document, extra, ocr_pages=ocr, native_text=planning_text
+                    )
                     additional = sorted(set(expanded) - set(trace["native_plan"]))
                     if additional:
                         trace["native_plan"] = sorted(set(expanded))

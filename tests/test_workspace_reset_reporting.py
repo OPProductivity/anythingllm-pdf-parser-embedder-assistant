@@ -43,7 +43,8 @@ def test_retry_resets_every_control_and_omitted_evidence_setting():
     expected = app.reset_automatic_run_settings_to_defaults()
     actual = app.reset_automatic_run_retry_settings()
     assert actual[:-1] == expected
-    assert len(actual) == 46
+    assert len(actual) == 50
+    assert actual[-5:-1] == tuple({"__type__": "update"} for _ in range(4))
     assert actual[9]["value"] == app.fresh_automatic_run_setting_values()["workspace_slug"]
     assert actual[8]["value"] == ""
     assert actual[10]["value"] == ""
@@ -219,6 +220,6 @@ def test_reset_event_outputs_include_all_mounted_controls():
     resets = [d for d in config["dependencies"] if "reset_automatic_run_retry_settings" in str(d.get("api_name")) or "reset_automatic_run_selection_settings" in str(d.get("api_name"))]
     assert len(resets) == 5
     for dependency in resets:
-        assert len(dependency["outputs"]) == 46
+        assert len(dependency["outputs"]) == 50
         assert evidence in dependency["outputs"]
         assert all(output in components for output in dependency["outputs"])

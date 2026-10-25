@@ -7951,7 +7951,8 @@ class PipelineCoreTests(unittest.TestCase):
 
         app.LIVE_AUTOMATIC_RUN_STATUS = {"state": "successful", "phase": "Complete"}
         updates = app.reset_automatic_run_settings_to_defaults()
-        self.assertEqual(len(updates), 45)
+        self.assertEqual(len(updates), 49)
+        self.assertEqual(updates[-4:], tuple({"__type__": "update"} for _ in range(4)))
         self.assertEqual(updates[0]["value"], "")  # document label
         self.assertEqual(updates[6]["value"], str(app.AUTO_OUTPUT_DIR))
         self.assertEqual(updates[8]["value"], "")  # visible API-key field
@@ -8005,7 +8006,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(observed_status, reserved)
         self.assertEqual(len(presentation), 16)
         self.assertTrue(all(update.get("__type__") == "update" for update in presentation))
-        self.assertEqual(len(settings), 45)
+        self.assertEqual(len(settings), 49)
         self.assertTrue(all(update.get("__type__") == "update" for update in settings))
 
     def test_output_mode_updates_hide_upload_only_controls_without_rewriting_values(self):
