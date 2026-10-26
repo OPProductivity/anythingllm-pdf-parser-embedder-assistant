@@ -15,6 +15,7 @@ import re
 import unicodedata
 
 import fitz
+from .native_reads import native_measurement, native_read, review_scope
 
 from .names import (has_author_affiliation_hint, looks_like_person_name,
                     normalize_author_candidate, split_author_line_candidates)
@@ -49,6 +50,13 @@ def _composition(atoms, indexes, kind):
 
 
 def native_page_atoms(page, page_number):
+    return native_measurement(
+        page, 'positioned_native_atoms_v1', (page_number,),
+        lambda: _native_page_atoms(page, page_number),
+    )
+
+
+def _native_page_atoms(page, page_number):
     """Keep positioned words and their extractor references, without reflow."""
     # Both views use identical flags. Extract the page once, then derive each
     # existing representation; this TextPage never leaves the current call.
@@ -389,7 +397,7 @@ def map_page(page, page_number, title_hint=""):
     atoms = native_page_atoms(page, page_number)
     result = map_atoms(atoms, page_number, page.rect.width, page.rect.height, title_hint)
     result["visual_object_count"] = (
-        len(page.get_images(full=True)) + (len(page.get_drawings()) if not atoms else 0)
+        len(native_read(page, 'get_images', full=True)) + (len(native_read(page, 'get_drawings')) if not atoms else 0)
     )
     return result
 
@@ -709,6 +717,7 @@ def _check_ocr(author, text, ocr_map=None, title_hint="", native_map=None):
             "ocr_credit_candidates": []}
 
 
+@review_scope
 def review_author_field_map(pdf_path, *, title_hint="", author="", author_source="",
                             ocr_peer_pages=(), tesseract="", max_ocr_calls=3,
                             ocr_runner=None, recognition_effort="thorough"):

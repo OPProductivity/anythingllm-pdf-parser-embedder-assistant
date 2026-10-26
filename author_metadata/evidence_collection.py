@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import time
 from typing import Callable
+from .native_reads import native_read, native_measurement
 
 # Compatibility handle for old diagnostics; cross-call evidence is not retained.
 _CACHE = {}
@@ -41,8 +42,18 @@ def text_quality(text):
     return "usable_native"
 
 
+def _opening_native_views(page):
+    import fitz
+    flags = fitz.TEXTFLAGS_DICT & ~fitz.TEXT_PRESERVE_IMAGES
+    def acquire():
+        textpage = page.get_textpage(flags=flags)
+        return (page.get_text('text', sort=True, textpage=textpage),
+                page.get_text('dict', flags=flags, textpage=textpage))
+    return native_measurement(page, 'opening_native_views_v1', (flags,), acquire)
+
+
 def _invisible_native_overlay(page):
-    spans = page.get_texttrace()
+    spans = native_read(page, 'get_texttrace')
     total = sum(len(span.get("chars", ())) for span in spans)
     hidden = sum(len(span.get("chars", ())) for span in spans if span.get("type") == 3)
     return total > 0 and hidden / total >= 0.5
@@ -52,7 +63,7 @@ def _image_regions(page, *, invisible_overlay=None):
     """Image areas without a usable native text layer need their own reading."""
     import fitz
 
-    words = page.get_text("words")
+    words = native_read(page, 'get_text', 'words')
     invisible_overlay = (
         _invisible_native_overlay(page)
         if invisible_overlay is None
@@ -60,7 +71,7 @@ def _image_regions(page, *, invisible_overlay=None):
     )
     regions = []
     area = max(1, page.rect.get_area())
-    for info in page.get_image_info():
+    for info in native_read(page, 'get_image_info'):
         rect = fitz.Rect(info["bbox"]) & page.rect
         narrow_text_shape = (
             rect.width >= 60
@@ -99,7 +110,7 @@ def _image_regions(page, *, invisible_overlay=None):
 def _plan(document, extra_text="", *, ocr_pages=None, native_text=None, native_dicts=None):
     """Opening and closing apparatus, extended by publishing structure."""
     if native_dicts is not None:
-        import fitz
+        import fitz  # noqa: F401 - preserve the established local import order.
     pages = set(range(1, min(5, len(document)) + 1))
     # Forward the same native readings through this collection, including the
     # OCR-informed planning pass. Nothing survives the current PDF request.
@@ -112,10 +123,7 @@ def _plan(document, extra_text="", *, ocr_pages=None, native_text=None, native_d
                 if native_dicts is None:
                     native_text[number] = page.get_text("text", sort=True)
                 else:
-                    flags = fitz.TEXTFLAGS_DICT & ~fitz.TEXT_PRESERVE_IMAGES
-                    textpage = page.get_textpage(flags=flags)
-                    native_text[number] = page.get_text("text", sort=True, textpage=textpage)
-                    native_dicts[number] = page.get_text("dict", flags=flags, textpage=textpage)
+                    native_text[number], native_dicts[number] = _opening_native_views(page)
             page_text[number] = native_text[number]
         except OSError, ValueError, RuntimeError:
             # The scheduled native attempt records this failure later and
@@ -553,8 +561,8 @@ def _hidden_explicit_byline_lines(page, *, require_person=True):
     from .structured_credit import _names
 
     found = []
-    for block in page.get_text(
-        "dict", flags=fitz.TEXTFLAGS_DICT & ~fitz.TEXT_PRESERVE_IMAGES
+    for block in native_read(
+        page, 'get_text', "dict", flags=fitz.TEXTFLAGS_DICT & ~fitz.TEXT_PRESERVE_IMAGES
     )["blocks"]:
         for line in block.get("lines", []):
             if abs(line.get("dir", (1, 0))[0]) < 0.9:
@@ -847,8 +855,8 @@ def collect(context):
                     clean_sparse_native = (
                         reason == "sparse_native"
                         and bool(text.strip())
-                        and not page.get_image_info()
-                        and not page.get_drawings()
+                        and not native_read(page, 'get_image_info')
+                        and not native_read(page, 'get_drawings')
                     )
                     regions = (
                         []
