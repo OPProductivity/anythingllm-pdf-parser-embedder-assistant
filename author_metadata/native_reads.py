@@ -16,7 +16,17 @@ _ATOMIC = {str, int, float, bool, bytes, complex, type(None)}
 
 def _immutable(value):
     kind = type(value)
-    return kind in _ATOMIC or kind is tuple and all(_immutable(v) for v in value)
+    if kind in _ATOMIC:
+        return True
+    if kind is not tuple:
+        return False
+    # Native coordinate tuples normally contain only scalar leaves. Inspect
+    # them directly instead of making a recursive Python call per coordinate.
+    for child in value:
+        child_kind = type(child)
+        if child_kind not in _ATOMIC and not (child_kind is tuple and _immutable(child)):
+            return False
+    return True
 
 
 def _copy_native(value, memo=None):

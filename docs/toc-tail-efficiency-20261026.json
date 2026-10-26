@@ -1,0 +1,117 @@
+{
+  "date": "2026-10-26",
+  "base_commit": "b8d27d3",
+  "changes": [
+    "Immediate owner wakeup when OCR regions finish; unchanged tasks, retries, worker budget and ordered results",
+    "Avoid recursive function calls for scalar leaves in immutable native coordinate tuples"
+  ],
+  "qualification": {
+    "offline_tests_passed": 3541,
+    "subtests_passed": 28,
+    "skipped": 2,
+    "deselected": 43,
+    "lint": "pass",
+    "core_types": "pass"
+  },
+  "coverage": {
+    "pdfs": 31,
+    "pages": 1683,
+    "same_original_filenames_order_defaults_full_sources": true,
+    "uploaded_records": 1659,
+    "exported_txt_names_and_bytes_equal": 1723,
+    "initial_inference_and_retained_review_reports_equal": 31,
+    "measured_call_counts_unchanged": true,
+    "fresh_embeddings": 1659,
+    "cache_reused": 0,
+    "exact_vector_proven_sources": 31,
+    "processing_errors": 0,
+    "original_hashes_unchanged": true
+  },
+  "baseline_cleanup": {
+    "workspace_slug": "toc-iii-speed-comparison-6530f74a",
+    "workspace_id": 1245,
+    "records": 1659,
+    "workspace_deleted": true,
+    "removed_document_files": 1659,
+    "scope": "Exact preceding test workspace and unshared stored records/cache files; originals and unrelated workspaces preserved.",
+    "namespace_after_deletion": "workspace_table_missing",
+    "remaining_namespace_vectors": 0,
+    "cache_files_removed_by_exact_path": 0,
+    "remaining_sql_vector_rows": 0,
+    "remaining_old_cache_files": 0,
+    "other_workspace_record_counts_unchanged": true,
+    "status": "complete"
+  },
+  "observed_timing": {
+    "baseline_commit": "b8d27d3",
+    "baseline_wall_s": 1407.9449208000005,
+    "candidate_wall_s": 1897.8532007999893,
+    "observed_total_reduction_percent": -34.79598333446316,
+    "distributions": {
+      "baseline": {
+        "count": 31,
+        "sum_s": 1024.661068999987,
+        "mean_s": 33.053582870967325,
+        "median_s": 27.44146290000208,
+        "minimum_s": 4.855575800000224,
+        "p10_s": 7.261645299993688,
+        "q1_s": 9.395530900001177,
+        "q3_s": 44.03633070000069,
+        "p90_s": 71.137973900004,
+        "p95_s": 91.03863479999927,
+        "maximum_s": 114.6295437000008,
+        "iqr_s": 34.64079979999951,
+        "population_stddev_s": 27.971041725423298,
+        "all_in_mean_per_pdf_s": 45.4175780903226
+      },
+      "candidate": {
+        "count": 31,
+        "sum_s": 1013.9652766000363,
+        "mean_s": 32.70855730967859,
+        "median_s": 28.20954480000364,
+        "minimum_s": 4.9867037999938475,
+        "p10_s": 7.392949000000954,
+        "q1_s": 9.117419700000028,
+        "q3_s": 40.73793719999958,
+        "p90_s": 65.07025580000482,
+        "p95_s": 91.92088980000699,
+        "maximum_s": 130.28187500000058,
+        "iqr_s": 31.62051749999955,
+        "population_stddev_s": 29.238952163176066,
+        "all_in_mean_per_pdf_s": 61.22107099354804
+      }
+    },
+    "paired_faster_pdfs": 18,
+    "paired_slower_pdfs": 13,
+    "counts": {
+      "sources": 31,
+      "pages": 1683,
+      "upload_records": 1659,
+      "fresh_cache_reuse": 0,
+      "cache_eligible_records": 0
+    },
+    "all_output_quality_fingerprints_equal": true,
+    "metrics_csv_rows": 2975,
+    "scope": "Same sources/order/defaults; original filenames; fresh embedding in both runs. One observed before/after run, not randomized repeated trials. Provider latency and machine activity remain potential influences."
+  },
+  "new_phase_partition_s": {
+    "metadata_preview_first_five": 9.157010299997637,
+    "selection_advisory_eta": 0.16475209999771323,
+    "workspace_mutation_lane_wait": 9.330001194030046e-05,
+    "workspace_creation": 0.3240716000000248,
+    "confirmation_preflight": 7.85308349999832,
+    "setup_to_first_worker": 0.7406785999919521,
+    "local_preparation": 1021.7985014000005,
+    "upload_mutation_lane_wait": 0.00011340000492054969,
+    "upload_embedding_vector_confirmation": 845.1674862999935,
+    "finalization": 12.647409500001231
+  },
+  "limits": [
+    "One sequential same-corpus run; not randomized replicated timing",
+    "1150-presentation benchmark explicitly omitted at user request",
+    "No new manual authorship audit",
+    "Browser rendering and parent imports excluded; worker imports included",
+    "Aggregate system context does not establish thermal, frequency or scheduling causes"
+  ],
+  "interpretation": "Prior upper-percentile increases did not introduce more measured work or change retained evidence. The new run has mixed tail results; no uniform tail-speedup or additional author-accuracy gain is claimed."
+}

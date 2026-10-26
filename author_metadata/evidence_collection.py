@@ -486,8 +486,11 @@ def _read_regions(document, tasks, executable, *, workers):
         return
     requests = Queue()
     cancelled = Event()
+    completed_notice = object()
 
     def service_request(request):
+        if request is completed_notice:
+            return
         task, factor, ready, response = request
         try:
             frame = _prepare_region(document, task, factors=(factor,)).frames[factor]
@@ -528,6 +531,9 @@ def _read_regions(document, tasks, executable, *, workers):
 
                         prepared = replace(prepared, request_frame=request_frame)
                         inflight[index] = pool.submit(_read_region, prepared, task, executable)
+                        # Wake the owner when a region completes without a
+                        # raster request; do not wait for the next timed poll.
+                        inflight[index].add_done_callback(lambda _: requests.put(completed_notice))
                         del prepared
                     except (OSError, ValueError, RuntimeError) as error:
                         completed[index] = failure(task, error)
