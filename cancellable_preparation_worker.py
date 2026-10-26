@@ -17,11 +17,13 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+from preparation_metrics import IMPORT_STARTED as _IMPORT_STARTED
 from automatic_worker_protocol import AUTOMATIC_WORKER_TRANSPORT_ARTIFACTS
 from auto_anythingllm_pipeline import prepare_pdf
 from orchestration import execute_preparation, legacy_summary_from_run
 from portable_paths import is_private_run_state_path
 from run_evidence import prepare_private_json, read_run_json
+_IMPORT_MS = round((time.perf_counter() - _IMPORT_STARTED) * 1000)
 
 
 _EVENT_WRITE_LOCK = threading.Lock()
@@ -239,6 +241,7 @@ def main(config_path: str) -> int:
         evidence_kind="worker_started",
     )
     try:
+        preparation_started = time.perf_counter()
         controlled = execute_preparation(
             Path(config["pdf_path"]),
             Path(config["output_dir"]),
@@ -246,6 +249,10 @@ def main(config_path: str) -> int:
             prepare_pdf,
         )
         summary = legacy_summary_from_run(controlled)
+        summary["worker_timings"] = {
+            "module_import_ms": _IMPORT_MS,
+            "control_and_prepare_ms": round((time.perf_counter() - preparation_started) * 1000),
+        }
         _write_json(
             result_path,
             {

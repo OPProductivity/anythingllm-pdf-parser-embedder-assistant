@@ -7847,7 +7847,7 @@ class PipelineCoreTests(unittest.TestCase):
 
         original_profile = app.automatic_timing_document_profile
         try:
-            def profile_for(files):
+            def profile_for(files, **_kwargs):
                 if "scan" in Path(files[0]).name:
                     return {
                         "page_count": 18,

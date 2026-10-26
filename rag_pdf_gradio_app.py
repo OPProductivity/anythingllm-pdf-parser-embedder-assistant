@@ -19177,6 +19177,51 @@ def automatic_timing_profile_document_limit(files):
     return None if count <= BATCH_FOLDER_FULL_PROFILE_DOCUMENT_LIMIT else BATCH_FOLDER_INITIAL_PROFILE_DOCUMENT_LIMIT
 
 
+def confirmed_progress_profile(path, manifest):
+    """Use only count/density facts from this confirmation, never source text."""
+    if not isinstance(manifest, dict):
+        return None
+    rows = manifest.get("files") or []
+    if not isinstance(rows, (list, tuple)):
+        return None
+    wanted = str(Path(path).resolve()).casefold()
+    for row in rows:
+        if not isinstance(row, dict) or not row.get("file"):
+            continue
+        try:
+            if str(Path(row["file"]).resolve()).casefold() != wanted:
+                continue
+            version = row.get("source_version") or {}
+            if not version or local_source_version(path) != version:
+                return None
+            coverage = row.get("full_native_text_coverage") or {}
+            if not isinstance(coverage, dict):
+                return None
+            profile = dict(coverage.get("timing_profile") or {})
+            if not profile:
+                profile = {
+                    "page_count": int(row.get("pages") or 0),
+                    "sampled_pages": int(row.get("sampled_pages") or 0),
+                    "mean_chars_per_page": float(row.get("mean_chars_per_page") or 0),
+                    "sparse_fraction": float(row.get("sparse_fraction") or 0),
+                    "image_density": float(row.get("image_density") or 0),
+                    "ocr_risk_bucket": "high" if row.get("risk") == "likely" else
+                                       "possible" if row.get("risk") == "possible" else "low",
+                }
+            if int(profile.get("page_count") or 0) <= 0 or int(profile.get("sampled_pages") or 0) <= 0:
+                return None
+            if int(row.get("pages") or 0) != int(profile["page_count"]):
+                return None
+            for key in ("mean_chars_per_page", "sparse_fraction", "image_density"):
+                value = float(profile.get(key) or 0)
+                if not math.isfinite(value) or value < 0:
+                    return None
+            return profile
+        except (OSError, TypeError, ValueError):
+            return None
+    return None
+
+
 def automatic_progress_file_allocations(
     files,
     *,
@@ -19186,6 +19231,7 @@ def automatic_progress_file_allocations(
     chunk_overlap=0,
     backend_mode="Automatic",
     unstructured_strategy="auto",
+    confirmation_manifest=None,
 ):
     """Allocate evidence progress by general local processing difficulty.
 
@@ -19199,7 +19245,13 @@ def automatic_progress_file_allocations(
     rows = []
     for raw_path in files or []:
         path = Path(raw_path)
-        profile = automatic_timing_document_profile([path])
+        profile = confirmed_progress_profile(path, confirmation_manifest)
+        profile_origin = "confirmation"
+        if profile is None:
+            # This is an advisory progress estimate. Required all-page native
+            # coverage and all expert/OCR acquisition remain independent.
+            profile = automatic_timing_document_profile([path], page_sample_limit=3)
+            profile_origin = "three_page_estimate"
         features = timing_model_features(
             profile,
             MODE_LOCAL_ONLY_LABEL,
@@ -19235,6 +19287,7 @@ def automatic_progress_file_allocations(
             "estimated_records": records,
             "ocr_likely_from_preflight": ocr_likely,
             "weight": round(weight, 6),
+            "profile_origin": profile_origin,
         })
     total = sum(float(row["weight"]) for row in rows)
     if total <= 0:
@@ -30674,6 +30727,7 @@ def run_automatic(
         chunk_overlap=int(anythingllm_chunk_overlap or 0),
         backend_mode=backend_mode or "Automatic",
         unstructured_strategy=unstructured_strategy or "auto",
+        confirmation_manifest=ocr_preflight_manifest,
     )
     if len(progress_allocations) != len(files):
         # A profile failure must never block the run. Retain the historical

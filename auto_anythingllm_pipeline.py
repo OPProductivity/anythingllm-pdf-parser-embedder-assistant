@@ -15,6 +15,7 @@ does not prove a later one.
 
 import argparse
 from recognition_effort import production_effort_value
+from preparation_metrics import document_measurements, result_measurements, measured, measure, snapshot as preparation_snapshot
 from text_export_hygiene import ascii_label_word, prepare_readable_pages, readable_export_text
 import csv
 import concurrent.futures
@@ -146,6 +147,15 @@ from author_metadata.legacy_fallback import (  # noqa: F401
     opening_filename_corroborated_credit,
     _infer_author_from_samples_or_filename,
 )
+
+# These wrappers aggregate numeric costs only within one preparation call.
+# They do not emit progress/timing events or retain document data.
+get_backend_pages = measured(lambda args, kwargs: "decode_" + str(args[1] if len(args) > 1 else kwargs.get("backend", "unknown")))(get_backend_pages)
+observe_submission_vector_ids = measured("physical_vector_ids")(observe_submission_vector_ids)
+prepare_readable_pages = measured("text_cleanup")(prepare_readable_pages)
+infer_profiled_author = measured("initial_author")(infer_profiled_author)
+review_author_field_map = measured("author_field_review")(review_author_field_map)
+recover_author_from_selected_extraction = measured("later_author_recovery")(recover_author_from_selected_extraction)
 
 # Native uploads have a long, externally observable embedding portion.  Keep
 # the declared pipeline ranges monotonic so the UI never has to hide a real
@@ -407,7 +417,8 @@ def measured_pipeline_phase(args, stage, **details):
     started = time.perf_counter()
     emit_pipeline_timing_event(args, stage, event="phase_started", **details)
     try:
-        yield
+        with measure(stage):
+            yield
     finally:
         emit_pipeline_timing_event(
             args,
@@ -740,6 +751,7 @@ def pdf_date_to_epoch_ms(value):
     return int(parsed.timestamp() * 1000)
 
 
+@measured("json_writes")
 def write_json(path: Path, data, *, compact=False):
     data = prepare_private_json(path, data)
     if compact or is_private_run_state_path(path):
@@ -786,6 +798,7 @@ def atomic_write_text(path: Path, content: str, *, encoding="utf-8", retries=3):
                 pass
 
 
+@measured("jsonl_writes")
 def append_jsonl(path: Path, rows):
     atomic_write_text(
         path,
@@ -819,6 +832,7 @@ def append_jsonl_receipt(path: Path, row, *, durable=True):
     return append_jsonl_receipts(path, [row], durable=durable)
 
 
+@measured("csv_writes")
 def write_csv(path: Path, rows, fieldnames=None):
     rows = list(rows)
     if fieldnames is None:
@@ -860,6 +874,7 @@ def xmp_publisher(xml_text):
     return ""
 
 
+@measured("metadata_geometry")
 def pdf_metadata(path: Path, include_page_geometry=False, include_author_samples=False, progress_callback=None):
     """Read PDF metadata and, optionally, author-inference samples in one open.
 
@@ -2249,6 +2264,8 @@ def retain_successful_run_leanly(
             "readiness_status": summary.get("readiness_status"),
             "selected_backend": summary.get("selected_backend"),
             "total_pipeline_seconds": summary.get("total_pipeline_seconds"),
+            "performance": summary.get("performance") or {},
+            "worker_timings": summary.get("worker_timings") or {},
             "ocr_processing_seconds": summary.get("ocr_processing_seconds", 0.0),
             "selected_output_ocr_processing_seconds": summary.get(
                 "selected_output_ocr_processing_seconds", 0.0
@@ -3977,6 +3994,7 @@ def _layout_vertical_copyright_key(row, width):
     return text.casefold()
 
 
+@measured("native_layout")
 def apply_region_aware_native_layout(pdf_path, pages, progress_callback=None):
     """Create conservative semantic text from positioned native PDF lines.
 
@@ -4912,6 +4930,7 @@ def reading_region_label(row):
     return f"Reading region: {name or 'sub-page region'} ({index} of {count})."
 
 
+@measured("segmentation")
 def make_segments(
     pdf_path,
     backend,
@@ -6959,6 +6978,7 @@ def explainable_layout_artifact_coverage_disagreement(selected, candidates, prof
     }
 
 
+@measured("provenance_manifest")
 def write_provenance_review_manifest(
     selected_dir: Path,
     source_meta,
@@ -7095,6 +7115,7 @@ def check_status(ok, warn=False):
     return "warning" if warn else "fail"
 
 
+@measured("diagnostics")
 def evaluate_edge_cases(
     profile,
     selected,
@@ -7845,6 +7866,7 @@ def write_failure_package(pdf_path: Path, out_root: Path, exc, args=None):
     return summary
 
 
+@measured("payload_build")
 def generate_api_payloads(segments, mode):
     rows = []
     for row in segments:
@@ -7892,6 +7914,7 @@ def native_segment_filename(row):
     return safe_stem(native_segment_title(row, include_heading=True))[:140] + ".txt"
 
 
+@measured("parent_mapping")
 def build_page_parent_rows(segments):
     page_rows = {}
     for row in segments:
@@ -7960,6 +7983,7 @@ def build_page_parent_rows(segments):
     return parents
 
 
+@measured("parent_mapping")
 def build_child_parent_map(segments, parent_rows):
     parent_lookup = {
         (int(parent["pdf_page"]), str(parent.get("logical_page") or "")): parent["parent_id"]
@@ -7986,6 +8010,7 @@ def build_child_parent_map(segments, parent_rows):
     return rows
 
 
+@measured("payload_build")
 def generate_page_parent_payloads(parent_rows, mode):
     rows = []
     for row in parent_rows:
@@ -14078,6 +14103,7 @@ def resolve_native_upload_representation(requested, harmonization_report_rows):
     return requested, {}
 
 
+@measured("payload_files")
 def build_file_upload_rows_from_payloads(payloads, files_dir: Path, *, artifact_catalog=None):
     files_dir = Path(files_dir)
     files_dir.mkdir(parents=True, exist_ok=True)
@@ -20149,6 +20175,7 @@ def inspect_native_metadata_rows(
     return result
 
 
+@measured("scalar_identity_observation")
 def inspect_native_metadata_count(
     storage_dir: Path,
     source_sha: str,
@@ -20231,7 +20258,18 @@ def inspect_native_metadata_count(
             result["error"] = "A grouped vector observation requires expected chunkSource identities."
             return result
         row_filter = " AND ".join(filters)
-        result["matching_rows"] = int(table.count_rows(filter=row_filter))
+        identities = None
+        if normalized_chunk_sources and "chunkSource" in columns:
+            # One scalar-column scan gives both the count and the exact
+            # identity set. Do not run the same wide filter twice, and never
+            # project dense vectors or complete document bodies for this.
+            identities = (
+                table.search().where(row_filter, prefilter=True)
+                .select(["chunkSource"]).limit(None).to_pandas()
+            )
+            result["matching_rows"] = len(identities)
+        else:
+            result["matching_rows"] = int(table.count_rows(filter=row_filter))
         result["matching_table_names"] = [workspace_namespace] if result["matching_rows"] else []
         result["metadata_fields_seen"] = [
             name for name in ("title", "docAuthor", "description", "docSource", "chunkSource", "published", "text")
@@ -20241,7 +20279,7 @@ def inspect_native_metadata_count(
         # useful page-marker hint without turning the five-second observer into
         # a document-wide materialization.
         if result["matching_rows"] and "text" in columns:
-            sample = table.search().where(row_filter, prefilter=True).limit(1).to_pandas()
+            sample = table.search().where(row_filter, prefilter=True).select(["text"]).limit(1).to_pandas()
             if not sample.empty:
                 text = str(sample.iloc[0].get("text") or "")
                 result["text_contains_source_document"] = "sourceDocument" in text
@@ -20262,13 +20300,14 @@ def inspect_native_metadata_count(
                 or result["matching_rows"] >= len(normalized_chunk_sources)
             )
         ):
-            identities = (
-                table.search()
-                .where(row_filter, prefilter=True)
-                .select(["chunkSource"])
-                .limit(result["matching_rows"] + 1)
-                .to_pandas()
-            )
+            if identities is None:
+                identities = (
+                    table.search()
+                    .where(row_filter, prefilter=True)
+                    .select(["chunkSource"])
+                    .limit(result["matching_rows"] + 1)
+                    .to_pandas()
+                )
             identity_column = identities.get("chunkSource")
             identity_values = identity_column.tolist() if identity_column is not None else []
             observed_sources = [
@@ -20431,6 +20470,7 @@ def inspect_lancedb_workspace_table(storage_dir: Path, workspace_slug: str, samp
     return result
 
 
+@measured("attachment_files")
 def inspect_uploaded_location_files(storage_dir, upload_locations, expected_needles=None, expected_payloads=None):
     result = {
         "status": "not_checked",
@@ -20524,6 +20564,7 @@ def inspect_uploaded_location_files(storage_dir, upload_locations, expected_need
     return result
 
 
+@measured("storage_fingerprint")
 def storage_observation_fingerprint(storage_dir: Path):
     """Return a small read-only fingerprint for SQLite/Lance write races."""
     rows = []
@@ -20599,6 +20640,7 @@ def full_post_upload_observation_is_required(
 # Pyright's flow analyzer cannot traverse this deliberately comprehensive,
 # read-only evidence coordinator. Keep the narrow analyzer-limit suppression on
 # its definition; individual type errors elsewhere in the module still fail.
+@result_measurements
 def verify_anythingllm_post_upload(storage_dir: Path, workspace_slug, source_sha, payloads, upload_locations=None, observation_mode="full", frontend_api_url=""):  # pyright: ignore[reportGeneralTypeIssues]
     result = {
         "status": "not_checked",
@@ -21931,6 +21973,7 @@ code{{background:#eee;padding:1px 4px}}</style></head>
 </body></html>"""
 
 
+@document_measurements
 def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright: ignore[reportGeneralTypeIssues]
     """Characterized legacy engine.
 
@@ -26526,6 +26569,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         index_path = out_root / "artifact-locations.json"
         write_json(index_path, {"schema_version": 1, "roles": artifact_catalog.roles})
         summary["artifact_locations"] = str(index_path)
+    summary["performance"] = preparation_snapshot()
     write_json(out_root / "run-summary.json", summary)
     # The Automatic parent tails these direct transport records until its child
     # has exited, then removes them at its post-exit cleanup boundary. Ordinary
