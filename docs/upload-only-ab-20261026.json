@@ -1,0 +1,97 @@
+{
+  "date": "2026-10-26",
+  "order": [
+    "A1",
+    "B1",
+    "B2",
+    "A2"
+  ],
+  "prepared_sources": 2,
+  "records_per_trial": 31,
+  "freshly_embedded_records_total": 124,
+  "provider_sdk_calls_total": 8,
+  "trial_results": [
+    {
+      "trial": "A1",
+      "version": "b8d27d3",
+      "upload_wall_s": 18.596745899994858,
+      "sdk_call_s": 12.587,
+      "queue_group_s": 15.9889,
+      "attachment_setup_other_residual_s": 2.6078458999948584,
+      "exact_vector_observation_s_nested": 1.588,
+      "fresh_provider_chunks": 31,
+      "cache_reused": 0,
+      "pdf_parse_attempts": 0,
+      "source_transactions_proven": 2
+    },
+    {
+      "trial": "B1",
+      "version": "b8e930a",
+      "upload_wall_s": 7.727675600006478,
+      "sdk_call_s": 2.296,
+      "queue_group_s": 5.3198,
+      "attachment_setup_other_residual_s": 2.407875600006478,
+      "exact_vector_observation_s_nested": 1.582,
+      "fresh_provider_chunks": 31,
+      "cache_reused": 0,
+      "pdf_parse_attempts": 0,
+      "source_transactions_proven": 2
+    },
+    {
+      "trial": "B2",
+      "version": "b8e930a",
+      "upload_wall_s": 7.674757000000682,
+      "sdk_call_s": 3.086,
+      "queue_group_s": 5.2543,
+      "attachment_setup_other_residual_s": 2.420457000000682,
+      "exact_vector_observation_s_nested": 1.496,
+      "fresh_provider_chunks": 31,
+      "cache_reused": 0,
+      "pdf_parse_attempts": 0,
+      "source_transactions_proven": 2
+    },
+    {
+      "trial": "A2",
+      "version": "b8d27d3",
+      "upload_wall_s": 16.679361099988455,
+      "sdk_call_s": 6.977,
+      "queue_group_s": 13.7212,
+      "attachment_setup_other_residual_s": 2.9581610999884553,
+      "exact_vector_observation_s_nested": 1.521,
+      "fresh_provider_chunks": 31,
+      "cache_reused": 0,
+      "pdf_parse_attempts": 0,
+      "source_transactions_proven": 2
+    }
+  ],
+  "means": {
+    "b8d27d3": {
+      "upload_mean_s": 17.638053499991656,
+      "sdk_mean_s": 9.782
+    },
+    "b8e930a": {
+      "upload_mean_s": 7.70121630000358,
+      "sdk_mean_s": 2.691
+    }
+  },
+  "validation": {
+    "uploaded_content_and_citation_fingerprints_equal": 31,
+    "exact_vector_proven_sources_per_trial": 2,
+    "pdf_parse_attempts_total": 0,
+    "fixture_unchanged": true,
+    "cache_reuse": 0,
+    "trial_cleanup": "complete",
+    "other_workspaces_unchanged": true,
+    "restored_production_modules_matching_b8d27d3": 114,
+    "focused_regressions_passed": 27
+  },
+  "fixture_policy": "Same read-only prepared text/metadata plans for all trials. Only the prepared-cache finder was forced to return misses in each isolated test process; live upload, embedding, receipt handling and exact confirmation were retained. Freshness independently verified in backend source plans and actual SDK completion events.",
+  "conclusion": "The small upload-only test did not reproduce slower uploads on b8e930a. User-requested rollback restores the b8d27d3 production implementation regardless; this is not claimed to be a proven upload fix.",
+  "limits": [
+    "Two sources, 31 prepared records, two repetitions per version; not the full 1659-record workload",
+    "Does not reproduce effects left by a preceding full parsing/OCR run",
+    "Provider/network/backend state can vary between sequential calls",
+    "No new metadata inference or authorship-accuracy evaluation"
+  ],
+  "rollback_policy": "Revert production and its completion-wakeup-specific test, preserve historical release documentation and run artifacts; use a new revert commit without rewriting main history."
+}
