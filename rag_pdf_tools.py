@@ -489,7 +489,7 @@ def write_validation_report(full_text: str, phrases, report_path: Path):
         writer.writerows(rows)
 
 
-def get_pages_with_pymupdf(pdf_path: Path, progress_callback=None):
+def get_pages_with_pymupdf(pdf_path: Path, progress_callback=None, native_layout_reads=None):
     pages = []
     # PyMuPDF's ``Document`` supports indexed page access, but its type stub
     # does not promise the iterator protocol. Indexed access is also explicit
@@ -505,7 +505,8 @@ def get_pages_with_pymupdf(pdf_path: Path, progress_callback=None):
         for page_index in range(page_count):
             page_num = page_index + 1
             page = doc[page_index]
-            pages.append({"page": page_num, "text": page.get_text("text"), "kind": "page"})
+            text = native_layout_reads.text(page) if native_layout_reads is not None else page.get_text("text")
+            pages.append({"page": page_num, "text": text, "kind": "page"})
             if callable(progress_callback):
                 progress_callback(page_num, page_count)
     return pages, page_count
@@ -3962,6 +3963,7 @@ def get_backend_pages(
     unstructured_checkpoint_dir=None,
     progress_callback=None,
     unstructured_page_numbers=None,
+    native_layout_reads=None,
 ):
     check_source(pdf_path)
     with fitz.open(pdf_path) as budget_document:
@@ -3971,7 +3973,7 @@ def get_backend_pages(
                 check_raster(budget_document[page_index], PYMUPDF4LLM_OCR_DPI)
     backend_key = backend.lower()
     if backend_key == "pymupdf":
-        pages, page_count = get_pages_with_pymupdf(pdf_path, progress_callback=progress_callback)
+        pages, page_count = get_pages_with_pymupdf(pdf_path, progress_callback=progress_callback, native_layout_reads=native_layout_reads)
         return check_pages(pages), page_count, []
     if backend_key == "pymupdf4llm":
         pages, page_count = get_pages_with_pymupdf4llm(pdf_path, progress_callback=progress_callback)

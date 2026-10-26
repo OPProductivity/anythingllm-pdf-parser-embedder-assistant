@@ -15,6 +15,7 @@ does not prove a later one.
 
 import argparse
 from recognition_effort import production_effort_value
+from native_layout_reads import NativeLayoutReads
 from preparation_metrics import document_measurements, result_measurements, measured, measure, snapshot as preparation_snapshot
 from text_export_hygiene import ascii_label_word, prepare_readable_pages, readable_export_text
 import csv
@@ -1885,9 +1886,18 @@ def materialize_retained_segments(prepared_text_path: Path, segments_dir: Path, 
     if segments_dir.exists():
         shutil.rmtree(segments_dir)
     segments_dir.mkdir(parents=True, exist_ok=True)
+    retained = []
+    for target, text in retained_segment_contents(prepared_text_path, segments_dir, segments):
+        target.write_text(text, encoding="utf-8")
+        retained.append(target)
+    return retained
+
+
+def retained_segment_contents(prepared_text_path, segments_dir, segments):
+    """Plan the exact existing export names/text without temporary writes."""
+    prepared_text_path, segments_dir = Path(prepared_text_path), Path(segments_dir)
     base_name = safe_stem(prepared_text_path.stem.removesuffix("-pdf-parsed")) or "document"
     page_counts = Counter()
-    retained = []
     for segment in segments or ():
         if not isinstance(segment, dict):
             continue
@@ -1903,10 +1913,7 @@ def materialize_retained_segments(prepared_text_path: Path, segments_dir: Path, 
             f"-p{pdf_page:03d}-s{within_page:02d}.txt",
             fallback="segment",
         )
-        target = segments_dir / filename
-        target.write_text(str(segment.get("text") or ""), encoding="utf-8")
-        retained.append(target)
-    return retained
+        yield segments_dir / filename, str(segment.get("text") or "")
 
 
 def local_segment_export_sources(prepared_text_path: Path, retained):
@@ -2068,11 +2075,33 @@ def retain_successful_run_leanly(
     stage_parent = selected_dir if selected_dir.is_dir() else out_root
     stage_dir = Path(tempfile.mkdtemp(prefix=".retained-segments-", dir=stage_parent))
     try:
-        staged_segments = (
-            materialize_retained_segments(prepared_text_path, stage_dir, segments)
-            if retain_segment_files
-            else []
-        )
+        catalog = None
+        artifact_index = out_root / "artifact-locations.json"
+        if preserve_private_evidence and artifact_index.is_file():
+            from canonical_artifacts import CanonicalArtifacts, checked_role_path
+
+            roles = read_run_json(artifact_index)["roles"]
+            catalog = CanonicalArtifacts(out_root, atomic_write_text, existing=(
+                checked_role_path(out_root, actual) for actual in set(roles.values())
+                if Path(actual).suffix.casefold() == ".txt"
+            ))
+        reused_segments = {}
+        if retain_segment_files and catalog:
+            staged_segments = []
+            for target, text in retained_segment_contents(prepared_text_path, stage_dir, segments):
+                existing = catalog.existing_text(text)
+                if existing is None:
+                    target.write_text(text, encoding="utf-8")
+                else:
+                    # Same physical-byte check as before, before creating a
+                    # temporary copy solely to read it back and delete it.
+                    reused_segments[target] = existing
+                staged_segments.append(target)
+        else:
+            staged_segments = (
+                materialize_retained_segments(prepared_text_path, stage_dir, segments)
+                if retain_segment_files else []
+            )
         planned_direct_segments = [out_root / segment_path.name for segment_path in staged_segments]
         planned_targets = [retained_text_path, *planned_direct_segments]
         if len({str(path).casefold() for path in planned_targets}) != len(planned_targets):
@@ -2094,18 +2123,10 @@ def retain_successful_run_leanly(
                 shutil.move(str(prepared_text_path), str(retained_text_path))
         retained_segments = []
         retained_segment_exports = []
-        catalog = None
-        artifact_index = out_root / "artifact-locations.json"
-        if preserve_private_evidence and artifact_index.is_file():
-            from canonical_artifacts import CanonicalArtifacts, checked_role_path
-
-            roles = read_run_json(artifact_index)["roles"]
-            catalog = CanonicalArtifacts(out_root, atomic_write_text, existing=(
-                checked_role_path(out_root, actual) for actual in set(roles.values())
-                if Path(actual).suffix.casefold() == ".txt"
-            ))
         for segment_path, direct_path in zip(staged_segments, planned_direct_segments):
-            existing = catalog.existing_bytes(segment_path.read_bytes()) if catalog else None
+            existing = reused_segments.get(segment_path)
+            if existing is None and catalog:
+                existing = catalog.existing_bytes(segment_path.read_bytes())
             if existing is None:
                 shutil.move(str(segment_path), str(direct_path))
                 actual = catalog.register(direct_path) if catalog else direct_path
@@ -3068,12 +3089,13 @@ def _layout_repair_ligature_spans(page, blocks):
                 span["native_ligature_space_repairs"] = count
 
 
-def _layout_line_rows(page):
+def _layout_line_rows(page, textpage=None):
     """Return native lines, repairing only source-proven overlapping spaces."""
     rows = []
-    blocks = page.get_text(
-        "dict", sort=False, flags=fitz.TEXTFLAGS_DICT & ~fitz.TEXT_PRESERVE_IMAGES
-    ).get("blocks", [])
+    options = {"sort": False, "flags": fitz.TEXTFLAGS_DICT & ~fitz.TEXT_PRESERVE_IMAGES}
+    if textpage is not None:
+        options["textpage"] = textpage
+    blocks = page.get_text("dict", **options).get("blocks", [])
     _layout_repair_ligature_spans(page, blocks)
     for block in blocks:
         if block.get("type") != 0:
@@ -3994,8 +4016,16 @@ def _layout_vertical_copyright_key(row, width):
     return text.casefold()
 
 
+@measured("native_line_measurements")
+def _native_layout_profile(page, textpage=None):
+    rows = _layout_line_rows(page) if textpage is None else _layout_line_rows(page, textpage=textpage)
+    return {
+        "width": float(page.rect.width), "height": float(page.rect.height), "rows": rows,
+    }
+
+
 @measured("native_layout")
-def apply_region_aware_native_layout(pdf_path, pages, progress_callback=None):
+def apply_region_aware_native_layout(pdf_path, pages, progress_callback=None, native_layout_reads=None):
     """Create conservative semantic text from positioned native PDF lines.
 
     The original extracted page text is retained in ``raw_text``. Only strong
@@ -4009,13 +4039,20 @@ def apply_region_aware_native_layout(pdf_path, pages, progress_callback=None):
     page_total = 0
     with fitz.open(pdf_path) as document:
         page_total = int(document.page_count or 0)
+        # Consume exact line measurements before drawing inspection: MuPDF's
+        # temporary rotation normalization can mark this read-only handle dirty.
+        # The drawing/footnote rules still run in their original page order.
+        premeasured = {
+            number: native_layout_reads.consume(document.load_page(number - 1))
+            for number in range(1, page_total + 1)
+        } if native_layout_reads is not None else {}
         for page_number in range(1, page_total + 1):
             page = document.load_page(page_number - 1)
-            rows = _layout_line_rows(page)
-            note_rules, note_rule_status = _layout_note_separator_rules(page, rows)
+            prior = premeasured.pop(page_number, None)
+            layout = prior if prior is not None else _native_layout_profile(page)
+            note_rules, note_rule_status = _layout_note_separator_rules(page, layout["rows"])
             page_layouts[page_number] = {
-                "width": float(page.rect.width), "height": float(page.rect.height), "rows": rows,
-                "note_separator_rules": note_rules, "note_separator_scan": note_rule_status,
+                **layout, "note_separator_rules": note_rules, "note_separator_scan": note_rule_status,
             }
             if progress_callback:
                 progress_callback(page_number, page_total, "native_layout_scan")
@@ -11297,6 +11334,7 @@ def find_exact_staged_document_candidates(storage_dir, payload, *, excluded_loca
         return []
 
 
+@measured("attachment_snapshot")
 def snapshot_staged_document_locations(storage_dir):
     """Take a cheap path-only snapshot before any attachment mutation."""
     if not storage_dir:
@@ -11306,11 +11344,28 @@ def snapshot_staged_document_locations(storage_dir):
         custom_documents = (documents_root / "custom-documents").resolve()
         if not custom_documents.is_dir() or not custom_documents.is_relative_to(documents_root):
             return []
-        return sorted(
-            candidate.relative_to(documents_root).as_posix()
-            for candidate in custom_documents.rglob("*.json")
-            if not candidate.is_symlink()
-        )
+        locations = []
+        pending = [(custom_documents, "custom-documents")]
+        while pending:
+            directory, relative = pending.pop()
+            # DirEntry supplies the enumeration's native type information.
+            # Path.rglob plus Path.is_symlink re-statted every existing item
+            # on Windows, even though this boundary needs path names only.
+            try:
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        if entry.is_symlink():
+                            continue
+                        location = relative + "/" + entry.name
+                        if os.path.normcase(entry.name).endswith(".json"):
+                            locations.append(location)
+                        if entry.is_dir(follow_symlinks=False):
+                            pending.append((Path(entry.path), location))
+            except OSError:
+                # Match pathlib's prior traversal: a disappearing/unreadable
+                # branch must not discard the other observed locations.
+                continue
+        return sorted(locations)
     except (OSError, TypeError, ValueError):
         return []
 
@@ -22539,6 +22594,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                         "whole_document_ocr_required_because_native_document_is_empty"
                     )
 
+            native_layout_reads = NativeLayoutReads(pdf_path, _native_layout_profile) if backend == "pymupdf" else None
             pages, page_count, element_rows = get_backend_pages(
                 pdf_path,
                 backend,
@@ -22551,6 +22607,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 ),
                 progress_callback=report_backend_page_progress,
                 unstructured_page_numbers=unstructured_page_numbers,
+                native_layout_reads=native_layout_reads,
             )
             report_upload_phase(
                 "candidate_evaluation",
@@ -22603,6 +22660,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                     pdf_path,
                     pages,
                     progress_callback=report_native_layout_progress,
+                    native_layout_reads=native_layout_reads,
                 )
             elif backend == "unstructured":
                 raw_ocr_pages = list(pages)

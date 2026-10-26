@@ -67,6 +67,7 @@ py-modules = [
   "desktop_service_trust",
   "source_guard",
   "preparation_metrics",
+  "native_layout_reads",
   "cli_exports",
   "pdf_budgets",
   "pdf_layout_geometry",

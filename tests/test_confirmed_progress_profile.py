@@ -1,6 +1,7 @@
 from copy import deepcopy
 import pytest
 import rag_pdf_gradio_app as app
+import fitz
 
 pytestmark = pytest.mark.offline_deterministic
 
@@ -79,3 +80,39 @@ def test_same_basename_in_another_directory_cannot_share_facts(tmp_path):
     one.write_bytes(b"same")
     two.write_bytes(b"same")
     assert app.confirmed_progress_profile(two, manifest(one)) is None
+
+
+def test_confirmed_batch_density_features_equal_the_same_native_sample(
+    tmp_path, monkeypatch
+):
+    paths = []
+    for index in range(2):
+        path = tmp_path / f"source-{index}.pdf"
+        with fitz.open() as doc:
+            for n in range(3):
+                page = doc.new_page()
+                page.insert_text((50, 80), "Source body text " * (index + n + 1))
+            doc.save(path)
+        paths.append(path)
+    confirmed = app.automatic_ocr_preflight_manifest(paths)
+    expected = app.automatic_timing_document_profile(paths, page_sample_limit=3)
+    actual = app.confirmed_timing_document_profile(paths, confirmed)
+    assert actual is not None
+    for key, value in expected.items():
+        assert actual[key] == value, key
+
+    def no_resample(*args, **kwargs):
+        raise AssertionError("ETA must use current confirmation facts")
+
+    monkeypatch.setattr(app, "automatic_timing_document_profile", no_resample)
+    estimate = app.estimate_automatic_run(
+        paths, app.MODE_LOCAL_ONLY_LABEL, "local_only", ocr_preflight_manifest=confirmed
+    )
+    assert estimate["profile"]["profile_origin"] == "current_confirmation_facts"
+    assert estimate["profile"]["page_count"] == 6
+
+
+def test_stale_or_incomplete_confirmation_cannot_supply_eta_features(tmp_path):
+    path = tmp_path / "source.pdf"
+    path.write_bytes(b"not used as source text")
+    assert app.confirmed_timing_document_profile([path], manifest(path)) is None

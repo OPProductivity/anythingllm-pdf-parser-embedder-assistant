@@ -18579,6 +18579,13 @@ def automatic_timing_document_profile(files, *, document_limit=None, page_sample
         ):
             profile[key] = int(round(profile[key] * sampling_ratio))
     profile["profile_sampling_ratio"] = round(sampling_ratio, 3)
+    if len(raw_paths) == 1:
+        profile["sampled_char_counts"] = list(sampled_char_counts)
+    return complete_timing_document_profile(profile, sampled_char_counts)
+
+
+def complete_timing_document_profile(profile, sampled_char_counts):
+    """Derive advisory density features from numeric measurements only."""
     sampled = max(1, profile["sampled_pages"])
     profile["mean_chars_per_page"] = round(profile["sampled_text_chars"] / sampled, 1)
     profile["mean_lines_per_page"] = round(profile["sampled_lines"] / sampled, 1)
@@ -18832,6 +18839,7 @@ def automatic_full_native_text_coverage(path):
                 "file_bytes": pdf_path.stat().st_size,
                 "sampled_pages": len(timing_rows),
                 "sampled_text_chars": sum(char_counts),
+                "sampled_char_counts": char_counts,
                 "sampled_images": sum(row["image_count"] for row in timing_rows),
                 "sampled_drawings": sum(row["drawing_count"] for row in timing_rows),
                 "tableish_lines": sum(row["tableish_lines"] for row in timing_rows),
@@ -19220,6 +19228,50 @@ def confirmed_progress_profile(path, manifest):
         except (OSError, TypeError, ValueError):
             return None
     return None
+
+
+def confirmed_timing_document_profile(files, manifest):
+    """Combine current confirmation counts without resampling the PDFs."""
+    paths = list(files or [])
+    if not paths:
+        return None
+    numeric = (
+        "page_count", "file_bytes", "sampled_pages", "sampled_text_chars",
+        "sampled_images", "sampled_drawings", "tableish_lines", "sampled_lines",
+        "sampled_words", "sparse_pages", "short_pages", "long_pages",
+    )
+    profile = {key: 0 for key in numeric}
+    profile.update({
+        "documents": len(paths), "profiled_documents": len(paths),
+        "document_page_counts": [], "profile_document_limit": None,
+        "profile_sampling_ratio": 1.0, "missing_inputs": 0, "unreadable_inputs": 0,
+        "profile_origin": "current_confirmation_facts",
+    })
+    counts = []
+    for path in paths:
+        prior = confirmed_progress_profile(path, manifest)
+        if prior is None:
+            return None
+        values = prior.get("sampled_char_counts")
+        if (not isinstance(values, list) or not values
+                or any(type(value) is not int or value < 0 for value in values)
+                or len(values) != prior.get("sampled_pages")):
+            return None
+        try:
+            for key in numeric:
+                value = prior[key]
+                if type(value) is not int or value < 0:
+                    return None
+                profile[key] += value
+            if sum(values) != prior["sampled_text_chars"]:
+                return None
+        except (KeyError, TypeError):
+            return None
+        profile["document_page_counts"].append(prior["page_count"])
+        counts.extend(values)
+    if len(paths) == 1:
+        profile["sampled_char_counts"] = list(counts)
+    return complete_timing_document_profile(profile, counts)
 
 
 def automatic_progress_file_allocations(
@@ -22680,11 +22732,13 @@ def estimate_automatic_run(
 ):
     # Backfill can scan historic artifacts. It belongs to startup/diagnostic
     # maintenance (``timing_model_html``), never to the Confirm/ETA path.
-    profile = (
-        automatic_timing_document_profile(files)
-        if profile_document_limit is None
-        else automatic_timing_document_profile(files, document_limit=profile_document_limit)
-    )
+    profile = confirmed_timing_document_profile(files, ocr_preflight_manifest)
+    if profile is None:
+        profile = (
+            automatic_timing_document_profile(files)
+            if profile_document_limit is None
+            else automatic_timing_document_profile(files, document_limit=profile_document_limit)
+        )
     effective_chunk_size = chunk_size
     effective_chunk_overlap = chunk_overlap
     if mode == MODE_NATIVE_UPLOAD_LABEL and inherit_anythingllm_settings is True:
