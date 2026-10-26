@@ -1,0 +1,84 @@
+{
+  "date": "2026-10-26",
+  "base_commit": "bb0b41d",
+  "qualification": {
+    "offline_tests_passed": 3540,
+    "subtests_passed": 28,
+    "skipped": 2,
+    "deselected": 43,
+    "lint": "pass",
+    "core_types": "pass"
+  },
+  "real_ocr_transport": {
+    "fresh_comparisons": 12,
+    "same_pixels_text_and_geometry": true
+  },
+  "same_corpus": {
+    "pdfs": 31,
+    "pages": 1683,
+    "original_filenames": true,
+    "full_sources": true,
+    "same_order_and_defaults": true,
+    "all_export_names_and_bytes_equal": 1723,
+    "all_uploaded_content_and_citation_fields_equal": 1659,
+    "initial_inference_reports_equal": 31,
+    "retained_field_review_reports_equal": 31,
+    "embedding_configuration_and_policy_equal": 31,
+    "selected_ocr_use_flags_equal": 31,
+    "volatile_exclusions": [
+      "measured acquisition/OCR durations",
+      "new upload IDs",
+      "ingestion timestamps",
+      "temporary upload URLs"
+    ]
+  },
+  "fresh_ingestion": {
+    "newly_attached_records": 1659,
+    "exact_vector_confirmed_records": 1659,
+    "cache_eligible_records": 0,
+    "cache_reused_records": 0,
+    "existing_workspace_records": 0,
+    "exact_vector_proven_sources": 31,
+    "errors": 0,
+    "original_sources_unchanged": true,
+    "measured_production_code_unchanged": true
+  },
+  "baseline_cleanup": {
+    "old_workspace_deleted": true,
+    "namespace_absent": true,
+    "sql_vectors_remaining": 0,
+    "cache_entries_remaining": 0,
+    "old_unshared_document_records_removed": 1659,
+    "timed_out_first_detach_reconciled_before_continuation": true
+  },
+  "observed_timing": {
+    "baseline_total_s": 1736.350803100002,
+    "candidate_total_s": 1407.9449208000005,
+    "observed_total_reduction_percent": 18.91356756443919,
+    "candidate_phase_partition_s": {
+      "metadata_preview_first_five": 8.355291699997906,
+      "selection_advisory_eta": 0.15605930000310764,
+      "workspace_mutation_lane_wait": 8.309999975608662e-05,
+      "workspace_creation": 0.34045009999681497,
+      "confirmation_preflight": 6.617066899998463,
+      "setup_to_first_worker": 0.7536838000014541,
+      "local_preparation": 1032.2784433999987,
+      "upload_mutation_lane_wait": 8.540000271750614e-05,
+      "upload_embedding_vector_confirmation": 347.7332091999997,
+      "finalization": 11.710546800000884
+    },
+    "attribution": "Upload/embedding implementation unchanged. Large upload-window reduction is observed service/environment variation, not attributed to the local code optimizations.",
+    "local_preparation_baseline_s": 1040.5296274,
+    "local_preparation_candidate_s": 1032.2784433999987,
+    "paired_faster_preparations": 18,
+    "paired_slower_preparations": 13
+  },
+  "coverage_limits": [
+    "One sequential before/after timing comparison",
+    "Browser rendering and parent application imports excluded",
+    "Worker imports included",
+    "No new manual authorship audit",
+    "No 1150-presentation neutral-filename benchmark rerun",
+    "No inferred load-corrected runtime or unmeasured thermal claim"
+  ]
+}

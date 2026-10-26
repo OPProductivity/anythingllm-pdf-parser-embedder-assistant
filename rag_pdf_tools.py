@@ -2762,7 +2762,9 @@ def _ocr_photographed_crop_with_layout(
         recognition_evidence.update(decision, crop_fraction=list(fraction))
         recognition_evidence["setup_seconds"] = round(time.perf_counter() - setup_started, 4)
     with tempfile.TemporaryDirectory(prefix="rag-photographed-layout-") as temp_dir:
-        image_path = Path(temp_dir) / "page.png"
+        # PGM carries the identical grayscale pixels without PNG compression.
+        # Resolution, crop, preprocessing, model and OCR options stay unchanged.
+        image_path = Path(temp_dir) / "page.pgm"
         output_base = Path(temp_dir) / "result"
         cropped.save(image_path)
         try:
@@ -3413,7 +3415,7 @@ def _ocr_photographed_crop(image, fraction, tesseract, image_ops, *, psm=4, reco
         recognition_evidence.update(decision, crop_fraction=list(fraction))
         recognition_evidence["setup_seconds"] = round(time.perf_counter() - setup_started, 4)
     with tempfile.TemporaryDirectory(prefix="rag-photographed-page-") as temp_dir:
-        image_path = Path(temp_dir) / "page.png"
+        image_path = Path(temp_dir) / "page.pgm"
         cropped.save(image_path)
         try:
             completed = _run_measured_tesseract(

@@ -11,6 +11,44 @@ import hashlib
 from pathlib import Path
 
 _ACTIVE = ContextVar('author_field_native_reads', default=None)
+_ATOMIC = {str, int, float, bool, bytes, complex, type(None)}
+
+
+def _immutable(value):
+    kind = type(value)
+    return kind in _ATOMIC or kind is tuple and all(_immutable(v) for v in value)
+
+
+def _copy_native(value, memo=None):
+    """Copy mutable native containers, retaining only proven immutable leaves.
+
+    Native word/trace coordinates contain many immutable tuples. Generic
+    deepcopy repeatedly visits every scalar in each tuple. Mutable containers,
+    aliases and cycles remain independent exactly as in deepcopy; unknown
+    extension objects still use its established protocol.
+    """
+    kind = type(value)
+    if kind in _ATOMIC or kind is tuple and _immutable(value):
+        return value
+    if memo is None:
+        memo = {}
+    identity = id(value)
+    if identity in memo:
+        return memo[identity]
+    if kind is list:
+        result = []
+        memo[identity] = result
+        result.extend(_copy_native(v, memo) for v in value)
+        return result
+    if kind is dict:
+        if any(type(key) is not str for key in value):
+            return deepcopy(value, memo)
+        result = {}
+        memo[identity] = result
+        for key, child in value.items():
+            result[key] = _copy_native(child, memo)
+        return result
+    return deepcopy(value, memo)
 
 
 def _stamp(path):
@@ -79,11 +117,11 @@ class _ReviewReads:
         counts['requests'] += 1
         if key is not None and key in self.values:
             counts['reused'] += 1
-            return deepcopy(self.values[key])
+            return _copy_native(self.values[key])
         counts['reads'] += 1
         value = acquire()
         if key is not None:
-            self.values[key] = deepcopy(value)
+            self.values[key] = _copy_native(value)
         return value
 
 

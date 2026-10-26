@@ -16,6 +16,7 @@ import unicodedata
 
 import fitz
 from .native_reads import native_measurement, native_read, review_scope
+from .lexical_scope import lexical_scope
 
 from .names import (has_author_affiliation_hint, looks_like_person_name,
                     normalize_author_candidate, split_author_line_candidates)
@@ -402,6 +403,7 @@ def map_page(page, page_number, title_hint=""):
     return result
 
 
+@lexical_scope()
 def map_pdf_opening(pdf_path: Path, title_hint="", max_frontmatter_pages=12):
     """Read four pages, extending bounded front matter until title and credit link."""
     pages = []
@@ -787,8 +789,9 @@ def review_author_field_map(pdf_path, *, title_hint="", author="", author_source
                                          "status": result.get("status") or "failed",
                                          "reason": result.get("reason") or "ocr_returned_no_text"})
                 continue
-            ocr_map = map_atoms(result.get("atoms") or [], target["page"],
-                                target["width"], target["height"], title_hint)
+            with lexical_scope():
+                ocr_map = map_atoms(result.get("atoms") or [], target["page"],
+                                    target["width"], target["height"], title_hint)
             comparison = _check_ocr(author, result.get("text") or "", ocr_map, title_hint,
                                     native_map=target)
             crop_sample = [{"page": target["page"], "text": result.get("text") or ""}]
