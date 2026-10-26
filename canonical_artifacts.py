@@ -9,40 +9,66 @@ import re
 
 def checked_role_path(root, relative):
     root = Path(root).resolve()
+    return _checked_role_path_at_root(root, relative)
+
+
+def _checked_role_path_at_root(root, relative):
+    """Validate a target against the catalog's already-resolved root anchor."""
     relative = Path(relative)
     path = root / relative
     if relative.is_absolute() or path.is_symlink():
-        raise ValueError('Unsafe canonical artifact role')
+        raise ValueError("Unsafe canonical artifact role")
     target = path.resolve()
     if target.is_relative_to(root):
         return target
-    pool = next((parent / '.run-evidence' for parent in root.parents
-                 if (parent / '.run-evidence').is_dir()), None)
-    if (pool is None or pool.is_symlink() or target.parent != pool.resolve()
-            or target.suffix not in {'.csv', '.md'} or not re.fullmatch(r'[0-9a-f]{64}', target.stem)
-            or hashlib.sha256(target.read_bytes()).hexdigest() != target.stem):
-        raise ValueError('Unsafe canonical artifact escapes its document or verified shared pool')
+    pool = next(
+        (
+            parent / ".run-evidence"
+            for parent in root.parents
+            if (parent / ".run-evidence").is_dir()
+        ),
+        None,
+    )
+    if (
+        pool is None
+        or pool.is_symlink()
+        or target.parent != pool.resolve()
+        or target.suffix not in {".csv", ".md"}
+        or not re.fullmatch(r"[0-9a-f]{64}", target.stem)
+        or hashlib.sha256(target.read_bytes()).hexdigest() != target.stem
+    ):
+        raise ValueError(
+            "Unsafe canonical artifact escapes its document or verified shared pool"
+        )
     return target
 
 
 class CanonicalArtifacts:
     """Keep role paths in an index and store each identical static body once."""
 
-    def __init__(self, root, writer, existing=()):
+    def __init__(self, root, writer, existing=(), *, defer_manifest_text=False):
         self.root = Path(root).resolve()
         self.writer = writer
         self.index = {}
         self.roles = {}
-        from manifest_text import ManifestTextWriter
-
-        self.manifest_text = ManifestTextWriter(self.root)
+        self._manifest_text = None
+        if not defer_manifest_text:
+            _ = self.manifest_text
         for path in existing:
             if Path(path).is_file():
                 self.register(path)
 
+    @property
+    def manifest_text(self):
+        if self._manifest_text is None:
+            from manifest_text import ManifestTextWriter
+
+            self._manifest_text = ManifestTextWriter(self.root)
+        return self._manifest_text
+
     def checked(self, path):
         path = Path(path)
-        return checked_role_path(self.root, os.path.relpath(path, self.root))
+        return _checked_role_path_at_root(self.root, os.path.relpath(path, self.root))
 
     def register(self, path):
         path = self.checked(path)
@@ -55,7 +81,9 @@ class CanonicalArtifacts:
 
     def role(self, preferred, actual):
         preferred, actual = self.checked(preferred), self.checked(actual)
-        self.roles[str(preferred.relative_to(self.root))] = os.path.relpath(actual, self.root)
+        self.roles[str(preferred.relative_to(self.root))] = os.path.relpath(
+            actual, self.root
+        )
         return actual
 
     def shared_file(self, preferred):
@@ -78,7 +106,7 @@ class CanonicalArtifacts:
             return self.role(preferred, preferred)
         if preferred.exists():
             if preferred.read_bytes() != source.read_bytes():
-                raise ValueError('Refusing to replace a different canonical artifact')
+                raise ValueError("Refusing to replace a different canonical artifact")
             source.unlink()
         else:
             preferred.parent.mkdir(parents=True, exist_ok=True)
@@ -87,7 +115,10 @@ class CanonicalArtifacts:
             paths[:] = [preferred if path == source else path for path in paths]
         old = str(source.relative_to(self.root))
         new = str(preferred.relative_to(self.root))
-        self.roles = {role: new if actual == old else actual for role, actual in self.roles.items()}
+        self.roles = {
+            role: new if actual == old else actual
+            for role, actual in self.roles.items()
+        }
         self.role(source, preferred)
         return self.role(preferred, preferred)
 
@@ -97,19 +128,19 @@ class CanonicalArtifacts:
         if existing is not None:
             return self.role(preferred, existing)
         # Match the established Windows writer's newline translation exactly.
-        encoded = content.replace('\n', os.linesep).encode('utf8')
+        encoded = content.replace("\n", os.linesep).encode("utf8")
         if preferred.exists() and preferred.read_bytes() != encoded:
-            raise ValueError('Refusing to modify an existing static canonical artifact')
+            raise ValueError("Refusing to modify an existing static canonical artifact")
         self.writer(preferred, content)
         self.register(preferred)
         return self.role(preferred, preferred)
 
-    def existing_text(self, content, suffix='.txt'):
+    def existing_text(self, content, suffix=".txt"):
         """Find reusable text without materializing an optional artifact."""
-        encoded = content.replace('\n', os.linesep).encode('utf8')
+        encoded = content.replace("\n", os.linesep).encode("utf8")
         return self.existing_bytes(encoded, suffix)
 
-    def existing_bytes(self, encoded, suffix='.txt'):
+    def existing_bytes(self, encoded, suffix=".txt"):
         """Reuse a staged export only when its physical bytes are identical."""
         key = (suffix, len(encoded), hashlib.sha256(encoded).digest())
         for path in self.index.get(key, []):
@@ -118,9 +149,13 @@ class CanonicalArtifacts:
         return None
 
     def jsonl(self, preferred, rows):
-        return self.text(preferred, ''.join(json.dumps(row,
-                                                      ensure_ascii=False, separators=(',', ':')) + '\n'
-                                            for row in self.manifest_text.records(rows)))
+        return self.text(
+            preferred,
+            "".join(
+                json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
+                for row in self.manifest_text.records(rows)
+            ),
+        )
 
     def remove_empty_alias_directories(self):
         for role, actual in self.roles.items():
@@ -136,4 +171,6 @@ class CanonicalArtifacts:
 
 
 def selected_artifact_path(selected, directory, name):
-    return Path((selected.get('artifact_paths') or {}).get(name) or Path(directory) / name)
+    return Path(
+        (selected.get("artifact_paths") or {}).get(name) or Path(directory) / name
+    )

@@ -1,0 +1,96 @@
+{
+  "date": "2026-10-26",
+  "base_commit": "826cf03",
+  "candidate_top_level_python_digest_recorded_in_local_receipt": true,
+  "offline": {
+    "lint": "pass",
+    "types": "pass",
+    "passed": 3535,
+    "skipped": 2,
+    "deselected": 43,
+    "subtests_passed": 28
+  },
+  "native_output_comparison": {
+    "pdfs": 31,
+    "pages": 2951,
+    "all_raw_layout_evidence_and_ocr_counts_equal": true,
+    "excluded_evidence_fields": [
+      "targeted_ocr_seconds",
+      "subprocess_seconds"
+    ]
+  },
+  "ocr_line_reconstruction": {
+    "freshly_ocred_pages": 3,
+    "word_partitions_compared": 9,
+    "all_equal": true
+  },
+  "private_retention_comparison": {
+    "sources": 42,
+    "records": 5420,
+    "all_export_names_and_contents_equal": true
+  },
+  "full_ingestion": {
+    "pdfs": 31,
+    "pages": 1683,
+    "original_filenames": true,
+    "full_sources": true,
+    "default_settings": true,
+    "metadata_overrides": false,
+    "first_five_preview_included": true,
+    "newly_attached_records": 1659,
+    "exact_vector_confirmed_records": 1659,
+    "cache_eligible_records": 0,
+    "reused_cached_records": 0,
+    "source_transactions_exact_vectors_proven": 31,
+    "upload_errors": 0,
+    "original_sources_unchanged": true,
+    "candidate_sources_unchanged": true,
+    "total_wall_s": 1736.350803100002,
+    "nonoverlapping_phase_wall_s": {
+      "metadata_preview_first_five": 9.819195500000205,
+      "selection_advisory_eta": 0.16251809999812394,
+      "workspace_mutation_lane_wait": 8.450000314041972e-05,
+      "workspace_creation": 0.3077601999975741,
+      "confirmation_preflight": 7.123527199997625,
+      "setup_to_first_worker": 0.7734627000027103,
+      "local_preparation": 1040.5296273999993,
+      "upload_mutation_lane_wait": 9.029999637277797e-05,
+      "upload_embedding_vector_confirmation": 666.425130100004,
+      "finalization": 11.209405900001002
+    },
+    "source_preparation_phase_totals_s": {
+      "source_metadata_and_author_inference": 96.84500000000003,
+      "anythingllm_configuration_resolution": 0.017,
+      "extraction_backend:pymupdf": 140.44099999999997,
+      "author_field_review": 520.357,
+      "payload_packaging_and_diagnostics": 16.644999999999996,
+      "anythingllm_batch_read_only_inspection": 2.025,
+      "targeted_native_metadata_observation": 0.02900000000000002,
+      "extraction_backend:unstructured": 182.85
+    },
+    "upload_breakdown": {
+      "sequential_embedding_group_windows_s": 569.4439,
+      "upload_setup_attachment_and_other_residual_s": 96.98123010000404,
+      "within_group_reconciliation_s": 305.0915,
+      "within_reconciliation_actual_vector_store_observation_s": 16.221,
+      "scope": "The first two values partition the measured upload window. Reconciliation is inside the group windows and includes queue waiting; vector-store observation is inside reconciliation. These nested times must not be added again."
+    }
+  },
+  "coverage_limits": [
+    "No browser transfer/rendering test",
+    "Isolated assistant history",
+    "No new manual author correctness audit",
+    "No 1150-presentation author benchmark rerun",
+    "No matched whole-corpus speed ratio",
+    "Course corpus is not an untouched accuracy holdout"
+  ],
+  "interrupted_attempt": {
+    "prepared_pdfs": 20,
+    "seconds": 745.6969663,
+    "upload_started": false,
+    "embedding_started": false,
+    "prepared_or_ocr_evidence_reused_in_fresh_run": false,
+    "cause": "Public output directory absent during capacity query; removing actor not established",
+    "fixed_failure": "Missing destination is recreated and its actual volume checked; other inspection errors safely hold the batch"
+  }
+}

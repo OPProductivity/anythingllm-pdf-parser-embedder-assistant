@@ -2081,7 +2081,7 @@ def retain_successful_run_leanly(
             from canonical_artifacts import CanonicalArtifacts, checked_role_path
 
             roles = read_run_json(artifact_index)["roles"]
-            catalog = CanonicalArtifacts(out_root, atomic_write_text, existing=(
+            catalog = CanonicalArtifacts(out_root, atomic_write_text, defer_manifest_text=True, existing=(
                 checked_role_path(out_root, actual) for actual in set(roles.values())
                 if Path(actual).suffix.casefold() == ".txt"
             ))

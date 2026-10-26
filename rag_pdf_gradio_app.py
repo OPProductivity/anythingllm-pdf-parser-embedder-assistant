@@ -11312,10 +11312,8 @@ def automatic_batch_output_capacity_preflight(
         artifact_total += projected_artifacts
         temporary_peak = max(temporary_peak, max(8 * 1024 * 1024, projected_artifacts // 2))
     target = Path(output_root)
-    usage = shutil.disk_usage(target)
     required = artifact_total + temporary_peak + max(0, int(safety_reserve_bytes))
-    return {
-        "status": "pass" if not unreadable and usage.free >= required else "insufficient_space",
+    facts = {
         "selected_pdfs": len(files or []),
         "projected_artifact_bytes": artifact_total,
         # Reuse this immutable size projection at later source boundaries.
@@ -11325,9 +11323,28 @@ def automatic_batch_output_capacity_preflight(
         "temporary_peak_bytes": temporary_peak,
         "safety_reserve_bytes": int(safety_reserve_bytes),
         "required_free_bytes": required,
-        "available_free_bytes": int(usage.free),
         "unreadable_sources": unreadable,
         "output_root": str(target),
+    }
+    try:
+        try:
+            usage = shutil.disk_usage(target)
+        except FileNotFoundError:
+            # Publication can be much later than private preparation. An
+            # empty public destination may disappear meanwhile; recreate the
+            # configured directory and inspect its actual volume again.
+            target.mkdir(parents=True, exist_ok=True)
+            usage = shutil.disk_usage(target)
+    except OSError as exc:
+        return facts | {
+            "status": "output_unavailable",
+            "available_free_bytes": None,
+            "error_type": type(exc).__name__,
+            "message": f"Could not create or inspect the output destination at {target}: {exc}",
+        }
+    return facts | {
+        "status": "pass" if not unreadable and usage.free >= required else "insufficient_space",
+        "available_free_bytes": int(usage.free),
         "message": (
             "Output volume has enough free space for the staged batch."
             if not unreadable and usage.free >= required
@@ -18482,7 +18499,7 @@ def _bucket(value, low, high, *, low_label="low", high_label="high", middle_labe
     return middle_label
 
 
-def automatic_timing_document_profile(files, *, document_limit=None, page_sample_limit=24):
+def automatic_timing_document_profile(files, *, document_limit=None, page_sample_limit=3):
     """Build a bounded local-only difficulty profile for ETA calibration.
 
     At most ``page_sample_limit`` evenly-spaced pages per input are sampled.
@@ -31902,8 +31919,8 @@ def run_automatic(
         if remaining_capacity["status"] != "pass":
             phase = "Output capacity changed — run held before the next PDF"
             detail = (
-                f"Before PDF {file_index}/{total_files}, the output volume no longer had the reserved "
-                "space for the remaining staged packages. Earlier prepared files were retained and "
+                f"Before PDF {file_index}/{total_files}: {remaining_capacity['message']} "
+                "Earlier prepared files were retained and "
                 "AnythingLLM was not changed by this run."
             )
             update_live_automatic_run_status(
@@ -31925,7 +31942,7 @@ def run_automatic(
                 phase,
                 [remaining_capacity["message"]],
                 [
-                    "Free space on the selected output volume, then start a new run.",
+                    "Check that the output folder is available and writable and has enough free space before starting a new run.",
                     "Earlier prepared files were retained; this held run did not begin an AnythingLLM upload.",
                 ],
                 {

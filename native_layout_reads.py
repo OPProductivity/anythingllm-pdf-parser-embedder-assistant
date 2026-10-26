@@ -41,6 +41,7 @@ class NativeLayoutReads:
         self.build = build
         self.values = {}
         self.documents = {}
+        self.document_names = {}
         self.valid = True
         try:
             self.version = stamp(self.path)
@@ -67,15 +68,20 @@ class NativeLayoutReads:
                 or doc.is_encrypted
                 or doc.needs_pass
                 or not doc.name
-                or Path(doc.name).resolve() != self.path
             ):
                 return False
-            if self.documents.get(id(doc)) is not doc:
+            if (
+                self.documents.get(id(doc)) is not doc
+                or self.document_names.get(id(doc)) != doc.name
+            ):
+                if Path(doc.name).resolve() != self.path:
+                    return False
                 if self._digest() != self.digest:
                     self.valid = False
                     self.values.clear()
                     return False
                 self.documents[id(doc)] = doc
+                self.document_names[id(doc)] = doc.name
             return True
         except OSError, RuntimeError, ValueError, AttributeError:
             return False

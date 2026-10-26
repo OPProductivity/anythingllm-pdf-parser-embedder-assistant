@@ -2876,14 +2876,11 @@ def relocate_bottom_caption_from_narrow_scan_prose(text, layout_rows):
 def _tsv_column_line_text(rows):
     """Rebuild one column from physical line bands, including split blocks."""
     logical_lines = []
-    for block, paragraph, line in sorted({
-        (row["block"], row["paragraph"], row["line"]) for row in rows
-    }):
-        line_rows = [
-            row for row in rows
-            if (row["block"], row["paragraph"], row["line"])
-            == (block, paragraph, line)
-        ]
+    grouped_rows = defaultdict(list)
+    for row in rows:
+        grouped_rows[(row["block"], row["paragraph"], row["line"])].append(row)
+    for key in sorted(grouped_rows):
+        line_rows = grouped_rows[key]
         logical_lines.append({
             "top": min(row["top"] for row in line_rows),
             "bottom": max(row["top"] + row["height"] for row in line_rows),
