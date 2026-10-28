@@ -4967,6 +4967,15 @@ def reading_region_label(row):
     return f"Reading region: {name or 'sub-page region'} ({index} of {count})."
 
 
+def page_preserve_segment_limit(segment_mode, inherited_limit, requested_ceiling=0):
+    """Keep explicit page-preserve ceilings separate from passage targets."""
+    hard_limit = max(1, int(inherited_limit))
+    ceiling = int(requested_ceiling or 0)
+    if str(segment_mode or "").casefold() == "page_limit" and ceiling > 0:
+        return min(hard_limit, ceiling)
+    return hard_limit
+
+
 @measured("segmentation")
 def make_segments(
     pdf_path,
@@ -8080,7 +8089,7 @@ def generate_page_parent_payloads(parent_rows, mode):
     return rows
 
 
-def representation_comparison_rows(segments, page_parent_rows, chunk_size, chunk_overlap, embedding_config):
+def representation_comparison_rows(segments, page_parent_rows, chunk_size, chunk_overlap, embedding_config, *, local_segment_limit=None):
     def summarize_units(name, units, provenance_strength, retrieval_precision, citation_fidelity):
         lengths = [len(str(unit.get("text") or "")) for unit in units]
         if lengths:
@@ -8098,6 +8107,7 @@ def representation_comparison_rows(segments, page_parent_rows, chunk_size, chunk
             "embedder_max_chunk_length": embedding_config.get("max_chunk_length") or "",
             "anythingllm_chunk_size": chunk_size,
             "anythingllm_chunk_overlap": chunk_overlap,
+            "local_segment_limit": local_segment_limit if local_segment_limit is not None else chunk_size,
             "provenance_strength": provenance_strength,
             "retrieval_precision_expectation": retrieval_precision,
             "citation_fidelity_expectation": citation_fidelity,
@@ -8130,6 +8140,7 @@ def representation_comparison_rows(segments, page_parent_rows, chunk_size, chunk
                 "embedder_max_chunk_length": embedding_config.get("max_chunk_length") or "",
                 "anythingllm_chunk_size": chunk_size,
                 "anythingllm_chunk_overlap": chunk_overlap,
+                "local_segment_limit": local_segment_limit if local_segment_limit is not None else chunk_size,
                 "provenance_strength": "children_per_parent_ratio",
                 "retrieval_precision_expectation": f"{len(segments)} child segments across {len(page_parent_rows)} page parents",
                 "citation_fidelity_expectation": "parent-child reconstruction available",
@@ -8271,13 +8282,15 @@ def explain_observed_columns(workspace_report):
     return rows
 
 
-def harmonization_rows(segments, page_parent_rows, chunk_size, chunk_overlap, embedding_config):
+def harmonization_rows(segments, page_parent_rows, chunk_size, chunk_overlap, embedding_config, *, local_segment_limit=None):
     try:
         embedder_limit = int(embedding_config.get("max_chunk_length") or 0)
     except (TypeError, ValueError):
         embedder_limit = 0
-    effective_limit = min(chunk_size, embedder_limit) if embedder_limit > 0 else int(chunk_size or 0)
-    effective_step = max(1, int(chunk_size or 0) - int(chunk_overlap or 0))
+    anythingllm_effective_limit = min(chunk_size, embedder_limit) if embedder_limit > 0 else int(chunk_size or 0)
+    local_limit = int(local_segment_limit if local_segment_limit is not None else anythingllm_effective_limit)
+    effective_limit = min(anythingllm_effective_limit, local_limit) if anythingllm_effective_limit else local_limit
+    effective_step = max(1, int(effective_limit or 0) - int(chunk_overlap or 0))
 
     def summarize(name, units, citation_goal):
         lengths = [len(str(unit.get("text") or "")) for unit in units]
@@ -8296,9 +8309,12 @@ def harmonization_rows(segments, page_parent_rows, chunk_size, chunk_overlap, em
             risk = "medium"
         else:
             risk = "high"
+        local_ceiling_applies = bool(anythingllm_effective_limit and effective_limit < anythingllm_effective_limit)
         recommendation = (
             "Suitable for current settings."
             if risk == "low"
+            else "Page parents exceed the requested local page ceiling; use passage segments for upload."
+            if name == "page_parents" and local_ceiling_applies
             else "Likely to be re-split by AnythingLLM; preserve provenance in promoted title fields and use parent-child reconstruction."
             if name == "page_parents"
             else "Reduce passage size or rely on local segmentation to keep retrieval units stable."
@@ -8312,6 +8328,8 @@ def harmonization_rows(segments, page_parent_rows, chunk_size, chunk_overlap, em
             "max_estimated_tokens": max(estimated_tokens) if estimated_tokens else 0,
             "anythingllm_chunk_size": chunk_size,
             "anythingllm_chunk_overlap": chunk_overlap,
+            "anythingllm_effective_limit": anythingllm_effective_limit or "",
+            "local_segment_limit": local_limit or "",
             "embedder_max_chunk_length": embedder_limit or "",
             "effective_limit": effective_limit or "",
             "units_exceeding_effective_limit": exceeding,
@@ -8340,7 +8358,12 @@ def representation_recommendation_rows(harmonization_report_rows):
         citation_reason = "Page parents fit within the effective current limit and preserve page-level provenance directly."
     else:
         citation_recommendation = "passage_segments_plus_page_parent_artifacts"
-        citation_reason = "Page parents are likely to be re-split; keep passage segments for upload and use page-parent artifacts for reconstruction."
+        citation_reason = (
+            "Page parents exceed the requested local page ceiling; keep passage segments for upload and page-parent artifacts for reconstruction."
+            if parent.get("local_segment_limit") and parent.get("anythingllm_effective_limit")
+            and int(parent["local_segment_limit"]) < int(parent["anythingllm_effective_limit"])
+            else "Page parents are likely to be re-split; keep passage segments for upload and use page-parent artifacts for reconstruction."
+        )
 
     if seg_risk in {"low", "medium"}:
         default_recommendation = "passage_segments"
@@ -9665,6 +9688,14 @@ def inspect_anythingllm_storage(storage_dir: Path, progress_callback=None):
     }
     if not result["exists"]:
         result["status"] = "missing_storage_dir"
+        return result
+    # Opening a nonexistent LanceDB path initializes it. A baseline inspection
+    # must report absent storage rather than create a database as a side effect.
+    if not result["lancedb_exists"]:
+        result["status"] = "missing_lancedb_dir"
+        return result
+    if not (storage_dir / "lancedb" / "__manifest").is_dir():
+        result["status"] = "missing_lancedb_manifest"
         return result
     try:
         import lancedb
@@ -14150,9 +14181,13 @@ def resolve_native_upload_representation(requested, harmonization_report_rows):
                           for row in harmonization_report_rows
                           if str(row.get("representation") or "") == "page_parents"), 0) or 0)
     if requested == "page_parents" and oversized:
+        parent = next((row for row in harmonization_report_rows if row.get("representation") == "page_parents"), {})
+        local_ceiling_applies = bool(parent.get("local_segment_limit") and parent.get("anythingllm_effective_limit")
+                                     and int(parent["local_segment_limit"]) < int(parent["anythingllm_effective_limit"]))
         return "segments", {
             "applied": True, "requested": "page_parents", "effective": "segments",
-            "reason": "page_parent_exceeds_effective_splitter_limit",
+            "reason": ("page_parent_exceeds_local_page_ceiling" if local_ceiling_applies
+                       else "page_parent_exceeds_effective_splitter_limit"),
             "oversized_page_parent_units": oversized,
         }
     return requested, {}
@@ -14279,7 +14314,7 @@ def relocate_uploaded_document(storage_dir: Path, location: str, folder_name: st
             relative_path = absolute_candidate.resolve().relative_to(documents_root)
             normalized_location = str(relative_path).replace("\\", "/")
         except Exception:
-            return raw_location, ""
+            return raw_location, "Uploaded document location is outside AnythingLLM documents storage."
     else:
         # Desktop locations are relative paths, not URLs or drive-relative
         # paths. Reject traversal before normalization can conceal it.
@@ -14312,6 +14347,10 @@ def relocate_uploaded_document(storage_dir: Path, location: str, folder_name: st
         target_path.relative_to(documents_root)
     except ValueError:
         return raw_location, "Managed upload target is outside AnythingLLM documents storage."
+    if source_path == target_path:
+        return target_relative.replace("\\", "/"), ""
+    if target_path.exists():
+        return raw_location, f"Managed upload target already exists: {target_path}"
     target_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(source_path), str(target_path))
     return target_relative.replace("\\", "/"), ""
@@ -17823,6 +17862,18 @@ def maybe_upload_payloads(
     }
 
 
+def finalize_file_attachment_location(storage_dir, location, row, folder_name):
+    """Apply the same guarded layout after normal or reconciled attachment."""
+    if not storage_dir:
+        return location, ""
+    try:
+        return relocate_uploaded_document(
+            Path(storage_dir), location, row.get("_anythingllm_folder_name") or folder_name,
+        )
+    except OSError as exc:
+        return location, f"Could not relocate the staged document: {exc}"
+
+
 def maybe_upload_segment_files(
     api_url,
     api_key,
@@ -18086,23 +18137,6 @@ def maybe_upload_segment_files(
                         )
                         if attachment_reconciliation.get("status") == "exact_location_recovered":
                             location = str(attachment_reconciliation["candidates"][0])
-                    record_submission_receipt(
-                        submission_receipt_path, receipt_payload,
-                        run_id=run_id, workspace_slug=workspace_slug, transport="file_upload",
-                        state="attached_reconciled" if attachment_reconciliation and location else (
-                            "attached" if location else "submitted"
-                        ),
-                        correlation_id=correlation_id, http_status=status, location=location,
-                        prepared_payload_hash=prepared_file_hash,
-                        next_check=(
-                            "Submit the recorded location to the workspace embedding update."
-                            if location else "Read the upload response and reconcile the native document before retrying."
-                        ),
-                        # The durable pre-request intent above makes a crash
-                        # here recoverable by reconciliation. Do not force a
-                        # separate physical flush for every ordinary success.
-                        receipt_buffer=deferred_receipts,
-                    )
                     if location:
                         pre_attachment_locations.add(location)
                         if storage_dir:
@@ -18110,15 +18144,21 @@ def maybe_upload_segment_files(
                             # files from several PDFs.  Keep the destination
                             # per source row so opting into document folders
                             # does not collapse every source into one folder.
-                            row_folder_name = row.get("_anythingllm_folder_name") or folder_name
-                            location, relocation_error = relocate_uploaded_document(
-                                Path(storage_dir),
-                                location,
-                                row_folder_name,
+                            location, relocation_error = finalize_file_attachment_location(
+                                storage_dir, location, row, folder_name,
                             )
                             if relocation_error:
-                                attachment.update(status="relocation_failed", error=relocation_error)
+                                attachment.update(status="relocation_failed", location=location, error=relocation_error)
                                 attachment_results.append(attachment)
+                                record_submission_receipt(
+                                    submission_receipt_path, receipt_payload,
+                                    run_id=run_id, workspace_slug=workspace_slug, transport="file_upload",
+                                    state="relocation_failed", correlation_id=correlation_id,
+                                    http_status=status, location=location,
+                                    prepared_payload_hash=prepared_file_hash,
+                                    error=relocation_error,
+                                    next_check="Reconcile the staged document before any replay; do not queue an unrelocated location.",
+                                )
                                 errors.append(
                                     {
                                         "error": relocation_error,
@@ -18143,6 +18183,20 @@ def maybe_upload_segment_files(
                             attachment_reconciliation=attachment_reconciliation,
                         )
                     attachment_results.append(attachment)
+                    record_submission_receipt(
+                        submission_receipt_path, receipt_payload,
+                        run_id=run_id, workspace_slug=workspace_slug, transport="file_upload",
+                        state=attachment["status"] if location else "submitted",
+                        correlation_id=correlation_id, http_status=status, location=location,
+                        prepared_payload_hash=prepared_file_hash,
+                        next_check=(
+                            "Submit the recorded location to the workspace embedding update."
+                            if location else "Reconcile the native document before any retry."
+                        ),
+                        # The durable pre-request intent protects the move-to-
+                        # acknowledgement crash window without per-file fsync.
+                        receipt_buffer=deferred_receipts,
+                    )
                     if not location:
                         # This has the same ambiguity boundary as the raw
                         # route above.  A later attachment cannot safely be
@@ -18189,8 +18243,23 @@ def maybe_upload_segment_files(
                     if attachment_reconciliation and attachment_reconciliation.get("status") == "exact_location_recovered":
                         location = str(attachment_reconciliation["candidates"][0])
                         pre_attachment_locations.add(location)
-                        locations.append(location)
                         uploaded += 1
+                        location, relocation_error = finalize_file_attachment_location(storage_dir, location, row, folder_name)
+                        if relocation_error:
+                            attachment.update(status="relocation_failed", location=location, error=relocation_error)
+                            attachment_results.append(attachment)
+                            record_submission_receipt(
+                                submission_receipt_path, receipt_payload,
+                                run_id=run_id, workspace_slug=workspace_slug, transport="file_upload",
+                                state="relocation_failed", correlation_id=correlation_id,
+                                http_status=status, location=location,
+                                prepared_payload_hash=prepared_file_hash,
+                                error=relocation_error,
+                                next_check="Reconcile the staged document before any replay; do not queue an unrelocated location.",
+                            )
+                            errors.append({"error": relocation_error, "segment": row.get("chunkSource", ""), "filename": row.get("filename", "")})
+                            break
+                        locations.append(location)
                         attachment.update(
                             status="attached_reconciled",
                             location=location,
@@ -18251,8 +18320,22 @@ def maybe_upload_segment_files(
                 if attachment_reconciliation.get("status") == "exact_location_recovered":
                     location = str(attachment_reconciliation["candidates"][0])
                     pre_attachment_locations.add(location)
-                    locations.append(location)
                     uploaded += 1
+                    location, relocation_error = finalize_file_attachment_location(storage_dir, location, row, folder_name)
+                    if relocation_error:
+                        attachment.update(status="relocation_failed", location=location, error=relocation_error)
+                        attachment_results.append(attachment)
+                        record_submission_receipt(
+                            submission_receipt_path, receipt_payload,
+                            run_id=run_id, workspace_slug=workspace_slug, transport="file_upload",
+                            state="relocation_failed", correlation_id=correlation_id,
+                            location=location, prepared_payload_hash=prepared_file_hash,
+                            error=relocation_error,
+                            next_check="Reconcile the staged document before any replay; do not queue an unrelocated location.",
+                        )
+                        errors.append({"error": relocation_error, "segment": row.get("chunkSource", ""), "filename": row.get("filename", "")})
+                        break
+                    locations.append(location)
                     attachment.update(
                         status="attached_reconciled",
                         location=location,
@@ -21577,6 +21660,39 @@ def workspace_storage_inspector(storage_dir: Path, workspace_slug):
     return result
 
 
+def inspect_workspace_vector_ids(storage_dir, workspace_slug, vector_ids):
+    """Read only requested IDs from the selected namespace, never initialize it."""
+    requested = {str(value) for value in vector_ids if value}
+    result = {"status": "not_checked", "present_ids": set(), "error": ""}
+    if not requested:
+        result["status"] = "no_vector_ids"
+        return result
+    database_path = Path(storage_dir) / "lancedb"
+    if not database_path.is_dir():
+        result.update(status="missing_lancedb_dir", error="Physical vector storage is missing.")
+        return result
+    try:
+        if not (database_path / "__manifest").is_dir():
+            result.update(status="workspace_table_missing", error="Physical vector storage has no database manifest.")
+            return result
+        import lancedb
+        db = lancedb.connect(str(database_path))
+        if workspace_slug not in lancedb_table_names(db):
+            result.update(status="workspace_table_missing", error="The selected workspace vector namespace is missing.")
+            return result
+        table = db.open_table(workspace_slug)
+        ids = sorted(requested)
+        for start in range(0, len(ids), 100):
+            batch = ids[start:start + 100]
+            quoted = ",".join("'" + value.replace("'", "''") + "'" for value in batch)
+            rows = table.search().where(f"id IN ({quoted})", prefilter=True).select(["id"]).to_arrow().to_pylist()
+            result["present_ids"].update(str(row["id"]) for row in rows if row.get("id") is not None)
+        result["status"] = "complete"
+    except Exception as exc:
+        result.update(status="inspection_unavailable", error=str(exc))
+    return result
+
+
 def workspace_duplicate_identity_audit(
     storage_dir: Path,
     workspace_slug: str,
@@ -21587,11 +21703,11 @@ def workspace_duplicate_identity_audit(
     """Read-only duplicate inventory for one workspace.
 
     ``chunkSource`` is deliberately stable for a PDF/page identity, so a
-    repeated value is useful evidence of an earlier import.  This helper is
-    intentionally scoped to ``workspace_documents`` plus their linked
-    ``document_vectors`` rows: it never infers that a global LanceDB match
-    belongs to the chosen workspace and it never deletes, rewrites, or
-    re-embeds anything.
+    repeated value is useful evidence of an earlier import. This helper
+    inventories ``workspace_documents`` plus linked ``document_vectors`` rows.
+    Skip decisions additionally require those exact vector IDs in the selected
+    physical namespace. A global match never establishes workspace membership;
+    this function never deletes, rewrites, or re-embeds anything.
 
     When prepared payloads are supplied, the result additionally states which
     *complete PDFs* are already indexed.  Callers can safely skip only those
@@ -21618,6 +21734,7 @@ def workspace_duplicate_identity_audit(
         "duplicate_vector_rows": 0,
         "duplicate_groups": [],
         "error": "",
+        "skip_proof_blocked": False,
     }
     slug = result["workspace_slug"]
     if not slug:
@@ -21696,10 +21813,42 @@ def workspace_duplicate_identity_audit(
             entry["vector_count"] = int(vector_counts.get(entry["doc_id"], 0))
             identity_rows.setdefault(chunk_source, []).append(entry)
 
+        matching_entries = [
+            entry for source in expected_sources for entry in identity_rows.get(source, [])
+        ]
+        selected_doc_ids = sorted({
+            entry["doc_id"] for source in expected_sources
+            for entry in identity_rows.get(source, []) if entry["vector_count"] > 0
+        })
+        vectors_by_doc = {}
+        for offset in range(0, len(selected_doc_ids), 800):
+            batch = selected_doc_ids[offset:offset + 800]
+            placeholders = ",".join("?" for _ in batch)
+            for vector_row in cur.execute(
+                f"select docId,vectorId from document_vectors where docId in ({placeholders})", batch,
+            ):
+                if vector_row["vectorId"]:
+                    vectors_by_doc.setdefault(str(vector_row["docId"]), set()).add(str(vector_row["vectorId"]))
+        expected_vector_ids = set().union(*vectors_by_doc.values()) if vectors_by_doc else set()
+        physical = inspect_workspace_vector_ids(storage_dir, slug, expected_vector_ids) if selected_doc_ids else {}
+        present_ids = physical.get("present_ids") or set()
+        if matching_entries and (
+            any(entry["vector_count"] <= 0 or not entry["doc_id"] for entry in matching_entries)
+            or physical.get("status") != "complete"
+            or expected_vector_ids - present_ids
+            or any(not vectors_by_doc.get(doc_id) for doc_id in selected_doc_ids)
+        ):
+            result["skip_proof_blocked"] = True
+            result["error"] = (
+                "Existing SQLite vector mappings lack complete physical proof in the selected workspace. "
+                "Reconcile storage before retrying; no automatic re-upload is safe. "
+                + str(physical.get("error") or "One or more linked vector IDs are missing.")
+            )
         ready_expected_sources = {
             chunk_source
             for chunk_source in expected_sources
-            if any(int(entry.get("vector_count") or 0) > 0 for entry in identity_rows.get(chunk_source, []))
+            if any(vectors_by_doc.get(entry["doc_id"]) and vectors_by_doc[entry["doc_id"]] <= present_ids
+                   for entry in identity_rows.get(chunk_source, []))
         }
         result["expected_ready_chunk_source_count"] = len(ready_expected_sources)
         result["_ready_expected_chunk_sources"] = sorted(ready_expected_sources)
@@ -21741,7 +21890,7 @@ def workspace_duplicate_identity_audit(
             max(0, int(group["vector_rows"]) - 1) for group in duplicate_groups
         )
         result["duplicate_groups"] = duplicate_groups[:sample_limit]
-        result["status"] = "complete"
+        result["status"] = "physical_vector_proof_unavailable" if result["skip_proof_blocked"] else "complete"
     except (sqlite3.OperationalError, OSError) as exc:
         result.update(status="inspection_unavailable", error=str(exc))
     except Exception as exc:
@@ -22295,6 +22444,10 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         embedder_chunk_limit = int(embedder_policy["recommended_limit"])
     if embedder_chunk_limit > 0:
         chunk_size = min(chunk_size, embedder_chunk_limit)
+    local_segment_limit = page_preserve_segment_limit(
+        getattr(args, "segment_mode", "passages"), chunk_size,
+        getattr(args, "page_preserve_ceiling", 0),
+    )
     chunk_overlap = int(
         getattr(args, "anythingllm_chunk_overlap", -1)
         if getattr(args, "anythingllm_chunk_overlap", -1) >= 0
@@ -22863,7 +23016,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 args.target_passage_length,
                 outline=usable_outline,
                 segment_mode=getattr(args, "segment_mode", "passages"),
-                effective_limit=chunk_size,
+                effective_limit=local_segment_limit,
                 custom_page_group_sizes=getattr(args, "custom_page_group_sizes", ()),
             )
             check_pages(segment_pages)
@@ -22996,7 +23149,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                     args.target_passage_length,
                     outline=usable_outline,
                     segment_mode=getattr(args, "segment_mode", "passages"),
-                    effective_limit=chunk_size,
+                    effective_limit=local_segment_limit,
                     custom_page_group_sizes=getattr(args, "custom_page_group_sizes", ()),
                 )
                 if not variant_segments:
@@ -23853,6 +24006,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         chunk_size,
         chunk_overlap,
         profile["anythingllm_embedding_config"],
+        local_segment_limit=local_segment_limit,
     )
     write_json(selected_dir / "representation-comparison.json", comparison_rows)
     harmonization_report_rows = harmonization_rows(
@@ -23861,6 +24015,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         chunk_size,
         chunk_overlap,
         profile["anythingllm_embedding_config"],
+        local_segment_limit=local_segment_limit,
     )
     write_json(selected_dir / "harmonization-report.json", harmonization_report_rows)
     recommendation_rows = representation_recommendation_rows(harmonization_report_rows)

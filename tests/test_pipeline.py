@@ -936,6 +936,7 @@ class PipelineCoreTests(unittest.TestCase):
         original_choices = app.local_workspace_choices
         original_desktop_refresh = app.request_desktop_workspace_refresh
         original_compatibility = app.automatic_native_mutation_compatibility_report
+        original_capacity = app.automatic_batch_output_capacity_preflight
         created = []
         captured = {}
         try:
@@ -949,6 +950,7 @@ class PipelineCoreTests(unittest.TestCase):
                 return ('summary', 'files', 'artifacts', 'download-state', 'button', 'readiness', 'timer')
 
             app.create_new_document_workspace = create_workspace
+            app.automatic_batch_output_capacity_preflight = lambda *_args, **_kwargs: {"status": "pass"}
             app.run_automatic = run_automatic
             app.local_workspace_choices = lambda: ([('PDF new document', 'pdf-new-document')], 'local ok')
             app.request_desktop_workspace_refresh = lambda: {'status': 'not_installed_or_not_running'}
@@ -989,6 +991,7 @@ class PipelineCoreTests(unittest.TestCase):
             app.local_workspace_choices = original_choices
             app.request_desktop_workspace_refresh = original_desktop_refresh
             app.automatic_native_mutation_compatibility_report = original_compatibility
+            app.automatic_batch_output_capacity_preflight = original_capacity
 
     def test_unqualified_contract_stops_before_new_workspace_mutation(self):
         import rag_pdf_gradio_app as app

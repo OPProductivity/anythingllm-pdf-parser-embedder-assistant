@@ -6539,7 +6539,12 @@ def create_new_document_workspace(api_url, api_key, document_label, pdf_files, w
     result["runtime"] = runtime
     result["authentication"] = authentication
     if result.get("status") == "created":
-        result["desktop_refresh"] = request_desktop_workspace_refresh()
+        try:
+            result["desktop_refresh"] = request_desktop_workspace_refresh()
+        except Exception as exc:
+            # The create request has already succeeded. A notification failure
+            # must not erase the returned workspace identity.
+            result["desktop_refresh"] = {"status": "error", "error": str(exc)}
     return result
 
 
@@ -24151,6 +24156,21 @@ def cancellation_unresolved_record_count(batch_upload_report):
     return len({str(location).strip().casefold() for location in locations if str(location).strip()})
 
 
+def cancellation_reconciliation_message(batch_upload_report, unresolved_records):
+    """Describe proof and new attachments without mixing their populations."""
+    report = batch_upload_report or {}
+    attached = _report_nonnegative_count(report, "newly_attached_records", "uploaded")
+    confirmed = _report_nonnegative_count(report, "vector_confirmed_records", "confirmed_vector_records", "embedded")
+    return (
+        "Cancellation completed at a safe checkpoint. "
+        f"Exact searchable-vector proof covers {confirmed} selected record(s); "
+        f"{attached} record(s) were newly attached. "
+        f"{unresolved_records} record(s) remain unconfirmed in the held source window. "
+        "No later PDF or new AnythingLLM request was submitted, and nothing was retried. "
+        "Review the recovery manifest before resuming."
+    )
+
+
 ERROR_DIMENSIONS_BY_CODE = {
     "AUTO-PDF-001": ("source_input", "source_missing", "source", "source_file_missing"),
     "AUTO-PDF-002": ("source_input", "source_locked", "source", "pdf_encrypted"),
@@ -25508,6 +25528,15 @@ def prepare_automatic_confirmation(*values):
         )
 
 
+def automatic_preupload_mutation_note(created_workspace_slug=""):
+    """Workspace creation and document submission are distinct mutations."""
+    prefix = (
+        f"Workspace '{created_workspace_slug}' was created for this run. "
+        if created_workspace_slug else ""
+    )
+    return prefix + "No document upload has started."
+
+
 def dispatch_confirmed_automatic_run(settings, *, progress):
     """Build one keyword-only launch request from the confirmed settings.
 
@@ -25532,6 +25561,7 @@ def dispatch_confirmed_automatic_run(settings, *, progress):
         ),
         retain_detailed_evidence=bool(settings.get("retain_detailed_evidence")),
         preflight_compatibility_report=settings.get("_preflight_compatibility_report"),
+        created_workspace_slug=settings.get("_created_workspace_slug", ""),
         progress=progress,
     )
     return run_automatic(**run_kwargs)
@@ -25550,6 +25580,7 @@ def run_automatic_from_confirmation(*values, progress=gr.Progress(track_tqdm=Fal
     # payload still becomes the established visible failure report rather than
     # a secondary UnboundLocalError in the diagnostic log.
     confirmed_settings = {}
+    created_workspace_slug = ""
     try:
         if len(values) == 1 and isinstance(values[0], dict):
             confirmed_settings = dict(values[0])
@@ -25629,6 +25660,17 @@ def run_automatic_from_confirmation(*values, progress=gr.Progress(track_tqdm=Fal
                     ),
                 )
             confirmed_settings["_preflight_compatibility_report"] = compatibility_report
+            capacity = automatic_batch_output_capacity_preflight(
+                confirmed_settings.get("files") or [],
+                Path(str(confirmed_settings.get("output_root_override") or AUTO_OUTPUT_DIR)),
+            )
+            if capacity.get("status") != "pass":
+                return automatic_confirmation_failure_response(
+                    "AUTO-OUTPUT-002", "Output capacity prevents this run",
+                    [capacity.get("message") or "Output capacity could not be verified.", "No workspace was created."],
+                    ["Check the output destination and available space, then confirm again."],
+                    timing_html=automatic_run_timing_html(state="failed", message="Stopped before workspace creation."),
+                )
             update_live_automatic_run_status(
                 state="preparing",
                 phase="Pre-processing: creating document workspace",
@@ -25649,14 +25691,35 @@ def run_automatic_from_confirmation(*values, progress=gr.Progress(track_tqdm=Fal
                 **_effort_kwargs(confirmed_settings.get("recognition_effort")),
             )
             if result.get("status") != "created" or not result.get("workspace_slug"):
+                returned_slug = str(result.get("workspace_slug") or "").strip()
+                before_request = result.get("status") in {
+                    "missing_document_name", "runtime_unavailable", "authentication_required",
+                }
+                creation_note = (
+                    "No workspace was created."
+                    if before_request else
+                    f"Workspace '{returned_slug}' may remain; check it before retrying."
+                    if returned_slug else
+                    "Workspace creation could not be confirmed; check AnythingLLM before retrying."
+                )
                 return automatic_confirmation_failure_response(
                     "AUTO-WORKSPACE-004",
                     "Could not create the new document workspace",
-                    [result.get("error") or result.get("status") or "Workspace creation did not return a slug."],
+                    [result.get("error") or result.get("status") or "Workspace creation did not return a slug.", creation_note],
                     ["Review the document title and AnythingLLM runtime, then confirm the run again."],
-                    timing_html=automatic_run_timing_html(state="failed", message="The new workspace was not created."),
+                    timing_html=automatic_run_timing_html(state="failed", message=creation_note),
                 )
             confirmed_settings["workspace_slug"] = result["workspace_slug"]
+            created_workspace_slug = str(result["workspace_slug"])
+            confirmed_settings["_created_workspace_slug"] = created_workspace_slug
+            if reserved_run_root:
+                try:
+                    _write_automatic_run_json(Path(reserved_run_root) / "workspace-creation.json", {
+                        "status": "created", "workspace_slug": created_workspace_slug,
+                    })
+                except OSError as exc:
+                    APP_LOGGER.warning("could not persist workspace creation receipt: %s", exc)
+            workspace_update = gr.update(value=created_workspace_slug)
             choices, _status = local_workspace_choices()
             choices = workspace_choices_with_new_document(choices)
             workspace_update = gr.update(choices=choices, value=result["workspace_slug"])
@@ -25671,6 +25734,13 @@ def run_automatic_from_confirmation(*values, progress=gr.Progress(track_tqdm=Fal
         if not isinstance(run_outputs, (tuple, list)) or len(run_outputs) != 7:
             raise RuntimeError("Automatic run returned an invalid UI result contract.")
         failure_banner = automatic_run_result_failure_banner(run_outputs)
+        if created_workspace_slug and failure_banner:
+            notice = (
+                f"Workspace '{created_workspace_slug}' was created for this run and retained. "
+                "Check its state before retrying; select it to reuse it."
+            )
+            run_outputs = (str(run_outputs[0]) + f"<p>{html.escape(notice)}</p>", *run_outputs[1:])
+            failure_banner += f"<p>{html.escape(notice)}</p>"
         # The prep run has finished its own upload/verification work. Refreshing the
         # guarded Desktop sidebar here is a notification only; it never alters the
         # pipeline result or turns incomplete embedding work into a success.
@@ -25694,13 +25764,20 @@ def run_automatic_from_confirmation(*values, progress=gr.Progress(track_tqdm=Fal
             confirmed_settings.get("workspace_slug") or "not-selected",
             len(confirmed_settings.get("files") or []),
         )
-        return automatic_confirmation_failure_response(
+        failure_response = automatic_confirmation_failure_response(
             "AUTO-RUN-UNEXPECTED-001",
             "The confirmed run could not start",
-            [str(exc) or type(exc).__name__],
+            [str(exc) or type(exc).__name__, *(
+                [f"Workspace '{created_workspace_slug}' was created for this run and has not been automatically removed. "
+                 "Check its state before retrying; select it to reuse it."]
+                if created_workspace_slug else []
+            )],
             ["Open Advanced → Run history for the detailed failure report.", "Retry after correcting the reported setting or runtime issue."],
             timing_html=automatic_run_timing_html(state="failed", message="The confirmed run did not start."),
         )
+        if created_workspace_slug:
+            failure_response = (*failure_response[:7], workspace_update, *failure_response[8:])
+        return failure_response
 
 
 def automatic_run_started_response(settings):
@@ -28817,6 +28894,24 @@ def upload_prepared_automatic_batch(
         )
         duplicate_preflight["policy"] = WORKSPACE_DUPLICATE_POLICY_SKIP
         duplicate_preflight.setdefault("skipped_source_paths", [])
+        if duplicate_preflight.get("status") not in {"complete", "missing_db"}:
+            # An unreadable existing inventory cannot prove that submitting
+            # the full plan is free of duplicates. A missing local database
+            # has no relational vector mapping to promote into skip proof;
+            # normal UI readiness checks workspace availability separately.
+            duplicate_preflight["skip_proof_blocked"] = True
+            duplicate_preflight["error"] = (
+                duplicate_preflight.get("error")
+                or "Workspace duplicate inspection did not complete."
+            )
+        if duplicate_preflight.get("skip_proof_blocked"):
+            # A stale/uncertain mapping is not permission to silently skip or
+            # re-submit. Retain preparation and hold before any attachment.
+            for summary, _rows, _sha, source_path in grouped_rows:
+                withheld_sources.append((summary, source_path, "error_workspace_vector_proof",
+                    duplicate_preflight.get("error") or "Existing workspace vector proof is unavailable."))
+            grouped_rows = []
+            all_rows = []
         ready_chunk_sources = {
             str(chunk_source).strip()
             for chunk_source in (duplicate_preflight.pop("_ready_expected_chunk_sources", []) or [])
@@ -28941,7 +29036,9 @@ def upload_prepared_automatic_batch(
                 )
         elif duplicate_preflight.get("status") != "complete" and callable(status_callback):
             status_callback(
-                "Workspace duplicate preflight was unavailable; proceeding without a skip decision",
+                ("Workspace vector proof is unavailable; the batch is held before submission"
+                 if duplicate_preflight.get("skip_proof_blocked") else
+                 "Workspace duplicate preflight was unavailable; proceeding without a skip decision"),
                 {
                     "timing_event": "workspace_duplicate_preflight_unavailable",
                     "reason": duplicate_preflight.get("error") or duplicate_preflight.get("status"),
@@ -28965,7 +29062,8 @@ def upload_prepared_automatic_batch(
                 "post_classification": (
                     "ocr_review_hold"
                     if status == "skipped_needs_ocr_review"
-                    else "local_preparation_hold"
+                    else "workspace_vector_proof_unavailable"
+                    if status == "error_workspace_vector_proof" else "local_preparation_hold"
                 ),
                 "runtime_status": "not_required_local_review_hold",
                 "queue_requested": 0,
@@ -28998,11 +29096,13 @@ def upload_prepared_automatic_batch(
                 "searchability_proven": True,
             }
         return explicit_upload_count_schema({
-            "status": "complete_with_review_holds" if withheld_sources else "complete",
+            "status": ("error_workspace_vector_proof" if duplicate_preflight.get("skip_proof_blocked") else
+                       "complete_with_review_holds" if withheld_sources else "complete"),
             "uploaded": sum(int(result.get("uploaded") or 0) for result in document_results.values()),
             "embedded": sum(int(result.get("embedded") or 0) for result in document_results.values()),
             "errors": [
-                {"error": f"{len(withheld_sources)} selected PDF(s) were withheld for local review; no eligible PDF records remained to submit."}
+                {"error": (duplicate_preflight.get("error") if duplicate_preflight.get("skip_proof_blocked") else
+                           f"{len(withheld_sources)} selected PDF(s) were withheld for local review; no eligible PDF records remained to submit.")}
             ] if withheld_sources else [],
             "document_results": document_results,
             "duplicate_preflight": duplicate_preflight,
@@ -30108,6 +30208,7 @@ def run_automatic(
     confirmation_preflight_status_events=None,
     retain_detailed_evidence=False,
     preflight_compatibility_report=None,
+    created_workspace_slug="",
     existing_workspace_duplicate_policy=WORKSPACE_DUPLICATE_POLICY_SKIP,
     apply_batch_metadata_overrides=False,
     document_publisher="",
@@ -30262,6 +30363,10 @@ def run_automatic(
         AUTO_RUN_STATE_DIR.mkdir(parents=True, exist_ok=True)
         run_root = Path(run_root_override) if run_root_override else create_fresh_automatic_run_root(AUTO_RUN_STATE_DIR)
         run_root.mkdir(parents=True, exist_ok=True)
+        if created_workspace_slug:
+            _write_automatic_run_json(run_root / "workspace-creation.json", {
+                "status": "created", "workspace_slug": created_workspace_slug,
+            })
         update_eta_checkpoint_record(
             run_root,
             numbers={
@@ -31920,8 +32025,8 @@ def run_automatic(
             phase = "Output capacity changed — run held before the next PDF"
             detail = (
                 f"Before PDF {file_index}/{total_files}: {remaining_capacity['message']} "
-                "Earlier prepared files were retained and "
-                "AnythingLLM was not changed by this run."
+                "Earlier prepared files were retained. "
+                f"{automatic_preupload_mutation_note(created_workspace_slug)}"
             )
             update_live_automatic_run_status(
                 run_root,
@@ -31940,7 +32045,7 @@ def run_automatic(
             return automatic_error_outputs(
                 "AUTO-OUTPUT-002",
                 phase,
-                [remaining_capacity["message"]],
+                [remaining_capacity["message"], automatic_preupload_mutation_note(created_workspace_slug)],
                 [
                     "Check that the output folder is available and writable and has enough free space before starting a new run.",
                     "Earlier prepared files were retained; this held run did not begin an AnythingLLM upload.",
@@ -32141,6 +32246,10 @@ def run_automatic(
             first_page_override=int(first_page_override or 0),
             end_page_override=int(end_page_override or 0),
             target_passage_length=int(target_passage_length or 750),
+            page_preserve_ceiling=(
+                int(page_preserve_plan["page_preserve_effective_ceiling"])
+                if page_preserve_plan.get("page_preserving") else 0
+            ),
             segment_mode=resolved_segment_mode,
             custom_page_group_sizes=resolved_custom_page_group_sizes,
             end_section_names=merged_end_section_headings(advanced_end_section_names),
@@ -32756,7 +32865,7 @@ def run_automatic(
         if not checkpoint_verification.get("reusable"):
             message = (
                 "Prepared files were retained, but their restart checkpoint could not be verified. "
-                "AnythingLLM was not changed."
+                f"{automatic_preupload_mutation_note(created_workspace_slug)}"
             )
             for summary in summaries:
                 if str(summary.get("api_upload_status") or "").casefold() in {
@@ -32791,7 +32900,7 @@ def run_automatic(
             if submission_checkpoint is None:
                 message = (
                     "The prepared batch is intact, but the pre-submission recovery boundary could not be written. "
-                    "AnythingLLM was not changed."
+                    f"{automatic_preupload_mutation_note(created_workspace_slug)}"
                 )
                 for summary in summaries:
                     if str(summary.get("api_upload_status") or "").casefold() in {
@@ -33919,16 +34028,6 @@ def run_automatic(
         progress(0.98, desc="Finalizing run output and completion checks")
 
     if cancellation_requested:
-        attached_records = int(
-            batch_upload_report.get("newly_attached_records")
-            or batch_upload_report.get("uploaded")
-            or 0
-        )
-        confirmed_records = int(
-            batch_upload_report.get("confirmed_vector_records")
-            or batch_upload_report.get("embedded")
-            or 0
-        )
         # ``embedded`` includes cache-linked records in mixed runs, whereas
         # ``newly_attached_records`` deliberately does not.  The recovery
         # manifest is the authoritative, source-local statement of work that
@@ -33936,13 +34035,7 @@ def run_automatic(
         # cache reuse from a new-attachment counter.
         unresolved_records = cancellation_unresolved_record_count(batch_upload_report)
         if unresolved_records:
-            cancellation_message = (
-                "Cancellation completed at a safe checkpoint. "
-                f"{confirmed_records} of {attached_records} attached record(s) have exact searchable-vector proof; "
-                f"{unresolved_records} record(s) remain unconfirmed in the held source window. "
-                "No later PDF or new AnythingLLM request was submitted, and nothing was retried. "
-                "Review the recovery manifest before resuming."
-            )
+            cancellation_message = cancellation_reconciliation_message(batch_upload_report, unresolved_records)
             cancellation_code = "CANCELLED-RECONCILIATION-REQUIRED"
         else:
             cancellation_message = (

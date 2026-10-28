@@ -3473,8 +3473,8 @@ def credible_short_ocr_display_text(text):
     letters = "".join(words)
     if not (2 <= len(words) <= 12 and 7 <= len(letters) <= 100):
         return False
-    if len(content.splitlines()) > 5:
-        return False
+    # Normalization intentionally removes line breaks. Stacked title leaves
+    # can have many short OCR lines; a raw-line cutoff is not a reliable veto.
     uppercase = letters == letters.upper()
     title_case = sum(word[:1].isupper() for word in words) >= max(2, len(words) - 1)
     return bool(uppercase or title_case)
