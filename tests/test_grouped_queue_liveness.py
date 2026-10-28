@@ -91,6 +91,7 @@ def test_owned_queue_deadline_uses_existing_stall_allowance(tmp_path, gap, state
         app.upload_prepared_automatic_batch(
             [summary], api_url='http://anythingllm', api_key='',
             workspace_slug='workspace', run_root=tmp_path / 'run',
+            existing_workspace_duplicate_policy=app.WORKSPACE_DUPLICATE_POLICY_UPLOAD,
         )
     submit.assert_called_once()
     evidence = captured['verification']

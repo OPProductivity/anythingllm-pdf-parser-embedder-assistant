@@ -130,7 +130,8 @@ def test_real_grouped_coordinator_credits_only_physically_proven_siblings(tmp_pa
         patch.object(pipeline, "update_workspace_embeddings_desktop_queue", side_effect=queue_update),
     ):
         report = app.upload_prepared_automatic_batch(summaries, api_url="http://fixture", api_key="",
-                                                   workspace_slug="fixture", run_root=run)
+                                                   workspace_slug="fixture", run_root=run,
+                                                   existing_workspace_duplicate_policy=app.WORKSPACE_DUPLICATE_POLICY_UPLOAD)
     expected = sum(counts[i] for i in range(len(counts)) if i not in rejected)
     assert len(queue_calls) == 1
     assert verifier_calls == ([sum(counts), expected] if late else [expected] if expected else [])

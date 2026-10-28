@@ -23910,6 +23910,7 @@ class PipelineCoreTests(unittest.TestCase):
                     api_key="test-key",  # pragma: allowlist secret -- synthetic upload fixture
                     workspace_slug="batch-workspace",
                     run_root=root / "run",
+                    existing_workspace_duplicate_policy=app.WORKSPACE_DUPLICATE_POLICY_UPLOAD,
                 )
 
         self.assertEqual(len(captured), 1)
@@ -24130,6 +24131,7 @@ class PipelineCoreTests(unittest.TestCase):
                     api_key="key",  # pragma: allowlist secret -- synthetic upload fixture
                     workspace_slug="workspace",
                     run_root=root / "run",
+                    existing_workspace_duplicate_policy=app.WORKSPACE_DUPLICATE_POLICY_UPLOAD,
                 )
 
         submitted = [row["filename"] for row in captured["upload_plan_rows"]]
@@ -24189,6 +24191,7 @@ class PipelineCoreTests(unittest.TestCase):
                 report = app.upload_prepared_automatic_batch(
                     [ready, held], api_url="http://anythingllm", api_key="key",  # pragma: allowlist secret -- synthetic upload fixture
                     workspace_slug="workspace", run_root=root / "run",
+                    existing_workspace_duplicate_policy=app.WORKSPACE_DUPLICATE_POLICY_UPLOAD,
                 )
 
         upload.assert_called_once()
@@ -24262,6 +24265,7 @@ class PipelineCoreTests(unittest.TestCase):
                 report = app.upload_prepared_automatic_batch(
                     [summary], api_url="http://anythingllm", api_key="key",  # pragma: allowlist secret -- synthetic upload fixture
                     workspace_slug="workspace", run_root=root / "run",
+                    existing_workspace_duplicate_policy=app.WORKSPACE_DUPLICATE_POLICY_UPLOAD,
                 )
 
         self.assertEqual(len(captured["upload_plan_rows"]), 1)
@@ -24360,6 +24364,7 @@ class PipelineCoreTests(unittest.TestCase):
                 report = app.upload_prepared_automatic_batch(
                     [summary], api_url="http://anythingllm", api_key="key",  # pragma: allowlist secret -- synthetic upload fixture
                     workspace_slug="workspace", run_root=root / "run",
+                    existing_workspace_duplicate_policy=app.WORKSPACE_DUPLICATE_POLICY_UPLOAD,
                     status_callback=lambda _message, detail: statuses.append(detail),
                 )
 
@@ -24454,6 +24459,7 @@ class PipelineCoreTests(unittest.TestCase):
                 report = app.upload_prepared_automatic_batch(
                     [summary], api_url="http://anythingllm", api_key="key",  # pragma: allowlist secret -- synthetic upload fixture
                     workspace_slug="workspace", run_root=root / "run",
+                    existing_workspace_duplicate_policy=app.WORKSPACE_DUPLICATE_POLICY_UPLOAD,
                 )
 
         self.assertEqual(report["status"], "reconciliation_pending")
@@ -24512,6 +24518,7 @@ class PipelineCoreTests(unittest.TestCase):
                 app.upload_prepared_automatic_batch(
                     [summary], api_url="http://anythingllm", api_key="key",  # pragma: allowlist secret -- synthetic upload fixture
                     workspace_slug="workspace", run_root=root / "run",
+                    existing_workspace_duplicate_policy=app.WORKSPACE_DUPLICATE_POLICY_UPLOAD,
                     status_callback=status_callback,
                 )
 
@@ -24596,6 +24603,7 @@ class PipelineCoreTests(unittest.TestCase):
                 report = app.upload_prepared_automatic_batch(
                     summaries, api_url="http://anythingllm", api_key="key",  # pragma: allowlist secret -- synthetic upload fixture
                     workspace_slug="workspace", run_root=root / "run",
+                    existing_workspace_duplicate_policy=app.WORKSPACE_DUPLICATE_POLICY_UPLOAD,
                 )
 
         first = report["document_results"][str(root / "first.pdf")]

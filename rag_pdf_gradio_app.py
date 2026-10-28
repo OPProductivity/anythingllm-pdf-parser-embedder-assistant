@@ -28894,11 +28894,10 @@ def upload_prepared_automatic_batch(
         )
         duplicate_preflight["policy"] = WORKSPACE_DUPLICATE_POLICY_SKIP
         duplicate_preflight.setdefault("skipped_source_paths", [])
-        if duplicate_preflight.get("status") not in {"complete", "missing_db"}:
-            # An unreadable existing inventory cannot prove that submitting
-            # the full plan is free of duplicates. A missing local database
-            # has no relational vector mapping to promote into skip proof;
-            # normal UI readiness checks workspace availability separately.
+        if duplicate_preflight.get("status") != "complete":
+            # A live API can expose a workspace even when the local SQLite
+            # path is missing or wrong. In skip mode, that absence cannot
+            # establish that submitting the full plan is free of duplicates.
             duplicate_preflight["skip_proof_blocked"] = True
             duplicate_preflight["error"] = (
                 duplicate_preflight.get("error")

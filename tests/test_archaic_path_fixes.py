@@ -179,7 +179,8 @@ def test_production_group_verifier_observes_active_staging_and_last_record(tmp_p
     monkeypatch.setattr(app.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(app.time, "sleep", sleep)
     app.upload_prepared_automatic_batch([summary], api_url="http://fixture", api_key="",
-                                       workspace_slug="fixture", run_root=tmp_path / "run")
+                                       workspace_slug="fixture", run_root=tmp_path / "run",
+                                       existing_workspace_duplicate_policy=app.WORKSPACE_DUPLICATE_POLICY_UPLOAD)
     assert captured["result"]["status"] == ("pass" if fresh else "timeout")
     assert clock[0] == (482.0 if fresh else 481.0)
 

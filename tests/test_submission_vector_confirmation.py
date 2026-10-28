@@ -181,6 +181,7 @@ def test_grouped_outcome_preserves_verifier_exception_for_terminal_reporting(tmp
         app.upload_prepared_automatic_batch(
             [summary], api_url='http://anythingllm', api_key='', workspace_slug='target',
             run_root=tmp_path / 'run',
+            existing_workspace_duplicate_policy=app.WORKSPACE_DUPLICATE_POLICY_UPLOAD,
         )
     assert summary['api_verification_error_type'] == 'RuntimeError'
     assert summary['api_embedded'] == 0
@@ -256,6 +257,7 @@ def test_production_batch_verifier_survives_identity_only_then_rechunked_progres
             {'pdf': str(tmp_path / 'fixture.pdf'), 'source_sha256': 'fixture',
              'native_upload_plan': str(plan), 'native_upload_transport': 'file_upload'},
         ], api_url='http://anythingllm', api_key='', workspace_slug='target', run_root=tmp_path / 'run',
+           existing_workspace_duplicate_policy=app.WORKSPACE_DUPLICATE_POLICY_UPLOAD,
            status_callback=lambda message, details: statuses.append((message, details)))
     submit.assert_called_once()
     assert captured['verification']['status'] == 'pass'

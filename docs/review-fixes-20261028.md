@@ -37,9 +37,10 @@ physical workspace namespace. SQLite mappings remain useful inventory evidence,
 but cannot alone establish searchability. If existing mappings lack physical
 proof, the batch is held before attachment; it neither skips the content as
 complete nor automatically re-uploads it. An unreadable existing inventory
-also holds submission. A missing local SQLite database has no relational
-mapping to promote into skip proof; the existing submission behavior is kept,
-with the ordinary UI readiness check governing workspace availability. The
+also holds submission. A missing local SQLite database now holds skip-mode
+submission too: the live API can still report a workspace when the local
+storage path is missing or wrong. The user-selected upload-again policy
+remains a separate explicit path. The
 lookup reads only the requested ID column in bounded ID batches and does not
 accept another namespace as proof.
 
@@ -71,3 +72,26 @@ benchmark or new performance qualification was run. The selected performance
 implementation remains the basis; these changes do not restore the reverted
 scheduler experiments or alter author expert priorities. A source checkout
 change is not evidence that an existing server is running this revision.
+
+## Missing-database follow-up qualification
+
+A later review found that live API workspace readiness can succeed even when
+the expected local SQLite file is absent. The earlier missing-database
+exception to the duplicate audit therefore did not provide a safe default
+skip-mode decision. The upload coordinator now holds before attachment for
+`missing_db`, as it already did for unreadable existing inventories and missing
+physical vectors. Older transport tests that intentionally use no database
+now select the explicit upload-again policy; two new regressions cover the
+missing-database hold and the API/local-storage mismatch.
+
+The revised offline parser suite passed **3,556 tests, 29 skipped, 43
+deselected, and 28 passing subtests**. A separate live Desktop check used a
+synthetic two-page PDF, a newly created workspace, and the production file
+upload and embedding path. Both selected records were uploaded, embedded and
+exactly vector-confirmed; a subsequent duplicate audit found them in the
+selected physical namespace. The owned workspace, documents, namespace and
+temporary credential were removed and verified absent. The pre-existing
+workspace, document and vector-mapping counts were unchanged. This is one
+small live path check, not a large-workload performance or author-accuracy
+qualification. The missing-database hold itself was exercised with a mocked
+transport, not by altering live Desktop storage.

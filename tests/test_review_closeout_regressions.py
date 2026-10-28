@@ -365,6 +365,46 @@ def test_unavailable_duplicate_inventory_holds_before_attachment(tmp_path):
     assert report["status"] == "error_workspace_vector_proof"
 
 
+def test_missing_local_database_holds_skip_mode_before_attachment(tmp_path):
+    storage, _staged, row = upload_fixture(tmp_path)
+    assert not (storage / "anythingllm.db").exists()
+    plan = tmp_path / "upload-plan.csv"
+    with plan.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(row))
+        writer.writeheader()
+        writer.writerow(row)
+    summary = {"pdf": "fixture.pdf", "source_sha256": "a" * 64,
+               "native_upload_plan": str(plan), "native_upload_transport": "file_upload",
+               "output_root": str(tmp_path / "prepared")}
+    with (
+        mock.patch.object(app, "default_anythingllm_storage_dir", return_value=storage),
+        mock.patch.object(app, "maybe_upload_to_anythingllm") as upload,
+    ):
+        report = app.upload_prepared_automatic_batch([summary], api_url="http://127.0.0.1:3001",
+            api_key="", workspace_slug="fixture", run_root=tmp_path / "run")
+    upload.assert_not_called()
+    assert report["status"] == "error_workspace_vector_proof"
+    assert report["uploaded"] == 0 and report["embedded"] == 0
+    assert report["duplicate_preflight"]["status"] == "missing_db"
+
+
+def test_live_api_workspace_can_pass_readiness_without_local_database(tmp_path):
+    with (
+        mock.patch.object(app, "default_anythingllm_storage_dir", return_value=tmp_path),
+        mock.patch.object(app, "local_workspace_slug_exists", return_value=(False, "Local database missing")),
+        mock.patch.object(app, "ensure_anythingllm_runtime",
+                          return_value={"status": "reachable", "message": "API ready"}),
+        mock.patch.object(app, "verify_anythingllm_upload_auth",
+                          return_value={"authenticated": True, "status": "pass"}),
+        mock.patch.object(app, "api_workspace_slug_exists", return_value=(True, "API workspace found")),
+    ):
+        report = app.native_upload_readiness_report(
+            "http://127.0.0.1:3001", "", "fixture", verify_authentication=True)
+    assert report["local_db_found"] is False
+    assert report["workspace_api_found"] is True
+    assert report["workspace_slug_found"] is True
+
+
 def test_batch_holds_stale_mapping_without_any_attachment_or_reupload(tmp_path):
     storage, _staged, row = upload_fixture(tmp_path)
     relational_fixture(storage)
