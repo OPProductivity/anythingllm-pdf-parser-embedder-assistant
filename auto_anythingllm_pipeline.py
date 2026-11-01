@@ -55,8 +55,8 @@ from pathlib import Path
 
 from portable_paths import application_paths, is_private_run_state_path
 from pdf_layout_geometry import verified_page_order
-from desktop_service_trust import (DesktopSocketIdentityError, desktop_listener, register_managed_key,
-                                   managed_key_storage, verify_connected_desktop_socket)
+from desktop_service_trust import (DesktopSocketIdentityError, connect_verified_desktop_socket,
+                                   desktop_listener, register_managed_key, managed_key_storage)
 from source_guard import locked_pdf_source
 from pdf_budgets import check_source, check_document, check_pages, check as check_pdf_budget
 from run_evidence import prepare_private_json, read_run_json
@@ -10706,10 +10706,14 @@ class _JsonPostResponseTracker:
             if scheme not in {"http", "https"} or not parsed.hostname:
                 raise ValueError("AnythingLLM JSON request requires an absolute http(s) URL.")
             port = parsed.port or (443 if scheme == "https" else 80)
-            owned_socket = socket.create_connection((parsed.hostname, port), timeout=self.timeout)
             storage = managed_key_storage(self.api_key) if self.api_key else None
             if storage:
-                verify_connected_desktop_socket(owned_socket, self.url, storage)
+                owned_socket = connect_verified_desktop_socket(
+                    lambda: socket.create_connection((parsed.hostname, port), timeout=self.timeout),
+                    self.url, storage,
+                )
+            else:
+                owned_socket = socket.create_connection((parsed.hostname, port), timeout=self.timeout)
             if scheme == "https":
                 owned_socket = ssl.create_default_context().wrap_socket(
                     owned_socket,

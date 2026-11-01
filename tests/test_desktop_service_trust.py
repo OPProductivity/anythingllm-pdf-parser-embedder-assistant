@@ -76,19 +76,30 @@ def test_pid_zero_listener_uses_exact_owned_probe_connection(monkeypatch, tmp_pa
     connect.assert_called_once_with(("127.0.0.1", 3001), timeout=0.5)
 
 
+def test_listener_table_error_falls_back_to_exact_owned_probe(monkeypatch, tmp_path):
+    storage = desktop_process_fixture(monkeypatch, tmp_path)
+    monkeypatch.setattr(trust.socket, "create_connection", Mock(return_value=ProbeSocket()))
+    monkeypatch.setattr(trust.psutil, "net_connections", Mock(side_effect=[
+        RuntimeError("GetExtendedTcpTable failed"),
+        [connection(trust.psutil.CONN_ESTABLISHED, 16304, 3001, 51001)],
+    ]))
+
+    assert trust.desktop_listener("http://127.0.0.1:3001", storage)["pid"] == 16304
+
+
 def test_pid_zero_fallback_rejects_wrong_peer_or_storage(monkeypatch, tmp_path):
     storage = desktop_process_fixture(monkeypatch, tmp_path, storage_override=tmp_path / "other-storage")
     monkeypatch.setattr(trust.socket, "create_connection", Mock(return_value=ProbeSocket()))
     monkeypatch.setattr(trust.psutil, "net_connections", Mock(side_effect=[
         [connection(trust.psutil.CONN_LISTEN, 0, 3001)],
-        [connection(trust.psutil.CONN_ESTABLISHED, 16304, 3001, 51001)],
+        *[[connection(trust.psutil.CONN_ESTABLISHED, 16304, 3001, 51001)] for _ in range(8)],
     ]))
     assert trust.desktop_listener("http://127.0.0.1:3001", storage) is None
 
     desktop_process_fixture(monkeypatch, tmp_path)
     monkeypatch.setattr(trust.psutil, "net_connections", Mock(side_effect=[
         [connection(trust.psutil.CONN_LISTEN, 0, 3001)],
-        [connection(trust.psutil.CONN_ESTABLISHED, 16304, 3001, 51002)],
+        *[[connection(trust.psutil.CONN_ESTABLISHED, 16304, 3001, 51002)] for _ in range(8)],
     ]))
     assert trust.desktop_listener("http://127.0.0.1:3001", storage) is None
 
@@ -142,3 +153,35 @@ def test_connected_socket_never_accepts_an_unowned_peer(monkeypatch, tmp_path):
         trust.verify_connected_desktop_socket(ProbeSocket(), "http://127.0.0.1:3001", storage)
 
     assert observed.call_count == 3
+
+
+def test_pre_send_reconnect_uses_a_new_verified_socket(monkeypatch, tmp_path):
+    first, second = Mock(), Mock()
+    connect = Mock(side_effect=[first, second])
+    verify = Mock(side_effect=[trust.DesktopSocketIdentityError("unproved"), None])
+    monkeypatch.setattr(trust, "verify_connected_desktop_socket", verify)
+
+    result = trust.connect_verified_desktop_socket(
+        connect, "http://127.0.0.1:3001", tmp_path, attempts=2
+    )
+
+    assert result is second
+    first.close.assert_called_once_with()
+    second.close.assert_not_called()
+    assert connect.call_count == 2
+
+
+def test_pre_send_reconnect_stays_closed_without_proof(monkeypatch, tmp_path):
+    sockets = [Mock() for _ in range(3)]
+    monkeypatch.setattr(
+        trust, "verify_connected_desktop_socket",
+        Mock(side_effect=trust.DesktopSocketIdentityError("unproved")),
+    )
+
+    with pytest.raises(trust.DesktopSocketIdentityError):
+        trust.connect_verified_desktop_socket(
+            Mock(side_effect=sockets), "http://127.0.0.1:3001", tmp_path, attempts=3
+        )
+
+    for sock in sockets:
+        sock.close.assert_called_once_with()

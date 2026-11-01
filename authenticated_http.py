@@ -4,7 +4,7 @@ import urllib.request
 import urllib.parse
 import time
 import http.client
-from desktop_service_trust import managed_key_storage, verify_connected_desktop_socket
+from desktop_service_trust import connect_verified_desktop_socket, managed_key_storage
 
 MAX_JSON_RESPONSE_BYTES = 64 * 1024 * 1024
 MAX_ERROR_RESPONSE_BYTES = 64 * 1024
@@ -75,9 +75,14 @@ def authenticated_opener(request):
     if storage:
         class DesktopConnection(http.client.HTTPConnection):
             def connect(self):
-                super().connect()
+                def open_socket():
+                    super(DesktopConnection, self).connect()
+                    return self.sock
+
                 try:
-                    verify_connected_desktop_socket(self.sock, request.full_url, storage)
+                    self.sock = connect_verified_desktop_socket(
+                        open_socket, request.full_url, storage
+                    )
                 except BaseException:
                     self.close()
                     raise

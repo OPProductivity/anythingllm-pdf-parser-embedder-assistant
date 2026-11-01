@@ -80,7 +80,11 @@ def desktop_listener(api_url, storage_dir):
         if port is None:
             return None
         storage = Path(storage_dir).resolve()
-        for connection in psutil.net_connections(kind="tcp"):
+        try:
+            listeners = psutil.net_connections(kind="tcp")
+        except (OSError, ValueError, RuntimeError, psutil.Error):
+            listeners = []
+        for connection in listeners:
             if (connection.status != psutil.CONN_LISTEN or not connection.pid
                     or connection.laddr.port != port
                     or connection.laddr.ip not in {"127.0.0.1", "::1", "0.0.0.0", "::"}):
@@ -90,8 +94,11 @@ def desktop_listener(api_url, storage_dir):
                 return descriptor
         # Windows can report a live Electron listener with PID 0. A bare
         # loopback response is insufficient; prove the owner of this socket.
-        with socket.create_connection((urllib.parse.urlsplit(api_url).hostname, port), timeout=0.5) as probe:
-            return _connected_desktop_owner(probe, api_url, storage)
+        for _ in range(8):
+            with socket.create_connection((urllib.parse.urlsplit(api_url).hostname, port), timeout=0.5) as probe:
+                descriptor = _connected_desktop_owner(probe, api_url, storage)
+                if descriptor:
+                    return descriptor
     except (OSError, ValueError, RuntimeError, psutil.Error):
         pass
     return None
@@ -127,6 +134,23 @@ def verify_connected_desktop_socket(sock, api_url, storage):
     raise DesktopSocketIdentityError(
         "Connected API socket is not owned by the expected Desktop instance; no credential was sent."
     )
+
+
+def connect_verified_desktop_socket(connect, api_url, storage, *, attempts=8):
+    """Retry only fresh, untrusted connections; never replay a sent request."""
+    for attempt in range(attempts):
+        sock = connect()
+        try:
+            verify_connected_desktop_socket(sock, api_url, storage)
+            return sock
+        except DesktopSocketIdentityError:
+            sock.close()
+            if attempt + 1 >= attempts:
+                raise
+        except BaseException:
+            sock.close()
+            raise
+    raise AssertionError("unreachable")
 
 
 def managed_async_transport(api_url, key):
