@@ -872,6 +872,12 @@ def test_auto_confirm_visibly_presses_button_before_preflight_finishes(
     page.locator(".pdf-upload-input input[type='file']").set_input_files(
         [str(path) for path in six_pdf_files]
     )
+    page.wait_for_function(
+        "(() => { const s = document.querySelector('#document-metadata-scan-status .metadata-scan-inline'); "
+        "return s?.dataset.state === 'ready' && s?.dataset.previewScope !== 'all' "
+        "&& document.querySelector('.automatic-run-activity')?.dataset.runState === 'ready'; })()",
+        timeout=90000,
+    )
     page.get_by_role("checkbox", name="Process metadata for all files").check()
     page.get_by_role("checkbox", name="Confirm and start run automatically").check()
     deadline = time.monotonic() + 90

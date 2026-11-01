@@ -37168,6 +37168,18 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 trigger_mode="always_last",
                 concurrency_limit=1,
                 concurrency_id="automatic-metadata-preview",
+            ).then(
+                # A standalone all-files preview owns the activity card while
+                # it runs. Restore the settled selection state afterward;
+                # otherwise the card remains "Finishing selection settings"
+                # and the browser's automatic Confirm guard cannot fire.
+                fn=automatic_selection_action_states,
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest,
+                        automatic_selection_state],
+                outputs=[confirm_automatic_run_button,
+                         cancel_automatic_run_button, automatic_run_activity],
+                show_progress="hidden",
+                queue=False,
             )
             confirm_automatic_run_button.click(
                 fn=run_automatic_for_browser_stream,
