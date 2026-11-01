@@ -890,6 +890,37 @@ def test_auto_confirm_visibly_presses_button_before_preflight_finishes(
     expect(confirm).to_have_text("Processing successful ✓")
 
 
+def test_auto_confirm_starts_when_existing_confirm_button_becomes_enabled(
+    page, local_app_url, local_app_home, six_pdf_files
+):
+    open_local_app(page, local_app_url)
+    page.get_by_role("radio", name="Create local files only").check()
+    page.locator(".pdf-upload-input input[type='file']").set_input_files(
+        [str(path) for path in six_pdf_files]
+    )
+    page.get_by_role("checkbox", name="Process metadata for all files").check()
+    page.wait_for_function(
+        "(() => { const s = document.querySelector('#document-metadata-scan-status .metadata-scan-inline'); "
+        "return s?.dataset.previewScope === 'all' && s?.dataset.previewComplete === 'true' "
+        "&& s?.dataset.state === 'ready' "
+        "&& document.querySelector('.automatic-run-activity')?.dataset.runState === 'ready'; })()",
+        timeout=90000,
+    )
+    confirm = page.get_by_role("button", name="Confirm and start processing")
+    expect(confirm).to_be_enabled()
+    confirm.evaluate("button => { button.disabled = true; }")
+    page.get_by_role("checkbox", name="Confirm and start run automatically").check()
+    expect(confirm).to_be_disabled()
+    confirm.evaluate("button => { button.disabled = false; }")
+    page.wait_for_function(
+        "['successful', 'warning', 'failed', 'cancelled'].includes("
+        "document.querySelector('.automatic-run-activity')?.dataset.runState)",
+        timeout=180000,
+    )
+    expect(page.locator("#confirm-automatic-run-button")).to_have_text("Processing successful ✓")
+    assert len(list((local_app_home / "run-state").rglob("source-profile.json"))) == 6
+
+
 def test_overrides_survive_before_during_and_after_detection_and_save_on_confirm(
     page, paused_metadata_app, one_page_pdf
 ):

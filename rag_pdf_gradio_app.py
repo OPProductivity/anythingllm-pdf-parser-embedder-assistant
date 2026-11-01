@@ -1023,7 +1023,7 @@ APP_CONNECTION_WATCHDOG_HEAD = """
     const metadataAutoConfirmCheckbox = () => document.querySelector(
       "#metadata-auto-confirm-control input[type='checkbox']");
     let autoConfirmIssuedForSelection = null;
-    let allScanStartedForSelection = null;
+    let allScanRequestedForSelection = null;
     const syncMetadataPreviewOptions = (names) => {
       const options = document.getElementById("metadata-preview-options");
       if (options) options.style.display = names.length >= 5 ? "flex" : "none";
@@ -1038,11 +1038,13 @@ APP_CONNECTION_WATCHDOG_HEAD = """
       const confirmHost = document.querySelector("#confirm-automatic-run-button");
       const confirm = confirmHost?.querySelector("button") || confirmHost;
       const selection = metadataSelectionIdentities().join("\\u001f");
+      const selectionReady = document.querySelector(
+        ".automatic-run-activity[data-run-state='ready']");
       if (status?.dataset.previewScope === "all" && status?.dataset.state === "scanning") {
-        allScanStartedForSelection = selection;
+        allScanRequestedForSelection = selection;
       }
       if (!all?.checked || !automatic?.checked || !selection ||
-          allScanStartedForSelection !== selection ||
+          allScanRequestedForSelection !== selection || !selectionReady ||
           status?.dataset.previewScope !== "all" ||
           status?.dataset.previewComplete !== "true" ||
           status?.dataset.state !== "ready" ||
@@ -1059,7 +1061,7 @@ APP_CONNECTION_WATCHDOG_HEAD = """
           !event.target.closest("button#cancel-automatic-run-button, #cancel-automatic-run-button button")) return;
       // A queued preview must never turn into an automatic Confirm after Cancel.
       autoConfirmIssuedForSelection = metadataSelectionIdentities().join("\\u001f");
-      allScanStartedForSelection = null;
+      allScanRequestedForSelection = null;
       if (metadataAutoConfirmCheckbox()?.checked) metadataAutoConfirmCheckbox().click();
     }, true);
     const ensureMetadataHeaderStatus = () => {
@@ -1114,7 +1116,7 @@ APP_CONNECTION_WATCHDOG_HEAD = """
         }
         metadataSelectionKey = key;
         autoConfirmIssuedForSelection = null;
-        allScanStartedForSelection = null;
+        allScanRequestedForSelection = null;
         if (metadataAutoConfirmCheckbox()?.checked) metadataAutoConfirmCheckbox().click();
         if (names.length) markDetectedValuesLoading();
         showMetadataStatus(names.length ? "scanning" : "idle",
@@ -1129,6 +1131,12 @@ APP_CONNECTION_WATCHDOG_HEAD = """
       if (target === metadataAutoConfirmCheckbox() && target.checked &&
           !metadataPreviewAllCheckbox()?.checked) metadataPreviewAllCheckbox()?.click();
       if (target === metadataAutoConfirmCheckbox() || target === metadataPreviewAllCheckbox()) {
+        // Gradio may coalesce the streamed scanning update before the browser
+        // paints it. The explicit all-files request still belongs to this
+        // visible selection, and final readiness is checked separately.
+        if (metadataPreviewAllCheckbox()?.checked) {
+          allScanRequestedForSelection = metadataSelectionIdentities().join("\\u001f");
+        }
         requestAnimationFrame(maybeAutomaticallyConfirmMetadataRun);
       }
     }, true);
@@ -1393,6 +1401,7 @@ APP_CONNECTION_WATCHDOG_HEAD = """
         controlSyncQueued = false;
         document.body?.classList.toggle("dark", appliedDark);
         document.querySelector("gradio-app")?.classList.toggle("dark", appliedDark);
+        watchConfirmButton();
         syncCheckbox();
         syncMetadataStatus();
         syncMetadataOverrideEditors();
@@ -1400,6 +1409,20 @@ APP_CONNECTION_WATCHDOG_HEAD = """
     };
     const observer = new MutationObserver(scheduleControlSync);
     observer.observe(document.documentElement, { childList: true, subtree: true });
+    // The final selection callback can enable the existing button in place.
+    // That attribute change does not reach the child-list observer above.
+    const confirmDisabledObserver = new MutationObserver(scheduleControlSync);
+    let observedConfirmHost = null;
+    const watchConfirmButton = () => {
+      const host = document.querySelector("#confirm-automatic-run-button");
+      if (!host || host === observedConfirmHost) return;
+      confirmDisabledObserver.disconnect();
+      observedConfirmHost = host;
+      confirmDisabledObserver.observe(host, {
+        attributes: true, subtree: true, attributeFilter: ["disabled"],
+      });
+    };
+    watchConfirmButton();
     applyStoredTheme();
     syncCheckbox();
     syncMetadataStatus();
