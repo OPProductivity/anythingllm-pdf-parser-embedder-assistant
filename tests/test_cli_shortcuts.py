@@ -208,6 +208,53 @@ def test_stop_retains_owned_run_cancellation_before_terminating_server_tree(tmp_
     assert json.loads((foreign_root / cli.AUTOMATIC_RUN_PROGRESS_NAME).read_text(encoding="utf-8"))["state"] == "running"
 
 
+@pytest.mark.parametrize(
+    ("command", "port_free", "expected"),
+    [("", True, True), ("python -m anythingllm_pdf_assistant_cli start", True, False),
+     ("", False, False), (None, True, False)],
+)
+def test_nonzero_taskkill_postcondition_requires_exited_root_and_free_port(command, port_free, expected):
+    with (
+        mock.patch.object(cli, "_owned_server_process_command", return_value=command),
+        mock.patch.object(cli, "_port_is_available", return_value=port_free),
+        mock.patch.object(cli.time, "monotonic", side_effect=[0.0, 3.0] if not expected else [0.0]),
+        mock.patch.object(cli.time, "sleep"),
+    ):
+        assert cli._server_exited_after_nonzero_taskkill(42, 7860) is expected
+
+
+@pytest.mark.parametrize("verified_exit", [True, False])
+def test_nonzero_taskkill_exit_only_completes_verified_stop(tmp_path: Path, verified_exit, capsys):
+    marker = tmp_path / "localhost-server.json"
+    record = {"root_pid": 42, "port": 7860}
+    marker.write_text(json.dumps(record), encoding="utf-8")
+    stop_result = mock.Mock(returncode=255, stdout="", stderr="taskkill reported a tree error")
+    with (
+        mock.patch.object(cli, "_listener_belongs_to_server_root", return_value=True),
+        mock.patch.object(cli, "_prepare_owned_active_runs_for_server_stop", return_value=[tmp_path / "owned-run"]),
+        mock.patch.object(cli, "_notify_browser_stop") as notify,
+        mock.patch.object(cli.subprocess, "run", return_value=stop_result),
+        mock.patch.object(cli, "_server_exited_after_nonzero_taskkill", return_value=verified_exit),
+        mock.patch.object(cli, "_finalize_owned_runs_after_server_stop") as finalize,
+        mock.patch.object(cli, "_port_is_available", return_value=True),
+        mock.patch.object(cli, "record_server_event") as event,
+    ):
+        assert cli._stop_pinned_server(marker, record, 42, 7860) == (0 if verified_exit else 1)
+    if verified_exit:
+        assert not marker.exists()
+        finalize.assert_called_once_with([tmp_path / "owned-run"], 42)
+        assert event.call_args.args[0] == "intentional_stop_completed"
+        assert event.call_args.kwargs["termination_command_exit_code"] == 255
+        assert event.call_args.kwargs["verified_exit_after_nonzero"] is True
+        assert "stop_cancelled" not in [call.args[1] for call in notify.call_args_list]
+    else:
+        assert marker.exists()
+        finalize.assert_not_called()
+        assert event.call_args.args[0] == "stop_command_failed"
+        assert "tree error" in capsys.readouterr().err
+        assert "stop_cancelled" in [call.args[1] for call in notify.call_args_list]
+
+
 def test_server_stop_refuses_to_kill_when_owned_recovery_cannot_be_written(tmp_path: Path, capsys):
     marker = tmp_path / "localhost-server.json"
     marker.write_text('{"root_pid": 42, "port": 7860}', encoding="utf-8")

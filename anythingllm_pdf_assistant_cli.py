@@ -919,6 +919,22 @@ def _stop_under_start_lock() -> int:
         return 1
 
 
+def _server_exited_after_nonzero_taskkill(pid: int, port: int) -> bool:
+    """Accept a partial tree-kill error only after proving the root and listener are gone.
+
+    The caller retains the root process handle, so its PID cannot be recycled
+    while this postcondition is checked. An inconclusive identity read stays a
+    failure; a free port alone is not enough.
+    """
+    deadline = time.monotonic() + 2.0
+    while True:
+        if _owned_server_process_command(pid) == "" and _port_is_available(port):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.15)
+
+
 def _stop_pinned_server(marker, record, pid, port):
     # The caller must retain the root process handle until this returns.
     # Preserve all existing tree-stop and cancellation-recovery semantics.
@@ -960,7 +976,11 @@ def _stop_pinned_server(marker, record, pid, port):
         _notify_browser_stop(record, "stop_cancelled")
         print(f"Could not stop the owned local PDF assistant server: {exc}", file=sys.stderr)
         return 1
-    if stopped.returncode != 0:
+    # Windows taskkill /T can return nonzero after terminating the owned root
+    # during a process-tree race. Trust the checked outcome, not the exit code
+    # alone; keep a genuine or inconclusive failure visible to the launcher.
+    nonzero_exit = stopped.returncode != 0
+    if nonzero_exit and not _server_exited_after_nonzero_taskkill(pid, port):
         record_server_event("stop_command_failed", record=record, command_exit_code=stopped.returncode)
         _notify_browser_stop(record, "stop_cancelled")
         print((stopped.stderr or stopped.stdout or "Could not stop the local server.").strip(), file=sys.stderr)
@@ -968,7 +988,7 @@ def _stop_pinned_server(marker, record, pid, port):
     try:
         _finalize_owned_runs_after_server_stop(stopped_runs, pid)
     except OSError as exc:
-        record_server_event("stop_recovery_write_failed", record=record, error=exc, termination_command_exit_code=0)
+        record_server_event("stop_recovery_write_failed", record=record, error=exc, termination_command_exit_code=stopped.returncode)
         print(
             "The owned server stopped, but final cancellation recovery could not be retained: "
             f"{exc}",
@@ -978,13 +998,13 @@ def _stop_pinned_server(marker, record, pid, port):
     deadline = time.monotonic() + 12
     while time.monotonic() < deadline:
         if _port_is_available(port):
-            record_server_event("intentional_stop_completed", record=record, termination_command_exit_code=0)
+            record_server_event("intentional_stop_completed", record=record, termination_command_exit_code=stopped.returncode, verified_exit_after_nonzero=nonzero_exit)
             marker.unlink(missing_ok=True)
             suffix = f" Preserved cancellation recovery for {len(stopped_runs)} active run(s)." if stopped_runs else ""
             print(f"Stopped the owned local PDF assistant server.{suffix}")
             return 0
         time.sleep(0.15)
-    record_server_event("stop_port_still_occupied", record=record, termination_command_exit_code=0)
+    record_server_event("stop_port_still_occupied", record=record, termination_command_exit_code=stopped.returncode)
     print("The owned server process stopped, but port %s is still in use; keeping the marker for diagnosis." % port, file=sys.stderr)
     return 1
 
