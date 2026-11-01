@@ -76,9 +76,12 @@ const server = http.createServer((_request, response) => {
     await page.waitForFunction(() => document.querySelector('.metadata-header-status')?.dataset.state === 'scanning');
     assert.match(await status.textContent(), /Preparing metadata preview for 3 PDFs/);
     await page.locator('#document-metadata-scan-status').evaluate(node => {
-      node.innerHTML = '<div class="metadata-scan-inline" data-state="warning" role="status"><span class="metadata-scan-copy">Metadata preview finished with an error.</span></div>';
+      node.innerHTML = '<div class="metadata-scan-inline" data-state="warning" role="status"><span class="metadata-scan-copy">1 metadata preview error. Latest: PDF 1/3, Patrick Deneen - A Political Proposal for America.pdf — PDF extension, non-PDF contents. Find that file in Document metadata for details.</span></div>';
     });
     await page.waitForFunction(() => document.querySelector('.metadata-header-status')?.dataset.state === 'warning');
+    assert.match(await status.textContent(), /Patrick Deneen.*non-PDF contents/);
+    assert.equal(await status.locator('.metadata-header-copy').evaluate(node =>
+      getComputedStyle(node).whiteSpace), 'normal');
 
     // These are the actual Python-rendered tables and application JS. No PDF
     // inference is simulated as correctness evidence: this exercises early

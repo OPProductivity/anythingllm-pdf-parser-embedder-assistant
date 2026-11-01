@@ -181,6 +181,75 @@ def test_one_failed_preview_does_not_strand_selection_or_hide_other_results(monk
     assert 'data-state="warning"' in events[-1][4]
 
 
+def test_plain_text_named_pdf_identifies_file_and_explains_conversion(tmp_path):
+    source = tmp_path / "Patrick Deneen - A Political Proposal for America.pdf"
+    source.write_text("lecture on Aristo populism", encoding="utf-8")
+
+    final = list(app.stream_automatic_detected_metadata_preview([str(source)], []))[-1]
+
+    assert 'data-state="warning"' in final[4]
+    assert source.name in final[4]
+    assert "PDF 1/1" in final[4]
+    assert "non-PDF contents" in final[4]
+    assert 'data-preview-error-kind="non_pdf"' in final[3]
+    assert "renaming a text file to .pdf does not convert it" in final[3]
+    assert str(tmp_path) not in final[3] + final[4]
+
+
+def test_multiple_preview_errors_name_latest_file_and_keep_each_detail(tmp_path):
+    first = tmp_path / "first.pdf"
+    last = tmp_path / "last.pdf"
+    first.write_bytes(b"not a PDF")
+    last.write_bytes(b"")
+
+    final = list(app.stream_automatic_detected_metadata_preview(
+        [str(first), str(last)], [],
+    ))[-1]
+
+    assert "2 metadata preview errors" in final[4]
+    assert "PDF 2/2, last.pdf" in final[4]
+    assert "empty file" in final[4]
+    assert "first.pdf" in final[3] and "last.pdf" in final[3]
+    assert 'data-preview-error-kind="non_pdf"' in final[3]
+    assert 'data-preview-error-kind="empty"' in final[3]
+
+
+def test_missing_and_damaged_pdf_are_distinguished(tmp_path):
+    missing = tmp_path / "removed.pdf"
+    damaged = tmp_path / "damaged.pdf"
+    damaged.write_bytes(b"%PDF-1.4\nnot a complete PDF")
+
+    final = list(app.stream_automatic_detected_metadata_preview(
+        [str(missing), str(damaged)], [],
+    ))[-1]
+
+    assert 'data-preview-error-kind="missing"' in final[3]
+    assert "Re-select the PDF before Confirm" in final[3]
+    assert 'data-preview-error-kind="unreadable_pdf"' in final[3]
+    assert "damaged, incomplete, or unsupported" in final[3]
+    assert "PDF 2/2, damaged.pdf" in final[4]
+
+
+@pytest.mark.parametrize(
+    ("error", "kind", "phrase"),
+    [
+        (PermissionError("access denied"), "access", "Access to this file was denied"),
+        (RuntimeError("password required"), "locked", "requires a password"),
+        (RuntimeError("unusual metadata failure"), "inspection", "unusual metadata failure"),
+    ],
+)
+def test_other_preview_failures_remain_file_specific(monkeypatch, tmp_path, error, kind, phrase):
+    source = tmp_path / "selected.pdf"
+    source.write_bytes(b"%PDF-1.4\n")
+    monkeypatch.setattr(app, "pdf_metadata", Mock(side_effect=error))
+
+    final = list(app.stream_automatic_detected_metadata_preview([str(source)], []))[-1]
+
+    assert source.name in final[4]
+    assert f'data-preview-error-kind="{kind}"' in final[3]
+    assert phrase in final[3]
+
+
 def test_later_selection_prevents_old_result_and_readiness_publication(monkeypatch):
     request = SimpleNamespace(session_hash="same-browser")
     state = app.automatic_selection_begin_state({}, "", ["first.pdf"], [], {}, request=request)[0]

@@ -2928,6 +2928,12 @@ body.dark #automatic-process-button[disabled] {
     text-overflow: ellipsis;
     white-space: nowrap;
 }
+#document-metadata-accordion > button.label-wrap .metadata-header-status[data-state="warning"] .metadata-header-copy {
+    overflow: visible;
+    text-overflow: clip;
+    overflow-wrap: anywhere;
+    white-space: normal;
+}
 #document-metadata-accordion > button.label-wrap .metadata-header-status[data-state="scanning"] .metadata-header-spinner {
     width: 13px;
     height: 13px;
@@ -13093,8 +13099,8 @@ def automatic_detected_metadata_preview(
             gr.update(value=current_author or ""),
             gr.update(value=current_short_label or ""),
             pending_metadata_panel_html(
-                f"Metadata preview could not be completed ({detail}). "
-                "The selected PDFs remain valid and can still be confirmed.",
+                f"Metadata preview stopped before individual results could be shown ({detail}). "
+                "The selected files remain in the list; check that each is a readable PDF before Confirm.",
                 detected_value="Unavailable",
             ),
             gr.update(),
@@ -13110,6 +13116,70 @@ def metadata_scan_status_html(state, message):
         'aria-live="polite" aria-atomic="true">'
         '<span class="metadata-scan-spinner" aria-hidden="true"></span>'
         f'<span class="metadata-scan-copy">{html.escape(message)}</span></div>'
+    )
+
+
+METADATA_PREVIEW_ERROR_LABELS = {
+    "missing": "file missing",
+    "directory": "folder selected instead of a file",
+    "extension": "not a .pdf file",
+    "access": "access denied",
+    "empty": "empty file",
+    "non_pdf": "PDF extension, non-PDF contents",
+    "unreadable_pdf": "PDF could not be read",
+    "locked": "locked PDF",
+    "inspection": "metadata inspection error",
+}
+
+
+def metadata_preview_failure(pdf_path, exc):
+    """Describe a failed preview; inspect file bytes only after PDF opening fails."""
+    if isinstance(exc, FileNotFoundError):
+        return "missing", "File is no longer available. Re-select the PDF before Confirm."
+    if isinstance(exc, IsADirectoryError):
+        return "directory", "This path is a folder, not a PDF file. Select a PDF."
+    if isinstance(exc, PermissionError):
+        return "access", "Access to this file was denied. Check its permissions and try again."
+    detail = safe_user_error_text(exc)
+    if re.search(r"\b(?:password|encrypted|authentication)\b", detail, re.IGNORECASE):
+        return "locked", "This PDF requires a password or cannot be read while encrypted. Provide an unlocked copy."
+    if isinstance(exc, fitz.FileDataError):
+        try:
+            with pdf_path.open("rb") as source:
+                opening = source.read(1024)
+        except FileNotFoundError:
+            return "missing", "File disappeared during preview. Re-select the PDF before Confirm."
+        except PermissionError:
+            return "access", "Access to this file was denied. Check its permissions and try again."
+        except OSError:
+            return "unreadable_pdf", "The PDF could not be read. Check that the file still exists and is accessible."
+        if not opening:
+            return "empty", "This file is empty. Replace it with a complete PDF before Confirm."
+        if b"%PDF-" not in opening:
+            return (
+                "non_pdf",
+                "This file has a .pdf extension but no PDF header. Export or obtain a real PDF; "
+                "renaming a text file to .pdf does not convert it.",
+            )
+        return "unreadable_pdf", (
+            "This file has a PDF header but could not be opened. It may be damaged, incomplete, "
+            "or unsupported; replace it with a readable copy before Confirm."
+        )
+    return "inspection", (
+        f"Metadata preview failed ({type(exc).__name__}): {detail}. "
+        "Check this file and try the preview again."
+    )
+
+
+def metadata_preview_warning_message(errors, selected_count):
+    """Name the latest affected PDF in the accordion heading."""
+    position, filename, kind = errors[-1]
+    label = METADATA_PREVIEW_ERROR_LABELS.get(kind, METADATA_PREVIEW_ERROR_LABELS["inspection"])
+    count = len(errors)
+    return (
+        f"{count} metadata preview error{'s' if count != 1 else ''}. "
+        f"Latest: PDF {position}/{selected_count}, {filename} — {label}. "
+        "Find that file in Document metadata for details."
     )
 
 
@@ -13186,7 +13256,7 @@ def stream_automatic_detected_metadata_preview(
             current_short_label = ""
     displayed = files[:5]
     completed_html = []
-    preview_errors = 0
+    preview_errors = []
     field_updates = tuple(gr.update(value=value or "", interactive=False) for value in
                           (current_title, current_author, current_short_label))
     if len(files) > 1 and not apply_batch_metadata_overrides:
@@ -13250,15 +13320,19 @@ def stream_automatic_detected_metadata_preview(
                 field_updates = result[:3]
             completed_html.append(result[3])
             if 'data-preview-error="true"' in result[3] or "Metadata preview could not be completed" in result[3]:
-                preview_errors += 1
+                match = re.search(r'data-preview-error-kind="([^"]+)"', result[3])
+                preview_errors.append((
+                    index + 1, Path(path).name,
+                    match.group(1) if match else "inspection",
+                ))
         except Exception as exc:
             APP_LOGGER.exception("individual PDF metadata preview failed")
-            preview_errors += 1
+            kind, message = metadata_preview_failure(Path(path), exc)
+            preview_errors.append((index + 1, Path(path).name, kind))
             completed_html.append(pending_metadata_panel_html(
-                f"Metadata preview failed: {safe_user_error_text(exc)}. "
-                "The file remains selected for a fresh attempt after Confirm.",
+                message,
                 filename=Path(path).name, detected_value="Unavailable",
-                document_key=local_path_identity_key(path), error=True,
+                document_key=local_path_identity_key(path), error=True, error_kind=kind,
             ))
         if automatic_lifecycle_busy() or not _selection_preview_is_current(selection_state, request):
             yield tuple(gr.update() for _ in range(7))
@@ -13273,7 +13347,7 @@ def stream_automatic_detected_metadata_preview(
             metadata_scan_status_html(
                 "warning" if preview_errors and index + 1 == len(displayed) else
                 "ready" if index + 1 == len(displayed) else "scanning",
-                "Metadata preview finished with an error. Expand Document metadata for details."
+                metadata_preview_warning_message(preview_errors, len(files))
                 if preview_errors and index + 1 == len(displayed) else
                 (
                     f"Preview ready for {len(displayed)} of {len(files)} selected PDFs. "
@@ -27082,15 +27156,19 @@ def extraction_backend_help(choice):
     return f'<div class="metadata-summary"><div class="metadata-file"><div class="metadata-status">{body}</div></div></div>'
 
 
-def detected_pdf_metadata_panel_html(primary_html, has_additional=False, error=False):
+def detected_pdf_metadata_panel_html(primary_html, has_additional=False, error=False,
+                                     error_kind=""):
     """Render one metadata panel; the info button reveals rows in its table."""
     info = (
         '<button type="button" class="metadata-info-toggle" aria-label="More detected PDF metadata" '
         'title="More detected PDF metadata" aria-expanded="false">i</button>'
         if has_additional else ""
     )
+    kind = (f' data-preview-error-kind="{html.escape(error_kind, quote=True)}"'
+            if error else "")
     return (
-        f'<div class="metadata-panel" data-preview-error="{str(error).lower()}">{info}{primary_html}</div>'
+        f'<div class="metadata-panel" data-preview-error="{str(error).lower()}"{kind}>'
+        f'{info}{primary_html}</div>'
     )
 
 
@@ -27137,7 +27215,8 @@ def metadata_table_html(primary_rows, additional_rows=(), *, include_overrides=T
 
 
 def pending_metadata_panel_html(message, *, filename="", loading=False,
-                                include_overrides=True, detected_value="", document_key="", error=False):
+                                include_overrides=True, detected_value="", document_key="", error=False,
+                                error_kind=""):
     value = detected_value or ("Loading…" if loading else "Select a PDF")
     rows = [(key, Path(filename).stem if key == "Title used" and filename else value,
              "filename_pending" if key == "Title used" and filename else "pending")
@@ -27146,7 +27225,7 @@ def pending_metadata_panel_html(message, *, filename="", loading=False,
     return detected_pdf_metadata_panel_html(
         heading + f'<div class="metadata-status">{html.escape(message)}</div>'
         + metadata_table_html(rows, include_overrides=include_overrides, document_key=document_key),
-        error=error,
+        error=error, error_kind=error_kind,
     )
 
 
@@ -27180,16 +27259,18 @@ def detected_metadata_preview(
     for index, raw_path in enumerate(files[:5], start=1):
         pdf_path = Path(raw_path)
         if not pdf_path.exists():
-            records.append({"filename": pdf_path.name, "error": "File is no longer available."})
+            records.append({"filename": pdf_path.name, "error_kind": "missing",
+                            "error": "File is no longer available. Re-select the PDF before Confirm."})
             continue
         if pdf_path.suffix.casefold() != ".pdf":
-            records.append({"filename": pdf_path.name, "error": "This file is not a PDF."})
+            records.append({"filename": pdf_path.name, "error_kind": "extension",
+                            "error": "This file does not have a .pdf extension. Select a PDF file."})
             continue
         try:
             meta = pdf_metadata(pdf_path)
         except Exception as exc:
-            records.append({"filename": pdf_path.name,
-                            "error": f"Metadata inspection failed: {safe_user_error_text(exc)}"})
+            kind, message = metadata_preview_failure(pdf_path, exc)
+            records.append({"filename": pdf_path.name, "error_kind": kind, "error": message})
             continue
 
         embedded_title = meta.get("title") or ""
@@ -27333,6 +27414,7 @@ def detected_metadata_preview(
             panels.append(pending_metadata_panel_html(
                 record["error"], filename=record["filename"], detected_value="Unavailable",
                 include_overrides=override_editor, document_key=document_key, error=True,
+                error_kind=record.get("error_kind") or "inspection",
             ))
             continue
         identity = identities[index] if index < len(identities) else {}

@@ -21,6 +21,16 @@ selection. All selected PDFs are listed and editable immediately. Sources
 beyond the preview limit say **Not previewed** and are detected freshly during
 confirmed processing. This limit does not limit which PDFs are processed.
 
+If a preview fails, the accordion heading reports the number of failures and
+names the latest affected PDF and its position in the selected list. That PDF's
+row explains the category: missing file, unsupported extension, empty file,
+non-PDF contents behind a `.pdf` name, unreadable PDF, access denial, password
+requirement, or another inspection error. A renamed text file must be exported
+as a real PDF before Confirm. File-content checks for this explanation occur
+only after PDF opening fails; successful metadata and author detection follows
+the same path as before. The heading describes previewed files only, not the
+later selected PDFs that have not been inspected yet.
+
 Each source is identified by its filename. There is no repeated "Detected PDF
 metadata" heading or unused Refresh button. The information button reveals
 additional rows in that source's table.
