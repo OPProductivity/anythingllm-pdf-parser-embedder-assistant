@@ -55,7 +55,7 @@ from pathlib import Path
 
 from portable_paths import application_paths, is_private_run_state_path
 from pdf_layout_geometry import verified_page_order
-from desktop_service_trust import (desktop_listener, register_managed_key, require_managed_key_origin,
+from desktop_service_trust import (DesktopSocketIdentityError, desktop_listener, register_managed_key,
                                    managed_key_storage, verify_connected_desktop_socket)
 from source_guard import locked_pdf_source
 from pdf_budgets import check_source, check_document, check_pages, check as check_pdf_budget
@@ -10538,9 +10538,8 @@ def _api_urlopen(request, timeout):
     # Keep this policy local, leaving unauthenticated HTTP and the owned queue
     # socket transport unchanged. Authenticated endpoints must not redirect.
     if request.has_header("Authorization") or request.has_header("X-anythingllm-pdf-prep-bridge"):
-        authorization = request.get_header("Authorization", "")
-        if authorization.startswith("Bearer "):
-            require_managed_key_origin(request.full_url, authorization[7:])
+        # authenticated_opener verifies the actual connected Desktop socket
+        # before urllib can send a managed bearer or request body.
         return authenticated_opener(request).open(request, timeout=timeout)
     return urllib.request.urlopen(request, timeout=timeout)
 
@@ -10702,8 +10701,6 @@ class _JsonPostResponseTracker:
     def _run(self):
         owned_socket = None
         try:
-            if self.api_key:
-                require_managed_key_origin(self.url, self.api_key)
             parsed = validate_authenticated_url(self.url) if self.api_key else urllib.parse.urlsplit(self.url)
             scheme = str(parsed.scheme or "").casefold()
             if scheme not in {"http", "https"} or not parsed.hostname:
@@ -12557,6 +12554,17 @@ def classify_anythingllm_mutation_outcome(*, stage, status=None, response_text="
     if isinstance(exception, urllib.error.HTTPError):
         status = int(getattr(exception, "code", 0) or 0)
         body = _read_http_error_body(exception)
+    elif isinstance(exception, DesktopSocketIdentityError):
+        return {
+            "category": "temporary_global_hold",
+            "classification": "desktop_socket_identity_unavailable_before_send",
+            "scope": "remaining_run",
+            "may_continue_later_sources": False,
+            "http_status": None,
+            "response": "",
+            "error": str(exception),
+            "stage": normalized_stage,
+        }
     elif exception is not None:
         reason = getattr(exception, "reason", None)
         timeout_exception = isinstance(exception, (TimeoutError, socket.timeout)) or isinstance(
@@ -17758,14 +17766,20 @@ def maybe_upload_payloads(
                         ),
                     )
             except Exception as exc:
-                attachment.update(status="submission_unknown", error=str(exc))
+                outcome = classify_anythingllm_mutation_outcome(stage="document_attachment", exception=exc)
+                receipt_state = mutation_outcome_receipt_state(outcome)
+                attachment.update(status=receipt_state, error=str(exc), mutation_outcome=outcome)
                 attachment_results.append(attachment)
-                errors.append({"error": str(exc), "segment": payload.get("metadata", {}).get("chunkSource", "")})
+                errors.append({**outcome, "segment": payload.get("metadata", {}).get("chunkSource", "")})
                 record_submission_receipt(
                     submission_receipt_path, payload,
                     run_id=run_id, workspace_slug=workspace_slug, transport="raw_text",
-                    state="submission_unknown", correlation_id=correlation_id, error=str(exc),
-                    next_check="Reconcile document location, workspace attachment, and targeted vector evidence; do not replay this POST automatically.",
+                    state=receipt_state, correlation_id=correlation_id, error=str(exc),
+                    next_check=(
+                        "Restore the owned Desktop socket before resuming; this POST was not sent."
+                        if receipt_state == "global_hold" else
+                        "Reconcile document location, workspace attachment, and targeted vector evidence; do not replay this POST automatically."
+                    ),
                 )
                 break
 
@@ -18358,7 +18372,8 @@ def maybe_upload_segment_files(
                         next_check="Submit the exactly reconciled staged location to the workspace queue.",
                     )
                     continue
-                attachment.update(status="submission_unknown", error=outcome["error"], mutation_outcome=outcome)
+                receipt_state = mutation_outcome_receipt_state(outcome)
+                attachment.update(status=receipt_state, error=outcome["error"], mutation_outcome=outcome)
                 attachment["attachment_reconciliation"] = attachment_reconciliation
                 attachment_results.append(attachment)
                 errors.append({
@@ -18371,9 +18386,13 @@ def maybe_upload_segment_files(
                 record_submission_receipt(
                     submission_receipt_path, receipt_payload,
                     run_id=run_id, workspace_slug=workspace_slug, transport="file_upload",
-                    state="submission_unknown", correlation_id=correlation_id, error=str(exc),
+                    state=receipt_state, correlation_id=correlation_id, error=str(exc),
                     prepared_payload_hash=prepared_file_hash,
-                    next_check="Reconcile document location, workspace attachment, and targeted vector evidence; do not replay this POST automatically.",
+                    next_check=(
+                        "Restore the owned Desktop socket before resuming; this POST was not sent."
+                        if receipt_state == "global_hold" else
+                        "Reconcile document location, workspace attachment, and targeted vector evidence; do not replay this POST automatically."
+                    ),
                 )
                 break
 

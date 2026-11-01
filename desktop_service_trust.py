@@ -4,12 +4,17 @@ import os
 from pathlib import Path
 import socket
 import threading
+import time
 import urllib.parse
 
 import psutil
 
 _credentials = {}
 _lock = threading.Lock()
+
+
+class DesktopSocketIdentityError(ValueError):
+    """The request's connected socket failed ownership proof before any send."""
 
 
 def _loopback_port(api_url):
@@ -42,7 +47,7 @@ def _trusted_desktop_process(pid, storage, port):
         if psutil.Process(process.pid).create_time() != created:
             return None
         return {"pid": process.pid, "created": created, "port": port, "storage": str(storage)}
-    except (OSError, ValueError, psutil.Error):
+    except (OSError, ValueError, RuntimeError, psutil.Error):
         return None
 
 
@@ -63,7 +68,7 @@ def _connected_desktop_owner(sock, api_url, storage):
                 descriptor = _trusted_desktop_process(connection.pid, storage, port)
                 if descriptor:
                     return descriptor
-    except (OSError, ValueError, psutil.Error):
+    except (OSError, ValueError, RuntimeError, psutil.Error):
         return None
     return None
 
@@ -87,7 +92,7 @@ def desktop_listener(api_url, storage_dir):
         # loopback response is insufficient; prove the owner of this socket.
         with socket.create_connection((urllib.parse.urlsplit(api_url).hostname, port), timeout=0.5) as probe:
             return _connected_desktop_owner(probe, api_url, storage)
-    except (OSError, ValueError, psutil.Error):
+    except (OSError, ValueError, RuntimeError, psutil.Error):
         pass
     return None
 
@@ -111,9 +116,17 @@ def require_managed_key_origin(api_url, key):
 
 def verify_connected_desktop_socket(sock, api_url, storage):
     """Bind trust to the established connection before any bearer is sent."""
-    if _connected_desktop_owner(sock, api_url, Path(storage).resolve()):
-        return
-    raise ValueError("Connected API socket is not owned by the expected Desktop instance; no credential was sent.")
+    expected_storage = Path(storage).resolve()
+    # Windows may omit a just-established connection from one table snapshot.
+    # Keep the socket open and require positive ownership proof before sending.
+    for attempt in range(3):
+        if _connected_desktop_owner(sock, api_url, expected_storage):
+            return
+        if attempt < 2:
+            time.sleep(0.05)
+    raise DesktopSocketIdentityError(
+        "Connected API socket is not owned by the expected Desktop instance; no credential was sent."
+    )
 
 
 def managed_async_transport(api_url, key):

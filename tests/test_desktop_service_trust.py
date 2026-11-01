@@ -116,3 +116,29 @@ def test_credential_socket_uses_its_own_owned_connection(monkeypatch, tmp_path):
     ])
     with pytest.raises(ValueError, match="no credential was sent"):
         trust.verify_connected_desktop_socket(ProbeSocket(), "http://127.0.0.1:3001", storage)
+
+
+def test_connected_socket_recovers_from_one_windows_table_failure(monkeypatch, tmp_path):
+    storage = desktop_process_fixture(monkeypatch, tmp_path)
+    observed = Mock(side_effect=[
+        RuntimeError("GetExtendedTcpTable failed"),
+        [connection(trust.psutil.CONN_ESTABLISHED, 16304, 3001, 51001)],
+    ])
+    monkeypatch.setattr(trust.psutil, "net_connections", observed)
+    monkeypatch.setattr(trust.time, "sleep", lambda _seconds: None)
+
+    trust.verify_connected_desktop_socket(ProbeSocket(), "http://127.0.0.1:3001", storage)
+
+    assert observed.call_count == 2
+
+
+def test_connected_socket_never_accepts_an_unowned_peer(monkeypatch, tmp_path):
+    storage = desktop_process_fixture(monkeypatch, tmp_path, storage_override=tmp_path / "other-storage")
+    observed = Mock(return_value=[connection(trust.psutil.CONN_ESTABLISHED, 16304, 3001, 51001)])
+    monkeypatch.setattr(trust.psutil, "net_connections", observed)
+    monkeypatch.setattr(trust.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(trust.DesktopSocketIdentityError, match="no credential was sent"):
+        trust.verify_connected_desktop_socket(ProbeSocket(), "http://127.0.0.1:3001", storage)
+
+    assert observed.call_count == 3
