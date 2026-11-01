@@ -1035,7 +1035,8 @@ APP_CONNECTION_WATCHDOG_HEAD = """
       const all = metadataPreviewAllCheckbox();
       const automatic = metadataAutoConfirmCheckbox();
       const status = document.querySelector("#document-metadata-scan-status .metadata-scan-inline");
-      const confirm = document.querySelector("#confirm-automatic-run-button");
+      const confirmHost = document.querySelector("#confirm-automatic-run-button");
+      const confirm = confirmHost?.querySelector("button") || confirmHost;
       const selection = metadataSelectionIdentities().join("\\u001f");
       if (status?.dataset.previewScope === "all" && status?.dataset.state === "scanning") {
         allScanStartedForSelection = selection;
@@ -1053,6 +1054,14 @@ APP_CONNECTION_WATCHDOG_HEAD = """
       // edits made after either checkbox was selected.
       confirm.click();
     };
+    document.addEventListener("click", (event) => {
+      if (!(event.target instanceof Element) ||
+          !event.target.closest("button#cancel-automatic-run-button, #cancel-automatic-run-button button")) return;
+      // A queued preview must never turn into an automatic Confirm after Cancel.
+      autoConfirmIssuedForSelection = metadataSelectionIdentities().join("\\u001f");
+      allScanStartedForSelection = null;
+      if (metadataAutoConfirmCheckbox()?.checked) metadataAutoConfirmCheckbox().click();
+    }, true);
     const ensureMetadataHeaderStatus = () => {
       const heading = document.querySelector("#document-metadata-accordion > button.label-wrap");
       if (!heading) return null;
@@ -13573,8 +13582,9 @@ def automatic_selection_action_states(
     folder_pdf_files=None,
     folder_manifest=None,
     selection_state=None,
+    request: gr.Request = None,
 ):
-    """Keep the visibly inert Cancel control synchronized with selection.
+    """Keep Confirm and Cancel synchronized with the owned selection.
 
     Gradio's File.change callback can run before its temporary path has fully
     propagated to an earlier reset handler. Pairing this with the final
@@ -13585,6 +13595,8 @@ def automatic_selection_action_states(
     # process-wide run-status record for that transient state: its one-second
     # observer can otherwise repaint a finished selection as a disabled,
     # fictitious in-progress run.
+    if selection_state and not _selection_preview_is_current(selection_state, request):
+        return gr.update(), gr.update(), gr.update()
     selection_pending = str((selection_state or {}).get("state") or "") == "pending"
     global LIVE_AUTOMATIC_RUN_STATUS
     with LIVE_AUTOMATIC_RUN_STATUS_LOCK:
@@ -13600,13 +13612,13 @@ def automatic_selection_action_states(
             # this callback must not authorize an early click.
             return (
                 gr.update(value="Confirm and start processing", interactive=False, variant="primary"),
-                gr.update(value="Cancel", interactive=False, visible=True),
+                gr.update(value="Cancel", interactive=True, visible=True),
                 gr.update(value=automatic_selection_preparing_status_html(pdf_files, folder_pdf_files), visible=True),
             )
     process_button = automatic_process_button_state(pdf_files, folder_pdf_files, folder_manifest)
     return (
         process_button,
-        gr.update(value="Cancel", interactive=False, visible=True),
+        gr.update(value="Cancel", interactive=bool(process_button.get("interactive")), visible=True),
         gr.update(value=automatic_live_status_html({
             "state": "ready" if process_button.get("interactive") else "idle",
         }), visible=True),
@@ -13614,7 +13626,7 @@ def automatic_selection_action_states(
 
 
 @automatic_next_run_callback(2)
-def automatic_selection_pending_action_states(pdf_files=None, folder_pdf_files=None):
+def automatic_selection_pending_action_states(pdf_files=None, folder_pdf_files=None, selection_state=None, request: gr.Request = None):
     """Keep the action row stable while a selection becomes usable.
 
     Metadata extraction, history lookup, and workspace-name derivation may be
@@ -13622,6 +13634,8 @@ def automatic_selection_pending_action_states(pdf_files=None, folder_pdf_files=N
     final readiness callback still enables Confirm only after those values are
     settled, so this is presentation feedback rather than early authorization.
     """
+    if selection_state and not _selection_preview_is_current(selection_state, request):
+        return gr.update(), gr.update(), gr.update()
     return (
         gr.update(
             value="Confirm and start processing",
@@ -13629,7 +13643,7 @@ def automatic_selection_pending_action_states(pdf_files=None, folder_pdf_files=N
             visible=True,
             variant="primary",
         ),
-        gr.update(value="Cancel", interactive=False, visible=True),
+        gr.update(value="Cancel", interactive=True, visible=True),
         gr.update(
             value=automatic_selection_preparing_status_html(pdf_files, folder_pdf_files),
             visible=True,
@@ -13676,6 +13690,8 @@ def _selection_preview_token(request):
 
 
 def _selection_preview_is_current(state, request):
+    if str((state or {}).get("state") or "") == "cancelled":
+        return False
     session = getattr(request, "session_hash", None)
     if not session:
         return True
@@ -13784,7 +13800,7 @@ def _automatic_selection_begin_state(
             visible=True,
             variant="primary",
         ),
-        gr.update(value="Cancel", interactive=False, visible=True),
+        gr.update(value="Cancel", interactive=True, visible=True),
         gr.update(
             value=automatic_selection_preparing_status_html(
                 pdf_files,
@@ -13952,7 +13968,7 @@ def automatic_selection_finish_state(selection_state, pdf_files=None, folder_pdf
         state,
         gr.update(interactive=True),
         automatic_process_button_state(pdf_files, folder_pdf_files, folder_manifest),
-        gr.update(value="Cancel", interactive=False, visible=True),
+        gr.update(value="Cancel", interactive=True, visible=True),
         gr.update(value=automatic_live_status_html({"state": state["state"]}), visible=True),
         gr.update(interactive=True),
     )
@@ -15398,11 +15414,14 @@ def automatic_live_status_html(status=None):
     """
     record = status or LIVE_AUTOMATIC_RUN_STATUS or {}
     state = str(record.get("state") or "")
-    if not state or state in {"ready", "idle"}:
-        display_state = "idle" if state == "idle" else "ready"
+    if not state or state in {"ready", "idle", "selection_cancelled"}:
+        display_state = state if state in {"idle", "selection_cancelled"} else "ready"
         instruction = (
             "No PDFs selected — choose a PDF or a folder to begin."
-            if state == "idle" else "Ready — Confirm to begin processing."
+            if state == "idle" else
+            "Preview cancelled. Clear and reselect PDFs, or retry the selected batch."
+            if state == "selection_cancelled" else
+            "Ready — Confirm to begin processing."
         )
         return (
             f'<div class="automatic-run-activity {display_state}" data-run-state="{display_state}" '
@@ -15918,7 +15937,7 @@ def reset_automatic_run_presentation(pdf_files=None, folder_pdf_files=None, sele
         gr.update(value=""),
         {},
         gr.update(),
-        gr.update(value="Cancel", interactive=False, visible=True),
+        gr.update(value="Cancel", interactive=selection_paths_present, visible=True),
         gr.update(value="", visible=False),
         gr.update(value="", visible=False),
         gr.update(value=[], visible=False),
@@ -17984,8 +18003,10 @@ def cancel_or_reset_automatic_run(
     folder_pdf_files=None,
     folder_manifest=None,
     run_activity_html="",
+    selection_state=None,
+    request: gr.Request = None,
 ):
-    """Reset safely before Confirm, or request a cooperative in-flight stop."""
+    """Cancel the owned preview or request a cooperative confirmed-run stop."""
     record = dict(LIVE_AUTOMATIC_RUN_STATUS or {})
     # A historical ``run-progress.json`` can legitimately retain ``running``
     # after an interrupted localhost process. It is recovery evidence, not an
@@ -18011,6 +18032,8 @@ def cancel_or_reset_automatic_run(
                 gr.update(),
                 gr.update(value="", visible=False),
                 gr.update(visible=False, interactive=False),
+                gr.update(), gr.update(), gr.update(),
+                gr.update(), gr.update(), gr.update(), gr.update(),
             )
         progress_record = record
         if str(progress_record.get("run_root") or "") != run_root:
@@ -18041,17 +18064,47 @@ def cancel_or_reset_automatic_run(
             gr.update(),
             gr.update(value="", visible=False),
             gr.update(visible=False, interactive=False),
+            gr.update(), gr.update(), gr.update(),
+            gr.update(), gr.update(), gr.update(), gr.update(),
         )
+    preflight_in_flight = bool(
+        str(record.get("state") or "") == "preparing"
+        and record.get("confirmation_in_flight")
+        and str(record.get("confirmation_owner_token") or "")
+    )
+    if preflight_in_flight:
+        update_live_automatic_run_status(
+            state="preparing", phase="Cancellation requested — stopping pre-processing",
+            expected_seconds=record.get("expected_seconds", 0),
+            details="Stopping the confirmed preflight before a run or upload starts.",
+            confirmed_fraction=record.get("confirmed_fraction"),
+            cancel_available=False, cancel_requested=True,
+            confirmation_in_flight=True,
+            confirmation_owner_token=record["confirmation_owner_token"],
+        )
+    cancelled_state = dict(selection_state or {})
+    cancelled_state["state"] = "cancelled"
+    cancelled_state["preview_token"] = _selection_preview_token(request)
     return (
         gr.update(value=""),
         {},
-        automatic_run_timing_html(state="ready"),
-        automatic_process_button_state(pdf_files, folder_pdf_files, folder_manifest),
+        automatic_run_timing_html(state="cancelled", message="Stopping pre-processing." if preflight_in_flight else "Selection preview cancelled."),
+        gr.update(value="Processing…" if preflight_in_flight else "Confirm and start processing",
+                  interactive=False, variant="primary" if preflight_in_flight else "secondary"),
         gr.update(),
         gr.update(visible=False, interactive=False),
-        gr.update(value="Cancel", interactive=False),
+        gr.update(value="Stopping processing…" if preflight_in_flight else "Cancel", interactive=False),
         gr.update(value="", visible=False),
         gr.update(visible=False, interactive=False),
+        cancelled_state,
+        gr.update(value=automatic_live_status_html(
+            dict(LIVE_AUTOMATIC_RUN_STATUS or {}) if preflight_in_flight else
+            {"state": "selection_cancelled"}), visible=True),
+        metadata_scan_status_html("idle", "Metadata preview cancelled. Clear and reselect PDFs to retry."),
+        gr.update(interactive=not preflight_in_flight),
+        gr.update(interactive=not preflight_in_flight),
+        gr.update(value="Select PDF Folder Here", interactive=not preflight_in_flight, visible=True),
+        gr.update(visible=True),
     )
 
 
@@ -19150,6 +19203,7 @@ def automatic_ocr_preflight_manifest(
     backend_mode="Automatic",
     unstructured_strategy="auto",
     progress_callback=None,
+    cancel_check=None,
 ):
     """Build one run-scoped OCR-risk manifest before confirmation.
 
@@ -19185,6 +19239,8 @@ def automatic_ocr_preflight_manifest(
             APP_LOGGER.debug("automatic OCR preflight status callback failed", exc_info=True)
 
     for source_index, raw_path in enumerate(source_paths, start=1):
+        if callable(cancel_check):
+            cancel_check()
         path = Path(raw_path)
         publish("source_started", source_index, path)
         try:
@@ -19207,6 +19263,8 @@ def automatic_ocr_preflight_manifest(
         except Exception:
             coverage = automatic_full_native_text_coverage(path)
             coverage_origin = "fallback_check"
+        if callable(cancel_check):
+            cancel_check()
         profile = dict(coverage.get("timing_profile") or {})
         if not profile:
             profile = automatic_timing_document_profile([path], page_sample_limit=3)
@@ -25415,7 +25473,8 @@ def automatic_confirmation_failure_response(code, title, details, next_steps=Non
     )
 
 
-def validated_automatic_run_settings(values, *, preflight_progress_callback=None):
+def validated_automatic_run_settings(values, *, preflight_progress_callback=None,
+                                     preflight_cancel_check=None):
     """Build one canonical automatic-run settings dictionary from UI values.
 
     Both Review and Confirm use this function.  Confirm deliberately receives
@@ -25533,12 +25592,17 @@ def validated_automatic_run_settings(values, *, preflight_progress_callback=None
             [],
             False,
         )
+    if callable(preflight_cancel_check):
+        preflight_cancel_check()
     ocr_preflight_manifest = automatic_ocr_preflight_manifest(
         files,
         backend_mode=settings.get("backend_mode", "Automatic"),
         unstructured_strategy=settings.get("unstructured_strategy", "auto"),
         progress_callback=preflight_progress_callback,
+        cancel_check=preflight_cancel_check,
     )
+    if callable(preflight_cancel_check):
+        preflight_cancel_check()
     settings["ocr_preflight_manifest"] = ocr_preflight_manifest
     if settings["mode"] != MODE_NATIVE_UPLOAD_LABEL:
         # Retain the browser controls so a later switch back to upload mode
@@ -26069,7 +26133,7 @@ def automatic_preprocessing_started_response():
         # the worker instead of narrating internal confirmation mechanics.
         # The durable status trace still records validation and reservation.
         gr.update(value="Processing…", interactive=False, variant="primary"),
-        gr.update(value="Cancel", interactive=False, visible=True),
+        gr.update(value="Cancel", interactive=True, visible=True),
         gr.update(visible=False, interactive=False),
     )
 
@@ -26080,6 +26144,47 @@ def confirm_button_completion_update(run_outputs):
     value = str((primary_update or {}).get("value") or "Processing complete")
     variant = str((primary_update or {}).get("variant") or "secondary")
     return gr.update(value=value, interactive=False, variant=variant)
+
+
+class AutomaticPreflightCancelled(Exception):
+    """The operator stopped a confirmed run before output was reserved."""
+
+
+def confirmed_preflight_cancel_requested(owner_token):
+    with LIVE_AUTOMATIC_RUN_STATUS_LOCK:
+        status = dict(LIVE_AUTOMATIC_RUN_STATUS or {})
+    return bool(
+        status.get("cancel_requested")
+        and str(status.get("confirmation_owner_token") or "") == str(owner_token or "")
+    )
+
+
+def automatic_preflight_cancelled_response(owner_token):
+    """Close a cancelled preflight without creating a run or failure record."""
+    message = "Processing cancelled before the run started. No PDF was submitted."
+    with LIVE_AUTOMATIC_RUN_STATUS_LOCK:
+        status = dict(LIVE_AUTOMATIC_RUN_STATUS or {})
+        if str(status.get("confirmation_owner_token") or "") == str(owner_token or ""):
+            update_live_automatic_run_status(
+                state="cancelled", phase="Pre-processing cancelled",
+                expected_seconds=status.get("expected_seconds", 0),
+                details=message, cancel_available=False, cancel_requested=True,
+                confirmation_in_flight=False,
+            )
+    return (
+        gr.update(value=run_summary_html("Status: cancelled\n" + message), visible=True),
+        gr.update(value=[], visible=False),
+        artifact_placeholder_html("Prepared output package"),
+        [],
+        gr.update(visible=False, interactive=False),
+        gr.update(),
+        automatic_run_timing_html(state="cancelled", message=message),
+        gr.update(),
+        gr.update(value="", visible=False),
+        gr.update(value="Processing cancelled", interactive=False, variant="secondary"),
+        gr.update(value="Cancel", interactive=False),
+        gr.update(visible=False, interactive=False),
+    )
 
 
 def _run_automatic_from_confirmation_stream_body(
@@ -26141,6 +26246,10 @@ def _run_automatic_from_confirmation_stream_body(
     preflight_status_events = []
     preflight_completed_sources = set()
 
+    def ensure_preflight_not_cancelled():
+        if confirmed_preflight_cancel_requested(confirmation_owner_token):
+            raise AutomaticPreflightCancelled()
+
     def preflight_progress_line(source_total):
         checked = len(preflight_completed_sources)
         return (
@@ -26156,6 +26265,8 @@ def _run_automatic_from_confirmation_stream_body(
         10--20 second window between the Confirm acknowledgement and the
         first durable pipeline description.
         """
+        if confirmed_preflight_cancel_requested(confirmation_owner_token):
+            return
         payload = dict(event or {})
         source_index = max(0, int(payload.get("source_index") or 0))
         source_total = max(0, int(payload.get("source_total") or 0))
@@ -26243,7 +26354,9 @@ def _run_automatic_from_confirmation_stream_body(
         settings, validation_report, _warnings, allowed = validated_automatic_run_settings(
             values,
             preflight_progress_callback=report_confirmation_preflight,
+            preflight_cancel_check=ensure_preflight_not_cancelled,
         )
+        ensure_preflight_not_cancelled()
         settings["_confirmation_preflight_elapsed_seconds"] = round(
             max(0.0, time.perf_counter() - preflight_started_at), 3
         )
@@ -26252,6 +26365,9 @@ def _run_automatic_from_confirmation_stream_body(
             settings["retain_detailed_evidence"] = bool(
                 values[len(AUTOMATIC_RUN_FIELDS) + 1]
             )
+    except AutomaticPreflightCancelled:
+        yield automatic_preflight_cancelled_response(confirmation_owner_token)
+        return
     except Exception as exc:
         final = automatic_confirmation_failure_response(
             "AUTO-CONFIRM-002",
@@ -26290,6 +26406,9 @@ def _run_automatic_from_confirmation_stream_body(
         )
         return
 
+    if confirmed_preflight_cancel_requested(confirmation_owner_token):
+        yield automatic_preflight_cancelled_response(confirmation_owner_token)
+        return
     APP_LOGGER.info(
         "automatic run acknowledged: mode=%s scope=%s workspace=%s files=%s",
         settings.get("mode") or "unknown",
@@ -26322,6 +26441,11 @@ def _run_automatic_from_confirmation_stream_body(
             gr.update(value="Cancel", interactive=False),
             gr.update(visible=False, interactive=False),
         )
+        return
+    if confirmed_preflight_cancel_requested(confirmation_owner_token):
+        if lease_required:
+            release_automatic_anythingllm_mutation_lease(confirmation_owner_token)
+        yield automatic_preflight_cancelled_response(confirmation_owner_token)
         return
     # Reserve the durable run folder before any post-confirmation workspace
     # action.  Cancel can now reach the same marker even while a new AnythingLLM
@@ -26367,6 +26491,15 @@ def _run_automatic_from_confirmation_stream_body(
             confirmed_fraction=0.0,
             cancel_available=False,
         )
+    if confirmed_preflight_cancel_requested(confirmation_owner_token):
+        reserved_root = settings.get("_reserved_run_root")
+        if reserved_root:
+            request_automatic_run_cancellation(reserved_root)
+        else:
+            if lease_required:
+                release_automatic_anythingllm_mutation_lease(confirmation_owner_token)
+            yield automatic_preflight_cancelled_response(confirmation_owner_token)
+            return
     yield automatic_run_started_response(settings)
     # Reuse the exact validated snapshot which produced the visible start
     # acknowledgement. Revalidating the same browser payload here could race
@@ -26687,6 +26820,7 @@ def run_automatic_for_browser_stream(
     viewed_run_root,
     *values,
     progress=gr.Progress(track_tqdm=False),
+    request: gr.Request = None,
 ):
     """Attach the established confirmation stream to one browser presentation.
 
@@ -26699,10 +26833,34 @@ def run_automatic_for_browser_stream(
     if len(values) == len(AUTOMATIC_RUN_FIELDS) + 6:
         metadata_overrides = values[-3:]
         values = values[:-3]
+    # Cancel can invalidate a queued Confirm before its first server yield.
+    # Do not accept a stale browser payload merely because its file paths exist.
+    if selection_state and not _selection_preview_is_current(selection_state, request):
+        yield tuple(gr.update() for _ in range(16))
+        return
     owned_root = str(viewed_run_root or "")
-    for outputs in run_automatic_from_ready_confirmation_stream(
+    source = iter(run_automatic_from_ready_confirmation_stream(
         selection_state, *values, metadata_overrides=metadata_overrides, progress=progress
-    ):
+    ))
+    while True:
+        # Check before resuming the generator: its next step may reserve a run
+        # or submit work before producing another browser update.
+        if selection_state and not _selection_preview_is_current(selection_state, request):
+            status_root = str((LIVE_AUTOMATIC_RUN_STATUS or {}).get("run_root") or "").strip()
+            if status_root:
+                request_automatic_run_cancellation(status_root)
+            yield tuple(gr.update() for _ in range(16))
+            return
+        try:
+            outputs = next(source)
+        except StopIteration:
+            return
+        if selection_state and not _selection_preview_is_current(selection_state, request):
+            status_root = str((LIVE_AUTOMATIC_RUN_STATUS or {}).get("run_root") or "").strip()
+            if status_root:
+                request_automatic_run_cancellation(status_root)
+            yield tuple(gr.update() for _ in range(16))
+            return
         status = dict(LIVE_AUTOMATIC_RUN_STATUS or {})
         status_root = str(status.get("run_root") or "").strip()
         if status_root:
@@ -36101,7 +36259,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=automatic_selection_pending_action_states,
-                inputs=[auto_pdfs, auto_folder_pdfs],
+                inputs=[auto_pdfs, auto_folder_pdfs, automatic_selection_state],
                 outputs=[confirm_automatic_run_button, cancel_automatic_run_button, automatic_run_activity],
                 show_progress="hidden",
                 queue=False,
@@ -36244,7 +36402,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=automatic_selection_pending_action_states,
-                inputs=[auto_pdfs, auto_folder_pdfs],
+                inputs=[auto_pdfs, auto_folder_pdfs, automatic_selection_state],
                 outputs=[confirm_automatic_run_button, cancel_automatic_run_button, automatic_run_activity],
                 show_progress="hidden",
                 queue=False,
@@ -36366,7 +36524,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=automatic_selection_pending_action_states,
-                inputs=[auto_pdfs, auto_folder_pdfs],
+                inputs=[auto_pdfs, auto_folder_pdfs, automatic_selection_state],
                 outputs=[confirm_automatic_run_button, cancel_automatic_run_button, automatic_run_activity],
                 show_progress="hidden",
                 queue=False,
@@ -36484,7 +36642,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=automatic_selection_pending_action_states,
-                inputs=[auto_pdfs, auto_folder_pdfs],
+                inputs=[auto_pdfs, auto_folder_pdfs, automatic_selection_state],
                 outputs=[confirm_automatic_run_button, cancel_automatic_run_button, automatic_run_activity],
                 show_progress="hidden",
                 queue=False,
@@ -37066,7 +37224,8 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
             )
             cancel_automatic_run_button.click(
                 fn=cancel_or_reset_automatic_run,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_run_activity],
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest,
+                        automatic_run_activity, automatic_selection_state],
                 outputs=[
                     auto_confirmation_html,
                     auto_confirmation_state,
@@ -37077,6 +37236,13 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     cancel_automatic_run_button,
                     automatic_run_failure,
                     open_generated_output_button,
+                    automatic_selection_state,
+                    automatic_run_activity,
+                    auto_metadata_status,
+                    auto_pdfs,
+                    auto_mode,
+                    choose_pdf_folder_button,
+                    pdf_folder_picker_area,
                 ],
                 show_progress="hidden",
                 queue=False,

@@ -8474,7 +8474,7 @@ class PipelineCoreTests(unittest.TestCase):
                 app.CANCELLED_AUTOMATIC_RUN_ROOTS.clear()
                 app.CANCELLED_AUTOMATIC_RUN_ROOTS.update(original_cancelled)
 
-    def test_prestart_cancel_preserves_the_ready_confirm_action(self):
+    def test_prestart_cancel_invalidates_preview_and_requires_retry(self):
         import rag_pdf_gradio_app as app
 
         original_status = app.LIVE_AUTOMATIC_RUN_STATUS
@@ -8484,12 +8484,62 @@ class PipelineCoreTests(unittest.TestCase):
             confirm_button = result[3]
             retired_review_button = result[5]
             self.assertEqual(confirm_button["value"], "Confirm and start processing")
-            self.assertEqual(confirm_button["variant"], "primary")
-            self.assertTrue(confirm_button["interactive"])
+            self.assertEqual(confirm_button["variant"], "secondary")
+            self.assertFalse(confirm_button["interactive"])
             self.assertFalse(retired_review_button["visible"])
             self.assertFalse(result[6]["interactive"])
+            self.assertEqual(result[9]["state"], "cancelled")
+            self.assertIn('data-run-state="selection_cancelled"', result[10]["value"])
+            self.assertFalse(app._selection_preview_is_current(result[9], None))
         finally:
             app.LIVE_AUTOMATIC_RUN_STATUS = original_status
+
+    def test_cancel_between_confirm_yields_prevents_preprocessing_resume(self):
+        import rag_pdf_gradio_app as app
+
+        request = SimpleNamespace(session_hash="cancel-confirm-" + uuid.uuid4().hex)
+        state = {"state": "ready", "preview_token": app._selection_preview_token(request)}
+        resumed = []
+
+        def paused_stream(*_args, **_kwargs):
+            yield tuple({} for _ in range(12))
+            resumed.append(True)
+            yield tuple({} for _ in range(12))
+
+        with mock.patch.object(app, "run_automatic_from_ready_confirmation_stream", paused_stream):
+            stream = app.run_automatic_for_browser_stream(state, "", request=request)
+            self.assertEqual(len(next(stream)), 16)
+            cancelled = app.cancel_or_reset_automatic_run(
+                ["selected.pdf"], [], {}, "", state, request=request,
+            )
+            self.assertEqual(cancelled[9]["state"], "cancelled")
+            self.assertEqual(len(next(stream)), 16)
+            self.assertEqual(resumed, [])
+
+    def test_cancelled_confirmed_preflight_never_reserves_or_submits(self):
+        import rag_pdf_gradio_app as app
+
+        owner = "cancel-preflight-" + uuid.uuid4().hex
+        previous = app.LIVE_AUTOMATIC_RUN_STATUS
+        try:
+            app.LIVE_AUTOMATIC_RUN_STATUS = {
+                "state": "preparing", "confirmation_in_flight": True,
+                "confirmation_owner_token": owner, "cancel_requested": True,
+            }
+            def stop_at_check(_values, **kwargs):
+                kwargs["preflight_cancel_check"]()
+
+            with mock.patch.object(app, "validated_automatic_run_settings", side_effect=stop_at_check), \
+                 mock.patch.object(app, "create_fresh_automatic_run_root") as reserve:
+                outputs = list(app._run_automatic_from_confirmation_stream_body(
+                    _confirmation_owner_token=owner, _confirmation_preclaimed=True,
+                ))
+            self.assertEqual(len(outputs), 1)
+            self.assertEqual(outputs[0][9]["value"], "Processing cancelled")
+            self.assertEqual(app.LIVE_AUTOMATIC_RUN_STATUS["state"], "cancelled")
+            reserve.assert_not_called()
+        finally:
+            app.LIVE_AUTOMATIC_RUN_STATUS = previous
 
     def test_cancellation_freezes_nonterminal_progress_at_the_last_confirmed_checkpoint(self):
         import rag_pdf_gradio_app as app
@@ -10665,7 +10715,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertFalse(confirm["interactive"])
         self.assertEqual(confirm["value"], "Confirm and start processing")
         self.assertTrue(cancel["visible"])
-        self.assertFalse(cancel["interactive"])
+        self.assertTrue(cancel["interactive"])
         self.assertIn('data-run-state="selection_preparing"', activity["value"])
         self.assertIn("1 PDF(s) accepted", activity["value"])
 
@@ -11076,7 +11126,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(len(preprocessing), 12)
         self.assertIn(">preparing<", preprocessing[0]["value"])
         self.assertEqual(preprocessing[9]["value"], "Processing…")
-        self.assertFalse(preprocessing[10]["interactive"])
+        self.assertTrue(preprocessing[10]["interactive"])
         self.assertFalse(preprocessing[11]["visible"])
         self.assertEqual(len(started), 12)
         self.assertIn(">starting<", started[0]["value"])
@@ -11213,8 +11263,14 @@ class PipelineCoreTests(unittest.TestCase):
         # and stream the same supporting metadata preview as the folder route.
         # Confirm still owns a fresh authoritative preparation.
         self.assertEqual(len(selection_dependencies), 1)
+        sync_component = next(
+            component for component in app.demo.config["components"]
+            if component.get("props", {}).get("elem_id") == "native-pdf-selection-sync"
+        )
         self.assertEqual(set(selection_dependencies[0]['targets']), {
-            (pdf_component['id'], event) for event in ('upload', 'delete', 'clear')
+            (pdf_component['id'], "upload"),
+            (pdf_component['id'], "clear"),
+            (sync_component['id'], "click"),
         })
         self.assertTrue(
             str(selection_dependencies[0].get("api_name") or "").startswith(
@@ -11832,7 +11888,7 @@ class PipelineCoreTests(unittest.TestCase):
         # active run in the process-global status or Confirm can remain locked.
         self.assertEqual(app.LIVE_AUTOMATIC_RUN_STATUS, {})
         self.assertFalse(reset[3]["interactive"])
-        self.assertFalse(reset[8]["interactive"])
+        self.assertTrue(reset[8]["interactive"])
         self.assertTrue(confirm["interactive"])
         self.assertEqual(confirm["value"], "Confirm and start processing")
 

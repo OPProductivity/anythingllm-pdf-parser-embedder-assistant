@@ -167,6 +167,59 @@ def one_page_pdf(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def paused_confirm_preflight_app(tmp_path, tmp_path_factory):
+    """Hold confirmed OCR preflight before it can reserve a run root."""
+    port = free_local_port()
+    app_home = tmp_path_factory.mktemp("cancel-preflight-home")
+    started, release = tmp_path / "preflight-started", tmp_path / "preflight-release"
+    environment = dict(os.environ)
+    environment.update({
+        "GRADIO_SERVER_PORT": str(port),
+        "ANYTHINGLLM_PDF_ASSISTANT_BROWSER_KEY": LOCAL_BROWSER_KEY,
+        "ANYTHINGLLM_PDF_ASSISTANT_HOME": str(app_home),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "NO_PROXY": "localhost,127.0.0.1",
+        "no_proxy": "localhost,127.0.0.1",
+    })
+    script = """
+import sys, time
+from pathlib import Path
+import rag_pdf_gradio_app as app
+started, release = (Path(p) for p in sys.argv[1:3])
+original = app.automatic_ocr_preflight_manifest
+def held_preflight(*args, **kwargs):
+    started.touch()
+    deadline = time.monotonic() + 60
+    while not release.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError('Browser test did not release confirmed preflight')
+        time.sleep(0.05)
+    return original(*args, **kwargs)
+app.automatic_ocr_preflight_manifest = held_preflight
+app.launch_application(port=int(sys.argv[3]), inbrowser=False)
+"""
+    with (tmp_path / "preflight-stderr.log").open("wb") as stderr:
+        process = subprocess.Popen(
+            [sys.executable, "-c", script, str(started), str(release), str(port)],
+            cwd=str(PROJECT_ROOT), env=environment,
+            stdout=subprocess.DEVNULL, stderr=stderr,
+        )
+        try:
+            url = f"http://127.0.0.1:{port}"
+            wait_for_http(url + "/healthz", process)
+            yield url, started, release, app_home
+        finally:
+            release.touch()
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=15)
+
+
+@pytest.fixture
 def batch_metadata_app(tmp_path, tmp_path_factory, two_pdf_files):
     """Exercise real folder/direct paths with only the second preview paused."""
     port = free_local_port()
@@ -390,8 +443,8 @@ def test_future_defaults_editor_does_not_change_a_selected_automatic_job(page, l
     expect(local_only).to_be_checked()
 
 
-def test_selected_pdf_exposes_one_confirm_action_and_safe_prestart_cancel(page, local_app_url, one_page_pdf):
-    """Selection exposes one action; Cancel before Confirm does not fake a stop."""
+def test_selected_pdf_exposes_confirm_and_prestart_cancel(page, local_app_url, one_page_pdf):
+    """Selection permits cancelling preview work before Confirm."""
     open_local_app(page, local_app_url)
     upload = page.locator(".pdf-upload-input input[type='file']")
     expect(upload).to_have_count(1)
@@ -402,7 +455,7 @@ def test_selected_pdf_exposes_one_confirm_action_and_safe_prestart_cancel(page, 
     expect(confirm).to_be_visible(timeout=15000)
     expect(confirm).to_be_enabled(timeout=20000)
     expect(cancel).to_be_visible()
-    expect(cancel).to_be_disabled()
+    expect(cancel).to_be_enabled()
     expect(page.get_by_role("button", name="Review settings and continue")).to_be_hidden()
     expect(page.get_by_text("Settings reviewed", exact=True)).to_have_count(0)
     confirm_box = confirm.bounding_box()
@@ -747,6 +800,94 @@ def test_auto_confirm_uses_override_entered_after_arming(page, paused_metadata_a
                 (app_home / "run-state").rglob("source-profile.json")]
     assert len(profiles) == 6
     assert sum(profile["detected_author"] == "Late Override Sixth" for profile in profiles) == 1
+
+
+def test_cancel_during_metadata_preview_blocks_late_auto_confirm_and_allows_retry(
+    page, paused_metadata_app, six_pdf_files
+):
+    url, started, release, app_home = paused_metadata_app
+    open_local_app(page, url)
+    page.get_by_role("radio", name="Create local files only").check()
+    page.locator(".pdf-upload-input input[type='file']").set_input_files(
+        [str(path) for path in six_pdf_files]
+    )
+    deadline = time.monotonic() + 30
+    while not started.exists():
+        assert time.monotonic() < deadline, "Preview did not reach paused inference"
+        page.wait_for_timeout(50)
+    page.get_by_role("checkbox", name="Process metadata for all files").check()
+    page.get_by_role("checkbox", name="Confirm and start run automatically").check()
+    cancel = page.get_by_role("button", name="Cancel")
+    expect(cancel).to_be_enabled(timeout=10000)
+    cancel.click()
+    expect(page.get_by_role("checkbox", name="Confirm and start run automatically")).not_to_be_checked()
+    page.wait_for_function(
+        "document.querySelector('.automatic-run-activity')?.dataset.runState === 'selection_cancelled'",
+        timeout=15000,
+    )
+    expect(page.locator("#confirm-automatic-run-button")).to_be_disabled()
+    release.touch()
+    page.wait_for_timeout(1200)
+    expect(page.locator("#confirm-automatic-run-button")).to_be_disabled()
+    assert not list((app_home / "run-state").rglob("source-profile.json"))
+    upload = page.locator(".pdf-upload-input input[type='file']")
+    upload.set_input_files([])
+    upload.set_input_files([str(path) for path in six_pdf_files])
+    expect(page.locator("#confirm-automatic-run-button")).to_be_enabled(timeout=60000)
+
+
+def test_cancel_after_confirm_stops_preflight_before_run_root(
+    page, paused_confirm_preflight_app, one_page_pdf
+):
+    url, started, release, app_home = paused_confirm_preflight_app
+    open_local_app(page, url)
+    page.get_by_role("radio", name="Create local files only").check()
+    page.locator(".pdf-upload-input input[type='file']").set_input_files(str(one_page_pdf))
+    confirm = page.get_by_role("button", name="Confirm and start processing")
+    expect(confirm).to_be_enabled(timeout=30000)
+    confirm.click()
+    deadline = time.monotonic() + 30
+    while not started.exists():
+        assert time.monotonic() < deadline, "Confirmed preflight did not start"
+        page.wait_for_timeout(50)
+    expect(page.locator("#confirm-automatic-run-button")).to_have_text("Processing…")
+    cancel = page.get_by_role("button", name="Cancel")
+    expect(cancel).to_be_enabled(timeout=10000)
+    cancel.click()
+    release.touch()
+    page.wait_for_function(
+        "document.querySelector('.automatic-run-activity')?.dataset.runState === 'cancelled'",
+        timeout=30000,
+    )
+    assert not list((app_home / "run-state").rglob("run-progress.json"))
+    assert not list((app_home / "run-state").rglob("source-profile.json"))
+
+
+def test_auto_confirm_visibly_presses_button_before_preflight_finishes(
+    page, paused_confirm_preflight_app, six_pdf_files
+):
+    url, started, release, _app_home = paused_confirm_preflight_app
+    open_local_app(page, url)
+    page.get_by_role("radio", name="Create local files only").check()
+    page.locator(".pdf-upload-input input[type='file']").set_input_files(
+        [str(path) for path in six_pdf_files]
+    )
+    page.get_by_role("checkbox", name="Process metadata for all files").check()
+    page.get_by_role("checkbox", name="Confirm and start run automatically").check()
+    deadline = time.monotonic() + 90
+    while not started.exists():
+        assert time.monotonic() < deadline, "Automatic Confirm did not start preflight"
+        page.wait_for_timeout(100)
+    confirm = page.locator("#confirm-automatic-run-button")
+    expect(confirm).to_have_text("Processing…")
+    expect(confirm).to_be_disabled()
+    release.touch()
+    page.wait_for_function(
+        "['successful', 'warning', 'failed', 'cancelled'].includes("
+        "document.querySelector('.automatic-run-activity')?.dataset.runState)",
+        timeout=180000,
+    )
+    expect(confirm).to_have_text("Processing successful ✓")
 
 
 def test_overrides_survive_before_during_and_after_detection_and_save_on_confirm(
