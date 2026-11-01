@@ -75,6 +75,7 @@ def local_app_url(tmp_path_factory, local_app_home):
     environment["ANYTHINGLLM_PDF_ASSISTANT_BROWSER_KEY"] = LOCAL_BROWSER_KEY
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     environment["ANYTHINGLLM_PDF_ASSISTANT_HOME"] = str(local_app_home)
+    environment["NO_PROXY"] = environment["no_proxy"] = "localhost,127.0.0.1"
     stderr_path = tmp_path_factory.mktemp("gradio-local-app") / "stderr.log"
     with stderr_path.open("wb") as stderr_handle:
         process = subprocess.Popen(
@@ -111,6 +112,8 @@ def paused_metadata_app(tmp_path, tmp_path_factory):
         "ANYTHINGLLM_PDF_ASSISTANT_BROWSER_KEY": LOCAL_BROWSER_KEY,
         "ANYTHINGLLM_PDF_ASSISTANT_HOME": str(app_home),
         "PYTHONDONTWRITEBYTECODE": "1",
+        "NO_PROXY": "localhost,127.0.0.1",
+        "no_proxy": "localhost,127.0.0.1",
     })
     script = """
 import sys, time
@@ -175,6 +178,8 @@ def batch_metadata_app(tmp_path, tmp_path_factory, two_pdf_files):
         "ANYTHINGLLM_PDF_ASSISTANT_BROWSER_KEY": LOCAL_BROWSER_KEY,
         "ANYTHINGLLM_PDF_ASSISTANT_HOME": str(app_home),
         "PYTHONDONTWRITEBYTECODE": "1",
+        "NO_PROXY": "localhost,127.0.0.1",
+        "no_proxy": "localhost,127.0.0.1",
     })
     script = """
 import sys, time
@@ -619,6 +624,131 @@ def test_metadata_overrides_update_processing_fields(page, local_app_url, one_pa
     )).to_have_value("")
 
 
+def test_removing_other_pdfs_preserves_surviving_metadata_overrides(
+    page, local_app_url, local_app_home, six_pdf_files
+):
+    open_local_app(page, local_app_url)
+    page.locator("#document-metadata-accordion > button.label-wrap").click()
+    page.locator(".pdf-upload-input input[type='file']").set_input_files(
+        [str(path) for path in six_pdf_files]
+    )
+    panels = page.locator(".metadata-panel")
+    expect(panels).to_have_count(6, timeout=60000)
+    for index in (0, 2, 4):
+        panels.filter(has_text=six_pdf_files[index].name).get_by_label(
+            "Override Author", exact=True
+        ).fill(f"Author {index}")
+    for index in (5, 3, 1):
+        page.locator("#automatic-pdf-upload .file-preview tr").filter(
+            has=page.locator(f'td[aria-label="{six_pdf_files[index].name}"]')
+        ).get_by_role("button", name="Remove this file").click()
+    expect(page.locator(".metadata-panel")).to_have_count(3, timeout=60000)
+    page.wait_for_function(
+        "document.querySelector('#document-metadata-scan-status .metadata-scan-inline')?.dataset.state === 'ready'",
+        timeout=60000,
+    )
+    for index in (0, 2, 4):
+        expect(page.locator(".metadata-panel").filter(
+            has_text=six_pdf_files[index].name
+        ).get_by_label("Override Author", exact=True)).to_have_value(f"Author {index}")
+    edits = json.loads(page.locator(
+        "#automatic-document-overrides-transport input, #automatic-document-overrides-transport textarea"
+    ).input_value())
+    assert len(edits) == 3
+    page.locator("#automatic-pdf-upload .file-preview tr").filter(
+        has=page.locator(f'td[aria-label="{six_pdf_files[2].name}"]')
+    ).get_by_role("button", name="Remove this file").click()
+    expect(page.locator(".metadata-panel")).to_have_count(2, timeout=60000)
+    for index in (0, 4):
+        expect(page.locator(".metadata-panel").filter(
+            has_text=six_pdf_files[index].name
+        ).get_by_label("Override Author", exact=True)).to_have_value(f"Author {index}")
+    page.get_by_role("radio", name="Create local files only").check()
+    page.get_by_role("button", name=re.compile(r"^Advanced preparation overrides")).click()
+    page.get_by_role("checkbox", name="Retain detailed evidence even if this run is ready").check()
+    confirm = page.locator("#confirm-automatic-run-button")
+    expect(confirm).to_be_enabled(timeout=30000)
+    existing_profiles = set((local_app_home / "run-state").rglob("source-profile.json"))
+    confirm.click()
+    page.wait_for_function(
+        "['successful', 'warning', 'failed', 'cancelled'].includes("
+        "document.querySelector('.automatic-run-activity')?.dataset.runState)",
+        timeout=120000,
+    )
+    expect(confirm).to_have_text("Processing successful ✓")
+    profiles = [json.loads(path.read_text(encoding="utf-8")) for path in
+                (local_app_home / "run-state").rglob("source-profile.json")
+                if path not in existing_profiles]
+    assert len(profiles) == 2
+    assert {profile["detected_author"] for profile in profiles} == {"Author 0", "Author 4"}
+
+
+def test_preview_all_control_scans_beyond_fifth_pdf(page, local_app_url, six_pdf_files):
+    open_local_app(page, local_app_url)
+    page.locator(".pdf-upload-input input[type='file']").set_input_files(
+        [str(path) for path in six_pdf_files]
+    )
+    preview_all = page.get_by_role("checkbox", name="Process metadata for all files")
+    expect(preview_all).to_be_visible(timeout=30000)
+    expect(page.get_by_label("Override Author").first).to_be_hidden()
+    page.wait_for_function(
+        "document.querySelector('#document-metadata-scan-status .metadata-scan-inline')?.dataset.state === 'ready'",
+        timeout=60000,
+    )
+    accordion_header = page.locator("#document-metadata-accordion > button.label-wrap")
+    accordion_header.click()
+    expect(page.locator(".metadata-panel").filter(
+        has_text=six_pdf_files[5].name
+    )).to_contain_text("Not previewed")
+    expect(preview_all).to_be_visible()
+    accordion_header.click()
+    preview_all.check()
+    expect(page.get_by_label("Override Author").first).to_be_hidden()
+    page.wait_for_function(
+        "(() => { const s = document.querySelector('#document-metadata-scan-status .metadata-scan-inline'); "
+        "return s?.dataset.previewScope === 'all' && s?.dataset.previewComplete === 'true' "
+        "&& s?.dataset.state === 'ready'; })()",
+        timeout=90000,
+    )
+    accordion_header.click()
+    expect(preview_all).to_be_visible()
+    expect(page.locator(".metadata-panel").filter(
+        has_text=six_pdf_files[5].name
+    )).not_to_contain_text("Not previewed")
+    expect(page.locator("#document-metadata-scan-status")).to_contain_text(
+        "6 of 6 selected PDFs"
+    )
+
+
+def test_auto_confirm_uses_override_entered_after_arming(page, paused_metadata_app, six_pdf_files):
+    url, started, release, app_home = paused_metadata_app
+    open_local_app(page, url)
+    page.get_by_role("radio", name="Create local files only").check()
+    page.locator(".pdf-upload-input input[type='file']").set_input_files(
+        [str(path) for path in six_pdf_files]
+    )
+    deadline = time.monotonic() + 30
+    while not started.exists():
+        assert time.monotonic() < deadline, "Preview did not reach the paused inference"
+        page.wait_for_timeout(50)
+    page.get_by_role("checkbox", name="Process metadata for all files").check()
+    page.get_by_role("checkbox", name="Confirm and start run automatically").check()
+    page.locator("#document-metadata-accordion > button.label-wrap").click()
+    sixth = page.locator(".metadata-panel").filter(has_text=six_pdf_files[5].name)
+    sixth.get_by_label("Override Author", exact=True).fill("Late Override Sixth")
+    release.touch()
+    page.wait_for_function(
+        "['successful', 'warning', 'failed', 'cancelled'].includes("
+        "document.querySelector('.automatic-run-activity')?.dataset.runState)",
+        timeout=180000,
+    )
+    expect(page.locator("#confirm-automatic-run-button")).to_have_text("Processing successful ✓")
+    profiles = [json.loads(path.read_text(encoding="utf-8")) for path in
+                (app_home / "run-state").rglob("source-profile.json")]
+    assert len(profiles) == 6
+    assert sum(profile["detected_author"] == "Late Override Sixth" for profile in profiles) == 1
+
+
 def test_overrides_survive_before_during_and_after_detection_and_save_on_confirm(
     page, paused_metadata_app, one_page_pdf
 ):
@@ -636,7 +766,9 @@ def test_overrides_survive_before_during_and_after_detection_and_save_on_confirm
     while not started.exists():
         assert time.monotonic() < deadline, "Preview did not reach the paused inference"
         page.wait_for_timeout(50)
-    expect(page.locator(".metadata-detected-value").first).to_have_text("Loading…")
+    expect(page.locator(
+        ".metadata-detected-value:not([data-metadata-known='filename'])"
+    ).first).to_have_text("Loading…")
     for field in fields:
         editor = page.get_by_label(f"Override {field}", exact=True)
         expect(editor).to_be_visible()

@@ -1,5 +1,6 @@
 import json
 import inspect
+import time
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -88,6 +89,46 @@ def test_early_terminal_is_recorded_once_but_never_calibrates(history_home, stat
 
 def test_unowned_preview_does_not_create_a_history_run(history_home):
     app.retain_early_terminal_history(None, "failed", "No run started", 2, 10)
+    assert not app.INGESTION_HISTORY_PATH.exists()
+
+
+def test_owned_workspace_failure_appears_in_run_history(history_home, monkeypatch):
+    run = history_home / "reserved-run"
+    run.mkdir()
+    monkeypatch.setattr(app, "LIVE_AUTOMATIC_RUN_STATUS", {
+        "state": "preparing", "run_root": str(run), "started_epoch": time.time() - 2,
+        "expected_seconds": 10, "confirmed_fraction": 0.0,
+    })
+
+    app.automatic_confirmation_failure_response(
+        "AUTO-WORKSPACE-004", "Could not create the new document workspace",
+        ["Local Desktop listener ownership could not be verified."],
+        owned_run_root=run, mode=app.MODE_NATIVE_UPLOAD_LABEL,
+    )
+
+    rows = read(app.INGESTION_HISTORY_PATH)
+    assert len(rows) == 1
+    assert rows[0]["state"] == "failed"
+    assert rows[0]["run_key"] == str(run)
+    assert "AUTO-WORKSPACE-004" in rows[0]["message"]
+    assert "listener ownership" in app.ingestion_history_html()
+    assert (run / "ingestion-terminal-record.json").is_file()
+
+
+def test_failure_history_rejects_stale_run_root(history_home, monkeypatch):
+    old_run = history_home / "prior-run"
+    new_run = history_home / "current-run"
+    old_run.mkdir()
+    new_run.mkdir()
+    monkeypatch.setattr(app, "LIVE_AUTOMATIC_RUN_STATUS", {
+        "state": "preparing", "run_root": str(old_run), "started_epoch": time.time(),
+    })
+
+    app.automatic_confirmation_failure_response(
+        "AUTO-WORKSPACE-004", "Current run failed", ["Ownership mismatch"],
+        owned_run_root=new_run,
+    )
+
     assert not app.INGESTION_HISTORY_PATH.exists()
 
 

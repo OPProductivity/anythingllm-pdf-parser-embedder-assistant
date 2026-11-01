@@ -1010,6 +1010,49 @@ APP_CONNECTION_WATCHDOG_HEAD = """
       ...document.querySelectorAll("#batch-folder-file-selector .token"),
     ].map(node => (node.getAttribute("aria-label") || node.textContent || "").trim())
       .filter(name => /\\.pdf\\b/i.test(name));
+    const metadataSelectionIdentities = () => [
+      ...[...document.querySelectorAll("#automatic-pdf-upload .file-preview tr")]
+        .map(row => row.querySelector(".download-link")?.getAttribute("href") ||
+          row.querySelector("td[aria-label]")?.getAttribute("aria-label") || ""),
+      ...[...document.querySelectorAll("#batch-folder-file-selector .token")]
+        .map(token => token.getAttribute("data-value") || token.getAttribute("title") ||
+          token.textContent || ""),
+    ].filter(Boolean);
+    const metadataPreviewAllCheckbox = () => document.querySelector(
+      "#metadata-preview-all-control input[type='checkbox']");
+    const metadataAutoConfirmCheckbox = () => document.querySelector(
+      "#metadata-auto-confirm-control input[type='checkbox']");
+    let autoConfirmIssuedForSelection = null;
+    let allScanStartedForSelection = null;
+    const syncMetadataPreviewOptions = (names) => {
+      const options = document.getElementById("metadata-preview-options");
+      if (options) options.style.display = names.length >= 5 ? "flex" : "none";
+      if (names.length < 5 && metadataAutoConfirmCheckbox()?.checked) {
+        metadataAutoConfirmCheckbox().click();
+      }
+    };
+    const maybeAutomaticallyConfirmMetadataRun = () => {
+      const all = metadataPreviewAllCheckbox();
+      const automatic = metadataAutoConfirmCheckbox();
+      const status = document.querySelector("#document-metadata-scan-status .metadata-scan-inline");
+      const confirm = document.querySelector("#confirm-automatic-run-button");
+      const selection = metadataSelectionIdentities().join("\\u001f");
+      if (status?.dataset.previewScope === "all" && status?.dataset.state === "scanning") {
+        allScanStartedForSelection = selection;
+      }
+      if (!all?.checked || !automatic?.checked || !selection ||
+          allScanStartedForSelection !== selection ||
+          status?.dataset.previewScope !== "all" ||
+          status?.dataset.previewComplete !== "true" ||
+          status?.dataset.state !== "ready" ||
+          !confirm || confirm.disabled ||
+          autoConfirmIssuedForSelection === selection) return;
+      autoConfirmIssuedForSelection = selection;
+      automatic.click();
+      // A real button click captures the current Gradio controls, including
+      // edits made after either checkbox was selected.
+      confirm.click();
+    };
     const ensureMetadataHeaderStatus = () => {
       const heading = document.querySelector("#document-metadata-accordion > button.label-wrap");
       if (!heading) return null;
@@ -1053,7 +1096,7 @@ APP_CONNECTION_WATCHDOG_HEAD = """
       mirrorServerMetadataStatus();
       ensureMetadataHeaderStatus();
       const names = metadataSelectionNames();
-      const key = names.join("\\u001f");
+      const key = metadataSelectionIdentities().join("\\u001f");
       if (key !== metadataSelectionKey) {
         if (metadataSelectionKey === null && names.length &&
             ["ready", "warning"].includes(metadataHeaderState)) {
@@ -1061,18 +1104,75 @@ APP_CONNECTION_WATCHDOG_HEAD = """
           return;
         }
         metadataSelectionKey = key;
+        autoConfirmIssuedForSelection = null;
+        allScanStartedForSelection = null;
+        if (metadataAutoConfirmCheckbox()?.checked) metadataAutoConfirmCheckbox().click();
         if (names.length) markDetectedValuesLoading();
         showMetadataStatus(names.length ? "scanning" : "idle",
           names.length ? `Preparing metadata preview for ${names.length} PDF${names.length === 1 ? "" : "s"}…` : "");
       }
+      syncMetadataPreviewOptions(names);
+      maybeAutomaticallyConfirmMetadataRun();
     };
+    document.addEventListener("change", (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLInputElement)) return;
+      if (target === metadataAutoConfirmCheckbox() && target.checked &&
+          !metadataPreviewAllCheckbox()?.checked) metadataPreviewAllCheckbox()?.click();
+      if (target === metadataAutoConfirmCheckbox() || target === metadataPreviewAllCheckbox()) {
+        requestAnimationFrame(maybeAutomaticallyConfirmMetadataRun);
+      }
+    }, true);
+    const clearNativePdfSelectionTransport = () => {
+      const source = document.querySelector(
+        "#native-pdf-selected-paths input, #native-pdf-selected-paths textarea");
+      if (source?.value) {
+        source.value = "";
+        source.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+    };
+    document.addEventListener("drop", (event) => {
+      if (event.target instanceof Element && event.target.closest("#automatic-pdf-upload")) {
+        clearNativePdfSelectionTransport();
+      }
+    }, true);
     document.addEventListener("change", (event) => {
       const target = event.target;
       if (target instanceof HTMLInputElement &&
           target.matches("#automatic-pdf-upload input[type='file']") && target.files?.length) {
+        clearNativePdfSelectionTransport();
         markDetectedValuesLoading();
         showMetadataStatus("scanning", "Preparing metadata preview…");
       }
+    }, true);
+    let nativePdfSyncTimer = null;
+    let nativePdfSelectionBefore = null;
+    const nativePdfSelectedPaths = () => [...document.querySelectorAll(
+      "#automatic-pdf-upload .file-preview tr .download-link")].map(link => {
+        const raw = link.getAttribute("href") || "";
+        const marker = "/gradio_api/file=";
+        const index = raw.indexOf(marker);
+        if (index < 0) return "";
+        const path = raw.slice(index + marker.length);
+        try { return decodeURIComponent(path); } catch (_) { return path; }
+      }).filter(Boolean);
+    document.addEventListener("click", (event) => {
+      if (!(event.target instanceof Element) ||
+          !event.target.closest("#automatic-pdf-upload .file-preview button[aria-label='Remove this file']")) return;
+      if (!nativePdfSelectionBefore) nativePdfSelectionBefore = nativePdfSelectedPaths();
+      clearTimeout(nativePdfSyncTimer);
+      nativePdfSyncTimer = setTimeout(() => {
+        const source = document.querySelector(
+          "#native-pdf-selected-paths input, #native-pdf-selected-paths textarea");
+        if (source && nativePdfSelectionBefore) {
+          source.value = JSON.stringify({ before: nativePdfSelectionBefore,
+            after: nativePdfSelectedPaths() });
+          source.dispatchEvent(new Event("input", { bubbles: true }));
+        }
+        nativePdfSelectionBefore = null;
+        nativePdfSyncTimer = null;
+        document.getElementById("native-pdf-selection-sync")?.click();
+      }, 250);
     }, true);
     document.addEventListener("click", (event) => {
       const button = event.target instanceof Element
@@ -3689,6 +3789,8 @@ html.dark .gradio-container .batch-folder-panel .batch-folder-title-icon {
     min-width: 0 !important;
     flex: 1 1 200px !important;
 }
+#metadata-preview-options { display: none; }
+#native-pdf-selection-sync { display: none; }
 .extraction-options-row label:has(input[type="checkbox"]),
 .extraction-options-row label[data-testid$="-checkbox-label"] {
     width: 100% !important;
@@ -13107,12 +13209,13 @@ def automatic_detected_metadata_preview(
         )
 
 
-def metadata_scan_status_html(state, message):
+def metadata_scan_status_html(state, message, *, scope="limited", complete=False):
     """A hidden transport for the visible accordion-heading status."""
     if state not in {"idle", "scanning", "ready", "warning"}:
         raise ValueError("Unknown metadata preview state")
     return (
-        f'<div class="metadata-scan-inline" data-state="{state}" role="status" '
+        f'<div class="metadata-scan-inline" data-state="{state}" '
+        f'data-preview-scope="{scope}" data-preview-complete="{str(bool(complete)).lower()}" role="status" '
         'aria-live="polite" aria-atomic="true">'
         '<span class="metadata-scan-spinner" aria-hidden="true"></span>'
         f'<span class="metadata-scan-copy">{html.escape(message)}</span></div>'
@@ -13222,6 +13325,7 @@ def stream_automatic_detected_metadata_preview(
     folder_manifest=None,
     selection_state=None,
     recognition_effort=None,
+    preview_all=False,
     request: gr.Request = None,
 ):
     """Publish scanning feedback and each result during one fresh inspection.
@@ -13254,7 +13358,9 @@ def stream_automatic_detected_metadata_preview(
             current_author = ""
         if not edits.get("document_short_label"):
             current_short_label = ""
-    displayed = files[:5]
+    preview_all = bool(preview_all and len(files) >= 5)
+    displayed = files if preview_all else files[:5]
+    preview_scope = "all" if preview_all else "limited"
     completed_html = []
     preview_errors = []
     field_updates = tuple(gr.update(value=value or "", interactive=False) for value in
@@ -13263,7 +13369,8 @@ def stream_automatic_detected_metadata_preview(
         field_updates = tuple(gr.update(value="", interactive=False) for _ in range(3))
     selection_note = (
         f"{len(files)} PDF(s) selected. Previewing {len(displayed)}. "
-        "Every selected PDF will be inspected freshly after Confirm."
+        + ("Metadata recognition is running for every selected PDF."
+           if preview_all else "Every selected PDF will be inspected freshly after Confirm.")
     )
     if len(files) > 1:
         selection_note += (
@@ -13292,7 +13399,9 @@ def stream_automatic_detected_metadata_preview(
             yield tuple(gr.update() for _ in range(7))
             return
         scanning = (
-            f"Author metadata recognition scanning… {index + 1}/{len(displayed)}: "
+            (f"Metadata recognition processing for all {len(files)} files… "
+             if preview_all else "Author metadata recognition scanning… ")
+            + f"{index + 1}/{len(displayed)}: "
             f"{Path(path).name}. {index} preview(s) complete. "
             "Reviewing available document evidence before deciding."
         )
@@ -13300,7 +13409,12 @@ def stream_automatic_detected_metadata_preview(
             *field_updates,
             preview_list_html(index, scanning),
             metadata_scan_status_html(
-                "scanning", f"Inspecting metadata for preview {index + 1} of {len(displayed)}…"
+                "scanning", (
+                    f"Metadata recognition processing for all {len(files)} files… "
+                    f"{index + 1}/{len(displayed)}"
+                    if preview_all else
+                    f"Inspecting metadata for preview {index + 1} of {len(displayed)}…"
+                ), scope=preview_scope,
             ),
             gr.update(),
             gr.update(value=automatic_selection_preparing_status_html(
@@ -13355,7 +13469,11 @@ def stream_automatic_detected_metadata_preview(
                     if len(files) > 1 else
                     "Metadata preview complete. Expand to review detected values and overrides."
                 ) if index + 1 == len(displayed) else
+                f"Metadata recognition processing for all {len(files)} files… "
+                f"{index + 1}/{len(displayed)} complete; reading the next PDF…"
+                if preview_all else
                 f"Preview {index + 1} of {len(displayed)} complete; reading the next PDF…",
+                scope=preview_scope, complete=index + 1 == len(displayed),
             ),
             gr.update(),
             gr.update(value=automatic_selection_preparing_status_html(
@@ -13689,13 +13807,28 @@ def automatic_selection_begin_state(
     pdf_files=None,
     folder_pdf_files=None,
     folder_manifest=None,
+    native_pdf_selected_paths="",
     request: gr.Request = None,
 ):
     """Lock the ordinary picker and run controls for a direct file selection."""
+    selected_pdfs = normalize_file_list(pdf_files)
+    native_reconciled = False
+    if native_pdf_selected_paths:
+        try:
+            native = json.loads(native_pdf_selected_paths)
+            before = {local_path_identity_key(path) for path in native["before"]}
+            after = {local_path_identity_key(path) for path in native["after"]}
+            current = {local_path_identity_key(path) for path in selected_pdfs}
+            if before and after <= current <= before:
+                selected_pdfs = [path for path in selected_pdfs
+                                 if local_path_identity_key(path) in after]
+                native_reconciled = current != after
+        except (TypeError, ValueError, KeyError):
+            pass
     result = _automatic_selection_begin_state(
         previous_state,
         _viewed_run_root,
-        pdf_files,
+        selected_pdfs,
         folder_pdf_files,
         folder_manifest,
         preserve_ordinary_picker=False,
@@ -13706,7 +13839,7 @@ def automatic_selection_begin_state(
         result[0].get("state") == "pending"
         and _selection_preview_is_current(result[0], request)
         and not automatic_lifecycle_busy()
-        and normalize_file_list(pdf_files)
+        and selected_pdfs
         and clean_downloadable_paths(manifest.get("pdf_candidates") or [])
     ):
         # This owned chain merges browser uploads into the existing folder
@@ -13714,6 +13847,8 @@ def automatic_selection_begin_state(
         # mapping and clearing the ordinary picker. A newer selection still
         # invalidates the preview token before finish can accept these paths.
         result[0]["accept_next_signature"] = True
+    if native_reconciled and result[0].get("state") == "pending":
+        result = (*result[:2], gr.update(value=selected_pdfs, interactive=False), *result[3:])
     return result
 
 
@@ -25240,22 +25375,33 @@ def completed_native_upload_requires_desktop_refresh(run_outputs):
     return terminal_state or partial_mutation
 
 
-def automatic_confirmation_failure_response(code, title, details, next_steps=None, timing_html=None):
+def automatic_confirmation_failure_response(code, title, details, next_steps=None, timing_html=None,
+                                            owned_run_root=None, mode=""):
     """Return the full confirm-click output contract for a known failed start."""
     APP_LOGGER.error("automatic run did not start: %s (%s)", code, title)
     record = dict(LIVE_AUTOMATIC_RUN_STATUS or {})
     if str(record.get("state") or "") == "preparing":
         root_cause = str((details or [""])[0] or "").strip()
+        failure_message = title + (f" — {root_cause}" if root_cause else "")
         update_live_automatic_run_status(
             record.get("run_root"),
             state="failed",
             phase="Pre-processing stopped",
             expected_seconds=record.get("expected_seconds", 0),
-            details=(title + (f" — {root_cause}" if root_cause else "")),
+            details=failure_message,
             completion_code=code,
             confirmed_fraction=record.get("confirmed_fraction"),
             cancel_available=False,
         )
+        # Confirmation failures after reservation own a real run folder. Keep
+        # them in Run history, but never turn an unowned preview or stale prior
+        # run root into a new history entry.
+        if owned_run_root and str(record.get("run_root") or "") == str(owned_run_root):
+            retain_early_terminal_history(
+                owned_run_root, "failed", f"{code}: {failure_message}",
+                max(0.0, time.time() - float(record.get("started_epoch") or time.time())),
+                record.get("expected_seconds", 0), mode=mode,
+            )
     return (
         *automatic_error_outputs(
             code,
@@ -25732,6 +25878,7 @@ def run_automatic_from_confirmation(*values, progress=gr.Progress(track_tqdm=Fal
                         state="failed",
                         message="Compatibility verification stopped the run before workspace creation.",
                     ),
+                    owned_run_root=reserved_run_root, mode=confirmed_settings.get("mode") or "",
                 )
             confirmed_settings["_preflight_compatibility_report"] = compatibility_report
             capacity = automatic_batch_output_capacity_preflight(
@@ -25744,6 +25891,7 @@ def run_automatic_from_confirmation(*values, progress=gr.Progress(track_tqdm=Fal
                     [capacity.get("message") or "Output capacity could not be verified.", "No workspace was created."],
                     ["Check the output destination and available space, then confirm again."],
                     timing_html=automatic_run_timing_html(state="failed", message="Stopped before workspace creation."),
+                    owned_run_root=reserved_run_root, mode=confirmed_settings.get("mode") or "",
                 )
             update_live_automatic_run_status(
                 state="preparing",
@@ -25782,6 +25930,7 @@ def run_automatic_from_confirmation(*values, progress=gr.Progress(track_tqdm=Fal
                     [result.get("error") or result.get("status") or "Workspace creation did not return a slug.", creation_note],
                     ["Review the document title and AnythingLLM runtime, then confirm the run again."],
                     timing_html=automatic_run_timing_html(state="failed", message=creation_note),
+                    owned_run_root=reserved_run_root, mode=confirmed_settings.get("mode") or "",
                 )
             confirmed_settings["workspace_slug"] = result["workspace_slug"]
             created_workspace_slug = str(result["workspace_slug"])
@@ -25848,6 +25997,8 @@ def run_automatic_from_confirmation(*values, progress=gr.Progress(track_tqdm=Fal
             )],
             ["Open Advanced → Run history for the detailed failure report.", "Retry after correcting the reported setting or runtime issue."],
             timing_html=automatic_run_timing_html(state="failed", message="The confirmed run did not start."),
+            owned_run_root=confirmed_settings.get("_reserved_run_root") or "",
+            mode=confirmed_settings.get("mode") or "",
         )
         if created_workspace_slug:
             failure_response = (*failure_response[:7], workspace_update, *failure_response[8:])
@@ -34503,6 +34654,14 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 elem_classes=["pdf-upload-input"],
                 buttons=[retry_selected_pdf_files_button],
             )
+            native_pdf_selection_sync_button = gr.Button(
+                "Synchronize selected PDFs", elem_id="native-pdf-selection-sync",
+            )
+            native_pdf_selected_paths = gr.Textbox(
+                value="", label="Native PDF selection paths",
+                elem_id="native-pdf-selected-paths",
+                elem_classes=["metadata-field-transport"],
+            )
             with gr.Group(elem_classes=["batch-folder-panel"]):
                 gr.HTML(
                     '<div class="batch-folder-title">'
@@ -34616,6 +34775,15 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
             # Keep callback argument positions stable without a user control.
             # Historical saved preferences cannot restore the retired mode.
             auto_recognition_effort = gr.State("thorough")
+            with gr.Row(elem_id="metadata-preview-options"):
+                preview_all_metadata = gr.Checkbox(
+                    label="Process metadata for all files", value=False,
+                    elem_id="metadata-preview-all-control",
+                )
+                auto_confirm_after_metadata = gr.Checkbox(
+                    label="Confirm and start run automatically", value=False,
+                    elem_id="metadata-auto-confirm-control",
+                )
             with gr.Accordion("Document metadata", open=False, elem_id="document-metadata-accordion", elem_classes=["top-level-accordion"]) as document_metadata_section:
                 auto_metadata_preview = gr.HTML(
                     value=pending_metadata_panel_html(
@@ -35955,7 +36123,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=stream_automatic_detected_metadata_preview,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest, automatic_selection_state, auto_recognition_effort],
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest, automatic_selection_state, auto_recognition_effort, preview_all_metadata],
                 outputs=[auto_label, auto_author, auto_short_label, auto_metadata_preview, auto_metadata_status, document_metadata_section, automatic_run_activity],
                 show_progress="hidden",
                 queue=True,
@@ -36005,9 +36173,10 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
             # reaches the server.  The state chain below then restores a
             # coherent fresh-run snapshot before the control is re-enabled.
             gr.on(
-                triggers=[auto_pdfs.upload, auto_pdfs.delete, auto_pdfs.clear],
+                triggers=[auto_pdfs.upload, auto_pdfs.clear,
+                          native_pdf_selection_sync_button.click],
                 fn=automatic_selection_begin_state,
-                inputs=[automatic_selection_state, automatic_viewed_run_root, auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
+                inputs=[automatic_selection_state, automatic_viewed_run_root, auto_pdfs, auto_folder_pdfs, auto_folder_manifest, native_pdf_selected_paths],
                 outputs=[
                     automatic_selection_state,
                     automatic_viewed_run_root,
@@ -36019,9 +36188,10 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 ],
                 show_progress="hidden",
                 queue=False,
-                # These user events also cover row removal and clearing. A
-                # programmatic File value update must not start a new chain
-                # and clear the batch that just absorbed its uploaded paths.
+                # Gradio's native remove button updates its file rows without
+                # reliably dispatching a settled File.delete/change callback.
+                # The browser's debounced sync click below reads the final
+                # File value after one or several row removals.
                 trigger_mode="always_last",
             ).then(
                 fn=pending_selected_metadata_preview,
@@ -36086,7 +36256,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=stream_automatic_detected_metadata_preview,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest, automatic_selection_state, auto_recognition_effort],
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest, automatic_selection_state, auto_recognition_effort, preview_all_metadata],
                 outputs=[auto_label, auto_author, auto_short_label, auto_metadata_preview, auto_metadata_status, document_metadata_section, automatic_run_activity],
                 show_progress="hidden",
                 queue=True,
@@ -36208,7 +36378,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=stream_automatic_detected_metadata_preview,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest, automatic_selection_state, auto_recognition_effort],
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest, automatic_selection_state, auto_recognition_effort, preview_all_metadata],
                 outputs=[auto_label, auto_author, auto_short_label, auto_metadata_preview, auto_metadata_status, document_metadata_section, automatic_run_activity],
                 show_progress="hidden",
                 queue=True,
@@ -36326,7 +36496,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=stream_automatic_detected_metadata_preview,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest, automatic_selection_state, auto_recognition_effort],
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest, automatic_selection_state, auto_recognition_effort, preview_all_metadata],
                 outputs=[auto_label, auto_author, auto_short_label, auto_metadata_preview, auto_metadata_status, document_metadata_section, automatic_run_activity],
                 show_progress="hidden",
                 queue=True,
@@ -36468,7 +36638,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=stream_automatic_detected_metadata_preview,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest, automatic_selection_state, auto_recognition_effort],
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author, auto_short_label, auto_use_file_title_fallback, apply_batch_metadata_overrides, auto_folder_manifest, automatic_selection_state, auto_recognition_effort, preview_all_metadata],
                 outputs=[auto_label, auto_author, auto_short_label, auto_metadata_preview, auto_metadata_status, document_metadata_section, automatic_run_activity],
                 show_progress="hidden",
                 queue=True,
@@ -36802,6 +36972,22 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     show_progress="hidden",
                     queue=False,
                 )
+            preview_all_metadata.change(
+                fn=stream_automatic_detected_metadata_preview,
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author,
+                        auto_short_label, auto_use_file_title_fallback,
+                        apply_batch_metadata_overrides, auto_folder_manifest,
+                        automatic_selection_state, auto_recognition_effort,
+                        preview_all_metadata],
+                outputs=[auto_label, auto_author, auto_short_label,
+                         auto_metadata_preview, auto_metadata_status,
+                         document_metadata_section, automatic_run_activity],
+                show_progress="hidden",
+                queue=True,
+                trigger_mode="always_last",
+                concurrency_limit=1,
+                concurrency_id="automatic-metadata-preview",
+            )
             confirm_automatic_run_button.click(
                 fn=run_automatic_for_browser_stream,
                 # Do not rely on gr.State for this irreversible action.  A

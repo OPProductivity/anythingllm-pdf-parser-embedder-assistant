@@ -2,6 +2,7 @@
 import hashlib
 import os
 from pathlib import Path
+import socket
 import threading
 import urllib.parse
 
@@ -11,40 +12,81 @@ _credentials = {}
 _lock = threading.Lock()
 
 
-def desktop_listener(api_url, storage_dir):
-    """Fail closed: a ping contract or loopback hostname is not identity."""
+def _loopback_port(api_url):
+    parsed = urllib.parse.urlsplit(api_url)
+    if parsed.scheme != "http" or parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+        return None
+    return parsed.port or 80
+
+
+def _trusted_desktop_process(pid, storage, port):
+    """Bind a socket owner to this user's installed Desktop and storage."""
     try:
-        parsed = urllib.parse.urlsplit(api_url)
-        if parsed.scheme != "http" or parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+        process = psutil.Process(pid)
+        created = process.create_time()
+        executable = Path(process.exe()).resolve()
+        if process.username() != psutil.Process().username() or executable.name.casefold() != "anythingllm.exe":
             return None
-        port = parsed.port or 80
+        trusted_roots = [Path(value) / "AnythingLLM" for value in (
+            os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")) if value]
+        if os.environ.get("LOCALAPPDATA"):
+            trusted_roots.append(Path(os.environ["LOCALAPPDATA"]) / "Programs" / "AnythingLLM")
+        if not any(executable.is_relative_to(root.resolve()) for root in trusted_roots):
+            return None
+        environment = process.environ()
+        configured_storage = environment.get("STORAGE_DIR")
+        if not configured_storage or Path(configured_storage).resolve() != storage:
+            return None
+        if int(environment.get("SERVER_PORT") or 0) != port:
+            return None
+        if psutil.Process(process.pid).create_time() != created:
+            return None
+        return {"pid": process.pid, "created": created, "port": port, "storage": str(storage)}
+    except (OSError, ValueError, psutil.Error):
+        return None
+
+
+def _connected_desktop_owner(sock, api_url, storage):
+    """Verify the exact peer socket, including when LISTEN has owner PID 0."""
+    port = _loopback_port(api_url)
+    if port is None or sock is None:
+        return None
+    try:
+        local, peer = sock.getsockname(), sock.getpeername()
+        if peer[0] not in {"127.0.0.1", "::1"} or peer[1] != port:
+            return None
+        for connection in psutil.net_connections(kind="tcp"):
+            if (connection.status == psutil.CONN_ESTABLISHED and connection.pid
+                    and connection.laddr and connection.raddr
+                    and connection.laddr.ip == peer[0] and connection.laddr.port == peer[1]
+                    and connection.raddr.ip == local[0] and connection.raddr.port == local[1]):
+                descriptor = _trusted_desktop_process(connection.pid, storage, port)
+                if descriptor:
+                    return descriptor
+    except (OSError, ValueError, psutil.Error):
+        return None
+    return None
+
+
+def desktop_listener(api_url, storage_dir):
+    """Fail closed: verify the listener or an exact owned probe connection."""
+    try:
+        port = _loopback_port(api_url)
+        if port is None:
+            return None
         storage = Path(storage_dir).resolve()
-        username = psutil.Process().username()
         for connection in psutil.net_connections(kind="tcp"):
             if (connection.status != psutil.CONN_LISTEN or not connection.pid
                     or connection.laddr.port != port
                     or connection.laddr.ip not in {"127.0.0.1", "::1", "0.0.0.0", "::"}):
                 continue
-            process = psutil.Process(connection.pid)
-            created = process.create_time()
-            executable = Path(process.exe()).resolve()
-            if process.username() != username or executable.name.casefold() != "anythingllm.exe":
-                continue
-            trusted_roots = [Path(value) / "AnythingLLM" for value in (
-                os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")) if value]
-            if os.environ.get("LOCALAPPDATA"):
-                trusted_roots.append(Path(os.environ["LOCALAPPDATA"]) / "Programs" / "AnythingLLM")
-            if not any(executable.is_relative_to(root.resolve()) for root in trusted_roots):
-                continue
-            environment = process.environ()
-            configured_storage = environment.get("STORAGE_DIR")
-            if not configured_storage or Path(configured_storage).resolve() != storage:
-                continue
-            if int(environment.get("SERVER_PORT") or 0) != port:
-                continue
-            if psutil.Process(process.pid).create_time() != created:
-                continue
-            return {"pid": process.pid, "created": created, "port": port, "storage": str(storage)}
+            descriptor = _trusted_desktop_process(connection.pid, storage, port)
+            if descriptor:
+                return descriptor
+        # Windows can report a live Electron listener with PID 0. A bare
+        # loopback response is insufficient; prove the owner of this socket.
+        with socket.create_connection((urllib.parse.urlsplit(api_url).hostname, port), timeout=0.5) as probe:
+            return _connected_desktop_owner(probe, api_url, storage)
     except (OSError, ValueError, psutil.Error):
         pass
     return None
@@ -69,19 +111,8 @@ def require_managed_key_origin(api_url, key):
 
 def verify_connected_desktop_socket(sock, api_url, storage):
     """Bind trust to the established connection before any bearer is sent."""
-    descriptor = desktop_listener(api_url, storage)
-    if descriptor and sock is not None:
-        try:
-            local, peer = sock.getsockname(), sock.getpeername()
-            process = psutil.Process(descriptor["pid"])
-            if process.create_time() == descriptor["created"]:
-                for connection in process.net_connections(kind="tcp"):
-                    if (connection.status == psutil.CONN_ESTABLISHED and connection.raddr
-                            and connection.laddr.ip == peer[0] and connection.laddr.port == peer[1]
-                            and connection.raddr.ip == local[0] and connection.raddr.port == local[1]):
-                        return
-        except (OSError, psutil.Error):
-            pass
+    if _connected_desktop_owner(sock, api_url, Path(storage).resolve()):
+        return
     raise ValueError("Connected API socket is not owned by the expected Desktop instance; no credential was sent.")
 
 

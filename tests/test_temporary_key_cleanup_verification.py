@@ -25,6 +25,21 @@ def test_key_absence_observation_reads_only_the_bound_desktop_store(tmp_path):
         )["status"] == "absent"
 
 
+def test_untrusted_listener_failure_explains_that_no_key_request_was_sent():
+    with (
+        mock.patch.object(pipeline, "resolve_anythingllm_api_key", return_value=("", "untrusted_local_service")),
+        mock.patch.object(pipeline, "create_temporary_desktop_api_key", return_value={
+            "status": "rejected_untrusted_service", "error": "Listener owner could not be verified.",
+        }),
+        mock.patch.object(pipeline, "post_json") as post,
+    ):
+        result = pipeline.verify_anythingllm_upload_auth("http://127.0.0.1:3001")
+    assert result["status"] == "authentication_required"
+    assert result["temporary_key_status"] == "rejected_untrusted_service"
+    assert "No API key request was sent" in result["message"]
+    post.assert_not_called()
+
+
 def test_http_success_without_physical_absence_is_cleanup_failure():
     with (
         mock.patch.object(

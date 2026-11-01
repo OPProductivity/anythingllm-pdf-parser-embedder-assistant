@@ -12682,8 +12682,14 @@ def verify_anythingllm_upload_auth(api_url, api_key=None):
     if temporary_key.get("status") != "created":
         result["status"] = "authentication_required"
         result["authentication_mode"] = "unavailable"
+        result["temporary_key_status"] = temporary_key.get("status", "error")
         result["error"] = temporary_key.get("error", "")
-        result["message"] = "AnythingLLM Desktop temporary API key creation is unavailable."
+        result["message"] = (
+            "The assistant could not verify that the local API listener belongs to AnythingLLM Desktop. "
+            "No API key request was sent."
+            if temporary_key.get("status") == "rejected_untrusted_service"
+            else "AnythingLLM Desktop temporary API key creation is unavailable."
+        )
         return result
     result["authenticated"] = True
     result["authentication_mode"] = "temporary_desktop_api_key"

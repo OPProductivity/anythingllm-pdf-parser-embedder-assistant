@@ -68,6 +68,21 @@ def test_preview_limit_is_explicit_and_no_document_is_inspected_twice(monkeypatc
     assert "source-10.pdf" in events[0][3] and "Not previewed" in events[0][3]
 
 
+def test_preview_all_scans_every_selected_pdf_and_marks_completion(monkeypatch):
+    inspect = Mock(side_effect=result)
+    monkeypatch.setattr(app, "detected_metadata_preview", inspect)
+    files = [f"source-{index}.pdf" for index in range(7)]
+    events = list(app.stream_automatic_detected_metadata_preview(
+        files, [], preview_all=True,
+    ))
+    assert "Metadata recognition processing for all 7 files" in events[0][4]
+    assert 'data-preview-scope="all"' in events[0][4]
+    assert 'data-preview-complete="false"' in events[0][4]
+    assert 'data-preview-complete="true"' in events[-1][4]
+    assert "7 of 7 selected PDFs" in events[-1][4]
+    assert [call.args[0][0] for call in inspect.call_args_list] == files
+
+
 def test_folder_names_are_visible_before_the_all_page_inspection_starts(monkeypatch, tmp_path):
     pdf = tmp_path / "selected.pdf"
     pdf.write_bytes(b"%PDF-1.4\n")
