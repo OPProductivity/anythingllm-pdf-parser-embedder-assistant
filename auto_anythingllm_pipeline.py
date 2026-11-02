@@ -121,7 +121,7 @@ from author_metadata.filename import infer_author_from_filename, structured_file
 from author_metadata.identity import (  # noqa: F401
     normalize_metadata_author, normalize_metadata_title,
     resolve_title_from_metadata_or_filename, resolve_author_from_metadata_and_inference,
-    author_confidence,
+    author_confidence, readable_person_author_case,
 )
 from author_metadata.context import AuthorEvidenceContext
 from author_metadata.field_map import compact_field_review, review_author_field_map
@@ -10520,16 +10520,28 @@ def read_workspace_model_configuration(storage_dir: Path, workspace_slug="test")
 
 
 def default_short_label(title, author, source_sha256=""):
-    """Use the first recognized author; never present a title word as an author label."""
+    """Use one surname, both surnames, or first surname plus et al."""
     # Fold diacritics only for compact labels, never for source metadata/text.
     def label_words(value):
         return re.findall(r"[^\W\d_](?:[^\W\d_]|['\u2019-])*",
                           unicodedata.normalize("NFC", value or ""))
 
-    first_author = re.split(r"\s*(?:,|;|\band\b|&)\s*", author or "", maxsplit=1, flags=re.I)[0]
-    author_words = label_words(first_author)
-    if author_words and (surname := ascii_label_word(author_words[-1])):
-        return surname
+    people = [part for part in re.split(r"\s*(?:,|;|\band\b|&)\s*", author or "", flags=re.I)
+              if part.strip()]
+    surnames = []
+    for person in people:
+        words = label_words(readable_person_author_case(person))
+        surname = ascii_label_word(words[-1]) if words else ""
+        if not surname:
+            surnames = []
+            break
+        surnames.append(surname)
+    if len(surnames) == 1:
+        return surnames[0]
+    if len(surnames) == 2:
+        return f"{surnames[0]} and {surnames[1]}"
+    if len(surnames) > 2:
+        return f"{surnames[0]} et al."
     digest = str(source_sha256 or "").lower()
     return f"PDF-{digest[:8]}" if re.fullmatch(r"[0-9a-f]{64}", digest) else "PDF"
 

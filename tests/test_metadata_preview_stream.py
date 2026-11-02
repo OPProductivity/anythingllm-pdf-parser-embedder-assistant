@@ -82,7 +82,7 @@ def test_preview_all_scans_every_selected_pdf_and_marks_completion(monkeypatch):
     assert 'data-preview-scope="all"' in events[0][4]
     assert 'data-preview-complete="false"' in events[0][4]
     assert 'data-preview-complete="true"' in events[-1][4]
-    assert "7 of 7 selected PDFs" in events[-1][4]
+    assert "7 of 7 PDFs" in events[-1][4]
     assert [call.args[0][0] for call in inspect.call_args_list] == files
 
 

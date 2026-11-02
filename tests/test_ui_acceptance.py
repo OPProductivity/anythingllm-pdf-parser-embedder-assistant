@@ -759,6 +759,51 @@ def test_metadata_preview_only_does_not_arm_auto_start(
         release.touch()
 
 
+def test_picker_change_during_metadata_scan_warns_then_rechecks_current_files(
+    page, paused_metadata_app, six_pdf_files
+):
+    url, started, release, _app_home = paused_metadata_app
+    open_local_app(page, url)
+    picker = page.locator(".pdf-upload-input input[type='file']")
+    picker.set_input_files([str(path) for path in six_pdf_files])
+    page.wait_for_function(
+        "(() => { const s = document.querySelector('#document-metadata-scan-status .metadata-scan-inline'); "
+        "return s?.dataset.state === 'ready' && s?.dataset.previewScope === 'none' "
+        "&& document.querySelector('.automatic-run-activity')?.dataset.runState === 'ready'; })()",
+        timeout=60000,
+    )
+    page.get_by_role("checkbox", name="Process metadata for all files").check()
+    try:
+        deadline = time.monotonic() + 30
+        while not started.exists():
+            assert time.monotonic() < deadline, "Metadata scan did not start"
+            page.wait_for_timeout(100)
+        picker.set_input_files([str(path) for path in six_pdf_files[:5]])
+        page.wait_for_function(
+            "document.documentElement.classList.contains('metadata-preview-stale')",
+            timeout=10000,
+        )
+        expect(page.locator("#metadata-preview-stale-row")).to_be_visible()
+        assert "not up to date" in page.locator("#document-metadata-accordion > button.label-wrap").inner_text()
+        release.touch()
+        page.wait_for_function(
+            "document.querySelector('.automatic-run-activity')?.dataset.runState === 'ready'",
+            timeout=60000,
+        )
+        if page.locator("#metadata-preview-stale-row").is_visible():
+            page.locator("#metadata-preview-rerun-button").click()
+        page.wait_for_function(
+            "(() => { const s = document.querySelector('#document-metadata-scan-status .metadata-scan-inline'); "
+            "return s?.dataset.state === 'ready' && s?.dataset.previewComplete === 'true' "
+            "&& s?.dataset.previewScope === 'all' "
+            "&& !document.documentElement.classList.contains('metadata-preview-stale'); })()",
+            timeout=90000,
+        )
+        expect(page.get_by_role("checkbox", name="Confirm and start run automatically")).not_to_be_checked()
+    finally:
+        release.touch()
+
+
 def test_real_sources_settings_then_all_file_auto_confirm(
     page, paused_confirm_preflight_app, optional_real_pdf_files
 ):

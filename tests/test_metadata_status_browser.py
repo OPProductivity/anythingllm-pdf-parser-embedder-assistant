@@ -1,6 +1,7 @@
 """Client-only metadata status behavior while preview callbacks are queued."""
 
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -23,8 +24,15 @@ def test_selected_pdf_metadata_status_is_visible_until_preview_finishes(tmp_path
                                    "pending": pending_selected_metadata_preview(
                                        ["first.pdf", "second.pdf"], []),
                                    }), encoding="utf8")
+    env = dict(os.environ)
+    try:
+        import playwright
+    except ModuleNotFoundError:
+        pass
+    else:
+        env["PDF_UI_PLAYWRIGHT_CORE"] = str(Path(playwright.__path__[0]) / "driver" / "package")
     result = subprocess.run(
         [node, str(root / "tests/ui/metadata_status.cjs"), str(fixture)],
-        capture_output=True, text=True, encoding="utf8", timeout=60,
+        capture_output=True, text=True, encoding="utf8", timeout=60, env=env,
     )
     assert result.returncode == 0, result.stdout + result.stderr

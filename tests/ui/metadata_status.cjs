@@ -1,7 +1,7 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const http = require('node:http');
-const {chromium} = require('playwright');
+const {chromium} = require(process.env.PDF_UI_PLAYWRIGHT_CORE || 'playwright');
 const source = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 const server = http.createServer((_request, response) => {
   response.writeHead(200, {'Content-Type': 'text/html; charset=utf-8'});
@@ -9,6 +9,9 @@ const server = http.createServer((_request, response) => {
     + source.APP_BROWSER_THEME_HEAD + '<body>'
     + '<div id="automatic-pdf-upload"><div class="file-preview"><table><tbody></tbody></table></div></div>'
     + '<div id="batch-folder-file-selector"></div>'
+    + '<div class="automatic-run-activity" data-run-state="idle"></div>'
+    + '<div id="metadata-preview-stale-row"><span class="metadata-stale-copy">Selection metadata is not up to date anymore.</span>'
+    + '<button id="metadata-preview-rerun-button">Run again</button></div>'
     + '<div id="document-metadata-accordion"><button class="label-wrap"><span>Document metadata</span>'
     + '<span class="icon">▼</span></button><div id="metadata-tables"></div></div>'
     + ['title', 'author', 'short-label', 'publisher'].map(field =>
@@ -61,27 +64,41 @@ const server = http.createServer((_request, response) => {
     });
     await page.waitForFunction(() => document.querySelector('.metadata-header-copy')?.textContent?.includes('2 PDFs'));
     await page.locator('#document-metadata-scan-status').evaluate(node => {
-      node.innerHTML = '<div class="metadata-scan-inline" data-state="scanning" role="status"><span class="metadata-scan-copy">Inspecting metadata for preview 1 of 2…</span></div>';
+      node.innerHTML = '<div class="metadata-scan-inline" data-state="scanning" data-selection-revision="1" role="status"><span class="metadata-scan-copy">Inspecting metadata for preview 1 of 2…</span></div>';
     });
     await page.waitForFunction(() => document.querySelector('.metadata-header-copy')?.textContent?.includes('preview 1 of 2'));
     await page.locator('#document-metadata-scan-status').evaluate(node => {
-      node.innerHTML = '<div class="metadata-scan-inline" data-state="ready" role="status"><span class="metadata-scan-copy">Preview ready for 2 of 2 selected PDFs.</span></div>';
+      node.innerHTML = '<div class="metadata-scan-inline" data-state="ready" data-selection-revision="1" role="status"><span class="metadata-scan-copy">Preview ready for 2 of 2 PDFs.  Expand here</span></div>';
     });
-    await page.waitForFunction(() => document.querySelector('.metadata-header-copy')?.textContent?.includes('2 of 2 selected PDFs'));
+    await page.waitForFunction(() => document.querySelector('.metadata-header-copy')?.textContent?.includes('2 of 2 PDFs'));
 
     await page.evaluate(() => {
       const token = document.createElement('span'); token.className = 'token';
       token.textContent = 'third.pdf ×'; document.querySelector('#batch-folder-file-selector').appendChild(token);
     });
-    await page.waitForFunction(() => document.querySelector('.metadata-header-status')?.dataset.state === 'scanning');
-    assert.match(await status.textContent(), /Preparing metadata preview for 3 PDFs/);
+    await page.waitForFunction(() => document.querySelector('.metadata-header-status')?.dataset.state === 'warning');
+    assert.match(await status.textContent(), /Selection metadata is not up to date anymore/);
+    assert.equal(await page.locator('#metadata-preview-stale-row').isVisible(), true);
     await page.locator('#document-metadata-scan-status').evaluate(node => {
-      node.innerHTML = '<div class="metadata-scan-inline" data-state="warning" role="status"><span class="metadata-scan-copy">1 metadata preview error. Latest: PDF 1/3, Patrick Deneen - A Political Proposal for America.pdf — PDF extension, non-PDF contents. Find that file in Document metadata for details.</span></div>';
+      node.innerHTML = '<div class="metadata-scan-inline" data-state="scanning" data-selection-revision="2" role="status"><span class="metadata-scan-copy">Inspecting metadata for preview 1 of 3…</span></div>';
+    });
+    await page.waitForFunction(() => document.querySelector('.metadata-header-copy')?.textContent?.includes('not up to date'));
+    await page.locator('#document-metadata-scan-status').evaluate(node => {
+      node.innerHTML = '<div class="metadata-scan-inline" data-state="ready" data-preview-scope="all" data-preview-complete="true" data-selection-revision="2" role="status"><span class="metadata-scan-copy">Preview ready for 3 of 3 PDFs.  Expand here</span></div>';
+    });
+    await page.waitForFunction(() => document.querySelector('.metadata-header-status')?.dataset.state === 'ready');
+    assert.equal(await page.locator('#metadata-preview-stale-row').isVisible(), false);
+    await page.locator('#document-metadata-scan-status').evaluate(node => {
+      node.innerHTML = '<div class="metadata-scan-inline" data-state="warning" data-selection-revision="2" role="status"><span class="metadata-scan-copy">1 metadata preview error. Latest: PDF 1/3, Patrick Deneen - A Political Proposal for America.pdf — PDF extension, non-PDF contents. Find that file in Document metadata for details.</span></div>';
     });
     await page.waitForFunction(() => document.querySelector('.metadata-header-status')?.dataset.state === 'warning');
     assert.match(await status.textContent(), /Patrick Deneen.*non-PDF contents/);
     assert.equal(await status.locator('.metadata-header-copy').evaluate(node =>
       getComputedStyle(node).whiteSpace), 'normal');
+    await page.locator('#document-metadata-scan-status').evaluate(node => {
+      node.innerHTML = '<div class="metadata-scan-inline" data-state="scanning" data-selection-revision="3" role="status"><span class="metadata-scan-copy">Inspecting metadata for preview 1 of 3…</span></div>';
+    });
+    await page.waitForFunction(() => document.querySelector('.metadata-header-status')?.dataset.state === 'scanning');
 
     // These are the actual Python-rendered tables and application JS. No PDF
     // inference is simulated as correctness evidence: this exercises early
@@ -107,7 +124,8 @@ const server = http.createServer((_request, response) => {
       const token = document.createElement('span'); token.className = 'token'; token.textContent = 'fourth.pdf ×';
       document.querySelector('#batch-folder-file-selector').appendChild(token);
     });
-    await page.waitForFunction(() => document.querySelector('.metadata-header-copy')?.textContent?.includes('4 PDFs'));
+    await page.waitForFunction(() => document.querySelector('.metadata-header-copy')?.textContent?.includes('not up to date'));
+    assert.equal(await page.locator('#metadata-preview-stale-row').isVisible(), true);
     assert.deepEqual(await titleSuggestions.allTextContents(), ['first', 'second']);
     assert.equal(await editors.evaluateAll(nodes => nodes.every(node => !node.disabled)), true);
     await page.locator('#metadata-tables').evaluate((node, html) => { node.innerHTML = html; }, source.pending);
@@ -118,6 +136,16 @@ const server = http.createServer((_request, response) => {
     await secondPublisher.fill('Second press after replacement');
     assert.equal(Object.values(JSON.parse(await transport.inputValue())).filter(item =>
       item.document_publisher === 'Second press after replacement').length, 1);
+    await page.locator('#metadata-preview-rerun-button').click();
+    await page.locator('#document-metadata-scan-status').evaluate(node => {
+      node.innerHTML = '<div class="metadata-scan-inline" data-state="scanning" data-selection-revision="3" role="status"><span class="metadata-scan-copy">Inspecting metadata for preview 1 of 4…</span></div>';
+    });
+    await page.waitForTimeout(100);
+    await page.locator('#document-metadata-scan-status').evaluate(node => {
+      node.innerHTML = '<div class="metadata-scan-inline" data-state="ready" data-preview-scope="all" data-preview-complete="true" data-selection-revision="3" role="status"><span class="metadata-scan-copy">Preview ready for 4 of 4 PDFs.  Expand here</span></div>';
+    });
+    await page.waitForFunction(() => document.querySelector('.metadata-header-status')?.dataset.state === 'ready');
+    assert.equal(await page.locator('#metadata-preview-stale-row').isVisible(), false);
     console.log('Immediate single, batch, progress, completion, reselection and warning states passed');
   } finally { await browser.close(); server.close(); }
 })().catch(error => { console.error(error.stack); process.exitCode = 1; });

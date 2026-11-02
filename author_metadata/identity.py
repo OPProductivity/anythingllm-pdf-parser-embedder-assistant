@@ -1,6 +1,7 @@
 """Resolve accepted document identity from metadata and author evidence."""
 
 import re
+import unicodedata
 from pathlib import Path
 from rag_pdf_tools import normalize_text
 from .constants import TRUSTED_AUTHOR_INFERENCE_SOURCES
@@ -34,6 +35,24 @@ def normalize_metadata_author(value):
     return ", ".join(normalized)
 
 
+def readable_person_author_case(value):
+    """Repair export-style capitalized names without rewriting ordinary case.
+
+    Keep initials, already mixed-case names, and user overrides as entered.
+    This changes the accepted person's display name, not the evidence text.
+    """
+    def repair_word(match):
+        word = match.group()
+        if word[:2].casefold() == "mc" and len(word) > 3 and word[2:].isupper():
+            return "Mc" + word[2:].capitalize()
+        if len(word) > 2 and word.isupper():
+            return word.capitalize()
+        return word
+
+    return re.sub(r"[^\W\d_]+", repair_word,
+                  unicodedata.normalize("NFC", str(value or "")), flags=re.UNICODE)
+
+
 def normalize_metadata_title(value):
     """Accept a human-facing PDF title, rejecting common producer leftovers.
 
@@ -44,7 +63,7 @@ def normalize_metadata_title(value):
     quality filter, not a title inference system; readable metadata remains
     preferred whenever it is plausibly intended for people.
     """
-    title = normalize_text(value or "")
+    title = repair_metadata_title_encoding(normalize_text(value or ""))
     if (
         len(title) < 3
         or len(title) > 300
@@ -70,6 +89,36 @@ def normalize_metadata_title(value):
     ):
         return ""
     return title
+
+
+def repair_metadata_title_encoding(value):
+    """Repair only recognizable UTF-8 mojibake in a human-facing title.
+
+    Some PDF producers first misdecode UTF-8 as Latin-1 and then serialize C1
+    bytes as HTML numeric references.  Keep ordinary titles unchanged and
+    refuse a repair that leaves control bytes or replacement characters.
+    """
+    original = str(value or "")
+    if not re.search(r"Ã|Â|â[\x80-\x9f]|&#(?:x[89][0-9a-f]|1(?:2[89]|[3-5][0-9]))\b", original, re.I):
+        return original
+    candidate = re.sub(
+        r"&#x([89][0-9a-f]);|&#(1(?:2[89]|[3-5][0-9]));",
+        lambda match: chr(int(match.group(1), 16) if match.group(1) else int(match.group(2))),
+        original, flags=re.I,
+    )
+    for _ in range(3):
+        try:
+            repaired = candidate.encode("latin-1").decode("utf-8")
+        except UnicodeError:
+            break
+        if repaired == candidate:
+            break
+        candidate = repaired
+    if (candidate == original or "\ufffd" in candidate
+            or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in candidate)):
+        return original
+    marker = re.compile(r"Ã|Â|â[\x80-\x9f]|&#(?:x[89][0-9a-f]|1(?:2[89]|[3-5][0-9]))\b", re.I)
+    return candidate if len(marker.findall(candidate)) < len(marker.findall(original)) else original
 
 
 def resolve_title_from_metadata_or_filename(
@@ -134,7 +183,11 @@ def resolve_author_from_metadata_and_inference(
         and not author_candidate_is_document_role(inferred_value)
         and (not single_person_credit or looks_like_person_name(inferred_value))
     ):
-        return {"author": inferred_value, "source": inferred_source or "text_inference"}
+        display_author = (inferred_value if inferred_source in {
+            "text_corporate_cover_byline", "text_role_scoped_creator"
+        } else readable_person_author_case(inferred_value))
+        return {"author": display_author,
+                "source": inferred_source or "text_inference"}
     return {"author": "", "source": "not_available"}
 
 

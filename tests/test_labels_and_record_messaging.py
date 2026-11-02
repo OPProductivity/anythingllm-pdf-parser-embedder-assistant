@@ -12,7 +12,7 @@ pytestmark = pytest.mark.offline_deterministic
 @pytest.mark.parametrize(('author', 'expected'), [
     ('Jos\u00e9 Esteban Mu\u00f1oz', 'Munoz'),
     ('Sonia Hern\u00e1ndez', 'Hernandez'),
-    ('SYLVANNA M. FALC\u00d3N', 'FALCON'),
+    ('SYLVANNA M. FALC\u00d3N', 'Falcon'),
     ('Catherine S. Ram\u00edrez', 'Ramirez'),
     ('Ren\u00e9 Garc\u00eda-M\u00e1rquez', 'Garcia-Marquez'),
     ('Fran\u00e7ois L\u00e9vesque', 'Levesque'),
@@ -23,14 +23,14 @@ pytestmark = pytest.mark.offline_deterministic
     ('Jane O\u2019Neill', "O'Neill"),
     ('Nguy\u1ec5n V\u0103n \u0110\u1ed7', 'Do'),
     ('George Packer', 'Packer'),
-    ('Jane Doe, John Roe', 'Doe'),
+    ('Jane Doe, John Roe', 'Doe and Roe'),
 ])
 @pytest.mark.parametrize('normalization', ['NFC', 'NFD'])
 def test_short_labels_fold_accents_without_changing_author(author, expected, normalization):
     original = unicodedata.normalize(normalization, author)
     assert pipeline.default_short_label('Collected Essays', original) == expected
     assert original == unicodedata.normalize(normalization, author)
-    assert pipeline.compact_label_token(expected) == expected.casefold().replace("'", '-')
+    assert pipeline.compact_label_token(expected) == expected.casefold().replace("'", '-').replace(" ", "-")
 
 
 @pytest.mark.parametrize('title', [

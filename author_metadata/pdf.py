@@ -126,6 +126,28 @@ def corroborates_filename_surname(existing_author, existing_source, native_sampl
     return name.split()[-1].casefold() == surname.casefold()
 
 
+def corroborate_terminal_filename_credit(path: Path, title: str, report: dict):
+    """Promote a bare opening name only when a title/name filename agrees.
+
+    A top-block name alone is deliberately weak. An exact complete name after
+    the final filename delimiter, paired with the same complete work title,
+    supplies the independent catalog cue without trusting arbitrary suffixes.
+    """
+    if (report.get("source") != "text_top_block_names"
+            or not 1 <= int(report.get("page") or 0) <= 5):
+        return report
+    name = normalize_author_candidate(report.get("author") or "")
+    if (not looks_like_person_name(name, allow_all_caps=True)
+            or normalize_text(report.get("evidence") or "").casefold() != name.casefold()):
+        return report
+    parts = re.split(r"\s+[-–—]\s+", Path(path).stem)
+    if (len(parts) != 2
+            or normalize_text(parts[0]).casefold() != normalize_text(title).casefold()
+            or normalize_text(parts[1]).casefold() != name.casefold()):
+        return report
+    return {**report, "source": "filename_corroborated_text_name"}
+
+
 def infer_author_from_initial_pdf_pages(path: Path, title_hint="", *, page_limit=3,
                                         use_file_title_fallback=True,
                                         recognition_effort="thorough"):
@@ -182,6 +204,7 @@ def infer_author_from_initial_pdf_pages(path: Path, title_hint="", *, page_limit
     sampling_warning = "; ".join(sampling_errors)
     report = (infer_author(context, sampling_error=sampling_warning)
               if sampling_warning else infer_author(context))
+    report = corroborate_terminal_filename_credit(pdf_path, identity.title, report)
     resolved = resolve_author_from_metadata_and_inference(metadata.get("author") or "", report)
     result = {"author": resolved["author"], "source": resolved["source"],
             "page": int(report.get("page") or 0), "evidence": str(report.get("evidence") or ""),

@@ -89,7 +89,10 @@ from author_metadata.dispatcher import infer_author as infer_profiled_author
 from author_metadata.pdf import infer_author_from_initial_pdf_pages
 from author_metadata.scholarly_article import has_editorial_opening
 from author_metadata.work_identity import resolve_work_identity
-from author_metadata.identity import author_confidence, resolve_author_from_metadata_and_inference
+from author_metadata.identity import (
+    author_confidence, repair_metadata_title_encoding,
+    resolve_author_from_metadata_and_inference,
+)
 
 from auto_anythingllm_pipeline import (
     _api_urlopen,
@@ -1009,6 +1012,20 @@ APP_CONNECTION_WATCHDOG_HEAD = """
     let metadataHeaderState = "idle";
     let metadataHeaderMessage = "";
     let metadataTransportSignature = null;
+    let metadataPreviewStale = false;
+    let metadataStaleRevision = "";
+    let metadataStaleSawScan = false;
+    let metadataStaleRerunRequested = false;
+    const syncMetadataStaleRow = () => {
+      document.querySelector("#metadata-preview-stale-row")?.style.setProperty(
+        "display", metadataPreviewStale ? "flex" : "none", "important");
+    };
+    const setMetadataPreviewStale = (stale) => {
+      metadataPreviewStale = stale;
+      document.documentElement.classList.toggle("metadata-preview-stale", stale);
+      syncMetadataStaleRow();
+      if (stale) showMetadataStatus("warning", "Selection metadata is not up to date anymore. Run again.");
+    };
     const metadataSelectionNames = () => [
       ...document.querySelectorAll("#automatic-pdf-upload .file-preview td[aria-label]"),
       ...document.querySelectorAll("#batch-folder-file-selector .token"),
@@ -1048,10 +1065,26 @@ APP_CONNECTION_WATCHDOG_HEAD = """
       if (!source) return;
       const state = source.dataset.state || "idle";
       const message = source.querySelector(".metadata-scan-copy")?.textContent || "";
-      const signature = `${state}\\u001f${message}`;
+      const revision = source.dataset.selectionRevision || "";
+      const signature = `${revision}\\u001f${state}\\u001f${message}`;
       if (signature === metadataTransportSignature) return;
       const first = metadataTransportSignature === null;
       metadataTransportSignature = signature;
+      if (metadataPreviewStale) {
+        if (state === "scanning" && (revision !== metadataStaleRevision || metadataStaleRerunRequested)) {
+          metadataStaleSawScan = true;
+        }
+        const freshReady = state === "ready" && source.dataset.previewComplete === "true"
+          && source.dataset.previewScope !== "none"
+          && (revision !== metadataStaleRevision
+              || (metadataStaleRerunRequested && metadataStaleSawScan));
+        if (freshReady) {
+          setMetadataPreviewStale(false);
+          metadataStaleRerunRequested = false;
+        } else {
+          return;
+        }
+      }
       if (!first || state !== "idle") showMetadataStatus(state, message);
     };
     const markDetectedValuesLoading = () => {
@@ -1061,6 +1094,7 @@ APP_CONNECTION_WATCHDOG_HEAD = """
     const syncMetadataStatus = () => {
       mirrorServerMetadataStatus();
       ensureMetadataHeaderStatus();
+      syncMetadataStaleRow();
       const names = metadataSelectionNames();
       const key = metadataSelectionIdentities().join("\\u001f");
       const activityState = document.querySelector(".automatic-run-activity")?.dataset.runState;
@@ -1077,13 +1111,29 @@ APP_CONNECTION_WATCHDOG_HEAD = """
           metadataSelectionKey = key;
           return;
         }
+        const changedExistingSelection = metadataSelectionKey !== null && Boolean(key)
+          && ["scanning", "ready", "warning"].includes(metadataHeaderState);
+        if (changedExistingSelection) {
+          metadataStaleRevision = document.querySelector(
+            "#document-metadata-scan-status .metadata-scan-inline")?.dataset.selectionRevision || "";
+          metadataStaleSawScan = false;
+          setMetadataPreviewStale(true);
+        } else if (!key) {
+          setMetadataPreviewStale(false);
+        }
         metadataSelectionKey = key;
         if (names.length) markDetectedValuesLoading();
-        showMetadataStatus(names.length ? "scanning" : "idle",
+        if (!metadataPreviewStale) showMetadataStatus(names.length ? "scanning" : "idle",
           names.length ? `Preparing metadata preview for ${names.length} PDF${names.length === 1 ? "" : "s"}…` : "");
       }
       syncMetadataPreviewOptions(names);
     };
+    document.addEventListener("click", (event) => {
+      if (event.target instanceof Element && event.target.closest("#metadata-preview-rerun-button")) {
+        metadataStaleRerunRequested = true;
+        metadataStaleSawScan = false;
+      }
+    }, true);
     const clearNativePdfSelectionTransport = () => {
       const source = document.querySelector(
         "#native-pdf-selected-paths input, #native-pdf-selected-paths textarea");
@@ -1103,7 +1153,7 @@ APP_CONNECTION_WATCHDOG_HEAD = """
           target.matches("#automatic-pdf-upload input[type='file']") && target.files?.length) {
         clearNativePdfSelectionTransport();
         markDetectedValuesLoading();
-        showMetadataStatus("scanning", "Preparing metadata preview…");
+        if (!metadataPreviewStale) showMetadataStatus("scanning", "Preparing metadata preview…");
       }
     }, true);
     let nativePdfSyncTimer = null;
@@ -2974,6 +3024,21 @@ body.dark #automatic-process-button[disabled] {
 .metadata-status-transport {
     display: none !important;
 }
+#metadata-preview-stale-row {
+    display: none !important;
+}
+html.metadata-preview-stale #metadata-preview-stale-row {
+    display: flex !important;
+    align-items: center;
+    border: 2px solid #dc2626;
+    border-radius: 5px;
+    padding: 5px 9px;
+    margin: 4px 0 8px;
+}
+#metadata-preview-stale-row .metadata-stale-copy {
+    color: #dc2626;
+    font-weight: 700;
+}
 #document-metadata-accordion > button.label-wrap {
     align-items: center;
 }
@@ -3006,6 +3071,12 @@ body.dark #automatic-process-button[disabled] {
     white-space: nowrap;
 }
 #document-metadata-accordion > button.label-wrap .metadata-header-status[data-state="warning"] .metadata-header-copy {
+    overflow: visible;
+    text-overflow: clip;
+    overflow-wrap: anywhere;
+    white-space: normal;
+}
+#document-metadata-accordion > button.label-wrap .metadata-header-status[data-state="ready"] .metadata-header-copy {
     overflow: visible;
     text-overflow: clip;
     overflow-wrap: anywhere;
@@ -3162,6 +3233,16 @@ body:not(.dark) .gradio-container #document-metadata-accordion .metadata-table t
 }
 .document-metadata-preview .metadata-table th {
     color: var(--body-text-color-subdued);
+}
+.document-metadata-preview .metadata-table tr.metadata-missing-author-row > * {
+    border-top: 2px solid #dc2626 !important;
+    border-bottom: 2px solid #dc2626 !important;
+}
+.document-metadata-preview .metadata-table tr.metadata-missing-author-row > :first-child {
+    border-left: 2px solid #dc2626 !important;
+}
+.document-metadata-preview .metadata-table tr.metadata-missing-author-row > :last-child {
+    border-right: 2px solid #dc2626 !important;
 }
 body .gradio-container .document-metadata-preview input.metadata-override-input {
     display: block;
@@ -13264,6 +13345,17 @@ def metadata_preview_warning_message(errors, selected_count):
     )
 
 
+def concise_author_evidence(author, evidence):
+    """Omit a slash-separated work title when all accepted names are present."""
+    value = str(evidence or "")
+    names = [name.strip() for name in re.split(
+        r"\s*(?:,|;|\band\b|&)\s*", str(author or ""), flags=re.I,
+    ) if name.strip()]
+    if "/" in value and names and all(name.casefold() in value.casefold() for name in names):
+        return str(author)
+    return value
+
+
 def pending_selected_metadata_preview(pdf_files=None, folder_files=None, folder_manifest=None,
                                       selection_state=None, request: gr.Request = None):
     """Show every document's editors from paths alone, before PDF inspection."""
@@ -13454,6 +13546,11 @@ def stream_automatic_detected_metadata_preview(
             return
         # Publish this result before beginning another potentially slow scan.
         completed = f"Author metadata preview: {index + 1}/{len(displayed)} complete."
+        missing_authors = sum('data-author-missing="true"' in panel for panel in completed_html)
+        missing_note = (
+            f" ({missing_authors} file{'s' if missing_authors != 1 else ''} "
+            f"{'lack' if missing_authors != 1 else 'lacks'} recognized author metadata!)"
+        ) if missing_authors else ""
         if index + 1 == len(displayed):
             field_updates = tuple({**update, "interactive": True} for update in field_updates)
         yield (
@@ -13462,13 +13559,14 @@ def stream_automatic_detected_metadata_preview(
             metadata_scan_status_html(
                 "warning" if preview_errors and index + 1 == len(displayed) else
                 "ready" if index + 1 == len(displayed) else "scanning",
-                metadata_preview_warning_message(preview_errors, len(files))
+                (metadata_preview_warning_message(preview_errors, len(files))
+                 + missing_note + "\u00a0\u00a0Expand here")
                 if preview_errors and index + 1 == len(displayed) else
                 (
-                    f"Preview ready for {len(displayed)} of {len(files)} selected PDFs. "
-                    "Expand Document metadata for individual results."
+                    f"Preview ready for {len(displayed)} of {len(files)} PDFs."
+                    f"{missing_note}\u00a0\u00a0Expand here"
                     if len(files) > 1 else
-                    "Metadata preview complete. Expand to review detected values and overrides."
+                    "Metadata preview complete." + missing_note + "\u00a0\u00a0Expand here"
                 ) if index + 1 == len(displayed) else
                 f"Metadata recognition processing for all {len(files)} files… "
                 f"{index + 1}/{len(displayed)} complete; reading the next PDF…"
@@ -13529,6 +13627,24 @@ def stream_deferred_all_metadata_preview(
         current_short_label, use_file_title_fallback,
         apply_batch_metadata_overrides, folder_manifest, selection_state,
         recognition_effort, preview_all, request,
+    )
+
+
+def stream_retry_metadata_preview(
+    pdf_files, folder_files, current_title="", current_author="",
+    current_short_label="", use_file_title_fallback=True,
+    apply_batch_metadata_overrides=False, folder_manifest=None,
+    selection_state=None, recognition_effort=None, request: gr.Request = None,
+):
+    """Reinspect the current selection after a stale picker change."""
+    if not automatic_selection_is_ready(selection_state):
+        yield tuple(gr.update() for _ in range(7))
+        return
+    yield from stream_automatic_detected_metadata_preview(
+        pdf_files, folder_files, current_title, current_author,
+        current_short_label, use_file_title_fallback,
+        apply_batch_metadata_overrides, folder_manifest, selection_state,
+        recognition_effort, True, request,
     )
 
 
@@ -26990,7 +27106,7 @@ def run_manual_confirmation_with_auto_state(
 
 def run_server_owned_auto_confirmation(
     auto_armed, preview_all, metadata_status, selection_state,
-    viewed_run_root, *values,
+    viewed_run_root, folder_manifest, *values,
     progress=gr.Progress(track_tqdm=False), request: gr.Request = None,
 ):
     """Start once from an acknowledged selection and current Gradio inputs."""
@@ -27003,12 +27119,23 @@ def run_server_owned_auto_confirmation(
         and 'data-preview-complete="true"' in status
         and f'data-selection-revision="{revision}"' in status
     )
+    # A picker can publish its new values before its selection-state callback
+    # invalidates the old preview token. Compare the actual submitted direct
+    # and folder paths with the selection acknowledged for this revision.
+    expected_selection = str((selection_state or {}).get("selection_signature") or "")
+    selected_files_current = (
+        not expected_selection or
+        (len(values) >= 2 and automatic_selection_signature(
+            values[0], values[1], folder_manifest,
+        ) == expected_selection)
+    )
     ready = (
         bool(auto_armed and revision)
         and automatic_selection_is_ready(selection_state)
         and _selection_preview_is_current(selection_state, request)
         and not automatic_lifecycle_busy()
         and preview_ready
+        and selected_files_current
     )
     if not ready:
         APP_LOGGER.info(
@@ -27652,7 +27779,8 @@ METADATA_OVERRIDE_FIELDS = {
 }
 
 
-def metadata_table_html(primary_rows, additional_rows=(), *, include_overrides=True, document_key=""):
+def metadata_table_html(primary_rows, additional_rows=(), *, include_overrides=True,
+                        document_key="", missing_author=False):
     """Keep detected evidence and optional user overrides in distinct columns."""
     def render_rows(rows, additional=False):
         rendered = []
@@ -27666,17 +27794,23 @@ def metadata_table_html(primary_rows, additional_rows=(), *, include_overrides=T
                 'autocomplete="off" value="">'
                 if field else ""
             )
-            row_class = ' class="metadata-extra-row" hidden' if additional else ""
+            row_classes = []
+            if additional:
+                row_classes.append("metadata-extra-row")
+            if missing_author and key in {"Author", "Short citation label"}:
+                row_classes.append("metadata-missing-author-row")
+            row_class = f' class="{" ".join(row_classes)}"' if row_classes else ""
+            row_hidden = " hidden" if additional else ""
             known = ' data-metadata-known="filename"' if _origin == "filename_pending" else ""
             rendered.append(
-                f'<tr{row_class}><th scope="row">{html.escape(str(key))}</th>'
+                f'<tr{row_class}{row_hidden}><th scope="row">{html.escape(str(key))}</th>'
                 f'<td class="metadata-detected-value"{known}>{html.escape(str(value))}</td>'
                 f'<td class="metadata-override-value">{control}</td></tr>'
             )
         return "".join(rendered)
 
     return (
-        '<table class="metadata-table"><colgroup><col class="metadata-key-column">'
+        f'<table class="metadata-table" data-author-missing="{str(bool(missing_author)).lower()}"><colgroup><col class="metadata-key-column">'
         '<col class="metadata-detected-column"><col class="metadata-override-column"></colgroup>'
         '<thead><tr><th scope="col">Field</th><th scope="col">Detected</th>'
         '<th scope="col">Override (if applied)</th></tr></thead><tbody>'
@@ -27696,7 +27830,8 @@ def pending_metadata_panel_html(message, *, filename="", loading=False,
     heading = f'<div class="metadata-file-name">{html.escape(filename)}</div>' if filename else ""
     return detected_pdf_metadata_panel_html(
         heading + f'<div class="metadata-status">{html.escape(message)}</div>'
-        + metadata_table_html(rows, include_overrides=include_overrides, document_key=document_key),
+        + metadata_table_html(rows, include_overrides=include_overrides,
+                              document_key=document_key, missing_author=error),
         error=error, error_kind=error_kind,
     )
 
@@ -27745,7 +27880,7 @@ def detected_metadata_preview(
             records.append({"filename": pdf_path.name, "error_kind": kind, "error": message})
             continue
 
-        embedded_title = meta.get("title") or ""
+        embedded_title = repair_metadata_title_encoding(meta.get("title") or "")
         author_started = time.perf_counter()
         author_inference = infer_author_from_initial_pdf_pages(
             pdf_path, page_limit=4, use_file_title_fallback=use_file_title_fallback,
@@ -27817,6 +27952,8 @@ def detected_metadata_preview(
             text_layer_detail = text_layer.get("error") or "Unknown profiling error"
             sample_text = "No sample available"
             sample_origin = "PyMuPDF sample"
+        raw_author_evidence = str(author_inference.get("evidence") or "")
+        displayed_author_evidence = concise_author_evidence(author, raw_author_evidence)
         metadata_rows = [
             ("Title used", title or "Not available", title_origin),
             ("Embedded title", embedded_title or "Not set", "PDF metadata"),
@@ -27825,7 +27962,7 @@ def detected_metadata_preview(
             ("Publisher", meta.get("publisher") or "Not set", meta.get("publisher_source") or "PDF metadata"),
             ("Author confidence", f"{author_inference.get('author_confidence', {}).get('score', 0)}/100 — "
              f"{author_inference.get('author_confidence', {}).get('basis', 'unresolved')}", "evidence grade"),
-            ("Author evidence", author_inference.get("evidence") or "None", "PDF text scan"),
+            ("Author evidence", displayed_author_evidence or "None", "PDF text scan"),
             ("Recognition effort", normalize_effort(recognition_effort).label, "selected policy"),
             ("Optional retries deferred", author_inference.get("optional_retries_deferred", 0), "effort policy"),
             ("Text-layer check", text_layer_status, "PyMuPDF sample"),
@@ -27849,6 +27986,8 @@ def detected_metadata_preview(
                 "PDF structure",
             ),
         ]
+        if raw_author_evidence and displayed_author_evidence != raw_author_evidence:
+            metadata_rows.append(("Full author evidence", raw_author_evidence, "PDF text scan"))
         primary_keys = {
             "Title used", "Embedded title", "Author", "Short citation label", "Publisher", "Author confidence",
             "Author evidence", "Text-layer check", "Sample extracted text", "Pages",
@@ -27856,6 +27995,7 @@ def detected_metadata_preview(
         primary_rows = [row for row in metadata_rows if row[0] in primary_keys]
         technical_rows = [row for row in metadata_rows if row[0] not in primary_keys]
         records.append({"filename": pdf_path.name, "primary_rows": primary_rows,
+                        "missing_author": not bool(author),
                         "technical_rows": technical_rows,
                         "identity": workspace_source_identity_from_pdf(
                             pdf_path, author_report=author_inference, **_effort_kwargs(recognition_effort))})
@@ -27902,6 +28042,7 @@ def detected_metadata_preview(
         table = metadata_table_html(
             record["primary_rows"], additional_rows,
             include_overrides=override_editor, document_key=document_key,
+            missing_author=record["missing_author"],
         )
         panels.append(detected_pdf_metadata_panel_html(
             f'<div class="metadata-file-name">{filename}</div>{table}',
@@ -35107,6 +35248,10 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     info="Arms automatic start for the all-file metadata preview. Select Process metadata for all files separately; the run starts when that preview finishes.",
                     elem_id="metadata-auto-confirm-control",
                 )
+            with gr.Row(elem_id="metadata-preview-stale-row"):
+                gr.HTML('<span class="metadata-stale-copy">Selection metadata is not up to date anymore.</span>')
+                metadata_preview_rerun_button = gr.Button("Run again", variant="secondary", size="sm",
+                                                         elem_id="metadata-preview-rerun-button")
             with gr.Accordion("Document metadata", open=False, elem_id="document-metadata-accordion", elem_classes=["top-level-accordion"]) as document_metadata_section:
                 auto_metadata_preview = gr.HTML(
                     value=pending_metadata_panel_html(
@@ -36247,7 +36392,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
             server_auto_inputs = [
                 auto_confirm_after_metadata, preview_all_metadata,
                 auto_metadata_status, automatic_selection_state,
-                automatic_viewed_run_root, *automatic_run_inputs,
+                automatic_viewed_run_root, auto_folder_manifest, *automatic_run_inputs,
                 auto_title_override, auto_author_override,
                 auto_short_label_override,
             ]
@@ -37350,6 +37495,28 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     show_progress="hidden",
                     queue=False,
                 )
+            metadata_preview_rerun_button.click(
+                fn=stream_retry_metadata_preview,
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author,
+                        auto_short_label, auto_use_file_title_fallback,
+                        apply_batch_metadata_overrides, auto_folder_manifest,
+                        automatic_selection_state, auto_recognition_effort],
+                outputs=[auto_label, auto_author, auto_short_label,
+                         auto_metadata_preview, auto_metadata_status,
+                         document_metadata_section, automatic_run_activity],
+                show_progress="hidden",
+                queue=True,
+                concurrency_limit=1,
+                concurrency_id="automatic-metadata-preview",
+            ).then(
+                fn=run_server_owned_auto_confirmation,
+                inputs=server_auto_inputs,
+                outputs=server_auto_outputs,
+                show_progress="hidden",
+                queue=True,
+                concurrency_limit=AUTOMATIC_RUN_CONCURRENCY_LIMIT,
+                concurrency_id=AUTOMATIC_RUN_CONCURRENCY_ID,
+            )
             preview_all_metadata.change(
                 fn=stream_all_metadata_preview_on_checkbox_change,
                 inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author,
