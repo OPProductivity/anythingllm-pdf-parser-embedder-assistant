@@ -691,6 +691,18 @@ def test_settings_changed_after_auto_start_do_not_redirect_active_run(
         output.fill(str(later_output))
         output.press("Tab")
         expect(output).to_have_value(str(later_output))
+        later_mode = page.get_by_role("radio", name="Create local files with diagnostic logs")
+        if later_mode.is_enabled():
+            later_mode.check()
+            expect(later_mode).to_be_checked()
+        segmentation = page.get_by_label("Segmentation mode", exact=True).first
+        if segmentation.is_enabled():
+            segmentation.click()
+            page.get_by_role("option", name="All in one file").click()
+        front_matter = page.get_by_role("checkbox", name="Include foreword/preface")
+        if front_matter.is_enabled():
+            front_matter.uncheck()
+            expect(front_matter).not_to_be_checked()
         expect(page.get_by_role("checkbox", name="Confirm and start run automatically")).to_be_checked()
         release.touch()
         page.wait_for_function(
@@ -702,7 +714,13 @@ def test_settings_changed_after_auto_start_do_not_redirect_active_run(
         assert original_output.is_dir()
         assert list(original_output.rglob("*.txt"))
         assert not later_output.exists()
-        assert len(list((app_home / "run-state").rglob("source-profile.json"))) == 6
+        summaries = [json.loads(path.read_text(encoding="utf-8")) for path in
+                     (app_home / "run-state").rglob("run-summary.json")]
+        assert len(summaries) == 6
+        assert {summary["segment_mode"] for summary in summaries} == {"page_limit"}
+        terminal = list((app_home / "run-state").rglob("ingestion-terminal-record.json"))
+        assert len(terminal) == 1
+        assert json.loads(terminal[0].read_text(encoding="utf-8"))["mode"] == "Create local files only"
     finally:
         release.touch()
 
