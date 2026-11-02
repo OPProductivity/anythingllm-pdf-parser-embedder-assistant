@@ -294,8 +294,6 @@ app.launch_application(port=int(sys.argv[6]), inbrowser=False)
             wait_for_http(url + "/healthz", process)
             yield url, scan_started, scan_release, preflight_started, preflight_release, payload
         finally:
-            scan_release.touch()
-            preflight_release.touch()
             if process.poll() is None:
                 process.terminate()
                 try:
@@ -303,6 +301,8 @@ app.launch_application(port=int(sys.argv[6]), inbrowser=False)
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=15)
+            scan_release.touch()
+            preflight_release.touch()
 
 
 @pytest.fixture
@@ -643,6 +643,55 @@ def test_auto_start_without_metadata_preview_uses_custom_output_folder(
         page.get_by_role("button", name="Cancel").click()
     finally:
         preflight_release.touch()
+
+
+@pytest.mark.parametrize("mode", [
+    "Create local files with diagnostic logs",
+    "Create local files and upload to AnythingLLM",
+])
+@pytest.mark.parametrize("preview_all", [False, True])
+def test_other_output_modes_keep_auto_start_independent_of_metadata_preview(
+    page, paused_auto_handoff_app, six_pdf_files, mode, preview_all
+):
+    (url, scan_started, scan_release, preflight_started,
+     preflight_release, payload) = paused_auto_handoff_app
+    open_local_app(page, url)
+    page.locator(".pdf-upload-input input[type='file']").set_input_files(
+        [str(path) for path in six_pdf_files]
+    )
+    page.wait_for_function(
+        "(() => { const s = document.querySelector('#document-metadata-scan-status .metadata-scan-inline'); "
+        "return s?.dataset.state === 'ready' && s?.dataset.previewScope === 'none' "
+        "&& document.querySelector('.automatic-run-activity')?.dataset.runState === 'ready'; })()",
+        timeout=60000,
+    )
+    page.get_by_role("radio", name=mode, exact=True).check()
+    metadata = page.get_by_role("checkbox", name="Process metadata for all files")
+    automatic = page.get_by_role("checkbox", name="Confirm and start run automatically")
+    expect(metadata).not_to_be_checked()
+    if preview_all:
+        metadata.check()
+        deadline = time.monotonic() + 30
+        while not scan_started.exists():
+            assert time.monotonic() < deadline, "Metadata preview did not start"
+            page.wait_for_timeout(100)
+    automatic.check()
+    if preview_all:
+        assert not preflight_started.exists(), "Auto-start bypassed requested metadata preview"
+        scan_release.touch()
+    deadline = time.monotonic() + 30
+    while not preflight_started.exists():
+        assert time.monotonic() < deadline, "Auto-start did not reach preflight"
+        page.wait_for_timeout(100)
+    actual = json.loads(payload.read_text(encoding="utf-8"))
+    assert actual["mode"] == mode
+    assert len(actual["files"]) == 6
+    if preview_all:
+        expect(metadata).to_be_checked()
+    else:
+        expect(metadata).not_to_be_checked()
+    expect(automatic).to_be_checked()
+    expect(page.locator("#confirm-automatic-run-button")).to_have_text("Processing…")
 
 
 def test_metadata_preview_only_does_not_arm_auto_start(
