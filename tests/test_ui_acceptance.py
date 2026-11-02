@@ -765,6 +765,13 @@ def test_picker_change_during_metadata_scan_warns_then_rechecks_current_files(
     url, started, release, _app_home = paused_metadata_app
     open_local_app(page, url)
     picker = page.locator(".pdf-upload-input input[type='file']")
+    page.evaluate("""() => {
+      window.__initialMetadataStaleSeen = false;
+      new MutationObserver(() => {
+        if (document.documentElement.classList.contains('metadata-preview-stale'))
+          window.__initialMetadataStaleSeen = true;
+      }).observe(document.documentElement, {attributes: true, attributeFilter: ['class']});
+    }""")
     picker.set_input_files([str(path) for path in six_pdf_files])
     page.wait_for_function(
         "(() => { const s = document.querySelector('#document-metadata-scan-status .metadata-scan-inline'); "
@@ -772,6 +779,8 @@ def test_picker_change_during_metadata_scan_warns_then_rechecks_current_files(
         "&& document.querySelector('.automatic-run-activity')?.dataset.runState === 'ready'; })()",
         timeout=60000,
     )
+    assert page.evaluate("window.__initialMetadataStaleSeen") is False
+    expect(page.locator("#metadata-preview-stale-row")).not_to_be_visible()
     page.get_by_role("checkbox", name="Process metadata for all files").check()
     try:
         deadline = time.monotonic() + 30
@@ -800,6 +809,11 @@ def test_picker_change_during_metadata_scan_warns_then_rechecks_current_files(
             timeout=90000,
         )
         expect(page.get_by_role("checkbox", name="Confirm and start run automatically")).not_to_be_checked()
+        page.get_by_role("button", name="Remove this file").first.click()
+        page.wait_for_function(
+            "document.documentElement.classList.contains('metadata-preview-stale')",
+            timeout=10000,
+        )
     finally:
         release.touch()
 
@@ -999,10 +1013,22 @@ def test_multiple_pdf_selection_keeps_both_files_in_the_pending_batch(page, loca
     open_local_app(page, local_app_url)
     upload = page.locator(".pdf-upload-input input[type='file']")
     expect(upload).to_have_count(1)
+    page.evaluate("""() => {
+      window.__initialMetadataStaleSeen = false;
+      new MutationObserver(() => {
+        if (document.documentElement.classList.contains('metadata-preview-stale'))
+          window.__initialMetadataStaleSeen = true;
+      }).observe(document.documentElement, {attributes: true, attributeFilter: ['class']});
+    }""")
     upload.set_input_files([str(path) for path in two_pdf_files])
 
     confirm = page.get_by_role("button", name="Confirm and start processing")
     expect(confirm).to_be_enabled(timeout=15000)
+    page.wait_for_function(
+        "document.querySelector('#document-metadata-scan-status .metadata-scan-inline')?.dataset.state === 'ready'",
+        timeout=30000,
+    )
+    assert page.evaluate("window.__initialMetadataStaleSeen") is False
     expect(page.get_by_role("button", name="Remove this file")).to_have_count(2)
     expect(page.locator("#automatic-pdf-upload .rag-selected-pdf-count")).to_have_text(
         "2 PDFs selected", timeout=15000

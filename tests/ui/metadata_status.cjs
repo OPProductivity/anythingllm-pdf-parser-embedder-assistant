@@ -55,6 +55,33 @@ const server = http.createServer((_request, response) => {
     await page.evaluate(() => document.querySelector('#automatic-pdf-upload tbody').replaceChildren());
     await page.waitForFunction(() => document.querySelector('.metadata-header-status')?.dataset.state === 'idle');
 
+    // A first upload renders many rows incrementally. Its own loading is not
+    // a user edit to a previously previewed selection.
+    await page.evaluate(() => {
+      const tbody = document.querySelector('#automatic-pdf-upload tbody');
+      for (let index = 1; index <= 5; index++) {
+        const row = document.createElement('td');
+        row.setAttribute('aria-label', `initial-${index}.pdf`);
+        tbody.appendChild(row);
+      }
+    });
+    await page.waitForFunction(() => document.querySelector('.metadata-header-copy')?.textContent?.includes('5 PDFs'));
+    await page.locator('#document-metadata-scan-status').evaluate(node => {
+      node.innerHTML = '<div class="metadata-scan-inline" data-state="ready" data-preview-scope="none" data-preview-complete="true" data-selection-revision="2" role="status"><span class="metadata-scan-copy">No metadata preview requested for 42 PDFs.</span></div>';
+    });
+    await page.evaluate(() => {
+      const tbody = document.querySelector('#automatic-pdf-upload tbody');
+      for (let index = 6; index <= 42; index++) {
+        const row = document.createElement('td');
+        row.setAttribute('aria-label', `initial-${index}.pdf`);
+        tbody.appendChild(row);
+      }
+    });
+    await page.waitForFunction(() => document.querySelector('.metadata-header-copy')?.textContent?.includes('42 PDFs'));
+    assert.equal(await page.locator('#metadata-preview-stale-row').isVisible(), false);
+    await page.evaluate(() => document.querySelector('#automatic-pdf-upload tbody').replaceChildren());
+    await page.waitForFunction(() => document.querySelector('.metadata-header-status')?.dataset.state === 'idle');
+
     await page.evaluate(() => {
       const host = document.querySelector('#batch-folder-file-selector');
       for (const name of ['first.pdf', 'second.pdf']) {
@@ -68,11 +95,12 @@ const server = http.createServer((_request, response) => {
     });
     await page.waitForFunction(() => document.querySelector('.metadata-header-copy')?.textContent?.includes('preview 1 of 2'));
     await page.locator('#document-metadata-scan-status').evaluate(node => {
-      node.innerHTML = '<div class="metadata-scan-inline" data-state="ready" data-selection-revision="1" role="status"><span class="metadata-scan-copy">Preview ready for 2 of 2 PDFs.  Expand here</span></div>';
+      node.innerHTML = '<div class="metadata-scan-inline" data-state="ready" data-preview-scope="all" data-preview-complete="true" data-selection-revision="1" role="status"><span class="metadata-scan-copy">Preview ready for 2 of 2 PDFs.  Expand here</span></div>';
     });
     await page.waitForFunction(() => document.querySelector('.metadata-header-copy')?.textContent?.includes('2 of 2 PDFs'));
 
     await page.evaluate(() => {
+      document.querySelector('#batch-folder-file-selector').dispatchEvent(new Event('change', {bubbles: true}));
       const token = document.createElement('span'); token.className = 'token';
       token.textContent = 'third.pdf ×'; document.querySelector('#batch-folder-file-selector').appendChild(token);
     });
@@ -96,7 +124,7 @@ const server = http.createServer((_request, response) => {
     assert.equal(await status.locator('.metadata-header-copy').evaluate(node =>
       getComputedStyle(node).whiteSpace), 'normal');
     await page.locator('#document-metadata-scan-status').evaluate(node => {
-      node.innerHTML = '<div class="metadata-scan-inline" data-state="scanning" data-selection-revision="3" role="status"><span class="metadata-scan-copy">Inspecting metadata for preview 1 of 3…</span></div>';
+      node.innerHTML = '<div class="metadata-scan-inline" data-state="scanning" data-preview-scope="all" data-selection-revision="3" role="status"><span class="metadata-scan-copy">Inspecting metadata for preview 1 of 3…</span></div>';
     });
     await page.waitForFunction(() => document.querySelector('.metadata-header-status')?.dataset.state === 'scanning');
 
@@ -121,6 +149,7 @@ const server = http.createServer((_request, response) => {
     // A new file-list mutation invokes the immediate loading pass. Known
     // filename suggestions survive it; unknown author/publisher cells load.
     await page.evaluate(() => {
+      document.querySelector('#batch-folder-file-selector').dispatchEvent(new Event('change', {bubbles: true}));
       const token = document.createElement('span'); token.className = 'token'; token.textContent = 'fourth.pdf ×';
       document.querySelector('#batch-folder-file-selector').appendChild(token);
     });

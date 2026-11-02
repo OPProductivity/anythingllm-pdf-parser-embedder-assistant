@@ -1060,13 +1060,25 @@ APP_CONNECTION_WATCHDOG_HEAD = """
       metadataHeaderMessage = message;
       ensureMetadataHeaderStatus();
     };
+    const markMetadataStaleForPickerEdit = () => {
+      const source = document.querySelector("#document-metadata-scan-status .metadata-scan-inline");
+      if (!metadataSelectionKey || !source || source.dataset.previewScope === "none"
+          || !["scanning", "ready", "warning"].includes(source.dataset.state)
+          || !Number(source.dataset.selectionRevision)) return;
+      // A File input or remove action is an explicit selection edit. Gradio
+      // progressively mounts rows during the first upload; those DOM changes
+      // alone are not evidence that an established selection was edited.
+      metadataStaleRevision = source.dataset.selectionRevision;
+      metadataStaleSawScan = false;
+      setMetadataPreviewStale(true);
+    };
     const mirrorServerMetadataStatus = () => {
       const source = document.querySelector("#document-metadata-scan-status .metadata-scan-inline");
       if (!source) return;
       const state = source.dataset.state || "idle";
       const message = source.querySelector(".metadata-scan-copy")?.textContent || "";
       const revision = source.dataset.selectionRevision || "";
-      const signature = `${revision}\\u001f${state}\\u001f${message}`;
+      const signature = `${revision}\\u001f${state}\\u001f${source.dataset.previewScope}\\u001f${source.dataset.previewComplete}\\u001f${message}`;
       if (signature === metadataTransportSignature) return;
       const first = metadataTransportSignature === null;
       metadataTransportSignature = signature;
@@ -1111,14 +1123,7 @@ APP_CONNECTION_WATCHDOG_HEAD = """
           metadataSelectionKey = key;
           return;
         }
-        const changedExistingSelection = metadataSelectionKey !== null && Boolean(key)
-          && ["scanning", "ready", "warning"].includes(metadataHeaderState);
-        if (changedExistingSelection) {
-          metadataStaleRevision = document.querySelector(
-            "#document-metadata-scan-status .metadata-scan-inline")?.dataset.selectionRevision || "";
-          metadataStaleSawScan = false;
-          setMetadataPreviewStale(true);
-        } else if (!key) {
+        if (!key) {
           setMetadataPreviewStale(false);
         }
         metadataSelectionKey = key;
@@ -1151,9 +1156,12 @@ APP_CONNECTION_WATCHDOG_HEAD = """
       const target = event.target;
       if (target instanceof HTMLInputElement &&
           target.matches("#automatic-pdf-upload input[type='file']") && target.files?.length) {
+        markMetadataStaleForPickerEdit();
         clearNativePdfSelectionTransport();
         markDetectedValuesLoading();
         if (!metadataPreviewStale) showMetadataStatus("scanning", "Preparing metadata preview…");
+      } else if (target instanceof Element && target.closest("#batch-folder-file-selector")) {
+        markMetadataStaleForPickerEdit();
       }
     }, true);
     let nativePdfSyncTimer = null;
@@ -1170,6 +1178,7 @@ APP_CONNECTION_WATCHDOG_HEAD = """
     document.addEventListener("click", (event) => {
       if (!(event.target instanceof Element) ||
           !event.target.closest("#automatic-pdf-upload .file-preview button[aria-label='Remove this file']")) return;
+      markMetadataStaleForPickerEdit();
       if (!nativePdfSelectionBefore) nativePdfSelectionBefore = nativePdfSelectedPaths();
       clearTimeout(nativePdfSyncTimer);
       nativePdfSyncTimer = setTimeout(() => {
