@@ -1010,14 +1010,10 @@ APP_CONNECTION_WATCHDOG_HEAD = """
       ...document.querySelectorAll("#batch-folder-file-selector .token"),
     ].map(node => (node.getAttribute("aria-label") || node.textContent || "").trim())
       .filter(name => /\\.pdf\\b/i.test(name));
-    const metadataSelectionIdentities = () => [
-      ...[...document.querySelectorAll("#automatic-pdf-upload .file-preview tr")]
-        .map(row => row.querySelector(".download-link")?.getAttribute("href") ||
-          row.querySelector("td[aria-label]")?.getAttribute("aria-label") || ""),
-      ...[...document.querySelectorAll("#batch-folder-file-selector .token")]
-        .map(token => token.getAttribute("data-value") || token.getAttribute("title") ||
-          token.textContent || ""),
-    ].filter(Boolean);
+    // File-row URLs can change when Gradio redraws unrelated settings. The
+    // visible filenames are stable for this selection; actual picker actions
+    // explicitly invalidate the auto-confirm intent below.
+    const metadataSelectionIdentities = () => metadataSelectionNames();
     const metadataPreviewAllCheckbox = () => document.querySelector(
       "#metadata-preview-all-control input[type='checkbox']");
     const metadataAutoConfirmCheckbox = () => document.querySelector(
@@ -1028,9 +1024,12 @@ APP_CONNECTION_WATCHDOG_HEAD = """
     const syncMetadataPreviewOptions = (names) => {
       const options = document.getElementById("metadata-preview-options");
       if (options) options.style.display = names.length >= 5 ? "flex" : "none";
-      if (names.length < 5 && metadataAutoConfirmCheckbox()?.checked) {
-        metadataAutoConfirmCheckbox().click();
-      }
+    };
+    const disarmForNewPdfSelection = () => {
+      autoConfirmIssuedForSelection = null;
+      allScanRequestedForSelection = null;
+      deferredAllPreviewForSelection = null;
+      if (metadataAutoConfirmCheckbox()?.checked) metadataAutoConfirmCheckbox().click();
     };
     const maybeAutomaticallyConfirmMetadataRun = () => {
       const all = metadataPreviewAllCheckbox();
@@ -1114,6 +1113,14 @@ APP_CONNECTION_WATCHDOG_HEAD = """
       ensureMetadataHeaderStatus();
       const names = metadataSelectionNames();
       const key = metadataSelectionIdentities().join("\\u001f");
+      const activityState = document.querySelector(".automatic-run-activity")?.dataset.runState;
+      if (!key && metadataSelectionKey &&
+          activityState !== "idle" && activityState !== "selection_cancelled") {
+        // Unrelated Gradio updates can temporarily unmount the file rows.
+        // Wait for an authoritative empty/cleared selection before changing
+        // the heading or hiding the user's preview controls.
+        return;
+      }
       if (key !== metadataSelectionKey) {
         if (metadataSelectionKey === null && names.length &&
             ["ready", "warning"].includes(metadataHeaderState)) {
@@ -1121,10 +1128,6 @@ APP_CONNECTION_WATCHDOG_HEAD = """
           return;
         }
         metadataSelectionKey = key;
-        autoConfirmIssuedForSelection = null;
-        allScanRequestedForSelection = null;
-        deferredAllPreviewForSelection = null;
-        if (metadataAutoConfirmCheckbox()?.checked) metadataAutoConfirmCheckbox().click();
         if (names.length) markDetectedValuesLoading();
         showMetadataStatus(names.length ? "scanning" : "idle",
           names.length ? `Preparing metadata preview for ${names.length} PDF${names.length === 1 ? "" : "s"}…` : "");
@@ -1173,6 +1176,7 @@ APP_CONNECTION_WATCHDOG_HEAD = """
     };
     document.addEventListener("drop", (event) => {
       if (event.target instanceof Element && event.target.closest("#automatic-pdf-upload")) {
+        disarmForNewPdfSelection();
         clearNativePdfSelectionTransport();
       }
     }, true);
@@ -1180,6 +1184,7 @@ APP_CONNECTION_WATCHDOG_HEAD = """
       const target = event.target;
       if (target instanceof HTMLInputElement &&
           target.matches("#automatic-pdf-upload input[type='file']") && target.files?.length) {
+        disarmForNewPdfSelection();
         clearNativePdfSelectionTransport();
         markDetectedValuesLoading();
         showMetadataStatus("scanning", "Preparing metadata preview…");
@@ -1199,6 +1204,7 @@ APP_CONNECTION_WATCHDOG_HEAD = """
     document.addEventListener("click", (event) => {
       if (!(event.target instanceof Element) ||
           !event.target.closest("#automatic-pdf-upload .file-preview button[aria-label='Remove this file']")) return;
+      disarmForNewPdfSelection();
       if (!nativePdfSelectionBefore) nativePdfSelectionBefore = nativePdfSelectedPaths();
       clearTimeout(nativePdfSyncTimer);
       nativePdfSyncTimer = setTimeout(() => {
@@ -1213,6 +1219,19 @@ APP_CONNECTION_WATCHDOG_HEAD = """
         nativePdfSyncTimer = null;
         document.getElementById("native-pdf-selection-sync")?.click();
       }, 250);
+    }, true);
+    document.addEventListener("click", (event) => {
+      if (event.target instanceof Element && event.target.closest(
+          "#choose-pdf-folder-button, #retry-selected-pdf-files, " +
+          "#retry-selected-pdf-batch, #clear-selected-pdf-batch")) {
+        disarmForNewPdfSelection();
+      }
+    }, true);
+    document.addEventListener("change", (event) => {
+      if (event.target instanceof Element &&
+          event.target.closest("#batch-folder-file-selector")) {
+        disarmForNewPdfSelection();
+      }
     }, true);
     document.addEventListener("click", (event) => {
       const button = event.target instanceof Element
@@ -13415,8 +13434,8 @@ def stream_automatic_detected_metadata_preview(
         if not edits.get("document_short_label"):
             current_short_label = ""
     preview_all = bool(preview_all and len(files) >= 5)
-    displayed = files if preview_all else files[:5]
-    preview_scope = "all" if preview_all else "limited"
+    displayed = files if preview_all else files if len(files) <= 5 else []
+    preview_scope = "all" if preview_all else "limited" if displayed else "none"
     completed_html = []
     preview_errors = []
     field_updates = tuple(gr.update(value=value or "", interactive=False) for value in
@@ -13424,7 +13443,8 @@ def stream_automatic_detected_metadata_preview(
     if len(files) > 1 and not apply_batch_metadata_overrides:
         field_updates = tuple(gr.update(value="", interactive=False) for _ in range(3))
     selection_note = (
-        f"{len(files)} PDF(s) selected. Previewing {len(displayed)}. "
+        f"{len(files)} PDF(s) selected. "
+        + (f"Previewing {len(displayed)}. " if displayed else "Metadata preview off. ")
         + ("Metadata recognition is running for every selected PDF."
            if preview_all else "Every selected PDF will be inspected freshly after Confirm.")
     )
@@ -13449,6 +13469,27 @@ def stream_automatic_detected_metadata_preview(
             ))
         note = f'<div class="metadata-selection-note">{html.escape(selection_note)}</div>' if len(files) > 1 else ""
         return '<div class="metadata-preview-list">' + note + "".join(panels) + "</div>"
+
+    if not displayed:
+        # Large batches have no arbitrary first-five preview. The user may
+        # explicitly request all-file recognition; Confirm still inspects
+        # every selected PDF freshly when that option stays off.
+        yield (
+            *(dict(update, interactive=True) for update in field_updates),
+            preview_list_html(),
+            metadata_scan_status_html(
+                "ready",
+                f"No metadata preview requested for {len(files)} PDFs. "
+                "Select Process metadata for all files to preview every PDF now; "
+                "Confirm will inspect every PDF during processing.",
+                scope="none", complete=True,
+            ),
+            gr.update(),
+            gr.update(value=automatic_selection_preparing_status_html(
+                files, [], detail="Metadata preview skipped; finishing selection settings."
+            ), visible=True),
+        )
+        return
 
     for index, path in enumerate(displayed):
         if automatic_lifecycle_busy() or not _selection_preview_is_current(selection_state, request):
@@ -35003,10 +35044,12 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
             with gr.Row(elem_id="metadata-preview-options"):
                 preview_all_metadata = gr.Checkbox(
                     label="Process metadata for all files", value=False,
+                    info="For batches over five PDFs, no preview starts until this is selected. It then previews every PDF.",
                     elem_id="metadata-preview-all-control",
                 )
                 auto_confirm_after_metadata = gr.Checkbox(
                     label="Confirm and start run automatically", value=False,
+                    info="Choose output and processing settings first. This presses Confirm as soon as the all-file preview is ready.",
                     elem_id="metadata-auto-confirm-control",
                 )
             deferred_all_metadata_preview_button = gr.Button(

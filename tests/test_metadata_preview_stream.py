@@ -55,15 +55,18 @@ def test_scanning_is_yielded_before_inference_and_each_result_before_next_file(m
     assert list(stream) == []
 
 
-def test_preview_limit_is_explicit_and_no_document_is_inspected_twice(monkeypatch):
+def test_large_batch_waits_for_explicit_all_file_preview(monkeypatch):
     inspect = Mock(side_effect=result)
     monkeypatch.setattr(app, "detected_metadata_preview", inspect)
     files = [f"source-{index}.pdf" for index in range(11)]
     events = list(app.stream_automatic_detected_metadata_preview(files, []))
-    assert "11 PDF(s) selected. Previewing 5." in events[-1][3]
+    assert len(events) == 1
+    assert "11 PDF(s) selected. Metadata preview off." in events[-1][3]
     assert "Every selected PDF will be inspected freshly" in events[-1][3]
-    assert "5 of 11 selected PDFs" in events[-1][4]
-    assert [call.args[0][0] for call in inspect.call_args_list] == files[:5]
+    assert 'data-preview-scope="none"' in events[-1][4]
+    assert 'data-preview-complete="true"' in events[-1][4]
+    assert "No metadata preview requested for 11 PDFs" in events[-1][4]
+    inspect.assert_not_called()
     assert events[0][3].count('data-metadata-override="document_publisher"') == len(files)
     assert "source-10.pdf" in events[0][3] and "Not previewed" in events[0][3]
 

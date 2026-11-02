@@ -3,8 +3,9 @@ r"""Opt-in browser acceptance tests for the localhost Gradio application.
 Run explicitly with:
   .\.venv\Scripts\python.exe -m pytest -m ui_local --browser chromium tests/test_ui_acceptance.py
 
-The suite starts a separate app instance, never contacts AnythingLLM Desktop,
-and uses only a disposable one-page PDF created in pytest's temporary folder.
+The suite starts separate app instances and never contacts AnythingLLM Desktop.
+The optional real-source test reads only root-level PDFs from an explicitly
+provided private directory and keeps all generated state in pytest's temp area.
 """
 
 from __future__ import annotations
@@ -329,6 +330,20 @@ def forty_two_pdf_files(tmp_path: Path) -> list[Path]:
     return paths
 
 
+@pytest.fixture
+def optional_real_pdf_files() -> list[Path]:
+    root = os.environ.get("MMT_REAL_PDF_SOURCE_DIR", "")
+    if not root:
+        pytest.skip("Set MMT_REAL_PDF_SOURCE_DIR for the opt-in real-source UI test")
+    directory = Path(root)
+    assert directory.is_dir()
+    files = sorted((path for path in directory.iterdir()
+                    if path.is_file() and path.suffix.casefold() == ".pdf"),
+                   key=lambda path: (path.stat().st_size, path.name))[:8]
+    assert len(files) >= 6
+    return files
+
+
 def test_large_batch_auto_confirm_handoff_timing(
     page, paused_confirm_preflight_app, forty_two_pdf_files
 ):
@@ -407,6 +422,91 @@ def test_auto_confirm_click_survives_checkbox_rerender(
             page.wait_for_timeout(100)
         assert page.evaluate("window.__autoConfirmButtonReplacements") >= 1
         assert started.exists(), "Checkbox rerender detached the Confirm click before delivery"
+    finally:
+        release.touch()
+
+
+def test_auto_confirm_stays_armed_across_setting_changes_and_cancel(
+    page, paused_metadata_app, six_pdf_files
+):
+    url, started, release, app_home = paused_metadata_app
+    open_local_app(page, url)
+    page.locator(".pdf-upload-input input[type='file']").set_input_files(
+        [str(path) for path in six_pdf_files]
+    )
+    page.wait_for_function(
+        "(() => { const s = document.querySelector('#document-metadata-scan-status .metadata-scan-inline'); "
+        "return s?.dataset.state === 'ready' && s?.dataset.previewScope === 'none' "
+        "&& document.querySelector('.automatic-run-activity')?.dataset.runState === 'ready'; })()",
+        timeout=60000,
+    )
+    page.get_by_role("radio", name="Create local files only").check()
+    all_files = page.get_by_role("checkbox", name="Process metadata for all files")
+    automatic = page.get_by_role("checkbox", name="Confirm and start run automatically")
+    all_files.check()
+    deadline = time.monotonic() + 30
+    while not started.exists() and time.monotonic() < deadline:
+        page.wait_for_timeout(100)
+    assert started.exists(), "Explicit all-file preview did not start"
+    try:
+        automatic.check()
+        page.get_by_role("radio", name="Create local files with diagnostic logs").check()
+        page.get_by_role("checkbox", name="Include foreword/preface").uncheck()
+        page.get_by_role("checkbox", name="Include bibliography/index/end notes").uncheck()
+        page.get_by_role("checkbox", name="Force Unstructured (instead of automatic)").check()
+        page.get_by_label("Segmentation mode", exact=True).first.click()
+        page.get_by_role("option", name="All in one file").click()
+        page.get_by_role("button", name=re.compile(r"^Advanced preparation overrides")).click()
+        page.get_by_label("First PDF page override", exact=True).fill("1")
+        page.get_by_label("End-matter start override", exact=True).fill("8")
+        page.wait_for_timeout(800)
+        expect(all_files).to_be_checked()
+        expect(automatic).to_be_checked()
+        expect(page.locator(".metadata-header-status")).to_have_attribute("data-state", "scanning")
+        expect(page.get_by_role("radio", name="Create local files with diagnostic logs")).to_be_checked()
+        page.get_by_role("button", name="Cancel").click()
+        expect(automatic).not_to_be_checked()
+        release.touch()
+        page.wait_for_timeout(900)
+        assert not list((app_home / "run-state").rglob("source-profile.json"))
+    finally:
+        release.touch()
+
+
+def test_real_sources_settings_then_all_file_auto_confirm(
+    page, paused_confirm_preflight_app, optional_real_pdf_files
+):
+    url, started, release, _app_home = paused_confirm_preflight_app
+    open_local_app(page, url)
+    page.locator(".pdf-upload-input input[type='file']").set_input_files(
+        [str(path) for path in optional_real_pdf_files]
+    )
+    page.wait_for_function(
+        "(() => { const s = document.querySelector('#document-metadata-scan-status .metadata-scan-inline'); "
+        "return s?.dataset.state === 'ready' && s?.dataset.previewScope === 'none' "
+        "&& document.querySelector('.automatic-run-activity')?.dataset.runState === 'ready'; })()",
+        timeout=90000,
+    )
+    page.get_by_role("radio", name="Create local files only").check()
+    page.get_by_role("checkbox", name="Include foreword/preface").uncheck()
+    page.get_by_role("checkbox", name="Include bibliography/index/end notes").uncheck()
+    all_files = page.get_by_role("checkbox", name="Process metadata for all files")
+    automatic = page.get_by_role("checkbox", name="Confirm and start run automatically")
+    try:
+        all_files.check()
+        automatic.check()
+        deadline = time.monotonic() + 180
+        while not started.exists() and time.monotonic() < deadline:
+            page.wait_for_timeout(250)
+        assert started.exists(), "Real-source automatic Confirm did not reach preflight"
+        expect(page.get_by_role("radio", name="Create local files only")).to_be_checked()
+        expect(page.get_by_role("checkbox", name="Include foreword/preface")).not_to_be_checked()
+        expect(page.get_by_role("checkbox", name="Include bibliography/index/end notes")).not_to_be_checked()
+        expect(page.locator("#document-metadata-scan-status .metadata-scan-inline")).to_have_attribute(
+            "data-preview-scope", "all"
+        )
+        expect(automatic).not_to_be_checked()
+        page.get_by_role("button", name="Cancel").click()
     finally:
         release.touch()
 
@@ -876,11 +976,11 @@ def test_auto_confirm_uses_override_entered_after_arming(page, paused_metadata_a
     page.locator(".pdf-upload-input input[type='file']").set_input_files(
         [str(path) for path in six_pdf_files]
     )
+    page.get_by_role("checkbox", name="Process metadata for all files").check()
     deadline = time.monotonic() + 30
     while not started.exists():
         assert time.monotonic() < deadline, "Preview did not reach the paused inference"
         page.wait_for_timeout(50)
-    page.get_by_role("checkbox", name="Process metadata for all files").check()
     page.get_by_role("checkbox", name="Confirm and start run automatically").check()
     page.locator("#document-metadata-accordion > button.label-wrap").click()
     sixth = page.locator(".metadata-panel").filter(has_text=six_pdf_files[5].name)
@@ -907,11 +1007,11 @@ def test_cancel_during_metadata_preview_blocks_late_auto_confirm_and_allows_retr
     page.locator(".pdf-upload-input input[type='file']").set_input_files(
         [str(path) for path in six_pdf_files]
     )
+    page.get_by_role("checkbox", name="Process metadata for all files").check()
     deadline = time.monotonic() + 30
     while not started.exists():
         assert time.monotonic() < deadline, "Preview did not reach paused inference"
         page.wait_for_timeout(50)
-    page.get_by_role("checkbox", name="Process metadata for all files").check()
     page.get_by_role("checkbox", name="Confirm and start run automatically").check()
     cancel = page.get_by_role("button", name="Cancel")
     expect(cancel).to_be_enabled(timeout=10000)
