@@ -1010,6 +1010,7 @@ APP_CONNECTION_WATCHDOG_HEAD = """
     // can announce a new selection before that callback begins.
     let metadataSelectionKey = null;
     let metadataHeaderState = "idle";
+    let metadataHeaderMissingAuthors = 0;
     let metadataHeaderMessage = "";
     let metadataTransportSignature = null;
     let metadataPreviewStale = false;
@@ -1050,14 +1051,16 @@ APP_CONNECTION_WATCHDOG_HEAD = """
         heading.insertBefore(status, heading.querySelector(".icon"));
       }
       status.dataset.state = metadataHeaderState;
+      status.dataset.missingAuthors = String(metadataHeaderMissingAuthors);
       const copy = status.querySelector(".metadata-header-copy");
       if (copy && copy.textContent !== metadataHeaderMessage) copy.textContent = metadataHeaderMessage;
       status.title = metadataHeaderMessage;
       return status;
     };
-    const showMetadataStatus = (state, message) => {
+    const showMetadataStatus = (state, message, missingAuthors = 0) => {
       metadataHeaderState = state;
       metadataHeaderMessage = message;
+      metadataHeaderMissingAuthors = Number(missingAuthors) || 0;
       ensureMetadataHeaderStatus();
     };
     const markMetadataStaleForPickerEdit = () => {
@@ -1077,8 +1080,9 @@ APP_CONNECTION_WATCHDOG_HEAD = """
       if (!source) return;
       const state = source.dataset.state || "idle";
       const message = source.querySelector(".metadata-scan-copy")?.textContent || "";
+      const missingAuthors = source.dataset.missingAuthors || "0";
       const revision = source.dataset.selectionRevision || "";
-      const signature = `${revision}\\u001f${state}\\u001f${source.dataset.previewScope}\\u001f${source.dataset.previewComplete}\\u001f${message}`;
+      const signature = `${revision}\\u001f${state}\\u001f${source.dataset.previewScope}\\u001f${source.dataset.previewComplete}\\u001f${missingAuthors}\\u001f${message}`;
       if (signature === metadataTransportSignature) return;
       const first = metadataTransportSignature === null;
       metadataTransportSignature = signature;
@@ -1097,7 +1101,7 @@ APP_CONNECTION_WATCHDOG_HEAD = """
           return;
         }
       }
-      if (!first || state !== "idle") showMetadataStatus(state, message);
+      if (!first || state !== "idle") showMetadataStatus(state, message, missingAuthors);
     };
     const markDetectedValuesLoading = () => {
       document.querySelectorAll("#document-metadata-accordion .metadata-detected-value:not([data-metadata-known='filename'])")
@@ -3090,6 +3094,13 @@ html.metadata-preview-stale #metadata-preview-stale-row {
     text-overflow: clip;
     overflow-wrap: anywhere;
     white-space: normal;
+}
+#document-metadata-accordion > button.label-wrap .metadata-header-status[data-state="ready"][data-missing-authors]:not([data-missing-authors="0"]) {
+    color: #b91c1c;
+}
+#document-metadata-accordion > button.label-wrap .metadata-header-status[data-state="ready"][data-missing-authors]:not([data-missing-authors="0"])::before {
+    content: "!";
+    color: #b91c1c;
 }
 #document-metadata-accordion > button.label-wrap .metadata-header-status[data-state="scanning"] .metadata-header-spinner {
     width: 13px;
@@ -13276,13 +13287,16 @@ def automatic_detected_metadata_preview(
         )
 
 
-def metadata_scan_status_html(state, message, *, scope="limited", complete=False, revision=0):
+def metadata_scan_status_html(state, message, *, scope="limited", complete=False, revision=0,
+                              missing_authors=0, missing_author_keys=()):
     """A hidden transport for the visible accordion-heading status."""
     if state not in {"idle", "scanning", "ready", "warning"}:
         raise ValueError("Unknown metadata preview state")
     return (
         f'<div class="metadata-scan-inline" data-state="{state}" '
         f'data-preview-scope="{scope}" data-preview-complete="{str(bool(complete)).lower()}" '
+        f'data-missing-authors="{max(0, int(missing_authors or 0))}" '
+        f'data-missing-author-keys="{html.escape(json.dumps(list(missing_author_keys), ensure_ascii=False), quote=True)}" '
         f'data-selection-revision="{max(0, int(revision or 0))}" role="status" '
         'aria-live="polite" aria-atomic="true">'
         '<span class="metadata-scan-spinner" aria-hidden="true"></span>'
@@ -13556,6 +13570,11 @@ def stream_automatic_detected_metadata_preview(
         # Publish this result before beginning another potentially slow scan.
         completed = f"Author metadata preview: {index + 1}/{len(displayed)} complete."
         missing_authors = sum('data-author-missing="true"' in panel for panel in completed_html)
+        missing_author_keys = [
+            local_path_identity_key(files[panel_index])
+            for panel_index, panel in enumerate(completed_html)
+            if 'data-author-missing="true"' in panel
+        ]
         missing_note = (
             f" ({missing_authors} file{'s' if missing_authors != 1 else ''} "
             f"{'lack' if missing_authors != 1 else 'lacks'} recognized author metadata!)"
@@ -13581,6 +13600,8 @@ def stream_automatic_detected_metadata_preview(
                 f"Preview {index + 1} of {len(displayed)} complete; reading the next PDF…",
                 scope=preview_scope, complete=index + 1 == len(displayed),
                 revision=selection_revision,
+                missing_authors=missing_authors if index + 1 == len(displayed) else 0,
+                missing_author_keys=missing_author_keys if index + 1 == len(displayed) else (),
             ),
             gr.update(),
             gr.update(value=automatic_selection_preparing_status_html(
@@ -25520,7 +25541,9 @@ def automatic_action_row_updates():
         )
     return (
         gr.update(),
-        gr.update(value="Confirm and start processing", interactive=False),
+        # An author-review hold has not accepted a run. Preserve its enabled
+        # Confirm button so the operator can enter an override and retry.
+        gr.update(),
         gr.update(value="Cancel", interactive=False),
     )
 
@@ -27100,15 +27123,65 @@ def run_automatic_for_browser_stream(
 
 
 def run_manual_confirmation_with_auto_state(
-    selection_state, viewed_run_root, *values,
+    selection_state, viewed_run_root, auto_armed, metadata_status, *values,
     progress=gr.Progress(track_tqdm=False), request: gr.Request = None,
 ):
     """Use the same server owner without changing the operator's auto choice."""
+    if auto_armed and 'data-preview-complete="true"' in str(metadata_status or ""):
+        files = unique_local_path_strings(
+            normalize_file_list(values[AUTOMATIC_RUN_FIELDS.index("pdf_files")])
+            + normalize_file_list(values[AUTOMATIC_RUN_FIELDS.index("folder_pdf_files")])
+        )
+        unresolved = unresolved_preview_author_keys(
+            metadata_status,
+            values[AUTOMATIC_RUN_FIELDS.index("document_metadata_overrides")], files,
+        )
+        if unresolved:
+            yield author_review_hold_updates(len(unresolved))
+            return
     for outputs in run_automatic_for_browser_stream(
-        selection_state, viewed_run_root, *values, explicit_manual=True,
+        selection_state, viewed_run_root, *values, explicit_manual=not auto_armed,
         progress=progress, request=request,
     ):
         yield gr.update(), *outputs
+
+
+def unresolved_preview_author_keys(metadata_status, document_overrides, files):
+    """Return previewed missing authors without an explicit per-PDF author edit."""
+    status = str(metadata_status or "")
+    count_match = re.search(r'data-missing-authors="(\d+)"', status)
+    missing_count = int(count_match.group(1)) if count_match else 0
+    if not missing_count:
+        return []
+    keys_match = re.search(r'data-missing-author-keys="([^"]*)"', status)
+    try:
+        keys = json.loads(html.unescape(keys_match.group(1))) if keys_match else []
+        edits = selected_document_metadata_overrides(document_overrides, files)
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return ["unresolved preview author"]
+    if not isinstance(keys, list) or len(keys) != missing_count:
+        return ["unresolved preview author"]
+    return [
+        key for key in keys
+        if not str(edits.get(key, {}).get("document_author") or "").strip()
+    ]
+
+
+def author_review_hold_updates(count):
+    """Keep Confirm retryable while an auto-armed missing author needs review."""
+    updates = [gr.update() for _ in range(17)]
+    updates[9] = gr.update(
+        value=(
+            '<div class="automatic-run-failure" role="status">'
+            '<strong>Automatic start paused.</strong> '
+            f"{count} PDF author{'s were' if count != 1 else ' was'} not recognized. "
+            "Expand Document metadata, enter an Author override for each flagged PDF, "
+            "then press Confirm. No run has started.</div>"
+        ),
+        visible=True,
+    )
+    updates[10] = gr.update(value="Confirm and start processing", interactive=True, variant="primary")
+    return tuple(updates)
 
 
 def run_server_owned_auto_confirmation(
@@ -27144,6 +27217,18 @@ def run_server_owned_auto_confirmation(
         and preview_ready
         and selected_files_current
     )
+    if ready:
+        files = unique_local_path_strings(
+            normalize_file_list(values[AUTOMATIC_RUN_FIELDS.index("pdf_files")])
+            + normalize_file_list(values[AUTOMATIC_RUN_FIELDS.index("folder_pdf_files")])
+        )
+        unresolved = unresolved_preview_author_keys(
+            status, values[AUTOMATIC_RUN_FIELDS.index("document_metadata_overrides")], files,
+        )
+        if unresolved:
+            APP_LOGGER.info("auto confirmation held for %s missing author(s)", len(unresolved))
+            yield author_review_hold_updates(len(unresolved))
+            return
     if not ready:
         APP_LOGGER.info(
             "auto confirmation waiting: armed=%s all=%s selection=%s revision=%s "
@@ -37608,7 +37693,8 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 # Do not rely on gr.State for this irreversible action.  A
                 # normal control payload makes the Confirm click observable by
                 # the server and resilient to a stale client-side State value.
-                inputs=[automatic_selection_state, automatic_viewed_run_root, *automatic_run_inputs,
+                inputs=[automatic_selection_state, automatic_viewed_run_root,
+                        auto_confirm_after_metadata, auto_metadata_status, *automatic_run_inputs,
                         auto_title_override, auto_author_override, auto_short_label_override],
                 outputs=server_auto_outputs,
                 # The live Automatic status card already acknowledges Confirm

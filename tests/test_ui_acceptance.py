@@ -389,12 +389,15 @@ def six_pdf_files(tmp_path: Path) -> list[Path]:
         document = fitz.open()
         try:
             page = document.new_page()
+            document.set_metadata({"author": "Clara Ellen North"})
             text = "\n".join(
                 f"Browser six-file batch PDF {index}, native text line {line}. "
                 "This paragraph provides enough ordinary selectable text for the native path."
                 for line in range(1, 18)
             )
-            page.insert_textbox((72, 72, 540, 760), text, fontsize=10)
+            page.insert_text((72, 72), "Regional Studies")
+            page.insert_text((72, 94), "By Clara Ellen North")
+            page.insert_textbox((72, 115, 540, 760), text, fontsize=10)
             document.save(path)
         finally:
             document.close()
@@ -655,6 +658,53 @@ def test_auto_start_waits_for_metadata_preview_with_custom_output_folder(
     finally:
         scan_release.touch()
         preflight_release.touch()
+
+
+def test_settings_changed_after_auto_start_do_not_redirect_active_run(
+    page, paused_confirm_preflight_app, six_pdf_files, tmp_path
+):
+    url, started, release, app_home = paused_confirm_preflight_app
+    original_output = tmp_path / "original-output"
+    later_output = tmp_path / "later-output"
+    open_local_app(page, url)
+    page.locator(".pdf-upload-input input[type='file']").set_input_files(
+        [str(path) for path in six_pdf_files]
+    )
+    page.wait_for_function(
+        "(() => { const s = document.querySelector('#document-metadata-scan-status .metadata-scan-inline'); "
+        "return s?.dataset.state === 'ready' && s?.dataset.previewScope === 'none' "
+        "&& document.querySelector('.automatic-run-activity')?.dataset.runState === 'ready'; })()",
+        timeout=60000,
+    )
+    page.get_by_role("radio", name="Create local files only").check()
+    output = page.get_by_label("(Change) Output Folder Path")
+    output.fill(str(original_output))
+    output.press("Tab")
+    page.get_by_role("checkbox", name="Process metadata for all files").check()
+    page.get_by_role("checkbox", name="Confirm and start run automatically").check()
+    try:
+        deadline = time.monotonic() + 60
+        while not started.exists():
+            assert time.monotonic() < deadline, "Automatic run did not enter preflight"
+            page.wait_for_timeout(100)
+        expect(page.locator("#confirm-automatic-run-button")).to_have_text("Processing…")
+        output.fill(str(later_output))
+        output.press("Tab")
+        expect(output).to_have_value(str(later_output))
+        expect(page.get_by_role("checkbox", name="Confirm and start run automatically")).to_be_checked()
+        release.touch()
+        page.wait_for_function(
+            "['successful', 'warning', 'failed', 'cancelled'].includes("
+            "document.querySelector('.automatic-run-activity')?.dataset.runState)",
+            timeout=180000,
+        )
+        expect(page.locator("#confirm-automatic-run-button")).to_have_text("Processing successful ✓")
+        assert original_output.is_dir()
+        assert list(original_output.rglob("*.txt"))
+        assert not later_output.exists()
+        assert len(list((app_home / "run-state").rglob("source-profile.json"))) == 6
+    finally:
+        release.touch()
 
 
 @pytest.mark.parametrize("mode", [
@@ -1353,6 +1403,56 @@ def test_auto_confirm_uses_override_entered_after_arming(page, paused_metadata_a
                 (app_home / "run-state").rglob("source-profile.json")]
     assert len(profiles) == 6
     assert sum(profile["detected_author"] == "Late Override Sixth" for profile in profiles) == 1
+
+
+def test_missing_preview_author_pauses_auto_run_until_override_and_manual_confirm(
+    page, local_app_url, local_app_home, six_pdf_files
+):
+    replacement = six_pdf_files[-1].with_name("missing-author-fixture.pdf")
+    with fitz.open() as document:
+        pdf_page = document.new_page()
+        pdf_page.insert_text((72, 72), "A PDF with no author evidence in its opening text.")
+        document.save(replacement)
+    replacement.replace(six_pdf_files[-1])
+    existing = set((local_app_home / "run-state").rglob("source-profile.json"))
+    open_local_app(page, local_app_url)
+    page.get_by_role("radio", name="Create local files only").check()
+    page.locator(".pdf-upload-input input[type='file']").set_input_files(
+        [str(path) for path in six_pdf_files]
+    )
+    page.get_by_role("checkbox", name="Process metadata for all files").check()
+    automatic = page.get_by_role("checkbox", name="Confirm and start run automatically")
+    automatic.check()
+    heading = page.locator("#document-metadata-accordion .metadata-header-status")
+    page.wait_for_function(
+        "(() => { const s = document.querySelector('#document-metadata-scan-status .metadata-scan-inline'); "
+        "return s?.dataset.previewComplete === 'true' && s?.dataset.previewScope === 'all'; })()",
+        timeout=90000,
+    )
+    expect(heading).to_have_attribute("data-missing-authors", "1")
+    expect(heading).to_contain_text("1 file lacks recognized author metadata")
+    page.wait_for_timeout(1500)
+    expect(automatic).to_be_checked()
+    expect(page.locator("#confirm-automatic-run-button")).to_have_text("Confirm and start processing")
+    assert set((local_app_home / "run-state").rglob("source-profile.json")) == existing
+    page.locator("#confirm-automatic-run-button").click()
+    page.wait_for_timeout(800)
+    assert set((local_app_home / "run-state").rglob("source-profile.json")) == existing
+    page.locator("#document-metadata-accordion > button.label-wrap").click()
+    page.locator(".metadata-panel").filter(
+        has_text=six_pdf_files[-1].name
+    ).get_by_label("Override Author", exact=True).fill("Benjamin D. Crace")
+    page.locator("#confirm-automatic-run-button").click()
+    page.wait_for_function(
+        "['successful', 'warning', 'failed', 'cancelled'].includes("
+        "document.querySelector('.automatic-run-activity')?.dataset.runState)",
+        timeout=180000,
+    )
+    expect(page.locator("#confirm-automatic-run-button")).to_have_text("Processing successful ✓")
+    profiles = [json.loads(path.read_text(encoding="utf-8")) for path in
+                (local_app_home / "run-state").rglob("source-profile.json") if path not in existing]
+    assert len(profiles) == 6
+    assert sum(profile["detected_author"] == "Benjamin D. Crace" for profile in profiles) == 1
 
 
 def test_cancel_during_metadata_preview_blocks_late_auto_confirm_and_allows_retry(

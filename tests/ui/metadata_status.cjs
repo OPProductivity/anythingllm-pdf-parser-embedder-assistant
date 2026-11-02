@@ -98,6 +98,11 @@ const server = http.createServer((_request, response) => {
       node.innerHTML = '<div class="metadata-scan-inline" data-state="ready" data-preview-scope="all" data-preview-complete="true" data-selection-revision="1" role="status"><span class="metadata-scan-copy">Preview ready for 2 of 2 PDFs.  Expand here</span></div>';
     });
     await page.waitForFunction(() => document.querySelector('.metadata-header-copy')?.textContent?.includes('2 of 2 PDFs'));
+    await page.locator('#document-metadata-scan-status').evaluate(node => {
+      node.innerHTML = '<div class="metadata-scan-inline" data-state="ready" data-preview-scope="all" data-preview-complete="true" data-selection-revision="1" data-missing-authors="1" role="status"><span class="metadata-scan-copy">Preview ready for 2 of 2 PDFs. (1 file lacks recognized author metadata!)  Expand here</span></div>';
+    });
+    await page.waitForFunction(() => document.querySelector('.metadata-header-status')?.dataset.missingAuthors === '1');
+    assert.equal(await status.evaluate(node => getComputedStyle(node).color), 'rgb(185, 28, 28)');
 
     await page.evaluate(() => {
       document.querySelector('#batch-folder-file-selector').dispatchEvent(new Event('change', {bubbles: true}));
@@ -111,6 +116,9 @@ const server = http.createServer((_request, response) => {
       node.innerHTML = '<div class="metadata-scan-inline" data-state="scanning" data-selection-revision="2" role="status"><span class="metadata-scan-copy">Inspecting metadata for preview 1 of 3…</span></div>';
     });
     await page.waitForFunction(() => document.querySelector('.metadata-header-copy')?.textContent?.includes('not up to date'));
+    // The stale preview must observe a scanning frame before accepting a new
+    // ready result for the same selection revision.
+    await page.waitForTimeout(100);
     await page.locator('#document-metadata-scan-status').evaluate(node => {
       node.innerHTML = '<div class="metadata-scan-inline" data-state="ready" data-preview-scope="all" data-preview-complete="true" data-selection-revision="2" role="status"><span class="metadata-scan-copy">Preview ready for 3 of 3 PDFs.  Expand here</span></div>';
     });

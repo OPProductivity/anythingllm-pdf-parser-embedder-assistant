@@ -100,11 +100,26 @@ def test_finished_preview_reports_missing_author_count_without_selected_word(mon
     status = events[-1][4]
     assert "Preview ready for 2 of 2 PDFs." in status
     assert "(1 file lacks recognized author metadata!)" in status
+    assert 'data-missing-authors="1"' in status
     assert "Expand here" in status
     assert "selected PDFs" not in status
     single_status = list(app.stream_automatic_detected_metadata_preview(["first.pdf"], []))[-1][4]
     assert "Preview ready for 1 of 1 PDFs." in single_status
     assert "(1 file lacks recognized author metadata!)" in single_status
+    assert 'data-missing-authors="1"' in single_status
+
+
+def test_missing_author_holds_auto_start_until_that_pdf_has_an_author_override():
+    key = app.local_path_identity_key("first.pdf")
+    status = app.metadata_scan_status_html(
+        "ready", "Preview ready", scope="all", complete=True, revision=1,
+        missing_authors=1, missing_author_keys=[key],
+    )
+    assert app.unresolved_preview_author_keys(status, "{}", ["first.pdf", "second.pdf"]) == [key]
+    wrong_pdf = {app.local_path_identity_key("second.pdf"): {"document_author": "Jane Doe"}}
+    assert app.unresolved_preview_author_keys(status, wrong_pdf, ["first.pdf", "second.pdf"]) == [key]
+    corrected = {key: {"document_author": "Benjamin D. Crace"}}
+    assert app.unresolved_preview_author_keys(status, corrected, ["first.pdf", "second.pdf"]) == []
 
 
 def test_auto_start_holds_when_picker_value_changes_before_selection_state(monkeypatch):

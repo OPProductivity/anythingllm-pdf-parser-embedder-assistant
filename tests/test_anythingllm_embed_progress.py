@@ -182,9 +182,16 @@ def test_reuses_only_an_exact_cached_page_parent_document(tmp_path):
         **payload,
         "textContent": "A changed page must not reuse the old vector.",
     }
+    corrected_author_payload = {
+        **payload,
+        "metadata": {**payload["metadata"], "docAuthor": "Corrected author"},
+    }
 
-    assert find_reusable_cached_document_locations(tmp_path, [payload, changed_payload]) == [
+    assert find_reusable_cached_document_locations(
+        tmp_path, [payload, changed_payload, corrected_author_payload]
+    ) == [
         location,
+        "",
         "",
     ]
 
