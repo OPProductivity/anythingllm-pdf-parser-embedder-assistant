@@ -221,6 +221,90 @@ app.launch_application(port=int(sys.argv[3]), inbrowser=False)
 
 
 @pytest.fixture
+def paused_auto_handoff_app(tmp_path, tmp_path_factory):
+    """Hold the final preview result and record the run's actual server inputs."""
+    port = free_local_port()
+    app_home = tmp_path_factory.mktemp("auto-handoff-home")
+    scan_started = tmp_path / "handoff-scan-started"
+    scan_release = tmp_path / "handoff-scan-release"
+    preflight_started = tmp_path / "handoff-preflight-started"
+    preflight_release = tmp_path / "handoff-preflight-release"
+    payload = tmp_path / "handoff-payload.json"
+    environment = dict(os.environ)
+    environment.update({
+        "GRADIO_SERVER_PORT": str(port),
+        "ANYTHINGLLM_PDF_ASSISTANT_BROWSER_KEY": LOCAL_BROWSER_KEY,
+        "ANYTHINGLLM_PDF_ASSISTANT_HOME": str(app_home),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "NO_PROXY": "localhost,127.0.0.1",
+        "no_proxy": "localhost,127.0.0.1",
+    })
+    script = """
+import json, sys, time
+from pathlib import Path
+import rag_pdf_gradio_app as app
+scan_started, scan_release, preflight_started, preflight_release, payload = (
+    Path(p) for p in sys.argv[1:6]
+)
+def wait_for_release(started, release):
+    started.touch()
+    deadline = time.monotonic() + 90
+    while not release.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError('Browser test did not release handoff gate')
+        time.sleep(0.05)
+infer = app.infer_author_from_initial_pdf_pages
+def held_infer(*args, **kwargs):
+    wait_for_release(scan_started, scan_release)
+    return infer(*args, **kwargs)
+app.infer_author_from_initial_pdf_pages = held_infer
+preflight = app.automatic_ocr_preflight_manifest
+def held_preflight(*args, **kwargs):
+    wait_for_release(preflight_started, preflight_release)
+    return preflight(*args, **kwargs)
+app.automatic_ocr_preflight_manifest = held_preflight
+run = app.run_automatic_for_browser_stream
+def captured_run(selection_state, viewed_run_root, *values, **kwargs):
+    settings = dict(zip(app.AUTOMATIC_RUN_FIELDS, values))
+    selected = settings.get('pdf_files') or []
+    payload.write_text(json.dumps({
+        'revision': selection_state.get('revision'),
+        'files': [Path(str(p)).name for p in selected],
+        'mode': settings.get('mode'),
+        'segment_mode': settings.get('segment_mode'),
+        'include_front_matter': settings.get('include_front_matter'),
+        'include_back_matter': settings.get('include_back_matter'),
+        'first_page_override': settings.get('first_page_override'),
+        'end_page_override': settings.get('end_page_override'),
+    }), encoding='utf-8')
+    yield from run(selection_state, viewed_run_root, *values, **kwargs)
+app.run_automatic_for_browser_stream = captured_run
+app.launch_application(port=int(sys.argv[6]), inbrowser=False)
+"""
+    with (tmp_path / "handoff-stderr.log").open("wb") as stderr:
+        process = subprocess.Popen(
+            [sys.executable, "-c", script, str(scan_started), str(scan_release),
+             str(preflight_started), str(preflight_release), str(payload), str(port)],
+            cwd=str(PROJECT_ROOT), env=environment,
+            stdout=subprocess.DEVNULL, stderr=stderr,
+        )
+        try:
+            url = f"http://127.0.0.1:{port}"
+            wait_for_http(url + "/healthz", process)
+            yield url, scan_started, scan_release, preflight_started, preflight_release, payload
+        finally:
+            scan_release.touch()
+            preflight_release.touch()
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=15)
+
+
+@pytest.fixture
 def batch_metadata_app(tmp_path, tmp_path_factory, two_pdf_files):
     """Exercise real folder/direct paths with only the second preview paused."""
     port = free_local_port()
@@ -386,7 +470,7 @@ def test_large_batch_auto_confirm_handoff_timing(
         release.touch()
 
 
-def test_auto_confirm_click_survives_checkbox_rerender(
+def test_auto_confirm_uses_server_handoff_without_dom_click(
     page, paused_confirm_preflight_app, six_pdf_files
 ):
     url, started, release, _app_home = paused_confirm_preflight_app
@@ -405,11 +489,9 @@ def test_auto_confirm_click_survives_checkbox_rerender(
     )
     page.evaluate("""() => {
       window.__autoConfirmButtonReplacements = 0;
-      const originalClick = HTMLInputElement.prototype.click;
-      HTMLInputElement.prototype.click = function(...args) {
-        if (this.closest('#metadata-auto-confirm-control') && this.checked) {
-          const button = document.querySelector('#confirm-automatic-run-button button, button#confirm-automatic-run-button');
-          button.replaceWith(button.cloneNode(true));
+      const originalClick = HTMLButtonElement.prototype.click;
+      HTMLButtonElement.prototype.click = function(...args) {
+        if (this.closest('#confirm-automatic-run-button') || this.id === 'confirm-automatic-run-button') {
           window.__autoConfirmButtonReplacements += 1;
         }
         return originalClick.apply(this, args);
@@ -420,8 +502,8 @@ def test_auto_confirm_click_survives_checkbox_rerender(
         deadline = time.monotonic() + 12
         while not started.exists() and time.monotonic() < deadline:
             page.wait_for_timeout(100)
-        assert page.evaluate("window.__autoConfirmButtonReplacements") >= 1
-        assert started.exists(), "Checkbox rerender detached the Confirm click before delivery"
+        assert page.evaluate("window.__autoConfirmButtonReplacements") == 0
+        assert started.exists(), "Server did not accept the automatic handoff"
     finally:
         release.touch()
 
@@ -471,6 +553,54 @@ def test_auto_confirm_stays_armed_across_setting_changes_and_cancel(
         assert not list((app_home / "run-state").rglob("source-profile.json"))
     finally:
         release.touch()
+
+
+def test_auto_handoff_reads_latest_settings_at_metadata_completion(
+    page, paused_auto_handoff_app, six_pdf_files
+):
+    (url, scan_started, scan_release, preflight_started,
+     preflight_release, payload) = paused_auto_handoff_app
+    open_local_app(page, url)
+    page.locator(".pdf-upload-input input[type='file']").set_input_files(
+        [str(path) for path in six_pdf_files]
+    )
+    all_files = page.get_by_role("checkbox", name="Process metadata for all files")
+    automatic = page.get_by_role("checkbox", name="Confirm and start run automatically")
+    all_files.check()
+    automatic.check()
+    try:
+        deadline = time.monotonic() + 30
+        while not scan_started.exists():
+            assert time.monotonic() < deadline, "Full metadata preview did not start"
+            page.wait_for_timeout(100)
+        page.get_by_role("radio", name="Create local files with diagnostic logs").check()
+        page.get_by_role("checkbox", name="Include foreword/preface").uncheck()
+        page.get_by_role("checkbox", name="Include bibliography/index/end notes").uncheck()
+        page.get_by_label("Segmentation mode", exact=True).first.click()
+        page.get_by_role("option", name="All in one file").click()
+        page.get_by_role("button", name=re.compile(r"^Advanced preparation overrides")).click()
+        page.get_by_label("First PDF page override", exact=True).fill("1")
+        page.get_by_label("End-matter start override", exact=True).fill("8")
+        expect(all_files).to_be_checked()
+        expect(automatic).to_be_checked()
+        scan_release.touch()
+        deadline = time.monotonic() + 90
+        while not preflight_started.exists():
+            assert time.monotonic() < deadline, "Server did not enter confirmed preflight"
+            page.wait_for_timeout(100)
+        actual = json.loads(payload.read_text(encoding="utf-8"))
+        assert len(actual["files"]) == 6
+        assert actual["mode"] == "Create local files with diagnostic logs"
+        assert actual["segment_mode"] == "All in one file"
+        assert actual["include_front_matter"] is False
+        assert actual["include_back_matter"] is False
+        assert actual["first_page_override"] == 1
+        assert actual["end_page_override"] == 8
+        expect(automatic).not_to_be_checked()
+        expect(page.locator("#confirm-automatic-run-button")).to_have_text("Processing…")
+    finally:
+        scan_release.touch()
+        preflight_release.touch()
 
 
 def test_real_sources_settings_then_all_file_auto_confirm(
@@ -1092,7 +1222,7 @@ def test_auto_confirm_visibly_presses_button_before_preflight_finishes(
     expect(confirm).to_have_text("Processing successful ✓")
 
 
-def test_auto_confirm_starts_when_existing_confirm_button_becomes_enabled(
+def test_auto_confirm_starts_without_browser_button_becoming_enabled(
     page, local_app_url, local_app_home, six_pdf_files
 ):
     open_local_app(page, local_app_url)
@@ -1113,7 +1243,6 @@ def test_auto_confirm_starts_when_existing_confirm_button_becomes_enabled(
     confirm.evaluate("button => { button.disabled = true; }")
     page.get_by_role("checkbox", name="Confirm and start run automatically").check()
     expect(confirm).to_be_disabled()
-    confirm.evaluate("button => { button.disabled = false; }")
     page.wait_for_function(
         "['successful', 'warning', 'failed', 'cancelled'].includes("
         "document.querySelector('.automatic-run-activity')?.dataset.runState)",

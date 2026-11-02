@@ -19,18 +19,25 @@ TICKET_SECONDS = 90
 
 
 def same_process_request(scope):
-    """Authorize Gradio's self-probe by its established outbound socket."""
+    """Authorize Gradio's self-probe by its own exact outbound socket."""
     client, server = scope.get("client"), scope.get("server")
     if not client or not server or client[0] not in {"127.0.0.1", "::1"}:
         return False
-    try:
-        for connection in psutil.Process().net_connections(kind="tcp"):
-            if (connection.status == psutil.CONN_ESTABLISHED and connection.raddr
-                    and tuple(connection.laddr) == tuple(client)
-                    and tuple(connection.raddr) == tuple(server)):
-                return True
-    except (OSError, psutil.Error):
-        pass
+    # Windows can report Gradio's own short-lived self-probe as CLOSE while
+    # middleware handles it. Keep process ownership and both exact endpoints
+    # mandatory; briefly retry if the process table has not caught up yet.
+    for attempt in range(5):
+        try:
+            for connection in psutil.Process().net_connections(kind="tcp"):
+                if (connection.status in {psutil.CONN_ESTABLISHED, psutil.CONN_CLOSE}
+                        and connection.raddr
+                        and tuple(connection.laddr) == tuple(client)
+                        and tuple(connection.raddr) == tuple(server)):
+                    return True
+        except (OSError, psutil.Error):
+            pass
+        if attempt < 4:
+            time.sleep(0.02)
     return False
 
 
@@ -44,8 +51,9 @@ def browser_ticket(key, *, now=None):
 class BrowserAccessMiddleware:
     """Protect every mounted Gradio HTTP/websocket route before dispatch."""
 
-    def __init__(self, app, *, key, stop_token=""):
+    def __init__(self, app, *, key, stop_token="", internal_probe_token=""):
         self.app, self.key, self.stop_token = app, key, stop_token
+        self.internal_probe_token = internal_probe_token
         self.sessions = set()
         self.used_tickets = {}
         self.lock = threading.Lock()
@@ -92,8 +100,16 @@ class BrowserAccessMiddleware:
         if allowed_host and same_origin and scope["type"] == "http":
             # Gradio initializes its queue through a self-request and checks
             # readiness with HEAD /. No external localhost client may use this.
+            internal_probe = (
+                bool(self.internal_probe_token)
+                and hmac.compare_digest(
+                    headers.get("x-pdf-assistant-internal-probe", ""),
+                    self.internal_probe_token,
+                )
+            )
             if ((path == "/gradio_api/startup-events" and scope["method"] == "GET")
-                    or (path == "/" and scope["method"] == "HEAD")) and same_process_request(scope):
+                    or (path == "/" and scope["method"] == "HEAD")) and (
+                        internal_probe or same_process_request(scope)):
                 return await self.app(scope, receive, send)
             if path == "/healthz" and scope["method"] == "GET":
                 return await self.app(scope, receive, send)

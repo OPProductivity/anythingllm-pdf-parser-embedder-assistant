@@ -22,10 +22,12 @@ import ctypes
 import json
 import html
 import hashlib
+import httpx
 import math
 import os
 import queue
 import re
+import secrets
 import shutil
 import sqlite3
 import statistics
@@ -475,6 +477,8 @@ APP_THEME = gr.themes.Soft(primary_hue="blue", neutral_hue="slate")
 # read-mostly record. The durable copy lives beside the generated artifacts so
 # an error can always be inspected after the browser event has ended.
 LIVE_AUTOMATIC_RUN_STATUS = {}
+CONFIRMATION_SELECTION_CLAIMS = OrderedDict()
+CONFIRMATION_SELECTION_CLAIMS_LOCK = threading.Lock()
 # ``run-progress.json`` is a recovery snapshot, not a per-record journal.
 # Source-transaction receipts retain the durable mutation boundary.  A
 # one-second snapshot cadence prevents thousands of queue callbacks from
@@ -1010,65 +1014,11 @@ APP_CONNECTION_WATCHDOG_HEAD = """
       ...document.querySelectorAll("#batch-folder-file-selector .token"),
     ].map(node => (node.getAttribute("aria-label") || node.textContent || "").trim())
       .filter(name => /\\.pdf\\b/i.test(name));
-    // File-row URLs can change when Gradio redraws unrelated settings. The
-    // visible filenames are stable for this selection; actual picker actions
-    // explicitly invalidate the auto-confirm intent below.
     const metadataSelectionIdentities = () => metadataSelectionNames();
-    const metadataPreviewAllCheckbox = () => document.querySelector(
-      "#metadata-preview-all-control input[type='checkbox']");
-    const metadataAutoConfirmCheckbox = () => document.querySelector(
-      "#metadata-auto-confirm-control input[type='checkbox']");
-    let autoConfirmIssuedForSelection = null;
-    let allScanRequestedForSelection = null;
-    let deferredAllPreviewForSelection = null;
     const syncMetadataPreviewOptions = (names) => {
       const options = document.getElementById("metadata-preview-options");
       if (options) options.style.display = names.length >= 5 ? "flex" : "none";
     };
-    const disarmForNewPdfSelection = () => {
-      autoConfirmIssuedForSelection = null;
-      allScanRequestedForSelection = null;
-      deferredAllPreviewForSelection = null;
-      if (metadataAutoConfirmCheckbox()?.checked) metadataAutoConfirmCheckbox().click();
-    };
-    const maybeAutomaticallyConfirmMetadataRun = () => {
-      const all = metadataPreviewAllCheckbox();
-      const automatic = metadataAutoConfirmCheckbox();
-      const status = document.querySelector("#document-metadata-scan-status .metadata-scan-inline");
-      const confirmHost = document.querySelector("#confirm-automatic-run-button");
-      const confirm = confirmHost?.querySelector("button") || confirmHost;
-      const selection = metadataSelectionIdentities().join("\\u001f");
-      const selectionReady = document.querySelector(
-        ".automatic-run-activity[data-run-state='ready']");
-      if (status?.dataset.previewScope === "all" && status?.dataset.state === "scanning") {
-        allScanRequestedForSelection = selection;
-      }
-      if (!all?.checked || !automatic?.checked || !selection ||
-          allScanRequestedForSelection !== selection || !selectionReady ||
-          status?.dataset.previewScope !== "all" ||
-          status?.dataset.previewComplete !== "true" ||
-          status?.dataset.state !== "ready" ||
-          !confirm || confirm.disabled ||
-          autoConfirmIssuedForSelection === selection) return;
-      autoConfirmIssuedForSelection = selection;
-      // A real button click captures the current Gradio controls, including
-      // edits made after either checkbox was selected.
-      // Dispatch it while the button is still attached. Unchecking the
-      // separate Gradio checkbox first can synchronously rerender Confirm,
-      // leaving this saved button detached and silently losing the click.
-      confirm.click();
-      const armed = metadataAutoConfirmCheckbox();
-      if (armed?.checked) armed.click();
-    };
-    document.addEventListener("click", (event) => {
-      if (!(event.target instanceof Element) ||
-          !event.target.closest("button#cancel-automatic-run-button, #cancel-automatic-run-button button")) return;
-      // A queued preview must never turn into an automatic Confirm after Cancel.
-      autoConfirmIssuedForSelection = metadataSelectionIdentities().join("\\u001f");
-      allScanRequestedForSelection = null;
-      deferredAllPreviewForSelection = null;
-      if (metadataAutoConfirmCheckbox()?.checked) metadataAutoConfirmCheckbox().click();
-    }, true);
     const ensureMetadataHeaderStatus = () => {
       const heading = document.querySelector("#document-metadata-accordion > button.label-wrap");
       if (!heading) return null;
@@ -1133,39 +1083,7 @@ APP_CONNECTION_WATCHDOG_HEAD = """
           names.length ? `Preparing metadata preview for ${names.length} PDF${names.length === 1 ? "" : "s"}…` : "");
       }
       syncMetadataPreviewOptions(names);
-      if (deferredAllPreviewForSelection === key &&
-          document.querySelector(".automatic-run-activity[data-run-state='ready']")) {
-        const status = document.querySelector(
-          "#document-metadata-scan-status .metadata-scan-inline");
-        deferredAllPreviewForSelection = null;
-        if (metadataPreviewAllCheckbox()?.checked &&
-            !(status?.dataset.previewScope === "all" &&
-              status?.dataset.previewComplete === "true")) {
-          document.getElementById("deferred-all-metadata-preview")?.click();
-        }
-      }
-      maybeAutomaticallyConfirmMetadataRun();
     };
-    document.addEventListener("change", (event) => {
-      const target = event.target;
-      if (!(target instanceof HTMLInputElement)) return;
-      if (target === metadataAutoConfirmCheckbox() && target.checked &&
-          !metadataPreviewAllCheckbox()?.checked) metadataPreviewAllCheckbox()?.click();
-      if (target === metadataAutoConfirmCheckbox() || target === metadataPreviewAllCheckbox()) {
-        // Gradio may coalesce the streamed scanning update before the browser
-        // paints it. The explicit all-files request still belongs to this
-        // visible selection, and final readiness is checked separately.
-        if (metadataPreviewAllCheckbox()?.checked) {
-          allScanRequestedForSelection = metadataSelectionIdentities().join("\\u001f");
-          if (!document.querySelector(".automatic-run-activity[data-run-state='ready']")) {
-            deferredAllPreviewForSelection = allScanRequestedForSelection;
-          }
-        } else {
-          deferredAllPreviewForSelection = null;
-        }
-        requestAnimationFrame(maybeAutomaticallyConfirmMetadataRun);
-      }
-    }, true);
     const clearNativePdfSelectionTransport = () => {
       const source = document.querySelector(
         "#native-pdf-selected-paths input, #native-pdf-selected-paths textarea");
@@ -1176,7 +1094,6 @@ APP_CONNECTION_WATCHDOG_HEAD = """
     };
     document.addEventListener("drop", (event) => {
       if (event.target instanceof Element && event.target.closest("#automatic-pdf-upload")) {
-        disarmForNewPdfSelection();
         clearNativePdfSelectionTransport();
       }
     }, true);
@@ -1184,7 +1101,6 @@ APP_CONNECTION_WATCHDOG_HEAD = """
       const target = event.target;
       if (target instanceof HTMLInputElement &&
           target.matches("#automatic-pdf-upload input[type='file']") && target.files?.length) {
-        disarmForNewPdfSelection();
         clearNativePdfSelectionTransport();
         markDetectedValuesLoading();
         showMetadataStatus("scanning", "Preparing metadata preview…");
@@ -1204,7 +1120,6 @@ APP_CONNECTION_WATCHDOG_HEAD = """
     document.addEventListener("click", (event) => {
       if (!(event.target instanceof Element) ||
           !event.target.closest("#automatic-pdf-upload .file-preview button[aria-label='Remove this file']")) return;
-      disarmForNewPdfSelection();
       if (!nativePdfSelectionBefore) nativePdfSelectionBefore = nativePdfSelectedPaths();
       clearTimeout(nativePdfSyncTimer);
       nativePdfSyncTimer = setTimeout(() => {
@@ -1219,19 +1134,6 @@ APP_CONNECTION_WATCHDOG_HEAD = """
         nativePdfSyncTimer = null;
         document.getElementById("native-pdf-selection-sync")?.click();
       }, 250);
-    }, true);
-    document.addEventListener("click", (event) => {
-      if (event.target instanceof Element && event.target.closest(
-          "#choose-pdf-folder-button, #retry-selected-pdf-files, " +
-          "#retry-selected-pdf-batch, #clear-selected-pdf-batch")) {
-        disarmForNewPdfSelection();
-      }
-    }, true);
-    document.addEventListener("change", (event) => {
-      if (event.target instanceof Element &&
-          event.target.closest("#batch-folder-file-selector")) {
-        disarmForNewPdfSelection();
-      }
     }, true);
     document.addEventListener("click", (event) => {
       const button = event.target instanceof Element
@@ -1776,7 +1678,7 @@ async def local_pdf_app_healthz():
     )
 
 
-def gradio_server_app_with_connection_watchdog():
+def gradio_server_app_with_connection_watchdog(*, internal_probe_token=""):
     """Create the app shell early enough for the HTML watchdog middleware."""
 
     app = GradioFastAPIApp()
@@ -1785,7 +1687,8 @@ def gradio_server_app_with_connection_watchdog():
     app.add_middleware(LocalServerConnectionWatchdogMiddleware)
     from browser_access import BrowserAccessMiddleware, server_browser_key
     app.add_middleware(BrowserAccessMiddleware, key=server_browser_key(),
-                       stop_token=os.environ.get("ANYTHINGLLM_PDF_ASSISTANT_STOP_TOKEN", ""))
+                       stop_token=os.environ.get("ANYTHINGLLM_PDF_ASSISTANT_STOP_TOKEN", ""),
+                       internal_probe_token=internal_probe_token)
     return app
 
 
@@ -3865,7 +3768,6 @@ html.dark .gradio-container .batch-folder-panel .batch-folder-title-icon {
 }
 #metadata-preview-options { display: none; }
 #native-pdf-selection-sync { display: none; }
-#deferred-all-metadata-preview { display: none; }
 .extraction-options-row label:has(input[type="checkbox"]),
 .extraction-options-row label[data-testid$="-checkbox-label"] {
     width: 100% !important;
@@ -13284,13 +13186,14 @@ def automatic_detected_metadata_preview(
         )
 
 
-def metadata_scan_status_html(state, message, *, scope="limited", complete=False):
+def metadata_scan_status_html(state, message, *, scope="limited", complete=False, revision=0):
     """A hidden transport for the visible accordion-heading status."""
     if state not in {"idle", "scanning", "ready", "warning"}:
         raise ValueError("Unknown metadata preview state")
     return (
         f'<div class="metadata-scan-inline" data-state="{state}" '
-        f'data-preview-scope="{scope}" data-preview-complete="{str(bool(complete)).lower()}" role="status" '
+        f'data-preview-scope="{scope}" data-preview-complete="{str(bool(complete)).lower()}" '
+        f'data-selection-revision="{max(0, int(revision or 0))}" role="status" '
         'aria-live="polite" aria-atomic="true">'
         '<span class="metadata-scan-spinner" aria-hidden="true"></span>'
         f'<span class="metadata-scan-copy">{html.escape(message)}</span></div>'
@@ -13434,6 +13337,7 @@ def stream_automatic_detected_metadata_preview(
         if not edits.get("document_short_label"):
             current_short_label = ""
     preview_all = bool(preview_all and len(files) >= 5)
+    selection_revision = int((selection_state or {}).get("revision") or 0)
     displayed = files if preview_all else files if len(files) <= 5 else []
     preview_scope = "all" if preview_all else "limited" if displayed else "none"
     completed_html = []
@@ -13482,7 +13386,7 @@ def stream_automatic_detected_metadata_preview(
                 f"No metadata preview requested for {len(files)} PDFs. "
                 "Select Process metadata for all files to preview every PDF now; "
                 "Confirm will inspect every PDF during processing.",
-                scope="none", complete=True,
+                scope="none", complete=True, revision=selection_revision,
             ),
             gr.update(),
             gr.update(value=automatic_selection_preparing_status_html(
@@ -13511,7 +13415,7 @@ def stream_automatic_detected_metadata_preview(
                     f"{index + 1}/{len(displayed)}"
                     if preview_all else
                     f"Inspecting metadata for preview {index + 1} of {len(displayed)}…"
-                ), scope=preview_scope,
+                ), scope=preview_scope, revision=selection_revision,
             ),
             gr.update(),
             gr.update(value=automatic_selection_preparing_status_html(
@@ -13571,6 +13475,7 @@ def stream_automatic_detected_metadata_preview(
                 if preview_all else
                 f"Preview {index + 1} of {len(displayed)} complete; reading the next PDF…",
                 scope=preview_scope, complete=index + 1 == len(displayed),
+                revision=selection_revision,
             ),
             gr.update(),
             gr.update(value=automatic_selection_preparing_status_html(
@@ -13599,6 +13504,44 @@ def stream_all_metadata_preview_on_checkbox_change(
         apply_batch_metadata_overrides, folder_manifest, selection_state,
         recognition_effort, preview_all, request,
     )
+
+
+def stream_deferred_all_metadata_preview(
+    pdf_files, folder_files, current_title="", current_author="",
+    current_short_label="", use_file_title_fallback=True,
+    apply_batch_metadata_overrides=False, folder_manifest=None,
+    selection_state=None, recognition_effort=None, preview_all=False,
+    metadata_status="", request: gr.Request = None,
+):
+    """Finish an early all-files request after the selection becomes ready."""
+    revision = int((selection_state or {}).get("revision") or 0)
+    already_complete = (
+        f'data-selection-revision="{revision}"' in str(metadata_status)
+        and 'data-preview-scope="all"' in str(metadata_status)
+        and 'data-preview-complete="true"' in str(metadata_status)
+    )
+    if (not preview_all or not automatic_selection_is_ready(selection_state)
+            or already_complete or not _selection_preview_is_current(selection_state, request)):
+        yield tuple(gr.update() for _ in range(7))
+        return
+    yield from stream_automatic_detected_metadata_preview(
+        pdf_files, folder_files, current_title, current_author,
+        current_short_label, use_file_title_fallback,
+        apply_batch_metadata_overrides, folder_manifest, selection_state,
+        recognition_effort, preview_all, request,
+    )
+
+
+def request_all_metadata_preview_for_auto(auto_armed, preview_all):
+    """An auto-start request includes an all-file preview request."""
+    return gr.update(value=True) if auto_armed and not preview_all else gr.update()
+
+
+def disarm_auto_for_selection_state(selection_state):
+    """A new or cancelled selection cannot inherit an earlier auto-start."""
+    if str((selection_state or {}).get("state") or "") in {"pending", "idle", "cancelled"}:
+        return gr.update(value=False)
+    return gr.update()
 
 
 def stream_refresh_automatic_run_estimate_for_fresh_selection(
@@ -13684,6 +13627,24 @@ def automatic_process_button_state(pdf_files=None, folder_pdf_files=None, folder
     )
 
 
+def automatic_selection_status_html(state, selection_state=None):
+    """Publish the owned selection revision with the Ready acknowledgement."""
+    rendered = automatic_live_status_html({"state": state})
+    if state != "ready":
+        return rendered
+    try:
+        revision = max(0, int((selection_state or {}).get("revision") or 0))
+    except (TypeError, ValueError):
+        revision = 0
+    if not revision:
+        return rendered
+    return rendered.replace(
+        'data-run-state="ready"',
+        f'data-run-state="ready" data-selection-revision="{revision}"',
+        1,
+    )
+
+
 def automatic_selection_action_states(
     pdf_files=None,
     folder_pdf_files=None,
@@ -13726,9 +13687,10 @@ def automatic_selection_action_states(
     return (
         process_button,
         gr.update(value="Cancel", interactive=bool(process_button.get("interactive")), visible=True),
-        gr.update(value=automatic_live_status_html({
-            "state": "ready" if process_button.get("interactive") else "idle",
-        }), visible=True),
+        gr.update(value=automatic_selection_status_html(
+            "ready" if process_button.get("interactive") else "idle",
+            selection_state,
+        ), visible=True),
     )
 
 
@@ -14076,7 +14038,7 @@ def automatic_selection_finish_state(selection_state, pdf_files=None, folder_pdf
         gr.update(interactive=True),
         automatic_process_button_state(pdf_files, folder_pdf_files, folder_manifest),
         gr.update(value="Cancel", interactive=True, visible=True),
-        gr.update(value=automatic_live_status_html({"state": state["state"]}), visible=True),
+        gr.update(value=automatic_selection_status_html(state["state"], state), visible=True),
         gr.update(interactive=True),
     )
 
@@ -18214,6 +18176,12 @@ def cancel_or_reset_automatic_run(
         gr.update(value="Select PDF Folder Here", interactive=not preflight_in_flight, visible=True),
         gr.update(visible=True),
     )
+
+
+def cancel_or_reset_automatic_run_and_disarm(*args, request: gr.Request = None):
+    """Cancel and clear the server-owned automatic-start intent together."""
+    result = cancel_or_reset_automatic_run(*args, request=request)
+    return gr.update(value=False), *result
 
 
 def opening_eta_presentation_seconds(expected_seconds, *, exact_cache_reuse_records=0, mode=None):
@@ -26927,6 +26895,7 @@ def run_automatic_for_browser_stream(
     selection_state,
     viewed_run_root,
     *values,
+    explicit_manual=False,
     progress=gr.Progress(track_tqdm=False),
     request: gr.Request = None,
 ):
@@ -26946,6 +26915,26 @@ def run_automatic_for_browser_stream(
     if selection_state and not _selection_preview_is_current(selection_state, request):
         yield tuple(gr.update() for _ in range(16))
         return
+    revision = int((selection_state or {}).get("revision") or 0)
+    if revision:
+        token = str((selection_state or {}).get("preview_token") or "")
+        session = str(getattr(request, "session_hash", "") or "")
+        signature = str((selection_state or {}).get("selection_signature") or "")
+        claim = (token or session or signature, revision)
+        with CONFIRMATION_SELECTION_CLAIMS_LOCK:
+            duplicate = claim in CONFIRMATION_SELECTION_CLAIMS
+            if (duplicate and explicit_manual
+                    and CONFIRMATION_SELECTION_CLAIMS[claim]
+                    and not automatic_lifecycle_busy()):
+                duplicate = False
+            if not duplicate:
+                CONFIRMATION_SELECTION_CLAIMS[claim] = False
+                CONFIRMATION_SELECTION_CLAIMS.move_to_end(claim)
+                while len(CONFIRMATION_SELECTION_CLAIMS) > 512:
+                    CONFIRMATION_SELECTION_CLAIMS.popitem(last=False)
+        if duplicate:
+            yield tuple(gr.update() for _ in range(16))
+            return
     owned_root = str(viewed_run_root or "")
     source = iter(run_automatic_from_ready_confirmation_stream(
         selection_state, *values, metadata_overrides=metadata_overrides, progress=progress
@@ -26962,6 +26951,10 @@ def run_automatic_for_browser_stream(
         try:
             outputs = next(source)
         except StopIteration:
+            if revision:
+                with CONFIRMATION_SELECTION_CLAIMS_LOCK:
+                    if claim in CONFIRMATION_SELECTION_CLAIMS:
+                        CONFIRMATION_SELECTION_CLAIMS[claim] = True
             return
         if selection_state and not _selection_preview_is_current(selection_state, request):
             status_root = str((LIVE_AUTOMATIC_RUN_STATUS or {}).get("run_root") or "").strip()
@@ -26974,6 +26967,57 @@ def run_automatic_for_browser_stream(
         if status_root:
             owned_root = status_root
         yield (*outputs, owned_root, *automatic_picker_lifecycle_updates(status))
+
+
+def run_manual_confirmation_with_auto_state(
+    selection_state, viewed_run_root, *values,
+    progress=gr.Progress(track_tqdm=False), request: gr.Request = None,
+):
+    """Use the same server owner for a human Confirm and an automatic start."""
+    for outputs in run_automatic_for_browser_stream(
+        selection_state, viewed_run_root, *values, explicit_manual=True,
+        progress=progress, request=request,
+    ):
+        yield gr.update(value=False), *outputs
+
+
+def run_server_owned_auto_confirmation(
+    auto_armed, preview_all, metadata_status, selection_state,
+    viewed_run_root, *values,
+    progress=gr.Progress(track_tqdm=False), request: gr.Request = None,
+):
+    """Start once from an acknowledged selection and current Gradio inputs."""
+    revision = int((selection_state or {}).get("revision") or 0)
+    status = str(metadata_status or "")
+    ready = (
+        bool(auto_armed and preview_all and revision)
+        and automatic_selection_is_ready(selection_state)
+        and _selection_preview_is_current(selection_state, request)
+        and not automatic_lifecycle_busy()
+        and 'data-state="ready"' in status
+        and 'data-preview-scope="all"' in status
+        and 'data-preview-complete="true"' in status
+        and f'data-selection-revision="{revision}"' in status
+    )
+    if not ready:
+        APP_LOGGER.info(
+            "auto confirmation waiting: armed=%s all=%s selection=%s revision=%s "
+            "status_ready=%s status_all=%s status_complete=%s status_revision=%s",
+            bool(auto_armed), bool(preview_all),
+            str((selection_state or {}).get("state") or ""), revision,
+            'data-state="ready"' in status,
+            'data-preview-scope="all"' in status,
+            'data-preview-complete="true"' in status,
+            f'data-selection-revision="{revision}"' in status,
+        )
+        yield tuple(gr.update() for _ in range(17))
+        return
+    for outputs in run_automatic_for_browser_stream(
+        selection_state, viewed_run_root, *values, progress=progress, request=request,
+    ):
+        # The checkbox changes only after the server has claimed this exact
+        # selection and yielded its first confirmation acknowledgement.
+        yield gr.update(value=False), *outputs
 
 
 METADATA_PREVIEW_TEXT_LAYER_PAGE_LIMIT = 3
@@ -35049,12 +35093,9 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 )
                 auto_confirm_after_metadata = gr.Checkbox(
                     label="Confirm and start run automatically", value=False,
-                    info="Choose output and processing settings first. This presses Confirm as soon as the all-file preview is ready.",
+                    info="Choose output and processing settings first. The server starts the run when the all-file preview is ready.",
                     elem_id="metadata-auto-confirm-control",
                 )
-            deferred_all_metadata_preview_button = gr.Button(
-                "Finish all-file metadata preview", elem_id="deferred-all-metadata-preview",
-            )
             with gr.Accordion("Document metadata", open=False, elem_id="document-metadata-accordion", elem_classes=["top-level-accordion"]) as document_metadata_section:
                 auto_metadata_preview = gr.HTML(
                     value=pending_metadata_panel_html(
@@ -36184,6 +36225,55 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 retain_detailed_evidence,
                 new_workspace_name_auto_state,
             ]
+            confirmation_outputs = [
+                auto_summary, auto_files, auto_artifacts, auto_download_state,
+                auto_button, native_upload_readiness, auto_run_timing,
+                workspace_slug, automatic_run_failure,
+                confirm_automatic_run_button, cancel_automatic_run_button,
+                open_generated_output_button, automatic_viewed_run_root,
+                auto_pdfs, choose_pdf_folder_button, auto_folder_file_selector,
+            ]
+            server_auto_inputs = [
+                auto_confirm_after_metadata, preview_all_metadata,
+                auto_metadata_status, automatic_selection_state,
+                automatic_viewed_run_root, *automatic_run_inputs,
+                auto_title_override, auto_author_override,
+                auto_short_label_override,
+            ]
+            server_auto_outputs = [auto_confirm_after_metadata, *confirmation_outputs]
+            def finish_selection_with_server_auto(event):
+                """Run the optional full preview and auto handoff after selection settles."""
+                return event.then(
+                    fn=stream_deferred_all_metadata_preview,
+                    inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author,
+                            auto_short_label, auto_use_file_title_fallback,
+                            apply_batch_metadata_overrides, auto_folder_manifest,
+                            automatic_selection_state, auto_recognition_effort,
+                            preview_all_metadata, auto_metadata_status],
+                    outputs=[auto_label, auto_author, auto_short_label,
+                             auto_metadata_preview, auto_metadata_status,
+                             document_metadata_section, automatic_run_activity],
+                    show_progress="hidden",
+                    queue=True,
+                    concurrency_limit=1,
+                    concurrency_id="automatic-metadata-preview",
+                ).then(
+                    fn=automatic_selection_action_states,
+                    inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest,
+                            automatic_selection_state],
+                    outputs=[confirm_automatic_run_button,
+                             cancel_automatic_run_button, automatic_run_activity],
+                    show_progress="hidden",
+                    queue=False,
+                ).then(
+                    fn=run_server_owned_auto_confirmation,
+                    inputs=server_auto_inputs,
+                    outputs=server_auto_outputs,
+                    show_progress="hidden",
+                    queue=True,
+                    concurrency_limit=AUTOMATIC_RUN_CONCURRENCY_LIMIT,
+                    concurrency_id=AUTOMATIC_RUN_CONCURRENCY_ID,
+                )
             automatic_timer_inputs = [
                 auto_pdfs,
                 auto_folder_pdfs,
@@ -36305,7 +36395,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 show_progress="hidden",
                 queue=False,
             )
-            retry_selected_pdf_files_button.click(
+            selection_event = retry_selected_pdf_files_button.click(
                 fn=automatic_retry_selection_begin_state,
                 inputs=[automatic_selection_state, automatic_viewed_run_root, auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
                 outputs=[
@@ -36440,10 +36530,11 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 show_progress="hidden",
                 queue=False,
             )
+            finish_selection_with_server_auto(selection_event)
             # Lock the run-defining mode as soon as a native picker selection
             # reaches the server.  The state chain below then restores a
             # coherent fresh-run snapshot before the control is re-enabled.
-            gr.on(
+            selection_event = gr.on(
                 triggers=[auto_pdfs.upload, auto_pdfs.clear,
                           native_pdf_selection_sync_button.click],
                 fn=automatic_selection_begin_state,
@@ -36563,7 +36654,8 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 show_progress="hidden",
                 queue=False,
             )
-            choose_pdf_folder_button.click(
+            finish_selection_with_server_auto(selection_event)
+            selection_event = choose_pdf_folder_button.click(
                 fn=automatic_folder_selection_begin_state,
                 inputs=[automatic_selection_state, automatic_viewed_run_root, auto_pdfs, auto_folder_pdfs, auto_folder_manifest, auto_folder_picker_timing],
                 js=PDF_FOLDER_PICKER_TIMING_JS,
@@ -36695,7 +36787,8 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 show_progress="hidden",
                 queue=False,
             )
-            retry_selected_pdf_batch_button.click(
+            finish_selection_with_server_auto(selection_event)
+            selection_event = retry_selected_pdf_batch_button.click(
                 fn=automatic_retry_selection_begin_state,
                 inputs=[automatic_selection_state, automatic_viewed_run_root, auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
                 outputs=[
@@ -36813,7 +36906,8 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 show_progress="hidden",
                 queue=False,
             )
-            clear_selected_pdf_batch_button.click(
+            finish_selection_with_server_auto(selection_event)
+            selection_event = clear_selected_pdf_batch_button.click(
                 fn=automatic_clear_selection_begin_state,
                 inputs=[automatic_selection_state, automatic_viewed_run_root, auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
                 outputs=[
@@ -36880,7 +36974,8 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 show_progress="hidden",
                 queue=False,
             )
-            auto_folder_file_selector.input(
+            finish_selection_with_server_auto(selection_event)
+            selection_event = auto_folder_file_selector.input(
                 fn=automatic_batch_subset_selection_update,
                 inputs=[auto_folder_manifest, auto_folder_file_selector, automatic_selection_state, automatic_viewed_run_root, auto_pdfs],
                 outputs=[
@@ -36940,6 +37035,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 show_progress="hidden",
                 queue=False,
             )
+            finish_selection_with_server_auto(selection_event)
             backend_mode.change(
                 fn=extraction_backend_help,
                 inputs=backend_mode,
@@ -37259,10 +37355,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 concurrency_limit=1,
                 concurrency_id="automatic-metadata-preview",
             ).then(
-                # A standalone all-files preview owns the activity card while
-                # it runs. Restore the settled selection state afterward;
-                # otherwise the card remains "Finishing selection settings"
-                # and the browser's automatic Confirm guard cannot fire.
+                # Restore Ready before the server evaluates auto-start.
                 fn=automatic_selection_action_states,
                 inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest,
                         automatic_selection_state],
@@ -37270,14 +37363,28 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                          cancel_automatic_run_button, automatic_run_activity],
                 show_progress="hidden",
                 queue=False,
+            ).then(
+                fn=run_server_owned_auto_confirmation,
+                inputs=server_auto_inputs,
+                outputs=server_auto_outputs,
+                show_progress="hidden",
+                queue=True,
+                concurrency_limit=AUTOMATIC_RUN_CONCURRENCY_LIMIT,
+                concurrency_id=AUTOMATIC_RUN_CONCURRENCY_ID,
             )
-            deferred_all_metadata_preview_button.click(
-                fn=stream_automatic_detected_metadata_preview,
+            automatic_selection_state.change(
+                fn=disarm_auto_for_selection_state,
+                inputs=[automatic_selection_state],
+                outputs=[auto_confirm_after_metadata],
+                show_progress="hidden",
+                queue=False,
+            ).then(
+                fn=stream_deferred_all_metadata_preview,
                 inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author,
                         auto_short_label, auto_use_file_title_fallback,
                         apply_batch_metadata_overrides, auto_folder_manifest,
                         automatic_selection_state, auto_recognition_effort,
-                        preview_all_metadata],
+                        preview_all_metadata, auto_metadata_status],
                 outputs=[auto_label, auto_author, auto_short_label,
                          auto_metadata_preview, auto_metadata_status,
                          document_metadata_section, automatic_run_activity],
@@ -37293,32 +37400,38 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                          cancel_automatic_run_button, automatic_run_activity],
                 show_progress="hidden",
                 queue=False,
+            ).then(
+                fn=run_server_owned_auto_confirmation,
+                inputs=server_auto_inputs,
+                outputs=server_auto_outputs,
+                show_progress="hidden",
+                queue=True,
+                concurrency_limit=AUTOMATIC_RUN_CONCURRENCY_LIMIT,
+                concurrency_id=AUTOMATIC_RUN_CONCURRENCY_ID,
+            )
+            auto_confirm_after_metadata.change(
+                fn=request_all_metadata_preview_for_auto,
+                inputs=[auto_confirm_after_metadata, preview_all_metadata],
+                outputs=[preview_all_metadata],
+                show_progress="hidden",
+                queue=False,
+            ).then(
+                fn=run_server_owned_auto_confirmation,
+                inputs=server_auto_inputs,
+                outputs=server_auto_outputs,
+                show_progress="hidden",
+                queue=True,
+                concurrency_limit=AUTOMATIC_RUN_CONCURRENCY_LIMIT,
+                concurrency_id=AUTOMATIC_RUN_CONCURRENCY_ID,
             )
             confirm_automatic_run_button.click(
-                fn=run_automatic_for_browser_stream,
+                fn=run_manual_confirmation_with_auto_state,
                 # Do not rely on gr.State for this irreversible action.  A
                 # normal control payload makes the Confirm click observable by
                 # the server and resilient to a stale client-side State value.
                 inputs=[automatic_selection_state, automatic_viewed_run_root, *automatic_run_inputs,
                         auto_title_override, auto_author_override, auto_short_label_override],
-                outputs=[
-                    auto_summary,
-                    auto_files,
-                    auto_artifacts,
-                    auto_download_state,
-                    auto_button,
-                    native_upload_readiness,
-                    auto_run_timing,
-                    workspace_slug,
-                    automatic_run_failure,
-                    confirm_automatic_run_button,
-                    cancel_automatic_run_button,
-                    open_generated_output_button,
-                    automatic_viewed_run_root,
-                    auto_pdfs,
-                    choose_pdf_folder_button,
-                    auto_folder_file_selector,
-                ],
+                outputs=server_auto_outputs,
                 # The live Automatic status card already acknowledges Confirm
                 # immediately and owns all visible progress.  Targeting
                 # Gradio's generic progress overlay at ``auto_summary`` made
@@ -37371,10 +37484,11 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             )
             cancel_automatic_run_button.click(
-                fn=cancel_or_reset_automatic_run,
+                fn=cancel_or_reset_automatic_run_and_disarm,
                 inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest,
                         automatic_run_activity, automatic_selection_state],
                 outputs=[
+                    auto_confirm_after_metadata,
                     auto_confirmation_html,
                     auto_confirmation_state,
                     auto_run_timing,
@@ -38237,17 +38351,36 @@ def launch_application(*, port: int | None = None, inbrowser: bool = False):
     """Launch the UI through either direct Python or the pipx console app."""
 
     selected_port = port if port is not None else int(os.environ.get("GRADIO_SERVER_PORT", "7860"))
-    demo.launch(
-        _app=gradio_server_app_with_connection_watchdog(),
-        server_name="127.0.0.1",
-        server_port=selected_port,
-        inbrowser=inbrowser,
-        theme=APP_THEME,
-        css=APP_CSS,
-        js=APP_JS,
-        favicon_path=APP_ICON,
-        footer_links=[],
-    )
+    # Gradio probes its own startup route with httpx.get. Identify that one
+    # in-process call explicitly: Windows can retire its socket before the
+    # ASGI middleware examines the process connection table.
+    internal_probe_token = secrets.token_urlsafe(32)
+    original_get = httpx.get
+    startup_url = f"http://127.0.0.1:{selected_port}/gradio_api/startup-events"
+
+    def internal_startup_get(url, *args, **kwargs):
+        if str(url) == startup_url:
+            headers = dict(kwargs.get("headers") or {})
+            headers["X-PDF-Assistant-Internal-Probe"] = internal_probe_token
+            kwargs["headers"] = headers
+        return original_get(url, *args, **kwargs)
+
+    httpx.get = internal_startup_get
+    try:
+        demo.launch(
+            _app=gradio_server_app_with_connection_watchdog(
+                internal_probe_token=internal_probe_token),
+            server_name="127.0.0.1",
+            server_port=selected_port,
+            inbrowser=inbrowser,
+            theme=APP_THEME,
+            css=APP_CSS,
+            js=APP_JS,
+            favicon_path=APP_ICON,
+            footer_links=[],
+        )
+    finally:
+        httpx.get = original_get
 
 
 if __name__ == "__main__":

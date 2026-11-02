@@ -1,11 +1,12 @@
 import pytest
 from unittest.mock import patch
+from types import SimpleNamespace
 from starlette.applications import Starlette
 from starlette.responses import PlainTextResponse
 from starlette.routing import Route, WebSocketRoute
 from starlette.testclient import TestClient
 
-from browser_access import BOOTSTRAP_PATH, BrowserAccessMiddleware, browser_ticket
+from browser_access import BOOTSTRAP_PATH, BrowserAccessMiddleware, browser_ticket, same_process_request
 
 pytestmark = pytest.mark.offline_deterministic
 KEY = "offline-launcher-key"
@@ -51,6 +52,35 @@ def test_internal_probe_exemption_is_exact_and_process_bound():
         assert c.get("/").status_code == 403
         assert c.post("/gradio_api/queue/join").status_code == 403
         assert c.get("/gradio_api/startup-events", headers={"Origin":"https://evil.invalid"}).status_code == 403
+
+
+def test_signed_internal_probe_is_limited_to_gradio_startup_routes():
+    async def ok(request):
+        return PlainTextResponse("ok")
+    app = Starlette(routes=[Route("/", ok), Route("/healthz", ok),
+                            Route("/gradio_api/startup-events", ok),
+                            Route("/gradio_api/queue/join", ok, methods=["POST"])])
+    app.add_middleware(BrowserAccessMiddleware, key=KEY, internal_probe_token="private-startup-token")
+    header = {"X-PDF-Assistant-Internal-Probe": "private-startup-token"}
+    with TestClient(app, base_url="http://127.0.0.1:7860") as c:
+        assert c.get("/gradio_api/startup-events", headers=header).status_code == 200
+        assert c.head("/", headers=header).status_code == 200
+        assert c.get("/", headers=header).status_code == 403
+        assert c.post("/gradio_api/queue/join", headers=header).status_code == 403
+        assert c.get("/gradio_api/startup-events").status_code == 403
+
+
+def test_closed_self_probe_socket_still_requires_own_exact_endpoints():
+    connection = SimpleNamespace(
+        status="CLOSE", laddr=("127.0.0.1", 60663),
+        raddr=("127.0.0.1", 60183),
+    )
+    owned = {"client": ("127.0.0.1", 60663), "server": ("127.0.0.1", 60183)}
+    unrelated = {"client": ("127.0.0.1", 60664), "server": ("127.0.0.1", 60183)}
+    with patch("browser_access.psutil.Process") as process, patch("browser_access.time.sleep"):
+        process.return_value.net_connections.return_value = [connection]
+        assert same_process_request(owned)
+        assert not same_process_request(unrelated)
 
 
 def test_ticket_is_one_use_and_session_does_not_cross_server_instances():
