@@ -27123,22 +27123,10 @@ def run_automatic_for_browser_stream(
 
 
 def run_manual_confirmation_with_auto_state(
-    selection_state, viewed_run_root, auto_armed, metadata_status, *values,
+    selection_state, viewed_run_root, auto_armed, *values,
     progress=gr.Progress(track_tqdm=False), request: gr.Request = None,
 ):
-    """Use the same server owner without changing the operator's auto choice."""
-    if auto_armed and 'data-preview-complete="true"' in str(metadata_status or ""):
-        files = unique_local_path_strings(
-            normalize_file_list(values[AUTOMATIC_RUN_FIELDS.index("pdf_files")])
-            + normalize_file_list(values[AUTOMATIC_RUN_FIELDS.index("folder_pdf_files")])
-        )
-        unresolved = unresolved_preview_author_keys(
-            metadata_status,
-            values[AUTOMATIC_RUN_FIELDS.index("document_metadata_overrides")], files,
-        )
-        if unresolved:
-            yield author_review_hold_updates(len(unresolved))
-            return
+    """A deliberate Confirm proceeds even when automatic author review is held."""
     for outputs in run_automatic_for_browser_stream(
         selection_state, viewed_run_root, *values, explicit_manual=not auto_armed,
         progress=progress, request=request,
@@ -27175,8 +27163,9 @@ def author_review_hold_updates(count):
             '<div class="automatic-run-failure" role="status">'
             '<strong>Automatic start paused.</strong> '
             f"{count} PDF author{'s were' if count != 1 else ' was'} not recognized. "
-            "Expand Document metadata, enter an Author override for each flagged PDF, "
-            "then press Confirm. No run has started.</div>"
+            "You may enter an Author override, or press Confirm to process all selected PDFs "
+            "with the generic PDF citation label for an unrecognized author. "
+            "No run has started.</div>"
         ),
         visible=True,
     )
@@ -37694,7 +37683,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 # normal control payload makes the Confirm click observable by
                 # the server and resilient to a stale client-side State value.
                 inputs=[automatic_selection_state, automatic_viewed_run_root,
-                        auto_confirm_after_metadata, auto_metadata_status, *automatic_run_inputs,
+                        auto_confirm_after_metadata, *automatic_run_inputs,
                         auto_title_override, auto_author_override, auto_short_label_override],
                 outputs=server_auto_outputs,
                 # The live Automatic status card already acknowledges Confirm

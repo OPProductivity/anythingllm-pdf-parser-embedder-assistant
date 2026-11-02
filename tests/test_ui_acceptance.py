@@ -1423,7 +1423,7 @@ def test_auto_confirm_uses_override_entered_after_arming(page, paused_metadata_a
     assert sum(profile["detected_author"] == "Late Override Sixth" for profile in profiles) == 1
 
 
-def test_missing_preview_author_pauses_auto_run_until_override_and_manual_confirm(
+def test_missing_preview_author_pauses_auto_run_but_manual_confirm_proceeds(
     page, local_app_url, local_app_home, six_pdf_files
 ):
     replacement = six_pdf_files[-1].with_name("missing-author-fixture.pdf")
@@ -1454,13 +1454,6 @@ def test_missing_preview_author_pauses_auto_run_until_override_and_manual_confir
     expect(page.locator("#confirm-automatic-run-button")).to_have_text("Confirm and start processing")
     assert set((local_app_home / "run-state").rglob("source-profile.json")) == existing
     page.locator("#confirm-automatic-run-button").click()
-    page.wait_for_timeout(800)
-    assert set((local_app_home / "run-state").rglob("source-profile.json")) == existing
-    page.locator("#document-metadata-accordion > button.label-wrap").click()
-    page.locator(".metadata-panel").filter(
-        has_text=six_pdf_files[-1].name
-    ).get_by_label("Override Author", exact=True).fill("Benjamin D. Crace")
-    page.locator("#confirm-automatic-run-button").click()
     page.wait_for_function(
         "['successful', 'warning', 'failed', 'cancelled'].includes("
         "document.querySelector('.automatic-run-activity')?.dataset.runState)",
@@ -1470,7 +1463,10 @@ def test_missing_preview_author_pauses_auto_run_until_override_and_manual_confir
     profiles = [json.loads(path.read_text(encoding="utf-8")) for path in
                 (local_app_home / "run-state").rglob("source-profile.json") if path not in existing]
     assert len(profiles) == 6
-    assert sum(profile["detected_author"] == "Benjamin D. Crace" for profile in profiles) == 1
+    missing = [profile for profile in profiles if profile["filename"] == six_pdf_files[-1].name]
+    assert len(missing) == 1
+    assert missing[0]["detected_author"] == ""
+    assert missing[0]["source_short_label"].startswith("PDF-")
 
 
 def test_cancel_during_metadata_preview_blocks_late_auto_confirm_and_allows_retry(
