@@ -315,6 +315,102 @@ def six_pdf_files(tmp_path: Path) -> list[Path]:
     return paths
 
 
+@pytest.fixture
+def forty_two_pdf_files(tmp_path: Path) -> list[Path]:
+    paths = [tmp_path / f"browser-large-batch-{index:02d}.pdf" for index in range(1, 43)]
+    for index, path in enumerate(paths, start=1):
+        document = fitz.open()
+        try:
+            page = document.new_page()
+            page.insert_text((72, 72), f"Browser batch source {index}\nby Test Author {index}")
+            document.save(path)
+        finally:
+            document.close()
+    return paths
+
+
+def test_large_batch_auto_confirm_handoff_timing(
+    page, paused_confirm_preflight_app, forty_two_pdf_files
+):
+    url, started, release, _app_home = paused_confirm_preflight_app
+    open_local_app(page, url)
+    page.get_by_role("radio", name="Create local files only").check()
+    began = time.monotonic()
+    page.locator(".pdf-upload-input input[type='file']").set_input_files(
+        [str(path) for path in forty_two_pdf_files]
+    )
+    page.get_by_role("checkbox", name="Process metadata for all files").check()
+    page.get_by_role("checkbox", name="Confirm and start run automatically").check()
+    transitions = []
+    last = None
+    metadata_ready_at = None
+    deadline = time.monotonic() + 240
+    try:
+        while not started.exists() and time.monotonic() < deadline:
+            state = page.evaluate("""() => {
+              const m = document.querySelector('#document-metadata-scan-status .metadata-scan-inline');
+              const a = document.querySelector('.automatic-run-activity');
+              const b = document.querySelector('#confirm-automatic-run-button button');
+              return [m?.dataset.state, m?.dataset.previewScope,
+                m?.dataset.previewComplete, a?.dataset.runState,
+                b?.disabled, document.querySelector('#metadata-auto-confirm-control input')?.checked];
+            }""")
+            if state != last:
+                transitions.append((round(time.monotonic() - began, 1), state))
+                last = state
+            if state[:3] == ["ready", "all", "true"] and metadata_ready_at is None:
+                metadata_ready_at = time.monotonic()
+            page.wait_for_timeout(200)
+        assert started.exists(), "Automatic Confirm did not reach preflight"
+        assert metadata_ready_at is not None, "All-file metadata never completed"
+        assert sum(state[0:2] == ["scanning", "all"]
+                   for _, state in transitions) == 1, transitions
+        assert time.monotonic() - metadata_ready_at < 30, transitions
+        expect(page.locator("#confirm-automatic-run-button")).to_have_text("Processing…")
+    finally:
+        release.touch()
+
+
+def test_auto_confirm_click_survives_checkbox_rerender(
+    page, paused_confirm_preflight_app, six_pdf_files
+):
+    url, started, release, _app_home = paused_confirm_preflight_app
+    open_local_app(page, url)
+    page.get_by_role("radio", name="Create local files only").check()
+    page.locator(".pdf-upload-input input[type='file']").set_input_files(
+        [str(path) for path in six_pdf_files]
+    )
+    page.get_by_role("checkbox", name="Process metadata for all files").check()
+    page.wait_for_function(
+        "(() => { const s = document.querySelector('#document-metadata-scan-status .metadata-scan-inline'); "
+        "return s?.dataset.state === 'ready' && s?.dataset.previewScope === 'all' "
+        "&& s?.dataset.previewComplete === 'true' "
+        "&& document.querySelector('.automatic-run-activity')?.dataset.runState === 'ready'; })()",
+        timeout=90000,
+    )
+    page.evaluate("""() => {
+      window.__autoConfirmButtonReplacements = 0;
+      const originalClick = HTMLInputElement.prototype.click;
+      HTMLInputElement.prototype.click = function(...args) {
+        if (this.closest('#metadata-auto-confirm-control') && this.checked) {
+          const button = document.querySelector('#confirm-automatic-run-button button, button#confirm-automatic-run-button');
+          button.replaceWith(button.cloneNode(true));
+          window.__autoConfirmButtonReplacements += 1;
+        }
+        return originalClick.apply(this, args);
+      };
+    }""")
+    try:
+        page.get_by_role("checkbox", name="Confirm and start run automatically").check()
+        deadline = time.monotonic() + 12
+        while not started.exists() and time.monotonic() < deadline:
+            page.wait_for_timeout(100)
+        assert page.evaluate("window.__autoConfirmButtonReplacements") >= 1
+        assert started.exists(), "Checkbox rerender detached the Confirm click before delivery"
+    finally:
+        release.touch()
+
+
 def test_fresh_file_selection_never_displays_prior_success(page, local_app_url, one_page_pdf):
     open_local_app(page, local_app_url)
     expect(page.get_by_text("Processing successful", exact=False)).to_have_count(0)

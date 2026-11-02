@@ -1024,6 +1024,7 @@ APP_CONNECTION_WATCHDOG_HEAD = """
       "#metadata-auto-confirm-control input[type='checkbox']");
     let autoConfirmIssuedForSelection = null;
     let allScanRequestedForSelection = null;
+    let deferredAllPreviewForSelection = null;
     const syncMetadataPreviewOptions = (names) => {
       const options = document.getElementById("metadata-preview-options");
       if (options) options.style.display = names.length >= 5 ? "flex" : "none";
@@ -1051,10 +1052,14 @@ APP_CONNECTION_WATCHDOG_HEAD = """
           !confirm || confirm.disabled ||
           autoConfirmIssuedForSelection === selection) return;
       autoConfirmIssuedForSelection = selection;
-      automatic.click();
       // A real button click captures the current Gradio controls, including
       // edits made after either checkbox was selected.
+      // Dispatch it while the button is still attached. Unchecking the
+      // separate Gradio checkbox first can synchronously rerender Confirm,
+      // leaving this saved button detached and silently losing the click.
       confirm.click();
+      const armed = metadataAutoConfirmCheckbox();
+      if (armed?.checked) armed.click();
     };
     document.addEventListener("click", (event) => {
       if (!(event.target instanceof Element) ||
@@ -1062,6 +1067,7 @@ APP_CONNECTION_WATCHDOG_HEAD = """
       // A queued preview must never turn into an automatic Confirm after Cancel.
       autoConfirmIssuedForSelection = metadataSelectionIdentities().join("\\u001f");
       allScanRequestedForSelection = null;
+      deferredAllPreviewForSelection = null;
       if (metadataAutoConfirmCheckbox()?.checked) metadataAutoConfirmCheckbox().click();
     }, true);
     const ensureMetadataHeaderStatus = () => {
@@ -1117,12 +1123,24 @@ APP_CONNECTION_WATCHDOG_HEAD = """
         metadataSelectionKey = key;
         autoConfirmIssuedForSelection = null;
         allScanRequestedForSelection = null;
+        deferredAllPreviewForSelection = null;
         if (metadataAutoConfirmCheckbox()?.checked) metadataAutoConfirmCheckbox().click();
         if (names.length) markDetectedValuesLoading();
         showMetadataStatus(names.length ? "scanning" : "idle",
           names.length ? `Preparing metadata preview for ${names.length} PDF${names.length === 1 ? "" : "s"}…` : "");
       }
       syncMetadataPreviewOptions(names);
+      if (deferredAllPreviewForSelection === key &&
+          document.querySelector(".automatic-run-activity[data-run-state='ready']")) {
+        const status = document.querySelector(
+          "#document-metadata-scan-status .metadata-scan-inline");
+        deferredAllPreviewForSelection = null;
+        if (metadataPreviewAllCheckbox()?.checked &&
+            !(status?.dataset.previewScope === "all" &&
+              status?.dataset.previewComplete === "true")) {
+          document.getElementById("deferred-all-metadata-preview")?.click();
+        }
+      }
       maybeAutomaticallyConfirmMetadataRun();
     };
     document.addEventListener("change", (event) => {
@@ -1136,6 +1154,11 @@ APP_CONNECTION_WATCHDOG_HEAD = """
         // visible selection, and final readiness is checked separately.
         if (metadataPreviewAllCheckbox()?.checked) {
           allScanRequestedForSelection = metadataSelectionIdentities().join("\\u001f");
+          if (!document.querySelector(".automatic-run-activity[data-run-state='ready']")) {
+            deferredAllPreviewForSelection = allScanRequestedForSelection;
+          }
+        } else {
+          deferredAllPreviewForSelection = null;
         }
         requestAnimationFrame(maybeAutomaticallyConfirmMetadataRun);
       }
@@ -3823,6 +3846,7 @@ html.dark .gradio-container .batch-folder-panel .batch-folder-title-icon {
 }
 #metadata-preview-options { display: none; }
 #native-pdf-selection-sync { display: none; }
+#deferred-all-metadata-preview { display: none; }
 .extraction-options-row label:has(input[type="checkbox"]),
 .extraction-options-row label[data-testid$="-checkbox-label"] {
     width: 100% !important;
@@ -13517,6 +13541,25 @@ def stream_automatic_detected_metadata_preview(
         )
 
 
+def stream_all_metadata_preview_on_checkbox_change(
+    pdf_files, folder_files, current_title="", current_author="",
+    current_short_label="", use_file_title_fallback=True,
+    apply_batch_metadata_overrides=False, folder_manifest=None,
+    selection_state=None, recognition_effort=None, preview_all=False,
+    request: gr.Request = None,
+):
+    """Let a pending selection own its preview before a checkbox scan starts."""
+    if str((selection_state or {}).get("state") or "") == "pending":
+        yield tuple(gr.update() for _ in range(7))
+        return
+    yield from stream_automatic_detected_metadata_preview(
+        pdf_files, folder_files, current_title, current_author,
+        current_short_label, use_file_title_fallback,
+        apply_batch_metadata_overrides, folder_manifest, selection_state,
+        recognition_effort, preview_all, request,
+    )
+
+
 def stream_refresh_automatic_run_estimate_for_fresh_selection(
     pdf_files=None, folder_pdf_files=None, folder_manifest=None,
     selection_state=None, request: gr.Request = None,
@@ -14783,6 +14826,7 @@ def update_live_automatic_run_status(
                 else 0.0
             ),
         )
+
     else:
         try:
             presentation_expected = max(0, int(presentation_expected_seconds))
@@ -34965,6 +35009,9 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     label="Confirm and start run automatically", value=False,
                     elem_id="metadata-auto-confirm-control",
                 )
+            deferred_all_metadata_preview_button = gr.Button(
+                "Finish all-file metadata preview", elem_id="deferred-all-metadata-preview",
+            )
             with gr.Accordion("Document metadata", open=False, elem_id="document-metadata-accordion", elem_classes=["top-level-accordion"]) as document_metadata_section:
                 auto_metadata_preview = gr.HTML(
                     value=pending_metadata_panel_html(
@@ -37154,7 +37201,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     queue=False,
                 )
             preview_all_metadata.change(
-                fn=stream_automatic_detected_metadata_preview,
+                fn=stream_all_metadata_preview_on_checkbox_change,
                 inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author,
                         auto_short_label, auto_use_file_title_fallback,
                         apply_batch_metadata_overrides, auto_folder_manifest,
@@ -37173,6 +37220,29 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 # it runs. Restore the settled selection state afterward;
                 # otherwise the card remains "Finishing selection settings"
                 # and the browser's automatic Confirm guard cannot fire.
+                fn=automatic_selection_action_states,
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest,
+                        automatic_selection_state],
+                outputs=[confirm_automatic_run_button,
+                         cancel_automatic_run_button, automatic_run_activity],
+                show_progress="hidden",
+                queue=False,
+            )
+            deferred_all_metadata_preview_button.click(
+                fn=stream_automatic_detected_metadata_preview,
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author,
+                        auto_short_label, auto_use_file_title_fallback,
+                        apply_batch_metadata_overrides, auto_folder_manifest,
+                        automatic_selection_state, auto_recognition_effort,
+                        preview_all_metadata],
+                outputs=[auto_label, auto_author, auto_short_label,
+                         auto_metadata_preview, auto_metadata_status,
+                         document_metadata_section, automatic_run_activity],
+                show_progress="hidden",
+                queue=True,
+                concurrency_limit=1,
+                concurrency_id="automatic-metadata-preview",
+            ).then(
                 fn=automatic_selection_action_states,
                 inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest,
                         automatic_selection_state],
