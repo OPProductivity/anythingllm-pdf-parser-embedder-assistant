@@ -27,6 +27,8 @@ def test_embedded_title_repairs_two_misdecodes_and_keeps_ordinary_titles():
     )
     assert repair_metadata_title_encoding(damaged) == expected
     assert normalize_metadata_title(damaged) == expected
+    mixed = "An already readable ‘quotation’ and Ã¢Â&#x80;Â&#x98;brokenÃ¢Â&#x80;Â&#x99; word"
+    assert repair_metadata_title_encoding(mixed) == "An already readable ‘quotation’ and ‘broken’ word"
     for ordinary in ("Ângela's Study", "The ‘betrayal’ of the United States", "Études culturelles"):
         assert repair_metadata_title_encoding(ordinary) == ordinary
 
@@ -100,6 +102,9 @@ def test_finished_preview_reports_missing_author_count_without_selected_word(mon
     assert "(1 file lacks recognized author metadata!)" in status
     assert "Expand here" in status
     assert "selected PDFs" not in status
+    single_status = list(app.stream_automatic_detected_metadata_preview(["first.pdf"], []))[-1][4]
+    assert "Preview ready for 1 of 1 PDFs." in single_status
+    assert "(1 file lacks recognized author metadata!)" in single_status
 
 
 def test_auto_start_holds_when_picker_value_changes_before_selection_state(monkeypatch):

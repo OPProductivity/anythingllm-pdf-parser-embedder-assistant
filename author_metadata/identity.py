@@ -98,27 +98,37 @@ def repair_metadata_title_encoding(value):
     bytes as HTML numeric references.  Keep ordinary titles unchanged and
     refuse a repair that leaves control bytes or replacement characters.
     """
-    original = str(value or "")
-    if not re.search(r"Ã|Â|â[\x80-\x9f]|&#(?:x[89][0-9a-f]|1(?:2[89]|[3-5][0-9]))\b", original, re.I):
-        return original
-    candidate = re.sub(
-        r"&#x([89][0-9a-f]);|&#(1(?:2[89]|[3-5][0-9]));",
-        lambda match: chr(int(match.group(1), 16) if match.group(1) else int(match.group(2))),
-        original, flags=re.I,
-    )
-    for _ in range(3):
-        try:
-            repaired = candidate.encode("latin-1").decode("utf-8")
-        except UnicodeError:
-            break
-        if repaired == candidate:
-            break
-        candidate = repaired
-    if (candidate == original or "\ufffd" in candidate
-            or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in candidate)):
-        return original
     marker = re.compile(r"Ã|Â|â[\x80-\x9f]|&#(?:x[89][0-9a-f]|1(?:2[89]|[3-5][0-9]))\b", re.I)
-    return candidate if len(marker.findall(candidate)) < len(marker.findall(original)) else original
+    original = str(value or "")
+    if not marker.search(original):
+        return original
+
+    def repair_latin1_span(span):
+        if not marker.search(span):
+            return span
+        candidate = re.sub(
+            r"&#x([89][0-9a-f]);|&#(1(?:2[89]|[3-5][0-9]));",
+            lambda match: chr(int(match.group(1), 16) if match.group(1) else int(match.group(2))),
+            span, flags=re.I,
+        )
+        for _ in range(3):
+            try:
+                repaired = candidate.encode("latin-1").decode("utf-8")
+            except UnicodeError:
+                break
+            if repaired == candidate:
+                break
+            candidate = repaired
+        if (candidate == span or "\ufffd" in candidate
+                or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in candidate)):
+            return span
+        return candidate if len(marker.findall(candidate)) < len(marker.findall(span)) else span
+
+    # Correctly decoded quotes or dashes elsewhere in the title cannot be
+    # encoded as Latin-1. Keep them intact while repairing only neighboring
+    # Latin-1 spans that contain a recognizable damaged sequence.
+    return "".join(repair_latin1_span(part) if all(ord(char) <= 255 for char in part)
+                   else part for part in re.split(r"([^\x00-\xff]+)", original))
 
 
 def resolve_title_from_metadata_or_filename(

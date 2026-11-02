@@ -13565,8 +13565,6 @@ def stream_automatic_detected_metadata_preview(
                 (
                     f"Preview ready for {len(displayed)} of {len(files)} PDFs."
                     f"{missing_note}\u00a0\u00a0Expand here"
-                    if len(files) > 1 else
-                    "Metadata preview complete." + missing_note + "\u00a0\u00a0Expand here"
                 ) if index + 1 == len(displayed) else
                 f"Metadata recognition processing for all {len(files)} files… "
                 f"{index + 1}/{len(displayed)} complete; reading the next PDF…"
