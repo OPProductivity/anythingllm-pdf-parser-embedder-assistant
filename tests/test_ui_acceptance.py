@@ -271,6 +271,7 @@ def captured_run(selection_state, viewed_run_root, *values, **kwargs):
         'revision': selection_state.get('revision'),
         'files': [Path(str(p)).name for p in selected],
         'mode': settings.get('mode'),
+        'output_root_override': settings.get('output_root_override'),
         'segment_mode': settings.get('segment_mode'),
         'include_front_matter': settings.get('include_front_matter'),
         'include_back_matter': settings.get('include_back_matter'),
@@ -596,11 +597,88 @@ def test_auto_handoff_reads_latest_settings_at_metadata_completion(
         assert actual["include_back_matter"] is False
         assert actual["first_page_override"] == 1
         assert actual["end_page_override"] == 8
-        expect(automatic).not_to_be_checked()
+        expect(automatic).to_be_checked()
         expect(page.locator("#confirm-automatic-run-button")).to_have_text("Processing…")
     finally:
         scan_release.touch()
         preflight_release.touch()
+
+
+def test_auto_start_without_metadata_preview_uses_custom_output_folder(
+    page, paused_auto_handoff_app, six_pdf_files, tmp_path
+):
+    (url, _scan_started, _scan_release, preflight_started,
+     preflight_release, payload) = paused_auto_handoff_app
+    open_local_app(page, url)
+    page.locator(".pdf-upload-input input[type='file']").set_input_files(
+        [str(path) for path in six_pdf_files]
+    )
+    page.wait_for_function(
+        "(() => { const s = document.querySelector('#document-metadata-scan-status .metadata-scan-inline'); "
+        "return s?.dataset.state === 'ready' && s?.dataset.previewScope === 'none' "
+        "&& document.querySelector('.automatic-run-activity')?.dataset.runState === 'ready'; })()",
+        timeout=60000,
+    )
+    page.get_by_role("radio", name="Create local files only").check()
+    chosen_output = tmp_path / "chosen-output"
+    output = page.get_by_label("(Change) Output Folder Path")
+    output.fill(str(chosen_output))
+    output.press("Tab")
+    metadata = page.get_by_role("checkbox", name="Process metadata for all files")
+    automatic = page.get_by_role("checkbox", name="Confirm and start run automatically")
+    expect(metadata).not_to_be_checked()
+    try:
+        automatic.check()
+        deadline = time.monotonic() + 30
+        while not preflight_started.exists():
+            assert time.monotonic() < deadline, "Auto-start did not reach preflight"
+            page.wait_for_timeout(100)
+        actual = json.loads(payload.read_text(encoding="utf-8"))
+        assert actual["mode"] == "Create local files only"
+        assert Path(actual["output_root_override"]) == chosen_output
+        assert len(actual["files"]) == 6
+        expect(metadata).not_to_be_checked()
+        expect(automatic).to_be_checked()
+        expect(page.locator("#confirm-automatic-run-button")).to_have_text("Processing…")
+        page.get_by_role("button", name="Cancel").click()
+    finally:
+        preflight_release.touch()
+
+
+def test_metadata_preview_only_does_not_arm_auto_start(
+    page, paused_metadata_app, six_pdf_files
+):
+    url, started, release, app_home = paused_metadata_app
+    open_local_app(page, url)
+    page.locator(".pdf-upload-input input[type='file']").set_input_files(
+        [str(path) for path in six_pdf_files]
+    )
+    page.wait_for_function(
+        "(() => { const s = document.querySelector('#document-metadata-scan-status .metadata-scan-inline'); "
+        "return s?.dataset.state === 'ready' && s?.dataset.previewScope === 'none' "
+        "&& document.querySelector('.automatic-run-activity')?.dataset.runState === 'ready'; })()",
+        timeout=60000,
+    )
+    metadata = page.get_by_role("checkbox", name="Process metadata for all files")
+    automatic = page.get_by_role("checkbox", name="Confirm and start run automatically")
+    try:
+        metadata.check()
+        deadline = time.monotonic() + 30
+        while not started.exists():
+            assert time.monotonic() < deadline, "Metadata preview did not start"
+            page.wait_for_timeout(100)
+        expect(automatic).not_to_be_checked()
+        release.touch()
+        page.wait_for_function(
+            "(() => { const s = document.querySelector('#document-metadata-scan-status .metadata-scan-inline'); "
+            "return s?.dataset.state === 'ready' && s?.dataset.previewScope === 'all' "
+            "&& s?.dataset.previewComplete === 'true'; })()",
+            timeout=90000,
+        )
+        expect(automatic).not_to_be_checked()
+        assert not list((app_home / "run-state").rglob("source-profile.json"))
+    finally:
+        release.touch()
 
 
 def test_real_sources_settings_then_all_file_auto_confirm(
@@ -635,7 +713,7 @@ def test_real_sources_settings_then_all_file_auto_confirm(
         expect(page.locator("#document-metadata-scan-status .metadata-scan-inline")).to_have_attribute(
             "data-preview-scope", "all"
         )
-        expect(automatic).not_to_be_checked()
+        expect(automatic).to_be_checked()
         page.get_by_role("button", name="Cancel").click()
     finally:
         release.touch()
@@ -1220,6 +1298,7 @@ def test_auto_confirm_visibly_presses_button_before_preflight_finishes(
         timeout=180000,
     )
     expect(confirm).to_have_text("Processing successful ✓")
+    expect(page.get_by_role("checkbox", name="Confirm and start run automatically")).to_be_checked()
 
 
 def test_auto_confirm_starts_without_browser_button_becoming_enabled(

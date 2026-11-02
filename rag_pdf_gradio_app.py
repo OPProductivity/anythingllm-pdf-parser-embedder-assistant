@@ -13532,11 +13532,6 @@ def stream_deferred_all_metadata_preview(
     )
 
 
-def request_all_metadata_preview_for_auto(auto_armed, preview_all):
-    """An auto-start request includes an all-file preview request."""
-    return gr.update(value=True) if auto_armed and not preview_all else gr.update()
-
-
 def disarm_auto_for_selection_state(selection_state):
     """A new or cancelled selection cannot inherit an earlier auto-start."""
     if str((selection_state or {}).get("state") or "") in {"pending", "idle", "cancelled"}:
@@ -26973,12 +26968,12 @@ def run_manual_confirmation_with_auto_state(
     selection_state, viewed_run_root, *values,
     progress=gr.Progress(track_tqdm=False), request: gr.Request = None,
 ):
-    """Use the same server owner for a human Confirm and an automatic start."""
+    """Use the same server owner without changing the operator's auto choice."""
     for outputs in run_automatic_for_browser_stream(
         selection_state, viewed_run_root, *values, explicit_manual=True,
         progress=progress, request=request,
     ):
-        yield gr.update(value=False), *outputs
+        yield gr.update(), *outputs
 
 
 def run_server_owned_auto_confirmation(
@@ -26989,22 +26984,28 @@ def run_server_owned_auto_confirmation(
     """Start once from an acknowledged selection and current Gradio inputs."""
     revision = int((selection_state or {}).get("revision") or 0)
     status = str(metadata_status or "")
+    preview_ready = (
+        not preview_all or (
+            'data-state="ready"' in status
+            and 'data-preview-scope="all"' in status
+            and 'data-preview-complete="true"' in status
+            and f'data-selection-revision="{revision}"' in status
+        )
+    )
     ready = (
-        bool(auto_armed and preview_all and revision)
+        bool(auto_armed and revision)
         and automatic_selection_is_ready(selection_state)
         and _selection_preview_is_current(selection_state, request)
         and not automatic_lifecycle_busy()
-        and 'data-state="ready"' in status
-        and 'data-preview-scope="all"' in status
-        and 'data-preview-complete="true"' in status
-        and f'data-selection-revision="{revision}"' in status
+        and preview_ready
     )
     if not ready:
         APP_LOGGER.info(
             "auto confirmation waiting: armed=%s all=%s selection=%s revision=%s "
-            "status_ready=%s status_all=%s status_complete=%s status_revision=%s",
+            "preview_ready=%s status_ready=%s status_all=%s status_complete=%s status_revision=%s",
             bool(auto_armed), bool(preview_all),
             str((selection_state or {}).get("state") or ""), revision,
+            preview_ready,
             'data-state="ready"' in status,
             'data-preview-scope="all"' in status,
             'data-preview-complete="true"' in status,
@@ -27015,9 +27016,8 @@ def run_server_owned_auto_confirmation(
     for outputs in run_automatic_for_browser_stream(
         selection_state, viewed_run_root, *values, progress=progress, request=request,
     ):
-        # The checkbox changes only after the server has claimed this exact
-        # selection and yielded its first confirmation acknowledgement.
-        yield gr.update(value=False), *outputs
+        # Keep the operator's choice visible after the server accepts the run.
+        yield gr.update(), *outputs
 
 
 METADATA_PREVIEW_TEXT_LAYER_PAGE_LIMIT = 3
@@ -35093,7 +35093,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 )
                 auto_confirm_after_metadata = gr.Checkbox(
                     label="Confirm and start run automatically", value=False,
-                    info="Choose output and processing settings first. The server starts the run when the all-file preview is ready.",
+                    info="Choose output and processing settings first. The server starts automatically when the selection is ready; if you requested an all-file metadata preview, it waits for that preview.",
                     elem_id="metadata-auto-confirm-control",
                 )
             with gr.Accordion("Document metadata", open=False, elem_id="document-metadata-accordion", elem_classes=["top-level-accordion"]) as document_metadata_section:
@@ -35108,7 +35108,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     choices=[MODE_LOCAL_ONLY_LABEL, MODE_LOCAL_WITH_LOGS_LABEL, MODE_NATIVE_UPLOAD_LABEL],
                     value=MODE_NATIVE_UPLOAD_LABEL,
                     label="Output mode",
-                    info="Every run pauses at the settings confirmation screen before local files are created or AnythingLLM is changed.",
+                    info="Review output and processing settings before confirming or enabling automatic start.",
                     elem_id="output-mode-radio",
                     interactive=False,
                 )
@@ -37410,12 +37410,6 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 concurrency_id=AUTOMATIC_RUN_CONCURRENCY_ID,
             )
             auto_confirm_after_metadata.change(
-                fn=request_all_metadata_preview_for_auto,
-                inputs=[auto_confirm_after_metadata, preview_all_metadata],
-                outputs=[preview_all_metadata],
-                show_progress="hidden",
-                queue=False,
-            ).then(
                 fn=run_server_owned_auto_confirmation,
                 inputs=server_auto_inputs,
                 outputs=server_auto_outputs,
