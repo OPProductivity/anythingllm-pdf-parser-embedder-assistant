@@ -442,7 +442,7 @@ def test_large_batch_auto_confirm_handoff_timing(
     page.locator(".pdf-upload-input input[type='file']").set_input_files(
         [str(path) for path in forty_two_pdf_files]
     )
-    page.get_by_role("checkbox", name="Process metadata for all files").check()
+    page.get_by_role("checkbox", name=re.compile(r"^Process and recognize metadata for all")).check()
     page.get_by_role("checkbox", name="Confirm and start run automatically").check()
     transitions = []
     last = None
@@ -483,7 +483,7 @@ def test_auto_confirm_uses_server_handoff_without_dom_click(
     page.locator(".pdf-upload-input input[type='file']").set_input_files(
         [str(path) for path in six_pdf_files]
     )
-    page.get_by_role("checkbox", name="Process metadata for all files").check()
+    page.get_by_role("checkbox", name=re.compile(r"^Process and recognize metadata for all")).check()
     page.wait_for_function(
         "(() => { const s = document.querySelector('#document-metadata-scan-status .metadata-scan-inline'); "
         "return s?.dataset.state === 'ready' && s?.dataset.previewScope === 'all' "
@@ -527,7 +527,7 @@ def test_auto_confirm_stays_armed_across_setting_changes_and_cancel(
         timeout=60000,
     )
     page.get_by_role("radio", name="Create local files only").check()
-    all_files = page.get_by_role("checkbox", name="Process metadata for all files")
+    all_files = page.get_by_role("checkbox", name=re.compile(r"^Process and recognize metadata for all"))
     automatic = page.get_by_role("checkbox", name="Confirm and start run automatically")
     all_files.check()
     deadline = time.monotonic() + 30
@@ -568,7 +568,7 @@ def test_auto_handoff_reads_latest_settings_at_metadata_completion(
     page.locator(".pdf-upload-input input[type='file']").set_input_files(
         [str(path) for path in six_pdf_files]
     )
-    all_files = page.get_by_role("checkbox", name="Process metadata for all files")
+    all_files = page.get_by_role("checkbox", name=re.compile(r"^Process and recognize metadata for all"))
     automatic = page.get_by_role("checkbox", name="Confirm and start run automatically")
     all_files.check()
     automatic.check()
@@ -627,7 +627,7 @@ def test_auto_start_waits_for_metadata_preview_with_custom_output_folder(
     output = page.get_by_label("(Change) Output Folder Path")
     output.fill(str(chosen_output))
     output.press("Tab")
-    metadata = page.get_by_role("checkbox", name="Process metadata for all files")
+    metadata = page.get_by_role("checkbox", name=re.compile(r"^Process and recognize metadata for all"))
     automatic = page.get_by_role("checkbox", name="Confirm and start run automatically")
     expect(metadata).not_to_be_checked()
     try:
@@ -680,7 +680,7 @@ def test_settings_changed_after_auto_start_do_not_redirect_active_run(
     output = page.get_by_label("(Change) Output Folder Path")
     output.fill(str(original_output))
     output.press("Tab")
-    page.get_by_role("checkbox", name="Process metadata for all files").check()
+    page.get_by_role("checkbox", name=re.compile(r"^Process and recognize metadata for all")).check()
     page.get_by_role("checkbox", name="Confirm and start run automatically").check()
     try:
         deadline = time.monotonic() + 60
@@ -747,7 +747,7 @@ def test_all_output_modes_keep_auto_start_and_cancel_consistent(
         timeout=60000,
     )
     page.get_by_role("radio", name=mode, exact=True).check()
-    metadata = page.get_by_role("checkbox", name="Process metadata for all files")
+    metadata = page.get_by_role("checkbox", name=re.compile(r"^Process and recognize metadata for all"))
     automatic = page.get_by_role("checkbox", name="Confirm and start run automatically")
     expect(metadata).not_to_be_checked()
     if metadata_first:
@@ -805,7 +805,7 @@ def test_metadata_preview_only_does_not_arm_auto_start(
         "&& document.querySelector('.automatic-run-activity')?.dataset.runState === 'ready'; })()",
         timeout=60000,
     )
-    metadata = page.get_by_role("checkbox", name="Process metadata for all files")
+    metadata = page.get_by_role("checkbox", name=re.compile(r"^Process and recognize metadata for all"))
     automatic = page.get_by_role("checkbox", name="Confirm and start run automatically")
     try:
         metadata.check()
@@ -849,7 +849,7 @@ def test_picker_change_during_metadata_scan_warns_then_rechecks_current_files(
     )
     assert page.evaluate("window.__initialMetadataStaleSeen") is False
     expect(page.locator("#metadata-preview-stale-row")).not_to_be_visible()
-    page.get_by_role("checkbox", name="Process metadata for all files").check()
+    page.get_by_role("checkbox", name=re.compile(r"^Process and recognize metadata for all")).check()
     try:
         deadline = time.monotonic() + 30
         while not started.exists():
@@ -903,7 +903,7 @@ def test_real_sources_settings_then_all_file_auto_confirm(
     page.get_by_role("radio", name="Create local files only").check()
     page.get_by_role("checkbox", name="Include foreword/preface").uncheck()
     page.get_by_role("checkbox", name="Include bibliography/index/end notes").uncheck()
-    all_files = page.get_by_role("checkbox", name="Process metadata for all files")
+    all_files = page.get_by_role("checkbox", name=re.compile(r"^Process and recognize metadata for all"))
     automatic = page.get_by_role("checkbox", name="Confirm and start run automatically")
     try:
         all_files.check()
@@ -1159,6 +1159,23 @@ def test_six_pdf_selection_keeps_every_file_in_the_pending_batch(page, local_app
     expect(page.get_by_role("button", name="Remove this file")).to_have_count(6)
     for path in six_pdf_files:
         expect(page.locator(f".pdf-upload-input td.filename[aria-label='{path.name}']")).to_have_count(1)
+    expect(page.get_by_role(
+        "checkbox", name="Process and recognize metadata for all 6 files"
+    )).to_have_count(1)
+
+
+def test_metadata_checkbox_label_updates_after_file_removal(page, local_app_url, six_pdf_files):
+    open_local_app(page, local_app_url)
+    page.locator(".pdf-upload-input input[type='file']").set_input_files(
+        [str(path) for path in six_pdf_files]
+    )
+    expect(page.get_by_role(
+        "checkbox", name="Process and recognize metadata for all 6 files"
+    )).to_have_count(1, timeout=60000)
+    page.get_by_role("button", name="Remove this file").last.click()
+    expect(page.get_by_role(
+        "checkbox", name="Process and recognize metadata for all 5 files"
+    )).to_have_count(1, timeout=60000)
 
 
 def test_six_pdf_local_batch_prepares_every_selected_source(page, local_app_url, six_pdf_files):
@@ -1261,7 +1278,7 @@ def test_metadata_table_stays_folded_and_shows_loading_then_detected_values(
     upload.set_input_files(str(one_page_pdf))
     header.click()
     expect(page.get_by_label("Override Author")).to_be_visible(timeout=30000)
-    expect(page.locator(".metadata-table thead th")).to_have_text(["Field", "Detected", "Override (if applied)"])
+    expect(page.locator(".metadata-table thead th")).to_have_text(["Field", "Detected", "Override (if set)"])
     page.wait_for_function(
         "document.querySelector('#document-metadata-scan-status .metadata-scan-inline')?.dataset.state === 'ready'",
         timeout=60000,
@@ -1362,7 +1379,7 @@ def test_preview_all_control_scans_beyond_fifth_pdf(page, local_app_url, six_pdf
     page.locator(".pdf-upload-input input[type='file']").set_input_files(
         [str(path) for path in six_pdf_files]
     )
-    preview_all = page.get_by_role("checkbox", name="Process metadata for all files")
+    preview_all = page.get_by_role("checkbox", name=re.compile(r"^Process and recognize metadata for all"))
     expect(preview_all).to_be_visible(timeout=30000)
     expect(page.get_by_label("Override Author").first).to_be_hidden()
     page.wait_for_function(
@@ -1390,7 +1407,7 @@ def test_preview_all_control_scans_beyond_fifth_pdf(page, local_app_url, six_pdf
         has_text=six_pdf_files[5].name
     )).not_to_contain_text("Not previewed")
     expect(page.locator("#document-metadata-scan-status")).to_contain_text(
-        "6 of 6 selected PDFs"
+        "6 of 6 PDFs"
     )
 
 
@@ -1401,7 +1418,7 @@ def test_auto_confirm_uses_override_entered_after_arming(page, paused_metadata_a
     page.locator(".pdf-upload-input input[type='file']").set_input_files(
         [str(path) for path in six_pdf_files]
     )
-    page.get_by_role("checkbox", name="Process metadata for all files").check()
+    page.get_by_role("checkbox", name=re.compile(r"^Process and recognize metadata for all")).check()
     deadline = time.monotonic() + 30
     while not started.exists():
         assert time.monotonic() < deadline, "Preview did not reach the paused inference"
@@ -1438,7 +1455,7 @@ def test_missing_preview_author_pauses_auto_run_but_manual_confirm_proceeds(
     page.locator(".pdf-upload-input input[type='file']").set_input_files(
         [str(path) for path in six_pdf_files]
     )
-    page.get_by_role("checkbox", name="Process metadata for all files").check()
+    page.get_by_role("checkbox", name=re.compile(r"^Process and recognize metadata for all")).check()
     automatic = page.get_by_role("checkbox", name="Confirm and start run automatically")
     automatic.check()
     heading = page.locator("#document-metadata-accordion .metadata-header-status")
@@ -1478,7 +1495,7 @@ def test_cancel_during_metadata_preview_blocks_late_auto_confirm_and_allows_retr
     page.locator(".pdf-upload-input input[type='file']").set_input_files(
         [str(path) for path in six_pdf_files]
     )
-    page.get_by_role("checkbox", name="Process metadata for all files").check()
+    page.get_by_role("checkbox", name=re.compile(r"^Process and recognize metadata for all")).check()
     deadline = time.monotonic() + 30
     while not started.exists():
         assert time.monotonic() < deadline, "Preview did not reach paused inference"
@@ -1545,7 +1562,7 @@ def test_auto_confirm_visibly_presses_button_before_preflight_finishes(
         "&& document.querySelector('.automatic-run-activity')?.dataset.runState === 'ready'; })()",
         timeout=90000,
     )
-    page.get_by_role("checkbox", name="Process metadata for all files").check()
+    page.get_by_role("checkbox", name=re.compile(r"^Process and recognize metadata for all")).check()
     page.get_by_role("checkbox", name="Confirm and start run automatically").check()
     deadline = time.monotonic() + 90
     while not started.exists():
@@ -1572,7 +1589,7 @@ def test_auto_confirm_starts_without_browser_button_becoming_enabled(
     page.locator(".pdf-upload-input input[type='file']").set_input_files(
         [str(path) for path in six_pdf_files]
     )
-    page.get_by_role("checkbox", name="Process metadata for all files").check()
+    page.get_by_role("checkbox", name=re.compile(r"^Process and recognize metadata for all")).check()
     page.wait_for_function(
         "(() => { const s = document.querySelector('#document-metadata-scan-status .metadata-scan-inline'); "
         "return s?.dataset.previewScope === 'all' && s?.dataset.previewComplete === 'true' "

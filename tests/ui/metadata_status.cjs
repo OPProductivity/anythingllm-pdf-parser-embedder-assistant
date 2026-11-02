@@ -38,7 +38,7 @@ const server = http.createServer((_request, response) => {
       document.querySelector('#automatic-pdf-upload tbody').appendChild(row);
     });
     await page.waitForFunction(() => document.querySelector('.metadata-header-status')?.dataset.state === 'scanning');
-    assert.match(await status.textContent(), /Preparing metadata preview for 1 PDF/);
+    assert.match(await status.textContent(), /Loading selected PDFs/);
     assert.equal(await page.locator('#document-metadata-scan-status').isVisible(), false);
     assert.equal(await status.isVisible(), true);
     assert.equal(await page.locator('#document-metadata-accordion > button.label-wrap').evaluate(node =>
@@ -65,9 +65,9 @@ const server = http.createServer((_request, response) => {
         tbody.appendChild(row);
       }
     });
-    await page.waitForFunction(() => document.querySelector('.metadata-header-copy')?.textContent?.includes('5 PDFs'));
+    await page.waitForFunction(() => document.querySelector('.metadata-header-copy')?.textContent?.includes('Loading selected PDFs'));
     await page.locator('#document-metadata-scan-status').evaluate(node => {
-      node.innerHTML = '<div class="metadata-scan-inline" data-state="ready" data-preview-scope="none" data-preview-complete="true" data-selection-revision="2" role="status"><span class="metadata-scan-copy">No metadata preview requested for 42 PDFs.</span></div>';
+      node.innerHTML = '<div class="metadata-scan-inline" data-state="ready" data-preview-scope="none" data-preview-complete="true" data-selection-revision="2" role="status"><span class="metadata-scan-copy">Automatic metadata processing not enabled. Set values manually.</span></div>';
     });
     await page.evaluate(() => {
       const tbody = document.querySelector('#automatic-pdf-upload tbody');
@@ -77,7 +77,7 @@ const server = http.createServer((_request, response) => {
         tbody.appendChild(row);
       }
     });
-    await page.waitForFunction(() => document.querySelector('.metadata-header-copy')?.textContent?.includes('42 PDFs'));
+    await page.waitForFunction(() => document.querySelector('.metadata-header-copy')?.textContent?.includes('Loading selected PDFs'));
     assert.equal(await page.locator('#metadata-preview-stale-row').isVisible(), false);
     await page.evaluate(() => document.querySelector('#automatic-pdf-upload tbody').replaceChildren());
     await page.waitForFunction(() => document.querySelector('.metadata-header-status')?.dataset.state === 'idle');
@@ -89,7 +89,7 @@ const server = http.createServer((_request, response) => {
         token.className = 'token'; token.textContent = name + ' ×'; host.appendChild(token);
       }
     });
-    await page.waitForFunction(() => document.querySelector('.metadata-header-copy')?.textContent?.includes('2 PDFs'));
+    await page.waitForFunction(() => document.querySelector('.metadata-header-copy')?.textContent?.includes('Loading selected PDFs'));
     await page.locator('#document-metadata-scan-status').evaluate(node => {
       node.innerHTML = '<div class="metadata-scan-inline" data-state="scanning" data-selection-revision="1" role="status"><span class="metadata-scan-copy">Inspecting metadata for preview 1 of 2…</span></div>';
     });

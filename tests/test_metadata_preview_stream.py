@@ -61,14 +61,31 @@ def test_large_batch_waits_for_explicit_all_file_preview(monkeypatch):
     files = [f"source-{index}.pdf" for index in range(11)]
     events = list(app.stream_automatic_detected_metadata_preview(files, []))
     assert len(events) == 1
-    assert "11 PDF(s) selected. Metadata preview off." in events[-1][3]
-    assert "Every selected PDF will be inspected freshly" in events[-1][3]
+    assert "metadata-selection-note" not in events[-1][3]
     assert 'data-preview-scope="none"' in events[-1][4]
     assert 'data-preview-complete="true"' in events[-1][4]
-    assert "No metadata preview requested for 11 PDFs" in events[-1][4]
+    assert "Automatic metadata processing not enabled. Set values manually." in events[-1][4]
     inspect.assert_not_called()
     assert events[0][3].count('data-metadata-override="document_publisher"') == len(files)
     assert "source-10.pdf" in events[0][3] and "Not previewed" in events[0][3]
+
+
+def test_metadata_checkbox_label_counts_direct_and_folder_selections():
+    assert app.metadata_preview_checkbox_label_update()["label"] == (
+        "Process and recognize metadata for all files"
+    )
+    assert app.metadata_preview_checkbox_label_update(["one.pdf"])["label"] == (
+        "Process and recognize metadata for all 1 file"
+    )
+    assert app.metadata_preview_checkbox_label_update(
+        ["old.pdf"], ["first.pdf", "second.pdf"]
+    )["label"] == "Process and recognize metadata for all 2 files"
+
+    controls = [component["props"] for component in app.demo.config["components"]
+                if component.get("props", {}).get("elem_id") in
+                {"metadata-preview-all-control", "metadata-auto-confirm-control"}]
+    assert len(controls) == 2
+    assert all(not control.get("info") for control in controls)
 
 
 def test_preview_all_scans_every_selected_pdf_and_marks_completion(monkeypatch):
@@ -387,6 +404,9 @@ def test_direct_and_folder_selection_chains_use_the_same_stream():
                if "stream_automatic_detected_metadata_preview" in str(d.get("api_name") or "")]
     assert len(streams) >= 5
     assert all(d["queue"] and len(d["outputs"]) == 7 for d in streams)
+    selection_controls = [d for d in config["dependencies"]
+                          if "automatic_selection_action_states" in str(d.get("api_name") or "")]
+    assert selection_controls and all(len(d["outputs"]) == 4 for d in selection_controls)
     assert not any((pdf_component['id'], 'change') in d.get('targets', [])
                    for d in config['dependencies'])
 

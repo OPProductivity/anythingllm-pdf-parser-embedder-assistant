@@ -1133,7 +1133,7 @@ APP_CONNECTION_WATCHDOG_HEAD = """
         metadataSelectionKey = key;
         if (names.length) markDetectedValuesLoading();
         if (!metadataPreviewStale) showMetadataStatus(names.length ? "scanning" : "idle",
-          names.length ? `Preparing metadata preview for ${names.length} PDF${names.length === 1 ? "" : "s"}…` : "");
+          names.length ? "Loading selected PDFs…" : "");
       }
       syncMetadataPreviewOptions(names);
     };
@@ -1163,7 +1163,7 @@ APP_CONNECTION_WATCHDOG_HEAD = """
         markMetadataStaleForPickerEdit();
         clearNativePdfSelectionTransport();
         markDetectedValuesLoading();
-        if (!metadataPreviewStale) showMetadataStatus("scanning", "Preparing metadata preview…");
+        if (!metadataPreviewStale) showMetadataStatus("scanning", "Loading selected PDFs…");
       } else if (target instanceof Element && target.closest("#batch-folder-file-selector")) {
         markMetadataStaleForPickerEdit();
       }
@@ -13396,15 +13396,13 @@ def pending_selected_metadata_preview(pdf_files=None, folder_files=None, folder_
     if not files:
         return pending_metadata_panel_html("Select a PDF to inspect its metadata.")
     panels = [pending_metadata_panel_html(
-        "Filename suggestion shown while metadata is being prepared. You can enter overrides now.",
+        "Loading PDF…",
         filename=Path(path).name, loading=True,
         document_key=local_path_identity_key(path),
     ) for path in files]
-    note = (f'<div class="metadata-selection-note">{len(files)} PDFs selected. '
-            'Each PDF has independent overrides; blank overrides use its detected values.</div>') if len(files) > 1 else ""
     if not _selection_preview_is_current(selection_state, request):
         return gr.update()
-    return '<div class="metadata-preview-list">' + note + "".join(panels) + '</div>'
+    return '<div class="metadata-preview-list">' + "".join(panels) + '</div>'
 
 
 def stream_automatic_detected_metadata_preview(
@@ -13461,17 +13459,6 @@ def stream_automatic_detected_metadata_preview(
                           (current_title, current_author, current_short_label))
     if len(files) > 1 and not apply_batch_metadata_overrides:
         field_updates = tuple(gr.update(value="", interactive=False) for _ in range(3))
-    selection_note = (
-        f"{len(files)} PDF(s) selected. "
-        + (f"Previewing {len(displayed)}. " if displayed else "Metadata preview off. ")
-        + ("Metadata recognition is running for every selected PDF."
-           if preview_all else "Every selected PDF will be inspected freshly after Confirm.")
-    )
-    if len(files) > 1:
-        selection_note += (
-            " Each PDF has independent overrides; blank fields use that PDF's detected values."
-        )
-
     def preview_list_html(active_index=None, detail=""):
         panels = list(completed_html)
         for pending_index in range(len(panels), len(files)):
@@ -13479,15 +13466,14 @@ def stream_automatic_detected_metadata_preview(
             will_preview = pending_index < len(displayed)
             message = detail if pending_index == active_index else (
                 "Waiting for metadata detection." if will_preview else
-                "This PDF will be detected freshly at Confirm; its overrides can be entered now."
+                "Not previewed."
             )
             panels.append(pending_metadata_panel_html(
                 message, filename=Path(path).name, loading=will_preview,
                 detected_value="" if will_preview else "Not previewed",
                 document_key=local_path_identity_key(path),
             ))
-        note = f'<div class="metadata-selection-note">{html.escape(selection_note)}</div>' if len(files) > 1 else ""
-        return '<div class="metadata-preview-list">' + note + "".join(panels) + "</div>"
+        return '<div class="metadata-preview-list">' + "".join(panels) + "</div>"
 
     if not displayed:
         # Large batches have no arbitrary first-five preview. The user may
@@ -13498,9 +13484,7 @@ def stream_automatic_detected_metadata_preview(
             preview_list_html(),
             metadata_scan_status_html(
                 "ready",
-                f"No metadata preview requested for {len(files)} PDFs. "
-                "Select Process metadata for all files to preview every PDF now; "
-                "Confirm will inspect every PDF during processing.",
+                "Automatic metadata processing not enabled. Set values manually.",
                 scope="none", complete=True, revision=selection_revision,
             ),
             gr.update(),
@@ -13784,6 +13768,17 @@ def automatic_selection_status_html(state, selection_state=None):
     )
 
 
+def metadata_preview_checkbox_label_update(pdf_files=None, folder_pdf_files=None):
+    """Label the current selection without changing the checkbox value."""
+    files = normalize_file_list(folder_pdf_files) or normalize_file_list(pdf_files)
+    count = len(files)
+    label = (
+        f"Process and recognize metadata for all {count} file{'s' if count != 1 else ''}"
+        if count else "Process and recognize metadata for all files"
+    )
+    return gr.update(label=label)
+
+
 def automatic_selection_action_states(
     pdf_files=None,
     folder_pdf_files=None,
@@ -13803,7 +13798,7 @@ def automatic_selection_action_states(
     # observer can otherwise repaint a finished selection as a disabled,
     # fictitious in-progress run.
     if selection_state and not _selection_preview_is_current(selection_state, request):
-        return gr.update(), gr.update(), gr.update()
+        return gr.update(), gr.update(), gr.update(), gr.update()
     selection_pending = str((selection_state or {}).get("state") or "") == "pending"
     global LIVE_AUTOMATIC_RUN_STATUS
     with LIVE_AUTOMATIC_RUN_STATUS_LOCK:
@@ -13812,7 +13807,7 @@ def automatic_selection_action_states(
             # A previously queued File.change completion belongs to the
             # selection that was just confirmed. It must not repaint
             # Confirm/Ready after the confirmation stream has acknowledged it.
-            return gr.update(), gr.update(), gr.update()
+            return gr.update(), gr.update(), gr.update(), gr.update()
         if selection_pending:
             # Metadata and workspace-name callbacks still own a coherent
             # selection snapshot.  The final acknowledgement enables Confirm;
@@ -13821,6 +13816,7 @@ def automatic_selection_action_states(
                 gr.update(value="Confirm and start processing", interactive=False, variant="primary"),
                 gr.update(value="Cancel", interactive=True, visible=True),
                 gr.update(value=automatic_selection_preparing_status_html(pdf_files, folder_pdf_files), visible=True),
+                metadata_preview_checkbox_label_update(pdf_files, folder_pdf_files),
             )
     process_button = automatic_process_button_state(pdf_files, folder_pdf_files, folder_manifest)
     return (
@@ -13830,6 +13826,7 @@ def automatic_selection_action_states(
             "ready" if process_button.get("interactive") else "idle",
             selection_state,
         ), visible=True),
+        metadata_preview_checkbox_label_update(pdf_files, folder_pdf_files),
     )
 
 
@@ -27894,7 +27891,7 @@ def metadata_table_html(primary_rows, additional_rows=(), *, include_overrides=T
         f'<table class="metadata-table" data-author-missing="{str(bool(missing_author)).lower()}"><colgroup><col class="metadata-key-column">'
         '<col class="metadata-detected-column"><col class="metadata-override-column"></colgroup>'
         '<thead><tr><th scope="col">Field</th><th scope="col">Detected</th>'
-        '<th scope="col">Override (if applied)</th></tr></thead><tbody>'
+        '<th scope="col">Override (if set)</th></tr></thead><tbody>'
         + render_rows(primary_rows)
         + render_rows(additional_rows, additional=True)
         + '</tbody></table>'
@@ -35320,13 +35317,11 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
             auto_recognition_effort = gr.State("thorough")
             with gr.Row(elem_id="metadata-preview-options"):
                 preview_all_metadata = gr.Checkbox(
-                    label="Process metadata for all files", value=False,
-                    info="For batches over five PDFs, no preview starts until this is selected. It then previews every PDF.",
+                    label="Process and recognize metadata for all files", value=False,
                     elem_id="metadata-preview-all-control",
                 )
                 auto_confirm_after_metadata = gr.Checkbox(
                     label="Confirm and start run automatically", value=False,
-                    info="Arms automatic start for the all-file metadata preview. Select Process metadata for all files separately; the run starts when that preview finishes.",
                     elem_id="metadata-auto-confirm-control",
                 )
             with gr.Row(elem_id="metadata-preview-stale-row"):
@@ -36499,7 +36494,8 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest,
                             automatic_selection_state],
                     outputs=[confirm_automatic_run_button,
-                             cancel_automatic_run_button, automatic_run_activity],
+                             cancel_automatic_run_button, automatic_run_activity,
+                             preview_all_metadata],
                     show_progress="hidden",
                     queue=False,
                 ).then(
@@ -36716,6 +36712,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     confirm_automatic_run_button,
                     cancel_automatic_run_button,
                     automatic_run_activity,
+                    preview_all_metadata,
                 ],
                 show_progress="hidden",
                 queue=False,
@@ -36750,6 +36747,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     confirm_automatic_run_button,
                     cancel_automatic_run_button,
                     automatic_run_activity,
+                    preview_all_metadata,
                 ],
                 show_progress="hidden",
                 queue=False,
@@ -37007,6 +37005,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     confirm_automatic_run_button,
                     cancel_automatic_run_button,
                     automatic_run_activity,
+                    preview_all_metadata,
                 ],
                 show_progress="hidden",
                 queue=False,
@@ -37126,6 +37125,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     confirm_automatic_run_button,
                     cancel_automatic_run_button,
                     automatic_run_activity,
+                    preview_all_metadata,
                 ],
                 show_progress="hidden",
                 queue=False,
@@ -37262,6 +37262,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     confirm_automatic_run_button,
                     cancel_automatic_run_button,
                     automatic_run_activity,
+                    preview_all_metadata,
                 ],
                 show_progress="hidden",
                 queue=False,
@@ -37619,7 +37620,8 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest,
                         automatic_selection_state],
                 outputs=[confirm_automatic_run_button,
-                         cancel_automatic_run_button, automatic_run_activity],
+                         cancel_automatic_run_button, automatic_run_activity,
+                         preview_all_metadata],
                 show_progress="hidden",
                 queue=False,
             ).then(
@@ -37656,7 +37658,8 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest,
                         automatic_selection_state],
                 outputs=[confirm_automatic_run_button,
-                         cancel_automatic_run_button, automatic_run_activity],
+                         cancel_automatic_run_button, automatic_run_activity,
+                         preview_all_metadata],
                 show_progress="hidden",
                 queue=False,
             ).then(
