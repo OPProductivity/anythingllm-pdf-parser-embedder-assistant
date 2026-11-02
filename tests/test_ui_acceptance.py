@@ -604,10 +604,10 @@ def test_auto_handoff_reads_latest_settings_at_metadata_completion(
         preflight_release.touch()
 
 
-def test_auto_start_without_metadata_preview_uses_custom_output_folder(
+def test_auto_start_waits_for_metadata_preview_with_custom_output_folder(
     page, paused_auto_handoff_app, six_pdf_files, tmp_path
 ):
-    (url, _scan_started, _scan_release, preflight_started,
+    (url, scan_started, scan_release, preflight_started,
      preflight_release, payload) = paused_auto_handoff_app
     open_local_app(page, url)
     page.locator(".pdf-upload-input input[type='file']").set_input_files(
@@ -629,6 +629,17 @@ def test_auto_start_without_metadata_preview_uses_custom_output_folder(
     expect(metadata).not_to_be_checked()
     try:
         automatic.check()
+        page.wait_for_timeout(1600)
+        assert not preflight_started.exists(), "Auto-start ran without requested metadata preview"
+        expect(metadata).not_to_be_checked()
+        expect(automatic).to_be_checked()
+        metadata.check()
+        deadline = time.monotonic() + 30
+        while not scan_started.exists():
+            assert time.monotonic() < deadline, "Metadata preview did not start"
+            page.wait_for_timeout(100)
+        assert not preflight_started.exists(), "Auto-start bypassed metadata recognition"
+        scan_release.touch()
         deadline = time.monotonic() + 30
         while not preflight_started.exists():
             assert time.monotonic() < deadline, "Auto-start did not reach preflight"
@@ -637,11 +648,12 @@ def test_auto_start_without_metadata_preview_uses_custom_output_folder(
         assert actual["mode"] == "Create local files only"
         assert Path(actual["output_root_override"]) == chosen_output
         assert len(actual["files"]) == 6
-        expect(metadata).not_to_be_checked()
+        expect(metadata).to_be_checked()
         expect(automatic).to_be_checked()
         expect(page.locator("#confirm-automatic-run-button")).to_have_text("Processing…")
         page.get_by_role("button", name="Cancel").click()
     finally:
+        scan_release.touch()
         preflight_release.touch()
 
 
@@ -650,9 +662,9 @@ def test_auto_start_without_metadata_preview_uses_custom_output_folder(
     "Create local files with diagnostic logs",
     "Create local files and upload to AnythingLLM",
 ])
-@pytest.mark.parametrize("preview_all", [False, True])
+@pytest.mark.parametrize("metadata_first", [False, True])
 def test_all_output_modes_keep_auto_start_and_cancel_consistent(
-    page, paused_auto_handoff_app, six_pdf_files, mode, preview_all
+    page, paused_auto_handoff_app, six_pdf_files, mode, metadata_first
 ):
     (url, scan_started, scan_release, preflight_started,
      preflight_release, payload) = paused_auto_handoff_app
@@ -670,16 +682,25 @@ def test_all_output_modes_keep_auto_start_and_cancel_consistent(
     metadata = page.get_by_role("checkbox", name="Process metadata for all files")
     automatic = page.get_by_role("checkbox", name="Confirm and start run automatically")
     expect(metadata).not_to_be_checked()
-    if preview_all:
+    if metadata_first:
         metadata.check()
         deadline = time.monotonic() + 30
         while not scan_started.exists():
             assert time.monotonic() < deadline, "Metadata preview did not start"
             page.wait_for_timeout(100)
     automatic.check()
-    if preview_all:
-        assert not preflight_started.exists(), "Auto-start bypassed requested metadata preview"
-        scan_release.touch()
+    if not metadata_first:
+        page.wait_for_timeout(1600)
+        assert not preflight_started.exists(), "Auto-start ran without metadata preview"
+        expect(metadata).not_to_be_checked()
+        expect(automatic).to_be_checked()
+        metadata.check()
+        deadline = time.monotonic() + 30
+        while not scan_started.exists():
+            assert time.monotonic() < deadline, "Metadata preview did not start"
+            page.wait_for_timeout(100)
+    assert not preflight_started.exists(), "Auto-start bypassed metadata recognition"
+    scan_release.touch()
     deadline = time.monotonic() + 30
     while not preflight_started.exists():
         assert time.monotonic() < deadline, "Auto-start did not reach preflight"
@@ -687,10 +708,7 @@ def test_all_output_modes_keep_auto_start_and_cancel_consistent(
     actual = json.loads(payload.read_text(encoding="utf-8"))
     assert actual["mode"] == mode
     assert len(actual["files"]) == 6
-    if preview_all:
-        expect(metadata).to_be_checked()
-    else:
-        expect(metadata).not_to_be_checked()
+    expect(metadata).to_be_checked()
     expect(automatic).to_be_checked()
     expect(page.locator("#confirm-automatic-run-button")).to_have_text("Processing…")
     # Let the one-second status observer repaint the action row. It must not

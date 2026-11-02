@@ -26997,12 +26997,11 @@ def run_server_owned_auto_confirmation(
     revision = int((selection_state or {}).get("revision") or 0)
     status = str(metadata_status or "")
     preview_ready = (
-        not preview_all or (
-            'data-state="ready"' in status
-            and 'data-preview-scope="all"' in status
-            and 'data-preview-complete="true"' in status
-            and f'data-selection-revision="{revision}"' in status
-        )
+        bool(preview_all)
+        and 'data-state="ready"' in status
+        and 'data-preview-scope="all"' in status
+        and 'data-preview-complete="true"' in status
+        and f'data-selection-revision="{revision}"' in status
     )
     ready = (
         bool(auto_armed and revision)
@@ -35105,7 +35104,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 )
                 auto_confirm_after_metadata = gr.Checkbox(
                     label="Confirm and start run automatically", value=False,
-                    info="Choose output and processing settings first. The server starts automatically when the selection is ready; if you requested an all-file metadata preview, it waits for that preview.",
+                    info="Arms automatic start for the all-file metadata preview. Select Process metadata for all files separately; the run starts when that preview finishes.",
                     elem_id="metadata-auto-confirm-control",
                 )
             with gr.Accordion("Document metadata", open=False, elem_id="document-metadata-accordion", elem_classes=["top-level-accordion"]) as document_metadata_section:
