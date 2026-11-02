@@ -15838,6 +15838,14 @@ def refresh_live_automatic_run_ui(viewed_run_root=None):
     rendered = automatic_live_status_html(record)
     activity = gr.update(value=rendered, visible=bool(rendered))
     if state == "preparing":
+        # Confirmed OCR preflight is cancellable before a run root exists.
+        # The stream enables Cancel on acknowledgement; the one-second status
+        # observer must not overwrite that button with a disabled state.
+        can_cancel_preflight = (
+            automatic_confirmation_in_flight(record)
+            and not bool(record.get("cancel_requested"))
+        )
+        cancel_label = "Stopping processing…" if record.get("cancel_requested") else "Cancel"
         return (
             activity,
             gr.update(),
@@ -15845,7 +15853,11 @@ def refresh_live_automatic_run_ui(viewed_run_root=None):
             gr.update(),
             gr.update(),
             gr.update(),
-            gr.update(value="Cancel", interactive=False, visible=True),
+            gr.update(
+                value=cancel_label,
+                interactive=can_cancel_preflight,
+                visible=True,
+            ),
             gr.update(),
             gr.update(),
             gr.update(),

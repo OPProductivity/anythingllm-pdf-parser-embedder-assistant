@@ -8392,6 +8392,36 @@ class PipelineCoreTests(unittest.TestCase):
         finally:
             app.LIVE_AUTOMATIC_RUN_STATUS = original_status
 
+    def test_confirmed_preflight_status_refresh_keeps_cancel_available(self):
+        import rag_pdf_gradio_app as app
+
+        original_status = app.LIVE_AUTOMATIC_RUN_STATUS
+        try:
+            app.LIVE_AUTOMATIC_RUN_STATUS = {
+                "state": "preparing",
+                "phase": "Preparing selected PDFs",
+                "confirmation_in_flight": True,
+                "confirmation_owner_token": "held-test",
+                "cancel_requested": False,
+            }
+            active = app.refresh_live_automatic_run_ui()
+            self.assertEqual(active[6]["value"], "Cancel")
+            self.assertTrue(active[6]["interactive"])
+            self.assertTrue(active[6]["visible"])
+
+            app.LIVE_AUTOMATIC_RUN_STATUS["cancel_requested"] = True
+            stopping = app.refresh_live_automatic_run_ui()
+            self.assertEqual(stopping[6]["value"], "Stopping processing…")
+            self.assertFalse(stopping[6]["interactive"])
+
+            app.LIVE_AUTOMATIC_RUN_STATUS = {
+                "state": "preparing", "confirmation_in_flight": False,
+            }
+            unowned = app.refresh_live_automatic_run_ui()
+            self.assertNotIn("interactive", unowned[6])
+        finally:
+            app.LIVE_AUTOMATIC_RUN_STATUS = original_status
+
     def test_running_status_refresh_forwards_queue_counts_to_the_overrun_tail(self):
         import rag_pdf_gradio_app as app
 

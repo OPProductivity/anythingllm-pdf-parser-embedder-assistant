@@ -646,11 +646,12 @@ def test_auto_start_without_metadata_preview_uses_custom_output_folder(
 
 
 @pytest.mark.parametrize("mode", [
+    "Create local files only",
     "Create local files with diagnostic logs",
     "Create local files and upload to AnythingLLM",
 ])
 @pytest.mark.parametrize("preview_all", [False, True])
-def test_other_output_modes_keep_auto_start_independent_of_metadata_preview(
+def test_all_output_modes_keep_auto_start_and_cancel_consistent(
     page, paused_auto_handoff_app, six_pdf_files, mode, preview_all
 ):
     (url, scan_started, scan_release, preflight_started,
@@ -692,6 +693,16 @@ def test_other_output_modes_keep_auto_start_independent_of_metadata_preview(
         expect(metadata).not_to_be_checked()
     expect(automatic).to_be_checked()
     expect(page.locator("#confirm-automatic-run-button")).to_have_text("Processing…")
+    # Let the one-second status observer repaint the action row. It must not
+    # disable Cancel while confirmed preflight is still waiting at this gate.
+    page.wait_for_timeout(1300)
+    cancel = page.locator("#cancel-automatic-run-button")
+    expect(cancel).to_be_enabled(timeout=5000)
+    cancel.click()
+    expect(cancel).to_be_disabled()
+    expect(page.locator(".automatic-run-activity")).to_have_attribute(
+        "data-cancel-requested", "true"
+    )
 
 
 def test_metadata_preview_only_does_not_arm_auto_start(
