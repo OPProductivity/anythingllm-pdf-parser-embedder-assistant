@@ -12352,18 +12352,29 @@ def start_anythingllm_desktop(executable_path=None):
         result["already_running"] = True
         return result
     try:
-        creationflags = 0
         if os.name == "nt":
-            creationflags = 0x00000008 | 0x00000200
-        subprocess.Popen(
-            [str(exe)],
-            cwd=str(exe.parent),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL,
-            creationflags=creationflags,
-            close_fds=False if os.name == "nt" else True,
-        )
+            # The assistant's Stop command terminates its owned process tree.
+            # A direct Popen makes Desktop a child of that tree, so a routine
+            # assistant-port restart can accidentally close Desktop. Windows
+            # `start` exits promptly and leaves Desktop independently running.
+            broker = subprocess.run(
+                ["cmd.exe", "/c", "start", "", "/b", str(exe)],
+                cwd=str(exe.parent),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                timeout=3.0,
+                check=False,
+            )
+            if broker.returncode:
+                raise OSError(f"Desktop launch broker exited with code {broker.returncode}.")
+        else:
+            subprocess.Popen(
+                [str(exe)], cwd=str(exe.parent),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL, close_fds=True,
+            )
         result["status"] = "started"
         result["started"] = True
         return result
