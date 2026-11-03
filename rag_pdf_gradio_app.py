@@ -354,10 +354,9 @@ EMBEDDING_OBSERVER_QUIET_SECONDS = 60
 # This timer only reads local AnythingLLM state. It never starts the desktop app,
 # creates an API key, mutates a workspace, or retries an embedding job.
 BACKGROUND_RECONCILIATION_INTERVAL_SECONDS = 5
-# This is a passive page-level health signal, intentionally slower than the
-# run-status clock. It makes a stopped Desktop visible in an already-open
-# browser tab but never starts Desktop, creates a key, or changes a workspace.
-ANYTHINGLLM_STARTUP_STATUS_INTERVAL_SECONDS = 10
+# This passive page-level health signal never starts Desktop or changes a workspace.
+# Check often enough that a newly ready Desktop clears the warning promptly.
+ANYTHINGLLM_STARTUP_STATUS_INTERVAL_SECONDS = 3
 # This descriptor exists only while the separately-installed guarded Desktop
 # bridge is running. The timer reads it for status but never calls the bridge.
 DESKTOP_REFRESH_BRIDGE_FILENAME = "anythingllm-pdf-prep-refresh-bridge.json"
@@ -2767,6 +2766,7 @@ gradio-app,
     padding: 0 !important;
 }
 .anythingllm-startup-status-module {
+    position: relative;
     width: 100%;
     margin: 0 0 14px;
     padding: 12px;
@@ -2776,9 +2776,22 @@ gradio-app,
     color: #1e3a5f;
 }
 .anythingllm-startup-status-module:has(.anythingllm-startup-status--offline) {
-    border-color: #fca5a5;
-    background: #fef2f2;
+    border-color: #f87171;
+    background: #fee2e2;
     color: #991b1b;
+}
+.anythingllm-startup-status-module:has(.anythingllm-startup-status--offline)::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    border-radius: inherit;
+    background: rgba(255, 255, 255, .58);
+    pointer-events: none;
+    animation: anythingllm-warning-unveil 5s steps(1, end) forwards;
+}
+@keyframes anythingllm-warning-unveil {
+    to { opacity: 0; }
 }
 .anythingllm-startup-status {
     margin: 0 0 10px;
@@ -2814,7 +2827,7 @@ body.dark .anythingllm-startup-status-module {
 }
 body.dark .anythingllm-startup-status-module:has(.anythingllm-startup-status--offline) {
     border-color: #b91c1c;
-    background: #450a0a;
+    background: #7f1d1d;
     color: #fee2e2;
 }
 .top-level-accordion,
@@ -5590,6 +5603,7 @@ def native_upload_readiness_report(
     autostart_runtime=False,
     verify_authentication=False,
     status_callback=None,
+    fast_startup_check=False,
 ):
     storage_dir = default_anythingllm_storage_dir()
     db_path = storage_dir / "anythingllm.db"
@@ -5630,9 +5644,11 @@ def native_upload_readiness_report(
     runtime = ensure_anythingllm_runtime(
         report["runtime_api_url"],
         api_key=(api_key or "").strip(),
-        timeout=1.25 if autostart_runtime else 0.5,
+        timeout=0.6 if fast_startup_check else 1.25 if autostart_runtime else 0.5,
         autostart_local=bool(autostart_runtime),
         status_callback=status_callback,
+        startup_fast_poll_interval=0.5 if fast_startup_check else None,
+        startup_fast_poll_window=8.0 if fast_startup_check else 0.0,
     )
     report["runtime_api_url"] = runtime.get("api_url") or report["runtime_api_url"]
     report["runtime_api_status"] = runtime.get("status") or "not_checked"
@@ -5945,11 +5961,17 @@ def initialize_anythingllm_on_app_open(api_url="", api_key="", workspace_slug=""
         selected_workspace,
         autostart_runtime=True,
         verify_authentication=False,
+        fast_startup_check=True,
     )
     reachable = bool(report.get("runtime_api_reachable"))
+    startup_attempt = {
+        "api_url": (api_url or DEFAULT_ANYTHINGLLM_API_URL).strip().rstrip("/"),
+        "status": str(report.get("runtime_start_status") or "not_attempted"),
+    }
     status_html = anythingllm_startup_status_html(
-        report.get("runtime_api_url") or api_url,
+        api_url,
         health={"reachable": reachable},
+        startup_attempt=startup_attempt,
     )
     return (
         workspace_update,
@@ -5957,6 +5979,7 @@ def initialize_anythingllm_on_app_open(api_url="", api_key="", workspace_slug=""
         native_upload_readiness_html(report),
         status_html,
         gr.update(visible=not reachable),
+        startup_attempt if not reachable else None,
     )
 
 
@@ -9912,7 +9935,7 @@ def anythingllm_observer_api_health(api_url):
         return {"reachable": False, "http_status": None, "error": str(exc)}
 
 
-def anythingllm_startup_status_html(api_url="", health=None):
+def anythingllm_startup_status_html(api_url="", health=None, startup_attempt=None):
     """Render the inexpensive pre-selection Desktop availability signal.
 
     This deliberately checks only the local API ping. The provider-backed
@@ -9922,32 +9945,61 @@ def anythingllm_startup_status_html(api_url="", health=None):
     health = health if health is not None else anythingllm_observer_api_health(api_url)
     if health.get("reachable"):
         return ""
+    attempt = startup_attempt if isinstance(startup_attempt, dict) else {}
+    target = (api_url or DEFAULT_ANYTHINGLLM_API_URL).strip().rstrip("/")
+    status = (
+        str(attempt.get("status") or "")
+        if attempt.get("api_url") == target else
+        "not_attempted" if attempt else ""
+    )
+    messages = {
+        "started": (
+            "This app started AnythingLLM Desktop, but its API did not become ready. "
+            "Click Refresh Status if Desktop finishes opening."
+        ),
+        "already_running": (
+            "AnythingLLM Desktop was already running, but its API did not respond. "
+            "Check Desktop, then click Refresh Status."
+        ),
+        "missing_executable": (
+            "This app tried to start AnythingLLM Desktop, but could not find it. "
+            "Start Desktop manually, then click Refresh Status."
+        ),
+        "start_failed": (
+            "This app tried to start AnythingLLM Desktop, but the launch failed. "
+            "Start Desktop manually, then click Refresh Status."
+        ),
+        "not_attempted": "The configured AnythingLLM service did not respond. Check its address, then click Refresh Status.",
+    }
+    message = messages.get(status, "Checking AnythingLLM Desktop and automatic startup…")
     return (
         '<section class="anythingllm-startup-status anythingllm-startup-status--offline" role="alert">'
-        '<div><strong>AnythingLLM is not available.</strong> Please start AnythingLLM Desktop, then click Refresh Status. '
-        'PDF preparation can continue in local-only mode, but AnythingLLM upload cannot start until Desktop is running.</div>'
+        f'<div><strong>AnythingLLM is not available.</strong> {message} '
+        'PDF preparation can continue locally; upload waits for AnythingLLM.</div>'
         '</section>'
     )
 
 
-def anythingllm_startup_status_view(api_url=""):
+def anythingllm_startup_status_view(api_url="", startup_attempt=None):
     """Return the quiet pre-selection signal and whether its warning is needed."""
     health = anythingllm_observer_api_health(api_url)
     unavailable = not health.get("reachable")
     return (
-        anythingllm_startup_status_html(api_url, health=health),
+        anythingllm_startup_status_html(api_url, health=health, startup_attempt=startup_attempt),
         gr.update(visible=unavailable),
+        gr.update() if unavailable else gr.update(value=None),
     )
 
 
-def refresh_anythingllm_startup_status(api_url=""):
+def refresh_anythingllm_startup_status(api_url="", startup_attempt=None):
     """Refresh the passive Desktop signal, showing a cue only for an unchanged outage."""
     health = anythingllm_observer_api_health(api_url)
     unavailable = not health.get("reachable")
     return (
-        anythingllm_startup_status_html(api_url, health=health),
+        anythingllm_startup_status_html(api_url, health=health, startup_attempt=startup_attempt),
         gr.update(visible=unavailable),
         gr.update(value="Refresh Status", variant="secondary"),
+        gr.update() if unavailable else gr.update(value=None),
     )
 
 
@@ -35163,6 +35215,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
             value=INITIAL_ANYTHINGLLM_STARTUP_STATUS,
             elem_id="anythingllm-startup-status",
         )
+        anythingllm_startup_attempt = gr.State(None)
         refresh_anythingllm_startup_status_button = gr.Button(
             "Refresh Status",
             variant="secondary",
@@ -36062,11 +36115,12 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
             )
             refresh_anythingllm_startup_status_refresh = refresh_anythingllm_startup_status_button.click(
                 fn=refresh_anythingllm_startup_status,
-                inputs=[api_url],
+                inputs=[api_url, anythingllm_startup_attempt],
                 outputs=[
                     anythingllm_startup_status,
                     anythingllm_startup_status_module,
                     refresh_anythingllm_startup_status_button,
+                    anythingllm_startup_attempt,
                 ],
                 show_progress="hidden",
                 queue=False,
@@ -36218,8 +36272,9 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
             )
             anythingllm_startup_status_timer.tick(
                 fn=anythingllm_startup_status_view,
-                inputs=[api_url],
-                outputs=[anythingllm_startup_status, anythingllm_startup_status_module],
+                inputs=[api_url, anythingllm_startup_attempt],
+                outputs=[anythingllm_startup_status, anythingllm_startup_status_module,
+                         anythingllm_startup_attempt],
                 show_progress="hidden",
                 queue=False,
                 trigger_mode="always_last",
@@ -36267,6 +36322,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     native_upload_readiness,
                     anythingllm_startup_status,
                     anythingllm_startup_status_module,
+                    anythingllm_startup_attempt,
                 ],
                 show_progress="minimal",
             )
@@ -36611,8 +36667,9 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
             )
             api_url.change(
                 fn=anythingllm_startup_status_view,
-                inputs=[api_url],
-                outputs=[anythingllm_startup_status, anythingllm_startup_status_module],
+                inputs=[api_url, anythingllm_startup_attempt],
+                outputs=[anythingllm_startup_status, anythingllm_startup_status_module,
+                         anythingllm_startup_attempt],
                 show_progress="hidden",
                 queue=False,
             )

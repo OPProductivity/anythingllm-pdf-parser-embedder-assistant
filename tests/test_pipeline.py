@@ -2854,8 +2854,14 @@ class PipelineCoreTests(unittest.TestCase):
             app.anythingllm_observer_api_health = original_health
 
         self.assertEqual(running, "")
-        self.assertIn("Please start AnythingLLM Desktop", unavailable)
-        self.assertIn("Refresh Status", unavailable)
+        self.assertIn("Checking AnythingLLM Desktop and automatic startup", unavailable)
+
+        started = app.anythingllm_startup_status_html(
+            "http://127.0.0.1:3001", health={"reachable": False},
+            startup_attempt={"api_url": "http://127.0.0.1:3001", "status": "started"},
+        )
+        self.assertIn("This app started AnythingLLM Desktop", started)
+        self.assertNotIn("Start Desktop manually", started)
 
     def test_startup_status_view_detects_a_runtime_loss_after_page_load(self):
         import rag_pdf_gradio_app as app
@@ -2863,16 +2869,37 @@ class PipelineCoreTests(unittest.TestCase):
         original_health = app.anythingllm_observer_api_health
         try:
             app.anythingllm_observer_api_health = lambda _url: {"reachable": True, "http_status": 200, "error": ""}
-            running_html, running_module = app.anythingllm_startup_status_view("http://127.0.0.1:3001")
+            running_html, running_module, cleared_attempt = app.anythingllm_startup_status_view("http://127.0.0.1:3001")
             app.anythingllm_observer_api_health = lambda _url: {"reachable": False, "http_status": None, "error": "refused"}
-            unavailable_html, unavailable_module = app.anythingllm_startup_status_view("http://127.0.0.1:3001")
+            unavailable_html, unavailable_module, retained_attempt = app.anythingllm_startup_status_view("http://127.0.0.1:3001")
         finally:
             app.anythingllm_observer_api_health = original_health
 
         self.assertEqual(running_html, "")
         self.assertFalse(running_module["visible"])
+        self.assertIsNone(cleared_attempt["value"])
         self.assertIn("AnythingLLM is not available", unavailable_html)
         self.assertTrue(unavailable_module["visible"])
+        self.assertNotIn("value", retained_attempt)
+
+    def test_startup_attempt_message_survives_passive_status_checks(self):
+        import rag_pdf_gradio_app as app
+
+        target = "http://127.0.0.1:3001"
+        attempt = {"api_url": target, "status": "started"}
+        with mock.patch.object(app, "anythingllm_observer_api_health", return_value={"reachable": False}):
+            timer_html, timer_module, timer_state = app.anythingllm_startup_status_view(target, attempt)
+            refresh_html, refresh_module, _, refresh_state = app.refresh_anythingllm_startup_status(target, attempt)
+        self.assertIn("This app started AnythingLLM Desktop", timer_html)
+        self.assertIn("This app started AnythingLLM Desktop", refresh_html)
+        self.assertTrue(timer_module["visible"] and refresh_module["visible"])
+        self.assertNotIn("value", timer_state)
+        self.assertNotIn("value", refresh_state)
+
+        changed_url = app.anythingllm_startup_status_html(
+            "http://127.0.0.1:3002", health={"reachable": False}, startup_attempt=attempt,
+        )
+        self.assertNotIn("This app started AnythingLLM Desktop", changed_url)
 
     def test_app_open_initialization_uses_one_guarded_local_start_attempt(self):
         import rag_pdf_gradio_app as app
@@ -2913,12 +2940,26 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(result[2], "readiness:started")
         self.assertEqual(result[3], "")
         self.assertFalse(result[4]["visible"])
+        self.assertIsNone(result[5])
+        self.assertTrue(captured["kwargs"]["fast_startup_check"])
+
+    def test_app_open_warning_reports_its_own_failed_start(self):
+        import rag_pdf_gradio_app as app
+
+        report = {"runtime_api_reachable": False, "runtime_start_status": "start_failed"}
+        with mock.patch.object(app, "load_workspaces_on_open", return_value=({"value": "new-document"}, "local")), \
+             mock.patch.object(app, "native_upload_readiness_report", return_value=report), \
+             mock.patch.object(app, "native_upload_readiness_html", return_value="readiness:failed"):
+            result = app.initialize_anythingllm_on_app_open("http://127.0.0.1:3001", "", "")
+        self.assertIn("This app tried to start AnythingLLM Desktop", result[3])
+        self.assertTrue(result[4]["visible"])
+        self.assertEqual(result[5]["status"], "start_failed")
 
     def test_startup_status_timer_is_passive_and_low_frequency(self):
         import rag_pdf_gradio_app as app
 
         source = Path(app.__file__).read_text(encoding="utf-8")
-        self.assertGreaterEqual(app.ANYTHINGLLM_STARTUP_STATUS_INTERVAL_SECONDS, 10)
+        self.assertEqual(app.ANYTHINGLLM_STARTUP_STATUS_INTERVAL_SECONDS, 3)
         self.assertIn("anythingllm_startup_status_timer = gr.Timer(", source)
         self.assertIn("anythingllm_startup_status_timer.tick(", source)
         self.assertIn("fn=anythingllm_startup_status_view", source)
@@ -3044,16 +3085,18 @@ class PipelineCoreTests(unittest.TestCase):
         original_health = app.anythingllm_observer_api_health
         try:
             app.anythingllm_observer_api_health = lambda _url: {"reachable": False, "http_status": None, "error": "refused"}
-            unavailable_html, unavailable_module, unavailable_button = app.refresh_anythingllm_startup_status("http://127.0.0.1:3001")
+            unavailable_html, unavailable_module, unavailable_button, retained_attempt = app.refresh_anythingllm_startup_status("http://127.0.0.1:3001")
             self.assertIn("AnythingLLM is not available", unavailable_html)
             self.assertTrue(unavailable_module["visible"])
             self.assertEqual(unavailable_button["variant"], "secondary")
+            self.assertNotIn("value", retained_attempt)
 
             app.anythingllm_observer_api_health = lambda _url: {"reachable": True, "http_status": 200, "error": ""}
-            running_html, running_module, running_button = app.refresh_anythingllm_startup_status("http://127.0.0.1:3001")
+            running_html, running_module, running_button, cleared_attempt = app.refresh_anythingllm_startup_status("http://127.0.0.1:3001")
             self.assertEqual(running_html, "")
             self.assertFalse(running_module["visible"])
             self.assertEqual(running_button["variant"], "secondary")
+            self.assertIsNone(cleared_attempt["value"])
 
         finally:
             app.anythingllm_observer_api_health = original_health
