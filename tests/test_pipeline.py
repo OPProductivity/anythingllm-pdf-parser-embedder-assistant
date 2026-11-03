@@ -2892,12 +2892,13 @@ class PipelineCoreTests(unittest.TestCase):
         attempt = {"api_url": target, "status": "started"}
         with mock.patch.object(app, "anythingllm_observer_api_health", return_value={"reachable": False}):
             timer_html, timer_module, timer_state = app.anythingllm_startup_status_view(target, attempt)
-            refresh_html, refresh_module, _, refresh_state = app.refresh_anythingllm_startup_status(target, attempt)
+            refresh_html, refresh_module, _, refresh_state, refresh_timer = app.refresh_anythingllm_startup_status(target, attempt)
         self.assertIn("This app started AnythingLLM Desktop", timer_html)
         self.assertIn("This app started AnythingLLM Desktop", refresh_html)
         self.assertTrue(timer_module["visible"] and refresh_module["visible"])
         self.assertNotIn("value", timer_state)
         self.assertNotIn("value", refresh_state)
+        self.assertFalse(refresh_timer["active"])
 
         changed_url = app.anythingllm_startup_status_html(
             "http://127.0.0.1:3002", health={"reachable": False}, startup_attempt=attempt,
@@ -2947,6 +2948,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertEqual(result[3], "")
         self.assertFalse(result[4]["visible"])
         self.assertIsNone(result[5])
+        self.assertTrue(result[6]["active"])
 
     def test_app_open_warning_reports_its_own_failed_start(self):
         import rag_pdf_gradio_app as app
@@ -2960,6 +2962,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn("This app tried to start AnythingLLM Desktop", result[3])
         self.assertTrue(result[4]["visible"])
         self.assertEqual(result[5]["status"], "start_failed")
+        self.assertFalse(result[6]["active"])
 
     def test_startup_status_timer_is_passive_and_low_frequency(self):
         import rag_pdf_gradio_app as app
@@ -3091,18 +3094,20 @@ class PipelineCoreTests(unittest.TestCase):
         original_health = app.anythingllm_observer_api_health
         try:
             app.anythingllm_observer_api_health = lambda _url: {"reachable": False, "http_status": None, "error": "refused"}
-            unavailable_html, unavailable_module, unavailable_button, retained_attempt = app.refresh_anythingllm_startup_status("http://127.0.0.1:3001")
+            unavailable_html, unavailable_module, unavailable_button, retained_attempt, stopped_timer = app.refresh_anythingllm_startup_status("http://127.0.0.1:3001")
             self.assertIn("AnythingLLM is not available", unavailable_html)
             self.assertTrue(unavailable_module["visible"])
             self.assertEqual(unavailable_button["variant"], "secondary")
             self.assertNotIn("value", retained_attempt)
+            self.assertFalse(stopped_timer["active"])
 
             app.anythingllm_observer_api_health = lambda _url: {"reachable": True, "http_status": 200, "error": ""}
-            running_html, running_module, running_button, cleared_attempt = app.refresh_anythingllm_startup_status("http://127.0.0.1:3001")
+            running_html, running_module, running_button, cleared_attempt, resumed_timer = app.refresh_anythingllm_startup_status("http://127.0.0.1:3001")
             self.assertEqual(running_html, "")
             self.assertFalse(running_module["visible"])
             self.assertEqual(running_button["variant"], "secondary")
             self.assertIsNone(cleared_attempt["value"])
+            self.assertTrue(resumed_timer["active"])
 
         finally:
             app.anythingllm_observer_api_health = original_health

@@ -355,7 +355,8 @@ EMBEDDING_OBSERVER_QUIET_SECONDS = 60
 # creates an API key, mutates a workspace, or retries an embedding job.
 BACKGROUND_RECONCILIATION_INTERVAL_SECONDS = 5
 # This passive page-level health signal never starts Desktop or changes a workspace.
-# Check often enough that a newly ready Desktop clears the warning promptly.
+# It stops after an unsuccessful bounded app-open launch and can be resumed by
+# a successful manual Refresh; a dismissed warning stops it immediately.
 ANYTHINGLLM_STARTUP_STATUS_INTERVAL_SECONDS = 3
 # This descriptor exists only while the separately-installed guarded Desktop
 # bridge is running. The timer reads it for status but never calls the bridge.
@@ -1622,6 +1623,14 @@ APP_THEME_FOUNDATION_HEAD = """
   html, body { min-height: 100%; }
   html.dark body { background: #0f172a; color: #e5eefc; }
   html:not(.dark) body { background: #eef2f7; color: #1e293b; }
+  /* The warning container mounts before its HTML child. Paint its final color
+     at parser time so hydration cannot show the generic blue panel first. */
+  #anythingllm-startup-status-module {
+    background: #fed7d7; border-color: #f87171; color: #991b1b;
+  }
+  html.dark #anythingllm-startup-status-module {
+    background: #7f1d1d; border-color: #b91c1c; color: #fee2e2;
+  }
   /* These are the stable layout facts from APP_CSS.  Applying them before
      Gradio creates its first component prevents the header from moving when
      the configuration stylesheet takes ownership a moment later. */
@@ -2769,13 +2778,8 @@ gradio-app,
     width: 100%;
     margin: 0 0 14px;
     padding: 12px;
-    border: 1px solid #bfdbfe;
+    border: 1px solid #f87171;
     border-radius: 10px;
-    background: #eff6ff;
-    color: #1e3a5f;
-}
-.anythingllm-startup-status-module:has(.anythingllm-startup-status--offline) {
-    border-color: #f87171;
     background: #fed7d7;
     color: #991b1b;
 }
@@ -2815,11 +2819,6 @@ html.anythingllm-warning-dismissed #anythingllm-startup-status-module {
     color: #ffffff !important;
 }
 body.dark .anythingllm-startup-status-module {
-    border-color: #1d4ed8;
-    background: #172554;
-    color: #dbeafe;
-}
-body.dark .anythingllm-startup-status-module:has(.anythingllm-startup-status--offline) {
     border-color: #b91c1c;
     background: #7f1d1d;
     color: #fee2e2;
@@ -5984,6 +5983,7 @@ def initialize_anythingllm_on_app_open(api_url="", api_key="", workspace_slug=""
         status_html,
         gr.update(visible=not reachable),
         startup_attempt if not reachable else None,
+        gr.update(active=reachable),
     )
 
 
@@ -9997,7 +9997,7 @@ def anythingllm_startup_status_view(api_url="", startup_attempt=None):
 
 
 def refresh_anythingllm_startup_status(api_url="", startup_attempt=None):
-    """Refresh the passive Desktop signal, showing a cue only for an unchanged outage."""
+    """Check on demand and resume monitoring only when the API is reachable."""
     health = anythingllm_observer_api_health(api_url)
     unavailable = not health.get("reachable")
     return (
@@ -10005,6 +10005,7 @@ def refresh_anythingllm_startup_status(api_url="", startup_attempt=None):
         gr.update(visible=unavailable),
         gr.update(value="Refresh Status", variant="secondary"),
         gr.update() if unavailable else gr.update(value=None),
+        gr.update(active=not unavailable),
     )
 
 
@@ -36138,6 +36139,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     anythingllm_startup_status_module,
                     refresh_anythingllm_startup_status_button,
                     anythingllm_startup_attempt,
+                    anythingllm_startup_status_timer,
                 ],
                 show_progress="hidden",
                 queue=False,
@@ -36145,7 +36147,8 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 js=ANYTHINGLLM_STARTUP_STATUS_REFRESH_JS,
             )
             close_anythingllm_startup_status_button.click(
-                fn=None,
+                fn=lambda: gr.update(active=False),
+                outputs=[anythingllm_startup_status_timer],
                 js=ANYTHINGLLM_STARTUP_STATUS_CLOSE_JS,
                 queue=False,
                 show_progress="hidden",
@@ -36346,6 +36349,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     anythingllm_startup_status,
                     anythingllm_startup_status_module,
                     anythingllm_startup_attempt,
+                    anythingllm_startup_status_timer,
                 ],
                 show_progress="minimal",
             )
@@ -36689,10 +36693,11 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             )
             api_url.change(
-                fn=anythingllm_startup_status_view,
+                fn=refresh_anythingllm_startup_status,
                 inputs=[api_url, anythingllm_startup_attempt],
                 outputs=[anythingllm_startup_status, anythingllm_startup_status_module,
-                         anythingllm_startup_attempt],
+                         refresh_anythingllm_startup_status_button,
+                         anythingllm_startup_attempt, anythingllm_startup_status_timer],
                 show_progress="hidden",
                 queue=False,
             )
