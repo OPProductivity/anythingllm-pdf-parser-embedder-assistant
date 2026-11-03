@@ -23070,6 +23070,14 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             segment_pages, text_export_hygiene = prepare_readable_pages(
                 pdf_path, pages, progress_callback=report_export_preparation,
             )
+            report_upload_phase(
+                "candidate_evaluation",
+                f"Building {backend} page segments and checking text quality",
+                completed_units=backend_index + 1,
+                total_units=max(1, len(backend_names)),
+                fallback_fraction=(backend_index + 1) / max(1, len(backend_names)),
+                evidence_kind="segment_quality_review",
+            )
             segments = make_segments(
                 pdf_path,
                 backend,
@@ -23699,6 +23707,14 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     # A reversible, shadow-only field map reviews the *final* author against
     # existing OCR and bounded alternative OCR crops. Failed OCR compositions
     # remain in its ledger and never suppress a later retry or alter labels.
+    report_upload_phase(
+        "candidate_evaluation",
+        "Reviewing author-field evidence with targeted OCR",
+        completed_units=1,
+        total_units=1,
+        fallback_fraction=selection_progress,
+        evidence_kind="author_field_review_started",
+    )
     field_review_started = time.perf_counter()
     try:
         ocr_peer = next((candidate for candidate in viable
