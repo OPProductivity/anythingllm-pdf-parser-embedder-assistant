@@ -565,6 +565,63 @@ def test_auto_confirm_stays_armed_across_setting_changes_and_cancel(
         release.touch()
 
 
+def test_armed_metadata_preview_ignores_stale_manual_confirm_click(
+    page, paused_auto_handoff_app, six_pdf_files
+):
+    (url, scan_started, scan_release, preflight_started,
+     preflight_release, payload) = paused_auto_handoff_app
+    open_local_app(page, url)
+    page.locator(".pdf-upload-input input[type='file']").set_input_files(
+        [str(path) for path in six_pdf_files]
+    )
+    page.wait_for_function(
+        "document.querySelector('.automatic-run-activity')?.dataset.runState === 'ready'",
+        timeout=60000,
+    )
+    page.get_by_role("radio", name="Create local files only").check()
+    metadata = page.get_by_role("checkbox", name=re.compile(r"^Process and recognize metadata for all"))
+    automatic = page.get_by_role("checkbox", name="Confirm and start run automatically")
+    metadata.check()
+    deadline = time.monotonic() + 30
+    while not scan_started.exists():
+        assert time.monotonic() < deadline, "Metadata preview did not start"
+        page.wait_for_timeout(50)
+    try:
+        automatic.check()
+        confirm = page.locator("#confirm-automatic-run-button")
+        expect(confirm).to_have_text("Processing will start automatically")
+        expect(confirm).to_be_disabled()
+        assert page.evaluate("""() => {
+          const host = document.querySelector('#confirm-automatic-run-button');
+          const button = host?.querySelector('button') || host;
+          return getComputedStyle(button).backgroundColor;
+        }""") == "rgb(29, 78, 216)"
+        # Reproduce a stale client that still presents the former blue action.
+        # The server must ignore its click while the armed preview owns work.
+        page.evaluate("""() => {
+          const host = document.querySelector('#confirm-automatic-run-button');
+          const button = host?.querySelector('button') || host;
+          button.disabled = false;
+          button.textContent = 'Confirm and start processing';
+          button.click();
+        }""")
+        page.wait_for_timeout(700)
+        assert not payload.exists()
+        assert not preflight_started.exists()
+        expect(page.locator(".metadata-header-status")).to_have_attribute("data-state", "scanning")
+        scan_release.touch()
+        deadline = time.monotonic() + 90
+        while not preflight_started.exists():
+            assert time.monotonic() < deadline, "Automatic handoff did not start"
+            page.wait_for_timeout(100)
+        assert payload.exists()
+        expect(metadata).to_be_checked()
+        expect(automatic).to_be_checked()
+    finally:
+        scan_release.touch()
+        preflight_release.touch()
+
+
 def test_auto_handoff_reads_latest_settings_at_metadata_completion(
     page, paused_auto_handoff_app, six_pdf_files
 ):
@@ -642,6 +699,9 @@ def test_auto_start_waits_for_metadata_preview_with_custom_output_folder(
         assert not preflight_started.exists(), "Auto-start ran without requested metadata preview"
         expect(metadata).not_to_be_checked()
         expect(automatic).to_be_checked()
+        expect(page.locator("#confirm-automatic-run-button")).to_have_text(
+            "Confirm and start processing"
+        )
         metadata.check()
         deadline = time.monotonic() + 30
         while not scan_started.exists():
@@ -820,6 +880,9 @@ def test_metadata_preview_only_does_not_arm_auto_start(
             assert time.monotonic() < deadline, "Metadata preview did not start"
             page.wait_for_timeout(100)
         expect(automatic).not_to_be_checked()
+        confirm = page.locator("#confirm-automatic-run-button")
+        expect(confirm).to_have_text("Finish metadata preview before confirming")
+        expect(confirm).to_be_disabled()
         release.touch()
         page.wait_for_function(
             "(() => { const s = document.querySelector('#document-metadata-scan-status .metadata-scan-inline'); "
@@ -828,6 +891,8 @@ def test_metadata_preview_only_does_not_arm_auto_start(
             timeout=90000,
         )
         expect(automatic).not_to_be_checked()
+        expect(confirm).to_have_text("Confirm and start processing")
+        expect(confirm).to_be_enabled()
         assert not list((app_home / "run-state").rglob("source-profile.json"))
     finally:
         release.touch()
@@ -1476,6 +1541,9 @@ def test_unchecking_metadata_during_scan_stops_preview_and_leaves_auto_start_ina
     )
     expect(auto_start).to_be_checked()
     expect(preview_all).not_to_be_checked()
+    confirm = page.locator("#confirm-automatic-run-button")
+    expect(confirm).to_have_text("Confirm and start processing")
+    expect(confirm).to_be_enabled()
     expect(page.locator("#document-metadata-scan-status")).to_contain_text(
         "Automatic metadata processing off"
     )

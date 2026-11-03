@@ -2005,6 +2005,17 @@ APP_JS = """
   };
   const wireAutomaticRunTimer = () => {
     const beginConfirmPresentation = (button) => {
+      const autoArmed = document.querySelector("#metadata-auto-confirm-control input")?.checked;
+      const previewAll = document.querySelector("#metadata-preview-all-control input")?.checked;
+      const metadata = document.querySelector("#document-metadata-scan-status .metadata-scan-inline");
+      const previewComplete = ["ready", "warning"].includes(metadata?.dataset.state)
+        && metadata?.dataset.previewScope === "all"
+        && metadata?.dataset.previewComplete === "true";
+      const manualReviewAllowed = previewComplete && (
+        metadata?.dataset.state === "warning"
+        || Number(metadata?.dataset.missingAuthors || 0) > 0
+      );
+      if (previewAll && (!previewComplete || (autoArmed && !manualReviewAllowed))) return;
       const shouldAcknowledge = !button.disabled
         && /confirm and start processing/i.test(button.textContent || "");
       if (!shouldAcknowledge || button.dataset.ragClientConfirmPending === "true") return;
@@ -2248,6 +2259,7 @@ APP_JS = """
       button.classList.toggle("rag-run-success", text.includes("successful"));
       button.classList.toggle("rag-run-warning", text.includes("review upload"));
       button.classList.toggle("rag-run-failed", text.includes("failed"));
+      button.classList.toggle("rag-auto-awaiting", text.includes("processing will start automatically"));
       // Confirm is mounted but intentionally disabled before Review. Only the
       // accepted in-flight state should retain a bright primary appearance.
       button.classList.toggle("rag-run-processing", processing);
@@ -5429,6 +5441,14 @@ button#confirm-automatic-run-button.rag-run-failed,
 }
 /* Processing is a state label, not a disabled control. The mounted Confirm
    button is otherwise visibly inactive before Review or after a reset. */
+button#confirm-automatic-run-button.rag-auto-awaiting,
+#confirm-automatic-run-button button.rag-auto-awaiting {
+    background: #1d4ed8 !important;
+    border-color: #1d4ed8 !important;
+    color: #ffffff !important;
+    opacity: 1 !important;
+    cursor: default !important;
+}
 button#confirm-automatic-run-button.rag-run-processing,
 button#confirm-automatic-run-button.rag-run-processing:disabled,
 #confirm-automatic-run-button button.rag-run-processing,
@@ -13900,7 +13920,9 @@ def stream_automatic_workspace_name_preview(
 
 
 @automatic_next_run_callback(1)
-def automatic_process_button_state(pdf_files=None, folder_pdf_files=None, folder_manifest=None, processed=False):
+def automatic_process_button_state(pdf_files=None, folder_pdf_files=None, folder_manifest=None,
+                                   processed=False, *, auto_armed=False, preview_all=False,
+                                   metadata_status="", selection_state=None):
     folder_candidates, _manifest_reused = folder_manifest_candidates(folder_pdf_files, folder_manifest)
     has_input = bool(normalize_file_list(pdf_files) or folder_candidates)
     if not has_input:
@@ -13908,6 +13930,7 @@ def automatic_process_button_state(pdf_files=None, folder_pdf_files=None, folder
             value="Confirm and start processing",
             interactive=False,
             variant="secondary",
+            elem_classes=[],
         )
     if processed:
         return gr.update(
@@ -13917,11 +13940,29 @@ def automatic_process_button_state(pdf_files=None, folder_pdf_files=None, folder
             # replay preparation/upload with the same PDF selection.
             interactive=False,
             variant="huggingface",
+            elem_classes=[],
+        )
+    if manual_confirmation_waits_for_automatic_preview(
+        auto_armed, preview_all, metadata_status, selection_state,
+    ):
+        return gr.update(
+            value="Processing will start automatically",
+            interactive=False,
+            variant="secondary",
+            elem_classes=["rag-auto-awaiting"],
+        )
+    if preview_all and not metadata_preview_ready_for_selection(metadata_status, selection_state):
+        return gr.update(
+            value="Finish metadata preview before confirming",
+            interactive=False,
+            variant="secondary",
+            elem_classes=[],
         )
     return gr.update(
         value="Confirm and start processing",
         interactive=True,
         variant="primary",
+        elem_classes=[],
     )
 
 
@@ -13959,6 +14000,9 @@ def automatic_selection_action_states(
     folder_pdf_files=None,
     folder_manifest=None,
     selection_state=None,
+    auto_armed=False,
+    preview_all=False,
+    metadata_status="",
     request: gr.Request = None,
 ):
     """Keep Confirm and Cancel synchronized with the owned selection.
@@ -13988,20 +14032,49 @@ def automatic_selection_action_states(
             # selection snapshot.  The final acknowledgement enables Confirm;
             # this callback must not authorize an early click.
             return (
-                gr.update(value="Confirm and start processing", interactive=False, variant="primary"),
+                gr.update(
+                    value=("Processing will start automatically" if auto_armed and preview_all
+                           else "Confirm and start processing"),
+                    interactive=False, variant="secondary" if auto_armed and preview_all else "primary",
+                    elem_classes=["rag-auto-awaiting"] if auto_armed and preview_all else [],
+                ),
                 gr.update(value="Cancel", interactive=True, visible=True),
                 gr.update(value=automatic_selection_preparing_status_html(pdf_files, folder_pdf_files), visible=True),
                 metadata_preview_checkbox_label_update(pdf_files, folder_pdf_files),
             )
-    process_button = automatic_process_button_state(pdf_files, folder_pdf_files, folder_manifest)
+    process_button = automatic_process_button_state(
+        pdf_files, folder_pdf_files, folder_manifest,
+        auto_armed=auto_armed, preview_all=preview_all,
+        metadata_status=metadata_status, selection_state=selection_state,
+    )
+    has_selection = bool(
+        normalize_file_list(pdf_files) or normalize_file_list(folder_pdf_files)
+        or folder_manifest_candidates(folder_pdf_files, folder_manifest)[0]
+    )
     return (
         process_button,
-        gr.update(value="Cancel", interactive=bool(process_button.get("interactive")), visible=True),
+        gr.update(value="Cancel", interactive=has_selection, visible=True),
         gr.update(value=automatic_selection_status_html(
-            "ready" if process_button.get("interactive") else "idle",
+            "ready" if has_selection else "idle",
             selection_state,
         ), visible=True),
         metadata_preview_checkbox_label_update(pdf_files, folder_pdf_files),
+    )
+
+
+def automatic_confirm_button_for_choices(
+    pdf_files, folder_pdf_files, folder_manifest, selection_state,
+    auto_armed, preview_all, metadata_status="", request: gr.Request = None,
+):
+    """Reflect the checkbox choice without claiming or cancelling a run."""
+    if (not automatic_selection_is_ready(selection_state)
+            or not _selection_preview_is_current(selection_state, request)
+            or automatic_lifecycle_busy()):
+        return gr.update()
+    return automatic_process_button_state(
+        pdf_files, folder_pdf_files, folder_manifest,
+        auto_armed=auto_armed, preview_all=preview_all,
+        metadata_status=metadata_status, selection_state=selection_state,
     )
 
 
@@ -14443,7 +14516,9 @@ def automatic_folder_selection_begin_state(
     return result
 
 
-def automatic_selection_finish_state(selection_state, pdf_files=None, folder_pdf_files=None, folder_manifest=None, request: gr.Request = None):
+def automatic_selection_finish_state(selection_state, pdf_files=None, folder_pdf_files=None,
+                                     folder_manifest=None, auto_armed=False, preview_all=False,
+                                     metadata_status="", request: gr.Request = None):
     """Acknowledge that the visible selection/configuration snapshot is ready."""
     state = dict(selection_state or {})
     if not _selection_preview_is_current(state, request):
@@ -14484,7 +14559,11 @@ def automatic_selection_finish_state(selection_state, pdf_files=None, folder_pdf
     return (
         state,
         gr.update(interactive=True),
-        automatic_process_button_state(pdf_files, folder_pdf_files, folder_manifest),
+        automatic_process_button_state(
+            pdf_files, folder_pdf_files, folder_manifest,
+            auto_armed=auto_armed, preview_all=preview_all,
+            metadata_status=metadata_status, selection_state=state,
+        ),
         gr.update(value="Cancel", interactive=True, visible=True),
         gr.update(value=automatic_selection_status_html(state["state"], state), visible=True),
         gr.update(interactive=True),
@@ -16347,6 +16426,7 @@ def refresh_live_automatic_run_ui(viewed_run_root=None):
                 value="Stopping processing…" if record.get("cancel_requested") else "Processing…",
                 interactive=False,
                 variant="primary",
+                elem_classes=[],
             ) if state == "running" else gr.update(),
             gr.update(),
             gr.update(),
@@ -18620,7 +18700,8 @@ def cancel_or_reset_automatic_run(
         {},
         automatic_run_timing_html(state="cancelled", message="Stopping pre-processing." if preflight_in_flight else "Selection preview cancelled."),
         gr.update(value="Processing…" if preflight_in_flight else "Confirm and start processing",
-                  interactive=False, variant="primary" if preflight_in_flight else "secondary"),
+                  interactive=False, variant="primary" if preflight_in_flight else "secondary",
+                  elem_classes=[]),
         gr.update(),
         gr.update(visible=False, interactive=False),
         gr.update(value="Stopping processing…" if preflight_in_flight else "Cancel", interactive=False),
@@ -25713,10 +25794,10 @@ def automatic_completion_button_state(completion):
     """
     state = (completion or {}).get("state")
     if state == "successful":
-        return gr.update(value="Processing successful ✓", interactive=False, variant="huggingface")
+        return gr.update(value="Processing successful ✓", interactive=False, variant="huggingface", elem_classes=[])
     if state == "warning":
         if (completion or {}).get("code") == "AUTO-EMBEDDING-RECONCILE-001":
-            return gr.update(value="Preparation complete — check AnythingLLM", interactive=False, variant="secondary")
+            return gr.update(value="Preparation complete — check AnythingLLM", interactive=False, variant="secondary", elem_classes=[])
         not_processed = max(0, int((completion or {}).get("not_processed_pdf_count") or 0))
         if not_processed:
             noun = "PDF" if not_processed == 1 else "PDFs"
@@ -25724,13 +25805,14 @@ def automatic_completion_button_state(completion):
                 value=f"Completed — {not_processed} {noun} not processed",
                 interactive=False,
                 variant="secondary",
+                elem_classes=[],
             )
-        return gr.update(value="Completed with diagnostic notice", interactive=False, variant="secondary")
+        return gr.update(value="Completed with diagnostic notice", interactive=False, variant="secondary", elem_classes=[])
     if (completion or {}).get("code") == "AUTO-EMBEDDING-PARTIAL-001":
-        return gr.update(value="Partial embedding — recovery available", interactive=False, variant="stop")
+        return gr.update(value="Partial embedding — recovery available", interactive=False, variant="stop", elem_classes=[])
     if state == "cancelled":
-        return gr.update(value="Processing stopped", interactive=False, variant="secondary")
-    return gr.update(value="Processing failed — see Run history", interactive=False, variant="stop")
+        return gr.update(value="Processing stopped", interactive=False, variant="secondary", elem_classes=[])
+    return gr.update(value="Processing failed — see Run history", interactive=False, variant="stop", elem_classes=[])
 
 
 def automatic_confirmation_html(settings):
@@ -26626,7 +26708,7 @@ def automatic_run_started_response(settings):
         gr.update(),
         gr.update(),
         gr.update(),
-        gr.update(value="Processing…", interactive=False, variant="primary"),
+        gr.update(value="Processing…", interactive=False, variant="primary", elem_classes=[]),
         gr.update(),
         automatic_run_timing_html(
             expected_seconds,
@@ -26637,7 +26719,7 @@ def automatic_run_started_response(settings):
         ),
         gr.update(),
         gr.update(value="", visible=False),
-        gr.update(value="Processing…", interactive=False, variant="primary"),
+        gr.update(value="Processing…", interactive=False, variant="primary", elem_classes=[]),
         gr.update(value="Cancel", interactive=True, visible=True),
         gr.update(visible=False, interactive=False),
     )
@@ -26661,7 +26743,7 @@ def automatic_preprocessing_started_response():
         gr.update(),
         gr.update(),
         gr.update(),
-        gr.update(value="Processing…", interactive=False, variant="primary"),
+        gr.update(value="Processing…", interactive=False, variant="primary", elem_classes=[]),
         gr.update(),
         automatic_run_timing_html(0, "pre-processing", state="running", server_driven=True),
         gr.update(),
@@ -26670,7 +26752,7 @@ def automatic_preprocessing_started_response():
         # commits the settings.  Keep the same steady Processing label used by
         # the worker instead of narrating internal confirmation mechanics.
         # The durable status trace still records validation and reservation.
-        gr.update(value="Processing…", interactive=False, variant="primary"),
+        gr.update(value="Processing…", interactive=False, variant="primary", elem_classes=[]),
         gr.update(value="Cancel", interactive=True, visible=True),
         gr.update(visible=False, interactive=False),
     )
@@ -27432,15 +27514,58 @@ def run_automatic_for_browser_stream(
 
 
 def run_manual_confirmation_with_auto_state(
-    selection_state, viewed_run_root, auto_armed, *values,
+    selection_state, viewed_run_root, auto_armed, preview_all, metadata_status, *values,
     progress=gr.Progress(track_tqdm=False), request: gr.Request = None,
 ):
     """A deliberate Confirm proceeds even when automatic author review is held."""
+    if manual_confirmation_waits_for_automatic_preview(
+        auto_armed, preview_all, metadata_status, selection_state,
+    ) or (preview_all and not metadata_preview_ready_for_selection(
+        metadata_status, selection_state,
+    )):
+        # A stale enabled browser button must not turn an armed preview into
+        # a manual processing run. Only the metadata toggle or Cancel can
+        # stop that preview; the server owns the eventual automatic handoff.
+        updates = [gr.update() for _ in range(17)]
+        updates[10] = gr.update(
+            value=("Processing will start automatically" if auto_armed
+                   else "Finish metadata preview before confirming"),
+            interactive=False, variant="secondary",
+            elem_classes=["rag-auto-awaiting"] if auto_armed else [],
+        )
+        yield tuple(updates)
+        return
     for outputs in run_automatic_for_browser_stream(
         selection_state, viewed_run_root, *values, explicit_manual=not auto_armed,
         progress=progress, request=request,
     ):
         yield gr.update(), *outputs
+
+
+def metadata_preview_ready_for_selection(metadata_status, selection_state):
+    status = str(metadata_status or "")
+    revision = int((selection_state or {}).get("revision") or 0)
+    return (
+        ('data-state="ready"' in status or 'data-state="warning"' in status)
+        and 'data-preview-scope="all"' in status
+        and 'data-preview-complete="true"' in status
+        and f'data-selection-revision="{revision}"' in status
+    )
+
+
+def manual_confirmation_waits_for_automatic_preview(auto_armed, preview_all,
+                                                    metadata_status, selection_state):
+    """Keep an armed auto handoff in charge except during author review."""
+    if not (auto_armed and preview_all):
+        return False
+    status = str(metadata_status or "")
+    if metadata_preview_ready_for_selection(status, selection_state) and 'data-state="warning"' in status:
+        return False
+    review_hold = (
+        metadata_preview_ready_for_selection(status, selection_state)
+        and re.search(r'data-missing-authors="[1-9][0-9]*"', status) is not None
+    )
+    return not review_hold
 
 
 def unresolved_preview_author_keys(metadata_status, document_overrides, files):
@@ -36834,7 +36959,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 ).then(
                     fn=automatic_selection_action_states,
                     inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest,
-                            automatic_selection_state],
+                            automatic_selection_state, auto_confirm_after_metadata, preview_all_metadata, auto_metadata_status],
                     outputs=[confirm_automatic_run_button,
                              cancel_automatic_run_button, automatic_run_activity,
                              preview_all_metadata],
@@ -37051,7 +37176,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=automatic_selection_action_states,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state],
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state, auto_confirm_after_metadata, preview_all_metadata, auto_metadata_status],
                 outputs=[
                     confirm_automatic_run_button,
                     cancel_automatic_run_button,
@@ -37086,7 +37211,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 concurrency_id="automatic-workspace-preview",
             ).then(
                 fn=automatic_selection_action_states,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state],
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state, auto_confirm_after_metadata, preview_all_metadata, auto_metadata_status],
                 outputs=[
                     confirm_automatic_run_button,
                     cancel_automatic_run_button,
@@ -37097,7 +37222,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=automatic_selection_finish_state,
-                inputs=[automatic_selection_state, auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
+                inputs=[automatic_selection_state, auto_pdfs, auto_folder_pdfs, auto_folder_manifest, auto_confirm_after_metadata, preview_all_metadata, auto_metadata_status],
                 outputs=[
                     automatic_selection_state,
                     auto_mode,
@@ -37221,7 +37346,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 concurrency_id="automatic-workspace-preview",
             ).then(
                 fn=automatic_selection_finish_state,
-                inputs=[automatic_selection_state, auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
+                inputs=[automatic_selection_state, auto_pdfs, auto_folder_pdfs, auto_folder_manifest, auto_confirm_after_metadata, preview_all_metadata, auto_metadata_status],
                 outputs=[
                     automatic_selection_state,
                     auto_mode,
@@ -37344,7 +37469,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 concurrency_id="automatic-workspace-preview",
             ).then(
                 fn=automatic_selection_action_states,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state],
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state, auto_confirm_after_metadata, preview_all_metadata, auto_metadata_status],
                 outputs=[
                     confirm_automatic_run_button,
                     cancel_automatic_run_button,
@@ -37355,7 +37480,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=automatic_selection_finish_state,
-                inputs=[automatic_selection_state, auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
+                inputs=[automatic_selection_state, auto_pdfs, auto_folder_pdfs, auto_folder_manifest, auto_confirm_after_metadata, preview_all_metadata, auto_metadata_status],
                 outputs=[
                     automatic_selection_state,
                     auto_mode,
@@ -37464,7 +37589,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 concurrency_id="automatic-workspace-preview",
             ).then(
                 fn=automatic_selection_action_states,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state],
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state, auto_confirm_after_metadata, preview_all_metadata, auto_metadata_status],
                 outputs=[
                     confirm_automatic_run_button,
                     cancel_automatic_run_button,
@@ -37475,7 +37600,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=automatic_selection_finish_state,
-                inputs=[automatic_selection_state, auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
+                inputs=[automatic_selection_state, auto_pdfs, auto_folder_pdfs, auto_folder_manifest, auto_confirm_after_metadata, preview_all_metadata, auto_metadata_status],
                 outputs=[
                     automatic_selection_state,
                     auto_mode,
@@ -37543,7 +37668,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=automatic_selection_finish_state,
-                inputs=[automatic_selection_state, auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
+                inputs=[automatic_selection_state, auto_pdfs, auto_folder_pdfs, auto_folder_manifest, auto_confirm_after_metadata, preview_all_metadata, auto_metadata_status],
                 outputs=[
                     automatic_selection_state,
                     auto_mode,
@@ -37601,7 +37726,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 concurrency_id="automatic-workspace-preview",
             ).then(
                 fn=automatic_selection_action_states,
-                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state],
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest, automatic_selection_state, auto_confirm_after_metadata, preview_all_metadata, auto_metadata_status],
                 outputs=[
                     confirm_automatic_run_button,
                     cancel_automatic_run_button,
@@ -37612,7 +37737,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
             ).then(
                 fn=automatic_selection_finish_state,
-                inputs=[automatic_selection_state, auto_pdfs, auto_folder_pdfs, auto_folder_manifest],
+                inputs=[automatic_selection_state, auto_pdfs, auto_folder_pdfs, auto_folder_manifest, auto_confirm_after_metadata, preview_all_metadata, auto_metadata_status],
                 outputs=[automatic_selection_state, auto_mode, confirm_automatic_run_button, cancel_automatic_run_button, automatic_run_activity, auto_pdfs],
                 show_progress="hidden",
                 queue=False,
@@ -37979,7 +38104,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 # Restore Ready before the server evaluates auto-start.
                 fn=automatic_selection_action_states,
                 inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest,
-                        automatic_selection_state],
+                        automatic_selection_state, auto_confirm_after_metadata, preview_all_metadata, auto_metadata_status],
                 outputs=[confirm_automatic_run_button,
                          cancel_automatic_run_button, automatic_run_activity,
                          preview_all_metadata],
@@ -37998,6 +38123,16 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 fn=auto_start_dependency_note,
                 inputs=[auto_confirm_after_metadata, preview_all_metadata],
                 outputs=[auto_start_dependency_status],
+                show_progress="hidden",
+                queue=False,
+            )
+            gr.on(
+                triggers=[preview_all_metadata.change, auto_confirm_after_metadata.change],
+                fn=automatic_confirm_button_for_choices,
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest,
+                        automatic_selection_state, auto_confirm_after_metadata,
+                        preview_all_metadata, auto_metadata_status],
+                outputs=[confirm_automatic_run_button],
                 show_progress="hidden",
                 queue=False,
             )
@@ -38024,7 +38159,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
             ).then(
                 fn=automatic_selection_action_states,
                 inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest,
-                        automatic_selection_state],
+                        automatic_selection_state, auto_confirm_after_metadata, preview_all_metadata, auto_metadata_status],
                 outputs=[confirm_automatic_run_button,
                          cancel_automatic_run_button, automatic_run_activity,
                          preview_all_metadata],
@@ -38054,7 +38189,8 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 # normal control payload makes the Confirm click observable by
                 # the server and resilient to a stale client-side State value.
                 inputs=[automatic_selection_state, automatic_viewed_run_root,
-                        auto_confirm_after_metadata, *automatic_run_inputs,
+                        auto_confirm_after_metadata, preview_all_metadata,
+                        auto_metadata_status, *automatic_run_inputs,
                         auto_title_override, auto_author_override, auto_short_label_override],
                 outputs=server_auto_outputs,
                 # The live Automatic status card already acknowledges Confirm

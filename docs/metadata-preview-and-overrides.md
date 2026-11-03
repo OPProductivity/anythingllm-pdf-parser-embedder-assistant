@@ -22,6 +22,12 @@ arbitrary first-five scan. **Process metadata for all files** requests a full
 preview. Without it, Confirm still detects every PDF freshly during processing.
 **Confirm and start run automatically** starts only after that explicit full
 preview completes; neither checkbox changes the other.
+While all-file recognition is still running, Confirm waits for the preview
+instead of interrupting it. With automatic start armed, the button reads
+**Processing will start automatically** in darker blue and cannot be clicked.
+With automatic start off, it reads **Finish metadata preview before confirming**
+until the preview is complete. Unchecking metadata recognition makes manual
+Confirm available again; the separate Cancel action remains available.
 
 Turning off all-file recognition stops its current preview after the PDF being
 inspected and keeps completed results already displayed. Turning it on again

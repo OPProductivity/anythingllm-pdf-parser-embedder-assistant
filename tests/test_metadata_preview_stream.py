@@ -30,6 +30,66 @@ def result(path, *_args, **_kwargs):
     )
 
 
+def test_armed_preview_disables_manual_confirm_but_keeps_cancel_available():
+    state = {"state": "ready", "revision": 5}
+    button, cancel, activity, _label = app.automatic_selection_action_states(
+        ["source.pdf"], [], {}, state, True, True,
+    )
+    assert button["value"] == "Processing will start automatically"
+    assert button["interactive"] is False
+    assert cancel["interactive"] is True
+    assert 'data-run-state="ready"' in activity["value"]
+    manual = app.automatic_confirm_button_for_choices(
+        ["source.pdf"], [], {}, state, True, False,
+    )
+    assert manual["value"] == "Confirm and start processing"
+    assert manual["interactive"] is True
+    scanning = app.metadata_scan_status_html("scanning", "2/5", scope="all", revision=5)
+    waiting = app.automatic_confirm_button_for_choices(
+        ["source.pdf"], [], {}, state, False, True, scanning,
+    )
+    assert waiting["value"] == "Finish metadata preview before confirming"
+    assert waiting["interactive"] is False
+
+
+def test_manual_confirm_cannot_claim_armed_preview_before_author_review(monkeypatch):
+    start = Mock()
+    monkeypatch.setattr(app, "run_automatic_for_browser_stream", start)
+    state = {"state": "ready", "revision": 5}
+    scanning = app.metadata_scan_status_html("scanning", "5/22", scope="all", revision=5)
+    blocked = list(app.run_manual_confirmation_with_auto_state(
+        state, "", True, True, scanning,
+    ))
+    assert len(blocked) == 1
+    assert blocked[0][10]["value"] == "Processing will start automatically"
+    assert blocked[0][10]["interactive"] is False
+    start.assert_not_called()
+    ready_missing = app.metadata_scan_status_html(
+        "ready", "Preview ready", scope="all", complete=True,
+        revision=5, missing_authors=1, missing_author_keys=["source.pdf"],
+    )
+    assert not app.manual_confirmation_waits_for_automatic_preview(
+        True, True, ready_missing, state,
+    )
+    assert app.manual_confirmation_waits_for_automatic_preview(
+        True, True, app.metadata_scan_status_html(
+            "ready", "Preview ready", scope="all", complete=True, revision=5,
+        ), state,
+    )
+    assert not app.manual_confirmation_waits_for_automatic_preview(True, False, scanning, state)
+    assert not app.manual_confirmation_waits_for_automatic_preview(False, True, scanning, state)
+    warning = app.metadata_scan_status_html(
+        "warning", "Preview completed with errors", scope="all",
+        complete=True, revision=5,
+    )
+    assert not app.manual_confirmation_waits_for_automatic_preview(True, True, warning, state)
+    blocked_manual = list(app.run_manual_confirmation_with_auto_state(
+        state, "", False, True, scanning,
+    ))
+    assert blocked_manual[0][10]["value"] == "Finish metadata preview before confirming"
+    start.assert_not_called()
+
+
 def test_scanning_is_yielded_before_inference_and_each_result_before_next_file(monkeypatch):
     inspect = Mock(side_effect=result)
     monkeypatch.setattr(app, "detected_metadata_preview", inspect)
