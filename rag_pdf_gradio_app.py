@@ -33622,6 +33622,9 @@ def run_automatic(
             # Keeping this worker-local prevents an early PDF from mutating the
             # workspace while later selections are still being prepared.
             prepare_and_upload=False,
+            # Automatic upload stages PDFs locally before one shared upload.
+            # Only that upload path needs a broad Desktop storage baseline.
+            inspect_anythingllm_storage_baseline=bool(prepare_and_upload),
             anythingllm_api_url=resolved_api_url,
             anythingllm_api_key=(api_key or "").strip(),
             workspace_slug=workspace_slug,

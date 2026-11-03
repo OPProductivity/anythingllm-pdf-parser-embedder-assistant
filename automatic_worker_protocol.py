@@ -49,6 +49,7 @@ AUTOMATIC_WORKER_ARGUMENT_FIELDS = frozenset({
     "flat_output_without_logs",
     "include_back_matter",
     "include_front_matter",
+    "inspect_anythingllm_storage_baseline",
     "lean_retention",
     "marker_style",
     "max_vector_chunks",

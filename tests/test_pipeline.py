@@ -12189,6 +12189,7 @@ class PipelineCoreTests(unittest.TestCase):
             def fake_prepare(pdf_path, out_dir, args):
                 captured["anythingllm_api_url"] = args.anythingllm_api_url
                 captured["prepare_and_upload"] = args.prepare_and_upload
+                captured["inspect_anythingllm_storage_baseline"] = args.inspect_anythingllm_storage_baseline
                 captured["native_upload_transport"] = getattr(args, "native_upload_transport", "")
                 captured["workspace_slug"] = args.workspace_slug
                 captured["document_folders"] = args.anythingllm_create_document_folders
@@ -12266,6 +12267,7 @@ class PipelineCoreTests(unittest.TestCase):
             app.prepare_pdf = original_prepare
             app.automatic_batch_output_capacity_preflight = original_capacity
         self.assertFalse(captured["prepare_and_upload"])
+        self.assertFalse(captured["inspect_anythingllm_storage_baseline"])
         self.assertEqual(captured["anythingllm_api_url"], "")
         self.assertEqual(captured["native_upload_transport"], "raw_text")
         self.assertEqual(captured["workspace_slug"], "")
@@ -12552,6 +12554,7 @@ class PipelineCoreTests(unittest.TestCase):
 
             def fake_prepare(pdf_path, out_dir, args):
                 captured["prepare_and_upload"] = args.prepare_and_upload
+                captured["inspect_anythingllm_storage_baseline"] = args.inspect_anythingllm_storage_baseline
                 captured["defer_lean_retention"] = args.defer_lean_retention
                 captured["upload_limit"] = args.upload_limit
                 captured["native_upload_transport"] = args.native_upload_transport
@@ -12639,6 +12642,7 @@ class PipelineCoreTests(unittest.TestCase):
         # Automatic upload mode stages this worker locally; the one shared
         # Desktop queue is submitted only after every selected PDF finishes.
         self.assertFalse(captured["prepare_and_upload"])
+        self.assertTrue(captured["inspect_anythingllm_storage_baseline"])
         self.assertTrue(captured["defer_lean_retention"])
         self.assertEqual(captured["upload_limit"], 0)
         self.assertEqual(captured["native_upload_transport"], "file_upload")
@@ -13266,6 +13270,7 @@ class PipelineCoreTests(unittest.TestCase):
     def test_prepare_pdf_does_not_auto_run_temporary_workspace_validation_for_local_only(self):
         original_run_temp_validation = pipeline.run_temporary_workspace_validation
         original_detect_api = pipeline.detect_anythingllm_api_url
+        original_inspect_storage = pipeline.inspect_anythingllm_storage
         try:
             calls = {"count": 0}
 
@@ -13288,6 +13293,9 @@ class PipelineCoreTests(unittest.TestCase):
 
             pipeline.run_temporary_workspace_validation = fake_temp_validation
             pipeline.detect_anythingllm_api_url = lambda api_url, api_key="", timeout=1.25: {"api_url": api_url}
+            pipeline.inspect_anythingllm_storage = lambda *_args, **_kwargs: self.fail(
+                "local-only preparation scanned AnythingLLM storage"
+            )
 
             with tempfile.TemporaryDirectory() as tmpdir:
                 root = Path(tmpdir)
@@ -13324,6 +13332,7 @@ class PipelineCoreTests(unittest.TestCase):
                     ollama_url="http://127.0.0.1:11434/api/embed",
                     max_vector_probes=4,
                     prepare_and_upload=False,
+                    inspect_anythingllm_storage_baseline=False,
                     anythingllm_api_url="http://127.0.0.1:3001",
                     anythingllm_api_key="",
                     workspace_slug="",
@@ -13333,12 +13342,14 @@ class PipelineCoreTests(unittest.TestCase):
                     anythingllm_chunk_size=400,
                     anythingllm_chunk_overlap=40,
                 )
-                pipeline.prepare_pdf(pdf_path, root / "output", args)
+                summary = pipeline.prepare_pdf(pdf_path, root / "output", args)
+                self.assertEqual(summary["storage_inspection_status"], "not_checked_no_upload")
 
             self.assertEqual(calls["count"], 0)
         finally:
             pipeline.run_temporary_workspace_validation = original_run_temp_validation
             pipeline.detect_anythingllm_api_url = original_detect_api
+            pipeline.inspect_anythingllm_storage = original_inspect_storage
 
     def test_build_run_diagnostics_does_not_turn_workspace_configuration_into_a_gate(self):
         diagnostics = pipeline.build_run_diagnostics(

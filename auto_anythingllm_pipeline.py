@@ -7615,7 +7615,7 @@ def build_run_diagnostics(
                 else "Review this only if you plan to upload or cite from the inline-fallback artifact."
             ),
         )
-    if storage_report.get("status") not in {"complete", "missing"}:
+    if storage_report.get("status") not in {"complete", "missing", "not_checked_no_upload"}:
         add("ANYTHINGLLM_STORAGE_INSPECTION_FAILED", "warning", "anythingllm", storage_report.get("error") or str(storage_report.get("status")), "Close database locks or verify the Desktop storage path.")
     runtime_status = metadata_schema_report.get("runtime_api_status")
     if runtime_status == "server_unreachable":
@@ -24404,8 +24404,22 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
                 "passed": 0,
                 "failed": 0,
             }
+        inspect_storage_baseline = bool(getattr(args, "inspect_anythingllm_storage_baseline", True))
+        def read_storage_baseline():
+            if inspect_storage_baseline:
+                return inspect_anythingllm_storage(storage_dir)
+            return {
+                "status": "not_checked_no_upload",
+                "storage_dir": str(storage_dir),
+                "tables": [],
+                "error": "",
+            }
         inspection_steps = [
-            ("Reading local AnythingLLM storage baseline", "storage_report", lambda: inspect_anythingllm_storage(storage_dir)),
+            (
+                "Reading local AnythingLLM storage baseline" if inspect_storage_baseline else "Skipping AnythingLLM storage baseline for local output",
+                "storage_report",
+                read_storage_baseline,
+            ),
             ("Reading workspace model configuration", "workspace_configuration", lambda: read_workspace_model_configuration(storage_dir, target_workspace_slug)),
             ("Reading AnythingLLM metadata schema", "metadata_schema_report", lambda: get_anythingllm_metadata_schema(
                 (args.anythingllm_api_url or "").strip(), args.anythingllm_api_key,
@@ -24471,7 +24485,11 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             {
                 "check": "storage_inspection",
                 "status": storage_report.get("status"),
-                "details": storage_report.get("error") or "Read-only inspection only; no direct DB writes attempted.",
+                "details": (
+                    "No upload requested; broad AnythingLLM storage scan omitted."
+                    if storage_report.get("status") == "not_checked_no_upload"
+                    else storage_report.get("error") or "Read-only inspection only; no direct DB writes attempted."
+                ),
             },
             {
                 "check": "metadata_schema",
@@ -25421,7 +25439,12 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
     )
     selected_expected_upload_payloads = expected_upload_payloads
     write_json(inspection_dir / "api-upload-report.json", upload_report)
-    if has_shared_batch_inspection:
+    if not bool(getattr(args, "inspect_anythingllm_storage_baseline", True)):
+        storage_after_report = {
+            "status": "not_checked_no_upload",
+            "message": "Local file output did not change AnythingLLM storage.",
+        }
+    elif has_shared_batch_inspection:
         # The per-batch verifier above already observes this document's exact
         # upload path and vector evidence.  A full LanceDB/storage traversal is
         # both global and mutable, so defer it to one batch-final audit.
