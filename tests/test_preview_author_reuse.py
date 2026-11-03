@@ -107,6 +107,7 @@ def test_preview_reuse_verifies_bytes_and_applies_run_override(tmp_path, monkeyp
 
 @pytest.mark.parametrize("snapshot_change", [
     "missing", "recognition_effort", "use_file_title_fallback", "title",
+    "author_samples_fingerprint", "schema_version",
 ])
 def test_missing_or_incompatible_preview_runs_fresh_author_inference(
         tmp_path, monkeypatch, snapshot_change):
@@ -125,6 +126,10 @@ def test_missing_or_incompatible_preview_runs_fresh_author_inference(
         snapshot["recognition_effort"] = "extremely_thorough"
     elif snapshot_change == "use_file_title_fallback":
         snapshot["use_file_title_fallback"] = False
+    elif snapshot_change == "author_samples_fingerprint":
+        snapshot["author_samples_fingerprint"] = "0" * 64
+    elif snapshot_change == "schema_version":
+        snapshot["schema_version"] = 1
     else:
         snapshot["title"] = "A Different Work"
 
@@ -141,6 +146,54 @@ def test_missing_or_incompatible_preview_runs_fresh_author_inference(
     profile = json.loads((out / "source-profile.json").read_text(encoding="utf-8"))
     expected_status = "not_available" if snapshot_change == "missing" else "stale_or_incompatible"
     assert profile["author_preview_reuse_status"] == expected_status
+    assert calls == [1]
+
+
+def test_fifth_page_credit_matches_fresh_worker_and_reuses_preview(tmp_path, monkeypatch):
+    pdf = tmp_path / "shared-histories.pdf"
+    with fitz.open() as doc:
+        doc.set_metadata({"title": "Shared Histories"})
+        for number in range(1, 7):
+            page = doc.new_page()
+            text = ("Praise for Shared Histories" if number == 1 else
+                    "Shared Histories\nAlice Smith\nUniversity Press" if number == 5 else
+                    "Front matter")
+            page.insert_text((72, 72), text)
+        doc.save(pdf)
+
+    snapshots = []
+    app.detected_metadata_preview(
+        [str(pdf)], snapshot_callback=lambda _index, _path, value: snapshots.append(value),
+        recognition_effort="thorough",
+    )
+    assert len(snapshots) == 1
+    assert snapshots[0]["author"] == "Alice Smith"
+    metadata = pipeline.pdf_metadata(pdf, include_author_samples=True)
+    assert snapshots[0]["author_samples_fingerprint"] == pipeline.author_samples_fingerprint(
+        metadata["_author_text_samples"], metadata["_author_sample_error"],
+    )
+    assert 5 in [sample["page"] for sample in metadata["_author_text_samples"]]
+
+    original_infer = pipeline.infer_profiled_author
+    calls = []
+
+    def record_infer(*args, **kwargs):
+        calls.append(1)
+        return original_infer(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "infer_profiled_author", record_infer)
+    reused_dir = tmp_path / "reused_fifth_page"
+    pipeline.prepare_pdf(pdf, reused_dir, _worker_args(tmp_path, snapshots[0]))
+    reused_profile = json.loads((reused_dir / "source-profile.json").read_text(encoding="utf-8"))
+    assert reused_profile["author_preview_reuse_status"] == "verified_preview_reused"
+    assert reused_profile["detected_author"] == "Alice Smith"
+    assert calls == []
+
+    fresh_dir = tmp_path / "fresh_fifth_page"
+    pipeline.prepare_pdf(pdf, fresh_dir, _worker_args(tmp_path, {}))
+    fresh_profile = json.loads((fresh_dir / "source-profile.json").read_text(encoding="utf-8"))
+    assert fresh_profile["detected_author"] == reused_profile["detected_author"]
+    assert fresh_profile["metadata_provenance"]["source_author"] == reused_profile["metadata_provenance"]["source_author"]
     assert calls == [1]
 
 

@@ -130,7 +130,8 @@ from author_metadata.work_identity import resolve_work_identity
 from author_metadata.pdf import (  # noqa: F401
     recover_author_from_selected_extraction, infer_author_from_pdf_text,
     selected_extraction_author_samples, infer_author_from_initial_pdf_pages,
-    corroborates_filename_surname,
+    corroborates_filename_surname, acquire_production_author_samples,
+    author_samples_fingerprint,
 )
 from author_metadata.review import (  # noqa: F401
     is_reviewed_work_citation,
@@ -922,55 +923,10 @@ def pdf_metadata(path: Path, include_page_geometry=False, include_author_samples
                     progress_callback("page_geometry", page_number, len(doc))
         author_text_samples = []
         author_sample_error = ""
-        author_sample_errors = []
         if include_author_samples:
-            def read_author_sample(page_number):
-                try:
-                    text = doc.load_page(page_number - 1).get_text("text")
-                    if text:
-                        author_text_samples.append({"page": page_number, "text": text})
-                except Exception as exc:
-                    author_sample_errors.append(f"page {page_number}: {exc}")
-
-            try:
-                opening_numbers = range(1, min(5, len(doc)) + 1)
-                for page_number in opening_numbers:
-                    read_author_sample(page_number)
-                opening_identity = resolve_work_identity(
-                    metadata.get("title") or "", path, author_text_samples,
-                )
-                book_frontmatter = opening_identity.profile.kind == "book"
-                sparse_frontmatter = (not book_frontmatter and len(doc) > 8
-                                      and 0 < sum(len(row["text"].strip()) for row in author_text_samples) < 300)
-                contents_frontmatter = (not book_frontmatter and any(
-                    re.search(r'\b(?:table of contents|contents)\b',row['text'][:800],re.I)
-                    for row in author_text_samples))
-                page_numbers = list(opening_numbers)
-                if book_frontmatter:
-                    page_numbers.extend(range(5, min(12, len(doc)) + 1))
-                elif sparse_frontmatter or contents_frontmatter or (len(doc) > 8 and not any(
-                    int(row['page']) <= 2 and row['text'].strip() for row in author_text_samples
-                )):
-                    # A small amount of cover/artwork text can hide a book's
-                    # first readable title page after the fourth PDF page.
-                    page_numbers.extend(range(5, min(8, len(doc)) + 1))
-                page_numbers.extend((max(1, len(doc) - 1), len(doc)))
-                if contents_frontmatter and any(re.search(r'\babout the author\b',row['text'],re.I)
-                                               for row in author_text_samples):
-                    page_numbers.extend(range(max(1,len(doc)-7),len(doc)+1))
-                page_numbers = list(dict.fromkeys(number for number in page_numbers
-                                                  if 1 <= number <= len(doc)))
-                for position, page_number in enumerate(page_numbers):
-                    if position < len(opening_numbers):
-                        if callable(progress_callback):
-                            progress_callback("author_sample", position + 1, len(page_numbers))
-                        continue
-                    read_author_sample(page_number)
-                    if callable(progress_callback):
-                        progress_callback("author_sample", position + 1, len(page_numbers))
-            except Exception as exc:
-                author_sample_errors.append(f"sampling plan: {exc}")
-            author_sample_error = "; ".join(author_sample_errors)
+            author_text_samples, author_sample_error = acquire_production_author_samples(
+                doc, path, metadata, progress_callback,
+            )
         result = {
             "pdf_page_count": len(doc),
             "title": normalize_text(metadata.get("title") or ""),
@@ -22388,9 +22344,11 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         preview_reuse_status = "stale_or_incompatible"
         candidate_report = preview_snapshot.get("inferred_author_report")
         if (
-            preview_snapshot.get("schema_version") == 1
+            preview_snapshot.get("schema_version") == 2
             and str(preview_snapshot.get("source_sha256") or "").lower() == source_sha
             and str(preview_snapshot.get("recognition_effort") or "") == author_context.recognition_effort
+            and str(preview_snapshot.get("author_samples_fingerprint") or "")
+            == author_samples_fingerprint(author_text_samples, author_sample_error)
             and bool(preview_snapshot.get("use_file_title_fallback")) == bool(use_file_title_fallback)
             and normalize_text(preview_snapshot.get("title") or "") == normalize_text(title)
             and (preview_snapshot.get("author") or getattr(args, "document_author", ""))

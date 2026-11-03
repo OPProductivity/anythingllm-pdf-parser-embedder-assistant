@@ -28472,10 +28472,11 @@ def detected_metadata_preview(
         if preview_sha:
             inference_options["include_inference_report"] = True
         author_inference = infer_author_from_initial_pdf_pages(
-            pdf_path, page_limit=4, use_file_title_fallback=use_file_title_fallback,
+            pdf_path, page_limit=5, use_file_title_fallback=use_file_title_fallback,
             **inference_options,
         )
         inferred_author_report = author_inference.pop("_inferred_author_report", None)
+        author_samples_fingerprint = author_inference.pop("_author_samples_fingerprint", "")
         APP_LOGGER.info(
             "Author metadata recognition completed in %.3fs for %s",
             time.perf_counter() - author_started, pdf_path,
@@ -28589,11 +28590,13 @@ def detected_metadata_preview(
                         "technical_rows": technical_rows,
                         "identity": workspace_source_identity_from_pdf(
                             pdf_path, author_report=author_inference, **_effort_kwargs(recognition_effort))})
-        if (callable(snapshot_callback) and preview_sha and isinstance(inferred_author_report, dict)
+        if (callable(snapshot_callback) and preview_sha and author_samples_fingerprint
+                and isinstance(inferred_author_report, dict)
                 and _metadata_preview_file_fingerprint(pdf_path) == preview_fingerprint):
             snapshot_callback(index - 1, pdf_path, {
-                "schema_version": 1,
+                "schema_version": 2,
                 "source_sha256": preview_sha,
+                "author_samples_fingerprint": author_samples_fingerprint,
                 "source_fingerprint": preview_fingerprint,
                 "recognition_effort": normalize_effort(recognition_effort).value,
                 "use_file_title_fallback": bool(use_file_title_fallback),

@@ -62,7 +62,7 @@ def test_preview_uses_its_own_just_acquired_author_report_without_a_second_autho
     monkeypatch.setattr(app, "infer_author_from_initial_pdf_pages", inference)
     output = app.detected_metadata_preview([str(path)], recognition_effort="thorough")
     assert "Alice Harrington" in output[3] and "Harrington" in output[3]
-    inference.assert_called_once_with(path, page_limit=4, use_file_title_fallback=True, recognition_effort="thorough")
+    inference.assert_called_once_with(path, page_limit=5, use_file_title_fallback=True, recognition_effort="thorough")
 
 
 def test_visible_effort_controls_are_absent_and_preview_callbacks_use_hidden_thorough_state():

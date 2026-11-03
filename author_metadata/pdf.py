@@ -1,5 +1,7 @@
 """PDF-page acquisition and selected-text recovery for author evidence."""
 
+import hashlib
+import json
 import re
 from pathlib import Path
 
@@ -14,6 +16,67 @@ from .names import (looks_like_person_name, normalize_author_candidate,
                     split_author_line_candidates)
 from .scholarly_article import has_editorial_opening
 from .work_identity import resolve_work_identity
+
+
+def author_samples_fingerprint(samples, sampling_error=""):
+    """Bind a preview verdict to the exact native samples seen by the worker."""
+    payload = {
+        "samples": [[int(row["page"]), str(row["text"])] for row in samples],
+        "sampling_error": str(sampling_error or ""),
+    }
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def acquire_production_author_samples(doc, path, metadata, progress_callback=None):
+    """Read the shared first-five/front-matter/closing-page author seed plan."""
+    samples = []
+    errors = []
+
+    def read_page(number):
+        try:
+            value = doc.load_page(number - 1).get_text("text")
+            if value:
+                samples.append({"page": number, "text": value})
+        except Exception as exc:
+            errors.append(f"page {number}: {exc}")
+
+    try:
+        opening_numbers = range(1, min(5, len(doc)) + 1)
+        for number in opening_numbers:
+            read_page(number)
+        opening_identity = resolve_work_identity(
+            metadata.get("title") or "", path, samples,
+        )
+        book_frontmatter = opening_identity.profile.kind == "book"
+        sparse_frontmatter = (not book_frontmatter and len(doc) > 8
+                              and 0 < sum(len(row["text"].strip()) for row in samples) < 300)
+        contents_frontmatter = (not book_frontmatter and any(
+            re.search(r"\b(?:table of contents|contents)\b", row["text"][:800], re.I)
+            for row in samples
+        ))
+        page_numbers = list(opening_numbers)
+        if book_frontmatter:
+            page_numbers.extend(range(5, min(12, len(doc)) + 1))
+        elif sparse_frontmatter or contents_frontmatter or (len(doc) > 8 and not any(
+            int(row["page"]) <= 2 and row["text"].strip() for row in samples
+        )):
+            # Cover and artwork text can precede the first readable title page.
+            page_numbers.extend(range(5, min(8, len(doc)) + 1))
+        page_numbers.extend((max(1, len(doc) - 1), len(doc)))
+        if contents_frontmatter and any(
+            re.search(r"\babout the author\b", row["text"], re.I) for row in samples
+        ):
+            page_numbers.extend(range(max(1, len(doc) - 7), len(doc) + 1))
+        page_numbers = list(dict.fromkeys(number for number in page_numbers
+                                          if 1 <= number <= len(doc)))
+        for position, number in enumerate(page_numbers):
+            if position >= len(opening_numbers):
+                read_page(number)
+            if callable(progress_callback):
+                progress_callback("author_sample", position + 1, len(page_numbers))
+    except Exception as exc:
+        errors.append(f"sampling plan: {exc}")
+    return samples, "; ".join(errors)
 
 
 def selected_extraction_author_samples(pages, *, page_limit=4):
@@ -165,33 +228,38 @@ def infer_author_from_initial_pdf_pages(path: Path, title_hint="", *, page_limit
     try:
         with fitz.open(pdf_path) as doc:
             metadata = dict(doc.metadata or {})
-            samples = []
+            if page_limit == 5:
+                samples, warning = acquire_production_author_samples(doc, pdf_path, metadata)
+                if warning:
+                    sampling_errors.append(warning)
+            else:
+                samples = []
 
-            def read_seed_page(index):
-                try:
-                    value = doc.load_page(index).get_text("text")
-                except Exception as exc:
-                    sampling_errors.append(f"page {index + 1}: {type(exc).__name__}")
-                    return
-                if value:
-                    samples.append({"page": index + 1, "text": value})
+                def read_seed_page(index):
+                    try:
+                        value = doc.load_page(index).get_text("text")
+                    except Exception as exc:
+                        sampling_errors.append(f"page {index + 1}: {type(exc).__name__}")
+                        return
+                    if value:
+                        samples.append({"page": index + 1, "text": value})
 
-            limit = min(max(1, int(page_limit or 3)), len(doc))
-            for index in range(limit):
-                read_seed_page(index)
-            identity = resolve_work_identity(
-                metadata.get("title") or "", pdf_path, samples,
-                title_override=title_hint,
-                use_file_title_fallback=use_file_title_fallback,
-            )
-            if limit >= 4 and identity.profile.kind == "book":
-                for index in range(limit, min(12, len(doc))):
+                limit = min(max(1, int(page_limit or 3)), len(doc))
+                for index in range(limit):
                     read_seed_page(index)
-            elif identity.profile.kind == "scholarly_article" and has_editorial_opening(samples):
-                for number in dict.fromkeys((max(1, len(doc) - 1), len(doc))):
-                    if number <= limit:
-                        continue
-                    read_seed_page(number - 1)
+                identity = resolve_work_identity(
+                    metadata.get("title") or "", pdf_path, samples,
+                    title_override=title_hint,
+                    use_file_title_fallback=use_file_title_fallback,
+                )
+                if limit >= 4 and identity.profile.kind == "book":
+                    for index in range(limit, min(12, len(doc))):
+                        read_seed_page(index)
+                elif identity.profile.kind == "scholarly_article" and has_editorial_opening(samples):
+                    for number in dict.fromkeys((max(1, len(doc) - 1), len(doc))):
+                        if number <= limit:
+                            continue
+                        read_seed_page(number - 1)
     except Exception as exc:
         return {"author": "", "source": "error", "page": 0, "evidence": "",
                 "error": type(exc).__name__, "author_confidence": author_confidence({})}
@@ -219,6 +287,7 @@ def infer_author_from_initial_pdf_pages(path: Path, title_hint="", *, page_limit
         # The UI stores this only in its private, selection-scoped preview
         # cache. The visible panel still receives the compact result above.
         result["_inferred_author_report"] = report
+        result["_author_samples_fingerprint"] = author_samples_fingerprint(samples, sampling_warning)
     if sampling_warning:
         result["initial_sampling_warning"] = sampling_warning
     return result
