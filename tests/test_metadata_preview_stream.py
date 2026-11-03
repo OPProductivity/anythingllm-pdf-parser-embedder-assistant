@@ -15,6 +15,8 @@ pytestmark = pytest.mark.offline_deterministic
 def idle_selection(monkeypatch):
     monkeypatch.setattr(app, "LIVE_AUTOMATIC_RUN_STATUS", {})
     monkeypatch.setattr(app, "SELECTION_PREVIEW_OWNERS", app.OrderedDict())
+    monkeypatch.setattr(app, "METADATA_PREVIEW_COMPLETED", app.OrderedDict())
+    monkeypatch.setattr(app, "METADATA_PREVIEW_TOGGLE_GENERATIONS", app.OrderedDict())
     monkeypatch.setattr(app, "folder_manifest_candidates", lambda files, manifest: (files or [], True))
 
 
@@ -153,6 +155,123 @@ def test_intermediate_heading_has_no_transient_next_pdf_sentence(monkeypatch):
     assert "6/6" not in events[1][4]
     assert "1/6" in events[0][4] and "1/6" in events[1][4]
     assert all("reading the next PDF" not in event[4] for event in events)
+
+
+def test_rechecking_unchanged_selection_keeps_detected_panels_until_rescan_finishes(monkeypatch):
+    inspect = Mock(side_effect=result)
+    monkeypatch.setattr(app, "detected_metadata_preview", inspect)
+    files = [f"source-{index}.pdf" for index in range(6)]
+    paused = app.metadata_scan_status_html(
+        "paused", "Automatic metadata processing off.", scope="none", revision=7,
+    )
+    events = list(app.stream_all_metadata_preview_on_checkbox_change(
+        files, [], selection_state={"revision": 7}, preview_all=True,
+        metadata_status=paused,
+    ))
+    assert len(events) == 12
+    assert all("value" not in event[3] for event in events[:-1])
+    assert "Rescanning metadata for all 6 files" in events[0][4]
+    assert "Complete: ['source-0.pdf']" in events[-1][3]
+    assert "Complete: ['source-5.pdf']" in events[-1][3]
+    assert inspect.call_count == 6
+
+
+def test_rechecking_unchanged_selection_resumes_after_last_completed_pdf(monkeypatch, tmp_path):
+    inspect = Mock(side_effect=result)
+    monkeypatch.setattr(app, "detected_metadata_preview", inspect)
+    files = [str(tmp_path / f"source-{index}.pdf") for index in range(6)]
+    for path in files:
+        app.Path(path).write_bytes(b"%PDF-1.4\nfixture")
+    request = SimpleNamespace(session_hash="metadata-resume-unit-test")
+    state = {"state": "ready", "revision": 7}
+    app.metadata_preview_toggle_changed(True, False, request=request)
+    first_stream = app.stream_automatic_detected_metadata_preview(
+        files, [], selection_state=state, preview_all=True, request=request,
+    )
+    for _ in range(4):
+        next(first_stream)
+    assert inspect.call_count == 2
+    app.metadata_preview_toggle_changed(False, False, request=request)
+    list(first_stream)
+    app.metadata_preview_toggle_changed(True, False, request=request)
+    paused = app.metadata_scan_status_html(
+        "paused", "Automatic metadata processing off.", scope="none", revision=7,
+    )
+    resumed = app.stream_all_metadata_preview_on_checkbox_change(
+        files, [], selection_state=state, preview_all=True,
+        metadata_status=paused, request=request,
+    )
+    first = next(resumed)
+    assert "3/6" in first[4]
+    assert "Continuing metadata recognition" in first[4]
+    assert "Complete:" in first[3]
+    assert "source-0.pdf" in first[3]
+    assert "source-1.pdf" in first[3]
+    assert inspect.call_count == 2
+    list(resumed)
+    assert [call.args[0][0] for call in inspect.call_args_list] == files
+
+
+def test_changed_pdf_invalidates_cached_prefix_from_that_pdf(monkeypatch, tmp_path):
+    inspect = Mock(side_effect=result)
+    monkeypatch.setattr(app, "detected_metadata_preview", inspect)
+    files = [str(tmp_path / f"source-{index}.pdf") for index in range(6)]
+    for path in files:
+        app.Path(path).write_bytes(b"%PDF-1.4\nfixture")
+    request = SimpleNamespace(session_hash="metadata-changed-pdf-unit-test")
+    state = {"state": "ready", "revision": 8}
+    app.metadata_preview_toggle_changed(True, False, request=request)
+    stream = app.stream_automatic_detected_metadata_preview(
+        files, [], selection_state=state, preview_all=True, request=request,
+    )
+    for _ in range(4):
+        next(stream)
+    app.metadata_preview_toggle_changed(False, False, request=request)
+    list(stream)
+    app.Path(files[1]).write_bytes(b"%PDF-1.4\nchanged fixture content")
+    app.metadata_preview_toggle_changed(True, False, request=request)
+    resumed = app.stream_automatic_detected_metadata_preview(
+        files, [], selection_state=state, preview_all=True, request=request,
+    )
+    first = next(resumed)
+    assert "2/6" in first[4]
+    assert "Complete:" in first[3]
+    assert "source-0.pdf" in first[3]
+    resumed.close()
+
+
+def test_rechecking_after_selection_change_does_not_retain_old_panels(monkeypatch):
+    monkeypatch.setattr(app, "detected_metadata_preview", Mock(side_effect=result))
+    paused = app.metadata_scan_status_html(
+        "paused", "Automatic metadata processing off.", scope="none", revision=7,
+    )
+    stream = app.stream_all_metadata_preview_on_checkbox_change(
+        [f"source-{index}.pdf" for index in range(6)], [],
+        selection_state={"revision": 8}, preview_all=True, metadata_status=paused,
+    )
+    first = next(stream)
+    assert "source-0.pdf" in first[3]
+    assert "Waiting for metadata detection." in first[3]
+    stream.close()
+
+
+def test_clear_detected_preview_keeps_document_editors_and_invalidates_scan():
+    request = SimpleNamespace(session_hash="metadata-clear-unit-test")
+    files = [f"source-{index}.pdf" for index in range(6)]
+    app.metadata_preview_toggle_changed(True, False, request=request)
+    before = app._metadata_preview_toggle_generation(request)
+    result = app.clear_detected_metadata_preview(
+        files, [], selection_state={"state": "ready", "revision": 9},
+        auto_armed=True, request=request,
+    )
+    assert len(result) == 7
+    assert result[3].count('class="metadata-override-input ') == 24
+    assert "Not previewed" in result[3]
+    assert 'data-metadata-known="filename"' not in result[3]
+    assert 'data-state="paused"' in result[4]
+    assert result[5]["value"] is False
+    assert result[6]["visible"] is True
+    assert app._metadata_preview_toggle_generation(request) > before
 
 
 def test_folder_names_are_visible_before_the_all_page_inspection_starts(monkeypatch, tmp_path):

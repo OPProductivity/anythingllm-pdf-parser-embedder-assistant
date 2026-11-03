@@ -102,7 +102,7 @@ def local_app_url(tmp_path_factory, local_app_home):
 
 
 @pytest.fixture
-def paused_metadata_app(tmp_path, tmp_path_factory):
+def paused_metadata_app(request, tmp_path, tmp_path_factory):
     """Hold one real preview at inference so editing during scanning is deterministic."""
     port = free_local_port()
     app_home = tmp_path_factory.mktemp("edit-home")
@@ -122,20 +122,26 @@ from pathlib import Path
 import rag_pdf_gradio_app as app
 started, release = (Path(p) for p in sys.argv[1:3])
 infer = app.infer_author_from_initial_pdf_pages
+pause_on = {int(value) for value in sys.argv[4].split(',')}
+calls = 0
 def paused_infer(*args, **kwargs):
-    started.touch()
-    deadline = time.monotonic() + 60
-    while not release.exists():
-        if time.monotonic() >= deadline:
-            raise TimeoutError('Browser test did not release metadata preview')
-        time.sleep(0.05)
+    global calls
+    calls += 1
+    if calls in pause_on:
+        started.write_text(str(calls))
+        deadline = time.monotonic() + 60
+        while not release.exists():
+            if time.monotonic() >= deadline:
+                raise TimeoutError('Browser test did not release metadata preview')
+            time.sleep(0.05)
     return infer(*args, **kwargs)
 app.infer_author_from_initial_pdf_pages = paused_infer
 app.launch_application(port=int(sys.argv[3]), inbrowser=False)
 """
     with (tmp_path / "app-stderr.log").open("wb") as stderr:
         process = subprocess.Popen(
-            [sys.executable, "-c", script, str(started), str(release), str(port)],
+            [sys.executable, "-c", script, str(started), str(release), str(port),
+             ",".join(str(value) for value in getattr(request, "param", (1,)))],
             cwd=str(PROJECT_ROOT), env=environment,
             stdout=subprocess.DEVNULL, stderr=stderr,
         )
@@ -1315,6 +1321,35 @@ def test_metadata_overrides_update_processing_fields(page, local_app_url, one_pa
     )).to_have_value("")
 
 
+def test_clear_detected_preview_preserves_manual_overrides(page, local_app_url, one_page_pdf):
+    open_local_app(page, local_app_url)
+    page.locator(".pdf-upload-input input[type='file']").set_input_files(str(one_page_pdf))
+    accordion = page.locator("#document-metadata-accordion")
+    accordion.locator(":scope > button.label-wrap").click()
+    page.wait_for_function(
+        "document.querySelector('#document-metadata-scan-status .metadata-scan-inline')?.dataset.state === 'ready'",
+        timeout=60000,
+    )
+    author = page.get_by_label("Override Author", exact=True)
+    author.fill("My manual author")
+    button = page.get_by_role("button", name="Clear detected metadata (keep overrides)")
+    expect(button).to_be_visible()
+    button.click()
+    page.wait_for_function(
+        "document.querySelector('#document-metadata-scan-status .metadata-scan-inline')?.dataset.state === 'paused'",
+        timeout=30000,
+    )
+    expect(author).to_have_value("My manual author")
+    expect(accordion.locator(".metadata-panel")).to_contain_text("Not previewed")
+    expect(accordion.locator(
+        'tr:has(> th:text-is("Title used")) .metadata-detected-value'
+    )).to_have_text("Not previewed")
+    assert "My manual author" in page.locator(
+        "#automatic-document-overrides-transport input, "
+        "#automatic-document-overrides-transport textarea"
+    ).input_value()
+
+
 def test_removing_other_pdfs_preserves_surviving_metadata_overrides(
     page, local_app_url, local_app_home, six_pdf_files
 ):
@@ -1453,6 +1488,91 @@ def test_unchecking_metadata_during_scan_stops_preview_and_leaves_auto_start_ina
         "&& s?.dataset.state === 'ready'; })()",
         timeout=90000,
     )
+    assert not list((app_home / "run-state").rglob("source-profile.json"))
+
+
+@pytest.mark.parametrize("paused_metadata_app", [(3, 4)], indirect=True)
+def test_rechecking_same_selection_resumes_after_completed_files(
+    page, paused_metadata_app, six_pdf_files
+):
+    url, started, release, _app_home = paused_metadata_app
+    open_local_app(page, url)
+    page.locator(".pdf-upload-input input[type='file']").set_input_files(
+        [str(path) for path in six_pdf_files]
+    )
+    preview_all = page.get_by_role("checkbox", name=re.compile(r"^Process and recognize metadata for all"))
+    expect(preview_all).to_be_visible(timeout=30000)
+    preview_all.check()
+    deadline = time.monotonic() + 30
+    while not started.exists():
+        assert time.monotonic() < deadline, "Preview did not start"
+        page.wait_for_timeout(50)
+    assert started.read_text() == "3"
+    accordion = page.locator("#document-metadata-accordion")
+    accordion.locator(":scope > button.label-wrap").click()
+    first_author = accordion.locator(".metadata-panel").first.locator(
+        'tr:has(> th:text-is("Author")) .metadata-detected-value'
+    )
+    old_author = first_author.inner_text()
+    assert old_author not in {"", "Not previewed", "Loading…"}
+    preview_all.uncheck()
+    release.touch()
+    page.wait_for_function(
+        "document.querySelector('#document-metadata-scan-status .metadata-scan-inline')?.dataset.state === 'paused'",
+        timeout=30000,
+    )
+    expect(first_author).to_have_text(old_author)
+    started.unlink()
+    release.unlink()
+    preview_all.check()
+    deadline = time.monotonic() + 30
+    while not started.exists():
+        assert time.monotonic() < deadline, "Resume did not start"
+        page.wait_for_timeout(50)
+    assert started.read_text() == "4"
+    expect(page.locator("#document-metadata-scan-status")).to_contain_text("Continuing metadata recognition")
+    expect(page.locator("#document-metadata-scan-status")).to_contain_text("4/6")
+    expect(first_author).to_have_text(old_author)
+    release.touch()
+    page.wait_for_function(
+        "(() => { const s = document.querySelector('#document-metadata-scan-status .metadata-scan-inline'); "
+        "return s?.dataset.previewScope === 'all' && s?.dataset.previewComplete === 'true'; })()",
+        timeout=90000,
+    )
+    expect(first_author).to_have_text(old_author)
+
+
+def test_clearing_detected_metadata_during_scan_keeps_overrides_and_blocks_auto_start(
+    page, paused_metadata_app, six_pdf_files
+):
+    url, started, release, app_home = paused_metadata_app
+    open_local_app(page, url)
+    page.locator(".pdf-upload-input input[type='file']").set_input_files(
+        [str(path) for path in six_pdf_files]
+    )
+    preview_all = page.get_by_role("checkbox", name=re.compile(r"^Process and recognize metadata for all"))
+    auto_start = page.get_by_role("checkbox", name="Confirm and start run automatically")
+    expect(preview_all).to_be_visible(timeout=30000)
+    auto_start.check()
+    preview_all.check()
+    deadline = time.monotonic() + 30
+    while not started.exists():
+        assert time.monotonic() < deadline, "Preview did not start"
+        page.wait_for_timeout(50)
+    accordion = page.locator("#document-metadata-accordion")
+    accordion.locator(":scope > button.label-wrap").click()
+    first_author = accordion.locator(".metadata-panel").first.get_by_label("Override Author", exact=True)
+    first_author.fill("Manual author stays")
+    page.get_by_role("button", name="Clear detected metadata (keep overrides)").click()
+    release.touch()
+    page.wait_for_function(
+        "document.querySelector('#document-metadata-scan-status .metadata-scan-inline')?.dataset.state === 'paused'",
+        timeout=30000,
+    )
+    expect(first_author).to_have_value("Manual author stays")
+    expect(auto_start).to_be_checked()
+    expect(preview_all).not_to_be_checked()
+    expect(page.locator("#metadata-auto-start-dependency-note")).to_be_visible()
     assert not list((app_home / "run-state").rglob("source-profile.json"))
 
 

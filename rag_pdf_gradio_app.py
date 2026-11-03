@@ -3326,6 +3326,12 @@ body .gradio-container .document-metadata-preview input.metadata-override-input:
 .document-metadata-preview .metadata-preview-list > .metadata-panel + .metadata-panel {
     margin-top: 8px;
 }
+#document-metadata-accordion:not(:has(.metadata-preview-list)) #clear-detected-metadata-preview {
+    display: none !important;
+}
+#clear-detected-metadata-preview {
+    margin-top: 10px;
+}
 .document-metadata-preview .metadata-selection-note {
     padding: 6px 8px;
     color: var(--body-text-color-subdued);
@@ -13472,7 +13478,7 @@ def concise_author_evidence(author, evidence):
 
 
 def pending_selected_metadata_preview(pdf_files=None, folder_files=None, folder_manifest=None,
-                                      selection_state=None, request: gr.Request = None):
+                                      selection_state=None, request: gr.Request = None, *, cleared=False):
     """Show every document's editors from paths alone, before PDF inspection."""
     if automatic_lifecycle_busy() or not _selection_preview_is_current(selection_state, request):
         return gr.update()
@@ -13488,8 +13494,10 @@ def pending_selected_metadata_preview(pdf_files=None, folder_files=None, folder_
     if not files:
         return pending_metadata_panel_html("Select a PDF to inspect its metadata.")
     panels = [pending_metadata_panel_html(
-        "Loading PDF…",
-        filename=Path(path).name, loading=True,
+        "Not previewed." if cleared else "Loading PDF…",
+        filename=Path(path).name, loading=not cleared,
+        detected_value="Not previewed" if cleared else "",
+        title_from_filename=not cleared,
         document_key=local_path_identity_key(path),
     ) for path in files]
     if not _selection_preview_is_current(selection_state, request):
@@ -13510,11 +13518,13 @@ def stream_automatic_detected_metadata_preview(
     recognition_effort=None,
     preview_all=False,
     request: gr.Request = None,
+    *,
+    retain_existing_preview=False,
 ):
-    """Publish scanning feedback and each result during one fresh inspection.
+    """Publish scanning feedback and resume a stopped, unchanged preview.
 
-    Completed HTML belongs only to this generator. No author, page text or OCR
-    evidence is retained for another selection or for the confirmed run.
+    The bounded per-session preview cache holds completed display panels only
+    for the current selection. Confirm still detects every PDF freshly.
     """
     if automatic_lifecycle_busy() or not _selection_preview_is_current(selection_state, request):
         yield tuple(gr.update() for _ in range(7))
@@ -13549,12 +13559,29 @@ def stream_automatic_detected_metadata_preview(
     selection_revision = int((selection_state or {}).get("revision") or 0)
     displayed = files if preview_all else files if len(files) <= 5 else []
     preview_scope = "all" if preview_all else "limited" if displayed else "none"
-    completed_html = []
+    cache_scope = _metadata_preview_cache_scope(
+        request, selection_state, files,
+        (current_title, current_author, current_short_label,
+         bool(use_file_title_fallback), bool(apply_batch_metadata_overrides),
+         str(recognition_effort or "")),
+    ) if preview_all else None
+    completed_html = _metadata_preview_cached_prefix(cache_scope, files)
+    resume_at = len(completed_html)
+    display_retained = retain_existing_preview and not completed_html
+    progress_prefix = (
+        f"Continuing metadata recognition for all {len(files)} files… "
+        if resume_at else
+        f"Rescanning metadata for all {len(files)} files… "
+        if retain_existing_preview and preview_all else
+        f"Metadata recognition processing for all {len(files)} files… "
+    )
     preview_errors = []
     field_updates = tuple(gr.update(value=value or "", interactive=False) for value in
                           (current_title, current_author, current_short_label))
     if len(files) > 1 and not apply_batch_metadata_overrides:
         field_updates = tuple(gr.update(value="", interactive=False) for _ in range(3))
+    if display_retained:
+        field_updates = tuple(gr.update(interactive=False) for _ in range(3))
     def preview_list_html(active_index=None, detail=""):
         panels = list(completed_html)
         for pending_index in range(len(panels), len(files)):
@@ -13590,25 +13617,50 @@ def stream_automatic_detected_metadata_preview(
         )
         return
 
-    for index, path in enumerate(displayed):
+    if resume_at == len(displayed):
+        missing_authors = sum('data-author-missing="true"' in panel for panel in completed_html)
+        missing_author_keys = [
+            local_path_identity_key(files[index])
+            for index, panel in enumerate(completed_html)
+            if 'data-author-missing="true"' in panel
+        ]
+        missing_note = (
+            f" ({missing_authors} file{'s' if missing_authors != 1 else ''} "
+            f"{'lack' if missing_authors != 1 else 'lacks'} recognized author metadata!)"
+        ) if missing_authors else ""
+        yield (
+            *(dict(update, interactive=True) for update in field_updates),
+            preview_list_html(),
+            metadata_scan_status_html(
+                "ready",
+                f"Preview ready for {len(displayed)} of {len(files)} PDFs."
+                f"{missing_note}\u00a0\u00a0Expand here",
+                scope=preview_scope, complete=True, revision=selection_revision,
+                missing_authors=missing_authors, missing_author_keys=missing_author_keys,
+            ),
+            gr.update(),
+            gr.update(),
+        )
+        return
+
+    for index in range(resume_at, len(displayed)):
+        path = displayed[index]
         if (automatic_lifecycle_busy() or not _selection_preview_is_current(selection_state, request)
                 or not _metadata_preview_toggle_is_current(request, toggle_generation, preview_all)):
             yield tuple(gr.update() for _ in range(7))
             return
         scanning = (
-            (f"Metadata recognition processing for all {len(files)} files… "
-             if preview_all else "Author metadata recognition scanning… ")
+            (progress_prefix if preview_all else "Author metadata recognition scanning… ")
             + f"{index + 1}/{len(displayed)}: "
             f"{Path(path).name}. {index} preview(s) complete. "
             "Reviewing available document evidence before deciding."
         )
         yield (
             *field_updates,
-            preview_list_html(index, scanning),
+            gr.update() if display_retained else preview_list_html(index, scanning),
             metadata_scan_status_html(
                 "scanning", (
-                    f"Metadata recognition processing for all {len(files)} files… "
-                    f"{index + 1}/{len(displayed)}"
+                    f"{progress_prefix}{index + 1}/{len(displayed)}"
                     if preview_all else
                     f"Inspecting metadata for preview {index + 1} of {len(displayed)}…"
                 ), scope=preview_scope, revision=selection_revision,
@@ -13636,6 +13688,8 @@ def stream_automatic_detected_metadata_preview(
                     index + 1, Path(path).name,
                     match.group(1) if match else "inspection",
                 ))
+            else:
+                _metadata_preview_cache_store(cache_scope, index, path, result[3])
         except Exception as exc:
             APP_LOGGER.exception("individual PDF metadata preview failed")
             kind, message = metadata_preview_failure(Path(path), exc)
@@ -13665,7 +13719,8 @@ def stream_automatic_detected_metadata_preview(
             field_updates = tuple({**update, "interactive": True} for update in field_updates)
         yield (
             *field_updates,
-            preview_list_html(),
+            (gr.update() if display_retained and index + 1 < len(displayed)
+             else preview_list_html()),
             metadata_scan_status_html(
                 "warning" if preview_errors and index + 1 == len(displayed) else
                 "ready" if index + 1 == len(displayed) else "scanning",
@@ -13676,8 +13731,7 @@ def stream_automatic_detected_metadata_preview(
                     f"Preview ready for {len(displayed)} of {len(files)} PDFs."
                     f"{missing_note}\u00a0\u00a0Expand here"
                 ) if index + 1 == len(displayed) else
-                f"Metadata recognition processing for all {len(files)} files… "
-                f"{index + 1}/{len(displayed)}"
+                f"{progress_prefix}{index + 1}/{len(displayed)}"
                 if preview_all else
                 f"Inspecting metadata for preview {index + 1} of {len(displayed)}…",
                 scope=preview_scope, complete=index + 1 == len(displayed),
@@ -13700,6 +13754,7 @@ def stream_all_metadata_preview_on_checkbox_change(
     current_short_label="", use_file_title_fallback=True,
     apply_batch_metadata_overrides=False, folder_manifest=None,
     selection_state=None, recognition_effort=None, preview_all=False,
+    metadata_status="",
     request: gr.Request = None,
 ):
     """Let a pending selection own its preview before a checkbox scan starts."""
@@ -13722,11 +13777,17 @@ def stream_all_metadata_preview_on_checkbox_change(
             gr.update(),
         )
         return
+    revision = int((selection_state or {}).get("revision") or 0)
+    retain_existing_preview = (
+        'data-state="paused"' in str(metadata_status)
+        and f'data-selection-revision="{revision}"' in str(metadata_status)
+    )
     yield from stream_automatic_detected_metadata_preview(
         pdf_files, folder_files, current_title, current_author,
         current_short_label, use_file_title_fallback,
         apply_batch_metadata_overrides, folder_manifest, selection_state,
         recognition_effort, preview_all, request,
+        retain_existing_preview=retain_existing_preview,
     )
 
 
@@ -13995,6 +14056,76 @@ SELECTION_PREVIEW_OWNERS = OrderedDict()
 SELECTION_PREVIEW_OWNERS_LOCK = threading.Lock()
 METADATA_PREVIEW_TOGGLE_GENERATIONS = OrderedDict()
 METADATA_PREVIEW_TOGGLE_LOCK = threading.Lock()
+# Completed preview panels live only for the current browser selection. They
+# are display evidence, never a substitute for Confirm's fresh PDF inspection.
+METADATA_PREVIEW_COMPLETED = OrderedDict()
+METADATA_PREVIEW_COMPLETED_LOCK = threading.Lock()
+MAX_METADATA_PREVIEW_SESSIONS = 64
+MAX_METADATA_PREVIEW_PANELS = 128
+
+
+def _metadata_preview_cache_scope(request, selection_state, files, settings):
+    session = getattr(request, "session_hash", None)
+    revision = int((selection_state or {}).get("revision") or 0)
+    if not session or not revision:
+        return None
+    state = selection_state or {}
+    return (
+        session, str(state.get("preview_token") or ""), revision,
+        str(state.get("selection_signature") or ""),
+        tuple(local_path_identity_key(path) for path in files),
+        tuple(str(value) for value in settings),
+    )
+
+
+def _metadata_preview_file_fingerprint(path):
+    try:
+        stat = Path(path).stat()
+    except OSError:
+        return None
+    return stat.st_size, stat.st_mtime_ns, stat.st_ino
+
+
+def _metadata_preview_cache_clear(request):
+    session = getattr(request, "session_hash", None)
+    if session:
+        with METADATA_PREVIEW_COMPLETED_LOCK:
+            METADATA_PREVIEW_COMPLETED.pop(session, None)
+
+
+def _metadata_preview_cached_prefix(scope, files):
+    if scope is None:
+        return []
+    session = scope[0]
+    with METADATA_PREVIEW_COMPLETED_LOCK:
+        record = METADATA_PREVIEW_COMPLETED.get(session)
+        if record is None or record["scope"] != scope:
+            record = {"scope": scope, "panels": []}
+            METADATA_PREVIEW_COMPLETED[session] = record
+        panels = record["panels"]
+        valid = 0
+        for index, (fingerprint, _html) in enumerate(panels):
+            if index >= len(files) or _metadata_preview_file_fingerprint(files[index]) != fingerprint:
+                break
+            valid += 1
+        if valid < len(panels):
+            del panels[valid:]
+        METADATA_PREVIEW_COMPLETED.move_to_end(session)
+        while len(METADATA_PREVIEW_COMPLETED) > MAX_METADATA_PREVIEW_SESSIONS:
+            METADATA_PREVIEW_COMPLETED.popitem(last=False)
+        return [panel for _fingerprint, panel in panels]
+
+
+def _metadata_preview_cache_store(scope, index, path, panel):
+    if scope is None or index >= MAX_METADATA_PREVIEW_PANELS:
+        return
+    fingerprint = _metadata_preview_file_fingerprint(path)
+    if fingerprint is None:
+        return
+    with METADATA_PREVIEW_COMPLETED_LOCK:
+        record = METADATA_PREVIEW_COMPLETED.get(scope[0])
+        if record is not None and record["scope"] == scope and len(record["panels"]) == index:
+            record["panels"].append((fingerprint, panel))
 
 
 def auto_start_dependency_note(auto_armed=False, preview_all=False):
@@ -14013,6 +14144,35 @@ def metadata_preview_toggle_changed(preview_all, auto_armed=False, request: gr.R
             while len(METADATA_PREVIEW_TOGGLE_GENERATIONS) > 512:
                 METADATA_PREVIEW_TOGGLE_GENERATIONS.popitem(last=False)
     return auto_start_dependency_note(auto_armed, preview_all)
+
+
+def clear_detected_metadata_preview(
+    pdf_files=None, folder_files=None, folder_manifest=None,
+    selection_state=None, auto_armed=False, request: gr.Request = None,
+):
+    """Discard detected suggestions only; keep per-document override drafts."""
+    if (automatic_lifecycle_busy() or not automatic_selection_is_ready(selection_state)
+            or not _selection_preview_is_current(selection_state, request)):
+        return tuple(gr.update() for _ in range(7))
+    preview = pending_selected_metadata_preview(
+        pdf_files, folder_files, folder_manifest, selection_state, request,
+        cleared=True,
+    )
+    if not isinstance(preview, str):
+        return tuple(gr.update() for _ in range(7))
+    note = metadata_preview_toggle_changed(False, auto_armed, request)
+    _metadata_preview_cache_clear(request)
+    revision = int((selection_state or {}).get("revision") or 0)
+    return (
+        *(gr.update(value="", interactive=True) for _ in range(3)),
+        preview,
+        metadata_scan_status_html(
+            "paused", "Detected metadata preview cleared.",
+            scope="none", complete=True, revision=revision,
+        ),
+        gr.update(value=False),
+        note,
+    )
 
 
 def _metadata_preview_toggle_generation(request):
@@ -14042,6 +14202,7 @@ def _selection_preview_token(request):
         SELECTION_PREVIEW_OWNERS.move_to_end(session)
         while len(SELECTION_PREVIEW_OWNERS) > 512:
             SELECTION_PREVIEW_OWNERS.popitem(last=False)
+    _metadata_preview_cache_clear(request)
     return token
 
 
@@ -28051,10 +28212,10 @@ def metadata_table_html(primary_rows, additional_rows=(), *, include_overrides=T
 
 def pending_metadata_panel_html(message, *, filename="", loading=False,
                                 include_overrides=True, detected_value="", document_key="", error=False,
-                                error_kind=""):
+                                error_kind="", title_from_filename=True):
     value = detected_value or ("Loading…" if loading else "Select a PDF")
-    rows = [(key, Path(filename).stem if key == "Title used" and filename else value,
-             "filename_pending" if key == "Title used" and filename else "pending")
+    rows = [(key, Path(filename).stem if key == "Title used" and filename and title_from_filename else value,
+             "filename_pending" if key == "Title used" and filename and title_from_filename else "pending")
             for key in METADATA_OVERRIDE_FIELDS]
     heading = f'<div class="metadata-file-name">{html.escape(filename)}</div>' if filename else ""
     return detected_pdf_metadata_panel_html(
@@ -35499,6 +35660,11 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     ),
                     elem_classes=["document-metadata-preview"],
                 )
+                clear_detected_metadata_button = gr.Button(
+                    "Clear detected metadata (keep overrides)",
+                    variant="secondary", size="sm",
+                    elem_id="clear-detected-metadata-preview",
+                )
             with gr.Row():
                 auto_mode = gr.Radio(
                     choices=[MODE_LOCAL_ONLY_LABEL, MODE_LOCAL_WITH_LOGS_LABEL, MODE_NATIVE_UPLOAD_LABEL],
@@ -37777,6 +37943,16 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 concurrency_limit=AUTOMATIC_RUN_CONCURRENCY_LIMIT,
                 concurrency_id=AUTOMATIC_RUN_CONCURRENCY_ID,
             )
+            clear_detected_metadata_button.click(
+                fn=clear_detected_metadata_preview,
+                inputs=[auto_pdfs, auto_folder_pdfs, auto_folder_manifest,
+                        automatic_selection_state, auto_confirm_after_metadata],
+                outputs=[auto_label, auto_author, auto_short_label,
+                         auto_metadata_preview, auto_metadata_status,
+                         preview_all_metadata, auto_start_dependency_status],
+                show_progress="hidden",
+                queue=False,
+            )
             preview_all_metadata.input(
                 fn=metadata_preview_toggle_changed,
                 inputs=[preview_all_metadata, auto_confirm_after_metadata],
@@ -37790,7 +37966,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                         auto_short_label, auto_use_file_title_fallback,
                         apply_batch_metadata_overrides, auto_folder_manifest,
                         automatic_selection_state, auto_recognition_effort,
-                        preview_all_metadata],
+                        preview_all_metadata, auto_metadata_status],
                 outputs=[auto_label, auto_author, auto_short_label,
                          auto_metadata_preview, auto_metadata_status,
                          document_metadata_section, automatic_run_activity],

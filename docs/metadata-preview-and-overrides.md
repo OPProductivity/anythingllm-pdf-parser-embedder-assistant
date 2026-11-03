@@ -23,6 +23,19 @@ preview. Without it, Confirm still detects every PDF freshly during processing.
 **Confirm and start run automatically** starts only after that explicit full
 preview completes; neither checkbox changes the other.
 
+Turning off all-file recognition stops its current preview after the PDF being
+inspected and keeps completed results already displayed. Turning it on again
+for the same selection continues after the last completed PDF. Before reusing
+one of those preview panels, the server checks that its source path, size,
+modification time, and file identity still match. If a check fails, preview
+restarts at that PDF and leaves the old display visible until refreshed.
+Completed preview panels are held only in a bounded per-session memory cache;
+the confirmed processing run still inspects every PDF freshly. The
+**Clear detected metadata (keep overrides)** button at the bottom of Document metadata discards
+detected preview values. It keeps all manually entered per-document overrides
+and turns off the metadata checkbox, so an armed auto-start cannot run from
+the cleared preview.
+
 Accepted person names shown in metadata are given readable capitalization
 while preserving initials and already mixed-case names. A default short
 citation label uses one surname for one author, both surnames for two, and
