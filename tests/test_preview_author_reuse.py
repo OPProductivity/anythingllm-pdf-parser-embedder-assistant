@@ -7,6 +7,7 @@ import json
 
 import fitz
 import pytest
+from gradio.helpers import special_args
 
 import auto_anythingllm_pipeline as pipeline
 import rag_pdf_gradio_app as app
@@ -231,3 +232,23 @@ def test_elaborate_checkbox_defaults_off_below_confirm():
     assert elaborate["props"]["value"] is False
     assert components.index(elaborate) > confirm_index
     assert app.fresh_automatic_run_setting_values()["enable_elaborate_metadata_extraction"] is False
+
+
+def test_gradio_injects_browser_request_before_confirmation_control_values():
+    request = SimpleNamespace(session_hash="preview-confirm-session")
+    manual_values = [{"state": "ready"}, "", False, True, "metadata-status", "pdf-files", "folder-files"]
+    injected, *_ = special_args(
+        app.run_manual_confirmation_with_auto_state_for_gradio,
+        inputs=list(manual_values), request=request,
+    )
+    assert injected[5] is request
+    assert injected[6:] == manual_values[5:]
+
+    automatic_values = [False, True, "metadata-status", {"state": "ready"}, "", {},
+                        "pdf-files", "folder-files"]
+    injected, *_ = special_args(
+        app.run_server_owned_auto_confirmation_for_gradio,
+        inputs=list(automatic_values), request=request,
+    )
+    assert injected[6] is request
+    assert injected[7:] == automatic_values[6:]

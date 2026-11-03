@@ -27604,6 +27604,17 @@ def run_manual_confirmation_with_auto_state(
         yield gr.update(), *outputs
 
 
+def run_manual_confirmation_with_auto_state_for_gradio(
+    selection_state, viewed_run_root, auto_armed, preview_all, metadata_status,
+    request: gr.Request, *values, progress=gr.Progress(track_tqdm=False),
+):
+    """Place Gradio's injected request before the variadic control values."""
+    yield from run_manual_confirmation_with_auto_state(
+        selection_state, viewed_run_root, auto_armed, preview_all,
+        metadata_status, *values, progress=progress, request=request,
+    )
+
+
 def metadata_preview_ready_for_selection(metadata_status, selection_state):
     status = str(metadata_status or "")
     revision = int((selection_state or {}).get("revision") or 0)
@@ -27733,6 +27744,19 @@ def run_server_owned_auto_confirmation(
     ):
         # Keep the operator's choice visible after the server accepts the run.
         yield gr.update(), *outputs
+
+
+def run_server_owned_auto_confirmation_for_gradio(
+    auto_armed, preview_all, metadata_status, selection_state,
+    viewed_run_root, folder_manifest, request: gr.Request, *values,
+    progress=gr.Progress(track_tqdm=False),
+):
+    """Pass the real browser request through the automatic Confirm handoff."""
+    yield from run_server_owned_auto_confirmation(
+        auto_armed, preview_all, metadata_status, selection_state,
+        viewed_run_root, folder_manifest, *values,
+        progress=progress, request=request,
+    )
 
 
 METADATA_PREVIEW_TEXT_LAYER_PAGE_LIMIT = 3
@@ -37076,7 +37100,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     show_progress="hidden",
                     queue=False,
                 ).then(
-                    fn=run_server_owned_auto_confirmation,
+                    fn=run_server_owned_auto_confirmation_for_gradio,
                     inputs=server_auto_inputs,
                     outputs=server_auto_outputs,
                     show_progress="hidden",
@@ -38170,7 +38194,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 concurrency_limit=1,
                 concurrency_id="automatic-metadata-preview",
             ).then(
-                fn=run_server_owned_auto_confirmation,
+                fn=run_server_owned_auto_confirmation_for_gradio,
                 inputs=server_auto_inputs,
                 outputs=server_auto_outputs,
                 show_progress="hidden",
@@ -38221,7 +38245,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 show_progress="hidden",
                 queue=False,
             ).then(
-                fn=run_server_owned_auto_confirmation,
+                fn=run_server_owned_auto_confirmation_for_gradio,
                 inputs=server_auto_inputs,
                 outputs=server_auto_outputs,
                 show_progress="hidden",
@@ -38276,7 +38300,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 show_progress="hidden",
                 queue=False,
             ).then(
-                fn=run_server_owned_auto_confirmation,
+                fn=run_server_owned_auto_confirmation_for_gradio,
                 inputs=server_auto_inputs,
                 outputs=server_auto_outputs,
                 show_progress="hidden",
@@ -38285,7 +38309,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 concurrency_id=AUTOMATIC_RUN_CONCURRENCY_ID,
             )
             auto_confirm_after_metadata.change(
-                fn=run_server_owned_auto_confirmation,
+                fn=run_server_owned_auto_confirmation_for_gradio,
                 inputs=server_auto_inputs,
                 outputs=server_auto_outputs,
                 show_progress="hidden",
@@ -38294,7 +38318,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 concurrency_id=AUTOMATIC_RUN_CONCURRENCY_ID,
             )
             confirm_automatic_run_button.click(
-                fn=run_manual_confirmation_with_auto_state,
+                fn=run_manual_confirmation_with_auto_state_for_gradio,
                 # Do not rely on gr.State for this irreversible action.  A
                 # normal control payload makes the Confirm click observable by
                 # the server and resilient to a stale client-side State value.
