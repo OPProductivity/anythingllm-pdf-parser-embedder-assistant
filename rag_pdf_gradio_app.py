@@ -385,6 +385,7 @@ DESKTOP_SERIAL_PROVIDER_REQUEST_PRIOR_SECONDS = 3.0
 # look stale.  This is presentation-only: it neither changes the estimate nor
 # weakens any live-reprice guardrail.
 INITIAL_ETA_LABEL_GRACE_SECONDS = 120
+EXPIRED_ETA_TEXT = "Estimate exceeded · processing continues"
 # The opening number is deliberately an operator-facing planning signal, not
 # the model's internal truth. Keep the requested optimism isolated here so it
 # cannot alter multi-lane pacing, historical learning, safety ceilings, or
@@ -15999,24 +16000,6 @@ def paced_progress_percent(record, now=None):
     return min(99, math.ceil(paced_progress_fraction(record, now) * 100.0 - 1e-9))
 
 
-def automatic_eta_finishing_detail(progress_phase="", phase=""):
-    """Return a short, factual activity label for an exhausted presentation ETA.
-
-    The estimate reaching zero is not terminal evidence. Keep the suffix tied
-    to the current structured phase, rather than repeating a long or mutable
-    queue description in the compact timing row.
-    """
-    normalized = str(progress_phase or "").strip().casefold()
-    return {
-        "desktop_queue": "Desktop queue active",
-        "queue_receipt": "checking queue receipt",
-        "identity_set": "confirming vectors",
-        "retrieval_sample": "checking retrieval",
-        "validation": "checking evidence",
-        "reporting": "saving run record",
-    }.get(normalized, "finalizing")
-
-
 def raw_elapsed_time_percent(record, now=None):
     """Return the uncapped elapsed share for audit purposes only."""
     now = time.time() if now is None else float(now)
@@ -16242,7 +16225,7 @@ def automatic_live_status_html(status=None):
         cache_total_documents = _status_count(record.get("cache_total_documents"))
         if presentation_expected:
             estimate_detail = (
-                f"Est: finishing · {automatic_eta_finishing_detail(record.get('progress_phase'), raw_phase)}"
+                EXPIRED_ETA_TEXT
                 if remaining <= 0
                 else f"Est: {format_estimate_clock(remaining)}"
             )
@@ -16258,7 +16241,11 @@ def automatic_live_status_html(status=None):
                     cache_total_records=_status_count(record.get("cache_total_records")),
                     partial=bool(record.get("cache_plan_partial")),
                 )
-            elif eta_basis == "initial_estimate" and elapsed < INITIAL_ETA_LABEL_GRACE_SECONDS:
+            elif (
+                remaining > 0
+                and eta_basis == "initial_estimate"
+                and elapsed < INITIAL_ETA_LABEL_GRACE_SECONDS
+            ):
                 estimate_detail += " · initial estimate"
         else:
             estimate_detail = "Est: calculating…"
@@ -18941,13 +18928,10 @@ def automatic_run_timing_html(
                 )
                 label = f"Est: ~{format_estimate_clock(rough_tail_seconds)}"
             else:
-                label = (
-                    "Est: finishing · "
-                    f"{automatic_eta_finishing_detail(progress_phase, source)}"
-                )
+                label = EXPIRED_ETA_TEXT
         else:
             label = f"Est: {format_estimate_clock(remaining)}"
-        if presentation_expected > 0:
+        if presentation_expected > 0 and label != EXPIRED_ETA_TEXT:
             label += basis_suffix
     elif state == "cancelled" and actual is not None:
         label = f"Stopped: {format_estimate_clock(actual)}"

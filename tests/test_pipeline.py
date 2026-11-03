@@ -4524,9 +4524,9 @@ class PipelineCoreTests(unittest.TestCase):
             now=111,
         )
 
-        # Without live queue counts, an exhausted estimate is an explicit final
-        # phase rather than a misleading zero or a false Desktop-queue claim.
-        self.assertIn("Est: finishing", rendered)
+        # An expired estimate does not imply that processing is nearly done.
+        self.assertIn("Estimate exceeded · processing continues", rendered)
+        self.assertNotIn("initial estimate", rendered)
         self.assertNotIn("Est: -", rendered)
 
     def test_workspace_name_is_sanitized_before_anythingllm_can_create_an_invalid_namespace(self):
@@ -6151,12 +6151,20 @@ class PipelineCoreTests(unittest.TestCase):
         with mock.patch.object(app.time, "time", return_value=180.0):
             rendered = app.automatic_live_status_html({
                 "state": "running",
-                "phase": "Checking workspace attachment",
+                "phase": "Extracting and evaluating with pymupdf: 256/299 pages processed",
                 "expected_seconds": 60,
                 "started_epoch": 100.0,
+                "confirmed_fraction": .31,
+                "batch_prepared_files": 4,
+                "batch_completed_files": 4,
+                "batch_current_file_index": 5,
+                "batch_total_files": 18,
         })
-        self.assertIn("Est: finishing · finalizing", rendered)
+        self.assertIn("Estimate exceeded · processing continues", rendered)
+        self.assertNotIn("initial estimate", rendered)
         self.assertNotIn("Est: 00m00s", rendered)
+        self.assertNotIn("finalizing", rendered)
+        self.assertIn("Current PDF: 5/18", rendered)
 
     def test_live_status_keeps_long_queue_details_in_the_reserved_scroll_lane(self):
         import rag_pdf_gradio_app as app
