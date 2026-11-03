@@ -455,6 +455,7 @@ AUTOMATIC_RUN_FIELDS = (
     "document_publisher",
     "document_metadata_overrides",
     "recognition_effort",
+    "enable_elaborate_metadata_extraction",
 )
 ANYTHINGLLM_EMBEDDER_ENGINE_CHOICES = [
     "anythingllm",
@@ -8183,6 +8184,7 @@ def automatic_run_processing_settings(values):
         "document_publisher": settings.get("document_publisher"),
         "document_metadata_overrides": settings.get("document_metadata_overrides"),
         "recognition_effort": normalize_effort(settings.get("recognition_effort") if settings.get("recognition_effort") is not None and settings.get("recognition_effort") != "" else "extremely_thorough").value,
+        "enable_elaborate_metadata_extraction": bool(settings.get("enable_elaborate_metadata_extraction")),
         "use_file_title_fallback": settings.get("use_file_title_fallback"),
         # A batch has no shared metadata by default.  The explicit opt-in is
         # part of the processing identity so a past accidental shared title
@@ -8252,6 +8254,7 @@ def builtin_automatic_run_setting_values(pdf_files=None, folder_pdf_files=None, 
         "document_publisher": "",
         "document_metadata_overrides": "",
         "recognition_effort": "thorough",
+        "enable_elaborate_metadata_extraction": False,
         "use_file_title_fallback": True,
         "apply_batch_metadata_overrides": False,
         "mode": MODE_NATIVE_UPLOAD_LABEL,
@@ -8324,6 +8327,7 @@ def fresh_automatic_run_setting_values(pdf_files=None, folder_pdf_files=None, *,
     effective = builtin | saved["defaults"]
     effective["mode"] = normalized_automatic_output_mode(effective.get("mode"))
     effective["recognition_effort"] = "thorough"
+    effective["enable_elaborate_metadata_extraction"] = False
     return effective
 
 
@@ -13583,8 +13587,8 @@ def stream_automatic_detected_metadata_preview(
         request, selection_state, files,
         (current_title, current_author, current_short_label,
          bool(use_file_title_fallback), bool(apply_batch_metadata_overrides),
-         str(recognition_effort or "")),
-    ) if preview_all else None
+         str(recognition_effort or ""), bool(preview_all)),
+    )
     completed_html = _metadata_preview_cached_prefix(cache_scope, files)
     resume_at = len(completed_html)
     display_retained = retain_existing_preview and not completed_html
@@ -13691,10 +13695,16 @@ def stream_automatic_detected_metadata_preview(
             ), visible=True),
         )
         try:
+            preview_snapshot = {}
+            def capture_preview_snapshot(_index, _path, snapshot):
+                preview_snapshot.update(snapshot)
+            preview_options = {**_effort_kwargs(recognition_effort)}
+            if cache_scope is not None:
+                preview_options["snapshot_callback"] = capture_preview_snapshot
             result = detected_metadata_preview(
                 [path], current_title, current_author, current_short_label,
                 use_file_title_fallback, apply_batch_metadata_overrides,
-                override_editor=True, **_effort_kwargs(recognition_effort),
+                override_editor=True, **preview_options,
             )
             if not isinstance(result[3], str):
                 yield tuple(gr.update() for _ in range(7))
@@ -13709,7 +13719,9 @@ def stream_automatic_detected_metadata_preview(
                     match.group(1) if match else "inspection",
                 ))
             else:
-                _metadata_preview_cache_store(cache_scope, index, path, result[3])
+                _metadata_preview_cache_store(
+                    cache_scope, index, path, result[3], preview_snapshot or None,
+                )
         except Exception as exc:
             APP_LOGGER.exception("individual PDF metadata preview failed")
             kind, message = metadata_preview_failure(Path(path), exc)
@@ -14129,8 +14141,9 @@ SELECTION_PREVIEW_OWNERS = OrderedDict()
 SELECTION_PREVIEW_OWNERS_LOCK = threading.Lock()
 METADATA_PREVIEW_TOGGLE_GENERATIONS = OrderedDict()
 METADATA_PREVIEW_TOGGLE_LOCK = threading.Lock()
-# Completed preview panels live only for the current browser selection. They
-# are display evidence, never a substitute for Confirm's fresh PDF inspection.
+# Completed preview panels and their separate structured author evidence live
+# only for the current browser selection. The worker must still verify source
+# bytes and settings before reusing any author decision.
 METADATA_PREVIEW_COMPLETED = OrderedDict()
 METADATA_PREVIEW_COMPLETED_LOCK = threading.Lock()
 MAX_METADATA_PREVIEW_SESSIONS = 64
@@ -14173,7 +14186,7 @@ def _metadata_preview_cached_prefix(scope, files):
     with METADATA_PREVIEW_COMPLETED_LOCK:
         record = METADATA_PREVIEW_COMPLETED.get(session)
         if record is None or record["scope"] != scope:
-            record = {"scope": scope, "panels": []}
+            record = {"scope": scope, "panels": [], "snapshots": []}
             METADATA_PREVIEW_COMPLETED[session] = record
         panels = record["panels"]
         valid = 0
@@ -14183,13 +14196,14 @@ def _metadata_preview_cached_prefix(scope, files):
             valid += 1
         if valid < len(panels):
             del panels[valid:]
+            del record.setdefault("snapshots", [])[valid:]
         METADATA_PREVIEW_COMPLETED.move_to_end(session)
         while len(METADATA_PREVIEW_COMPLETED) > MAX_METADATA_PREVIEW_SESSIONS:
             METADATA_PREVIEW_COMPLETED.popitem(last=False)
         return [panel for _fingerprint, panel in panels]
 
 
-def _metadata_preview_cache_store(scope, index, path, panel):
+def _metadata_preview_cache_store(scope, index, path, panel, snapshot=None):
     if scope is None or index >= MAX_METADATA_PREVIEW_PANELS:
         return
     fingerprint = _metadata_preview_file_fingerprint(path)
@@ -14199,6 +14213,32 @@ def _metadata_preview_cache_store(scope, index, path, panel):
         record = METADATA_PREVIEW_COMPLETED.get(scope[0])
         if record is not None and record["scope"] == scope and len(record["panels"]) == index:
             record["panels"].append((fingerprint, panel))
+            record.setdefault("snapshots", []).append(dict(snapshot or {}))
+
+
+def _metadata_preview_snapshots_for_selection(request, selection_state, files):
+    """Copy matching private preview evidence; the worker verifies SHA-256."""
+    session = getattr(request, "session_hash", None)
+    if not session:
+        return {}
+    state = selection_state or {}
+    with METADATA_PREVIEW_COMPLETED_LOCK:
+        record = METADATA_PREVIEW_COMPLETED.get(session)
+        if not record:
+            return {}
+        scope = record["scope"]
+        if (scope[1:4] != (
+                str(state.get("preview_token") or ""),
+                int(state.get("revision") or 0),
+                str(state.get("selection_signature") or ""))
+                or scope[4] != tuple(local_path_identity_key(path) for path in files)):
+            return {}
+        snapshots = {}
+        for path, (fingerprint, _html), snapshot in zip(
+                files, record["panels"], record.get("snapshots") or []):
+            if _metadata_preview_file_fingerprint(path) == fingerprint and snapshot:
+                snapshots[local_path_identity_key(path)] = dict(snapshot)
+        return snapshots
 
 
 def auto_start_dependency_note(auto_armed=False, preview_all=False):
@@ -26466,6 +26506,7 @@ def dispatch_confirmed_automatic_run(settings, *, progress):
         retain_detailed_evidence=bool(settings.get("retain_detailed_evidence")),
         preflight_compatibility_report=settings.get("_preflight_compatibility_report"),
         created_workspace_slug=settings.get("_created_workspace_slug", ""),
+        metadata_preview_snapshots=settings.get("_metadata_preview_snapshots"),
         progress=progress,
     )
     return run_automatic(**run_kwargs)
@@ -26812,6 +26853,7 @@ def _run_automatic_from_confirmation_stream_body(
     progress=gr.Progress(track_tqdm=False),
     _confirmation_owner_token="",
     _confirmation_preclaimed=False,
+    _metadata_preview_snapshots=None,
 ):
     """Stream a start acknowledgement, then the verified terminal run result.
 
@@ -26981,6 +27023,7 @@ def _run_automatic_from_confirmation_stream_body(
             max(0.0, time.perf_counter() - preflight_started_at), 3
         )
         settings["_confirmation_preflight_status_events"] = list(preflight_status_events)
+        settings["_metadata_preview_snapshots"] = dict(_metadata_preview_snapshots or {})
         if len(values) > len(AUTOMATIC_RUN_FIELDS) + 1:
             settings["retain_detailed_evidence"] = bool(
                 values[len(AUTOMATIC_RUN_FIELDS) + 1]
@@ -27189,6 +27232,7 @@ def _run_automatic_confirmation_background_worker(
     completed,
     owner_token,
     values,
+    metadata_preview_snapshots,
 ):
     """Keep one confirmed run alive when its browser stream is replaced.
 
@@ -27205,6 +27249,7 @@ def _run_automatic_confirmation_background_worker(
             progress=_background_automatic_progress,
             _confirmation_owner_token=owner_token,
             _confirmation_preclaimed=True,
+            _metadata_preview_snapshots=metadata_preview_snapshots,
         ):
             events.put(("output", output))
     except BaseException as exc:  # Preserve the original exception for direct callers/tests.
@@ -27225,7 +27270,9 @@ def _run_automatic_confirmation_background_worker(
         events.put(("done", None))
 
 
-def run_automatic_from_confirmation_stream(*values, progress=gr.Progress(track_tqdm=False)):
+def run_automatic_from_confirmation_stream(
+    *values, progress=gr.Progress(track_tqdm=False), metadata_preview_snapshots=None,
+):
     """Bridge a durable confirmed worker to the browser's streaming response.
 
     A browser reload, timer overlap, or replaced Gradio response must not
@@ -27258,7 +27305,7 @@ def run_automatic_from_confirmation_stream(*values, progress=gr.Progress(track_t
     completed = threading.Event()
     worker = threading.Thread(
         target=_run_automatic_confirmation_background_worker,
-        args=(events, completed, owner_token, tuple(values)),
+        args=(events, completed, owner_token, tuple(values), dict(metadata_preview_snapshots or {})),
         name=f"anythingllm-confirm-{owner_token.rsplit('-', 1)[-1][:8]}",
         daemon=True,
     )
@@ -27391,7 +27438,8 @@ def automatic_explicit_metadata_values(selection_state, values, overrides=None):
 
 
 def run_automatic_from_ready_confirmation_stream(
-    selection_state, *values, metadata_overrides=None, progress=gr.Progress(track_tqdm=False)
+    selection_state, *values, metadata_overrides=None, metadata_preview_snapshots=None,
+    progress=gr.Progress(track_tqdm=False)
 ):
     """Accept one visible Confirm click while preserving server-side validation.
 
@@ -27432,7 +27480,9 @@ def run_automatic_from_ready_confirmation_stream(
             extra={"event": "automatic_confirm_selection_state_lag"},
         )
     values = automatic_explicit_metadata_values(selection_state, values, overrides=metadata_overrides)
-    yield from run_automatic_from_confirmation_stream(*values, progress=progress)
+    yield from run_automatic_from_confirmation_stream(
+        *values, progress=progress, metadata_preview_snapshots=metadata_preview_snapshots,
+    )
 
 
 def run_automatic_for_browser_stream(
@@ -27480,8 +27530,19 @@ def run_automatic_for_browser_stream(
             yield tuple(gr.update() for _ in range(16))
             return
     owned_root = str(viewed_run_root or "")
+    def selected_input(field):
+        index = AUTOMATIC_RUN_FIELDS.index(field)
+        return values[index] if index < len(values) else None
+    selected_files = unique_local_path_strings(
+        normalize_file_list(selected_input("pdf_files"))
+        + normalize_file_list(selected_input("folder_pdf_files"))
+    )
+    preview_snapshots = _metadata_preview_snapshots_for_selection(
+        request, selection_state, selected_files,
+    )
     source = iter(run_automatic_from_ready_confirmation_stream(
-        selection_state, *values, metadata_overrides=metadata_overrides, progress=progress
+        selection_state, *values, metadata_overrides=metadata_overrides,
+        metadata_preview_snapshots=preview_snapshots, progress=progress,
     ))
     while True:
         # Check before resuming the generator: its next step may reserve a run
@@ -28361,6 +28422,7 @@ def detected_metadata_preview(
     apply_batch_metadata_overrides=False,
     override_editor=True,
     recognition_effort=None,
+    snapshot_callback=None,
 ):
     files = normalize_file_list(pdf_files)
     if not files:
@@ -28389,6 +28451,14 @@ def detected_metadata_preview(
                             "error": "This file does not have a .pdf extension. Select a PDF file."})
             continue
         try:
+            preview_fingerprint = (
+                _metadata_preview_file_fingerprint(pdf_path)
+                if callable(snapshot_callback) else None
+            )
+            try:
+                preview_sha = sha256_file(pdf_path) if preview_fingerprint else ""
+            except OSError:
+                preview_sha = ""
             meta = pdf_metadata(pdf_path)
         except Exception as exc:
             kind, message = metadata_preview_failure(pdf_path, exc)
@@ -28397,10 +28467,14 @@ def detected_metadata_preview(
 
         embedded_title = repair_metadata_title_encoding(meta.get("title") or "")
         author_started = time.perf_counter()
+        inference_options = _effort_kwargs(recognition_effort)
+        if preview_sha:
+            inference_options["include_inference_report"] = True
         author_inference = infer_author_from_initial_pdf_pages(
             pdf_path, page_limit=4, use_file_title_fallback=use_file_title_fallback,
-            **_effort_kwargs(recognition_effort),
+            **inference_options,
         )
+        inferred_author_report = author_inference.pop("_inferred_author_report", None)
         APP_LOGGER.info(
             "Author metadata recognition completed in %.3fs for %s",
             time.perf_counter() - author_started, pdf_path,
@@ -28514,6 +28588,19 @@ def detected_metadata_preview(
                         "technical_rows": technical_rows,
                         "identity": workspace_source_identity_from_pdf(
                             pdf_path, author_report=author_inference, **_effort_kwargs(recognition_effort))})
+        if (callable(snapshot_callback) and preview_sha and isinstance(inferred_author_report, dict)
+                and _metadata_preview_file_fingerprint(pdf_path) == preview_fingerprint):
+            snapshot_callback(index - 1, pdf_path, {
+                "schema_version": 1,
+                "source_sha256": preview_sha,
+                "source_fingerprint": preview_fingerprint,
+                "recognition_effort": normalize_effort(recognition_effort).value,
+                "use_file_title_fallback": bool(use_file_title_fallback),
+                "title": title,
+                "author": author,
+                "author_source": str(author_inference.get("source") or ""),
+                "inferred_author_report": inferred_author_report,
+            })
 
     should_fill_fields = len(files) == 1
     title_value = current_title or (detected_title if should_fill_fields else "")
@@ -31423,6 +31510,8 @@ def run_automatic(
     document_publisher="",
     document_metadata_overrides="",
     recognition_effort=None,
+    enable_elaborate_metadata_extraction=False,
+    metadata_preview_snapshots=None,
     progress=gr.Progress(track_tqdm=False),
 ):
     # Progress ownership stays with ``update_live_automatic_run_status`` and
@@ -32950,6 +33039,11 @@ def run_automatic(
     unstructured_circuit_breaker = {}
     per_document_override_mode = bool(document_metadata_overrides)
     overrides_by_document = selected_document_metadata_overrides(document_metadata_overrides, files)
+    preview_snapshots_by_document = {
+        str(key): dict(value)
+        for key, value in dict(metadata_preview_snapshots or {}).items()
+        if isinstance(value, dict)
+    }
     batch_uses_per_pdf_metadata = len(files) > 1 and not bool(apply_batch_metadata_overrides)
     batch_metadata_policy = (
         "per_pdf_override_or_detection" if per_document_override_mode else
@@ -33447,6 +33541,11 @@ def run_automatic(
             # from that PDF; first-file preview values cannot leak across it.
             **source_metadata,
             recognition_effort=normalize_effort(recognition_effort).value,
+            enable_elaborate_metadata_extraction=bool(enable_elaborate_metadata_extraction),
+            author_preview_snapshot=(
+                {} if enable_elaborate_metadata_extraction else
+                preview_snapshots_by_document.get(local_path_identity_key(pdf_path), {})
+            ),
             use_file_title_fallback=bool(use_file_title_fallback),
             deep_extraction=bool(deep_extraction),
             include_front_matter=bool(include_front_matter),
@@ -33472,16 +33571,17 @@ def run_automatic(
             ),
             marker_style="short",
             disable_inline_markers=not bool(generate_inline_fallback),
-            # Successful customer runs remain compact by default.  The
-            # explicit evidence option is useful for acceptance tests and
-            # forensic review; it does not alter the prepared payload,
-            # AnythingLLM calls, or verification decision.
-            lean_retention=not bool(retain_detailed_evidence),
+            # Elaborate author review is useful only if its private evidence
+            # survives a successful run. Keep it in run-state without adding
+            # JSON files to the published flat TXT export.
+            lean_retention=not bool(retain_detailed_evidence or enable_elaborate_metadata_extraction),
             # A native batch cannot compact individual PDFs before the outer
             # shared upload has consumed their plans. The pipeline retains
             # those artifacts on both success and failure until that batch
             # boundary decides what is safe to remove.
-            defer_lean_retention=bool(prepare_and_upload and not retain_detailed_evidence),
+            defer_lean_retention=bool(
+                prepare_and_upload and not (retain_detailed_evidence or enable_elaborate_metadata_extraction)
+            ),
             flat_output_without_logs=False,
             run_vector_eval=bool(run_vector_eval),
             simulation_adapter=simulation_adapter,
@@ -34748,6 +34848,7 @@ def run_automatic(
         and summaries
         and not cancellation_requested
         and not retain_detailed_evidence
+        and not enable_elaborate_metadata_extraction
         and automatic_completion(summaries, prepare_and_upload).get("state") == "successful"
     ):
         try:
@@ -36421,6 +36522,11 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                         # visibly disabled alongside Confirm.
                         visible=True,
                 )
+                enable_elaborate_metadata_extraction = gr.Checkbox(
+                    label="Enable elaborate metadata extraction during run",
+                    value=False,
+                    elem_id="automatic-elaborate-metadata-control",
+                )
                 auto_confirmation_state = gr.State({})
                 # Per-browser selection acknowledgement.  It is deliberately
                 # not a run payload: Confirm still receives the visible
@@ -36920,6 +37026,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 auto_publisher,
                 auto_document_overrides,
                 auto_recognition_effort,
+                enable_elaborate_metadata_extraction,
                 new_workspace_name,
                 retain_detailed_evidence,
                 new_workspace_name_auto_state,

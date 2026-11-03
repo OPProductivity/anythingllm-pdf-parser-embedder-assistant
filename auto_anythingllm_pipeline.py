@@ -22381,9 +22381,47 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         profile=work_identity.profile,
         recognition_effort=production_effort_value(getattr(args, "recognition_effort", None)),
     )
-    inferred_author = infer_profiled_author(
-        author_context, sampling_error=author_sample_error,
-    )
+    preview_snapshot = getattr(args, "author_preview_snapshot", None)
+    preview_reuse_status = "not_available"
+    inferred_author = None
+    if isinstance(preview_snapshot, dict) and preview_snapshot:
+        preview_reuse_status = "stale_or_incompatible"
+        candidate_report = preview_snapshot.get("inferred_author_report")
+        if (
+            not bool(getattr(args, "enable_elaborate_metadata_extraction", False))
+            and preview_snapshot.get("schema_version") == 1
+            and str(preview_snapshot.get("source_sha256") or "").lower() == source_sha
+            and str(preview_snapshot.get("recognition_effort") or "") == author_context.recognition_effort
+            and bool(preview_snapshot.get("use_file_title_fallback")) == bool(use_file_title_fallback)
+            and normalize_text(preview_snapshot.get("title") or "") == normalize_text(title)
+            and (preview_snapshot.get("author") or getattr(args, "document_author", ""))
+            and isinstance(candidate_report, dict)
+        ):
+            preview_resolution = resolve_author_from_metadata_and_inference(
+                pdf_meta.get("author") or "", candidate_report,
+            )
+            if (
+                normalize_text(preview_resolution.get("author") or "")
+                == normalize_text(preview_snapshot.get("author") or "")
+                and str(preview_resolution.get("source") or "")
+                == str(preview_snapshot.get("author_source") or "")
+            ):
+                inferred_author = dict(candidate_report)
+                preview_reuse_status = "verified_preview_reused"
+                report_upload_phase(
+                    "metadata", "Reusing author evidence from verified metadata preview",
+                    completed_units=1, total_units=1,
+                    fallback_fraction=0.05, evidence_kind="author_preview_reused",
+                )
+    if inferred_author is None:
+        report_upload_phase(
+            "metadata", "Inferring author from PDF evidence",
+            completed_units=1, total_units=1,
+            fallback_fraction=0.05, evidence_kind="author_inference_started",
+        )
+        inferred_author = infer_profiled_author(
+            author_context, sampling_error=author_sample_error,
+        )
     resolved_author = resolve_author_from_metadata_and_inference(
         pdf_meta.get("author") or "",
         inferred_author,
@@ -22411,6 +22449,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             "subject": "pdf_metadata" if pdf_meta.get("subject") else "not_available",
         },
         "author_inference": inferred_author,
+        "author_preview_reuse_status": preview_reuse_status,
     }
     source_meta["source_short_label"] = normalize_text(
         args.document_short_label or default_short_label(
@@ -22432,6 +22471,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         "source_short_label": source_meta["source_short_label"],
         "metadata_provenance": source_meta["metadata_provenance"],
         "author_inference": inferred_author,
+        "author_preview_reuse_status": preview_reuse_status,
         "author_document_profile": (
             author_context.profile_evidence()
             | ({"sampling_warning": author_sample_error, "scope_complete": False}
@@ -22455,6 +22495,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         pdf_pages=profile["pdf_page_count"],
         author_source=author_source,
         author_samples_reused=True,
+        author_preview_reuse_status=preview_reuse_status,
     )
     outline = pdf_meta.get("outline") or []
     geometry_by_page = {
@@ -23704,61 +23745,59 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
             post_extraction_author_recovery["status"] = "not_recovered"
     selected["post_extraction_author_recovery"] = dict(post_extraction_author_recovery)
     profile["post_extraction_author_recovery"] = dict(post_extraction_author_recovery)
-    # A reversible, shadow-only field map reviews the *final* author against
-    # existing OCR and bounded alternative OCR crops. Failed OCR compositions
-    # remain in its ledger and never suppress a later retry or alter labels.
-    report_upload_phase(
-        "candidate_evaluation",
-        "Reviewing author-field evidence with targeted OCR",
-        completed_units=1,
-        total_units=1,
-        fallback_fraction=selection_progress,
-        evidence_kind="author_field_review_started",
-    )
-    field_review_started = time.perf_counter()
-    try:
-        ocr_peer = next((candidate for candidate in viable
-                         if candidate.get("backend") == "unstructured"
-                         and candidate.get("unstructured_strategy") in {"ocr_only", "hi_res"}
-                         and candidate.get("pages") and not candidate.get("error")), None)
-        tesseract_path = str((unstructured_runtime_probe or {}).get("tesseract_executable") or "")
-        if not tesseract_path:
-            # Some callers supply only a boolean capability probe. Ask the
-            # canonical local resolver for the executable before declaring
-            # the independent final OCR check unavailable.
-            tesseract_path = str(ensure_tesseract_runtime().get("executable") or "")
-        field_review = review_author_field_map(
-            pdf_path,
-            title_hint=source_meta.get("source_title") or "",
-            author=source_meta.get("source_author") or "",
-            author_source=(source_meta.get("metadata_provenance") or {}).get("source_author") or "",
-            ocr_peer_pages=(ocr_peer or {}).get("pages") or (),
-            tesseract=tesseract_path,
-            recognition_effort=author_context.recognition_effort,
+    # This shadow review never changes final metadata. Run its extra OCR only
+    # when the operator explicitly requests elaborate run-time evidence.
+    if bool(getattr(args, "enable_elaborate_metadata_extraction", False)):
+        report_upload_phase(
+            "candidate_evaluation",
+            "Reviewing author-field evidence with targeted OCR",
+            completed_units=1, total_units=1,
+            fallback_fraction=selection_progress,
+            evidence_kind="author_field_review_started",
         )
-        field_review_path = Path(selected["candidate_dir"]) / "author-field-review.json"
-        write_json(field_review_path, compact_field_review(field_review))
-        field_review_summary = {
-            "status": field_review.get("status"),
-            "mode": field_review.get("mode"),
-            "final_review": field_review.get("final_review"),
-            "mapped_pages": [page["page"] for page in field_review.get("pages") or []],
-            "ocr_checks": [{"source": row.get("source"), "page": row.get("page"),
-                            "composition": row.get("composition"), "status": row.get("status"),
-                            "reason": row.get("reason")}
-                           for row in field_review.get("checks") or []],
-            "review_file": str(field_review_path),
-            "changes_final_metadata": False,
-        }
-    except (OSError, ValueError, RuntimeError, fitz.FileDataError) as exc:
-        field_review_summary = {"status": "error", "error_type": type(exc).__name__,
-                                "changes_final_metadata": False}
+        field_review_started = time.perf_counter()
+        try:
+            ocr_peer = next((candidate for candidate in viable
+                             if candidate.get("backend") == "unstructured"
+                             and candidate.get("unstructured_strategy") in {"ocr_only", "hi_res"}
+                             and candidate.get("pages") and not candidate.get("error")), None)
+            tesseract_path = str((unstructured_runtime_probe or {}).get("tesseract_executable") or "")
+            if not tesseract_path:
+                tesseract_path = str(ensure_tesseract_runtime().get("executable") or "")
+            field_review = review_author_field_map(
+                pdf_path,
+                title_hint=source_meta.get("source_title") or "",
+                author=source_meta.get("source_author") or "",
+                author_source=(source_meta.get("metadata_provenance") or {}).get("source_author") or "",
+                ocr_peer_pages=(ocr_peer or {}).get("pages") or (),
+                tesseract=tesseract_path,
+                recognition_effort=author_context.recognition_effort,
+            )
+            field_review_path = Path(selected["candidate_dir"]) / "author-field-review.json"
+            write_json(field_review_path, compact_field_review(field_review))
+            field_review_summary = {
+                "status": field_review.get("status"),
+                "mode": field_review.get("mode"),
+                "final_review": field_review.get("final_review"),
+                "mapped_pages": [page["page"] for page in field_review.get("pages") or []],
+                "ocr_checks": [{"source": row.get("source"), "page": row.get("page"),
+                                "composition": row.get("composition"), "status": row.get("status"),
+                                "reason": row.get("reason")}
+                               for row in field_review.get("checks") or []],
+                "review_file": str(field_review_path),
+                "changes_final_metadata": False,
+            }
+        except (OSError, ValueError, RuntimeError, fitz.FileDataError) as exc:
+            field_review_summary = {"status": "error", "error_type": type(exc).__name__,
+                                    "changes_final_metadata": False}
+        emit_pipeline_timing_event(args, "author_field_review",
+                                   elapsed_seconds=time.perf_counter() - field_review_started,
+                                   source_bytes=profile["file_size"],
+                                   pdf_pages=profile["pdf_page_count"])
+    else:
+        field_review_summary = {"status": "not_requested", "changes_final_metadata": False}
     profile["author_field_review"] = field_review_summary
     selected["author_field_review"] = field_review_summary
-    emit_pipeline_timing_event(args, "author_field_review",
-                               elapsed_seconds=time.perf_counter() - field_review_started,
-                               source_bytes=profile["file_size"],
-                               pdf_pages=profile["pdf_page_count"])
     selection_stage = f"Selected {selected['backend']} and writing output variants"
     if len(viable) > 1:
         selection_stage += f" — compared {len(viable)} extractors; selected by quality policy"
@@ -26474,6 +26513,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         "detected_publisher": profile.get("detected_publisher", ""),
         "author_recognition_effort": profile.get("author_recognition_effort", "thorough"),
         "author_optional_retries_deferred": profile.get("author_optional_retries_deferred", 0),
+        "author_preview_reuse_status": profile.get("author_preview_reuse_status", "not_available"),
         "source_short_label": profile.get("source_short_label", ""),
         "metadata_provenance": dict(profile.get("metadata_provenance") or {}),
         "total_pipeline_seconds": round(time.perf_counter() - total_started, 2),

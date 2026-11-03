@@ -150,7 +150,8 @@ def corroborate_terminal_filename_credit(path: Path, title: str, report: dict):
 
 def infer_author_from_initial_pdf_pages(path: Path, title_hint="", *, page_limit=3,
                                         use_file_title_fallback=True,
-                                        recognition_effort="thorough"):
+                                        recognition_effort="thorough",
+                                        include_inference_report=False):
     """Seed a UI suggestion, then complete planned native/image acquisition.
 
     ``page_limit`` bounds the initial seed, not the shared acquisition plan.
@@ -212,6 +213,10 @@ def infer_author_from_initial_pdf_pages(path: Path, title_hint="", *, page_limit
     collection = report.get("evidence_review", {}).get("collection", {})
     result.update(recognition_effort=context.recognition_effort,
                   optional_retries_deferred=collection.get("deliberately_deferred_retries", 0))
+    if include_inference_report:
+        # The UI stores this only in its private, selection-scoped preview
+        # cache. The visible panel still receives the compact result above.
+        result["_inferred_author_report"] = report
     if sampling_warning:
         result["initial_sampling_warning"] = sampling_warning
     return result

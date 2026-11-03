@@ -51,6 +51,7 @@ def test_opening_ocr_scope_preserves_recovered_cover_and_user_boundary(
         workspace_slug="", test_workspace_slug="test", upload_limit=0,
         anythingllm_storage_dir=str(tmp_path / "missing-storage"),
         anythingllm_chunk_size=400, anythingllm_chunk_overlap=40,
+        enable_elaborate_metadata_extraction=True,
         ocr_preflight_hint={"full_native_text_coverage": {
             "status": "verified", "page_count": 12,
             "image_backed_low_text_pages": [{

@@ -14387,7 +14387,7 @@ class PipelineCoreTests(unittest.TestCase):
         self.assertIn("Sample extracted text", html_preview)
         self.assertIn("Possible scanned or low-text PDF", html_preview)
         self.assertIn('class="metadata-info-toggle"', html_preview)
-        self.assertEqual(html_preview.count('<table class="metadata-table">'), 1)
+        self.assertEqual(html_preview.count('<table class="metadata-table"'), 1)
         primary, additional = html_preview.split('class="metadata-extra-row"', 1)
         self.assertIn('<tbody><tr><th scope="row">Title used</th>', primary)
         self.assertIn("Author evidence", primary)
