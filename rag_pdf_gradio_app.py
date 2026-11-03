@@ -2776,12 +2776,18 @@ gradio-app,
 }
 .anythingllm-startup-status-module:has(.anythingllm-startup-status--offline) {
     border-color: #f87171;
-    background: #fee2e2;
+    background: #fed7d7;
     color: #991b1b;
 }
+html.anythingllm-warning-dismissed #anythingllm-startup-status-module {
+    display: none !important;
+}
 .anythingllm-startup-status {
-    margin: 0 0 10px;
+    margin: 0 0 6px;
     color: inherit;
+}
+.anythingllm-local-mode-note {
+    margin-top: 6px;
 }
 .anythingllm-startup-status strong { color: inherit; }
 #anythingllm-startup-status,
@@ -2797,7 +2803,9 @@ gradio-app,
     min-width: 0 !important;
 }
 #refresh-anythingllm-startup-status,
-#refresh-anythingllm-startup-status > button {
+#refresh-anythingllm-startup-status > button,
+#close-anythingllm-startup-status,
+#close-anythingllm-startup-status > button {
     width: 100% !important;
 }
 #refresh-anythingllm-startup-status.anythingllm-refresh-status-flash,
@@ -5589,7 +5597,7 @@ def native_upload_readiness_report(
     autostart_runtime=False,
     verify_authentication=False,
     status_callback=None,
-    fast_startup_check=False,
+    runtime_resolution=None,
 ):
     storage_dir = default_anythingllm_storage_dir()
     db_path = storage_dir / "anythingllm.db"
@@ -5627,14 +5635,12 @@ def native_upload_readiness_report(
         workspace_found, workspace_message = local_workspace_slug_exists(report["workspace_slug"])
         report["workspace_slug_found"] = workspace_found
         report["workspace_slug_message"] = workspace_message
-    runtime = ensure_anythingllm_runtime(
+    runtime = runtime_resolution if isinstance(runtime_resolution, dict) else ensure_anythingllm_runtime(
         report["runtime_api_url"],
         api_key=(api_key or "").strip(),
-        timeout=0.6 if fast_startup_check else 1.25 if autostart_runtime else 0.5,
+        timeout=1.25 if autostart_runtime else 0.5,
         autostart_local=bool(autostart_runtime),
         status_callback=status_callback,
-        startup_fast_poll_interval=0.5 if fast_startup_check else None,
-        startup_fast_poll_window=8.0 if fast_startup_check else 0.0,
     )
     report["runtime_api_url"] = runtime.get("api_url") or report["runtime_api_url"]
     report["runtime_api_status"] = runtime.get("status") or "not_checked"
@@ -5936,6 +5942,19 @@ def initialize_anythingllm_on_app_open(api_url="", api_key="", workspace_slug=""
     timer strictly observational.  This neither authenticates nor creates an
     API key, and remote URLs remain excluded by ``ensure_anythingllm_runtime``.
     """
+    # Resolve the local Desktop before loading workspace choices. A slow local
+    # inventory must not postpone the one app-open launch attempt. Limit only
+    # the initial unavailable-API sweep; the subsequent readiness wait still
+    # checks all configured candidates and retains its 45-second bound.
+    runtime = ensure_anythingllm_runtime(
+        (api_url or "").strip() or DEFAULT_ANYTHINGLLM_API_URL,
+        api_key=(api_key or "").strip(),
+        timeout=0.6,
+        autostart_local=True,
+        startup_fast_poll_interval=0.5,
+        startup_fast_poll_window=8.0,
+        initial_max_candidates=1,
+    )
     workspace_update, workspace_status = load_workspaces_on_open()
     selected_workspace = (
         (workspace_slug or "").strip()
@@ -5945,9 +5964,8 @@ def initialize_anythingllm_on_app_open(api_url="", api_key="", workspace_slug=""
         api_url,
         api_key,
         selected_workspace,
-        autostart_runtime=True,
         verify_authentication=False,
-        fast_startup_check=True,
+        runtime_resolution=runtime,
     )
     reachable = bool(report.get("runtime_api_reachable"))
     startup_attempt = {
@@ -9960,8 +9978,9 @@ def anythingllm_startup_status_html(api_url="", health=None, startup_attempt=Non
     message = messages.get(status, "Checking AnythingLLM Desktop and automatic startup…")
     return (
         '<section class="anythingllm-startup-status anythingllm-startup-status--offline" role="alert">'
-        f'<div><strong>AnythingLLM is not available.</strong> {message} '
-        'PDF preparation can continue locally; upload waits for AnythingLLM.</div>'
+        f'<div><strong>AnythingLLM is not available.</strong> {message}</div>'
+        '<div class="anythingllm-local-mode-note">PDF processing and parsing locally is still available '
+        'with output mode: “Create local files only”.</div>'
         '</section>'
     )
 
@@ -10046,6 +10065,11 @@ ANYTHINGLLM_STARTUP_STATUS_REFRESH_JS = r"""
   window.anythingllmRefreshStatusFlashTimer = window.setTimeout(() => {
     button.classList.remove("anythingllm-refresh-status-flash");
   }, 1300);
+}
+"""
+ANYTHINGLLM_STARTUP_STATUS_CLOSE_JS = r"""
+() => {
+  document.documentElement.classList.add("anythingllm-warning-dismissed");
 }
 """
 def anythingllm_desktop_process_seen():
@@ -35202,12 +35226,19 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
             elem_id="anythingllm-startup-status",
         )
         anythingllm_startup_attempt = gr.State(None)
-        refresh_anythingllm_startup_status_button = gr.Button(
-            "Refresh Status",
-            variant="secondary",
-            size="sm",
-            elem_id="refresh-anythingllm-startup-status",
-        )
+        with gr.Row():
+            refresh_anythingllm_startup_status_button = gr.Button(
+                "Refresh Status",
+                variant="secondary",
+                size="sm",
+                elem_id="refresh-anythingllm-startup-status",
+            )
+            close_anythingllm_startup_status_button = gr.Button(
+                "Close",
+                variant="secondary",
+                size="sm",
+                elem_id="close-anythingllm-startup-status",
+            )
 
     with gr.Tabs():
         with gr.Tab("Automatic") as automatic_tab:
@@ -36112,6 +36143,12 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=False,
                 trigger_mode="always_last",
                 js=ANYTHINGLLM_STARTUP_STATUS_REFRESH_JS,
+            )
+            close_anythingllm_startup_status_button.click(
+                fn=None,
+                js=ANYTHINGLLM_STARTUP_STATUS_CLOSE_JS,
+                queue=False,
+                show_progress="hidden",
             )
             inspect_workspace_button.click(
                 fn=workspace_inspector_html,

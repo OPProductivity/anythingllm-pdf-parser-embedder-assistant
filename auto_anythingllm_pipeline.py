@@ -12305,9 +12305,17 @@ def ping_anythingllm_api(api_url, api_key=None, timeout=2.0):
     return result
 
 
-def detect_anythingllm_api_url(preferred_url="", api_key=None, timeout=2.0):
+def detect_anythingllm_api_url(preferred_url="", api_key=None, timeout=2.0, max_candidates=None):
     attempts = []
-    for candidate in preferred_anythingllm_api_urls(preferred_url):
+    limit = max(1, int(max_candidates)) if max_candidates is not None else None
+    if limit == 1 and str(preferred_url or "").strip():
+        # App-open startup can probe its configured URL before inventory work.
+        candidates = [str(preferred_url).strip().rstrip("/")]
+    else:
+        candidates = preferred_anythingllm_api_urls(preferred_url)
+        if limit is not None:
+            candidates = candidates[:limit]
+    for candidate in candidates:
         probe = ping_anythingllm_api(candidate, api_key=api_key, timeout=timeout)
         attempts.append(probe)
         if probe["status"] in {"reachable", "reachable_auth_required"}:
@@ -12425,6 +12433,7 @@ def ensure_anythingllm_runtime(
     startup_poll_interval=1.5,
     startup_fast_poll_interval=None,
     startup_fast_poll_window=0.0,
+    initial_max_candidates=None,
 ):
     """Ensure the local Desktop API can be reached, reporting bounded lifecycle updates.
 
@@ -12441,7 +12450,10 @@ def ensure_anythingllm_runtime(
             # A presentation observer must not break runtime recovery.
             pass
 
-    detection = detect_anythingllm_api_url(preferred_url, api_key=api_key, timeout=timeout)
+    detection = detect_anythingllm_api_url(
+        preferred_url, api_key=api_key, timeout=timeout,
+        **({"max_candidates": initial_max_candidates} if initial_max_candidates is not None else {}),
+    )
     result = {
         **detection,
         "start": {

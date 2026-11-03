@@ -2855,6 +2855,9 @@ class PipelineCoreTests(unittest.TestCase):
 
         self.assertEqual(running, "")
         self.assertIn("Checking AnythingLLM Desktop and automatic startup", unavailable)
+        self.assertIn('class="anythingllm-local-mode-note"', unavailable)
+        self.assertIn('output mode: “Create local files only”', unavailable)
+        self.assertNotIn("upload waits for AnythingLLM", unavailable)
 
         started = app.anythingllm_startup_status_html(
             "http://127.0.0.1:3001", health={"reachable": False},
@@ -2904,50 +2907,53 @@ class PipelineCoreTests(unittest.TestCase):
     def test_app_open_initialization_uses_one_guarded_local_start_attempt(self):
         import rag_pdf_gradio_app as app
 
-        original_workspaces = app.load_workspaces_on_open
-        original_readiness = app.native_upload_readiness_report
-        original_readiness_html = app.native_upload_readiness_html
         captured = {}
-        try:
-            app.load_workspaces_on_open = lambda: ({"value": "new-document"}, "local workspaces")
+        events = []
+        runtime = {"status": "reachable", "api_url": "http://127.0.0.1:3001",
+                   "start": {"status": "started"}}
 
-            def fake_readiness(api_url, api_key, workspace_slug, **kwargs):
-                captured.update(
-                    api_url=api_url,
-                    api_key=api_key,
-                    workspace_slug=workspace_slug,
-                    kwargs=kwargs,
-                )
-                return {
-                    "runtime_api_url": "http://127.0.0.1:3001",
-                    "runtime_api_reachable": True,
-                    "runtime_start_status": "started",
-                }
+        def fake_runtime(*args, **kwargs):
+            events.append("runtime")
+            captured["runtime_kwargs"] = kwargs
+            return runtime
 
-            app.native_upload_readiness_report = fake_readiness
-            app.native_upload_readiness_html = lambda report: "readiness:started"
+        def fake_workspaces():
+            events.append("workspaces")
+            return {"value": "new-document"}, "local workspaces"
+
+        def fake_readiness(api_url, api_key, workspace_slug, **kwargs):
+            events.append("readiness")
+            captured.update(api_url=api_url, api_key=api_key,
+                            workspace_slug=workspace_slug, kwargs=kwargs)
+            return {"runtime_api_url": "http://127.0.0.1:3001",
+                    "runtime_api_reachable": True, "runtime_start_status": "started"}
+
+        with mock.patch.object(app, "ensure_anythingllm_runtime", side_effect=fake_runtime), \
+             mock.patch.object(app, "load_workspaces_on_open", side_effect=fake_workspaces), \
+             mock.patch.object(app, "native_upload_readiness_report", side_effect=fake_readiness), \
+             mock.patch.object(app, "native_upload_readiness_html", return_value="readiness:started"):
             result = app.initialize_anythingllm_on_app_open(
                 "http://127.0.0.1:3001", "existing-key", ""
             )
-        finally:
-            app.load_workspaces_on_open = original_workspaces
-            app.native_upload_readiness_report = original_readiness
-            app.native_upload_readiness_html = original_readiness_html
 
+        self.assertEqual(events, ["runtime", "workspaces", "readiness"])
         self.assertEqual(captured["workspace_slug"], "new-document")
-        self.assertTrue(captured["kwargs"]["autostart_runtime"])
         self.assertFalse(captured["kwargs"]["verify_authentication"])
+        self.assertIs(captured["kwargs"]["runtime_resolution"], runtime)
+        self.assertEqual(captured["runtime_kwargs"]["initial_max_candidates"], 1)
+        self.assertEqual(captured["runtime_kwargs"]["timeout"], 0.6)
+        self.assertTrue(captured["runtime_kwargs"]["autostart_local"])
         self.assertEqual(result[2], "readiness:started")
         self.assertEqual(result[3], "")
         self.assertFalse(result[4]["visible"])
         self.assertIsNone(result[5])
-        self.assertTrue(captured["kwargs"]["fast_startup_check"])
 
     def test_app_open_warning_reports_its_own_failed_start(self):
         import rag_pdf_gradio_app as app
 
         report = {"runtime_api_reachable": False, "runtime_start_status": "start_failed"}
-        with mock.patch.object(app, "load_workspaces_on_open", return_value=({"value": "new-document"}, "local")), \
+        with mock.patch.object(app, "ensure_anythingllm_runtime", return_value={"status": "unreachable"}), \
+             mock.patch.object(app, "load_workspaces_on_open", return_value=({"value": "new-document"}, "local")), \
              mock.patch.object(app, "native_upload_readiness_report", return_value=report), \
              mock.patch.object(app, "native_upload_readiness_html", return_value="readiness:failed"):
             result = app.initialize_anythingllm_on_app_open("http://127.0.0.1:3001", "", "")
@@ -9344,6 +9350,33 @@ class PipelineCoreTests(unittest.TestCase):
             self.assertEqual(result["attempts"][0]["status"], "collector_stub")
         finally:
             pipeline.get_json = original_get_json
+
+    def test_app_open_detection_limits_only_the_initial_unavailable_url_sweep(self):
+        urls = ["http://127.0.0.1:3001", "http://localhost:3001", "http://127.0.0.1:8888"]
+        with mock.patch.object(pipeline, "preferred_anythingllm_api_urls", return_value=urls) as inventory, \
+             mock.patch.object(pipeline, "ping_anythingllm_api", return_value={
+                 "status": "unreachable", "api_url": urls[0], "message": "refused",
+             }) as ping:
+            result = pipeline.detect_anythingllm_api_url(urls[0], timeout=0.6, max_candidates=1)
+        self.assertEqual(result["status"], "unreachable")
+        self.assertEqual(len(result["attempts"]), 1)
+        inventory.assert_not_called()
+        ping.assert_called_once_with(urls[0], api_key=None, timeout=0.6)
+
+    def test_readiness_reuses_app_open_runtime_without_second_launch(self):
+        import rag_pdf_gradio_app as app
+
+        runtime = {"status": "unreachable", "api_url": "http://127.0.0.1:3001",
+                   "message": "refused", "start": {"status": "started"}}
+        with tempfile.TemporaryDirectory() as tmpdir, \
+             mock.patch.object(app, "default_anythingllm_storage_dir", return_value=Path(tmpdir)), \
+             mock.patch.object(app, "ensure_anythingllm_runtime") as ensure:
+            report = app.native_upload_readiness_report(
+                "http://127.0.0.1:3001", "", "", runtime_resolution=runtime,
+            )
+        ensure.assert_not_called()
+        self.assertEqual(report["runtime_start_status"], "started")
+        self.assertFalse(report["runtime_api_reachable"])
 
     def test_ensure_anythingllm_runtime_autostarts_desktop_when_api_is_down(self):
         original_detect = pipeline.detect_anythingllm_api_url
