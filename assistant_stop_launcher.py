@@ -5,6 +5,12 @@ from pathlib import Path
 import subprocess
 import sys
 
+NO_SERVER_TO_STOP_MESSAGE = "PDF Assistant is already stopped. Nothing to stop."
+
+
+def show_info(message):
+    ctypes.windll.user32.MessageBoxW(None, str(message), "PDF Assistant", 0x40)
+
 
 def show_failure(message):
     ctypes.windll.user32.MessageBoxW(
@@ -26,6 +32,8 @@ def stop():
         return 1
     if result.returncode:
         show_failure((result.stderr or result.stdout or "Stop did not complete. Please retry.").strip()[-2000:])
+    elif NO_SERVER_TO_STOP_MESSAGE in result.stdout:
+        show_info(NO_SERVER_TO_STOP_MESSAGE)
     return result.returncode
 
 

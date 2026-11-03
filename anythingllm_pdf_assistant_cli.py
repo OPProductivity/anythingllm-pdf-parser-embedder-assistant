@@ -45,6 +45,7 @@ def _notify_browser_stop(record, event):
 
 
 SERVER_MARKER_NAME = "localhost-server.json"
+NO_SERVER_TO_STOP_MESSAGE = "PDF Assistant is already stopped. Nothing to stop."
 SERVER_ROOT_PID_ENV = "ANYTHINGLLM_PDF_ASSISTANT_SERVER_ROOT_PID"
 AUTOMATIC_RUN_PROGRESS_NAME = "run-progress.json"
 AUTOMATIC_RUN_CANCELLATION_MARKER = ".cancel-requested.json"
@@ -866,6 +867,13 @@ def _stop() -> int:
     # cleanup. Use the same ownership mutex, not a separate competing lock.
     try:
         record = json.loads(_server_marker_path().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        print(NO_SERVER_TO_STOP_MESSAGE)
+        return 0
+    except (OSError, ValueError, TypeError, RuntimeError) as exc:
+        print(f"Could not resolve local server Stop: {exc}", file=sys.stderr)
+        return 1
+    try:
         port = int(record.get("port") or 0)
         with _server_start_ownership_lock(port):
             return _stop_under_start_lock()
@@ -883,6 +891,9 @@ def _stop_under_start_lock() -> int:
         record = json.loads(marker.read_text(encoding="utf-8"))
         pid = _marker_root_pid(record)
         port = int(record.get("port") or 0)
+    except FileNotFoundError:
+        print(NO_SERVER_TO_STOP_MESSAGE)
+        return 0
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         print("No owned local PDF assistant server is recorded.", file=sys.stderr)
         return 1

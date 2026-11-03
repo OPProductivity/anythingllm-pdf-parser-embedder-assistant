@@ -125,6 +125,25 @@ def test_stop_refuses_a_recycled_or_unowned_process():
     assert run.call_count == 1
 
 
+def test_stop_without_a_server_marker_is_a_normal_no_op(tmp_path, capsys):
+    marker = tmp_path / "localhost-server.json"
+    with (
+        mock.patch.object(cli, "_server_marker_path", return_value=marker),
+        mock.patch.object(cli, "_server_start_ownership_lock") as ownership_lock,
+    ):
+        assert cli._stop() == 0
+    assert capsys.readouterr().out.strip() == cli.NO_SERVER_TO_STOP_MESSAGE
+    ownership_lock.assert_not_called()
+
+
+def test_stop_marker_access_failure_remains_an_error(tmp_path, capsys):
+    marker = tmp_path / "localhost-server.json"
+    with mock.patch.object(cli, "_server_marker_path", return_value=marker):
+        with mock.patch.object(Path, "read_text", side_effect=PermissionError("access denied")):
+            assert cli._stop() == 1
+    assert "access denied" in capsys.readouterr().err
+
+
 def test_stop_removes_a_stale_marker_when_its_port_is_free(capsys):
     with tempfile.TemporaryDirectory() as tmpdir:
         marker = Path(tmpdir) / "localhost-server.json"
