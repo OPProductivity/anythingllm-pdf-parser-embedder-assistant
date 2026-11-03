@@ -105,6 +105,45 @@ def test_preview_reuse_verifies_bytes_and_applies_run_override(tmp_path, monkeyp
     assert calls == [1, 1]
 
 
+@pytest.mark.parametrize("snapshot_change", [
+    "missing", "recognition_effort", "use_file_title_fallback", "title",
+])
+def test_missing_or_incompatible_preview_runs_fresh_author_inference(
+        tmp_path, monkeypatch, snapshot_change):
+    pdf = tmp_path / "known.pdf"
+    _fixture_pdf(pdf)
+    snapshots = []
+    app.detected_metadata_preview(
+        [str(pdf)], snapshot_callback=lambda _index, _path, value: snapshots.append(value),
+        recognition_effort="thorough",
+    )
+    assert len(snapshots) == 1
+    snapshot = deepcopy(snapshots[0])
+    if snapshot_change == "missing":
+        snapshot = {}
+    elif snapshot_change == "recognition_effort":
+        snapshot["recognition_effort"] = "extremely_thorough"
+    elif snapshot_change == "use_file_title_fallback":
+        snapshot["use_file_title_fallback"] = False
+    else:
+        snapshot["title"] = "A Different Work"
+
+    original_infer = pipeline.infer_profiled_author
+    calls = []
+
+    def record_infer(*args, **kwargs):
+        calls.append(1)
+        return original_infer(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "infer_profiled_author", record_infer)
+    out = tmp_path / "fresh"
+    pipeline.prepare_pdf(pdf, out, _worker_args(tmp_path, snapshot))
+    profile = json.loads((out / "source-profile.json").read_text(encoding="utf-8"))
+    expected_status = "not_available" if snapshot_change == "missing" else "stale_or_incompatible"
+    assert profile["author_preview_reuse_status"] == expected_status
+    assert calls == [1]
+
+
 def test_preview_cache_is_bound_to_session_selection_and_file_revision(tmp_path):
     pdf = tmp_path / "selected.pdf"
     pdf.write_bytes(b"source content")
