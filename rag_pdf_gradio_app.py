@@ -2766,7 +2766,6 @@ gradio-app,
     padding: 0 !important;
 }
 .anythingllm-startup-status-module {
-    position: relative;
     width: 100%;
     margin: 0 0 14px;
     padding: 12px;
@@ -2779,19 +2778,6 @@ gradio-app,
     border-color: #f87171;
     background: #fee2e2;
     color: #991b1b;
-}
-.anythingllm-startup-status-module:has(.anythingllm-startup-status--offline)::before {
-    content: "";
-    position: absolute;
-    inset: 0;
-    z-index: 1;
-    border-radius: inherit;
-    background: rgba(255, 255, 255, .58);
-    pointer-events: none;
-    animation: anythingllm-warning-unveil 5s steps(1, end) forwards;
-}
-@keyframes anythingllm-warning-unveil {
-    to { opacity: 0; }
 }
 .anythingllm-startup-status {
     margin: 0 0 10px;

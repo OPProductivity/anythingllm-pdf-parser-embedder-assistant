@@ -5,7 +5,7 @@ import pytest
 pytestmark = pytest.mark.ui_local
 
 
-def test_warning_starts_pale_then_unveils_red_after_five_seconds(page):
+def test_warning_uses_red_background_without_a_white_overlay(page):
     from rag_pdf_gradio_app import APP_CSS, anythingllm_startup_status_html
 
     warning = anythingllm_startup_status_html(health={"reachable": False})
@@ -18,18 +18,10 @@ def test_warning_starts_pale_then_unveils_red_after_five_seconds(page):
       const overlay = getComputedStyle(panel, '::before');
       return {
         background: getComputedStyle(panel).backgroundColor,
-        overlay: overlay.backgroundColor,
-        duration: overlay.animationDuration,
-        opacity: overlay.opacity,
+        overlayContent: overlay.content,
       };
     }""")
     assert style == {
         "background": "rgb(254, 226, 226)",
-        "overlay": "rgba(255, 255, 255, 0.58)",
-        "duration": "5s",
-        "opacity": "1",
+        "overlayContent": "none",
     }
-    page.wait_for_function(
-        "getComputedStyle(document.querySelector('.anythingllm-startup-status-module'), '::before').opacity === '0'",
-        timeout=6500,
-    )
