@@ -21,15 +21,30 @@ def test_warning_uses_red_background_without_a_white_overlay(page):
 
     warning = anythingllm_startup_status_html(health={"reachable": False})
     page.set_content(
-        APP_THEME_FOUNDATION_HEAD + f'<style>{APP_CSS}</style>'
+        APP_THEME_FOUNDATION_HEAD
+        + '<style>.html-container.pending { opacity: .2; transition: opacity .15s; }</style>'
+        + f'<style>{APP_CSS}</style>'
         '<div id="anythingllm-startup-status-module" class="anythingllm-startup-status-module"></div>'
     )
     assert page.locator("#anythingllm-startup-status-module").evaluate(
         "node => getComputedStyle(node).backgroundColor"
     ) == "rgb(254, 215, 215)"
     page.locator("#anythingllm-startup-status-module").evaluate(
-        "(node, html) => { node.innerHTML = html; }", warning
+        "(node, html) => { node.innerHTML = '<div id=\"anythingllm-startup-status\"><div class=\"html-container pending\">' + html + '</div></div>'; }",
+        warning,
     )
+    assert page.locator("#anythingllm-startup-status .html-container.pending").evaluate(
+        "node => getComputedStyle(node).opacity"
+    ) == "1"
+    spinner = page.locator(".anythingllm-startup-inline-spinner")
+    assert spinner.count() == 1
+    assert spinner.get_attribute("aria-hidden") == "true"
+    assert spinner.evaluate("node => getComputedStyle(node).animationName") == "anythingllm-startup-spin"
+    finished = anythingllm_startup_status_html(
+        health={"reachable": False},
+        startup_attempt={"api_url": "http://127.0.0.1:3001", "status": "start_failed"},
+    )
+    assert "anythingllm-startup-inline-spinner" not in finished
     style = page.evaluate("""() => {
       const panel = document.querySelector('.anythingllm-startup-status-module');
       const overlay = getComputedStyle(panel, '::before');

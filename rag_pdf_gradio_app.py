@@ -1628,6 +1628,20 @@ APP_THEME_FOUNDATION_HEAD = """
   #anythingllm-startup-status-module {
     background: #fed7d7; border-color: #f87171; color: #991b1b;
   }
+  #anythingllm-startup-status .html-container {
+    opacity: 1 !important; transition: none !important;
+  }
+  .anythingllm-startup-inline-spinner {
+    display: inline-block; width: .8em; height: .8em;
+    margin: 0 .35em 0 .1em; border: 2px solid currentColor;
+    border-right-color: transparent; border-radius: 50%;
+    vertical-align: -.1em;
+    animation: anythingllm-startup-spin .7s linear infinite;
+  }
+  @keyframes anythingllm-startup-spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) {
+    .anythingllm-startup-inline-spinner { animation: none; }
+  }
   html.dark #anythingllm-startup-status-module {
     background: #7f1d1d; border-color: #b91c1c; color: #fee2e2;
   }
@@ -2800,6 +2814,12 @@ html.anythingllm-warning-dismissed #anythingllm-startup-status-module {
     border: 0 !important;
     background: transparent !important;
     box-shadow: none !important;
+}
+#anythingllm-startup-status .html-container {
+    /* Gradio's pending class fades callback outputs to 0.2 opacity. Keep the
+       warning text readable while the bounded Desktop startup is running. */
+    opacity: 1 !important;
+    transition: none !important;
 }
 #anythingllm-startup-status-module > .form,
 #anythingllm-startup-status-module > .block,
@@ -9976,9 +9996,13 @@ def anythingllm_startup_status_html(api_url="", health=None, startup_attempt=Non
         "not_attempted": "The configured AnythingLLM service did not respond. Check its address, then click Refresh Status.",
     }
     message = messages.get(status, "Checking AnythingLLM Desktop and automatic startup…")
+    pending_indicator = (
+        '<span class="anythingllm-startup-inline-spinner" aria-hidden="true"></span>'
+        if not status else ''
+    )
     return (
         '<section class="anythingllm-startup-status anythingllm-startup-status--offline" role="alert">'
-        f'<div><strong>AnythingLLM is not available.</strong> {message}</div>'
+        f'<div><strong>AnythingLLM is not available.</strong> {pending_indicator}{message}</div>'
         '<div class="anythingllm-local-mode-note">PDF processing and parsing locally is still available '
         'with output mode: “Create local files only”.</div>'
         '</section>'
@@ -36351,7 +36375,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     anythingllm_startup_attempt,
                     anythingllm_startup_status_timer,
                 ],
-                show_progress="minimal",
+                show_progress="hidden",
             )
             fresh_run_presentation_outputs = [
                 automatic_run_activity,
