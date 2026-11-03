@@ -13547,8 +13547,9 @@ def stream_automatic_detected_metadata_preview(
 ):
     """Publish scanning feedback and resume a stopped, unchanged preview.
 
-    The bounded per-session preview cache holds completed display panels only
-    for the current selection. Confirm still detects every PDF freshly.
+    The bounded per-session preview cache holds completed display panels and
+    author evidence for the current selection. Confirm verifies the source and
+    settings before the worker can reuse any author decision.
     """
     if automatic_lifecycle_busy() or not _selection_preview_is_current(selection_state, request):
         yield tuple(gr.update() for _ in range(7))
@@ -33542,9 +33543,8 @@ def run_automatic(
             **source_metadata,
             recognition_effort=normalize_effort(recognition_effort).value,
             enable_elaborate_metadata_extraction=bool(enable_elaborate_metadata_extraction),
-            author_preview_snapshot=(
-                {} if enable_elaborate_metadata_extraction else
-                preview_snapshots_by_document.get(local_path_identity_key(pdf_path), {})
+            author_preview_snapshot=preview_snapshots_by_document.get(
+                local_path_identity_key(pdf_path), {}
             ),
             use_file_title_fallback=bool(use_file_title_fallback),
             deep_extraction=bool(deep_extraction),
@@ -36523,7 +36523,7 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                         visible=True,
                 )
                 enable_elaborate_metadata_extraction = gr.Checkbox(
-                    label="Enable elaborate metadata extraction during run",
+                    label="Run additional author-field and OCR review (diagnostic only)",
                     value=False,
                     elem_id="automatic-elaborate-metadata-control",
                 )

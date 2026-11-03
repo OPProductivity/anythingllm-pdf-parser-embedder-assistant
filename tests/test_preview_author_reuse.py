@@ -1,6 +1,7 @@
 """Verified author-preview reuse through the actual local preparation worker."""
 
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 import json
 
@@ -63,7 +64,7 @@ def test_preview_reuse_verifies_bytes_and_applies_run_override(tmp_path, monkeyp
 
     monkeypatch.setattr(pipeline, "infer_profiled_author", record_infer)
     out = tmp_path / "reused"
-    pipeline.prepare_pdf(
+    reused = pipeline.prepare_pdf(
         pdf, out, _worker_args(tmp_path, snapshots[0], author_override="Manual Scholar"),
     )
     profile = json.loads((out / "source-profile.json").read_text(encoding="utf-8"))
@@ -73,6 +74,21 @@ def test_preview_reuse_verifies_bytes_and_applies_run_override(tmp_path, monkeyp
     assert profile["author_field_review"]["status"] == "not_requested"
     assert calls == []
 
+    out = tmp_path / "reused_with_review"
+    reviewed = pipeline.prepare_pdf(
+        pdf, out, _worker_args(
+            tmp_path, snapshots[0], author_override="Manual Scholar", elaborate=True,
+        ),
+    )
+    profile = json.loads((out / "source-profile.json").read_text(encoding="utf-8"))
+    assert profile["author_preview_reuse_status"] == "verified_preview_reused"
+    assert profile["detected_author"] == "Manual Scholar"
+    assert profile["metadata_provenance"]["source_author"] == "user_override"
+    assert profile["author_field_review"]["status"] == "reviewed"
+    assert Path(profile["author_field_review"]["review_file"]).is_file()
+    assert Path(reused["upload_file"]).read_bytes() == Path(reviewed["upload_file"]).read_bytes()
+    assert calls == []
+
     stale = deepcopy(snapshots[0])
     stale["source_sha256"] = "0" * 64
     out = tmp_path / "stale"
@@ -80,6 +96,13 @@ def test_preview_reuse_verifies_bytes_and_applies_run_override(tmp_path, monkeyp
     profile = json.loads((out / "source-profile.json").read_text(encoding="utf-8"))
     assert profile["author_preview_reuse_status"] == "stale_or_incompatible"
     assert calls == [1]
+
+    out = tmp_path / "stale_with_review"
+    pipeline.prepare_pdf(pdf, out, _worker_args(tmp_path, stale, elaborate=True))
+    profile = json.loads((out / "source-profile.json").read_text(encoding="utf-8"))
+    assert profile["author_preview_reuse_status"] == "stale_or_incompatible"
+    assert profile["author_field_review"]["status"] == "reviewed"
+    assert calls == [1, 1]
 
 
 def test_preview_cache_is_bound_to_session_selection_and_file_revision(tmp_path):
@@ -112,7 +135,7 @@ def test_elaborate_checkbox_defaults_off_below_confirm():
                      == "automatic-elaborate-metadata-control")
     confirm_index = next(index for index, row in enumerate(components)
                          if row.get("props", {}).get("elem_id") == "confirm-automatic-run-button")
-    assert elaborate["props"]["label"] == "Enable elaborate metadata extraction during run"
+    assert elaborate["props"]["label"] == "Run additional author-field and OCR review (diagnostic only)"
     assert elaborate["props"]["value"] is False
     assert components.index(elaborate) > confirm_index
     assert app.fresh_automatic_run_setting_values()["enable_elaborate_metadata_extraction"] is False

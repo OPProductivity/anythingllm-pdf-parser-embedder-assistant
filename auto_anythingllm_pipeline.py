@@ -22388,8 +22388,7 @@ def _prepare_pdf_legacy_engine(pdf_path: Path, out_root: Path, args):  # pyright
         preview_reuse_status = "stale_or_incompatible"
         candidate_report = preview_snapshot.get("inferred_author_report")
         if (
-            not bool(getattr(args, "enable_elaborate_metadata_extraction", False))
-            and preview_snapshot.get("schema_version") == 1
+            preview_snapshot.get("schema_version") == 1
             and str(preview_snapshot.get("source_sha256") or "").lower() == source_sha
             and str(preview_snapshot.get("recognition_effort") or "") == author_context.recognition_effort
             and bool(preview_snapshot.get("use_file_title_fallback")) == bool(use_file_title_fallback)
