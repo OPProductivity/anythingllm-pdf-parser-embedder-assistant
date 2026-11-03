@@ -156,7 +156,9 @@ def infer_author_from_initial_pdf_pages(path: Path, title_hint="", *, page_limit
 
     ``page_limit`` bounds the initial seed, not the shared acquisition plan.
     A failed seed-page read is a warning: remaining pages and OCR still run.
-    No PDF/OCR evidence is persisted for reuse by another request.
+    When requested, the structured inference report may be held in the UI's
+    bounded, selection-scoped cache for a later confirmed worker. The worker
+    verifies source bytes and recognition settings before reusing it.
     """
     pdf_path = Path(path)
     sampling_errors = []
