@@ -3894,6 +3894,11 @@ html.dark .gradio-container .batch-folder-panel .batch-folder-title-icon {
     flex: 1 1 200px !important;
 }
 #metadata-preview-options { display: none; }
+#metadata-auto-start-dependency-note {
+    margin: 2px 0 8px;
+    color: var(--body-text-color-subdued);
+    font-size: 0.9rem;
+}
 #native-pdf-selection-sync { display: none; }
 .extraction-options-row label:has(input[type="checkbox"]),
 .extraction-options-row label[data-testid$="-checkbox-label"] {
@@ -13377,7 +13382,7 @@ def automatic_detected_metadata_preview(
 def metadata_scan_status_html(state, message, *, scope="limited", complete=False, revision=0,
                               missing_authors=0, missing_author_keys=()):
     """A hidden transport for the visible accordion-heading status."""
-    if state not in {"idle", "scanning", "ready", "warning"}:
+    if state not in {"idle", "scanning", "ready", "warning", "paused"}:
         raise ValueError("Unknown metadata preview state")
     return (
         f'<div class="metadata-scan-inline" data-state="{state}" '
@@ -13514,6 +13519,10 @@ def stream_automatic_detected_metadata_preview(
     if automatic_lifecycle_busy() or not _selection_preview_is_current(selection_state, request):
         yield tuple(gr.update() for _ in range(7))
         return
+    toggle_generation = _metadata_preview_toggle_generation(request)
+    if preview_all and not _metadata_preview_toggle_is_current(request, toggle_generation, True):
+        yield tuple(gr.update() for _ in range(7))
+        return
     candidates, _reused = folder_manifest_candidates(folder_files, folder_manifest)
     files = candidates or normalize_file_list(pdf_files)
     if not files:
@@ -13582,7 +13591,8 @@ def stream_automatic_detected_metadata_preview(
         return
 
     for index, path in enumerate(displayed):
-        if automatic_lifecycle_busy() or not _selection_preview_is_current(selection_state, request):
+        if (automatic_lifecycle_busy() or not _selection_preview_is_current(selection_state, request)
+                or not _metadata_preview_toggle_is_current(request, toggle_generation, preview_all)):
             yield tuple(gr.update() for _ in range(7))
             return
         scanning = (
@@ -13635,7 +13645,8 @@ def stream_automatic_detected_metadata_preview(
                 filename=Path(path).name, detected_value="Unavailable",
                 document_key=local_path_identity_key(path), error=True, error_kind=kind,
             ))
-        if automatic_lifecycle_busy() or not _selection_preview_is_current(selection_state, request):
+        if (automatic_lifecycle_busy() or not _selection_preview_is_current(selection_state, request)
+                or not _metadata_preview_toggle_is_current(request, toggle_generation, preview_all)):
             yield tuple(gr.update() for _ in range(7))
             return
         # Publish this result before beginning another potentially slow scan.
@@ -13666,9 +13677,9 @@ def stream_automatic_detected_metadata_preview(
                     f"{missing_note}\u00a0\u00a0Expand here"
                 ) if index + 1 == len(displayed) else
                 f"Metadata recognition processing for all {len(files)} files… "
-                f"{index + 1}/{len(displayed)} complete; reading the next PDF…"
+                f"{index + 1}/{len(displayed)}"
                 if preview_all else
-                f"Preview {index + 1} of {len(displayed)} complete; reading the next PDF…",
+                f"Inspecting metadata for preview {index + 1} of {len(displayed)}…",
                 scope=preview_scope, complete=index + 1 == len(displayed),
                 revision=selection_revision,
                 missing_authors=missing_authors if index + 1 == len(displayed) else 0,
@@ -13694,6 +13705,22 @@ def stream_all_metadata_preview_on_checkbox_change(
     """Let a pending selection own its preview before a checkbox scan starts."""
     if str((selection_state or {}).get("state") or "") == "pending":
         yield tuple(gr.update() for _ in range(7))
+        return
+    if not preview_all:
+        # Unchecking stops the active stream through the per-session toggle
+        # generation. Keep completed results and manual edits visible instead
+        # of replacing every PDF with a fresh "Not previewed" table.
+        yield (
+            *(gr.update(interactive=True) for _ in range(3)),
+            gr.update(),
+            metadata_scan_status_html(
+                "paused", "Automatic metadata processing off. Recheck to scan all files.",
+                scope="none", complete=True,
+                revision=int((selection_state or {}).get("revision") or 0),
+            ),
+            gr.update(open=False),
+            gr.update(),
+        )
         return
     yield from stream_automatic_detected_metadata_preview(
         pdf_files, folder_files, current_title, current_author,
@@ -13966,6 +13993,43 @@ def automatic_selection_preparing_status_html(pdf_files=None, folder_pdf_files=N
 # results. An older stream must not publish into a newer selection.
 SELECTION_PREVIEW_OWNERS = OrderedDict()
 SELECTION_PREVIEW_OWNERS_LOCK = threading.Lock()
+METADATA_PREVIEW_TOGGLE_GENERATIONS = OrderedDict()
+METADATA_PREVIEW_TOGGLE_LOCK = threading.Lock()
+
+
+def auto_start_dependency_note(auto_armed=False, preview_all=False):
+    """Explain the inactive auto-start choice only when it can surprise someone."""
+    return gr.update(visible=bool(auto_armed and not preview_all))
+
+
+def metadata_preview_toggle_changed(preview_all, auto_armed=False, request: gr.Request = None):
+    """Invalidate an in-flight scan before the new checkbox action is queued."""
+    session = getattr(request, "session_hash", None)
+    if session:
+        with METADATA_PREVIEW_TOGGLE_LOCK:
+            generation = int((METADATA_PREVIEW_TOGGLE_GENERATIONS.get(session) or (0, False))[0]) + 1
+            METADATA_PREVIEW_TOGGLE_GENERATIONS[session] = (generation, bool(preview_all))
+            METADATA_PREVIEW_TOGGLE_GENERATIONS.move_to_end(session)
+            while len(METADATA_PREVIEW_TOGGLE_GENERATIONS) > 512:
+                METADATA_PREVIEW_TOGGLE_GENERATIONS.popitem(last=False)
+    return auto_start_dependency_note(auto_armed, preview_all)
+
+
+def _metadata_preview_toggle_generation(request):
+    session = getattr(request, "session_hash", None)
+    if not session:
+        return 0
+    with METADATA_PREVIEW_TOGGLE_LOCK:
+        return int((METADATA_PREVIEW_TOGGLE_GENERATIONS.get(session) or (0, False))[0])
+
+
+def _metadata_preview_toggle_is_current(request, generation, preview_all=False):
+    session = getattr(request, "session_hash", None)
+    if not session:
+        return True
+    with METADATA_PREVIEW_TOGGLE_LOCK:
+        current_generation, enabled = METADATA_PREVIEW_TOGGLE_GENERATIONS.get(session) or (0, True)
+    return current_generation == generation and (not preview_all or enabled)
 
 
 def _selection_preview_token(request):
@@ -35419,6 +35483,11 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                     label="Confirm and start run automatically", value=False,
                     elem_id="metadata-auto-confirm-control",
                 )
+            auto_start_dependency_status = gr.HTML(
+                '<div role="status" aria-live="polite">'
+                'Auto-start is inactive until metadata recognition is selected.</div>',
+                visible=False, elem_id="metadata-auto-start-dependency-note",
+            )
             with gr.Row(elem_id="metadata-preview-stale-row"):
                 gr.HTML('<span class="metadata-stale-copy">Selection metadata is not up to date anymore.</span>')
                 metadata_preview_rerun_button = gr.Button("Run again", variant="secondary", size="sm",
@@ -37708,7 +37777,14 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 concurrency_limit=AUTOMATIC_RUN_CONCURRENCY_LIMIT,
                 concurrency_id=AUTOMATIC_RUN_CONCURRENCY_ID,
             )
-            preview_all_metadata.change(
+            preview_all_metadata.input(
+                fn=metadata_preview_toggle_changed,
+                inputs=[preview_all_metadata, auto_confirm_after_metadata],
+                outputs=[auto_start_dependency_status],
+                show_progress="hidden",
+                queue=False,
+                trigger_mode="always_last",
+            ).then(
                 fn=stream_all_metadata_preview_on_checkbox_change,
                 inputs=[auto_pdfs, auto_folder_pdfs, auto_label, auto_author,
                         auto_short_label, auto_use_file_title_fallback,
@@ -37741,6 +37817,13 @@ with gr.Blocks(title="PDF to AnythingLLM Text") as demo:
                 queue=True,
                 concurrency_limit=AUTOMATIC_RUN_CONCURRENCY_LIMIT,
                 concurrency_id=AUTOMATIC_RUN_CONCURRENCY_ID,
+            )
+            auto_confirm_after_metadata.change(
+                fn=auto_start_dependency_note,
+                inputs=[auto_confirm_after_metadata, preview_all_metadata],
+                outputs=[auto_start_dependency_status],
+                show_progress="hidden",
+                queue=False,
             )
             automatic_selection_state.change(
                 fn=disarm_auto_for_selection_state,

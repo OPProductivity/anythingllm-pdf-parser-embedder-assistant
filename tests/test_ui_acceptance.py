@@ -1411,6 +1411,51 @@ def test_preview_all_control_scans_beyond_fifth_pdf(page, local_app_url, six_pdf
     )
 
 
+def test_unchecking_metadata_during_scan_stops_preview_and_leaves_auto_start_inactive(
+    page, paused_metadata_app, six_pdf_files
+):
+    url, started, release, app_home = paused_metadata_app
+    open_local_app(page, url)
+    page.locator(".pdf-upload-input input[type='file']").set_input_files(
+        [str(path) for path in six_pdf_files]
+    )
+    preview_all = page.get_by_role("checkbox", name=re.compile(r"^Process and recognize metadata for all"))
+    auto_start = page.get_by_role("checkbox", name="Confirm and start run automatically")
+    expect(preview_all).to_be_visible(timeout=30000)
+    auto_start.check()
+    expect(page.locator("#metadata-auto-start-dependency-note")).to_be_visible()
+    assert not list((app_home / "run-state").rglob("source-profile.json"))
+    preview_all.check()
+    expect(page.locator("#metadata-auto-start-dependency-note")).to_be_hidden()
+    deadline = time.monotonic() + 30
+    while not started.exists():
+        assert time.monotonic() < deadline, "Preview did not start"
+        page.wait_for_timeout(50)
+    preview_all.uncheck()
+    expect(page.locator("#metadata-auto-start-dependency-note")).to_be_visible()
+    release.touch()
+    page.wait_for_function(
+        "(() => { const s = document.querySelector('#document-metadata-scan-status .metadata-scan-inline'); "
+        "return s?.dataset.previewScope === 'none' && s?.dataset.state === 'paused'; })()",
+        timeout=60000,
+    )
+    expect(auto_start).to_be_checked()
+    expect(preview_all).not_to_be_checked()
+    expect(page.locator("#document-metadata-scan-status")).to_contain_text(
+        "Automatic metadata processing off"
+    )
+    assert not list((app_home / "run-state").rglob("source-profile.json"))
+    auto_start.uncheck()
+    preview_all.check()
+    page.wait_for_function(
+        "(() => { const s = document.querySelector('#document-metadata-scan-status .metadata-scan-inline'); "
+        "return s?.dataset.previewScope === 'all' && s?.dataset.previewComplete === 'true' "
+        "&& s?.dataset.state === 'ready'; })()",
+        timeout=90000,
+    )
+    assert not list((app_home / "run-state").rglob("source-profile.json"))
+
+
 def test_auto_confirm_uses_override_entered_after_arming(page, paused_metadata_app, six_pdf_files):
     url, started, release, app_home = paused_metadata_app
     open_local_app(page, url)

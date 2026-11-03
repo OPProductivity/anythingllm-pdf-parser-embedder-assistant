@@ -103,6 +103,58 @@ def test_preview_all_scans_every_selected_pdf_and_marks_completion(monkeypatch):
     assert [call.args[0][0] for call in inspect.call_args_list] == files
 
 
+def test_unchecking_all_preview_stops_after_current_pdf_and_keeps_existing_results(monkeypatch):
+    inspect = Mock(side_effect=result)
+    monkeypatch.setattr(app, "detected_metadata_preview", inspect)
+    request = SimpleNamespace(session_hash="metadata-toggle-unit-test")
+    files = [f"source-{index}.pdf" for index in range(6)]
+    app.metadata_preview_toggle_changed(True, False, request=request)
+    stream = app.stream_automatic_detected_metadata_preview(
+        files, [], preview_all=True, request=request,
+    )
+    assert "1/6" in next(stream)[4]
+    assert app.metadata_preview_toggle_changed(False, True, request=request)["visible"]
+    assert all("value" not in update for update in next(stream))
+    assert inspect.call_count == 1
+    assert list(stream) == []
+
+    stopped = list(app.stream_all_metadata_preview_on_checkbox_change(
+        files, [], selection_state={"revision": 4}, preview_all=False,
+        request=request,
+    ))
+    assert len(stopped) == 1
+    assert "value" not in stopped[0][3]
+    assert 'data-state="paused"' in stopped[0][4]
+    assert 'data-preview-scope="none"' in stopped[0][4]
+    assert stopped[0][5]["open"] is False
+    assert inspect.call_count == 1
+
+
+def test_unchecking_before_queued_preview_starts_does_not_inspect_a_pdf(monkeypatch):
+    inspect = Mock(side_effect=result)
+    monkeypatch.setattr(app, "detected_metadata_preview", inspect)
+    request = SimpleNamespace(session_hash="metadata-queued-toggle-unit-test")
+    app.metadata_preview_toggle_changed(True, False, request=request)
+    app.metadata_preview_toggle_changed(False, True, request=request)
+    events = list(app.stream_automatic_detected_metadata_preview(
+        [f"source-{index}.pdf" for index in range(6)], [],
+        preview_all=True, request=request,
+    ))
+    assert len(events) == 1
+    assert all("value" not in update for update in events[0])
+    inspect.assert_not_called()
+
+
+def test_intermediate_heading_has_no_transient_next_pdf_sentence(monkeypatch):
+    monkeypatch.setattr(app, "detected_metadata_preview", Mock(side_effect=result))
+    events = list(app.stream_automatic_detected_metadata_preview(
+        [f"source-{index}.pdf" for index in range(6)], [], preview_all=True,
+    ))
+    assert "6/6" not in events[1][4]
+    assert "1/6" in events[0][4] and "1/6" in events[1][4]
+    assert all("reading the next PDF" not in event[4] for event in events)
+
+
 def test_folder_names_are_visible_before_the_all_page_inspection_starts(monkeypatch, tmp_path):
     pdf = tmp_path / "selected.pdf"
     pdf.write_bytes(b"%PDF-1.4\n")
